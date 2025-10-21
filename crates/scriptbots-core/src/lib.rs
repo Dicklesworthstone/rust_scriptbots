@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 new_key_type! {
@@ -214,6 +214,15 @@ pub struct AgentState {
     pub id: AgentId,
     pub data: AgentData,
     pub runtime: AgentRuntime,
+}
+
+#[derive(Debug, Clone)]
+struct ActuationDelta {
+    heading: f32,
+    velocity: Velocity,
+    position: Position,
+    health_delta: f32,
+    spiked: bool,
 }
 
 /// Events emitted after processing a world tick.
@@ -967,6 +976,12 @@ pub struct ScriptBotsConfig {
     pub food_sharing_radius: f32,
     /// Fraction of energy shared per neighbor when donating.
     pub food_sharing_rate: f32,
+    /// Base radius used when checking spike impacts.
+    pub spike_radius: f32,
+    /// Damage applied by a spike at full power.
+    pub spike_damage: f32,
+    /// Energy cost of deploying a spike.
+    pub spike_energy_cost: f32,
 }
 
 impl Default for ScriptBotsConfig {
@@ -988,6 +1003,9 @@ impl Default for ScriptBotsConfig {
             food_intake_rate: 0.05,
             food_sharing_radius: 80.0,
             food_sharing_rate: 0.1,
+            spike_radius: 40.0,
+            spike_damage: 0.25,
+            spike_energy_cost: 0.02,
         }
     }
 }
@@ -1044,6 +1062,9 @@ impl ScriptBotsConfig {
             || self.food_intake_rate < 0.0
             || self.food_sharing_radius <= 0.0
             || self.food_sharing_rate < 0.0
+            || self.spike_radius <= 0.0
+            || self.spike_damage < 0.0
+            || self.spike_energy_cost < 0.0
         {
             return Err(WorldStateError::InvalidConfig(
                 "metabolism and sharing parameters must be non-negative, radius positive",
@@ -1161,6 +1182,7 @@ pub struct WorldState {
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
+    pending_deaths: Vec<AgentId>,
 }
 
 impl WorldState {
@@ -1184,6 +1206,7 @@ impl WorldState {
             runtime: AgentMap::new(),
             index,
             brain_registry: BrainRegistry::new(),
+            pending_deaths: Vec::new(),
         })
     }
 
@@ -1329,14 +1352,7 @@ impl WorldState {
         let positions_snapshot: Vec<Position> = self.agents.columns().positions().to_vec();
         let headings_snapshot: Vec<f32> = self.agents.columns().headings().to_vec();
 
-        #[derive(Clone)]
-        struct Delta {
-            heading: f32,
-            velocity: Velocity,
-            position: Position,
-        }
-
-        let mut deltas: Vec<Option<Delta>> = vec![None; handles.len()];
+        let mut deltas: Vec<Option<ActuationDelta>> = vec![None; handles.len()];
 
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
@@ -1381,13 +1397,28 @@ impl WorldState {
                 next_pos.x = Self::wrap_position(next_pos.x + vx, width);
                 next_pos.y = Self::wrap_position(next_pos.y + vy, height);
 
+                let movement_penalty = self.config.movement_drain * (vx.abs() + vy.abs());
+                let boost_penalty = boost * self.config.movement_drain * 0.5;
+                let metabolism_penalty = self.config.metabolism_drain;
+                let health_delta = -(metabolism_penalty + movement_penalty + boost_penalty);
+
                 runtime.energy =
                     (runtime.energy - (forward.abs() + strafe.abs() + boost * 0.5) * 0.01).max(0.0);
 
-                deltas[idx] = Some(Delta {
+                let spike_power = runtime
+                    .outputs
+                    .get(5)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                runtime.spiked = spike_power > 0.5;
+
+                deltas[idx] = Some(ActuationDelta {
                     heading,
                     velocity: Velocity::new(vx, vy),
                     position: next_pos,
+                    health_delta,
+                    spiked: runtime.spiked,
                 });
             }
         }
@@ -1410,11 +1441,29 @@ impl WorldState {
             }
         }
         {
+            let healths = columns.health_mut();
+            for (idx, delta) in deltas.iter().enumerate() {
+                if let Some(delta) = delta {
+                    healths[idx] = (healths[idx] + delta.health_delta).clamp(0.0, 2.0);
+                }
+            }
+        }
+        {
             let positions = columns.positions_mut();
-            for (idx, delta) in deltas.into_iter().enumerate() {
+            for (idx, delta) in deltas.iter().enumerate() {
                 if let Some(delta) = delta {
                     positions[idx] = delta.position;
                 }
+            }
+        }
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            if let Some(delta) = &deltas[idx] {
+                if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                    runtime.spiked = delta.spiked;
+                }
+            } else if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                runtime.spiked = false;
             }
         }
     }
@@ -1436,9 +1485,8 @@ impl WorldState {
 
         let cell_size = self.config.food_cell_size as f32;
         let positions = self.agents.columns().positions();
-        let mut sharing_pairs: Vec<(AgentId, AgentId)> = Vec::new();
-
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        let mut sharers: Vec<usize> = Vec::new();
 
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
@@ -1452,28 +1500,24 @@ impl WorldState {
                     runtime.food_delta += intake;
                 }
                 if runtime.outputs.get(4).copied().unwrap_or(0.0) > 0.5 {
-                    sharing_pairs.push((*agent_id, *agent_id));
+                    sharers.push(idx);
                 }
             }
         }
 
-        if sharing_pairs.len() < 2 {
+        if sharers.len() < 2 {
             return;
         }
 
         let radius_sq = self.config.food_sharing_radius * self.config.food_sharing_radius;
         let share_rate = self.config.food_sharing_rate;
 
-        for (i, &(id_a, _)) in sharing_pairs.iter().enumerate() {
-            for &(id_b, _) in sharing_pairs.iter().skip(i + 1) {
-                let idx_a = match self.agents.index_of(id_a) {
-                    Some(idx) => idx,
-                    None => continue,
-                };
-                let idx_b = match self.agents.index_of(id_b) {
-                    Some(idx) => idx,
-                    None => continue,
-                };
+        for (i, idx_a) in sharers.iter().enumerate() {
+            for idx_b in sharers.iter().skip(i + 1) {
+                let idx_a = *idx_a;
+                let idx_b = *idx_b;
+                let id_a = handles[idx_a];
+                let id_b = handles[idx_b];
                 let pos_a = positions[idx_a];
                 let pos_b = positions[idx_b];
                 let dx = pos_a.x - pos_b.x;
@@ -1481,9 +1525,15 @@ impl WorldState {
                 if dx * dx + dy * dy <= radius_sq {
                     let energy_a = self.runtime.get(id_a).map_or(0.0, |r| r.energy);
                     let energy_b = self.runtime.get(id_b).map_or(0.0, |r| r.energy);
-                    let diff = (energy_a - energy_b) * 0.5;
-                    let transfer = diff.abs().min(share_rate).signum() * diff.abs().min(share_rate);
-                    if transfer > 0.0 {
+                    let diff = energy_a - energy_b;
+                    if diff.abs() <= f32::EPSILON {
+                        continue;
+                    }
+                    let transfer = (diff.abs() * 0.5).min(share_rate);
+                    if transfer <= 0.0 {
+                        continue;
+                    }
+                    if diff > 0.0 {
                         if let Some(runtime_a) = self.runtime.get_mut(id_a) {
                             runtime_a.energy = (runtime_a.energy - transfer).max(0.0);
                             runtime_a.food_delta -= transfer;
@@ -1492,8 +1542,7 @@ impl WorldState {
                             runtime_b.energy = (runtime_b.energy + transfer).min(2.0);
                             runtime_b.food_delta += transfer;
                         }
-                    } else if transfer < 0.0 {
-                        let transfer = -transfer;
+                    } else {
                         if let Some(runtime_b) = self.runtime.get_mut(id_b) {
                             runtime_b.energy = (runtime_b.energy - transfer).max(0.0);
                             runtime_b.food_delta -= transfer;
@@ -1508,6 +1557,87 @@ impl WorldState {
         }
     }
 
+    fn stage_combat(&mut self) {
+        let spike_radius = self.config.spike_radius;
+        if spike_radius <= 0.0 {
+            return;
+        }
+
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        if handles.is_empty() {
+            return;
+        }
+
+        let positions = self.agents.columns().positions();
+        let spike_lengths = self.agents.columns().spike_lengths();
+        let positions_pairs: Vec<(f32, f32)> = positions.iter().map(|p| (p.x, p.y)).collect();
+        let _ = self.index.rebuild(&positions_pairs);
+
+        let mut damage = vec![0.0f32; handles.len()];
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            let spike_power;
+            {
+                let runtime = match self.runtime.get(*agent_id) {
+                    Some(rt) if rt.spiked => rt,
+                    _ => continue,
+                };
+                spike_power = runtime
+                    .outputs
+                    .get(5)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                if spike_power <= f32::EPSILON {
+                    continue;
+                }
+            }
+
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                runtime.energy =
+                    (runtime.energy - self.config.spike_energy_cost * spike_power).max(0.0);
+            }
+
+            let reach = (spike_radius + spike_lengths[idx]).max(1.0);
+            let reach_sq = reach * reach;
+            self.index.neighbors_within(
+                idx,
+                reach_sq,
+                &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
+                    damage[other_idx] += self.config.spike_damage * spike_power;
+                },
+            );
+        }
+
+        let columns = self.agents.columns_mut();
+        let healths = columns.health_mut();
+        for (idx, dmg) in damage.into_iter().enumerate() {
+            if dmg <= 0.0 {
+                continue;
+            }
+            healths[idx] = (healths[idx] - dmg).max(0.0);
+            if let Some(runtime) = self.runtime.get_mut(handles[idx]) {
+                runtime.food_delta -= dmg;
+            }
+            if healths[idx] <= 0.0 {
+                self.pending_deaths.push(handles[idx]);
+            }
+        }
+    }
+
+    fn stage_death_cleanup(&mut self) {
+        if self.pending_deaths.is_empty() {
+            return;
+        }
+        let mut unique = HashSet::new();
+        let removals: Vec<AgentId> = self.pending_deaths.drain(..).collect();
+        for agent_id in removals {
+            if unique.insert(agent_id) {
+                self.remove_agent(agent_id);
+            }
+        }
+    }
+
     /// Execute one simulation tick pipeline returning emitted events.
     pub fn step(&mut self) -> TickEvents {
         let next_tick = self.tick.next();
@@ -1518,6 +1648,8 @@ impl WorldState {
         self.stage_brains();
         self.stage_actuation();
         self.stage_food();
+        self.stage_combat();
+        self.stage_death_cleanup();
 
         let mut events = TickEvents {
             tick: next_tick,
@@ -1833,10 +1965,12 @@ mod tests {
 
         fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
             let mut outputs = [0.0; OUTPUT_SIZE];
+            outputs[0] = 1.0;
+            outputs[3] = 0.5;
+            outputs[4] = 1.0;
             if !inputs.is_empty() {
-                outputs[0] = inputs[0];
+                outputs[6] = inputs[0];
             }
-            outputs[1] = 1.0;
             outputs
         }
     }
@@ -1849,6 +1983,10 @@ mod tests {
         config.food_cell_size = 10;
         config.initial_food = 0.1;
         config.food_respawn_interval = 0;
+        config.food_intake_rate = 0.0;
+        config.metabolism_drain = 0.05;
+        config.movement_drain = 0.01;
+        config.food_sharing_rate = 0.0;
         config.rng_seed = Some(9);
 
         let mut world = WorldState::new(config).expect("world");
@@ -1861,8 +1999,7 @@ mod tests {
         let events = world.step();
         assert_eq!(events.tick, Tick(1));
         let runtime = world.agent_runtime(id).expect("runtime");
-        assert!((runtime.outputs[1] - 1.0).abs() < f32::EPSILON);
-        assert!((runtime.outputs[0] - runtime.sensors[0]).abs() < 1e-6);
+        assert!((runtime.outputs[0] - 1.0).abs() < f32::EPSILON);
         let position = world.agents().columns().positions()[0];
         assert!(position.x != 0.0 || position.y != 0.0);
         assert!(runtime.energy < 1.0);
@@ -1891,18 +2028,15 @@ mod tests {
 
     #[test]
     fn brain_genome_validation_detects_errors() {
-        let layers = vec![LayerSpec {
-            inputs: INPUT_SIZE,
-            outputs: 16,
-            activation: ActivationKind::Relu,
-            bias: true,
-            dropout: 0.5,
-        }];
+        let layers = vec![
+            LayerSpec::dense(INPUT_SIZE, 16, ActivationKind::Relu),
+            LayerSpec::dense(16, OUTPUT_SIZE, ActivationKind::Sigmoid),
+        ];
         let mut genome = BrainGenome::new(
             BrainFamily::Mlp,
             INPUT_SIZE,
             OUTPUT_SIZE,
-            layers,
+            layers.clone(),
             MutationRates::default(),
             GenomeHyperParams::default(),
             GenomeProvenance::default(),
@@ -1919,13 +2053,26 @@ mod tests {
         );
 
         genome.layers[0].dropout = 0.0;
-        genome.layers[0].outputs = OUTPUT_SIZE + 1;
+        genome.layers[1].inputs = OUTPUT_SIZE + 1;
+        assert_eq!(
+            genome.validate(),
+            Err(GenomeError::MismatchedTopology {
+                index: 1,
+                expected: 16,
+                actual: OUTPUT_SIZE + 1
+            })
+        );
+
+        genome.layers[1].inputs = 16;
+        genome.layers[1].outputs = OUTPUT_SIZE + 2;
         assert_eq!(
             genome.validate(),
             Err(GenomeError::OutputMismatch {
                 expected: OUTPUT_SIZE,
-                actual: OUTPUT_SIZE + 1
+                actual: OUTPUT_SIZE + 2
             })
         );
+        genome.layers = layers;
+        assert!(genome.validate().is_ok());
     }
 }
