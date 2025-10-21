@@ -137,7 +137,7 @@
 ## Testing, Tooling, and CI
 - Unit tests in `scriptbots-core` covering reproduction math, spike damage, food sharing formulas.
 - Property tests (QuickCheck/Proptest) verifying invariants (health clamped [0, 2], reproduction resets counter).
-- Determinism tests running simulation for fixed ticks with seeded RNG and asserting stable snapshots. [Currently In Progress - GPT-5 Codex 2025-10-21]
+- Determinism tests running simulation for fixed ticks with seeded RNG and asserting stable snapshots. [Completed - GPT-5 Codex 2025-10-21]
 - Bench harness (`criterion`) measuring ticks/sec at various agent counts.
 - GPUI view tests using `#[gpui::test]` macro to ensure layout compiles and actions dispatch.citeturn0search0
 - Storage tests:
@@ -183,14 +183,14 @@
    - MLP (baseline) complete with mutate/crossover. [Completed - GPT-5 Codex 2025-10-21]
    - DWRAON feature gate; assembly brain behind `--features experimental`. [Completed - GPT-5 Codex 2025-10-21]
    - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds. [Currently In Progress - GPT-5 Codex 2025-10-21]citeturn2search1turn2search2
-   - Seed NeuroFlow weights using the world RNG for deterministic runs. [Completed - GPT-5 Codex 2025-10-21]
-   - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Completed - GPT-5 Codex 2025-10-21]
+   - Seed NeuroFlow weights using the world RNG for deterministic runs. [Currently In Progress - GPT-5 Codex 2025-10-21]
+   - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Currently In Progress - GPT-5 Codex 2025-10-21]
 6. **Persistence Layer (Weeks 7-8)**
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Currently In Progress - GPT-5 Codex 2025-10-21]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Currently In Progress - GPT-5 Codex 2025-10-21]
 7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
    - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding complete; canvas renderer + inspector pending]
-   - Implement camera controls, overlays, history chart.
+   - Implement camera controls, overlays, history chart. [Currently In Progress - GPT-5 Codex 2025-10-21: camera pan/zoom + metrics overlay]
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.
 8. **Integration & UX Polish (Weeks 10-11)**
    - Hook actions to simulation, selection workflows, debug overlays.

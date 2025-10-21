@@ -58,6 +58,22 @@ pub struct NeuroflowBrainConfig {
     pub momentum: f64,
 }
 
+impl NeuroflowBrainConfig {
+    #[must_use]
+    pub fn from_settings(settings: &NeuroflowSettings) -> Self {
+        let mut config = Self::default();
+        if !settings.hidden_layers.is_empty() {
+            config.hidden_layers = settings.hidden_layers.clone();
+        }
+        config.activation = match settings.activation {
+            NeuroflowActivationKind::Tanh => NeuroflowActivation::Tanh,
+            NeuroflowActivationKind::Sigmoid => NeuroflowActivation::Sigmoid,
+            NeuroflowActivationKind::Relu => NeuroflowActivation::Relu,
+        };
+        config
+    }
+}
+
 impl Default for NeuroflowBrainConfig {
     fn default() -> Self {
         Self {
