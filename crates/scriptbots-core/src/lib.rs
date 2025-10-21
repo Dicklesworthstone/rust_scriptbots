@@ -6,6 +6,7 @@ use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use thiserror::Error;
 
 new_key_type! {
@@ -225,6 +226,14 @@ struct ActuationDelta {
     spiked: bool,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct SpawnOrder {
+    parent_index: usize,
+    data: AgentData,
+    runtime: AgentRuntime,
+}
+
 /// Events emitted after processing a world tick.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TickEvents {
@@ -232,6 +241,31 @@ pub struct TickEvents {
     pub charts_flushed: bool,
     pub epoch_rolled: bool,
     pub food_respawned: Option<(u32, u32)>,
+}
+
+/// Summary emitted to persistence hooks each tick.
+#[derive(Debug, Clone)]
+pub struct TickSummary {
+    pub tick: Tick,
+    pub agent_count: usize,
+    pub births: usize,
+    pub deaths: usize,
+    pub total_energy: f32,
+    pub average_energy: f32,
+    pub average_health: f32,
+}
+
+/// Persistence sink invoked after each tick.
+pub trait WorldPersistence: Send {
+    fn on_tick(&mut self, summary: &TickSummary);
+}
+
+/// No-op persistence sink.
+#[derive(Debug, Default)]
+pub struct NullPersistence;
+
+impl WorldPersistence for NullPersistence {
+    fn on_tick(&mut self, _summary: &TickSummary) {}
 }
 
 /// Current on-disk schema version for serialized brain genomes.
@@ -976,12 +1010,28 @@ pub struct ScriptBotsConfig {
     pub food_sharing_radius: f32,
     /// Fraction of energy shared per neighbor when donating.
     pub food_sharing_rate: f32,
+    /// Energy threshold required before reproduction can trigger.
+    pub reproduction_energy_threshold: f32,
+    /// Energy deducted from a parent upon reproduction.
+    pub reproduction_energy_cost: f32,
+    /// Cooldown in ticks between reproductions.
+    pub reproduction_cooldown: u32,
+    /// Starting energy assigned to a child agent.
+    pub reproduction_child_energy: f32,
+    /// Spatial jitter applied to child spawn positions.
+    pub reproduction_spawn_jitter: f32,
+    /// Color mutation range applied per channel.
+    pub reproduction_color_jitter: f32,
+    /// Scale factor applied to trait mutations.
+    pub reproduction_mutation_scale: f32,
     /// Base radius used when checking spike impacts.
     pub spike_radius: f32,
     /// Damage applied by a spike at full power.
     pub spike_damage: f32,
     /// Energy cost of deploying a spike.
     pub spike_energy_cost: f32,
+    /// Interval (ticks) between persistence flushes. 0 disables persistence.
+    pub persistence_interval: u32,
 }
 
 impl Default for ScriptBotsConfig {
@@ -1003,9 +1053,17 @@ impl Default for ScriptBotsConfig {
             food_intake_rate: 0.05,
             food_sharing_radius: 80.0,
             food_sharing_rate: 0.1,
+            reproduction_energy_threshold: 1.5,
+            reproduction_energy_cost: 0.75,
+            reproduction_cooldown: 300,
+            reproduction_child_energy: 1.0,
+            reproduction_spawn_jitter: 20.0,
+            reproduction_color_jitter: 0.05,
+            reproduction_mutation_scale: 0.02,
             spike_radius: 40.0,
             spike_damage: 0.25,
             spike_energy_cost: 0.02,
+            persistence_interval: 0,
         }
     }
 }
@@ -1062,12 +1120,18 @@ impl ScriptBotsConfig {
             || self.food_intake_rate < 0.0
             || self.food_sharing_radius <= 0.0
             || self.food_sharing_rate < 0.0
+            || self.reproduction_energy_threshold < 0.0
+            || self.reproduction_energy_cost < 0.0
+            || self.reproduction_child_energy < 0.0
+            || self.reproduction_spawn_jitter < 0.0
+            || self.reproduction_color_jitter < 0.0
+            || self.reproduction_mutation_scale < 0.0
             || self.spike_radius <= 0.0
             || self.spike_damage < 0.0
             || self.spike_energy_cost < 0.0
         {
             return Err(WorldStateError::InvalidConfig(
-                "metabolism and sharing parameters must be non-negative, radius positive",
+                "metabolism, reproduction, and sharing parameters must be non-negative, radius positive",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -1170,7 +1234,6 @@ impl FoodGrid {
 }
 
 /// Aggregate world state shared by the simulation and rendering layers.
-#[derive(Debug)]
 pub struct WorldState {
     config: ScriptBotsConfig,
     tick: Tick,
@@ -1183,11 +1246,36 @@ pub struct WorldState {
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
     pending_deaths: Vec<AgentId>,
+    #[allow(dead_code)]
+    pending_spawns: Vec<SpawnOrder>,
+    persistence: Box<dyn WorldPersistence>,
+    last_births: usize,
+    last_deaths: usize,
+}
+
+impl fmt::Debug for WorldState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorldState")
+            .field("config", &self.config)
+            .field("tick", &self.tick)
+            .field("epoch", &self.epoch)
+            .field("closed", &self.closed)
+            .field("agent_count", &self.agents.len())
+            .finish()
+    }
 }
 
 impl WorldState {
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
+        Self::with_persistence(config, Box::new(NullPersistence::default()))
+    }
+
+    /// Instantiate a new world using the supplied configuration and persistence sink.
+    pub fn with_persistence(
+        config: ScriptBotsConfig,
+        persistence: Box<dyn WorldPersistence>,
+    ) -> Result<Self, WorldStateError> {
         let (food_w, food_h) = config.food_dimensions()?;
         let rng = config.seeded_rng();
         let index = UniformGridIndex::new(
@@ -1207,6 +1295,10 @@ impl WorldState {
             index,
             brain_registry: BrainRegistry::new(),
             pending_deaths: Vec::new(),
+            pending_spawns: Vec::new(),
+            persistence,
+            last_births: 0,
+            last_deaths: 0,
         })
     }
 
@@ -1400,10 +1492,10 @@ impl WorldState {
                 let movement_penalty = self.config.movement_drain * (vx.abs() + vy.abs());
                 let boost_penalty = boost * self.config.movement_drain * 0.5;
                 let metabolism_penalty = self.config.metabolism_drain;
-                let health_delta = -(metabolism_penalty + movement_penalty + boost_penalty);
+                let drain = metabolism_penalty + movement_penalty + boost_penalty;
+                let health_delta = -drain;
 
-                runtime.energy =
-                    (runtime.energy - (forward.abs() + strafe.abs() + boost * 0.5) * 0.01).max(0.0);
+                runtime.energy = (runtime.energy - drain).max(0.0);
 
                 let spike_power = runtime
                     .outputs
@@ -1636,6 +1728,210 @@ impl WorldState {
                 self.remove_agent(agent_id);
             }
         }
+        self.last_deaths = unique.len();
+    }
+
+    fn stage_reproduction(&mut self) {
+        if self.config.reproduction_energy_threshold <= 0.0 {
+            return;
+        }
+
+        let cooldown = self.config.reproduction_cooldown.max(1) as f32;
+        let width = self.config.world_width as f32;
+        let height = self.config.world_height as f32;
+        let jitter = self.config.reproduction_spawn_jitter;
+        let color_jitter = self.config.reproduction_color_jitter;
+
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        if handles.is_empty() {
+            return;
+        }
+
+        let parent_snapshots: Vec<AgentData> = {
+            let columns = self.agents.columns();
+            (0..columns.len())
+                .map(|idx| columns.snapshot(idx))
+                .collect()
+        };
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            let mut parent_runtime = None;
+            {
+                let runtime = match self.runtime.get_mut(*agent_id) {
+                    Some(rt) => rt,
+                    None => continue,
+                };
+                runtime.reproduction_counter += 1.0;
+                if runtime.energy < self.config.reproduction_energy_threshold {
+                    continue;
+                }
+                if runtime.reproduction_counter < cooldown {
+                    continue;
+                }
+                if runtime.energy < self.config.reproduction_energy_cost {
+                    continue;
+                }
+                runtime.energy -= self.config.reproduction_energy_cost;
+                runtime.reproduction_counter = 0.0;
+                parent_runtime = Some(runtime.clone());
+            }
+
+            if let Some(parent_runtime) = parent_runtime {
+                let parent_data = parent_snapshots[idx];
+                let child_data =
+                    self.build_child_data(&parent_data, jitter, color_jitter, width, height);
+                let child_runtime = self.build_child_runtime(&parent_runtime);
+                self.pending_spawns.push(SpawnOrder {
+                    parent_index: idx,
+                    data: child_data,
+                    runtime: child_runtime,
+                });
+            }
+        }
+    }
+
+    fn stage_spawn_commit(&mut self) {
+        if self.pending_spawns.is_empty() {
+            return;
+        }
+        let mut orders = std::mem::take(&mut self.pending_spawns);
+        orders.sort_by_key(|order| order.parent_index);
+        self.last_births = orders.len();
+        for order in orders {
+            let child_id = self.spawn_agent(order.data);
+            if let Some(runtime) = self.runtime.get_mut(child_id) {
+                *runtime = order.runtime;
+            }
+        }
+    }
+
+    fn build_child_data(
+        &mut self,
+        parent: &AgentData,
+        jitter: f32,
+        color_jitter: f32,
+        width: f32,
+        height: f32,
+    ) -> AgentData {
+        let mut child = *parent;
+        let jitter_x = if jitter > 0.0 {
+            self.rng.random_range(-jitter..jitter)
+        } else {
+            0.0
+        };
+        let jitter_y = if jitter > 0.0 {
+            self.rng.random_range(-jitter..jitter)
+        } else {
+            0.0
+        };
+        child.position.x = Self::wrap_position(parent.position.x + jitter_x, width);
+        child.position.y = Self::wrap_position(parent.position.y + jitter_y, height);
+        child.velocity = Velocity::default();
+        child.heading = self
+            .rng
+            .random_range(-std::f32::consts::PI..std::f32::consts::PI);
+        child.health = 1.0;
+        child.boost = false;
+        child.age = 0;
+        child.generation = parent.generation.next();
+        let spike_variance = self.config.reproduction_mutation_scale;
+        if spike_variance > 0.0 {
+            child.spike_length = (child.spike_length
+                + self.rng.random_range(-spike_variance..spike_variance))
+            .clamp(0.0, (parent.spike_length + spike_variance).max(0.1));
+        }
+        if color_jitter > 0.0 {
+            for channel in &mut child.color {
+                *channel =
+                    (*channel + self.rng.random_range(-color_jitter..color_jitter)).clamp(0.0, 1.0);
+            }
+        }
+        child
+    }
+
+    fn build_child_runtime(&mut self, parent: &AgentRuntime) -> AgentRuntime {
+        let mut runtime = parent.clone();
+        runtime.energy = self.config.reproduction_child_energy.clamp(0.0, 2.0);
+        runtime.reproduction_counter = 0.0;
+        runtime.sensors = [0.0; INPUT_SIZE];
+        runtime.outputs = [0.0; OUTPUT_SIZE];
+        runtime.food_delta = 0.0;
+        runtime.spiked = false;
+        runtime.sound_output = 0.0;
+        runtime.give_intent = 0.0;
+        runtime.indicator = IndicatorState::default();
+        runtime.selection = SelectionState::None;
+        runtime.mutation_log.clear();
+        runtime.brain = BrainBinding::default();
+
+        let mutation_scale =
+            runtime.mutation_rates.secondary * self.config.reproduction_mutation_scale;
+        if mutation_scale > 0.0 {
+            runtime.herbivore_tendency =
+                self.mutate_value(runtime.herbivore_tendency, mutation_scale, 0.0, 1.0);
+            runtime.trait_modifiers.smell =
+                self.mutate_value(runtime.trait_modifiers.smell, mutation_scale, 0.05, 3.0);
+            runtime.trait_modifiers.sound =
+                self.mutate_value(runtime.trait_modifiers.sound, mutation_scale, 0.05, 3.0);
+            runtime.trait_modifiers.hearing =
+                self.mutate_value(runtime.trait_modifiers.hearing, mutation_scale, 0.1, 4.0);
+            runtime.trait_modifiers.eye =
+                self.mutate_value(runtime.trait_modifiers.eye, mutation_scale, 0.5, 4.0);
+            runtime.trait_modifiers.blood =
+                self.mutate_value(runtime.trait_modifiers.blood, mutation_scale, 0.5, 4.0);
+        }
+        runtime
+    }
+
+    fn mutate_value(&mut self, value: f32, scale: f32, min: f32, max: f32) -> f32 {
+        if scale <= 0.0 {
+            return value.clamp(min, max);
+        }
+        let delta = self.rng.random_range(-scale..scale);
+        (value + delta).clamp(min, max)
+    }
+
+    fn stage_persistence(&mut self, next_tick: Tick) {
+        if self.config.persistence_interval == 0
+            || next_tick.0 % self.config.persistence_interval as u64 != 0
+        {
+            self.last_births = 0;
+            self.last_deaths = 0;
+            return;
+        }
+
+        let agent_count = self.agents.len();
+        let mut total_energy = 0.0;
+        for id in self.agents.iter_handles() {
+            if let Some(runtime) = self.runtime.get(id) {
+                total_energy += runtime.energy;
+            }
+        }
+        let average_energy = if agent_count > 0 {
+            total_energy / agent_count as f32
+        } else {
+            0.0
+        };
+        let healths = self.agents.columns().health();
+        let total_health: f32 = healths.iter().sum();
+        let average_health = if agent_count > 0 {
+            total_health / agent_count as f32
+        } else {
+            0.0
+        };
+
+        let summary = TickSummary {
+            tick: next_tick,
+            agent_count,
+            births: self.last_births,
+            deaths: self.last_deaths,
+            total_energy,
+            average_energy,
+            average_health,
+        };
+        self.persistence.on_tick(&summary);
+        self.last_births = 0;
+        self.last_deaths = 0;
     }
 
     /// Execute one simulation tick pipeline returning emitted events.
@@ -1650,6 +1946,9 @@ impl WorldState {
         self.stage_food();
         self.stage_combat();
         self.stage_death_cleanup();
+        self.stage_reproduction();
+        self.stage_spawn_commit();
+        self.stage_persistence(next_tick);
 
         let mut events = TickEvents {
             tick: next_tick,
@@ -1676,6 +1975,11 @@ impl WorldState {
     #[must_use]
     pub fn config_mut(&mut self) -> &mut ScriptBotsConfig {
         &mut self.config
+    }
+
+    /// Replace the persistence sink.
+    pub fn set_persistence(&mut self, persistence: Box<dyn WorldPersistence>) {
+        self.persistence = persistence;
     }
 
     /// Current simulation tick.
@@ -1812,6 +2116,7 @@ impl WorldState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn sample_agent(seed: u32) -> AgentData {
         AgentData {
@@ -1923,6 +2228,20 @@ mod tests {
         config.food_respawn_amount = 0.4;
         config.food_max = 0.5;
         config.chart_flush_interval = 2;
+        config.food_intake_rate = 0.0;
+        config.metabolism_drain = 0.0;
+        config.movement_drain = 0.0;
+        config.food_sharing_radius = 20.0;
+        config.food_sharing_rate = 0.0;
+        config.reproduction_energy_threshold = 10.0;
+        config.reproduction_energy_cost = 0.0;
+        config.reproduction_cooldown = 10;
+        config.reproduction_spawn_jitter = 0.0;
+        config.reproduction_color_jitter = 0.0;
+        config.reproduction_mutation_scale = 0.0;
+        config.spike_radius = 1.0;
+        config.spike_damage = 0.0;
+        config.spike_energy_cost = 0.0;
         config.rng_seed = Some(7);
 
         let mut world = WorldState::new(config).expect("world");
@@ -1987,6 +2306,17 @@ mod tests {
         config.metabolism_drain = 0.05;
         config.movement_drain = 0.01;
         config.food_sharing_rate = 0.0;
+        config.food_sharing_radius = 20.0;
+        config.reproduction_energy_threshold = 10.0;
+        config.reproduction_energy_cost = 0.0;
+        config.reproduction_cooldown = 1_000;
+        config.reproduction_child_energy = 0.0;
+        config.reproduction_spawn_jitter = 0.0;
+        config.reproduction_color_jitter = 0.0;
+        config.reproduction_mutation_scale = 0.0;
+        config.spike_radius = 1.0;
+        config.spike_damage = 0.0;
+        config.spike_energy_cost = 0.0;
         config.rng_seed = Some(9);
 
         let mut world = WorldState::new(config).expect("world");
@@ -2074,5 +2404,115 @@ mod tests {
         );
         genome.layers = layers;
         assert!(genome.validate().is_ok());
+    }
+
+    #[derive(Clone, Default)]
+    struct SpyPersistence {
+        logs: Arc<Mutex<Vec<TickSummary>>>,
+    }
+
+    impl WorldPersistence for SpyPersistence {
+        fn on_tick(&mut self, summary: &TickSummary) {
+            self.logs.lock().unwrap().push(summary.clone());
+        }
+    }
+
+    #[test]
+    fn persistence_receives_tick_summary() {
+        let mut config = ScriptBotsConfig::default();
+        config.world_width = 100;
+        config.world_height = 100;
+        config.food_cell_size = 10;
+        config.initial_food = 0.0;
+        config.food_respawn_interval = 0;
+        config.food_intake_rate = 0.0;
+        config.metabolism_drain = 0.0;
+        config.movement_drain = 0.0;
+        config.food_sharing_rate = 0.0;
+        config.food_sharing_radius = 20.0;
+        config.reproduction_energy_threshold = 10.0;
+        config.reproduction_energy_cost = 0.0;
+        config.reproduction_cooldown = 10;
+        config.reproduction_child_energy = 0.0;
+        config.reproduction_spawn_jitter = 0.0;
+        config.reproduction_color_jitter = 0.0;
+        config.reproduction_mutation_scale = 0.0;
+        config.spike_radius = 1.0;
+        config.spike_damage = 0.0;
+        config.spike_energy_cost = 0.0;
+        config.persistence_interval = 1;
+        config.rng_seed = Some(123);
+
+        let spy = SpyPersistence::default();
+        let logs = spy.logs.clone();
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let id = world.spawn_agent(sample_agent(0));
+        world.agent_runtime_mut(id).unwrap().energy = 1.0;
+
+        world.step();
+
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let summary = &entries[0];
+        assert_eq!(summary.tick, Tick(1));
+        assert_eq!(summary.agent_count, 1);
+        assert_eq!(summary.births, 0);
+        assert_eq!(summary.deaths, 0);
+        assert!((summary.average_energy - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reproduction_spawns_child() {
+        let mut config = ScriptBotsConfig::default();
+        config.world_width = 200;
+        config.world_height = 200;
+        config.food_cell_size = 10;
+        config.initial_food = 0.0;
+        config.food_respawn_interval = 0;
+        config.food_intake_rate = 0.0;
+        config.metabolism_drain = 0.0;
+        config.movement_drain = 0.0;
+        config.food_sharing_rate = 0.0;
+        config.food_sharing_radius = 20.0;
+        config.reproduction_energy_threshold = 0.4;
+        config.reproduction_energy_cost = 0.1;
+        config.reproduction_cooldown = 1;
+        config.reproduction_child_energy = 0.6;
+        config.reproduction_spawn_jitter = 0.0;
+        config.reproduction_color_jitter = 0.0;
+        config.reproduction_mutation_scale = 0.0;
+        config.spike_radius = 1.0;
+        config.spike_damage = 0.0;
+        config.spike_energy_cost = 0.0;
+        config.chart_flush_interval = 0;
+        config.rng_seed = Some(11);
+
+        let mut world = WorldState::new(config).expect("world");
+        let parent_id = world.spawn_agent(sample_agent(0));
+        {
+            let runtime = world.agent_runtime_mut(parent_id).expect("runtime");
+            runtime.energy = 1.0;
+            runtime.reproduction_counter = 1.0;
+        }
+
+        assert_eq!(world.agent_count(), 1);
+        world.step();
+        assert_eq!(world.agent_count(), 2);
+
+        let handles: Vec<_> = world.agents().iter_handles().collect();
+        let child_id = handles
+            .into_iter()
+            .find(|id| *id != parent_id)
+            .expect("child");
+        let child_state = world.snapshot_agent(child_id).expect("child state");
+        assert_eq!(child_state.data.generation, Generation(1));
+        assert!((child_state.runtime.energy - 0.6).abs() < 1e-6);
+        assert!(
+            world
+                .agent_runtime(parent_id)
+                .expect("parent runtime")
+                .energy
+                < 1.0
+        );
     }
 }

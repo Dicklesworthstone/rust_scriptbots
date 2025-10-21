@@ -42,6 +42,9 @@ tch = "0.18.0"
 rstar = "0.12.2"
 kiddo = "4.2.0"
 
+[patch.crates-io]
+num-bigint-dig = { git = "https://github.com/dignifiedquire/num-bigint", rev = "d94efb24354fe56dc799d9979c279a542d2ce195" }
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 missing_docs = "warn"
