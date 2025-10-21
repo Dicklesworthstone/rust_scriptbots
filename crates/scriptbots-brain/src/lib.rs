@@ -3,6 +3,10 @@
 use rand::RngCore;
 use scriptbots_core::{AgentId, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Tick};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
+
+pub mod mlp;
+pub use mlp::MlpBrain;
 
 /// Small newtype wrapper identifying brain families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -27,7 +31,7 @@ impl From<&'static str> for BrainKind {
 }
 
 /// Shared interface implemented by all agent brains.
-pub trait Brain: Send + Sync {
+pub trait Brain: Send + Sync + Any {
     /// Unique identifier for analytics/registry display.
     fn kind(&self) -> BrainKind;
 
@@ -41,6 +45,12 @@ pub trait Brain: Send + Sync {
     fn crossover(&self, _other: &dyn Brain, _rng: &mut dyn RngCore) -> Option<Box<dyn Brain>> {
         None
     }
+
+    /// Downcast support for concrete brain logic.
+    fn as_any(&self) -> &(dyn Any + Send + Sync);
+
+    /// Mutable downcast support for concrete brain logic.
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync);
 }
 
 /// Summary emitted after each brain evaluation.
@@ -70,6 +80,14 @@ mod tests {
         }
 
         fn mutate(&mut self, _rng: &mut dyn RngCore, _rate: f32, _scale: f32) {}
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync) {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
+            self
+        }
     }
 
     #[test]
