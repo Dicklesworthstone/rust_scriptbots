@@ -1,6 +1,6 @@
 //! Optional modern ML brain backends (Candle, tract-onnx, tch).
 
-use scriptbots_brain::{into_runner, Brain, BrainKind};
+use scriptbots_brain::{Brain, BrainKind, into_runner};
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 use std::any::Any;
 
@@ -12,13 +12,6 @@ pub enum MlBackendKind {
     Tch,
     #[default]
     None,
-    fn as_any(&self) -> &(dyn Any + Send + Sync) {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
-        self
-    }
 }
 
 /// Placeholder structure that will host the chosen ML model.
@@ -72,6 +65,14 @@ impl Brain for MlBrain {
 
     fn mutate(&mut self, _rng: &mut dyn rand::RngCore, _rate: f32, _scale: f32) {
         // Mutation behavior will be implemented per-backend as we integrate models.
+    }
+
+    fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
+        self
     }
 }
 
