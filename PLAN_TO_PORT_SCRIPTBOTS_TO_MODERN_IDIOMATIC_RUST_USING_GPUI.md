@@ -89,7 +89,7 @@
   - Keep sensor aggregation and brain inference behind pluggable traits so alternative implementations (SIMD-optimized, GPU-backed) can be introduced without touching higher-level logic. Prototype GPU execution by batching inference into wgpu compute shaders or other accelerators once profiling justifies the investment.
 
 ## Rendering with GPUI
-- Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Currently In Progress: window + history HUD]
+- Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
 - State ownership:
   - `SimulationEntity`: `Entity<SimulationModel>` holds shared simulation state (agents, food grid snapshot, metrics). Updates triggered via background tasks that mutate entity and call `cx.notify()`.
   - UI-specific entity for camera (zoom, pan) mirroring original GLView controls.
@@ -187,7 +187,7 @@
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Currently In Progress - GPT-5 Codex 2025-10-21]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Currently In Progress - GPT-5 Codex 2025-10-21]
 7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
-   - Build GPUI window, canvas renderer, agent inspector UI.
+   - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
    - Implement camera controls, overlays, history chart.
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.
 8. **Integration & UX Polish (Weeks 10-11)**
