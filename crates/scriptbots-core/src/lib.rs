@@ -5,6 +5,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use std::collections::HashMap;
 use thiserror::Error;
 
 new_key_type! {
@@ -88,18 +89,74 @@ impl Default for SelectionState {
     }
 }
 
-/// Handle referencing an externally stored brain instance.
+/// Runtime brain attachment tracking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum BrainBinding {
     /// Brain not yet attached.
     Unbound,
-    /// Brain managed by an external registry (identified via opaque key).
-    External { registry_key: u64, kind: String },
+    /// Brain keyed in the world brain registry.
+    Registry { key: u64 },
 }
 
 impl Default for BrainBinding {
     fn default() -> Self {
         Self::Unbound
+    }
+}
+
+/// Thin trait object used to drive brain evaluations without coupling to concrete brain crates.
+pub trait BrainRunner: Send {
+    /// Static identifier of the brain implementation.
+    fn kind(&self) -> &'static str;
+
+    /// Evaluate outputs for the provided sensors.
+    fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE];
+}
+
+/// Registry owning brain runners keyed by opaque handles.
+#[derive(Default)]
+pub struct BrainRegistry {
+    next_key: u64,
+    runners: HashMap<u64, Box<dyn BrainRunner>>, // stored in insertion order for determinism via key
+}
+
+impl std::fmt::Debug for BrainRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrainRegistry")
+            .field("next_key", &self.next_key)
+            .field("runner_count", &self.runners.len())
+            .finish()
+    }
+}
+
+impl BrainRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a new brain runner, returning its registry key.
+    pub fn register(&mut self, brain: Box<dyn BrainRunner>) -> u64 {
+        let key = self.next_key;
+        self.next_key += 1;
+        self.runners.insert(key, brain);
+        key
+    }
+
+    /// Removes a brain runner from the registry.
+    pub fn unregister(&mut self, key: u64) -> Option<Box<dyn BrainRunner>> {
+        self.runners.remove(&key)
+    }
+
+    /// Executes the brain assigned to `key`, returning the outputs if the key exists.
+    pub fn tick(&mut self, key: u64, inputs: &[f32; INPUT_SIZE]) -> Option<[f32; OUTPUT_SIZE]> {
+        self.runners.get_mut(&key).map(|brain| brain.tick(inputs))
+    }
+
+    /// Returns whether a key is registered.
+    #[must_use]
+    pub fn contains(&self, key: u64) -> bool {
+        self.runners.contains_key(&key)
     }
 }
 
@@ -1078,6 +1135,7 @@ pub struct WorldState {
     food: FoodGrid,
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
+    brain_registry: BrainRegistry,
 }
 
 impl WorldState {
@@ -1100,6 +1158,7 @@ impl WorldState {
             agents: AgentArena::new(),
             runtime: AgentMap::new(),
             index,
+            brain_registry: BrainRegistry::new(),
         })
     }
 
@@ -1202,6 +1261,87 @@ impl WorldState {
         }
     }
 
+    fn default_outputs(inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        let mut outputs = [0.0; OUTPUT_SIZE];
+        let limit = OUTPUT_SIZE.min(INPUT_SIZE);
+        outputs[..limit].copy_from_slice(&inputs[..limit]);
+        outputs
+    }
+
+    fn stage_brains(&mut self) {
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        for agent_id in handles {
+            if let Some(runtime) = self.runtime.get_mut(agent_id) {
+                let outputs = match runtime.brain {
+                    BrainBinding::Registry { key } => self
+                        .brain_registry
+                        .tick(key, &runtime.sensors)
+                        .unwrap_or_else(|| Self::default_outputs(&runtime.sensors)),
+                    BrainBinding::Unbound => Self::default_outputs(&runtime.sensors),
+                };
+                runtime.outputs = outputs;
+            }
+        }
+    }
+
+    fn wrap_position(value: f32, extent: f32) -> f32 {
+        if extent <= 0.0 {
+            return 0.0;
+        }
+        let mut v = value % extent;
+        if v < 0.0 {
+            v += extent;
+        }
+        v
+    }
+
+    fn stage_actuation(&mut self) {
+        let width = self.config.world_width as f32;
+        let height = self.config.world_height as f32;
+        let speed_base = self.config.sense_radius * 0.1; // reuse sensing radius to scale movement
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        {
+            let columns = self.agents.columns_mut();
+            let positions = columns.positions_mut();
+            let velocities = columns.velocities_mut();
+            let headings = columns.headings_mut();
+
+            for (idx, agent_id) in handles.iter().enumerate() {
+                if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                    let forward = runtime.outputs.get(0).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let strafe = runtime.outputs.get(1).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let turn = runtime.outputs.get(2).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let boost = runtime.outputs.get(3).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+
+                    let heading = headings[idx] + turn * 0.1;
+                    headings[idx] = heading;
+
+                    let cos_h = heading.cos();
+                    let sin_h = heading.sin();
+                    let forward_dx = cos_h * forward;
+                    let forward_dy = sin_h * forward;
+
+                    let strafe_dx = -sin_h * strafe;
+                    let strafe_dy = cos_h * strafe;
+
+                    let speed_scale = speed_base * (1.0 + boost);
+                    let vx = (forward_dx + strafe_dx) * speed_scale;
+                    let vy = (forward_dy + strafe_dy) * speed_scale;
+                    velocities[idx].vx = vx;
+                    velocities[idx].vy = vy;
+
+                    positions[idx].x =
+                        Self::wrap_position(positions[idx].x + vx, width);
+                    positions[idx].y =
+                        Self::wrap_position(positions[idx].y + vy, height);
+
+                    runtime.energy = (runtime.energy - (forward.abs() + strafe.abs()) * 0.01)
+                        .max(0.0);
+                }
+            }
+        }
+    }
+
     fn stage_reset_events(&mut self) {
         for runtime in self.runtime.values_mut() {
             runtime.spiked = false;
@@ -1218,6 +1358,8 @@ impl WorldState {
 
         self.stage_aging();
         self.stage_sense();
+        self.stage_brains();
+        self.stage_actuation();
 
         let mut events = TickEvents {
             tick: next_tick,
@@ -1330,6 +1472,18 @@ impl WorldState {
     #[must_use]
     pub fn food_mut(&mut self) -> &mut FoodGrid {
         &mut self.food
+    }
+
+    /// Immutable access to the brain registry.
+    #[must_use]
+    pub fn brain_registry(&self) -> &BrainRegistry {
+        &self.brain_registry
+    }
+
+    /// Mutable access to the brain registry.
+    #[must_use]
+    pub fn brain_registry_mut(&mut self) -> &mut BrainRegistry {
+        &mut self.brain_registry
     }
 
     /// Immutable access to per-agent runtime metadata.
@@ -1510,6 +1664,50 @@ mod tests {
         assert!(events_second.charts_flushed);
         assert_eq!(events_second.tick, Tick(2));
         assert!(!events_second.epoch_rolled);
+    }
+
+    struct StubBrain;
+
+    impl BrainRunner for StubBrain {
+        fn kind(&self) -> &'static str {
+            "stub"
+        }
+
+        fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+            let mut outputs = [0.0; OUTPUT_SIZE];
+            if !inputs.is_empty() {
+                outputs[0] = inputs[0];
+            }
+            outputs[1] = 1.0;
+            outputs
+        }
+    }
+
+    #[test]
+    fn brain_registry_executes_registered_brain() {
+        let mut config = ScriptBotsConfig::default();
+        config.world_width = 100;
+        config.world_height = 100;
+        config.food_cell_size = 10;
+        config.initial_food = 0.1;
+        config.food_respawn_interval = 0;
+        config.rng_seed = Some(9);
+
+        let mut world = WorldState::new(config).expect("world");
+        let id = world.spawn_agent(sample_agent(0));
+        let key = world.brain_registry_mut().register(Box::new(StubBrain));
+        if let Some(runtime) = world.agent_runtime_mut(id) {
+            runtime.brain = BrainBinding::Registry { key };
+        }
+
+        let events = world.step();
+        assert_eq!(events.tick, Tick(1));
+        let runtime = world.agent_runtime(id).expect("runtime");
+        assert!((runtime.outputs[1] - 1.0).abs() < f32::EPSILON);
+        assert!((runtime.outputs[0] - runtime.sensors[0]).abs() < 1e-6);
+        let position = world.agents().columns().positions()[0];
+        assert!(position.x != 0.0 || position.y != 0.0);
+        assert!(runtime.energy < 1.0);
     }
 
     #[test]
