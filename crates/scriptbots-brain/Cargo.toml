@@ -1,0 +1,11 @@
+[package]
+name = "scriptbots-brain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+scriptbots-core = { path = "../scriptbots-core" }
