@@ -957,6 +957,16 @@ pub struct ScriptBotsConfig {
     pub sense_radius: f32,
     /// Normalization factor for counting neighbors.
     pub sense_max_neighbors: f32,
+    /// Baseline metabolism drain applied each tick.
+    pub metabolism_drain: f32,
+    /// Fraction of velocity converted to additional energy cost.
+    pub movement_drain: f32,
+    /// Base rate at which agents siphon food from cells.
+    pub food_intake_rate: f32,
+    /// Radius used for food sharing with friendly neighbors.
+    pub food_sharing_radius: f32,
+    /// Fraction of energy shared per neighbor when donating.
+    pub food_sharing_rate: f32,
 }
 
 impl Default for ScriptBotsConfig {
@@ -973,6 +983,11 @@ impl Default for ScriptBotsConfig {
             food_max: 0.5,
             sense_radius: 120.0,
             sense_max_neighbors: 12.0,
+            metabolism_drain: 0.002,
+            movement_drain: 0.005,
+            food_intake_rate: 0.05,
+            food_sharing_radius: 80.0,
+            food_sharing_rate: 0.1,
         }
     }
 }
@@ -1022,6 +1037,16 @@ impl ScriptBotsConfig {
         if self.food_respawn_amount > self.food_max {
             return Err(WorldStateError::InvalidConfig(
                 "food_respawn_amount cannot exceed food_max",
+            ));
+        }
+        if self.metabolism_drain < 0.0
+            || self.movement_drain < 0.0
+            || self.food_intake_rate < 0.0
+            || self.food_sharing_radius <= 0.0
+            || self.food_sharing_rate < 0.0
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "metabolism and sharing parameters must be non-negative, radius positive",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -1298,45 +1323,97 @@ impl WorldState {
     fn stage_actuation(&mut self) {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
-        let speed_base = self.config.sense_radius * 0.1; // reuse sensing radius to scale movement
+        let speed_base = self.config.sense_radius * 0.1;
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+
+        let positions_snapshot: Vec<Position> = self.agents.columns().positions().to_vec();
+        let headings_snapshot: Vec<f32> = self.agents.columns().headings().to_vec();
+
+        #[derive(Clone)]
+        struct Delta {
+            heading: f32,
+            velocity: Velocity,
+            position: Position,
+        }
+
+        let mut deltas: Vec<Option<Delta>> = vec![None; handles.len()];
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                let forward = runtime
+                    .outputs
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(-1.0, 1.0);
+                let strafe = runtime
+                    .outputs
+                    .get(1)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(-1.0, 1.0);
+                let turn = runtime
+                    .outputs
+                    .get(2)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(-1.0, 1.0);
+                let boost = runtime
+                    .outputs
+                    .get(3)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+
+                let heading = headings_snapshot[idx] + turn * 0.1;
+                let cos_h = heading.cos();
+                let sin_h = heading.sin();
+                let forward_dx = cos_h * forward;
+                let forward_dy = sin_h * forward;
+                let strafe_dx = -sin_h * strafe;
+                let strafe_dy = cos_h * strafe;
+
+                let speed_scale = speed_base * (1.0 + boost);
+                let vx = (forward_dx + strafe_dx) * speed_scale;
+                let vy = (forward_dy + strafe_dy) * speed_scale;
+
+                let mut next_pos = positions_snapshot[idx];
+                next_pos.x = Self::wrap_position(next_pos.x + vx, width);
+                next_pos.y = Self::wrap_position(next_pos.y + vy, height);
+
+                runtime.energy =
+                    (runtime.energy - (forward.abs() + strafe.abs() + boost * 0.5) * 0.01).max(0.0);
+
+                deltas[idx] = Some(Delta {
+                    heading,
+                    velocity: Velocity::new(vx, vy),
+                    position: next_pos,
+                });
+            }
+        }
+
+        let columns = self.agents.columns_mut();
         {
-            let columns = self.agents.columns_mut();
-            let positions = columns.positions_mut();
-            let velocities = columns.velocities_mut();
             let headings = columns.headings_mut();
-
-            for (idx, agent_id) in handles.iter().enumerate() {
-                if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                    let forward = runtime.outputs.get(0).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-                    let strafe = runtime.outputs.get(1).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-                    let turn = runtime.outputs.get(2).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-                    let boost = runtime.outputs.get(3).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-
-                    let heading = headings[idx] + turn * 0.1;
-                    headings[idx] = heading;
-
-                    let cos_h = heading.cos();
-                    let sin_h = heading.sin();
-                    let forward_dx = cos_h * forward;
-                    let forward_dy = sin_h * forward;
-
-                    let strafe_dx = -sin_h * strafe;
-                    let strafe_dy = cos_h * strafe;
-
-                    let speed_scale = speed_base * (1.0 + boost);
-                    let vx = (forward_dx + strafe_dx) * speed_scale;
-                    let vy = (forward_dy + strafe_dy) * speed_scale;
-                    velocities[idx].vx = vx;
-                    velocities[idx].vy = vy;
-
-                    positions[idx].x =
-                        Self::wrap_position(positions[idx].x + vx, width);
-                    positions[idx].y =
-                        Self::wrap_position(positions[idx].y + vy, height);
-
-                    runtime.energy = (runtime.energy - (forward.abs() + strafe.abs()) * 0.01)
-                        .max(0.0);
+            for (idx, delta) in deltas.iter().enumerate() {
+                if let Some(delta) = delta {
+                    headings[idx] = delta.heading;
+                }
+            }
+        }
+        {
+            let velocities = columns.velocities_mut();
+            for (idx, delta) in deltas.iter().enumerate() {
+                if let Some(delta) = delta {
+                    velocities[idx] = delta.velocity;
+                }
+            }
+        }
+        {
+            let positions = columns.positions_mut();
+            for (idx, delta) in deltas.into_iter().enumerate() {
+                if let Some(delta) = delta {
+                    positions[idx] = delta.position;
                 }
             }
         }
@@ -1351,6 +1428,86 @@ impl WorldState {
         }
     }
 
+    fn stage_food(&mut self) {
+        let intake_rate = self.config.food_intake_rate;
+        if intake_rate <= 0.0 {
+            return;
+        }
+
+        let cell_size = self.config.food_cell_size as f32;
+        let positions = self.agents.columns().positions();
+        let mut sharing_pairs: Vec<(AgentId, AgentId)> = Vec::new();
+
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                let pos = positions[idx];
+                let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
+                let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
+                if let Some(cell) = self.food.get_mut(cell_x, cell_y) {
+                    let intake = cell.min(intake_rate);
+                    *cell -= intake;
+                    runtime.energy = (runtime.energy + intake * 0.5).min(2.0);
+                    runtime.food_delta += intake;
+                }
+                if runtime.outputs.get(4).copied().unwrap_or(0.0) > 0.5 {
+                    sharing_pairs.push((*agent_id, *agent_id));
+                }
+            }
+        }
+
+        if sharing_pairs.len() < 2 {
+            return;
+        }
+
+        let radius_sq = self.config.food_sharing_radius * self.config.food_sharing_radius;
+        let share_rate = self.config.food_sharing_rate;
+
+        for (i, &(id_a, _)) in sharing_pairs.iter().enumerate() {
+            for &(id_b, _) in sharing_pairs.iter().skip(i + 1) {
+                let idx_a = match self.agents.index_of(id_a) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                let idx_b = match self.agents.index_of(id_b) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                let pos_a = positions[idx_a];
+                let pos_b = positions[idx_b];
+                let dx = pos_a.x - pos_b.x;
+                let dy = pos_a.y - pos_b.y;
+                if dx * dx + dy * dy <= radius_sq {
+                    let energy_a = self.runtime.get(id_a).map_or(0.0, |r| r.energy);
+                    let energy_b = self.runtime.get(id_b).map_or(0.0, |r| r.energy);
+                    let diff = (energy_a - energy_b) * 0.5;
+                    let transfer = diff.abs().min(share_rate).signum() * diff.abs().min(share_rate);
+                    if transfer > 0.0 {
+                        if let Some(runtime_a) = self.runtime.get_mut(id_a) {
+                            runtime_a.energy = (runtime_a.energy - transfer).max(0.0);
+                            runtime_a.food_delta -= transfer;
+                        }
+                        if let Some(runtime_b) = self.runtime.get_mut(id_b) {
+                            runtime_b.energy = (runtime_b.energy + transfer).min(2.0);
+                            runtime_b.food_delta += transfer;
+                        }
+                    } else if transfer < 0.0 {
+                        let transfer = -transfer;
+                        if let Some(runtime_b) = self.runtime.get_mut(id_b) {
+                            runtime_b.energy = (runtime_b.energy - transfer).max(0.0);
+                            runtime_b.food_delta -= transfer;
+                        }
+                        if let Some(runtime_a) = self.runtime.get_mut(id_a) {
+                            runtime_a.energy = (runtime_a.energy + transfer).min(2.0);
+                            runtime_a.food_delta += transfer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Execute one simulation tick pipeline returning emitted events.
     pub fn step(&mut self) -> TickEvents {
         let next_tick = self.tick.next();
@@ -1360,6 +1517,7 @@ impl WorldState {
         self.stage_sense();
         self.stage_brains();
         self.stage_actuation();
+        self.stage_food();
 
         let mut events = TickEvents {
             tick: next_tick,
