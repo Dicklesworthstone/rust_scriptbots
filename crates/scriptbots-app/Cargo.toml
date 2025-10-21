@@ -7,12 +7,15 @@ edition = "2024"
 anyhow = { workspace = true }
 scriptbots-brain = { path = "../scriptbots-brain" }
 scriptbots-brain-ml = { path = "../scriptbots-brain-ml", optional = true }
+scriptbots-brain-neuro = { path = "../scriptbots-brain-neuro", optional = true }
 scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-render = { path = "../scriptbots-render" }
 scriptbots-storage = { path = "../scriptbots-storage" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+rand = { workspace = true }
 
 [features]
 default = []
 ml = ["scriptbots-brain-ml"]
+neuro = ["scriptbots-brain-neuro"]

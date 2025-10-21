@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use thiserror::Error;
@@ -78,32 +79,22 @@ impl Default for IndicatorState {
 }
 
 /// Selection state applied by user interaction.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SelectionState {
+    #[default]
     None,
     Hovered,
     Selected,
 }
 
-impl Default for SelectionState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 /// Runtime brain attachment tracking.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum BrainBinding {
     /// Brain not yet attached.
+    #[default]
     Unbound,
     /// Brain keyed in the world brain registry.
     Registry { key: u64 },
-}
-
-impl Default for BrainBinding {
-    fn default() -> Self {
-        Self::Unbound
-    }
 }
 
 /// Thin trait object used to drive brain evaluations without coupling to concrete brain crates.
@@ -268,9 +259,67 @@ pub struct TickSummary {
     pub average_health: f32,
 }
 
+/// Scalar metric sampled during persistence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricSample {
+    pub name: Cow<'static, str>,
+    pub value: f64,
+}
+
+impl MetricSample {
+    /// Creates a new metric sample.
+    #[must_use]
+    pub fn new(name: impl Into<Cow<'static, str>>, value: f64) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
+    }
+
+    /// Helper for `f32` values.
+    #[must_use]
+    pub fn from_f32(name: &'static str, value: f32) -> Self {
+        Self::new(name, f64::from(value))
+    }
+}
+
+/// Event type recorded for persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PersistenceEventKind {
+    Births,
+    Deaths,
+    Custom(Cow<'static, str>),
+}
+
+/// Structured persistence event entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistenceEvent {
+    pub kind: PersistenceEventKind,
+    pub count: usize,
+}
+
+impl PersistenceEvent {
+    /// Construct a new event entry.
+    #[must_use]
+    pub fn new(kind: PersistenceEventKind, count: usize) -> Self {
+        Self { kind, count }
+    }
+}
+
+/// Aggregate payload forwarded to persistence sinks.
+#[derive(Debug, Clone)]
+pub struct PersistenceBatch {
+    pub summary: TickSummary,
+    pub epoch: u64,
+    pub closed: bool,
+    pub metrics: Vec<MetricSample>,
+    pub events: Vec<PersistenceEvent>,
+    pub agents: Vec<AgentState>,
+}
+
 /// Persistence sink invoked after each tick.
 pub trait WorldPersistence: Send {
-    fn on_tick(&mut self, summary: &TickSummary);
+    fn on_tick(&mut self, payload: &PersistenceBatch);
 }
 
 /// No-op persistence sink.
@@ -278,36 +327,34 @@ pub trait WorldPersistence: Send {
 pub struct NullPersistence;
 
 impl WorldPersistence for NullPersistence {
-    fn on_tick(&mut self, _summary: &TickSummary) {}
+    fn on_tick(&mut self, _payload: &PersistenceBatch) {}
 }
 
 /// Current on-disk schema version for serialized brain genomes.
 pub const GENOME_FORMAT_VERSION: u16 = 1;
 
 /// Supported brain family discriminants.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum BrainFamily {
+    #[default]
     Mlp,
     Dwraon,
     Assembly,
     External(String),
 }
 
-impl Default for BrainFamily {
-    fn default() -> Self {
-        Self::Mlp
-    }
-}
-
 /// Supported activation functions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum ActivationKind {
+    #[default]
     Identity,
     Relu,
     Sigmoid,
     Tanh,
     Softplus,
-    LeakyRelu { slope: f32 },
+    LeakyRelu {
+        slope: f32,
+    },
     Custom(String),
 }
 
@@ -912,7 +959,6 @@ impl AgentArena {
     }
 
     /// Iterate over active agent handles in dense iteration order.
-    #[must_use]
     pub fn iter_handles(&self) -> impl Iterator<Item = AgentId> + '_ {
         self.handles.iter().copied()
     }
@@ -1097,8 +1143,8 @@ impl ScriptBotsConfig {
                 "food_cell_size must be non-zero",
             ));
         }
-        if self.world_width % self.food_cell_size != 0
-            || self.world_height % self.food_cell_size != 0
+        if !self.world_width.is_multiple_of(self.food_cell_size)
+            || !self.world_height.is_multiple_of(self.food_cell_size)
         {
             return Err(WorldStateError::InvalidConfig(
                 "world dimensions must be divisible by food_cell_size",
@@ -1969,7 +2015,47 @@ impl WorldState {
             average_energy,
             average_health,
         };
-        self.persistence.on_tick(&summary);
+        let mut metrics = Vec::with_capacity(3);
+        metrics.push(MetricSample::from_f32("total_energy", summary.total_energy));
+        metrics.push(MetricSample::from_f32(
+            "average_energy",
+            summary.average_energy,
+        ));
+        metrics.push(MetricSample::from_f32(
+            "average_health",
+            summary.average_health,
+        ));
+
+        let mut events = Vec::with_capacity(2);
+        if self.last_births > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Births,
+                self.last_births,
+            ));
+        }
+        if self.last_deaths > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Deaths,
+                self.last_deaths,
+            ));
+        }
+
+        let mut agents = Vec::with_capacity(agent_count);
+        for id in self.agents.iter_handles() {
+            if let Some(snapshot) = self.snapshot_agent(id) {
+                agents.push(snapshot);
+            }
+        }
+
+        let batch = PersistenceBatch {
+            summary: summary.clone(),
+            epoch: self.epoch,
+            closed: self.closed,
+            metrics,
+            events,
+            agents,
+        };
+        self.persistence.on_tick(&batch);
         if self.history.len() >= self.config.history_capacity {
             self.history.pop_front();
         }
@@ -2238,9 +2324,11 @@ mod tests {
 
     #[test]
     fn world_state_initialises_from_config() {
-        let mut config = ScriptBotsConfig::default();
-        config.initial_food = 0.25;
-        config.rng_seed = Some(42);
+        let config = ScriptBotsConfig {
+            initial_food: 0.25,
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        };
         let mut world = WorldState::new(config.clone()).expect("world");
         assert_eq!(world.agent_count(), 0);
         assert_eq!(world.food().width(), 100);
@@ -2269,30 +2357,32 @@ mod tests {
 
     #[test]
     fn step_executes_pipeline() {
-        let mut config = ScriptBotsConfig::default();
-        config.world_width = 100;
-        config.world_height = 100;
-        config.food_cell_size = 10;
-        config.initial_food = 0.1;
-        config.food_respawn_interval = 1;
-        config.food_respawn_amount = 0.4;
-        config.food_max = 0.5;
-        config.chart_flush_interval = 2;
-        config.food_intake_rate = 0.0;
-        config.metabolism_drain = 0.0;
-        config.movement_drain = 0.0;
-        config.food_sharing_radius = 20.0;
-        config.food_sharing_rate = 0.0;
-        config.reproduction_energy_threshold = 10.0;
-        config.reproduction_energy_cost = 0.0;
-        config.reproduction_cooldown = 10;
-        config.reproduction_spawn_jitter = 0.0;
-        config.reproduction_color_jitter = 0.0;
-        config.reproduction_mutation_scale = 0.0;
-        config.spike_radius = 1.0;
-        config.spike_damage = 0.0;
-        config.spike_energy_cost = 0.0;
-        config.rng_seed = Some(7);
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.1,
+            food_respawn_interval: 1,
+            food_respawn_amount: 0.4,
+            food_max: 0.5,
+            chart_flush_interval: 2,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            food_sharing_radius: 20.0,
+            food_sharing_rate: 0.0,
+            reproduction_energy_threshold: 10.0,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 10,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_mutation_scale: 0.0,
+            spike_radius: 1.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            rng_seed: Some(7),
+            ..ScriptBotsConfig::default()
+        };
 
         let mut world = WorldState::new(config).expect("world");
         let id = world.spawn_agent(sample_agent(0));
@@ -2346,28 +2436,30 @@ mod tests {
 
     #[test]
     fn brain_registry_executes_registered_brain() {
-        let mut config = ScriptBotsConfig::default();
-        config.world_width = 100;
-        config.world_height = 100;
-        config.food_cell_size = 10;
-        config.initial_food = 0.1;
-        config.food_respawn_interval = 0;
-        config.food_intake_rate = 0.0;
-        config.metabolism_drain = 0.05;
-        config.movement_drain = 0.01;
-        config.food_sharing_rate = 0.0;
-        config.food_sharing_radius = 20.0;
-        config.reproduction_energy_threshold = 10.0;
-        config.reproduction_energy_cost = 0.0;
-        config.reproduction_cooldown = 1_000;
-        config.reproduction_child_energy = 0.0;
-        config.reproduction_spawn_jitter = 0.0;
-        config.reproduction_color_jitter = 0.0;
-        config.reproduction_mutation_scale = 0.0;
-        config.spike_radius = 1.0;
-        config.spike_damage = 0.0;
-        config.spike_energy_cost = 0.0;
-        config.rng_seed = Some(9);
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.1,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.05,
+            movement_drain: 0.01,
+            food_sharing_rate: 0.0,
+            food_sharing_radius: 20.0,
+            reproduction_energy_threshold: 10.0,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 1_000,
+            reproduction_child_energy: 0.0,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_mutation_scale: 0.0,
+            spike_radius: 1.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            rng_seed: Some(9),
+            ..ScriptBotsConfig::default()
+        };
 
         let mut world = WorldState::new(config).expect("world");
         let id = world.spawn_agent(sample_agent(0));
@@ -2458,41 +2550,43 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct SpyPersistence {
-        logs: Arc<Mutex<Vec<TickSummary>>>,
+        logs: Arc<Mutex<Vec<PersistenceBatch>>>,
     }
 
     impl WorldPersistence for SpyPersistence {
-        fn on_tick(&mut self, summary: &TickSummary) {
-            self.logs.lock().unwrap().push(summary.clone());
+        fn on_tick(&mut self, payload: &PersistenceBatch) {
+            self.logs.lock().unwrap().push(payload.clone());
         }
     }
 
     #[test]
-    fn persistence_receives_tick_summary() {
-        let mut config = ScriptBotsConfig::default();
-        config.world_width = 100;
-        config.world_height = 100;
-        config.food_cell_size = 10;
-        config.initial_food = 0.0;
-        config.food_respawn_interval = 0;
-        config.food_intake_rate = 0.0;
-        config.metabolism_drain = 0.0;
-        config.movement_drain = 0.0;
-        config.food_sharing_rate = 0.0;
-        config.food_sharing_radius = 20.0;
-        config.reproduction_energy_threshold = 10.0;
-        config.reproduction_energy_cost = 0.0;
-        config.reproduction_cooldown = 10;
-        config.reproduction_child_energy = 0.0;
-        config.reproduction_spawn_jitter = 0.0;
-        config.reproduction_color_jitter = 0.0;
-        config.reproduction_mutation_scale = 0.0;
-        config.spike_radius = 1.0;
-        config.spike_damage = 0.0;
-        config.spike_energy_cost = 0.0;
-        config.persistence_interval = 1;
-        config.history_capacity = 4;
-        config.rng_seed = Some(123);
+    fn persistence_receives_tick_batch() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            food_sharing_rate: 0.0,
+            food_sharing_radius: 20.0,
+            reproduction_energy_threshold: 10.0,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 10,
+            reproduction_child_energy: 0.0,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_mutation_scale: 0.0,
+            spike_radius: 1.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            persistence_interval: 1,
+            history_capacity: 4,
+            rng_seed: Some(123),
+            ..ScriptBotsConfig::default()
+        };
 
         let spy = SpyPersistence::default();
         let logs = spy.logs.clone();
@@ -2504,7 +2598,8 @@ mod tests {
 
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
-        let summary = &entries[0];
+        let batch = &entries[0];
+        let summary = &batch.summary;
         assert_eq!(summary.tick, Tick(1));
         assert_eq!(summary.agent_count, 1);
         assert_eq!(summary.births, 0);
@@ -2518,31 +2613,33 @@ mod tests {
 
     #[test]
     fn reproduction_spawns_child() {
-        let mut config = ScriptBotsConfig::default();
-        config.world_width = 200;
-        config.world_height = 200;
-        config.food_cell_size = 10;
-        config.initial_food = 0.0;
-        config.food_respawn_interval = 0;
-        config.food_intake_rate = 0.0;
-        config.metabolism_drain = 0.0;
-        config.movement_drain = 0.0;
-        config.food_sharing_rate = 0.0;
-        config.food_sharing_radius = 20.0;
-        config.reproduction_energy_threshold = 0.4;
-        config.reproduction_energy_cost = 0.1;
-        config.reproduction_cooldown = 1;
-        config.reproduction_child_energy = 0.6;
-        config.reproduction_spawn_jitter = 0.0;
-        config.reproduction_color_jitter = 0.0;
-        config.reproduction_mutation_scale = 0.0;
-        config.spike_radius = 1.0;
-        config.spike_damage = 0.0;
-        config.spike_energy_cost = 0.0;
-        config.persistence_interval = 0;
-        config.history_capacity = 8;
-        config.chart_flush_interval = 0;
-        config.rng_seed = Some(11);
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            food_sharing_rate: 0.0,
+            food_sharing_radius: 20.0,
+            reproduction_energy_threshold: 0.4,
+            reproduction_energy_cost: 0.1,
+            reproduction_cooldown: 1,
+            reproduction_child_energy: 0.6,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_mutation_scale: 0.0,
+            spike_radius: 1.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            persistence_interval: 0,
+            history_capacity: 8,
+            chart_flush_interval: 0,
+            rng_seed: Some(11),
+            ..ScriptBotsConfig::default()
+        };
 
         let mut world = WorldState::new(config).expect("world");
         let parent_id = world.spawn_agent(sample_agent(0));

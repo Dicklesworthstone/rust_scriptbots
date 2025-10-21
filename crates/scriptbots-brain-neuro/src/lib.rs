@@ -1,0 +1,201 @@
+//! NeuroFlow-backed brain implementation gated behind an opt-in feature.
+//!
+//! This module wraps the `neuroflow` crate’s [`FeedForward`] network so that it can participate in
+//! the ScriptBots brain registry. The integration intentionally keeps configuration minimal while
+//! remaining forward-compatible with richer training workflows. The implementation focuses on
+//! inference; mutation currently randomizes weights using the recorded architecture.
+
+use neuroflow::FeedForward;
+use neuroflow::activators::Type;
+use rand::{Rng, RngCore};
+use serde::{Deserialize, Serialize};
+
+use scriptbots_brain::{Brain, BrainKind, into_runner};
+use scriptbots_core::{BrainRunner, WorldState};
+
+/// Number of inputs inherited from the simulation sensors.
+const INPUT_SIZE: usize = scriptbots_core::INPUT_SIZE;
+/// Number of outputs consumed by the actuation stage.
+const OUTPUT_SIZE: usize = scriptbots_core::OUTPUT_SIZE;
+
+/// Activation families supported by NeuroFlow.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum NeuroflowActivation {
+    /// Hyperbolic tangent activation.
+    Tanh,
+    /// Logistic sigmoid activation.
+    Sigmoid,
+    /// Rectified linear unit (ReLU).
+    Relu,
+    /// Linear activation (identity).
+    Linear,
+}
+
+impl Default for NeuroflowActivation {
+    fn default() -> Self {
+        Self::Tanh
+    }
+}
+
+impl NeuroflowActivation {
+    fn to_type(self) -> Type {
+        match self {
+            Self::Tanh => Type::Tanh,
+            Self::Sigmoid => Type::Sigmoid,
+            Self::Relu => Type::Relu,
+            Self::Linear => Type::Linear,
+        }
+    }
+}
+
+/// Configuration options for constructing a NeuroFlow-backed brain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeuroflowBrainConfig {
+    /// Sizes of hidden layers between the fixed input/output layers.
+    pub hidden_layers: Vec<usize>,
+    /// Activation function applied to hidden/output layers.
+    pub activation: NeuroflowActivation,
+    /// Learning rate baked into the network (relevant if online learning is enabled later).
+    pub learning_rate: f64,
+    /// Momentum factor used by NeuroFlow’s trainer.
+    pub momentum: f64,
+}
+
+impl Default for NeuroflowBrainConfig {
+    fn default() -> Self {
+        Self {
+            hidden_layers: vec![48, 32, 24],
+            activation: NeuroflowActivation::Tanh,
+            learning_rate: 0.01,
+            momentum: 0.05,
+        }
+    }
+}
+
+/// Runtime brain leveraging NeuroFlow's feed-forward network.
+pub struct NeuroflowBrain {
+    network: FeedForward,
+    config: NeuroflowBrainConfig,
+    inputs: Vec<f64>,
+}
+
+impl std::fmt::Debug for NeuroflowBrain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NeuroflowBrain")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NeuroflowBrain {
+    /// Identifier for the brain registry.
+    pub const KIND: BrainKind = BrainKind::new("ml.neuroflow");
+
+    /// Construct a new brain with random weights using the supplied configuration.
+    #[must_use]
+    pub fn new(config: NeuroflowBrainConfig, rng: &mut dyn RngCore) -> Self {
+        let network = Self::build_network(&config, rng);
+        Self {
+            network,
+            config,
+            inputs: vec![0.0; INPUT_SIZE],
+        }
+    }
+
+    /// Convenience helper to box the brain into a [`BrainRunner`].
+    #[must_use]
+    pub fn runner(config: NeuroflowBrainConfig, rng: &mut dyn RngCore) -> Box<dyn BrainRunner> {
+        into_runner(Self::new(config, rng))
+    }
+
+    /// Register a NeuroFlow brain into the world registry and return its key.
+    #[must_use]
+    pub fn register(
+        world: &mut WorldState,
+        config: NeuroflowBrainConfig,
+        rng: &mut dyn RngCore,
+    ) -> u64 {
+        world
+            .brain_registry_mut()
+            .register(Self::runner(config, rng))
+    }
+
+    fn build_network(config: &NeuroflowBrainConfig, _rng: &mut dyn RngCore) -> FeedForward {
+        let mut layers = Vec::with_capacity(config.hidden_layers.len() + 2);
+        layers.push(INPUT_SIZE as i32);
+        for &size in &config.hidden_layers {
+            layers.push(size as i32);
+        }
+        layers.push(OUTPUT_SIZE as i32);
+
+        let mut network = FeedForward::new(&layers);
+        network
+            .activation(config.activation.to_type())
+            .learning_rate(config.learning_rate)
+            .momentum(config.momentum);
+        network
+    }
+}
+
+impl Brain for NeuroflowBrain {
+    fn kind(&self) -> BrainKind {
+        Self::KIND
+    }
+
+    fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        for (slot, value) in self.inputs.iter_mut().zip(inputs.iter()) {
+            *slot = (*value) as f64;
+        }
+        let outputs = self.network.calc(&self.inputs);
+        let mut result = [0.0; OUTPUT_SIZE];
+        for (dst, src) in result.iter_mut().zip(outputs.iter()) {
+            *dst = (*src) as f32;
+        }
+        result
+    }
+
+    fn mutate(&mut self, rng: &mut dyn RngCore, rate: f32, _scale: f32) {
+        if rate <= 0.0 {
+            return;
+        }
+        if rng.random::<f32>() <= rate {
+            self.network = Self::build_network(&self.config, rng);
+        }
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    #[test]
+    fn runner_executes_and_returns_outputs() {
+        let mut rng = SmallRng::seed_from_u64(0xBEEF);
+        let mut runner = NeuroflowBrain::runner(NeuroflowBrainConfig::default(), &mut rng);
+        let outputs = runner.tick(&[0.0; INPUT_SIZE]);
+        assert_eq!(outputs.len(), OUTPUT_SIZE);
+        assert!(outputs.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn mutate_regenerates_network() {
+        let mut rng = SmallRng::seed_from_u64(0xCAFE);
+        let config = NeuroflowBrainConfig::default();
+        let mut brain = NeuroflowBrain::new(config.clone(), &mut rng);
+        let baseline = brain.tick(&[0.0; INPUT_SIZE]);
+        brain.mutate(&mut rng, 1.0, 0.5);
+        let after = brain.tick(&[0.0; INPUT_SIZE]);
+        // The outputs are likely to differ after reinitialization.
+        assert_ne!(baseline, after);
+    }
+}

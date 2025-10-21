@@ -5,8 +5,20 @@ use scriptbots_core::{AgentId, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Tick};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
+#[cfg(feature = "mlp")]
 pub mod mlp;
+#[cfg(feature = "mlp")]
 pub use mlp::MlpBrain;
+
+#[cfg(feature = "dwraon")]
+pub mod dwraon;
+#[cfg(feature = "dwraon")]
+pub use dwraon::DwraonBrain;
+
+#[cfg(feature = "assembly")]
+pub mod assembly;
+#[cfg(feature = "assembly")]
+pub use assembly::AssemblyBrain;
 
 /// Small newtype wrapper identifying brain families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

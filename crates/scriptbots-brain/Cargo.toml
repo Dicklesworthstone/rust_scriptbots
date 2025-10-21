@@ -3,6 +3,13 @@ name = "scriptbots-brain"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["mlp"]
+mlp = []
+dwraon = []
+assembly = []
+experimental = ["assembly"]
+
 [dependencies]
 rand = { workspace = true }
 rayon = { workspace = true }

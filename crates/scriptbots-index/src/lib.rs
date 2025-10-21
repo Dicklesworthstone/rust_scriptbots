@@ -60,12 +60,12 @@ impl UniformGridIndex {
             0.0
         };
         let cells_x = if cell_size > 0.0 {
-            (width / cell_size).ceil().max(1.0) as i32
+            Self::cells_for_dimension(width, cell_size)
         } else {
             1
         };
         let cells_y = if cell_size > 0.0 {
-            (height / cell_size).ceil().max(1.0) as i32
+            Self::cells_for_dimension(height, cell_size)
         } else {
             1
         };
@@ -83,15 +83,44 @@ impl UniformGridIndex {
     }
 
     #[inline]
-    fn wrap(&self, value: i32, max: i32) -> i32 {
+    const fn wrap(value: i32, max: i32) -> i32 {
         ((value % max) + max) % max
     }
 
     #[inline]
     fn cell_from_point(&self, x: f32, y: f32) -> (i32, i32) {
-        let cx = self.wrap((x * self.inv_cell_size).floor() as i32, self.cells_x);
-        let cy = self.wrap((y * self.inv_cell_size).floor() as i32, self.cells_y);
+        let cx = Self::wrap(Self::discretize_cell(x * self.inv_cell_size), self.cells_x);
+        let cy = Self::wrap(Self::discretize_cell(y * self.inv_cell_size), self.cells_y);
         (cx, cy)
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn cells_for_dimension(dimension: f32, cell_size: f32) -> i32 {
+        let raw = (dimension / cell_size).ceil().max(1.0);
+        raw.min(i32::MAX as f32) as i32
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn discretize_cell(value: f32) -> i32 {
+        let floored = value.floor();
+        floored.max(i32::MIN as f32).min(i32::MAX as f32) as i32
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn discretize_positive(value: f32) -> i32 {
+        value.ceil().max(0.0).min(i32::MAX as f32) as i32
     }
 }
 
@@ -136,12 +165,12 @@ impl NeighborhoodIndex for UniformGridIndex {
         let (ax, ay) = self.positions[agent_idx];
         let (cell_x, cell_y) = self.agent_cells[agent_idx];
         let radius = radius_sq.sqrt();
-        let cell_radius = (radius * self.inv_cell_size).ceil() as i32;
+        let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
 
         for dx in -cell_radius..=cell_radius {
             for dy in -cell_radius..=cell_radius {
-                let nx = self.wrap(cell_x + dx, self.cells_x);
-                let ny = self.wrap(cell_y + dy, self.cells_y);
+                let nx = Self::wrap(cell_x + dx, self.cells_x);
+                let ny = Self::wrap(cell_y + dy, self.cells_y);
                 if let Some(indices) = self.buckets.get(&(nx, ny)) {
                     for &other_idx in indices {
                         if other_idx == agent_idx {
@@ -150,7 +179,7 @@ impl NeighborhoodIndex for UniformGridIndex {
                         let (ox, oy) = self.positions[other_idx];
                         let dx = ox - ax;
                         let dy = oy - ay;
-                        let dist_sq = dx * dx + dy * dy;
+                        let dist_sq = dx.mul_add(dx, dy * dy);
                         if dist_sq <= radius_sq {
                             visitor(other_idx, OrderedFloat(dist_sq));
                         }

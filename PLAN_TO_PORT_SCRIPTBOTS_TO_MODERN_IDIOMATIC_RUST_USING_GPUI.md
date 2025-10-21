@@ -89,7 +89,7 @@
   - Keep sensor aggregation and brain inference behind pluggable traits so alternative implementations (SIMD-optimized, GPU-backed) can be introduced without touching higher-level logic. Prototype GPU execution by batching inference into wgpu compute shaders or other accelerators once profiling justifies the investment.
 
 ## Rendering with GPUI
-- Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
+- Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Completed - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
 - State ownership:
   - `SimulationEntity`: `Entity<SimulationModel>` holds shared simulation state (agents, food grid snapshot, metrics). Updates triggered via background tasks that mutate entity and call `cx.notify()`.
   - UI-specific entity for camera (zoom, pan) mirroring original GLView controls.
@@ -181,13 +181,13 @@
    - Integrate Rayon, add spatial partition acceleration, verify determinism under multi-thread.
 5. **Brain Ports (Weeks 5-7)**
    - MLP (baseline) complete with mutate/crossover. [Completed - GPT-5 Codex 2025-10-21]
-   - DWRAON feature gate; assembly brain behind `--features experimental`.
-   - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds.citeturn2search1turn2search2
+   - DWRAON feature gate; assembly brain behind `--features experimental`. [Completed - GPT-5 Codex 2025-10-21]
+   - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds. [Currently In Progress - GPT-5 Codex 2025-10-21]citeturn2search1turn2search2
 6. **Persistence Layer (Weeks 7-8)**
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Currently In Progress - GPT-5 Codex 2025-10-21]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Currently In Progress - GPT-5 Codex 2025-10-21]
 7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
-   - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
+   - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding complete; canvas renderer + inspector pending]
    - Implement camera controls, overlays, history chart.
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.
 8. **Integration & UX Polish (Weeks 10-11)**

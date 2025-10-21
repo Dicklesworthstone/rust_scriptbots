@@ -1,0 +1,11 @@
+[package]
+name = "scriptbots-brain-neuro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+neuroflow = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+scriptbots-brain = { path = "../scriptbots-brain" }
+scriptbots-core = { path = "../scriptbots-core" }

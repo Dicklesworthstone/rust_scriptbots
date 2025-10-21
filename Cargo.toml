@@ -4,6 +4,7 @@ members = [
     "crates/scriptbots-core",
     "crates/scriptbots-brain",
     "crates/scriptbots-brain-ml",
+    "crates/scriptbots-brain-neuro",
     "crates/scriptbots-index",
     "crates/scriptbots-storage",
     "crates/scriptbots-render",
@@ -41,6 +42,7 @@ tract-onnx = "0.21.6"
 tch = "0.18.0"
 rstar = "0.12.2"
 kiddo = "4.2.0"
+neuroflow = "0.2.0"
 
 [patch.crates-io]
 num-bigint-dig = { git = "https://github.com/dignifiedquire/num-bigint", rev = "d94efb24354fe56dc799d9979c279a542d2ce195" }
