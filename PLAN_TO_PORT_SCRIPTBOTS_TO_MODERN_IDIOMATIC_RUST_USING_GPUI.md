@@ -180,7 +180,7 @@
 4. **Introduce Concurrency (Weeks 4-5)** [Completed: stage_sense/actuation/combat parallelized with Rayon]
    - Integrate Rayon, add spatial partition acceleration, verify determinism under multi-thread.
 5. **Brain Ports (Weeks 5-7)**
-   - MLP (baseline) complete with mutate/crossover. [Currently In Progress - GPT-5 Codex 2025-10-21]
+   - MLP (baseline) complete with mutate/crossover. [Completed - GPT-5 Codex 2025-10-21]
    - DWRAON feature gate; assembly brain behind `--features experimental`.
    - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds.citeturn2search1turn2search2
 6. **Persistence Layer (Weeks 7-8)**
