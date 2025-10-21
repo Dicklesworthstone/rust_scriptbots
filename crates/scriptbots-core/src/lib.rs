@@ -248,7 +248,7 @@ pub struct TickEvents {
 }
 
 /// Summary emitted to persistence hooks each tick.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TickSummary {
     pub tick: Tick,
     pub agent_count: usize,
@@ -1087,6 +1087,8 @@ pub struct ScriptBotsConfig {
     pub history_capacity: usize,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
     pub persistence_interval: u32,
+    /// Enable registration of NeuroFlow-backed brains at runtime.
+    pub enable_neuroflow_brain: bool,
 }
 
 impl Default for ScriptBotsConfig {
@@ -1120,6 +1122,7 @@ impl Default for ScriptBotsConfig {
             spike_energy_cost: 0.02,
             history_capacity: 256,
             persistence_interval: 0,
+            enable_neuroflow_brain: false,
         }
     }
 }
@@ -2469,6 +2472,48 @@ mod tests {
         let position = world.agents().columns().positions()[0];
         assert!(position.x != 0.0 || position.y != 0.0);
         assert!(runtime.energy < 1.0);
+    }
+
+    fn run_seeded_history(mut config: ScriptBotsConfig, steps: usize) -> Vec<TickSummary> {
+        config.history_capacity = steps;
+        config.persistence_interval = 1;
+        let mut world = WorldState::new(config).expect("world");
+        for seed in 0..4 {
+            world.spawn_agent(sample_agent(seed));
+        }
+        for _ in 0..steps {
+            world.step();
+        }
+        world.history().cloned().collect()
+    }
+
+    #[test]
+    fn seeded_runs_are_deterministic() {
+        const STEPS: usize = 48;
+        let base_config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            initial_food: 0.3,
+            food_respawn_interval: 2,
+            food_respawn_amount: 0.25,
+            food_max: 1.2,
+            chart_flush_interval: 12,
+            rng_seed: Some(1_234_567),
+            ..ScriptBotsConfig::default()
+        };
+
+        let history_a = run_seeded_history(base_config.clone(), STEPS);
+        let history_b = run_seeded_history(base_config.clone(), STEPS);
+        assert_eq!(history_a, history_b, "seeded runs diverged");
+
+        let mut different_seed = base_config;
+        different_seed.rng_seed = Some(987654321);
+        let history_c = run_seeded_history(different_seed, STEPS);
+        assert_ne!(
+            history_a, history_c,
+            "different seeds should produce different histories"
+        );
     }
 
     #[test]

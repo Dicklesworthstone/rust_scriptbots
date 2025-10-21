@@ -12,9 +12,9 @@ type SharedStorageArc = Arc<Mutex<Storage>>;
 
 fn main() -> Result<()> {
     init_tracing();
-    let (world, storage) = bootstrap_world()?;
+    let (world, _storage) = bootstrap_world()?;
     info!("Starting ScriptBots simulation shell");
-    run_demo(world, storage);
+    run_demo(world);
     Ok(())
 }
 
@@ -77,9 +77,12 @@ fn install_brains(world: &mut WorldState, rng: &mut SmallRng) -> Vec<u64> {
     #[cfg(feature = "neuro")]
     {
         use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig};
-        let config = NeuroflowBrainConfig::default();
-        let key = NeuroflowBrain::register(world, config, rng);
-        keys.push(key);
+        let enable_neuro = world.config().enable_neuroflow_brain;
+        if enable_neuro {
+            let config = NeuroflowBrainConfig::default();
+            let key = NeuroflowBrain::register(world, config, rng);
+            keys.push(key);
+        }
     }
 
     keys
