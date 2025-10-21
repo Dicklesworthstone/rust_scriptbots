@@ -9,8 +9,6 @@ description.workspace = true
 
 [dependencies]
 ordered-float = { workspace = true }
-rayon = { workspace = true }
-scriptbots-core = { path = "../scriptbots-core" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 

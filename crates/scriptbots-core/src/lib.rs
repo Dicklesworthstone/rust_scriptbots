@@ -1,6 +1,8 @@
 //! Core types shared across the ScriptBots workspace.
 
+use ordered_float::OrderedFloat;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
+use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
 use thiserror::Error;
@@ -894,6 +896,10 @@ pub struct ScriptBotsConfig {
     pub food_respawn_amount: f32,
     /// Maximum food allowed per cell.
     pub food_max: f32,
+    /// Radius used for neighborhood sensing.
+    pub sense_radius: f32,
+    /// Normalization factor for counting neighbors.
+    pub sense_max_neighbors: f32,
 }
 
 impl Default for ScriptBotsConfig {
@@ -908,6 +914,8 @@ impl Default for ScriptBotsConfig {
             food_respawn_interval: 15,
             food_respawn_amount: 0.5,
             food_max: 0.5,
+            sense_radius: 120.0,
+            sense_max_neighbors: 12.0,
         }
     }
 }
@@ -957,6 +965,16 @@ impl ScriptBotsConfig {
         if self.food_respawn_amount > self.food_max {
             return Err(WorldStateError::InvalidConfig(
                 "food_respawn_amount cannot exceed food_max",
+            ));
+        }
+        if self.sense_radius <= 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "sense_radius must be positive",
+            ));
+        }
+        if self.sense_max_neighbors <= 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "sense_max_neighbors must be positive",
             ));
         }
         Ok(dims)
@@ -1059,6 +1077,7 @@ pub struct WorldState {
     agents: AgentArena,
     food: FoodGrid,
     runtime: AgentMap<AgentRuntime>,
+    index: UniformGridIndex,
 }
 
 impl WorldState {
@@ -1066,6 +1085,11 @@ impl WorldState {
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
         let (food_w, food_h) = config.food_dimensions()?;
         let rng = config.seeded_rng();
+        let index = UniformGridIndex::new(
+            config.food_cell_size as f32,
+            config.world_width as f32,
+            config.world_height as f32,
+        );
         Ok(Self {
             food: FoodGrid::new(food_w, food_h, config.initial_food)?,
             config,
@@ -1075,6 +1099,7 @@ impl WorldState {
             rng,
             agents: AgentArena::new(),
             runtime: AgentMap::new(),
+            index,
         })
     }
 
@@ -1107,6 +1132,76 @@ impl WorldState {
         }
     }
 
+    fn stage_sense(&mut self) {
+        let agent_count = self.agents.len();
+        if agent_count == 0 {
+            return;
+        }
+
+        let columns = self.agents.columns();
+        let positions_slice = columns.positions();
+        let health_slice = columns.health();
+        let ages_slice = columns.ages();
+        let position_pairs: Vec<(f32, f32)> = positions_slice.iter().map(|p| (p.x, p.y)).collect();
+
+        if self.index.rebuild(&position_pairs).is_err() {
+            return;
+        }
+
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        let energies: Vec<f32> = handles
+            .iter()
+            .map(|id| self.runtime.get(*id).map_or(0.0, |rt| rt.energy))
+            .collect();
+
+        let radius = self.config.sense_radius;
+        let radius_sq = radius * radius;
+        let neighbor_normalizer = self.config.sense_max_neighbors;
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            let mut nearest_sq = f32::INFINITY;
+            let mut neighbor_count = 0usize;
+            let mut neighbor_energy_sum = 0.0_f32;
+            let mut neighbor_health_sum = 0.0_f32;
+
+            self.index.neighbors_within(
+                idx,
+                radius_sq,
+                &mut |other_idx, dist_sq: OrderedFloat<f32>| {
+                    neighbor_count += 1;
+                    let dist_sq_val = dist_sq.into_inner();
+                    if dist_sq_val < nearest_sq {
+                        nearest_sq = dist_sq_val;
+                    }
+                    neighbor_energy_sum += energies[other_idx];
+                    neighbor_health_sum += health_slice[other_idx];
+                },
+            );
+
+            let nearest_dist = if neighbor_count > 0 {
+                nearest_sq.sqrt()
+            } else {
+                radius
+            };
+
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                runtime.sensors.fill(0.0);
+                runtime.sensors[0] = (1.0 / (1.0 + nearest_dist)).clamp(0.0, 1.0);
+                runtime.sensors[1] = (neighbor_count as f32 / neighbor_normalizer).clamp(0.0, 1.0);
+                runtime.sensors[2] = (health_slice[idx] / 2.0).clamp(0.0, 1.0);
+                let self_energy = energies[idx];
+                runtime.sensors[3] = (self_energy / 2.0).clamp(0.0, 1.0);
+                runtime.sensors[4] = (ages_slice[idx] as f32 / 1_000.0).clamp(0.0, 1.0);
+                if neighbor_count > 0 {
+                    runtime.sensors[5] =
+                        (neighbor_energy_sum / neighbor_count as f32 / 2.0).clamp(0.0, 1.0);
+                    runtime.sensors[6] =
+                        (neighbor_health_sum / neighbor_count as f32 / 2.0).clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
+
     fn stage_reset_events(&mut self) {
         for runtime in self.runtime.values_mut() {
             runtime.spiked = false;
@@ -1122,6 +1217,7 @@ impl WorldState {
         let previous_epoch = self.epoch;
 
         self.stage_aging();
+        self.stage_sense();
 
         let mut events = TickEvents {
             tick: next_tick,
@@ -1407,6 +1503,7 @@ mod tests {
         assert_eq!(runtime.food_delta, 0.0);
         assert_eq!(runtime.sound_output, 0.0);
         assert_eq!(runtime.give_intent, 0.0);
+        assert!(runtime.sensors[0] > 0.0);
 
         let events_second = world.step();
         assert_eq!(world.tick(), Tick(2));

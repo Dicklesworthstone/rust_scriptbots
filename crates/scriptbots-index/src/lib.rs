@@ -2,6 +2,7 @@
 
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use thiserror::Error;
 
 /// Errors emitted by spatial index implementations.
@@ -26,29 +27,77 @@ pub trait NeighborhoodIndex {
     );
 }
 
-/// Baseline uniform grid index; currently a placeholder until full implementation lands.
+/// Baseline uniform grid index backing neighbor queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniformGridIndex {
     /// Edge length of each grid cell used for bucketing agents.
     pub cell_size: f32,
     #[serde(skip)]
-    agent_order: Vec<usize>,
+    width: f32,
+    #[serde(skip)]
+    height: f32,
+    #[serde(skip)]
+    inv_cell_size: f32,
+    #[serde(skip)]
+    cells_x: i32,
+    #[serde(skip)]
+    cells_y: i32,
+    #[serde(skip)]
+    buckets: HashMap<(i32, i32), Vec<usize>>,
+    #[serde(skip)]
+    agent_cells: Vec<(i32, i32)>,
+    #[serde(skip)]
+    positions: Vec<(f32, f32)>,
 }
 
 impl UniformGridIndex {
-    /// Create a new uniform grid with the provided cell size.
+    /// Create a new uniform grid with the provided cell size and world dimensions.
     #[must_use]
-    pub fn new(cell_size: f32) -> Self {
+    pub fn new(cell_size: f32, width: f32, height: f32) -> Self {
+        let inv_cell_size = if cell_size > 0.0 {
+            1.0 / cell_size
+        } else {
+            0.0
+        };
+        let cells_x = if cell_size > 0.0 {
+            (width / cell_size).ceil().max(1.0) as i32
+        } else {
+            1
+        };
+        let cells_y = if cell_size > 0.0 {
+            (height / cell_size).ceil().max(1.0) as i32
+        } else {
+            1
+        };
         Self {
             cell_size,
-            agent_order: Vec::new(),
+            width,
+            height,
+            inv_cell_size,
+            cells_x,
+            cells_y,
+            buckets: HashMap::new(),
+            agent_cells: Vec::new(),
+            positions: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn wrap(&self, value: i32, max: i32) -> i32 {
+        ((value % max) + max) % max
+    }
+
+    #[inline]
+    fn cell_from_point(&self, x: f32, y: f32) -> (i32, i32) {
+        let cx = self.wrap((x * self.inv_cell_size).floor() as i32, self.cells_x);
+        let cy = self.wrap((y * self.inv_cell_size).floor() as i32, self.cells_y);
+        (cx, cy)
     }
 }
 
 impl Default for UniformGridIndex {
     fn default() -> Self {
-        Self::new(50.0)
+        Self::new(50.0, 1_000.0, 1_000.0)
     }
 }
 
@@ -57,19 +106,57 @@ impl NeighborhoodIndex for UniformGridIndex {
         if self.cell_size <= 0.0 {
             return Err(IndexError::InvalidConfig("cell_size must be positive"));
         }
-        self.agent_order.clear();
-        self.agent_order
-            .extend(positions.iter().enumerate().map(|(idx, _)| idx));
+        if self.width <= 0.0 || self.height <= 0.0 {
+            return Err(IndexError::InvalidConfig(
+                "world dimensions must be positive",
+            ));
+        }
+        self.positions.clear();
+        self.positions.extend_from_slice(positions);
+        self.agent_cells.resize(positions.len(), (0, 0));
+        self.buckets.clear();
+
+        for (idx, &(x, y)) in positions.iter().enumerate() {
+            let key = self.cell_from_point(x, y);
+            self.agent_cells[idx] = key;
+            self.buckets.entry(key).or_default().push(idx);
+        }
         Ok(())
     }
 
     fn neighbors_within(
         &self,
         agent_idx: usize,
-        _radius_sq: f32,
-        _visitor: &mut dyn FnMut(usize, OrderedFloat<f32>),
+        radius_sq: f32,
+        visitor: &mut dyn FnMut(usize, OrderedFloat<f32>),
     ) {
-        // Placeholder: full neighborhood traversal will be implemented with real grid buckets.
-        let _ = agent_idx;
+        if agent_idx >= self.positions.len() || radius_sq < 0.0 {
+            return;
+        }
+        let (ax, ay) = self.positions[agent_idx];
+        let (cell_x, cell_y) = self.agent_cells[agent_idx];
+        let radius = radius_sq.sqrt();
+        let cell_radius = (radius * self.inv_cell_size).ceil() as i32;
+
+        for dx in -cell_radius..=cell_radius {
+            for dy in -cell_radius..=cell_radius {
+                let nx = self.wrap(cell_x + dx, self.cells_x);
+                let ny = self.wrap(cell_y + dy, self.cells_y);
+                if let Some(indices) = self.buckets.get(&(nx, ny)) {
+                    for &other_idx in indices {
+                        if other_idx == agent_idx {
+                            continue;
+                        }
+                        let (ox, oy) = self.positions[other_idx];
+                        let dx = ox - ax;
+                        let dy = oy - ay;
+                        let dist_sq = dx * dx + dy * dy;
+                        if dist_sq <= radius_sq {
+                            visitor(other_idx, OrderedFloat(dist_sq));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
