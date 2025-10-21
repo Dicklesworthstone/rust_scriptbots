@@ -4,15 +4,12 @@ use rand::Rng;
 use scriptbots_brain::Brain;
 
 /// Supported ML backends selected at build time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum MlBackendKind {
-    #[cfg(feature = "candle")]
     Candle,
-    #[cfg(feature = "tract")]
     Tract,
-    #[cfg(feature = "tch")]
     Tch,
-    #[cfg(not(any(feature = "candle", feature = "tract", feature = "tch")))]
+    #[default]
     None,
 }
 
@@ -49,13 +46,9 @@ impl MlBrain {
 impl Brain for MlBrain {
     fn kind(&self) -> &'static str {
         match self.kind {
-            #[cfg(feature = "candle")]
             MlBackendKind::Candle => "candle",
-            #[cfg(feature = "tract")]
             MlBackendKind::Tract => "tract-onnx",
-            #[cfg(feature = "tch")]
             MlBackendKind::Tch => "tch",
-            #[cfg(not(any(feature = "candle", feature = "tract", feature = "tch")))]
             MlBackendKind::None => "ml-placeholder",
         }
     }

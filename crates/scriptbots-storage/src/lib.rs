@@ -1,6 +1,6 @@
 //! DuckDB-backed persistence layer for ScriptBots.
 
-use duckdb::{params, Connection};
+use duckdb::{Connection, params};
 use scriptbots_core::Tick;
 use thiserror::Error;
 
@@ -29,8 +29,10 @@ impl Storage {
 
     /// Persist aggregated metrics for a tick.
     pub fn record_tick(&self, tick: Tick, agent_count: usize) -> Result<(), StorageError> {
-        self.conn
-            .execute("insert or replace into tick_metrics values (?, ?)", params![tick.0, agent_count as i64])?;
+        self.conn.execute(
+            "insert or replace into tick_metrics values (?, ?)",
+            params![tick.0, agent_count as i64],
+        )?;
         Ok(())
     }
 }

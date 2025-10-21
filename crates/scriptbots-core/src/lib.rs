@@ -1,9 +1,161 @@
-//! Core data structures and traits shared across the ScriptBots workspace.
+//! Core types shared across the ScriptBots workspace.
 
+use rand::{RngCore, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
+use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use thiserror::Error;
 
-/// Unique identifier assigned to each agent at creation time.
-pub type AgentId = u64;
+new_key_type! {
+    /// Stable handle for agents backed by a generational slot map.
+    pub struct AgentId;
+}
+
+/// Convenience alias for associating side data with agents.
+pub type AgentMap<T> = SecondaryMap<AgentId, T>;
+
+/// Number of sensor inputs wired into each agent brain.
+pub const INPUT_SIZE: usize = 25;
+/// Number of control outputs produced by each agent brain.
+pub const OUTPUT_SIZE: usize = 9;
+
+/// Per-agent mutation rate configuration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MutationRates {
+    pub primary: f32,
+    pub secondary: f32,
+}
+
+impl Default for MutationRates {
+    fn default() -> Self {
+        Self {
+            primary: 0.003,
+            secondary: 0.05,
+        }
+    }
+}
+
+/// Trait modifiers affecting sense organs and physiology.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TraitModifiers {
+    pub smell: f32,
+    pub sound: f32,
+    pub hearing: f32,
+    pub eye: f32,
+    pub blood: f32,
+}
+
+impl Default for TraitModifiers {
+    fn default() -> Self {
+        Self {
+            smell: 0.3,
+            sound: 0.4,
+            hearing: 1.0,
+            eye: 1.5,
+            blood: 1.5,
+        }
+    }
+}
+
+/// Highlight shown around an agent in the UI.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct IndicatorState {
+    pub intensity: f32,
+    pub color: [f32; 3],
+}
+
+impl Default for IndicatorState {
+    fn default() -> Self {
+        Self {
+            intensity: 0.0,
+            color: [0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Selection state applied by user interaction.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SelectionState {
+    None,
+    Hovered,
+    Selected,
+}
+
+impl Default for SelectionState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Handle referencing an externally stored brain instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum BrainBinding {
+    /// Brain not yet attached.
+    Unbound,
+    /// Brain managed by an external registry (identified via opaque key).
+    External { registry_key: u64, kind: String },
+}
+
+impl Default for BrainBinding {
+    fn default() -> Self {
+        Self::Unbound
+    }
+}
+
+/// Runtime data associated with an agent beyond the dense SoA columns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRuntime {
+    pub energy: f32,
+    pub reproduction_counter: f32,
+    pub herbivore_tendency: f32,
+    pub mutation_rates: MutationRates,
+    pub trait_modifiers: TraitModifiers,
+    pub clocks: [f32; 2],
+    pub sound_multiplier: f32,
+    pub give_intent: f32,
+    pub sensors: [f32; INPUT_SIZE],
+    pub outputs: [f32; OUTPUT_SIZE],
+    pub indicator: IndicatorState,
+    pub selection: SelectionState,
+    pub food_delta: f32,
+    pub spiked: bool,
+    pub hybrid: bool,
+    pub sound_output: f32,
+    pub brain: BrainBinding,
+    pub mutation_log: Vec<String>,
+}
+
+impl Default for AgentRuntime {
+    fn default() -> Self {
+        Self {
+            energy: 1.0,
+            reproduction_counter: 0.0,
+            herbivore_tendency: 0.5,
+            mutation_rates: MutationRates::default(),
+            trait_modifiers: TraitModifiers::default(),
+            clocks: [50.0, 50.0],
+            sound_multiplier: 1.0,
+            give_intent: 0.0,
+            sensors: [0.0; INPUT_SIZE],
+            outputs: [0.0; OUTPUT_SIZE],
+            indicator: IndicatorState::default(),
+            selection: SelectionState::None,
+            food_delta: 0.0,
+            spiked: false,
+            hybrid: false,
+            sound_output: 0.0,
+            brain: BrainBinding::default(),
+            mutation_log: Vec::new(),
+        }
+    }
+}
+
+/// Combined snapshot of dense columns and runtime metadata for a single agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentState {
+    pub id: AgentId,
+    pub data: AgentData,
+    pub runtime: AgentRuntime,
+}
 
 /// High level simulation clock (ticks processed since boot).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -14,5 +166,896 @@ impl Tick {
     #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
+    }
+
+    /// Resets the tick counter back to zero.
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self(0)
+    }
+}
+
+/// Axis-aligned 2D position (SoA column representation).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Position {
+    /// Construct a new position.
+    #[must_use]
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+/// Velocity (wheel outputs translated to world-space delta).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct Velocity {
+    pub vx: f32,
+    pub vy: f32,
+}
+
+impl Velocity {
+    /// Construct a new velocity vector.
+    #[must_use]
+    pub const fn new(vx: f32, vy: f32) -> Self {
+        Self { vx, vy }
+    }
+}
+
+/// Lineage counter (agents produced by reproduction increment this).
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+pub struct Generation(pub u32);
+
+impl Generation {
+    /// Advances to the next lineage generation.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// Scalar fields for a single agent used when inserting or snapshotting from the SoA store.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct AgentData {
+    pub position: Position,
+    pub velocity: Velocity,
+    pub heading: f32,
+    pub health: f32,
+    pub color: [f32; 3],
+    pub spike_length: f32,
+    pub boost: bool,
+    pub age: u32,
+    pub generation: Generation,
+}
+
+impl AgentData {
+    /// Creates a new agent payload with the provided scalar fields.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        position: Position,
+        velocity: Velocity,
+        heading: f32,
+        health: f32,
+        color: [f32; 3],
+        spike_length: f32,
+        boost: bool,
+        age: u32,
+        generation: Generation,
+    ) -> Self {
+        Self {
+            position,
+            velocity,
+            heading,
+            health,
+            color,
+            spike_length,
+            boost,
+            age,
+            generation,
+        }
+    }
+}
+
+impl Default for AgentData {
+    fn default() -> Self {
+        Self {
+            position: Position::default(),
+            velocity: Velocity::default(),
+            heading: 0.0,
+            health: 1.0,
+            color: [0.0; 3],
+            spike_length: 0.0,
+            boost: false,
+            age: 0,
+            generation: Generation::default(),
+        }
+    }
+}
+
+/// Collection of per-agent columns for hot-path iteration.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct AgentColumns {
+    positions: Vec<Position>,
+    velocities: Vec<Velocity>,
+    headings: Vec<f32>,
+    health: Vec<f32>,
+    colors: Vec<[f32; 3]>,
+    spike_lengths: Vec<f32>,
+    boosts: Vec<bool>,
+    ages: Vec<u32>,
+    generations: Vec<Generation>,
+}
+
+impl AgentColumns {
+    /// Create an empty collection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a collection with reserved capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            positions: Vec::with_capacity(capacity),
+            velocities: Vec::with_capacity(capacity),
+            headings: Vec::with_capacity(capacity),
+            health: Vec::with_capacity(capacity),
+            colors: Vec::with_capacity(capacity),
+            spike_lengths: Vec::with_capacity(capacity),
+            boosts: Vec::with_capacity(capacity),
+            ages: Vec::with_capacity(capacity),
+            generations: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Number of active rows in the columns.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// Returns true if there are no active rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reserve additional capacity in each backing vector.
+    pub fn reserve(&mut self, additional: usize) {
+        self.positions.reserve(additional);
+        self.velocities.reserve(additional);
+        self.headings.reserve(additional);
+        self.health.reserve(additional);
+        self.colors.reserve(additional);
+        self.spike_lengths.reserve(additional);
+        self.boosts.reserve(additional);
+        self.ages.reserve(additional);
+        self.generations.reserve(additional);
+    }
+
+    /// Remove all rows while retaining capacity.
+    pub fn clear(&mut self) {
+        self.positions.clear();
+        self.velocities.clear();
+        self.headings.clear();
+        self.health.clear();
+        self.colors.clear();
+        self.spike_lengths.clear();
+        self.boosts.clear();
+        self.ages.clear();
+        self.generations.clear();
+    }
+
+    /// Push a new row onto each column.
+    pub fn push(&mut self, agent: AgentData) {
+        self.positions.push(agent.position);
+        self.velocities.push(agent.velocity);
+        self.headings.push(agent.heading);
+        self.health.push(agent.health);
+        self.colors.push(agent.color);
+        self.spike_lengths.push(agent.spike_length);
+        self.boosts.push(agent.boost);
+        self.ages.push(agent.age);
+        self.generations.push(agent.generation);
+        self.debug_assert_coherent();
+    }
+
+    /// Swap-remove the row at `index` and return its scalar fields.
+    pub fn swap_remove(&mut self, index: usize) -> AgentData {
+        let removed = AgentData {
+            position: self.positions.swap_remove(index),
+            velocity: self.velocities.swap_remove(index),
+            heading: self.headings.swap_remove(index),
+            health: self.health.swap_remove(index),
+            color: self.colors.swap_remove(index),
+            spike_length: self.spike_lengths.swap_remove(index),
+            boost: self.boosts.swap_remove(index),
+            age: self.ages.swap_remove(index),
+            generation: self.generations.swap_remove(index),
+        };
+        self.debug_assert_coherent();
+        removed
+    }
+
+    /// Return a copy of the scalar fields at `index`.
+    #[must_use]
+    pub fn snapshot(&self, index: usize) -> AgentData {
+        AgentData {
+            position: self.positions[index],
+            velocity: self.velocities[index],
+            heading: self.headings[index],
+            health: self.health[index],
+            color: self.colors[index],
+            spike_length: self.spike_lengths[index],
+            boost: self.boosts[index],
+            age: self.ages[index],
+            generation: self.generations[index],
+        }
+    }
+
+    /// Immutable access to the positions slice.
+    #[must_use]
+    pub fn positions(&self) -> &[Position] {
+        &self.positions
+    }
+
+    /// Mutable access to the positions slice.
+    #[must_use]
+    pub fn positions_mut(&mut self) -> &mut [Position] {
+        &mut self.positions
+    }
+
+    /// Immutable access to the velocities slice.
+    #[must_use]
+    pub fn velocities(&self) -> &[Velocity] {
+        &self.velocities
+    }
+
+    /// Mutable access to the velocities slice.
+    #[must_use]
+    pub fn velocities_mut(&mut self) -> &mut [Velocity] {
+        &mut self.velocities
+    }
+
+    /// Immutable access to headings.
+    #[must_use]
+    pub fn headings(&self) -> &[f32] {
+        &self.headings
+    }
+
+    /// Mutable access to headings.
+    #[must_use]
+    pub fn headings_mut(&mut self) -> &mut [f32] {
+        &mut self.headings
+    }
+
+    /// Immutable access to health values.
+    #[must_use]
+    pub fn health(&self) -> &[f32] {
+        &self.health
+    }
+
+    /// Mutable access to health values.
+    #[must_use]
+    pub fn health_mut(&mut self) -> &mut [f32] {
+        &mut self.health
+    }
+
+    /// Immutable access to color triples.
+    #[must_use]
+    pub fn colors(&self) -> &[[f32; 3]] {
+        &self.colors
+    }
+
+    /// Mutable access to color triples.
+    #[must_use]
+    pub fn colors_mut(&mut self) -> &mut [[f32; 3]] {
+        &mut self.colors
+    }
+
+    /// Immutable access to spike lengths.
+    #[must_use]
+    pub fn spike_lengths(&self) -> &[f32] {
+        &self.spike_lengths
+    }
+
+    /// Mutable access to spike lengths.
+    #[must_use]
+    pub fn spike_lengths_mut(&mut self) -> &mut [f32] {
+        &mut self.spike_lengths
+    }
+
+    /// Immutable access to boost flags.
+    #[must_use]
+    pub fn boosts(&self) -> &[bool] {
+        &self.boosts
+    }
+
+    /// Mutable access to boost flags.
+    #[must_use]
+    pub fn boosts_mut(&mut self) -> &mut [bool] {
+        &mut self.boosts
+    }
+
+    /// Immutable access to age counters.
+    #[must_use]
+    pub fn ages(&self) -> &[u32] {
+        &self.ages
+    }
+
+    /// Mutable access to age counters.
+    #[must_use]
+    pub fn ages_mut(&mut self) -> &mut [u32] {
+        &mut self.ages
+    }
+
+    /// Immutable access to agent generations.
+    #[must_use]
+    pub fn generations(&self) -> &[Generation] {
+        &self.generations
+    }
+
+    /// Mutable access to agent generations.
+    #[must_use]
+    pub fn generations_mut(&mut self) -> &mut [Generation] {
+        &mut self.generations
+    }
+
+    #[inline]
+    fn debug_assert_coherent(&self) {
+        debug_assert_eq!(self.positions.len(), self.velocities.len());
+        debug_assert_eq!(self.positions.len(), self.headings.len());
+        debug_assert_eq!(self.positions.len(), self.health.len());
+        debug_assert_eq!(self.positions.len(), self.colors.len());
+        debug_assert_eq!(self.positions.len(), self.spike_lengths.len());
+        debug_assert_eq!(self.positions.len(), self.boosts.len());
+        debug_assert_eq!(self.positions.len(), self.ages.len());
+        debug_assert_eq!(self.positions.len(), self.generations.len());
+    }
+}
+
+/// Dense SoA storage with generational handles for agent access.
+#[derive(Debug)]
+pub struct AgentArena {
+    slots: SlotMap<AgentId, usize>,
+    handles: Vec<AgentId>,
+    columns: AgentColumns,
+}
+
+impl Default for AgentArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentArena {
+    /// Create an empty arena.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            slots: SlotMap::with_key(),
+            handles: Vec::new(),
+            columns: AgentColumns::new(),
+        }
+    }
+
+    /// Create an arena with reserved capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            slots: SlotMap::with_capacity_and_key(capacity),
+            handles: Vec::with_capacity(capacity),
+            columns: AgentColumns::with_capacity(capacity),
+        }
+    }
+
+    /// Number of active agents.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Returns true when no agents are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Reserve space for additional agents.
+    pub fn reserve(&mut self, additional: usize) {
+        self.slots.reserve(additional);
+        self.handles.reserve(additional);
+        self.columns.reserve(additional);
+    }
+
+    /// Iterate over active agent handles in dense iteration order.
+    #[must_use]
+    pub fn iter_handles(&self) -> impl Iterator<Item = AgentId> + '_ {
+        self.handles.iter().copied()
+    }
+
+    /// Borrow the underlying column storage.
+    #[must_use]
+    pub fn columns(&self) -> &AgentColumns {
+        &self.columns
+    }
+
+    /// Mutably borrow the underlying column storage.
+    #[must_use]
+    pub fn columns_mut(&mut self) -> &mut AgentColumns {
+        &mut self.columns
+    }
+
+    /// Returns the dense index for `id`, if present.
+    #[must_use]
+    pub fn index_of(&self, id: AgentId) -> Option<usize> {
+        self.slots.get(id).copied()
+    }
+
+    /// Returns true if `id` refers to a live agent.
+    #[must_use]
+    pub fn contains(&self, id: AgentId) -> bool {
+        self.slots.contains_key(id)
+    }
+
+    /// Insert a new agent and return its handle.
+    pub fn insert(&mut self, agent: AgentData) -> AgentId {
+        let index = self.columns.len();
+        self.columns.push(agent);
+        let id = self.slots.insert(index);
+        self.handles.push(id);
+        id
+    }
+
+    /// Remove `id` returning its scalar data if it was present.
+    pub fn remove(&mut self, id: AgentId) -> Option<AgentData> {
+        let index = self.slots.remove(id)?;
+        let removed = self.columns.swap_remove(index);
+        let removed_handle = self.handles.swap_remove(index);
+        debug_assert_eq!(removed_handle, id);
+        if index < self.handles.len() {
+            let moved = self.handles[index];
+            if let Some(slot) = self.slots.get_mut(moved) {
+                *slot = index;
+            }
+        }
+        Some(removed)
+    }
+
+    /// Produce a copy of the scalar data for `id`.
+    #[must_use]
+    pub fn snapshot(&self, id: AgentId) -> Option<AgentData> {
+        let index = self.index_of(id)?;
+        Some(self.columns.snapshot(index))
+    }
+
+    /// Clear all stored agents.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.handles.clear();
+        self.columns.clear();
+    }
+}
+
+/// Errors that can occur when constructing world state.
+#[derive(Debug, Error)]
+pub enum WorldStateError {
+    /// Indicates an invalid configuration value.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(&'static str),
+}
+
+/// Static configuration for a ScriptBots world.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptBotsConfig {
+    /// Width of the world in world units.
+    pub world_width: u32,
+    /// Height of the world in world units.
+    pub world_height: u32,
+    /// Size of one food cell in world units (must evenly divide width/height).
+    pub food_cell_size: u32,
+    /// Initial food value seeded into each grid cell.
+    pub initial_food: f32,
+    /// Optional RNG seed for reproducible worlds.
+    pub rng_seed: Option<u64>,
+}
+
+impl Default for ScriptBotsConfig {
+    fn default() -> Self {
+        Self {
+            world_width: 6_000,
+            world_height: 6_000,
+            food_cell_size: 60,
+            initial_food: 1.0,
+            rng_seed: None,
+        }
+    }
+}
+
+impl ScriptBotsConfig {
+    /// Validates the configuration, returning derived grid dimensions.
+    fn food_dimensions(&self) -> Result<(u32, u32), WorldStateError> {
+        if self.world_width == 0 || self.world_height == 0 {
+            return Err(WorldStateError::InvalidConfig(
+                "world dimensions must be non-zero",
+            ));
+        }
+        if self.food_cell_size == 0 {
+            return Err(WorldStateError::InvalidConfig(
+                "food_cell_size must be non-zero",
+            ));
+        }
+        if self.world_width % self.food_cell_size != 0
+            || self.world_height % self.food_cell_size != 0
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "world dimensions must be divisible by food_cell_size",
+            ));
+        }
+        Ok((
+            self.world_width / self.food_cell_size,
+            self.world_height / self.food_cell_size,
+        ))
+    }
+
+    /// Returns the configured RNG seed, generating one from entropy if absent.
+    fn seeded_rng(&self) -> SmallRng {
+        match self.rng_seed {
+            Some(seed) => SmallRng::seed_from_u64(seed),
+            None => {
+                let seed = rand::rng().next_u64();
+                SmallRng::seed_from_u64(seed)
+            }
+        }
+    }
+}
+
+/// 2D food grid storing scalar energy values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoodGrid {
+    width: u32,
+    height: u32,
+    cells: Vec<f32>,
+}
+
+impl FoodGrid {
+    /// Construct a grid with `width * height` cells initialised to `initial`.
+    pub fn new(width: u32, height: u32, initial: f32) -> Result<Self, WorldStateError> {
+        if width == 0 || height == 0 {
+            return Err(WorldStateError::InvalidConfig(
+                "food grid dimensions must be non-zero",
+            ));
+        }
+        Ok(Self {
+            width,
+            height,
+            cells: vec![initial; (width as usize) * (height as usize)],
+        })
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[must_use]
+    pub fn cells(&self) -> &[f32] {
+        &self.cells
+    }
+
+    #[must_use]
+    pub fn cells_mut(&mut self) -> &mut [f32] {
+        &mut self.cells
+    }
+
+    /// Returns the flat index for `(x, y)` without bounds checks.
+    #[inline]
+    fn offset(&self, x: u32, y: u32) -> usize {
+        (y as usize) * (self.width as usize) + (x as usize)
+    }
+
+    /// Immutable access to a specific cell.
+    pub fn get(&self, x: u32, y: u32) -> Option<f32> {
+        if x < self.width && y < self.height {
+            Some(self.cells[self.offset(x, y)])
+        } else {
+            None
+        }
+    }
+
+    /// Mutable access to a specific cell.
+    pub fn get_mut(&mut self, x: u32, y: u32) -> Option<&mut f32> {
+        if x < self.width && y < self.height {
+            let idx = self.offset(x, y);
+            Some(&mut self.cells[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Fills the grid with the provided scalar value.
+    pub fn fill(&mut self, value: f32) {
+        self.cells.fill(value);
+    }
+}
+
+/// Aggregate world state shared by the simulation and rendering layers.
+#[derive(Debug)]
+pub struct WorldState {
+    config: ScriptBotsConfig,
+    tick: Tick,
+    epoch: u64,
+    closed: bool,
+    rng: SmallRng,
+    agents: AgentArena,
+    food: FoodGrid,
+    runtime: AgentMap<AgentRuntime>,
+}
+
+impl WorldState {
+    /// Instantiate a new world using the supplied configuration.
+    pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
+        let (food_w, food_h) = config.food_dimensions()?;
+        let rng = config.seeded_rng();
+        Ok(Self {
+            food: FoodGrid::new(food_w, food_h, config.initial_food)?,
+            config,
+            tick: Tick::zero(),
+            epoch: 0,
+            closed: false,
+            rng,
+            agents: AgentArena::new(),
+            runtime: AgentMap::new(),
+        })
+    }
+
+    /// Returns an immutable reference to configuration.
+    #[must_use]
+    pub fn config(&self) -> &ScriptBotsConfig {
+        &self.config
+    }
+
+    /// Mutable access to the configuration (for hot edits).
+    #[must_use]
+    pub fn config_mut(&mut self) -> &mut ScriptBotsConfig {
+        &mut self.config
+    }
+
+    /// Current simulation tick.
+    #[must_use]
+    pub const fn tick(&self) -> Tick {
+        self.tick
+    }
+
+    /// Current epoch counter.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns whether the environment is closed to random spawning.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Toggle the closed-environment flag.
+    pub fn set_closed(&mut self, closed: bool) {
+        self.closed = closed;
+    }
+
+    /// Advances the world tick counter, rolling epochs when needed.
+    pub fn advance_tick(&mut self) {
+        self.tick = self.tick.next();
+        if self.tick.0 % 10_000 == 0 {
+            self.epoch += 1;
+        }
+    }
+
+    /// Resets ticks and epochs (useful for restarts).
+    pub fn reset_time(&mut self) {
+        self.tick = Tick::zero();
+        self.epoch = 0;
+    }
+
+    /// Borrow the world RNG mutably for deterministic sampling.
+    #[must_use]
+    pub fn rng(&mut self) -> &mut SmallRng {
+        &mut self.rng
+    }
+
+    /// Read-only access to the agent arena.
+    #[must_use]
+    pub fn agents(&self) -> &AgentArena {
+        &self.agents
+    }
+
+    /// Mutable access to the agent arena.
+    #[must_use]
+    pub fn agents_mut(&mut self) -> &mut AgentArena {
+        &mut self.agents
+    }
+
+    /// Number of live agents.
+    #[must_use]
+    pub fn agent_count(&self) -> usize {
+        self.agents.len()
+    }
+
+    /// Spawn a new agent, returning its handle.
+    pub fn spawn_agent(&mut self, agent: AgentData) -> AgentId {
+        let id = self.agents.insert(agent);
+        self.runtime.insert(id, AgentRuntime::default());
+        id
+    }
+
+    /// Remove an agent by handle, returning its last known data.
+    pub fn remove_agent(&mut self, id: AgentId) -> Option<AgentData> {
+        self.runtime.remove(id);
+        self.agents.remove(id)
+    }
+
+    /// Immutable access to the food grid.
+    #[must_use]
+    pub fn food(&self) -> &FoodGrid {
+        &self.food
+    }
+
+    /// Mutable access to the food grid.
+    #[must_use]
+    pub fn food_mut(&mut self) -> &mut FoodGrid {
+        &mut self.food
+    }
+
+    /// Immutable access to per-agent runtime metadata.
+    #[must_use]
+    pub fn runtime(&self) -> &AgentMap<AgentRuntime> {
+        &self.runtime
+    }
+
+    /// Mutable access to per-agent runtime metadata.
+    #[must_use]
+    pub fn runtime_mut(&mut self) -> &mut AgentMap<AgentRuntime> {
+        &mut self.runtime
+    }
+
+    /// Borrow runtime data for a specific agent.
+    #[must_use]
+    pub fn agent_runtime(&self, id: AgentId) -> Option<&AgentRuntime> {
+        self.runtime.get(id)
+    }
+
+    /// Mutably borrow runtime data for a specific agent.
+    #[must_use]
+    pub fn agent_runtime_mut(&mut self, id: AgentId) -> Option<&mut AgentRuntime> {
+        self.runtime.get_mut(id)
+    }
+
+    /// Produce a combined snapshot of an agent's scalar columns and runtime data.
+    #[must_use]
+    pub fn snapshot_agent(&self, id: AgentId) -> Option<AgentState> {
+        let data = self.agents.snapshot(id)?;
+        let runtime = self.runtime.get(id)?.clone();
+        Some(AgentState { id, data, runtime })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_agent(seed: u32) -> AgentData {
+        AgentData {
+            position: Position::new(seed as f32, seed as f32 + 1.0),
+            velocity: Velocity::new(seed as f32 * 0.1, -(seed as f32) * 0.1),
+            heading: seed as f32 * 0.5,
+            health: 1.0 + seed as f32,
+            color: [seed as f32, seed as f32 + 0.5, seed as f32 + 1.0],
+            spike_length: seed as f32 * 2.0,
+            boost: seed % 2 == 0,
+            age: seed,
+            generation: Generation(seed),
+        }
+    }
+
+    #[test]
+    fn insert_allocates_unique_handles() {
+        let mut arena = AgentArena::new();
+        let a = arena.insert(sample_agent(0));
+        let b = arena.insert(sample_agent(1));
+        assert_ne!(a, b);
+        assert_eq!(arena.len(), 2);
+        assert!(arena.contains(a));
+        assert!(arena.contains(b));
+    }
+
+    #[test]
+    fn remove_keeps_dense_storage_coherent() {
+        let mut arena = AgentArena::new();
+        let a = arena.insert(sample_agent(0));
+        let b = arena.insert(sample_agent(1));
+        let c = arena.insert(sample_agent(2));
+        assert_eq!(arena.len(), 3);
+
+        let removed = arena.remove(b).expect("agent removed");
+        assert_eq!(removed.generation, Generation(1));
+        assert_eq!(arena.len(), 2);
+        assert!(arena.contains(a));
+        assert!(arena.contains(c));
+        assert!(!arena.contains(b));
+
+        let snapshot_c = arena.snapshot(c).expect("snapshot");
+        assert_eq!(snapshot_c.position, Position::new(2.0, 3.0));
+        assert_eq!(arena.index_of(c), Some(1));
+
+        let d = arena.insert(sample_agent(3));
+        assert_ne!(
+            b, d,
+            "generational handles should not be reused immediately"
+        );
+    }
+
+    #[test]
+    fn food_grid_accessors() {
+        let mut grid = FoodGrid::new(4, 2, 0.5).expect("grid");
+        assert_eq!(grid.width(), 4);
+        assert_eq!(grid.height(), 2);
+        assert_eq!(grid.get(1, 1), Some(0.5));
+        *grid.get_mut(2, 0).expect("cell") = 3.0;
+        assert_eq!(grid.get(2, 0), Some(3.0));
+        assert!(grid.get(5, 0).is_none());
+        grid.fill(2.0);
+        assert!(
+            grid.cells()
+                .iter()
+                .all(|&cell| (cell - 2.0).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn world_state_initialises_from_config() {
+        let config = ScriptBotsConfig {
+            world_width: 6000,
+            world_height: 6000,
+            food_cell_size: 60,
+            initial_food: 0.25,
+            rng_seed: Some(42),
+        };
+        let mut world = WorldState::new(config.clone()).expect("world");
+        assert_eq!(world.agent_count(), 0);
+        assert_eq!(world.food().width(), 100);
+        assert_eq!(world.food().height(), 100);
+        assert_eq!(world.food().get(0, 0), Some(0.25));
+        assert_eq!(world.config().world_width, config.world_width);
+
+        let id = world.spawn_agent(sample_agent(5));
+        assert_eq!(world.agent_count(), 1);
+        assert!(world.agents().contains(id));
+        let runtime = world.agent_runtime(id).expect("runtime");
+        assert!(runtime.mutation_log.is_empty());
+        assert_eq!(runtime.sensors, [0.0; INPUT_SIZE]);
+        let snapshot = world.snapshot_agent(id).expect("snapshot");
+        assert_eq!(snapshot.runtime.indicator.intensity, 0.0);
+
+        world.advance_tick();
+        world.advance_tick();
+        assert_eq!(world.tick(), Tick(2));
+
+        let removed = world.remove_agent(id).expect("removed agent");
+        assert_eq!(removed.generation, Generation(5));
+        assert_eq!(world.agent_count(), 0);
+        assert!(world.agent_runtime(id).is_none());
     }
 }

@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+slotmap = { workspace = true }
+rand = { workspace = true }

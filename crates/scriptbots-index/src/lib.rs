@@ -1,13 +1,13 @@
 //! Spatial indexing abstractions for agent neighborhood queries.
 
 use ordered_float::OrderedFloat;
-use scriptbots_core::AgentId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors emitted by spatial index implementations.
 #[derive(Debug, Error)]
 pub enum IndexError {
+    /// Indicates configuration values that cannot be used (e.g., non-positive cell size).
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
 }
@@ -29,9 +29,10 @@ pub trait NeighborhoodIndex {
 /// Baseline uniform grid index; currently a placeholder until full implementation lands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniformGridIndex {
+    /// Edge length of each grid cell used for bucketing agents.
     pub cell_size: f32,
     #[serde(skip)]
-    agent_order: Vec<AgentId>,
+    agent_order: Vec<usize>,
 }
 
 impl UniformGridIndex {
@@ -58,7 +59,7 @@ impl NeighborhoodIndex for UniformGridIndex {
         }
         self.agent_order.clear();
         self.agent_order
-            .extend(positions.iter().enumerate().map(|(idx, _)| idx as AgentId));
+            .extend(positions.iter().enumerate().map(|(idx, _)| idx));
         Ok(())
     }
 

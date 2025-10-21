@@ -17,7 +17,7 @@
 - Rendering: `GLView` draws agents, overlays, and time-series of herbivore/carnivore counts with immediate-mode OpenGL.
 - Configuration: `settings.h` and `config.h.in` encode global constants (grid size, reproduction rates, spike damage, etc.).
 
-## Target Rust Workspace Layout [Currently In Progress: Workspace scaffolding]
+## Target Rust Workspace Layout [Completed: Workspace scaffolding baseline crates]
 - `Cargo.toml` (workspace) with members:
   - `crates/scriptbots-core`: Pure simulation logic, no UI or platform dependencies.
   - `crates/scriptbots-brain`: Houses `Brain` trait + concrete implementations (`mlp`, `dwraon`, `assembly`). Depends on `scriptbots-core`.
@@ -30,19 +30,19 @@
 - Use Cargo features to toggle experimental brains (`assembly`), AI modules, or headless mode.
 
 ## Simulation Core Design
-### Data Model
-- `WorldState` struct:
+### Data Model [Completed: SoA columns & generational IDs]
+- `WorldState` struct: [Completed: arena-backed scaffold with FoodGrid]
   - `agents: Vec<AgentState>` stored in SoA-friendly layout via `Vec<AgentState>` with packed fields or `AgentColumns` (parallel `Vec` per field) for cache-friendly iteration.
   - `food: Grid<f32>` represented as `Vec<f32>` sized `width * height`; wrapper offers safe indexing and iteration slices for Rayon.
   - `rng: SmallRng` per-world; optionally supply per-agent RNG seeds to avoid contention.
   - `epoch`, `tick_counter`, `closed_environment` flags mirroring C++ logic.
-- `AgentState`:
+- `AgentState`: [Completed: runtime struct + sensor buffers]
   - Scalar fields mapped to Rust primitives (`f32`, `u16`, `bool`).
-  - Sensor buffers as `[f32; INPUT_SIZE]`, outputs `[f32; OUTPUT_SIZE]` to avoid heap allocations.
-  - `brain: Box<dyn Brain + Send + Sync>` or enum-based dispatch for zero-cost dynamic dispatch.
-  - History/event info (`indicator`, `sound_output`, `select_state`).
-  - `id: AgentId` newtype around `u64`.
-- Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback.
+  - Sensor buffers as `[f32; INPUT_SIZE]`, outputs `[f32; OUTPUT_SIZE]` to avoid heap allocations. [Done via `AgentRuntime::sensors`/`outputs`]
+  - `brain: Box<dyn Brain + Send + Sync>` or enum-based dispatch for zero-cost dynamic dispatch. [Pending: replace temporary `BrainBinding` once registry is wired]
+  - History/event info (`indicator`, `sound_output`, `select_state`). [Backed by `IndicatorState`, `SelectionState`, and runtime fields]
+  - `id: AgentId` generational slotmap handle to prevent stale references.
+- Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback. [Completed: validation + RNG seeding + defaults]
 - `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends.
 
 ### Time-Step Pipeline
