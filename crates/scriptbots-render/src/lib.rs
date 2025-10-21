@@ -1,53 +1,40 @@
 //! GPUI rendering layer for ScriptBots.
 
-use gpui::{App, Application, Canvas, Entity, EntityContext, View, ViewContext, ViewRef};
+use gpui::{
+    App, Application, Context, IntoElement, Render, Window, WindowOptions, div, prelude::*,
+};
 use scriptbots_core::WorldState;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-/// Root view holding the shared world state reference.
-pub struct WorldView {
+/// Root view displaying high level simulation stats.
+struct WorldView {
     world: Arc<Mutex<WorldState>>,
 }
 
-impl WorldView {
-    fn new(world: Arc<Mutex<WorldState>>) -> Self {
-        Self { world }
-    }
+impl Render for WorldView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let summary_text = self
+            .world
+            .lock()
+            .ok()
+            .and_then(|world| world.history().last().cloned())
+            .map(|s| {
+                format!(
+                    "Tick {} | Agents {} | Births {} | Deaths {} | Avg Energy {:.2} | Avg Health {:.2}",
+                    s.tick.0,
+                    s.agent_count,
+                    s.births,
+                    s.deaths,
+                    s.average_energy,
+                    s.average_health,
+                )
+            })
+            .unwrap_or_else(|| "No simulation data yet.".to_string());
 
-    fn render_hud(&self, cx: &mut ViewContext<Self>, world: &WorldState) {
-        if let Some(summary) = world.history().last() {
-            cx.set_title(&format!(
-                "ScriptBots — Tick {} — Agents {} (Δ+{} Δ-{}) AvgEnergy {:.2}",
-                summary.tick.0,
-                summary.agent_count,
-                summary.births,
-                summary.deaths,
-                summary.average_energy,
-            ));
-        } else {
-            cx.set_title("ScriptBots — (no summaries yet)");
-        }
-    }
-}
-
-impl View for WorldView {
-    fn render(&mut self, cx: &mut ViewContext<Self>) {
-        if let Ok(world) = self.world.lock() {
-            self.render_hud(cx, &world);
-            let mut canvas = Canvas::new();
-            let width = world.config().world_width as f32;
-            let height = world.config().world_height as f32;
-            canvas.clear(gpui::Color::BLACK);
-            let agents = world.agents().columns().positions();
-            let health = world.agents().columns().health();
-            for (idx, position) in agents.iter().enumerate() {
-                let energy = health.get(idx).copied().unwrap_or(0.0).clamp(0.0, 2.0) / 2.0;
-                let color = gpui::Color::rgba(energy, 1.0 - energy, 0.2, 1.0);
-                canvas.fill_circle(position.x / width, position.y / height, 4.0, color);
-            }
-            cx.draw(&canvas);
-        }
+        div().child(div().child(summary_text)).child(
+            div().child("Rendering milestones will add live agent visuals and controls here."),
+        )
     }
 }
 
@@ -66,7 +53,12 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>) {
         }
     }
 
-    Application::new().run(move |cx: &mut App| {
-        cx.open_window(|cx| cx.new_view(|cx| WorldView::new(world.clone())));
+    Application::new().run(move |app: &mut App| {
+        app.open_window(WindowOptions::default(), move |_, cx| {
+            cx.new(|_| WorldView {
+                world: world.clone(),
+            })
+        })
+        .expect("failed to open GPUI window");
     });
 }
