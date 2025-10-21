@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 scriptbots-brain = { path = "../scriptbots-brain" }
-scriptbots-brain-neuro = { path = "../scriptbots-brain-neuro", optional = true }
+scriptbots-brain-ml = { path = "../scriptbots-brain-ml", optional = true }
 scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-render = { path = "../scriptbots-render" }
 scriptbots-storage = { path = "../scriptbots-storage" }
@@ -15,4 +15,4 @@ tracing-subscriber = { workspace = true }
 
 [features]
 default = []
-neuroflow = ["scriptbots-brain-neuro"]
+ml = ["scriptbots-brain-ml"]

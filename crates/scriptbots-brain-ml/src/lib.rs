@@ -26,14 +26,15 @@ impl MlBrain {
     /// Construct a new ML brain instance using the active backend feature.
     #[must_use]
     pub fn new() -> Self {
-        #[cfg(feature = "candle")]
-        let kind = MlBackendKind::Candle;
-        #[cfg(all(not(feature = "candle"), feature = "tract"))]
-        let kind = MlBackendKind::Tract;
-        #[cfg(all(not(any(feature = "candle", feature = "tract")), feature = "tch"))]
-        let kind = MlBackendKind::Tch;
-        #[cfg(not(any(feature = "candle", feature = "tract", feature = "tch")))]
-        let kind = MlBackendKind::None;
+        let kind = if cfg!(feature = "candle") {
+            MlBackendKind::Candle
+        } else if cfg!(feature = "tract") {
+            MlBackendKind::Tract
+        } else if cfg!(feature = "tch") {
+            MlBackendKind::Tch
+        } else {
+            MlBackendKind::None
+        };
 
         Self { kind }
     }
@@ -50,9 +51,9 @@ impl Brain for MlBrain {
         match self.kind {
             #[cfg(feature = "candle")]
             MlBackendKind::Candle => "candle",
-            #[cfg(all(not(feature = "candle"), feature = "tract"))]
+            #[cfg(feature = "tract")]
             MlBackendKind::Tract => "tract-onnx",
-            #[cfg(all(not(any(feature = "candle", feature = "tract")), feature = "tch"))]
+            #[cfg(feature = "tch")]
             MlBackendKind::Tch => "tch",
             #[cfg(not(any(feature = "candle", feature = "tract", feature = "tch")))]
             MlBackendKind::None => "ml-placeholder",

@@ -8,6 +8,25 @@ authors.workspace = true
 description.workspace = true
 
 [dependencies]
+ordered-float = { workspace = true }
+rayon = { workspace = true }
+scriptbots-core = { path = "../scriptbots-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = ["grid"]
+grid = []
+rstar = ["dep:rstar"]
+kd = ["dep:kiddo"]
+
+[dependencies.rstar]
+workspace = true
+optional = true
+
+[dependencies.kiddo]
+workspace = true
+optional = true
 
 [lints]
 workspace = true
