@@ -349,12 +349,7 @@ impl SimulationView {
                     .rounded_md()
                     .px_3()
                     .py_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xfacc15))
-                            .child(badge),
-                    )
+                    .child(div().text_sm().text_color(rgb(0xfacc15)).child(badge))
                     .child(div().text_sm().text_color(rgb(0xe2e8f0)).child(content)),
             );
         }

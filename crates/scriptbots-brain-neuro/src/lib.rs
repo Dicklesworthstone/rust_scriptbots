@@ -27,8 +27,6 @@ pub enum NeuroflowActivation {
     Sigmoid,
     /// Rectified linear unit (ReLU).
     Relu,
-    /// Linear activation (identity).
-    Linear,
 }
 
 impl Default for NeuroflowActivation {
@@ -43,7 +41,6 @@ impl NeuroflowActivation {
             Self::Tanh => Type::Tanh,
             Self::Sigmoid => Type::Sigmoid,
             Self::Relu => Type::Relu,
-            Self::Linear => Type::Linear,
         }
     }
 }
