@@ -2006,7 +2006,9 @@ impl WorldState {
 
     fn stage_persistence(&mut self, next_tick: Tick) {
         if self.config.persistence_interval == 0
-            || next_tick.0 % self.config.persistence_interval as u64 != 0
+            || !next_tick
+                .0
+                .is_multiple_of(self.config.persistence_interval as u64)
         {
             self.last_births = 0;
             self.last_deaths = 0;

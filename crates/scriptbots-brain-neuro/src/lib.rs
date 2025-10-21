@@ -9,9 +9,10 @@ use neuroflow::activators::Type;
 use neuroflow::FeedForward;
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use scriptbots_brain::{into_runner, Brain, BrainKind};
-use scriptbots_core::{BrainRunner, WorldState};
+use scriptbots_core::{BrainRunner, NeuroflowActivationKind, NeuroflowSettings, WorldState};
 
 /// Number of inputs inherited from the simulation sensors.
 const INPUT_SIZE: usize = scriptbots_core::INPUT_SIZE;
