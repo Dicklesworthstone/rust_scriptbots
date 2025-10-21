@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "crates/scriptbots-core",
     "crates/scriptbots-brain",
-    "crates/scriptbots-brain-neuro",
+    "crates/scriptbots-brain-ml",
+    "crates/scriptbots-index",
     "crates/scriptbots-storage",
     "crates/scriptbots-render",
     "crates/scriptbots-app",

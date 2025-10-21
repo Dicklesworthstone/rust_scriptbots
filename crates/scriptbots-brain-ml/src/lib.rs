@@ -1,35 +1,70 @@
-//! Placeholder NeuroFlow-backed brain integrations.
+//! Optional modern ML brain backends (Candle, tract-onnx, tch).
 
-use std::marker::PhantomData;
-
-use neuroflow::FeedForward;
 use rand::Rng;
 use scriptbots_brain::Brain;
 
-/// Temporary wrapper that reserves space for a future NeuroFlow network.
-#[derive(Default)]
-pub struct NeuroBrain {
-    _marker: PhantomData<FeedForward>,
+/// Supported ML backends selected at build time.
+#[derive(Debug, Clone, Copy)]
+pub enum MlBackendKind {
+    #[cfg(feature = "candle")]
+    Candle,
+    #[cfg(feature = "tract")]
+    Tract,
+    #[cfg(feature = "tch")]
+    Tch,
+    #[cfg(not(any(feature = "candle", feature = "tract", feature = "tch")))]
+    None,
 }
 
-impl NeuroBrain {
-    /// Construct a placeholder NeuroFlow brain.
+/// Placeholder structure that will host the chosen ML model.
+#[derive(Debug, Default)]
+pub struct MlBrain {
+    kind: MlBackendKind,
+}
+
+impl MlBrain {
+    /// Construct a new ML brain instance using the active backend feature.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        #[cfg(feature = "candle")]
+        let kind = MlBackendKind::Candle;
+        #[cfg(all(not(feature = "candle"), feature = "tract"))]
+        let kind = MlBackendKind::Tract;
+        #[cfg(all(not(any(feature = "candle", feature = "tract")), feature = "tch"))]
+        let kind = MlBackendKind::Tch;
+        #[cfg(not(any(feature = "candle", feature = "tract", feature = "tch")))]
+        let kind = MlBackendKind::None;
+
+        Self { kind }
+    }
+
+    /// Returns which backend is active.
+    #[must_use]
+    pub const fn backend(&self) -> MlBackendKind {
+        self.kind
     }
 }
 
-impl Brain for NeuroBrain {
+impl Brain for MlBrain {
     fn kind(&self) -> &'static str {
-        "neuroflow"
+        match self.kind {
+            #[cfg(feature = "candle")]
+            MlBackendKind::Candle => "candle",
+            #[cfg(all(not(feature = "candle"), feature = "tract"))]
+            MlBackendKind::Tract => "tract-onnx",
+            #[cfg(all(not(any(feature = "candle", feature = "tract")), feature = "tch"))]
+            MlBackendKind::Tch => "tch",
+            #[cfg(not(any(feature = "candle", feature = "tract", feature = "tch")))]
+            MlBackendKind::None => "ml-placeholder",
+        }
     }
 
     fn tick(&mut self, inputs: &[f32]) -> Vec<f32> {
+        // Placeholder: pass-through until concrete integrations land.
         inputs.to_vec()
     }
 
     fn mutate<R: Rng>(&mut self, _rng: &mut R, _rate: f32, _scale: f32) {
-        // Mutation logic will be implemented alongside the full NeuroFlow integration.
+        // Mutation behavior will be implemented per-backend as we integrate models.
     }
 }
