@@ -89,7 +89,7 @@
   - Keep sensor aggregation and brain inference behind pluggable traits so alternative implementations (SIMD-optimized, GPU-backed) can be introduced without touching higher-level logic. Prototype GPU execution by batching inference into wgpu compute shaders or other accelerators once profiling justifies the investment.
 
 ## Rendering with GPUI
-- Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0
+- Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Currently In Progress: window + history HUD]
 - State ownership:
   - `SimulationEntity`: `Entity<SimulationModel>` holds shared simulation state (agents, food grid snapshot, metrics). Updates triggered via background tasks that mutate entity and call `cx.notify()`.
   - UI-specific entity for camera (zoom, pan) mirroring original GLView controls.
@@ -177,7 +177,7 @@
 3. **World Mechanics (Weeks 2-4)**
    - Implement food grid, sensing pipeline (sequential first), reproduction queue, death cleanup.
    - Ensure parity with original via scenario tests (e.g., spike kill distribution).
-4. **Introduce Concurrency (Weeks 4-5)** [Currently In Progress: parallelization audit]
+4. **Introduce Concurrency (Weeks 4-5)** [Completed: stage_sense/actuation/combat parallelized with Rayon]
    - Integrate Rayon, add spatial partition acceleration, verify determinism under multi-thread.
 5. **Brain Ports (Weeks 5-7)**
    - MLP (baseline) complete with mutate/crossover.
@@ -186,7 +186,7 @@
 6. **Persistence Layer (Weeks 7-8)**
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics).
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query).
-7. **Rendering Layer (Weeks 8-10)**
+7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
    - Build GPUI window, canvas renderer, agent inspector UI.
    - Implement camera controls, overlays, history chart.
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.

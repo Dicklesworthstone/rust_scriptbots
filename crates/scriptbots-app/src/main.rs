@@ -2,13 +2,14 @@ use anyhow::Result;
 use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
 use scriptbots_render::run_demo;
 use scriptbots_storage::Storage;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 fn main() -> Result<()> {
     init_tracing();
-    bootstrap_world()?;
+    let world = bootstrap_world()?;
     info!("Starting ScriptBots simulation shell");
-    run_demo();
+    run_demo(world);
     Ok(())
 }
 
@@ -18,7 +19,7 @@ fn init_tracing() {
         .try_init();
 }
 
-fn bootstrap_world() -> Result<()> {
+fn bootstrap_world() -> Result<Arc<Mutex<WorldState>>> {
     let mut config = ScriptBotsConfig::default();
     config.persistence_interval = 60;
     config.history_capacity = 600;
@@ -45,7 +46,7 @@ fn bootstrap_world() -> Result<()> {
         warn!("World bootstrap completed without persistence summaries");
     }
 
-    Ok(())
+    Ok(Arc::new(Mutex::new(world)))
 }
 
 fn seed_agents(world: &mut WorldState) {

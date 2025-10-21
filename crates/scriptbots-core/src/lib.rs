@@ -224,7 +224,6 @@ struct ActuationDelta {
     velocity: Velocity,
     position: Position,
     health_delta: f32,
-    spiked: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1490,7 +1489,7 @@ impl WorldState {
                     let turn = outputs.get(2).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
                     let boost = outputs.get(3).copied().unwrap_or(0.0).clamp(0.0, 1.0);
 
-                    let heading = headings_snapshot[idx] + turn * 0.1;
+                    let heading: f32 = headings_snapshot[idx] + turn * 0.1;
                     let cos_h = heading.cos();
                     let sin_h = heading.sin();
                     let forward_dx = cos_h * forward;
@@ -1522,7 +1521,6 @@ impl WorldState {
                             velocity: Velocity::new(vx, vy),
                             position: next_pos,
                             health_delta,
-                            spiked,
                         }),
                         energy,
                         spiked,
@@ -1710,7 +1708,7 @@ impl WorldState {
                         };
                     }
 
-                    let reach = (spike_radius + spike_lengths[idx]).max(1.0);
+                    let reach: f32 = (spike_radius + spike_lengths[idx]).max(1.0);
                     let reach_sq = reach * reach;
                     let mut contributions = Vec::new();
                     index.neighbors_within(
