@@ -1,11 +1,11 @@
 //! Core types shared across the ScriptBots workspace.
 
 use ordered_float::OrderedFloat;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
-use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use slotmap::{new_key_type, SecondaryMap, SlotMap};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -1149,17 +1149,12 @@ impl Default for NeuroflowSettings {
 }
 
 /// Supported activation functions for NeuroFlow networks.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum NeuroflowActivationKind {
+    #[default]
     Tanh,
     Sigmoid,
     Relu,
-}
-
-impl Default for NeuroflowActivationKind {
-    fn default() -> Self {
-        Self::Tanh
-    }
 }
 
 impl ScriptBotsConfig {
@@ -1364,7 +1359,7 @@ impl fmt::Debug for WorldState {
 impl WorldState {
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
-        Self::with_persistence(config, Box::new(NullPersistence::default()))
+        Self::with_persistence(config, Box::new(NullPersistence))
     }
 
     /// Instantiate a new world using the supplied configuration and persistence sink.
@@ -1411,7 +1406,7 @@ impl WorldState {
         if interval == 0 {
             return None;
         }
-        if next_tick.0 % interval as u64 != 0 {
+        if !next_tick.0.is_multiple_of(interval as u64) {
             return None;
         }
         let width = self.food.width();
@@ -2347,11 +2342,10 @@ mod tests {
         assert_eq!(grid.get(2, 0), Some(3.0));
         assert!(grid.get(5, 0).is_none());
         grid.fill(2.0);
-        assert!(
-            grid.cells()
-                .iter()
-                .all(|&cell| (cell - 2.0).abs() < f32::EPSILON)
-        );
+        assert!(grid
+            .cells()
+            .iter()
+            .all(|&cell| (cell - 2.0).abs() < f32::EPSILON));
     }
 
     #[test]

@@ -1,10 +1,15 @@
 use anyhow::Result;
-use rand::{SeedableRng, rngs::SmallRng};
+use rand::{rngs::SmallRng, SeedableRng};
 use scriptbots_brain::MlpBrain;
-use scriptbots_core::{AgentData, BrainBinding, NeuroflowActivationKind, ScriptBotsConfig, WorldState};
+use scriptbots_core::{
+    AgentData, BrainBinding, NeuroflowActivationKind, ScriptBotsConfig, WorldState,
+};
 use scriptbots_render::run_demo;
 use scriptbots_storage::{SharedStorage, Storage};
-use std::{env, sync::{Arc, Mutex}};
+use std::{
+    env,
+    sync::{Arc, Mutex},
+};
 use tracing::{info, warn};
 
 type SharedWorld = Arc<Mutex<WorldState>>;
@@ -93,21 +98,27 @@ fn apply_env_overrides(config: &mut ScriptBotsConfig) {
     if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_ENABLED") {
         match parse_bool(&value) {
             Some(flag) => config.neuroflow.enabled = flag,
-            None => warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ENABLED value; expected true/false"),
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ENABLED value; expected true/false")
+            }
         }
     }
 
     if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_HIDDEN") {
         match parse_layers(&value) {
             Some(layers) => config.neuroflow.hidden_layers = layers,
-            None => warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_HIDDEN value; expected comma-separated integers"),
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_HIDDEN value; expected comma-separated integers")
+            }
         }
     }
 
     if let Ok(value) = env::var("SCRIPTBOTS_NEUROFLOW_ACTIVATION") {
         match parse_activation(&value) {
             Some(activation) => config.neuroflow.activation = activation,
-            None => warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ACTIVATION value; expected tanh|sigmoid|relu"),
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_NEUROFLOW_ACTIVATION value; expected tanh|sigmoid|relu")
+            }
         }
     }
 }
