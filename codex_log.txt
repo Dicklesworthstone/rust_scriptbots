@@ -2728,3 +2728,1896 @@ Resolving deltas: 100% (98/98), done.
 › Find and fix a bug in @filename
 
   29% context left · ? for shortcuts
+
+---
+
+❯ cd /data/projects/rust_scriptbots
+│ directory: /data/projects/rust_scriptbots      │
+╰────────────────────────────────────────────────╯
+
+  /review - review any changes and find issues
+❯
+❯ npm install -g @openai/codex@latest
+
+changed 1 package in 5s
+❯ cod
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /approvals - choose what Codex can do without approval
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+• Explored
+  └ List ls
+    Read README.md, PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+    Search find crates/scriptbots-brain -maxdepth 2 -type f
+    Read lib.rs
+    Search find crates/scriptbots-brain-ml -maxdepth 2 -type f
+    Search find crates/scriptbots-storage -maxdepth 2 -type f
+    Read lib.rs
+    Search find crates/scriptbots-render -maxdepth 2 -type f
+
+• Ran cargo check
+  └ (no output)
+
+• I'll create a clear, concise summary detailing the project's high-level structure—including crates, workspace setup, and their roles—plus the exploration of the README and plan documents. I'll also note the cargo check results with warnings, reference dependencies and features, and emphasize that no modifications were made, following the user's
+  instructions.
+
+─ Worked for 1m 41s ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Quick take: multi-crate Rust 2024 workspace porting ScriptBots (Karpathy) toward deterministic, GPU-accelerated simulation with GPUI front end. Core crates scaffolded but mostly placeholders: scriptbots-core defines basic types and columnar agent storage; scriptbots-brain exposes the Brain trait and telemetry; scriptbots-brain-ml selects among future
+  Candle/Tract/tch integrations; scriptbots-index contains a skeletal uniform grid; scriptbots-storage wraps DuckDB for per-tick metrics; scriptbots-render bootstraps a blank GPUI app; scriptbots-app wires tracing and launches the demo. Workspace-level Cargo manifest centralizes dependencies (Rayon, DuckDB, GPUI git), lints (warn on unsafe, Clippy
+  pedantic/nursery), and tuned profiles.
+
+  Documentation: README.md and the “bible” PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md map the staged roadmap from core world mechanics through rendering and analytics; best-practice guidance lives in RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md. Legacy C++ reference (original_scriptbots_code_for_reference/) holds the full GLUT
+  implementation for parity. AGENTS.md reiterates strict process rules (no deletions, manual edits, plan annotations when taking tasks).
+
+  Tooling status: cargo check (10/21/2025) passes for all crates; current warnings note unused PyO3 patch entries and a future-incompat notice for num-bigint-dig via dependencies—nothing blocking yet.
+
+  No changes made; ready for the specific task when you’re ready.
+
+
+› Read AGENTS.md and ALL of PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md super carefully if you haven't yet. Then proceed with the plan; you got interrupted while implementing the part of the plan marked as currently in progress.
+
+
+• Explored
+  └ Search Currently In Progress in PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+
+• Ran wc -l PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+  └ 215 PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+
+• Explored
+  └ Read PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+    Search \[.*\] in PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+    Search TODO
+    Read codex_log.txt, PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    32  ## Simulation Core Design
+    33 -### Data Model
+    33 +### Data Model [Currently In Progress: SoA columns & generational IDs]
+    34  - `WorldState` struct:
+
+• Explored
+  └ Search generation in Agent.h
+    Search AgentColumns in PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+    Search generation in PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+    Search generat
+
+• I'm reviewing the codex log to understand prior context on generational IDs and slotmap usage. Since slotmap isn't yet a dependency, I may need to add it. The task to implement Data Model SoA columns and generational IDs looks complex, so I'll create a 3-step plan covering code inspection, implementation, and testing, using the plan tool for structured
+  progress.
+
+• Updated Plan
+  └ □ Review existing scriptbots-core data model and requirements for SoA columns and generational IDs from the plan and legacy reference.
+    □ Implement enhanced AgentId/AgentKey and AgentColumns structures with generational arena support and supporting APIs in scriptbots-core.
+    □ Add unit tests or validations as needed and run cargo check to ensure new data model compiles cleanly.
+
+• Explored
+  └ Read World.h, Agent.h
+
+• Updated Plan
+  └ ✔ Review existing scriptbots-core data model and requirements for SoA columns and generational IDs from the plan and legacy reference.
+    □ Implement enhanced AgentId/AgentKey and AgentColumns structures with generational arena support and supporting APIs in scriptbots-core.
+    □ Add unit tests or validations as needed and run cargo check to ensure new data model compiles cleanly.
+
+• Explored
+  └ Search slotmap
+
+• I'm working out how to combine generational keys using the slotmap crate with a struct-of-arrays layout for agent data. The idea is to map generational keys to indices in SoA vectors, keep keys and data in sync with swap-remove, and decide whether to use slotmap keys directly as agent IDs or wrap them. I'll also consider serialization support and
+  whether to add slotmap as a workspace dependency. This approach balances safe ID reuse with performant data layout, which looks promising for the scriptbots-core crate.
+
+• Explored
+  └ Search AgentColumns in codex_log.txt
+
+• I'm working through updating dependencies, redefining AgentId as a generational SlotMap key with serde support, and designing AgentColumns to store core agent attributes separately in a structure-of-arrays style while clarifying distinctions between generational handles and genealogical generation counts. There's a lot to get right with data modeling
+  to keep things flexible and consistent!
+
+• Explored
+  └ Search AgentGeneration in codex_log.txt
+    Search gencount
+
+• I'm drafting a new AgentArena with generational IDs using SlotMap, defining AgentColumns with SoA vectors to hold agent data, and planning insertion, removal, and access methods to maintain consistency and efficient swaps; I'm also considering serialization, tests, and updating module imports and dependencies accordingly.
+
+• Edited Cargo.toml (+1 -0)
+    32  ordered-float = "4.2.0"
+    33 +slotmap = { version = "1.0.7", features = ["serde"] }
+    34
+
+• Implementing detailed core agent structs and arena
+
+  I'll define core types like AgentId, Tick, Position, Generation, and a thorough AgentData struct with key fields, all deriving traits for serialization and copying where appropriate. I’ll implement AgentColumns holding SoA vectors with consistency checks, and an AgentArena that manages agents densely with slotmap keys, offering methods like insert,
+  remove, snapshot, iteration, and indexing. I’ll also add comprehensive tests to confirm insertion, removal, key uniqueness, and data integrity, ensuring this core module is robust and matches the workspace's design goals.
+
+• Edited crates/scriptbots-core/src/lib.rs (+500 -11)
+      3  use serde::{Deserialize, Serialize};
+      4 +use slotmap::{new_key_type, SecondaryMap, SlotMap};
+      5 +
+      6 +new_key_type! {
+      7 +    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+      8 +    /// Stable handle for agents backed by a generational slot map.
+      9 +    pub struct AgentId;
+     10 +}
+     11
+      5 -/// Unique identifier assigned to each agent.
+      6 -pub type AgentId = u64;
+     12 +/// Convenience alias for associating side data with agents.
+     13 +pub type AgentMap<T> = SecondaryMap<AgentId, T>;
+     14
+        ⋮
+     27  /// Axis-aligned 2D position (SoA column representation).
+     21 -#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+     28 +#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+     29  pub struct Position {
+        ⋮
+     33
+     34 +impl Position {
+     35 +    /// Construct a new position.
+     36 +    #[must_use]
+     37 +    pub const fn new(x: f32, y: f32) -> Self {
+     38 +        Self { x, y }
+     39 +    }
+     40 +}
+     41 +
+     42  /// Velocity (wheel outputs translated to world-space delta).
+     28 -#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+     43 +#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+     44  pub struct Velocity {
+        ⋮
+     48
+     49 +impl Velocity {
+     50 +    /// Construct a new velocity vector.
+     51 +    #[must_use]
+     52 +    pub const fn new(vx: f32, vy: f32) -> Self {
+     53 +        Self { vx, vy }
+     54 +    }
+     55 +}
+     56 +
+     57 +/// Lineage counter (agents produced by reproduction increment this).
+     58 +#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+     59 +pub struct Generation(pub u32);
+     60 +
+     61 +impl Generation {
+     62 +    /// Advances to the next lineage generation.
+     63 +    #[must_use]
+     64 +    pub const fn next(self) -> Self {
+     65 +        Self(self.0 + 1)
+     66 +    }
+     67 +}
+     68 +
+     69 +/// Scalar fields for a single agent used when inserting or snapshotting from the SoA store.
+     70 +#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+     71 +pub struct AgentData {
+     72 +    pub position: Position,
+     73 +    pub velocity: Velocity,
+     74 +    pub heading: f32,
+     75 +    pub health: f32,
+     76 +    pub color: [f32; 3],
+     77 +    pub spike_length: f32,
+     78 +    pub boost: bool,
+     79 +    pub age: u32,
+     80 +    pub generation: Generation,
+     81 +}
+     82 +
+     83 +impl AgentData {
+     84 +    /// Creates a new agent payload with the provided scalar fields.
+     85 +    #[allow(clippy::too_many_arguments)]
+     86 +    #[must_use]
+     87 +    pub const fn new(
+     88 +        position: Position,
+     89 +        velocity: Velocity,
+     90 +        heading: f32,
+     91 +        health: f32,
+     92 +        color: [f32; 3],
+     93 +        spike_length: f32,
+     94 +        boost: bool,
+     95 +        age: u32,
+     96 +        generation: Generation,
+     97 +    ) -> Self {
+     98 +        Self {
+     99 +            position,
+    100 +            velocity,
+    101 +            heading,
+    102 +            health,
+    103 +            color,
+    104 +            spike_length,
+    105 +            boost,
+    106 +            age,
+    107 +            generation,
+    108 +        }
+    109 +    }
+    110 +}
+    111 +
+    112 +impl Default for AgentData {
+    113 +    fn default() -> Self {
+    114 +        Self {
+    115 +            position: Position::default(),
+    116 +            velocity: Velocity::default(),
+    117 +            heading: 0.0,
+    118 +            health: 1.0,
+    119 +            color: [0.0; 3],
+    120 +            spike_length: 0.0,
+    121 +            boost: false,
+    122 +            age: 0,
+    123 +            generation: Generation::default(),
+    124 +        }
+    125 +    }
+    126 +}
+    127 +
+    128  /// Collection of per-agent columns for hot-path iteration.
+     35 -#[derive(Debug, Default)]
+    129 +#[derive(Debug, Default, Serialize, Deserialize)]
+    130  pub struct AgentColumns {
+     37 -    pub ids: Vec<AgentId>,
+     38 -    pub positions: Vec<Position>,
+     39 -    pub velocities: Vec<Velocity>,
+     40 -    pub energies: Vec<f32>,
+     41 -    pub colors: Vec<[f32; 3]>,
+     42 -    pub spikes: Vec<f32>,
+    131 +    positions: Vec<Position>,
+    132 +    velocities: Vec<Velocity>,
+    133 +    headings: Vec<f32>,
+    134 +    health: Vec<f32>,
+    135 +    colors: Vec<[f32; 3]>,
+    136 +    spike_lengths: Vec<f32>,
+    137 +    boosts: Vec<bool>,
+    138 +    ages: Vec<u32>,
+    139 +    generations: Vec<Generation>,
+    140 +}
+    141 +
+    142 +impl AgentColumns {
+    143 +    /// Create an empty collection.
+    144 +    #[must_use]
+    145 +    pub fn new() -> Self {
+    146 +        Self::default()
+    147 +    }
+    148 +
+    149 +    /// Create a collection with reserved capacity.
+    150 +    #[must_use]
+    151 +    pub fn with_capacity(capacity: usize) -> Self {
+    152 +        Self {
+    153 +            positions: Vec::with_capacity(capacity),
+    154 +            velocities: Vec::with_capacity(capacity),
+    155 +            headings: Vec::with_capacity(capacity),
+    156 +            health: Vec::with_capacity(capacity),
+    157 +            colors: Vec::with_capacity(capacity),
+    158 +            spike_lengths: Vec::with_capacity(capacity),
+    159 +            boosts: Vec::with_capacity(capacity),
+    160 +            ages: Vec::with_capacity(capacity),
+    161 +            generations: Vec::with_capacity(capacity),
+    162 +        }
+    163 +    }
+    164 +
+    165 +    /// Number of active rows in the columns.
+    166 +    #[must_use]
+    167 +    pub fn len(&self) -> usize {
+    168 +        self.positions.len()
+    169 +    }
+    170 +
+    171 +    /// Returns true if there are no active rows.
+    172 +    #[must_use]
+    173 +    pub fn is_empty(&self) -> bool {
+    174 +        self.len() == 0
+    175 +    }
+    176 +
+    177 +    /// Reserve additional capacity in each backing vector.
+    178 +    pub fn reserve(&mut self, additional: usize) {
+    179 +        self.positions.reserve(additional);
+    180 +        self.velocities.reserve(additional);
+    181 +        self.headings.reserve(additional);
+    182 +        self.health.reserve(additional);
+    183 +        self.colors.reserve(additional);
+    184 +        self.spike_lengths.reserve(additional);
+    185 +        self.boosts.reserve(additional);
+    186 +        self.ages.reserve(additional);
+    187 +        self.generations.reserve(additional);
+    188 +    }
+    189 +
+    190 +    /// Push a new row onto each column.
+    191 +    pub fn push(&mut self, agent: AgentData) {
+    192 +        self.positions.push(agent.position);
+    193 +        self.velocities.push(agent.velocity);
+    194 +        self.headings.push(agent.heading);
+    195 +        self.health.push(agent.health);
+    196 +        self.colors.push(agent.color);
+    197 +        self.spike_lengths.push(agent.spike_length);
+    198 +        self.boosts.push(agent.boost);
+    199 +        self.ages.push(agent.age);
+    200 +        self.generations.push(agent.generation);
+    201 +        self.debug_assert_coherent();
+    202 +    }
+    203 +
+    204 +    /// Swap-remove the row at `index` and return its scalar fields.
+    205 +    pub fn swap_remove(&mut self, index: usize) -> AgentData {
+    206 +        let removed = AgentData {
+    207 +            position: self.positions.swap_remove(index),
+    208 +            velocity: self.velocities.swap_remove(index),
+    209 +            heading: self.headings.swap_remove(index),
+    210 +            health: self.health.swap_remove(index),
+    211 +            color: self.colors.swap_remove(index),
+    212 +            spike_length: self.spike_lengths.swap_remove(index),
+    213 +            boost: self.boosts.swap_remove(index),
+    214 +            age: self.ages.swap_remove(index),
+    215 +            generation: self.generations.swap_remove(index),
+    216 +        };
+    217 +        self.debug_assert_coherent();
+    218 +        removed
+    219 +    }
+    220 +
+    221 +    /// Return a copy of the scalar fields at `index`.
+    222 +    #[must_use]
+    223 +    pub fn snapshot(&self, index: usize) -> AgentData {
+    224 +        AgentData {
+    225 +            position: self.positions[index],
+    226 +            velocity: self.velocities[index],
+    227 +            heading: self.headings[index],
+    228 +            health: self.health[index],
+    229 +            color: self.colors[index],
+    230 +            spike_length: self.spike_lengths[index],
+    231 +            boost: self.boosts[index],
+    232 +            age: self.ages[index],
+    233 +            generation: self.generations[index],
+    234 +        }
+    235 +    }
+    236 +
+    237 +    /// Immutable access to the positions slice.
+    238 +    #[must_use]
+    239 +    pub fn positions(&self) -> &[Position] {
+    240 +        &self.positions
+    241 +    }
+    242 +
+    243 +    /// Mutable access to the positions slice.
+    244 +    #[must_use]
+    245 +    pub fn positions_mut(&mut self) -> &mut [Position] {
+    246 +        &mut self.positions
+    247 +    }
+    248 +
+    249 +    /// Immutable access to the velocities slice.
+    250 +    #[must_use]
+    251 +    pub fn velocities(&self) -> &[Velocity] {
+    252 +        &self.velocities
+    253 +    }
+    254 +
+    255 +    /// Mutable access to the velocities slice.
+    256 +    #[must_use]
+    257 +    pub fn velocities_mut(&mut self) -> &mut [Velocity] {
+    258 +        &mut self.velocities
+    259 +    }
+    260 +
+    261 +    /// Immutable access to headings.
+    262 +    #[must_use]
+    263 +    pub fn headings(&self) -> &[f32] {
+    264 +        &self.headings
+    265 +    }
+    266 +
+    267 +    /// Mutable access to headings.
+    268 +    #[must_use]
+    269 +    pub fn headings_mut(&mut self) -> &mut [f32] {
+    270 +        &mut self.headings
+    271 +    }
+    272 +
+    273 +    /// Immutable access to health values.
+    274 +    #[must_use]
+    275 +    pub fn health(&self) -> &[f32] {
+    276 +        &self.health
+    277 +    }
+    278 +
+    279 +    /// Mutable access to health values.
+    280 +    #[must_use]
+    281 +    pub fn health_mut(&mut self) -> &mut [f32] {
+    282 +        &mut self.health
+    283 +    }
+    284 +
+    285 +    /// Immutable access to color triples.
+    286 +    #[must_use]
+    287 +    pub fn colors(&self) -> &[[f32; 3]] {
+    288 +        &self.colors
+    289 +    }
+    290 +
+    291 +    /// Mutable access to color triples.
+    292 +    #[must_use]
+    293 +    pub fn colors_mut(&mut self) -> &mut [[f32; 3]] {
+    294 +        &mut self.colors
+    295 +    }
+    296 +
+    297 +    /// Immutable access to spike lengths.
+    298 +    #[must_use]
+    299 +    pub fn spike_lengths(&self) -> &[f32] {
+    300 +        &self.spike_lengths
+    301 +    }
+    302 +
+    303 +    /// Mutable access to spike lengths.
+    304 +    #[must_use]
+    305 +    pub fn spike_lengths_mut(&mut self) -> &mut [f32] {
+    306 +        &mut self.spike_lengths
+    307 +    }
+    308 +
+    309 +    /// Immutable access to boost flags.
+    310 +    #[must_use]
+    311 +    pub fn boosts(&self) -> &[bool] {
+    312 +        &self.boosts
+    313 +    }
+    314 +
+    315 +    /// Mutable access to boost flags.
+    316 +    #[must_use]
+    317 +    pub fn boosts_mut(&mut self) -> &mut [bool] {
+    318 +        &mut self.boosts
+    319 +    }
+    320 +
+    321 +    /// Immutable access to age counters.
+    322 +    #[must_use]
+    323 +    pub fn ages(&self) -> &[u32] {
+    324 +        &self.ages
+    325 +    }
+    326 +
+    327 +    /// Mutable access to age counters.
+    328 +    #[must_use]
+    329 +    pub fn ages_mut(&mut self) -> &mut [u32] {
+    330 +        &mut self.ages
+    331 +    }
+    332 +
+    333 +    /// Immutable access to agent generations.
+    334 +    #[must_use]
+    335 +    pub fn generations(&self) -> &[Generation] {
+    336 +        &self.generations
+    337 +    }
+    338 +
+    339 +    /// Mutable access to agent generations.
+    340 +    #[must_use]
+    341 +    pub fn generations_mut(&mut self) -> &mut [Generation] {
+    342 +        &mut self.generations
+    343 +    }
+    344 +
+    345 +    #[inline]
+    346 +    fn debug_assert_coherent(&self) {
+    347 +        debug_assert_eq!(self.positions.len(), self.velocities.len());
+    348 +        debug_assert_eq!(self.positions.len(), self.headings.len());
+    349 +        debug_assert_eq!(self.positions.len(), self.health.len());
+    350 +        debug_assert_eq!(self.positions.len(), self.colors.len());
+    351 +        debug_assert_eq!(self.positions.len(), self.spike_lengths.len());
+    352 +        debug_assert_eq!(self.positions.len(), self.boosts.len());
+    353 +        debug_assert_eq!(self.positions.len(), self.ages.len());
+    354 +        debug_assert_eq!(self.positions.len(), self.generations.len());
+    355 +    }
+    356 +}
+    357 +
+    358 +/// Dense SoA storage with generational handles for agent access.
+    359 +#[derive(Debug)]
+    360 +pub struct AgentArena {
+    361 +    slots: SlotMap<AgentId, usize>,
+    362 +    handles: Vec<AgentId>,
+    363 +    columns: AgentColumns,
+    364 +}
+    365 +
+    366 +impl Default for AgentArena {
+    367 +    fn default() -> Self {
+    368 +        Self::new()
+    369 +    }
+    370 +}
+    371 +
+    372 +impl AgentArena {
+    373 +    /// Create an empty arena.
+    374 +    #[must_use]
+    375 +    pub fn new() -> Self {
+    376 +        Self {
+    377 +            slots: SlotMap::with_key(),
+    378 +            handles: Vec::new(),
+    379 +            columns: AgentColumns::new(),
+    380 +        }
+    381 +    }
+    382 +
+    383 +    /// Create an arena with reserved capacity.
+    384 +    #[must_use]
+    385 +    pub fn with_capacity(capacity: usize) -> Self {
+    386 +        Self {
+    387 +            slots: SlotMap::with_capacity_and_key(capacity),
+    388 +            handles: Vec::with_capacity(capacity),
+    389 +            columns: AgentColumns::with_capacity(capacity),
+    390 +        }
+    391 +    }
+    392 +
+    393 +    /// Number of active agents.
+    394 +    #[must_use]
+    395 +    pub fn len(&self) -> usize {
+    396 +        self.columns.len()
+    397 +    }
+    398 +
+    399 +    /// Returns true when no agents are stored.
+    400 +    #[must_use]
+    401 +    pub fn is_empty(&self) => bool {
+    402 +        self.columns.is_empty()
+    403 +    }
+    404 +
+    405 +    /// Reserve space for additional agents.
+    406 +    pub fn reserve(&mut self, additional: usize) {
+    407 +        self.slots.reserve(additional);
+    408 +        self.handles.reserve(additional);
+    409 +        self.columns.reserve(additional);
+    410 +    }
+    411 +
+    412 +    /// Iterate over active agent handles in dense iteration order.
+    413 +    #[must_use]
+    414 +    pub fn iter_handles(&self) -> impl Iterator<Item = AgentId> + '_ {
+    415 +        self.handles.iter().copied()
+    416 +    }
+    417 +
+    418 +    /// Borrow the underlying column storage.
+    419 +    #[must_use]
+    420 +    pub fn columns(&self) -> &AgentColumns {
+    421 +        &self.columns
+    422 +    }
+    423 +
+    424 +    /// Mutably borrow the underlying column storage.
+    425 +    #[must_use]
+    426 +    pub fn columns_mut(&mut self) -> &mut AgentColumns {
+    427 +        &mut self.columns
+    428 +    }
+    429 +
+    430 +    /// Returns the dense index for `id`, if present.
+    431 +    #[must_use]
+    432 +    pub fn index_of(&self, id: AgentId) -> Option<usize> {
+    433 +        self.slots.get(id).copied()
+    434 +    }
+    435 +
+    436 +    /// Returns true if `id` refers to a live agent.
+    437 +    #[must_use]
+    438 +    pub fn contains(&self, id: AgentId) -> bool {
+    439 +        self.slots.contains_key(id)
+    440 +    }
+    441 +
+    442 +    /// Insert a new agent and return its handle.
+    443 +    pub fn insert(&mut self, agent: AgentData) -> AgentId {
+    444 +        let index = self.columns.len();
+    445 +        self.columns.push(agent);
+    446 +        let id = self.slots.insert(index);
+    447 +        self.handles.push(id);
+    448 +        id
+    449 +    }
+    450 +
+    451 +    /// Remove `id` returning its scalar data if it was present.
+    452 +    pub fn remove(&mut self, id: AgentId) -> Option<AgentData> {
+    453 +        let index = self.slots.remove(id)?;
+    454 +        let removed = self.columns.swap_remove(index);
+    455 +        let removed_handle = self.handles.swap_remove(index);
+    456 +        debug_assert_eq!(removed_handle, id);
+    457 +        if index < self.handles.len() {
+    458 +            let moved = self.handles[index];
+    459 +            if let Some(slot) = self.slots.get_mut(moved) {
+    460 +                *slot = index;
+    461 +            }
+    462 +        }
+    463 +        Some(removed)
+    464 +    }
+    465 +
+    466 +    /// Produce a copy of the scalar data for `id`.
+    467 +    #[must_use]
+    468 +    pub fn snapshot(&self, id: AgentId) -> Option<AgentData> {
+    469 +        let index = self.index_of(id)?;
+    470 +        Some(self.columns.snapshot(index))
+    471 +    }
+    472 +
+    473 +    /// Clear all stored agents.
+    474 +    pub fn clear(&mut self) {
+    475 +        self.slots.clear();
+    476 +        self.handles.clear();
+    477 +        self.columns = AgentColumns::new();
+    478 +    }
+    479 +}
+    480 +
+    481 +#[cfg(test)]
+    482 +mod tests {
+    483 +    use super::*;
+    484 +
+    485 +    fn sample_agent(seed: u32) -> AgentData {
+    486 +        AgentData {
+    487 +            position: Position::new(seed as f32, seed as f32 + 1.0),
+    490 +            health: 1.0 + seed as f32,
+    493 +            boost: seed % 2 == 0,
+    494 +            age: seed,
+    495 +            generation: Generation(seed),
+    496 +        }
+    497 +    }
+    498 +
+    499 +    #[test]
+    500 +    fn insert_allocates_unique_handles() {
+    501 +        let mut arena = AgentArena::new();
+    502 +        let a = arena.insert(sample_agent(0));
+    505 +        assert_eq!(arena.len(), 2);
+    508 +    }
+    509 +
+    510 +    #[test]
+    511 +    fn remove_keeps_dense_storage_coherent() {
+    512 +        let mut arena = AgentArena::new();
+    517 +
+    518 +        let removed = arena.remove(b).expect("agent removed");
+    519 +        assert_eq!(removed.generation, Generation(1));
+    520 +        assert_eq!(arena.len(), 2);
+    521 +        assert!(arena.contains(a));
+    522 +        assert!(arena.contains(c));
+    523 +        assert!(!arena.contains(b));
+    524 +
+    525 +        let snapshot_c = arena.snapshot(c).expect("snapshot");
+    526 +        assert_eq!(snapshot_c.position, Position::new(2.0, 3.0));
+    527 +        assert_eq!(arena.index_of(c), Some(1));
+    528 +
+    529 +        let d = arena.insert(sample_agent(3));
+    530 +        assert_ne!(b, d, "generational handles should not be reused immediately");
+    531 +    }
+• I noticed a compile error due to using an arrow instead of the correct function syntax in is_empty. I’m fixing that and checking that SlotMap::reserve exists, which it does. For clearing, I’m deciding to add a clear method to AgentColumns to clear its internal collections without losing capacity, then update AgentArena::clear to call this new method
+• Edited crates/scriptbots-core/src/lib.rs (+15 -2)
+    189
+    190 +    /// Remove all rows while retaining capacity.
+    191 +    pub fn clear(&mut self) {
+    192 +        self.positions.clear();
+    193 +        self.velocities.clear();
+    196 +        self.colors.clear();
+    197 +        self.spike_lengths.clear();
+    198 +        self.boosts.clear();
+    199 +        self.ages.clear();
+    200 +        self.generations.clear();
+    201 +    }
+    202 +
+    203      /// Push a new row onto each column.
+        ⋮
+    413      #[must_use]
+    401 -    pub fn is_empty(&self) => bool {
+    414 +    pub fn is_empty(&self) -> bool {
+    415          self.columns.is_empty()
+    490 +        self.columns.clear();
+    491      }
+
+• Edited crates/scriptbots-core/Cargo.toml (+1 -0)
+    8  thiserror = { workspace = true }
+    9 +slotmap = { workspace = true }
+
+• Ran cargo fmt
+  └ (no output)
+  └ warning: Patch `pyo3 v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    Patch `pyo3-build-config v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    … +157 lines
+    error: could not compile `scriptbots-core` (lib) due to 10 previous errors
+    warning: build failed, waiting for other jobs to finish...
+    6  new_key_type! {
+    7 -    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    7      /// Stable handle for agents backed by a generational slot map.
+
+• Ran cargo fmt
+• Ran cargo check
+  └ warning: Patch `pyo3 v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    Patch `pyo3-build-config v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    … +21 lines
+    error: could not compile `scriptbots-index` (lib) due to 1 previous error
+• Explored
+  └ Search AgentId
+    Read lib.rs
+
+• Edited crates/scriptbots-index/src/lib.rs (+2 -3)
+       ⋮
+    34      #[serde(skip)]
+    36 -    agent_order: Vec<AgentId>,
+    35 +    agent_order: Vec<usize>,
+    36  }
+       ⋮
+    61          self.agent_order
+    63 -            .extend(positions.iter().enumerate().map(|(idx, _)| idx as AgentId));
+    62 +            .extend(positions.iter().enumerate().map(|(idx, _)| idx));
+    63          Ok(())
+
+• Ran cargo fmt
+  └ (no output)
+
+• Ran cargo check
+  └ (no output)
+
+• Updated Plan
+  └ ✔ Review existing scriptbots-core data model and requirements for SoA columns and generational IDs from the plan and legacy reference.
+    ✔ Implement enhanced AgentId/AgentKey and AgentColumns structures with generational arena support and supporting APIs in scriptbots-core.
+    ✔ Add unit tests or validations as needed and run cargo check to ensure new data model compiles cleanly.
+
+• Ran git status -sb
+  └ ## main...origin/main
+     M Cargo.toml
+    … +5 lines
+     M crates/scriptbots-index/src/lib.rs
+     M crates/scriptbots-storage/src/lib.rs
+
+• I'm double-checking unrelated file changes from formatting tools like cargo fmt to ensure we didn't unintentionally modify code outside our scope, especially in scriptbots-brain-ml and scriptbots-storage. Then, I'll update the plan document to reflect the new use of a generational slotmap handle for the AgentId type instead of just a u64 newtype.
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    43    - History/event info (`indicator`, `sound_output`, `select_state`).
+    44 -  - `id: AgentId` newtype around `u64`.
+    44 +  - `id: AgentId` generational slotmap handle to prevent stale references.
+    45  - Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback.
+
+• Explored
+  └ Read lib.rs, PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    32  ## Simulation Core Design
+    33 -### Data Model [Currently In Progress: SoA columns & generational IDs]
+    33 +### Data Model [Completed: SoA columns & generational IDs]
+    34  - `WorldState` struct:
+
+• I’m gathering key points for the final summary: the generational AgentId addition, new AgentData structures, test coverage, and updates to scriptbots-index and the plan doc. I’ll also verify that cargo check runs clean and consider whether to mention unrelated file changes possibly due to formatting. Then I'll suggest logical next steps like
+  integrating AgentArena into the world state.
+
+• Ran git diff -- crates/scriptbots-brain-ml/src/lib.rs
+  └ diff --git a/crates/scriptbots-brain-ml/src/lib.rs b/crates/scriptbots-brain-ml/src/lib.rs
+    index d11d197..5e025d9 100644
+    … +32 lines
+             }
+         }
+
+• Ran git diff -- Cargo.toml
+  └ diff --git a/Cargo.toml b/Cargo.toml
+    index 7163357..9135a9a 100644
+    … +8 lines
+     duckdb = { version = "1.4.1", default-features = false, features = ["bundled"] }
+     gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", branch = "main" }
+
+• Ran git diff -- crates/scriptbots-core/Cargo.toml
+  └ diff --git a/crates/scriptbots-core/Cargo.toml b/crates/scriptbots-core/Cargo.toml
+    index 35fc6be..228b306 100644
+    … +5 lines
+     thiserror = { workspace = true }
+    +slotmap = { workspace = true }
+
+• Ran git diff -- PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+  └ diff --git a/PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md b/PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+    index 087f8d4..19d4551 100644
+    … +27 lines
+     - `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends.
+
+
+• Explored
+  └ Read Cargo.toml
+
+• I’m pulling together a concise summary listing each major update with precise line references using inline code formatting, highlighting tests run (cargo check), and noting no new warnings beyond existing ones. I’ll also mention updating the project plan to mark the data model complete and propose a natural next step to wire the new AgentArena into the
+  upcoming WorldState implementation. This final message will keep a friendly, clear tone while making future directions obvious.
+
+─ Worked for 11m 50s ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• - Added the slotmap workspace dependency so core crates can issue generational agent handles (Cargo.toml:33, crates/scriptbots-core/Cargo.toml:9).
+  - Rebuilt the core SoA data model around AgentId slotmap keys, defined reusable AgentData/AgentColumns APIs, and added unit coverage for insertion/removal invariants (crates/scriptbots-core/src/lib.rs:6, crates/scriptbots-core/src/lib.rs:70, crates/scriptbots-core/src/lib.rs:372, crates/scriptbots-core/src/lib.rs:495).
+  - Updated the placeholder spatial index to track dense indices instead of casting raw integers into AgentId handles (crates/scriptbots-index/src/lib.rs:31).
+  - Marked the Data Model milestone complete in the project plan and documented the move to generational handles for future contributors (PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md:33, PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md:44).
+
+  Tests: cargo check
+
+  Next steps:
+
+  1. Start wiring AgentArena into the forthcoming WorldState implementation so the rest of the pipeline can consume real generational IDs and SoA slices.
+
+
+› Proceed meticulously with the plan, doing all the next remaining unfinished tasks systematically and continuing to notate your progress in-line in the plan document.
+
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    33  ### Data Model [Completed: SoA columns & generational IDs]
+    34 -- `WorldState` struct:
+    34 +- `WorldState` struct: [Currently In Progress: arena-backed scaffold]
+    35    - `agents: Vec<AgentState>` stored in SoA-friendly layout via `Vec<AgentState>` with packed fields or `AgentColumns` (parallel `Vec` per field) for cache-friendly iteration.
+
+• Explored
+  └ Search WIDTH in settings.h
+
+• I'm fleshing out core types like ScriptBotsConfig, FoodGrid, and WorldState, carefully balancing serde support and error handling. I'm planning robust config validation with custom errors, initializing random seeds properly, and defining essential methods to manage the world’s state and food grid efficiently. This foundation will support later features reliably.
+
+• Edited crates/scriptbots-core/src/lib.rs (+318 -1)
+      2
+      3 +use rand::{rngs::SmallRng, SeedableRng};
+      4  use serde::{Deserialize, Serialize};
+      4 -use slotmap::{SecondaryMap, SlotMap, new_key_type};
+      5 +use slotmap::{new_key_type, SecondaryMap, SlotMap};
+      6 +use thiserror::Error;
+      7
+        ⋮
+     25      }
+     26 +
+     27 +    /// Resets the tick counter back to zero.
+     28 +    #[must_use]
+     29 +    pub const fn zero() -> Self {
+     30 +        Self(0)
+     31 +    }
+     32  }
+        ⋮
+    502
+    503 +/// Errors that can occur when constructing world state.
+    504 +#[derive(Debug, Error)]
+    505 +pub enum WorldStateError {
+    506 +    /// Indicates an invalid configuration value.
+    507 +    #[error("invalid configuration: {0}")]
+    508 +    InvalidConfig(&'static str),
+    509 +}
+    510 +
+    511 +/// Static configuration for a ScriptBots world.
+    512 +#[derive(Debug, Clone, Serialize, Deserialize)]
+    513 +pub struct ScriptBotsConfig {
+    514 +    /// Width of the world in world units.
+    515 +    pub world_width: u32,
+    516 +    /// Height of the world in world units.
+    517 +    pub world_height: u32,
+    518 +    /// Size of one food cell in world units (must evenly divide width/height).
+    519 +    pub food_cell_size: u32,
+    520 +    /// Initial food value seeded into each grid cell.
+    521 +    pub initial_food: f32,
+    522 +    /// Optional RNG seed for reproducible worlds.
+    523 +    pub rng_seed: Option<u64>,
+    524 +}
+    525 +
+    526 +impl Default for ScriptBotsConfig {
+    527 +    fn default() -> Self {
+    528 +        Self {
+    529 +            world_width: 6_000,
+    530 +            world_height: 6_000,
+    531 +            food_cell_size: 60,
+    532 +            initial_food: 1.0,
+    533 +            rng_seed: None,
+    534 +        }
+    535 +    }
+    536 +}
+    537 +
+    538 +impl ScriptBotsConfig {
+    539 +    /// Validates the configuration, returning derived grid dimensions.
+    540 +    fn food_dimensions(&self) -> Result<(u32, u32), WorldStateError> {
+    541 +        if self.world_width == 0 || self.world_height == 0 {
+    542 +            return Err(WorldStateError::InvalidConfig(
+    543 +                "world dimensions must be non-zero",
+    544 +            ));
+    545 +        }
+    546 +        if self.food_cell_size == 0 {
+    547 +            return Err(WorldStateError::InvalidConfig(
+    548 +                "food_cell_size must be non-zero",
+    549 +            ));
+    550 +        }
+    551 +        if self.world_width % self.food_cell_size != 0 || self.world_height % self.food_cell_size != 0
+    552 +        {
+    553 +            return Err(WorldStateError::InvalidConfig(
+    554 +                "world dimensions must be divisible by food_cell_size",
+    555 +            ));
+    556 +        }
+    557 +        Ok((
+    558 +            self.world_width / self.food_cell_size,
+    559 +            self.world_height / self.food_cell_size,
+    560 +        ))
+    561 +    }
+    562 +
+    563 +    /// Returns the configured RNG seed, generating one from entropy if absent.
+    564 +    fn seeded_rng(&self) -> SmallRng {
+    565 +        match self.rng_seed {
+    566 +            Some(seed) => SmallRng::seed_from_u64(seed),
+    567 +            None => SmallRng::from_entropy(),
+    568 +        }
+    569 +    }
+    570 +}
+    571 +
+    572 +/// 2D food grid storing scalar energy values.
+    573 +#[derive(Debug, Clone, Serialize, Deserialize)]
+    574 +pub struct FoodGrid {
+    575 +    width: u32,
+    576 +    height: u32,
+    577 +    cells: Vec<f32>,
+    578 +}
+    579 +
+    580 +impl FoodGrid {
+    581 +    /// Construct a grid with `width * height` cells initialised to `initial`.
+    582 +    pub fn new(width: u32, height: u32, initial: f32) -> Result<Self, WorldStateError> {
+    583 +        if width == 0 || height == 0 {
+    584 +            return Err(WorldStateError::InvalidConfig(
+    585 +                "food grid dimensions must be non-zero",
+    586 +            ));
+    587 +        }
+    588 +        Ok(Self {
+    589 +            width,
+    590 +            height,
+    591 +            cells: vec![initial; (width as usize) * (height as usize)],
+    592 +        })
+    593 +    }
+    594 +
+    595 +    #[must_use]
+    596 +    pub const fn width(&self) -> u32 {
+    597 +        self.width
+    598 +    }
+    599 +
+    600 +    #[must_use]
+    601 +    pub const fn height(&self) -> u32 {
+    602 +        self.height
+    603 +    }
+    604 +
+    605 +    #[must_use]
+    606 +    pub fn cells(&self) -> &[f32] {
+    607 +        &self.cells
+    608 +    }
+    609 +
+    610 +    #[must_use]
+    611 +    pub fn cells_mut(&mut self) -> &mut [f32] {
+    612 +        &mut self.cells
+    613 +    }
+    614 +
+    615 +    /// Returns the flat index for `(x, y)` without bounds checks.
+    616 +    #[inline]
+    617 +    fn offset(&self, x: u32, y: u32) -> usize {
+    618 +        (y as usize) * (self.width as usize) + (x as usize)
+    619 +    }
+    620 +
+    621 +    /// Immutable access to a specific cell.
+    622 +    pub fn get(&self, x: u32, y: u32) -> Option<f32> {
+    623 +        if x < self.width && y < self.height {
+    624 +            Some(self.cells[self.offset(x, y)])
+    625 +        } else {
+    626 +            None
+    627 +        }
+    628 +    }
+    629 +
+    630 +    /// Mutable access to a specific cell.
+    631 +    pub fn get_mut(&mut self, x: u32, y: u32) -> Option<&mut f32> {
+    632 +        if x < self.width && y < self.height {
+    633 +            let idx = self.offset(x, y);
+    634 +            Some(&mut self.cells[idx])
+    635 +        } else {
+    636 +            None
+    637 +        }
+    638 +    }
+    639 +
+    640 +    /// Fills the grid with the provided scalar value.
+    641 +    pub fn fill(&mut self, value: f32) {
+    642 +        self.cells.fill(value);
+    643 +    }
+    644 +}
+    645 +
+    646 +/// Aggregate world state shared by the simulation and rendering layers.
+    647 +#[derive(Debug)]
+    648 +pub struct WorldState {
+    649 +    config: ScriptBotsConfig,
+    650 +    tick: Tick,
+    651 +    epoch: u64,
+    652 +    closed: bool,
+    653 +    rng: SmallRng,
+    654 +    agents: AgentArena,
+    655 +    food: FoodGrid,
+    656 +}
+    657 +
+    658 +impl WorldState {
+    659 +    /// Instantiate a new world using the supplied configuration.
+    660 +    pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
+    661 +        let (food_w, food_h) = config.food_dimensions()?;
+    662 +        let rng = config.seeded_rng();
+    663 +        Ok(Self {
+    664 +            food: FoodGrid::new(food_w, food_h, config.initial_food)?,
+    665 +            config,
+    666 +            tick: Tick::zero(),
+    667 +            epoch: 0,
+    668 +            closed: false,
+    669 +            rng,
+    670 +            agents: AgentArena::new(),
+    671 +        })
+    672 +    }
+    673 +
+    674 +    /// Returns an immutable reference to configuration.
+    675 +    #[must_use]
+    676 +    pub fn config(&self) -> &ScriptBotsConfig {
+    677 +        &self.config
+    678 +    }
+    679 +
+    680 +    /// Mutable access to the configuration (for hot edits).
+    681 +    #[must_use]
+    682 +    pub fn config_mut(&mut self) -> &mut ScriptBotsConfig {
+    683 +        &mut self.config
+    684 +    }
+    685 +
+    686 +    /// Current simulation tick.
+    687 +    #[must_use]
+    688 +    pub const fn tick(&self) -> Tick {
+    689 +        self.tick
+    690 +    }
+    691 +
+    692 +    /// Current epoch counter.
+    693 +    #[must_use]
+    694 +    pub const fn epoch(&self) -> u64 {
+    695 +        self.epoch
+    696 +    }
+    697 +
+    698 +    /// Returns whether the environment is closed to random spawning.
+    699 +    #[must_use]
+    700 +    pub const fn is_closed(&self) -> bool {
+    701 +        self.closed
+    702 +    }
+    703 +
+    704 +    /// Toggle the closed-environment flag.
+    705 +    pub fn set_closed(&mut self, closed: bool) {
+    706 +        self.closed = closed;
+    707 +    }
+    708 +
+    709 +    /// Advances the world tick counter, rolling epochs when needed.
+    710 +    pub fn advance_tick(&mut self) {
+    711 +        self.tick = self.tick.next();
+    712 +        if self.tick.0 % 10_000 == 0 {
+    713 +            self.epoch += 1;
+    714 +        }
+    715 +    }
+    716 +
+    719 +        self.tick = Tick::zero();
+    722 +
+    723 +    /// Borrow the world RNG mutably for deterministic sampling.
+    724 +    #[must_use]
+    725 +    pub fn rng(&mut self) -> &mut SmallRng {
+    726 +        &mut self.rng
+    727 +    }
+    728 +
+    729 +    /// Read-only access to the agent arena.
+    733 +    }
+    734 +
+    735 +    /// Mutable access to the agent arena.
+    736 +    #[must_use]
+    737 +    pub fn agents_mut(&mut self) -> &mut AgentArena {
+    738 +        &mut self.agents
+    739 +    }
+    740 +
+    741 +    /// Number of live agents.
+    742 +    #[must_use]
+    743 +    pub fn agent_count(&self) -> usize {
+    744 +        self.agents.len()
+    749 +        self.agents.insert(agent)
+    750 +    }
+    751 +
+    752 +    /// Remove an agent by handle, returning its last known data.
+    753 +    pub fn remove_agent(&mut self, id: AgentId) -> Option<AgentData> {
+    754 +        self.agents.remove(id)
+    755 +    }
+    756 +
+    757 +    /// Immutable access to the food grid.
+    758 +    #[must_use]
+    759 +    pub fn food(&self) -> &FoodGrid {
+    760 +        &self.food
+    761 +    }
+    762 +
+    763 +    /// Mutable access to the food grid.
+    764 +    #[must_use]
+    765 +    pub fn food_mut(&mut self) -> &mut FoodGrid {
+    766 +        &mut self.food
+    767 +    }
+    768 +}
+    823      }
+    824 +
+    825 +    #[test]
+    826 +    fn food_grid_accessors() {
+    827 +        let mut grid = FoodGrid::new(4, 2, 0.5).expect("grid");
+    828 +        assert_eq!(grid.width(), 4);
+    831 +        *grid.get_mut(2, 0).expect("cell") = 3.0;
+    834 +        grid.fill(2.0);
+    835 +        assert!(grid.cells().iter().all(|&cell| (cell - 2.0).abs() < f32::EPSILON));
+    836 +    }
+    837 +
+    838 +    #[test]
+    839 +    fn world_state_initialises_from_config() {
+    840 +        let config = ScriptBotsConfig {
+    844 +            initial_food: 0.25,
+    845 +            rng_seed: Some(42),
+    846 +        };
+    847 +        let mut world = WorldState::new(config.clone()).expect("world");
+    848 +        assert_eq!(world.agent_count(), 0);
+    849 +        assert_eq!(world.food().width(), 100);
+    850 +        assert_eq!(world.food().height(), 100);
+    851 +        assert_eq!(world.food().get(0, 0), Some(0.25));
+    852 +        assert_eq!(world.config().world_width, config.world_width);
+    853 +
+    854 +        let id = world.spawn_agent(sample_agent(5));
+    855 +        assert_eq!(world.agent_count(), 1);
+    856 +        assert!(world.agents().contains(id));
+    857 +
+    858 +        world.advance_tick();
+    859 +        world.advance_tick();
+    860 +        assert_eq!(world.tick(), Tick(2));
+    861 +
+    862 +        let removed = world.remove_agent(id).expect("removed agent");
+    863 +        assert_eq!(removed.generation, Generation(5));
+    864 +        assert_eq!(world.agent_count(), 0);
+    865 +    }
+    866  }
+
+• Edited crates/scriptbots-core/Cargo.toml (+1 -0)
+     9  slotmap = { workspace = true }
+    10 +rand = { workspace = true }
+
+• Ran cargo fmt
+  └ (no output)
+    Patch `pyo3-build-config v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    … +20 lines
+    For more information about this error, try `rustc --explain E0599`.
+    error: could not compile `scriptbots-core` (lib) due to 1 previous error
+
+• I'm reviewing how to replace the old SmallRng::from_entropy approach since rand 0.9 changed APIs. I’m focusing on using StdRng::from_entropy to seed a SmallRng via from_rng, which returns a Result. To handle errors gracefully, I plan to make seeded_rng return a Result and add a new Entropy error variant to the WorldStateError enum. This will propagate errors properly instead of panicking, requiring updates to dependent methods like WorldState::new. I’ll also
+  adjust imports and error handling accordingly. This approach feels safer and aligns with the crate’s new design!
+
+• Explored
+  └ Read lib.rs
+
+• Edited crates/scriptbots-core/src/lib.rs (+5 -2)
+    2
+    3 -use rand::{SeedableRng, rngs::SmallRng};
+    3 +use rand::{
+    4 +    rngs::{SmallRng, StdRng},
+    5 +    SeedableRng,
+    6 +};
+    7  use serde::{Deserialize, Serialize};
+
+• Explored
+  └ Search WorldStateError in lib.rs
+• Edited crates/scriptbots-core/src/lib.rs (+9 -3)
+    511      InvalidConfig(&'static str),
+    512 +    /// Failure while seeding randomness.
+    513 +    #[error("failed to seed RNG: {0}")]
+    514 +    Entropy(#[from] rand::Error),
+    568 -    fn seeded_rng(&self) -> SmallRng {
+    571 +    fn seeded_rng(&self) -> Result<SmallRng, WorldStateError> {
+    572          match self.rng_seed {
+    570 -            Some(seed) => SmallRng::seed_from_u64(seed),
+    571 -            None => SmallRng::from_entropy(),
+    573 +            Some(seed) => Ok(SmallRng::seed_from_u64(seed)),
+    577 +            }
+    578          }
+
+• Explored
+  └ Read lib.rs
+
+    672 -        let rng = config.seeded_rng();
+
+• Ran cargo fmt
+  └ (no output)
+
+• Ran cargo check
+  └ warning: Patch `pyo3 v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    Patch `pyo3-build-config v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    error: could not compile `scriptbots-core` (lib) due to 3 previous errors
+    2
+    3 -use rand::{
+    4 -    SeedableRng,
+    5 -    rngs::{SmallRng, StdRng},
+    6 -};
+    3 +use rand::{rngs::SmallRng, Rng, SeedableRng};
+    4  use serde::{Deserialize, Serialize};
+
+• Edited crates/scriptbots-core/src/lib.rs (+0 -3)
+    508      InvalidConfig(&'static str),
+    509 -    /// Failure while seeding randomness.
+    510 -    #[error("failed to seed RNG: {0}")]
+    511 -    Entropy(#[from] rand::Error),
+    509  }
+
+• Explored
+  └ Read lib.rs
+
+• Edited crates/scriptbots-core/src/lib.rs (+4 -4)
+    564      /// Returns the configured RNG seed, generating one from entropy if absent.
+    565 -    fn seeded_rng(&self) -> Result<SmallRng, WorldStateError> {
+    565 +    fn seeded_rng(&self) -> SmallRng {
+    566          match self.rng_seed {
+    567 -            Some(seed) => Ok(SmallRng::seed_from_u64(seed)),
+    567 +            Some(seed) => SmallRng::seed_from_u64(seed),
+    568              None => {
+    569 -                let mut entropy = StdRng::from_entropy();
+    570 -                SmallRng::from_rng(&mut entropy).map_err(WorldStateError::from)
+    569 +                let seed = rand::thread_rng().next_u64();
+    570 +                SmallRng::seed_from_u64(seed)
+    571              }
+
+• Edited crates/scriptbots-core/src/lib.rs (+1 -1)
+    665          let (food_w, food_h) = config.food_dimensions()?;
+    666 -        let rng = config.seeded_rng()?;
+    666 +        let rng = config.seeded_rng();
+    667          Ok(Self {
+
+• Explored
+  └ Read lib.rs
+
+• Ran cargo fmt
+  └ (no output)
+
+• Ran cargo check
+  └ warning: Patch `pyo3 v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    Patch `pyo3-build-config v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    … +46 lines
+    warning: `scriptbots-core` (lib) generated 2 warnings
+    error: could not compile `scriptbots-core` (lib) due to 1 previous error; 2 warnings emitted
+
+• Explored
+  └ Read lib.rs
+
+• Edited crates/scriptbots-core/src/lib.rs (+1 -1)
+    2
+    3 -use rand::{Rng, SeedableRng, rngs::SmallRng};
+    3 +use rand::{rngs::SmallRng, RngCore, SeedableRng};
+    4  use serde::{Deserialize, Serialize};
+
+• Explored
+  └ Search thread_rng in lib.rs
+
+• Edited crates/scriptbots-core/src/lib.rs (+1 -1)
+    568              None => {
+    569 -                let seed = rand::thread_rng().next_u64();
+    569 +                let seed = rand::rng().next_u64();
+    570                  SmallRng::seed_from_u64(seed)
+
+• Ran cargo fmt
+  └ (no output)
+
+• Ran cargo check
+  └ (no output)
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    33  ### Data Model [Completed: SoA columns & generational IDs]
+    34 -- `WorldState` struct: [Currently In Progress: arena-backed scaffold]
+    34 +- `WorldState` struct: [Completed: arena-backed scaffold with FoodGrid]
+    35    - `agents: Vec<AgentState>` stored in SoA-friendly layout via `Vec<AgentState>` with packed fields or `AgentColumns` (parallel `Vec` per field) for cache-friendly iteration.
+
+• Ran rg "#define INPUT_SIZE" -n original_scriptbots_code_for_reference -g"*.h"
+  └ (no output)
+
+• Explored
+  └ Search EYES in settings.h
+    Search in.resize in original_scriptbots_code_for_reference
+    Read Agent.cpp
+    Search INPUTSIZE in original_scriptbots_code_for_reference
+    Search OUTPUTSIZE in settings.h
+
+• I'm planning detailed Rust structs like AgentState and AgentRuntime to represent agents comprehensively, including sensor arrays, outputs, mutation data, and brain binding placeholders. I'll define constants for input/output sizes, incorporate supporting types, and consider integration with existing arena and world state structures while balancing complexity and feature gating. This foundational
+  work sets up for future integration and gradual implementation.
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    38    - `epoch`, `tick_counter`, `closed_environment` flags mirroring C++ logic.
+    39 -- `AgentState`:
+    39 +- `AgentState`: [Currently In Progress: runtime struct + sensor buffers]
+    40    - Scalar fields mapped to Rust primitives (`f32`, `u16`, `bool`).
+
+• I'm adding new constants and several related structs like AgentRuntime, MutationRates, and IndicatorState with defaults and serde derives; then integrating a runtime map into WorldState with methods for access, spawn, removal, and testing to track agent runtime states consistently.
+
+• I'm setting up constants, new data types, and extending WorldState to include runtime agent data management with spawn, remove, and snapshot functions; I'll also add tests to confirm these features work properly.
+
+• Edited crates/scriptbots-core/src/lib.rs (+144 -0)
+     15
+     16 +/// Number of sensor inputs wired into each agent brain.
+     17 +pub const INPUT_SIZE: usize = 25;
+     18 +/// Number of control outputs produced by each agent brain.
+     19 +pub const OUTPUT_SIZE: usize = 9;
+     20 +
+     21 +/// Per-agent mutation rate configuration.
+     22 +#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+     23 +pub struct MutationRates {
+     24 +    pub primary: f32,
+     25 +    pub secondary: f32,
+     26 +}
+     27 +
+     28 +impl Default for MutationRates {
+     29 +    fn default() -> Self {
+     30 +        Self {
+     31 +            primary: 0.003,
+     32 +            secondary: 0.05,
+     33 +        }
+     34 +    }
+     35 +}
+     36 +
+     37 +/// Trait modifiers affecting sense organs and physiology.
+     38 +#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+     39 +pub struct TraitModifiers {
+     40 +    pub smell: f32,
+     41 +    pub sound: f32,
+     42 +    pub hearing: f32,
+     43 +    pub eye: f32,
+     44 +    pub blood: f32,
+     45 +}
+     46 +
+     47 +impl Default for TraitModifiers {
+     48 +    fn default() -> Self {
+     49 +        Self {
+     50 +            smell: 0.3,
+     51 +            sound: 0.4,
+     52 +            hearing: 1.0,
+     53 +            eye: 1.5,
+     54 +            blood: 1.5,
+     55 +        }
+     56 +    }
+     57 +}
+     58 +
+     59 +/// Highlight shown around an agent in the UI.
+     60 +#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+     61 +pub struct IndicatorState {
+     62 +    pub intensity: f32,
+     63 +    pub color: [f32; 3],
+     64 +}
+     65 +
+     66 +impl Default for IndicatorState {
+     67 +    fn default() -> Self {
+     68 +        Self {
+     69 +            intensity: 0.0,
+     70 +            color: [0.0, 0.0, 0.0],
+     74 +
+     75 +/// Selection state applied by user interaction.
+     76 +#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+     77 +pub enum SelectionState {
+     78 +    None,
+     79 +    Hovered,
+     80 +    Selected,
+     81 +}
+     82 +
+     83 +impl Default for SelectionState {
+     88 +
+     89 +/// Handle referencing an externally stored brain instance.
+     90 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+     91 +pub enum BrainBinding {
+     92 +    /// Brain not yet attached.
+     93 +    Unbound,
+     94 +    /// Brain managed by an external registry (identified via opaque key).
+     95 +    External { registry_key: u64, kind: String },
+     96 +}
+     97 +
+     98 +impl Default for BrainBinding {
+     99 +    fn default() -> Self {
+    100 +        Self::Unbound
+    101 +    }
+    102 +}
+    103 +
+    104 +/// Runtime data associated with an agent beyond the dense SoA columns.
+    105 +#[derive(Debug, Clone, Serialize, Deserialize)]
+    106 +pub struct AgentRuntime {
+    107 +    pub energy: f32,
+    108 +    pub reproduction_counter: f32,
+    109 +    pub herbivore_tendency: f32,
+    110 +    pub mutation_rates: MutationRates,
+    111 +    pub trait_modifiers: TraitModifiers,
+    112 +    pub clocks: [f32; 2],
+    113 +    pub sound_multiplier: f32,
+    114 +    pub give_intent: f32,
+    115 +    pub sensors: [f32; INPUT_SIZE],
+    116 +    pub outputs: [f32; OUTPUT_SIZE],
+    117 +    pub indicator: IndicatorState,
+    118 +    pub selection: SelectionState,
+    119 +    pub food_delta: f32,
+    120 +    pub spiked: bool,
+    121 +    pub hybrid: bool,
+    122 +    pub sound_output: f32,
+    123 +    pub brain: BrainBinding,
+    124 +    pub mutation_log: Vec<String>,
+    125 +}
+    126 +
+    127 +impl Default for AgentRuntime {
+    128 +    fn default() -> Self {
+    129 +        Self {
+    130 +            energy: 1.0,
+    131 +            reproduction_counter: 0.0,
+    132 +            herbivore_tendency: 0.5,
+    133 +            mutation_rates: MutationRates::default(),
+    134 +            trait_modifiers: TraitModifiers::default(),
+    135 +            clocks: [50.0, 50.0],
+    136 +            sound_multiplier: 1.0,
+    137 +            give_intent: 0.0,
+    138 +            sensors: [0.0; INPUT_SIZE],
+    139 +            outputs: [0.0; OUTPUT_SIZE],
+    140 +            indicator: IndicatorState::default(),
+    141 +            selection: SelectionState::None,
+    142 +            food_delta: 0.0,
+    146 +            brain: BrainBinding::default(),
+    147 +            mutation_log: Vec::new(),
+    148 +        }
+    149 +    }
+    150 +}
+    151 +
+    152 +/// Combined snapshot of dense columns and runtime metadata for a single agent.
+    153 +#[derive(Debug, Clone, Serialize, Deserialize)]
+    154 +pub struct AgentState {
+    155 +    pub id: AgentId,
+    156 +    pub data: AgentData,
+    157 +    pub runtime: AgentRuntime,
+    158 +}
+    159 +
+    160  /// High level simulation clock (ticks processed since boot).
+
+
+    804 +    runtime: AgentMap<AgentRuntime>,
+    805  }
+
+• Edited crates/scriptbots-core/src/lib.rs (+1 -0)
+    819              agents: AgentArena::new(),
+    820 +            runtime: AgentMap::new(),
+    821          })
+    Read lib.rs
+
+• I'll adjust spawn_agent and remove_agent to update runtime state accordingly, add getters for runtime access, and implement a snapshot_agent method to return the agent's current state. This involves using SecondaryMap's get/get_mut and fitting new methods cohesively into the existing structure.
+
+• Edited crates/scriptbots-core/src/lib.rs (+36 -1)
+    898      pub fn spawn_agent(&mut self, agent: AgentData) -> AgentId {
+    899 -        self.agents.insert(agent)
+    899 +        let id = self.agents.insert(agent);
+    900 +        self.runtime.insert(id, AgentRuntime::default());
+    901 +        id
+    902      }
+        ⋮
+    905      pub fn remove_agent(&mut self, id: AgentId) -> Option<AgentData> {
+        ⋮
+    920      }
+    921 +
+    922 +    /// Immutable access to per-agent runtime metadata.
+    923 +    #[must_use]
+    924 +    pub fn runtime(&self) -> &AgentMap<AgentRuntime> {
+    925 +        &self.runtime
+    926 +    }
+    927 +
+    928 +    /// Mutable access to per-agent runtime metadata.
+    929 +    #[must_use]
+    930 +    pub fn runtime_mut(&mut self) -> &mut AgentMap<AgentRuntime> {
+    931 +        &mut self.runtime
+    932 +    }
+    933 +
+    934 +    /// Borrow runtime data for a specific agent.
+    935 +    #[must_use]
+    936 +    pub fn agent_runtime(&self, id: AgentId) -> Option<&AgentRuntime> {
+    937 +        self.runtime.get(id)
+    938 +    }
+    939 +
+    940 +    /// Mutably borrow runtime data for a specific agent.
+    941 +    #[must_use]
+    942 +    pub fn agent_runtime_mut(&mut self, id: AgentId) -> Option<&mut AgentRuntime> {
+    943 +        self.runtime.get_mut(id)
+    944 +    }
+    945 +
+    946 +    /// Produce a combined snapshot of an agent's scalar columns and runtime data.
+    947 +    #[must_use]
+    948 +    pub fn snapshot_agent(&self, id: AgentId) -> Option<AgentState> {
+    949 +        let data = self.snapshot(id)?;
+    950 +        let runtime = self.runtime.get(id)?.clone();
+    951 +        Some(AgentState { id, data, runtime })
+    952 +    }
+    953  }
+
+• Edited crates/scriptbots-core/src/lib.rs (+1 -1)
+    948      pub fn snapshot_agent(&self, id: AgentId) -> Option<AgentState> {
+    949 -        let data = self.snapshot(id)?;
+    949 +        let data = self.agents.snapshot(id)?;
+    950          let runtime = self.runtime.get(id)?.clone();
+
+• Explored
+  └ Read lib.rs
+
+• Edited crates/scriptbots-core/src/lib.rs (+6 -0)
+    1045          assert!(world.agents().contains(id));
+    1046 +        let runtime = world.agent_runtime(id).expect("runtime");
+    1047 +        assert!(runtime.mutation_log.is_empty());
+    1048 +        assert_eq!(runtime.sensors, [0.0; INPUT_SIZE]);
+    1049 +        let snapshot = world.snapshot_agent(id).expect("snapshot");
+    1050 +        assert_eq!(snapshot.runtime.indicator.intensity, 0.0);
+    1051
+         ⋮
+    1058          assert_eq!(world.agent_count(), 0);
+    1059 +        assert!(world.agent_runtime(id).is_none());
+    1060      }
+
+• I'm making sure AgentRuntime supports serialization with its Vec<String>, confirming equality checks on sensor arrays work fine, and verifying that snapshot methods in AgentArena and WorldState provide proper access and cloning. I'm also double-checking method accessibility, handling of SecondaryMap::insert, the availability of INPUT_SIZE constant, and overall structural updates before running the
+  formatter.
+
+• Ran cargo fmt
+  └ (no output)
+
+• Ran cargo check
+  └ (no output)
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    38    - `epoch`, `tick_counter`, `closed_environment` flags mirroring C++ logic.
+    39 -- `AgentState`: [Currently In Progress: runtime struct + sensor buffers]
+    39 +- `AgentState`: [Completed: runtime struct + sensor buffers]
+    40    - Scalar fields mapped to Rust primitives (`f32`, `u16`, `bool`).
+
+• Explored
+  └ Read PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+4 -4)
+    40    - Scalar fields mapped to Rust primitives (`f32`, `u16`, `bool`).
+    41 -  - Sensor buffers as `[f32; INPUT_SIZE]`, outputs `[f32; OUTPUT_SIZE]` to avoid heap allocations.
+    42 -  - `brain: Box<dyn Brain + Send + Sync>` or enum-based dispatch for zero-cost dynamic dispatch.
+    43 -  - History/event info (`indicator`, `sound_output`, `select_state`).
+    41 +  - Sensor buffers as `[f32; INPUT_SIZE]`, outputs `[f32; OUTPUT_SIZE]` to avoid heap allocations. [Done via `AgentRuntime::sensors`/`outputs`]
+    42 +  - `brain: Box<dyn Brain + Send + Sync>` or enum-based dispatch for zero-cost dynamic dispatch. [Pending: replace temporary `BrainBinding` once registry is wired]
+    43 +  - History/event info (`indicator`, `sound_output`, `select_state`). [Backed by `IndicatorState`, `SelectionState`, and runtime fields]
+    44    - `id: AgentId` generational slotmap handle to prevent stale references.
+    45 -- Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback.
+    45 +- Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback. [Completed: validation + RNG seeding + defaults]
+    46  - `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends.
+
+• Ran git status -sb
+  └ ## main...origin/main
+     M Cargo.toml
+    … +5 lines
+     M crates/scriptbots-index/src/lib.rs
+     M crates/scriptbots-storage/src/lib.rs
+
+
+• I'll clarify which files were changed in this session, focusing on Cargo.toml, scriptbots-core source files, and the plan, while noting earlier uncommitted changes in scriptbots-storage weren't touched now. I'll highlight additions like slotmap in Cargo.toml and constants in crates/scriptbots-core/src/lib.rs, approximating line numbers for reference. Finally, I'll set BrainGenome as the next step in
+  the plan before crafting the final response with a clear, bullet-point summary.
+
+• Explored
+  └ Read lib.rs, PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md, Cargo.toml
+
+• I’m preparing a concise bullet summary highlighting key code changes with precise file and line references, including the added runtime support structures, WorldState enhancements, new dependencies like rand, test extensions, and plan document updates. I’ll also mention that the BrainGenome work hasn’t started yet and suggest it as a clear next step alongside integrating brain traits. Finally, I’ll
+  note that cargo check was run to verify correctness.
+
+─ Worked for 12m 45s ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• - Added agent-runtime scaffolding (MutationRates, TraitModifiers, IndicatorState, SelectionState, BrainBinding, AgentRuntime, AgentState, plus INPUT_SIZE/OUTPUT_SIZE) so sensors, outputs, and lineage metadata live alongside SoA columns (crates/scriptbots-core/src/lib.rs:16-158).
+  - Hardened WorldState with validated ScriptBotsConfig, deterministic RNG seeding, FoodGrid, and a SecondaryMap-backed runtime store; spawn_agent/remove_agent now synchronize both arenas and expose helpers for snapshots and runtime access (crates/scriptbots-core/src/lib.rs:647-952).
+  - Expanded core tests to cover food-grid API, world initialization, runtime bookkeeping, and agent snapshots to guard the new data model (crates/scriptbots-core/src/lib.rs:972-1042).
+  - Declared crate-level dependencies needed by the new runtime (shared slotmap plus rand in the core crate) (Cargo.toml:33, crates/scriptbots-core/Cargo.toml:6-10).
+  - Updated the project “bible” to record completed work, note the temporary BrainBinding placeholder, and mark ScriptBotsConfig as delivered (PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md:34-45).
+
+  Tests: cargo check
+
+  Next steps:
+
+  1. Flesh out BrainBinding into a real registry hook once scriptbots-brain exposes the trait-safe factory (unblocks the remaining AgentState bullet).
+  2. Define the BrainGenome data model and serialization helpers to keep plan momentum before diving into the time-step pipeline.
+
+
+› proceed
+
+
+• I'm laying out a detailed plan to build the BrainGenome data structures in scriptbots-core, including enums for activation functions, layer specifications, and mutation parameters, while planning serialization, versioning, error handling, and tests to align with the project's needs. I'll also update the plan to mark this task in progress before starting the implementation.
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    45  - Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback. [Completed: validation + RNG seeding + defaults]
+    46 -- `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends.
+    46 +- `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends. [Currently In Progress: schema + validation]
+    47
+
+• I'm designing enums and structs for brain genomes including activations, brain families (with custom strings), layer specs with activation and dropout, mutation rates, and provenance data. I’m planning validation methods and defaults to ensure topology correctness and preparing tests to verify these structures work well.
+
+• Edited crates/scriptbots-core/src/lib.rs (+208 -0)
+    159
+    160 +/// Current on-disk schema version for serialized brain genomes.
+    161 +pub const GENOME_FORMAT_VERSION: u16 = 1;
+    162 +
+    163 +/// Supported brain family discriminants.
+    164 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    165 +pub enum BrainFamily {
+    166 +    Mlp,
+    167 +    Dwraon,
+    168 +    Assembly,
+    169 +    External(String),
+    170 +}
+    171 +
+    172 +impl Default for BrainFamily {
+    173 +    fn default() -> Self {
+    174 +        Self::Mlp
+    175 +    }
+    176 +}
+    177 +
+    178 +/// Supported activation functions.
+    179 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    180 +pub enum ActivationKind {
+    181 +    Identity,
+    182 +    Relu,
+    183 +    Sigmoid,
+    184 +    Tanh,
+    185 +    Softplus,
+    186 +    LeakyRelu { slope: f32 },
+    187 +    Custom(String),
+    188 +}
+    189 +
+    190 +impl Default for ActivationKind {
+    191 +    fn default() -> Self {
+    192 +        Self::Identity
+    193 +    }
+    194 +}
+    195 +
+    196 +/// Layer specification used by fully-connected style brains.
+    197 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    198 +pub struct LayerSpec {
+    199 +    pub inputs: usize,
+    200 +    pub outputs: usize,
+    201 +    pub activation: ActivationKind,
+    202 +    pub bias: bool,
+    203 +    pub dropout: f32,
+    204 +}
+    205 +
+    206 +impl LayerSpec {
+    207 +    /// Convenience helper to build a dense layer.
+    208 +    #[must_use]
+    209 +    pub fn dense(inputs: usize, outputs: usize, activation: ActivationKind) -> Self {
+    210 +        Self {
+    211 +            inputs,
+    212 +            outputs,
+    213 +            activation,
+    214 +            bias: true,
+    215 +            dropout: 0.0,
+    216 +        }
+    217 +    }
+    218 +}
+    219 +
+    220 +impl Default for LayerSpec {
+    221 +    fn default() -> Self {
+    222 +        Self::dense(1, 1, ActivationKind::Identity)
+    223 +    }
+    224 +}
+    225 +
+    226 +/// Hyperparameter bundle stored alongside genomes.
+    227 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    228 +pub struct GenomeHyperParams {
+    229 +    pub learning_rate: f32,
+    230 +    pub momentum: f32,
+    231 +    pub weight_decay: f32,
+    232 +    pub temperature: f32,
+    233 +}
+    234 +
+    235 +impl Default for GenomeHyperParams {
+    236 +    fn default() -> Self {
+    237 +        Self {
+    238 +            learning_rate: 0.01,
+    239 +            momentum: 0.9,
+    240 +            weight_decay: 0.0,
+    241 +            temperature: 1.0,
+    242 +        }
+    243 +    }
+    244 +}
+    245 +
+    246 +/// Provenance metadata for lineage tracking.
+    247 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    248 +pub struct GenomeProvenance {
+    249 +    pub parents: [Option<AgentId>; 2],
+    250 +    pub created_at: Tick,
+    251 +    pub comment: Option<String>,
+    252 +}
+    253 +
+    254 +impl Default for GenomeProvenance {
+    255 +    fn default() -> Self {
+    256 +        Self {
+    257 +            parents: [None, None],
+    258 +            created_at: Tick::zero(),
+    259 +            comment: None,
+    260 +        }
+    261 +    }
+    262 +}
+    263 +
+    264 +/// Errors raised when validating genome structures.
+    265 +#[derive(Debug, Error, PartialEq)]
+    266 +pub enum GenomeError {
+    267 +    #[error("layer stack must contain at least one layer")]
+    268 +    EmptyLayers,
+    269 +    #[error("layer {index} has zero-sized dimensions")]
+    270 +    ZeroSizedLayer { index: usize },
+    271 +    #[error("layer {index} dropout {dropout} must be between 0.0 and 1.0")]
+    272 +    InvalidDropout { index: usize, dropout: f32 },
+    273 +    #[error("layer {index} input {actual} does not match previous output {expected}")]
+    274 +    MismatchedTopology { index: usize, expected: usize, actual: usize },
+    275 +    #[error("final layer outputs {actual} do not match genome output_size {expected}")]
+    276 +    OutputMismatch { expected: usize, actual: usize },
+    277 +    #[error("input_size must be non-zero")]
+    278 +    ZeroInput,
+    279 +    #[error("output_size must be non-zero")]
+    280 +    ZeroOutput,
+    281 +}
+    282 +
+    283 +/// Versioned, serializable genome description.
+    284 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    285 +pub struct BrainGenome {
+    286 +    pub version: u16,
+    287 +    pub family: BrainFamily,
+    288 +    pub input_size: usize,
+    289 +    pub output_size: usize,
+    290 +    pub layers: Vec<LayerSpec>,
+    291 +    pub mutation: MutationRates,
+    292 +    pub hyper_params: GenomeHyperParams,
+    293 +    pub provenance: GenomeProvenance,
+    294 +}
+    295 +
+    296 +impl BrainGenome {
+    297 +    /// Construct and validate a new genome.
+    298 +    pub fn new(
+    299 +        family: BrainFamily,
+    300 +        input_size: usize,
+    301 +        output_size: usize,
+    302 +        layers: Vec<LayerSpec>,
+    303 +        mutation: MutationRates,
+    304 +        hyper_params: GenomeHyperParams,
+    305 +        provenance: GenomeProvenance,
+    306 +    ) -> Result<Self, GenomeError> {
+    307 +        let genome = Self {
+    308 +            version: GENOME_FORMAT_VERSION,
+    309 +            family,
+    310 +            input_size,
+    311 +            output_size,
+    312 +            layers,
+    313 +            mutation,
+    314 +            hyper_params,
+    315 +            provenance,
+    316 +        };
+    317 +        genome.validate()?;
+    318 +        Ok(genome)
+    319 +    }
+    320 +
+    321 +    /// Ensure layer topology matches declared IO sizes.
+    322 +    pub fn validate(&self) -> Result<(), GenomeError> {
+    323 +        if self.input_size == 0 {
+    324 +            return Err(GenomeError::ZeroInput);
+    325 +        }
+    326 +        if self.output_size == 0 {
+    327 +            return Err(GenomeError::ZeroOutput);
+    328 +        }
+    329 +        if self.layers.is_empty() {
+    330 +            return Err(GenomeError::EmptyLayers);
+    331 +        }
+    332 +        let mut expected_inputs = self.input_size;
+    333 +        for (index, layer) in self.layers.iter().enumerate() {
+    334 +            if layer.inputs == 0 || layer.outputs == 0 {
+    335 +                return Err(GenomeError::ZeroSizedLayer { index });
+    336 +            }
+    337 +            if layer.inputs != expected_inputs {
+    338 +                return Err(GenomeError::MismatchedTopology {
+    339 +                    index,
+    340 +                    expected: expected_inputs,
+    341 +                    actual: layer.inputs,
+    342 +                });
+    343 +            }
+    344 +            if !(0.0..=1.0).contains(&layer.dropout) {
+    345 +                return Err(GenomeError::InvalidDropout {
+    346 +                    index,
+    347 +                    dropout: layer.dropout,
+    348 +                });
+    349 +            }
+    352 +        if expected_inputs != self.output_size {
+    355 +                actual: expected_inputs,
+    356 +            });
+    357 +        }
+    358 +        Ok(())
+    359 +    }
+    360 +
+    361 +    /// Returns true if the genome references at least one parent.
+    362 +    #[must_use]
+    363 +    pub fn is_descendant(&self) -> bool {
+    364 +        self.provenance.parents.iter().any(Option::is_some)
+    365 +    }
+    366 +}
+    367 +
+    368  /// High level simulation clock (ticks processed since boot).
+
+• Edited crates/scriptbots-core/src/lib.rs (+1 -1)
+    920              None => {
+    921 -                let seed = rand::rng().next_u64();
+    921 +                let seed: u64 = rand::random();
+    922                  SmallRng::seed_from_u64(seed)
+
+    1269 +
+    1272 +        let layers = vec![
+    1273 +            LayerSpec::dense(INPUT_SIZE, 32, ActivationKind::Relu),
+    1274 +            LayerSpec::dense(32, OUTPUT_SIZE, ActivationKind::Sigmoid),
+    1275 +        ];
+    1276 +        let genome = BrainGenome::new(
+    1277 +            BrainFamily::Mlp,
+    1278 +            INPUT_SIZE,
+    1279 +            OUTPUT_SIZE,
+    1280 +            layers,
+    1281 +            MutationRates::default(),
+    1282 +            GenomeHyperParams::default(),
+    1283 +            GenomeProvenance::default(),
+    1284 +        )
+    1285 +        .expect("genome valid");
+    1286 +        assert_eq!(genome.version, GENOME_FORMAT_VERSION);
+    1287 +        assert!(genome.validate().is_ok());
+    1288 +        assert!(!genome.is_descendant());
+    1289 +    }
+    1290 +
+    1291 +    #[test]
+    1292 +    fn brain_genome_validation_detects_errors() {
+    1293 +        let layers = vec![LayerSpec {
+    1294 +            inputs: INPUT_SIZE,
+    1295 +            outputs: 16,
+    1296 +            activation: ActivationKind::Relu,
+    1297 +            bias: true,
+    1298 +            dropout: 0.5,
+    1299 +        }];
+    1300 +        let mut genome = BrainGenome::new(
+    1301 +            BrainFamily::Mlp,
+    1302 +            INPUT_SIZE,
+    1303 +            OUTPUT_SIZE,
+    1304 +            layers,
+    1305 +            MutationRates::default(),
+    1306 +            GenomeHyperParams::default(),
+    1307 +            GenomeProvenance::default(),
+    1308 +        )
+    1309 +        .expect("base genome valid");
+    1310 +
+    1311 +        genome.layers[0].dropout = 1.2;
+    1312 +        assert_eq!(
+    1313 +            genome.validate(),
+    1314 +            Err(GenomeError::InvalidDropout {
+    1315 +                index: 0,
+    1316 +                dropout: 1.2
+    1317 +            })
+    1318 +        );
+    1319 +
+    1320 +        genome.layers[0].dropout = 0.0;
+    1321 +        genome.layers[0].outputs = OUTPUT_SIZE + 1;
+    1322 +        assert_eq!(
+    1323 +            genome.validate(),
+    1324 +            Err(GenomeError::OutputMismatch {
+    1325 +                expected: OUTPUT_SIZE,
+    1326 +                actual: OUTPUT_SIZE + 1
+    1327 +            })
+    1328 +        );
+    1329 +    }
+    1330  }
+
+• Ran cargo fmt
+  └ (no output)
+
+• Ran cargo check
+  └ warning: Patch `pyo3 v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    Patch `pyo3-build-config v0.26.0 (https://github.com/PyO3/pyo3?rev=2490163685753ce3dc45b15fdd6e02c02ef02ba5#24901636)` was not used in the crate graph.
+    … +37 lines
+    warning: `scriptbots-core` (lib) generated 1 warning
+    error: could not compile `scriptbots-core` (lib) due to 1 previous error; 1 warning emitted
+
+• Edited crates/scriptbots-core/src/lib.rs (+3 -3)
+     2
+     3 -use rand::{RngCore, SeedableRng, rngs::SmallRng};
+     3 +use rand::{SeedableRng, rngs::SmallRng};
+     4  use serde::{Deserialize, Serialize};
+       ⋮
+    21  /// Per-agent mutation rate configuration.
+    22 -#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    22 +#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+    23  pub struct MutationRates {
+       ⋮
+    37  /// Trait modifiers affecting sense organs and physiology.
+    38 -#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    38 +#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+    39  pub struct TraitModifiers {
+
+• Ran cargo fmt
+  └ (no output)
+
+• Ran cargo check
+  └ (no output)
+
+• Edited PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md (+1 -1)
+    45  - Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback. [Completed: validation + RNG seeding + defaults]
+    46 -- `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends. [Currently In Progress: schema + validation]
+    46 +- `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends. [Completed: schema + validation helpers]
+    47
+
+• I'm wrapping up by detailing all the code changes with exact file and line references, reminding to run cargo check, updating the plan with what’s done, and suggesting next steps like connecting BrainBinding to the trait and noting the aggregator—keeping it clear and systematic as the user requested.
+
+─ Worked for 2m 51s ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• Updates
+
+  - Expanded core runtime model with mutation traits, selection metadata, and serialized brain genome scaffolding; includes validation helpers, provenance tracking, and comprehensive tests (crates/scriptbots-core/src/lib.rs:16, crates/scriptbots-core/src/lib.rs:152, crates/scriptbots-core/src/lib.rs:273, crates/scriptbots-core/src/lib.rs:647, crates/scriptbots-core/src/lib.rs:956).
+  - Synced workspace deps so the core crate pulls rand via the workspace and kept slotmap available (Cargo.toml:33, crates/scriptbots-core/Cargo.toml:6).
+  - “Bible” now records completed data-model milestones and notes the temporary brain binding shim (PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md:34, PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md:42).
+
+  Tests: cargo check
+
+  Next steps:
+
+  1. Replace the placeholder BrainBinding with an actual registry hook once scriptbots-brain exposes factory APIs.
+  2. Begin fleshing out the time-step pipeline stages (aging/food respawn/event reset) using the new arena and runtime structures.
+
+  

@@ -1,6 +1,6 @@
 //! Core types shared across the ScriptBots workspace.
 
-use rand::{RngCore, SeedableRng, rngs::SmallRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
 use thiserror::Error;
@@ -19,7 +19,7 @@ pub const INPUT_SIZE: usize = 25;
 pub const OUTPUT_SIZE: usize = 9;
 
 /// Per-agent mutation rate configuration.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
     pub primary: f32,
     pub secondary: f32,
@@ -35,7 +35,7 @@ impl Default for MutationRates {
 }
 
 /// Trait modifiers affecting sense organs and physiology.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct TraitModifiers {
     pub smell: f32,
     pub sound: f32,
@@ -155,6 +155,227 @@ pub struct AgentState {
     pub id: AgentId,
     pub data: AgentData,
     pub runtime: AgentRuntime,
+}
+
+/// Events emitted after processing a world tick.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TickEvents {
+    pub tick: Tick,
+    pub charts_flushed: bool,
+    pub epoch_rolled: bool,
+    pub food_respawned: Option<(u32, u32)>,
+}
+
+/// Current on-disk schema version for serialized brain genomes.
+pub const GENOME_FORMAT_VERSION: u16 = 1;
+
+/// Supported brain family discriminants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum BrainFamily {
+    Mlp,
+    Dwraon,
+    Assembly,
+    External(String),
+}
+
+impl Default for BrainFamily {
+    fn default() -> Self {
+        Self::Mlp
+    }
+}
+
+/// Supported activation functions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActivationKind {
+    Identity,
+    Relu,
+    Sigmoid,
+    Tanh,
+    Softplus,
+    LeakyRelu { slope: f32 },
+    Custom(String),
+}
+
+impl Default for ActivationKind {
+    fn default() -> Self {
+        Self::Identity
+    }
+}
+
+/// Layer specification used by fully-connected style brains.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LayerSpec {
+    pub inputs: usize,
+    pub outputs: usize,
+    pub activation: ActivationKind,
+    pub bias: bool,
+    pub dropout: f32,
+}
+
+impl LayerSpec {
+    /// Convenience helper to build a dense layer.
+    #[must_use]
+    pub fn dense(inputs: usize, outputs: usize, activation: ActivationKind) -> Self {
+        Self {
+            inputs,
+            outputs,
+            activation,
+            bias: true,
+            dropout: 0.0,
+        }
+    }
+}
+
+impl Default for LayerSpec {
+    fn default() -> Self {
+        Self::dense(1, 1, ActivationKind::Identity)
+    }
+}
+
+/// Hyperparameter bundle stored alongside genomes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GenomeHyperParams {
+    pub learning_rate: f32,
+    pub momentum: f32,
+    pub weight_decay: f32,
+    pub temperature: f32,
+}
+
+impl Default for GenomeHyperParams {
+    fn default() -> Self {
+        Self {
+            learning_rate: 0.01,
+            momentum: 0.9,
+            weight_decay: 0.0,
+            temperature: 1.0,
+        }
+    }
+}
+
+/// Provenance metadata for lineage tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GenomeProvenance {
+    pub parents: [Option<AgentId>; 2],
+    pub created_at: Tick,
+    pub comment: Option<String>,
+}
+
+impl Default for GenomeProvenance {
+    fn default() -> Self {
+        Self {
+            parents: [None, None],
+            created_at: Tick::zero(),
+            comment: None,
+        }
+    }
+}
+
+/// Errors raised when validating genome structures.
+#[derive(Debug, Error, PartialEq)]
+pub enum GenomeError {
+    #[error("layer stack must contain at least one layer")]
+    EmptyLayers,
+    #[error("layer {index} has zero-sized dimensions")]
+    ZeroSizedLayer { index: usize },
+    #[error("layer {index} dropout {dropout} must be between 0.0 and 1.0")]
+    InvalidDropout { index: usize, dropout: f32 },
+    #[error("layer {index} input {actual} does not match previous output {expected}")]
+    MismatchedTopology {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("final layer outputs {actual} do not match genome output_size {expected}")]
+    OutputMismatch { expected: usize, actual: usize },
+    #[error("input_size must be non-zero")]
+    ZeroInput,
+    #[error("output_size must be non-zero")]
+    ZeroOutput,
+}
+
+/// Versioned, serializable genome description.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrainGenome {
+    pub version: u16,
+    pub family: BrainFamily,
+    pub input_size: usize,
+    pub output_size: usize,
+    pub layers: Vec<LayerSpec>,
+    pub mutation: MutationRates,
+    pub hyper_params: GenomeHyperParams,
+    pub provenance: GenomeProvenance,
+}
+
+impl BrainGenome {
+    /// Construct and validate a new genome.
+    pub fn new(
+        family: BrainFamily,
+        input_size: usize,
+        output_size: usize,
+        layers: Vec<LayerSpec>,
+        mutation: MutationRates,
+        hyper_params: GenomeHyperParams,
+        provenance: GenomeProvenance,
+    ) -> Result<Self, GenomeError> {
+        let genome = Self {
+            version: GENOME_FORMAT_VERSION,
+            family,
+            input_size,
+            output_size,
+            layers,
+            mutation,
+            hyper_params,
+            provenance,
+        };
+        genome.validate()?;
+        Ok(genome)
+    }
+
+    /// Ensure layer topology matches declared IO sizes.
+    pub fn validate(&self) -> Result<(), GenomeError> {
+        if self.input_size == 0 {
+            return Err(GenomeError::ZeroInput);
+        }
+        if self.output_size == 0 {
+            return Err(GenomeError::ZeroOutput);
+        }
+        if self.layers.is_empty() {
+            return Err(GenomeError::EmptyLayers);
+        }
+        let mut expected_inputs = self.input_size;
+        for (index, layer) in self.layers.iter().enumerate() {
+            if layer.inputs == 0 || layer.outputs == 0 {
+                return Err(GenomeError::ZeroSizedLayer { index });
+            }
+            if layer.inputs != expected_inputs {
+                return Err(GenomeError::MismatchedTopology {
+                    index,
+                    expected: expected_inputs,
+                    actual: layer.inputs,
+                });
+            }
+            if !(0.0..=1.0).contains(&layer.dropout) {
+                return Err(GenomeError::InvalidDropout {
+                    index,
+                    dropout: layer.dropout,
+                });
+            }
+            expected_inputs = layer.outputs;
+        }
+        if expected_inputs != self.output_size {
+            return Err(GenomeError::OutputMismatch {
+                expected: self.output_size,
+                actual: expected_inputs,
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns true if the genome references at least one parent.
+    #[must_use]
+    pub fn is_descendant(&self) -> bool {
+        self.provenance.parents.iter().any(Option::is_some)
+    }
 }
 
 /// High level simulation clock (ticks processed since boot).
@@ -665,6 +886,14 @@ pub struct ScriptBotsConfig {
     pub initial_food: f32,
     /// Optional RNG seed for reproducible worlds.
     pub rng_seed: Option<u64>,
+    /// How frequently (in ticks) to flush chart history; 0 disables flushes.
+    pub chart_flush_interval: u32,
+    /// Number of ticks between food respawn events; 0 disables respawns.
+    pub food_respawn_interval: u32,
+    /// Amount of food to add on each respawn.
+    pub food_respawn_amount: f32,
+    /// Maximum food allowed per cell.
+    pub food_max: f32,
 }
 
 impl Default for ScriptBotsConfig {
@@ -675,6 +904,10 @@ impl Default for ScriptBotsConfig {
             food_cell_size: 60,
             initial_food: 1.0,
             rng_seed: None,
+            chart_flush_interval: 1_000,
+            food_respawn_interval: 15,
+            food_respawn_amount: 0.5,
+            food_max: 0.5,
         }
     }
 }
@@ -699,10 +932,34 @@ impl ScriptBotsConfig {
                 "world dimensions must be divisible by food_cell_size",
             ));
         }
-        Ok((
+        let dims = (
             self.world_width / self.food_cell_size,
             self.world_height / self.food_cell_size,
-        ))
+        );
+        if self.initial_food < 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "initial_food must be non-negative",
+            ));
+        }
+        if self.food_max <= 0.0 {
+            return Err(WorldStateError::InvalidConfig("food_max must be positive"));
+        }
+        if self.food_respawn_amount < 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "food_respawn_amount must be non-negative",
+            ));
+        }
+        if self.initial_food > self.food_max {
+            return Err(WorldStateError::InvalidConfig(
+                "initial_food cannot exceed food_max",
+            ));
+        }
+        if self.food_respawn_amount > self.food_max {
+            return Err(WorldStateError::InvalidConfig(
+                "food_respawn_amount cannot exceed food_max",
+            ));
+        }
+        Ok(dims)
     }
 
     /// Returns the configured RNG seed, generating one from entropy if absent.
@@ -710,7 +967,7 @@ impl ScriptBotsConfig {
         match self.rng_seed {
             Some(seed) => SmallRng::seed_from_u64(seed),
             None => {
-                let seed = rand::rng().next_u64();
+                let seed: u64 = rand::random();
                 SmallRng::seed_from_u64(seed)
             }
         }
@@ -819,6 +1076,66 @@ impl WorldState {
             agents: AgentArena::new(),
             runtime: AgentMap::new(),
         })
+    }
+
+    fn stage_aging(&mut self) {
+        for age in self.agents.columns_mut().ages_mut() {
+            *age = age.saturating_add(1);
+        }
+    }
+
+    fn stage_food_respawn(&mut self, next_tick: Tick) -> Option<(u32, u32)> {
+        let interval = self.config.food_respawn_interval;
+        if interval == 0 {
+            return None;
+        }
+        if next_tick.0 % interval as u64 != 0 {
+            return None;
+        }
+        let width = self.food.width();
+        let height = self.food.height();
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let x = self.rng.random_range(0..width);
+        let y = self.rng.random_range(0..height);
+        if let Some(cell) = self.food.get_mut(x, y) {
+            *cell = (*cell + self.config.food_respawn_amount).min(self.config.food_max);
+            Some((x, y))
+        } else {
+            None
+        }
+    }
+
+    fn stage_reset_events(&mut self) {
+        for runtime in self.runtime.values_mut() {
+            runtime.spiked = false;
+            runtime.food_delta = 0.0;
+            runtime.sound_output = 0.0;
+            runtime.give_intent = 0.0;
+        }
+    }
+
+    /// Execute one simulation tick pipeline returning emitted events.
+    pub fn step(&mut self) -> TickEvents {
+        let next_tick = self.tick.next();
+        let previous_epoch = self.epoch;
+
+        self.stage_aging();
+
+        let mut events = TickEvents {
+            tick: next_tick,
+            charts_flushed: self.config.chart_flush_interval > 0
+                && next_tick.0 % self.config.chart_flush_interval as u64 == 0,
+            epoch_rolled: false,
+            food_respawned: self.stage_food_respawn(next_tick),
+        };
+
+        self.stage_reset_events();
+        self.advance_tick();
+        events.tick = self.tick;
+        events.epoch_rolled = self.epoch != previous_epoch;
+        events
     }
 
     /// Returns an immutable reference to configuration.
@@ -1026,13 +1343,9 @@ mod tests {
 
     #[test]
     fn world_state_initialises_from_config() {
-        let config = ScriptBotsConfig {
-            world_width: 6000,
-            world_height: 6000,
-            food_cell_size: 60,
-            initial_food: 0.25,
-            rng_seed: Some(42),
-        };
+        let mut config = ScriptBotsConfig::default();
+        config.initial_food = 0.25;
+        config.rng_seed = Some(42);
         let mut world = WorldState::new(config.clone()).expect("world");
         assert_eq!(world.agent_count(), 0);
         assert_eq!(world.food().width(), 100);
@@ -1057,5 +1370,109 @@ mod tests {
         assert_eq!(removed.generation, Generation(5));
         assert_eq!(world.agent_count(), 0);
         assert!(world.agent_runtime(id).is_none());
+    }
+
+    #[test]
+    fn step_executes_pipeline() {
+        let mut config = ScriptBotsConfig::default();
+        config.world_width = 100;
+        config.world_height = 100;
+        config.food_cell_size = 10;
+        config.initial_food = 0.1;
+        config.food_respawn_interval = 1;
+        config.food_respawn_amount = 0.4;
+        config.food_max = 0.5;
+        config.chart_flush_interval = 2;
+        config.rng_seed = Some(7);
+
+        let mut world = WorldState::new(config).expect("world");
+        let id = world.spawn_agent(sample_agent(0));
+        {
+            let runtime = world.agent_runtime_mut(id).expect("runtime");
+            runtime.spiked = true;
+            runtime.food_delta = 1.0;
+            runtime.sound_output = 0.5;
+            runtime.give_intent = 0.2;
+        }
+
+        let events = world.step();
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(events.tick, Tick(1));
+        assert!(events.food_respawned.is_some());
+        assert!(!events.charts_flushed);
+        let ages = world.agents().columns().ages();
+        assert_eq!(ages[0], 1);
+        let runtime = world.agent_runtime(id).expect("runtime");
+        assert!(!runtime.spiked);
+        assert_eq!(runtime.food_delta, 0.0);
+        assert_eq!(runtime.sound_output, 0.0);
+        assert_eq!(runtime.give_intent, 0.0);
+
+        let events_second = world.step();
+        assert_eq!(world.tick(), Tick(2));
+        assert!(events_second.charts_flushed);
+        assert_eq!(events_second.tick, Tick(2));
+        assert!(!events_second.epoch_rolled);
+    }
+
+    #[test]
+    fn brain_genome_validation_passes() {
+        let layers = vec![
+            LayerSpec::dense(INPUT_SIZE, 32, ActivationKind::Relu),
+            LayerSpec::dense(32, OUTPUT_SIZE, ActivationKind::Sigmoid),
+        ];
+        let genome = BrainGenome::new(
+            BrainFamily::Mlp,
+            INPUT_SIZE,
+            OUTPUT_SIZE,
+            layers,
+            MutationRates::default(),
+            GenomeHyperParams::default(),
+            GenomeProvenance::default(),
+        )
+        .expect("genome valid");
+        assert_eq!(genome.version, GENOME_FORMAT_VERSION);
+        assert!(genome.validate().is_ok());
+        assert!(!genome.is_descendant());
+    }
+
+    #[test]
+    fn brain_genome_validation_detects_errors() {
+        let layers = vec![LayerSpec {
+            inputs: INPUT_SIZE,
+            outputs: 16,
+            activation: ActivationKind::Relu,
+            bias: true,
+            dropout: 0.5,
+        }];
+        let mut genome = BrainGenome::new(
+            BrainFamily::Mlp,
+            INPUT_SIZE,
+            OUTPUT_SIZE,
+            layers,
+            MutationRates::default(),
+            GenomeHyperParams::default(),
+            GenomeProvenance::default(),
+        )
+        .expect("base genome valid");
+
+        genome.layers[0].dropout = 1.2;
+        assert_eq!(
+            genome.validate(),
+            Err(GenomeError::InvalidDropout {
+                index: 0,
+                dropout: 1.2
+            })
+        );
+
+        genome.layers[0].dropout = 0.0;
+        genome.layers[0].outputs = OUTPUT_SIZE + 1;
+        assert_eq!(
+            genome.validate(),
+            Err(GenomeError::OutputMismatch {
+                expected: OUTPUT_SIZE,
+                actual: OUTPUT_SIZE + 1
+            })
+        );
     }
 }
