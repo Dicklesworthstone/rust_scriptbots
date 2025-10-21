@@ -273,7 +273,7 @@ impl SimulationView {
             .bg(rgb(0x0b1220))
             .p_4()
             .min_w(px(360.0))
-            .flex_grow(1.0)
+            .flex_grow()
             .child(
                 div()
                     .text_sm()
@@ -313,7 +313,7 @@ impl SimulationView {
             .bg(rgb(0x0b1220))
             .p_4()
             .min_w(px(360.0))
-            .flex_grow(1.0)
+            .flex_grow()
             .child(
                 div()
                     .text_sm()
@@ -352,7 +352,6 @@ impl SimulationView {
                     .child(
                         div()
                             .text_sm()
-                            .font_mono()
                             .text_color(rgb(0xfacc15))
                             .child(badge),
                     )

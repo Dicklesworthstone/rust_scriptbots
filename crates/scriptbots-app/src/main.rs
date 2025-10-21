@@ -7,11 +7,14 @@ use scriptbots_storage::{SharedStorage, Storage};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+type SharedWorld = Arc<Mutex<WorldState>>;
+type SharedStorageArc = Arc<Mutex<Storage>>;
+
 fn main() -> Result<()> {
     init_tracing();
-    let (world, _storage) = bootstrap_world()?;
+    let (world, storage) = bootstrap_world()?;
     info!("Starting ScriptBots simulation shell");
-    run_demo(world);
+    run_demo(world, storage);
     Ok(())
 }
 
@@ -21,14 +24,14 @@ fn init_tracing() {
         .try_init();
 }
 
-fn bootstrap_world() -> Result<(Arc<Mutex<WorldState>>, Arc<Mutex<Storage>>)> {
+fn bootstrap_world() -> Result<(SharedWorld, SharedStorageArc)> {
     let config = ScriptBotsConfig {
         persistence_interval: 60,
         history_capacity: 600,
         ..ScriptBotsConfig::default()
     };
 
-    let storage = Arc::new(Mutex::new(Storage::open("scriptbots.db")?));
+    let storage: SharedStorageArc = Arc::new(Mutex::new(Storage::open("scriptbots.db")?));
     let persistence = SharedStorage::new(Arc::clone(&storage));
     let mut world = WorldState::with_persistence(config, Box::new(persistence))?;
     let mut rng =

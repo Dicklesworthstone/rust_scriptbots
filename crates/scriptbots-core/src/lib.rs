@@ -358,12 +358,6 @@ pub enum ActivationKind {
     Custom(String),
 }
 
-impl Default for ActivationKind {
-    fn default() -> Self {
-        Self::Identity
-    }
-}
-
 /// Layer specification used by fully-connected style brains.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LayerSpec {
