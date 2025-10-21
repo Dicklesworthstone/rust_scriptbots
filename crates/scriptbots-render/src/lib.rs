@@ -1,42 +1,9 @@
 //! GPUI rendering layer for ScriptBots.
 
-use gpui::{
-    App, Application, Context, IntoElement, Render, Window, WindowOptions, div, prelude::*,
-};
+use gpui::{App, Application};
 use scriptbots_core::WorldState;
 use std::sync::{Arc, Mutex};
 use tracing::info;
-
-/// Root view displaying high level simulation stats.
-struct WorldView {
-    world: Arc<Mutex<WorldState>>,
-}
-
-impl Render for WorldView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let summary_text = self
-            .world
-            .lock()
-            .ok()
-            .and_then(|world| world.history().last().cloned())
-            .map(|s| {
-                format!(
-                    "Tick {} | Agents {} | Births {} | Deaths {} | Avg Energy {:.2} | Avg Health {:.2}",
-                    s.tick.0,
-                    s.agent_count,
-                    s.births,
-                    s.deaths,
-                    s.average_energy,
-                    s.average_health,
-                )
-            })
-            .unwrap_or_else(|| "No simulation data yet.".to_string());
-
-        div().child(div().child(summary_text)).child(
-            div().child("Rendering milestones will add live agent visuals and controls here."),
-        )
-    }
-}
 
 /// Bootstraps a minimal GPUI application.
 pub fn run_demo(world: Arc<Mutex<WorldState>>) {
@@ -53,12 +20,7 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>) {
         }
     }
 
-    Application::new().run(move |app: &mut App| {
-        app.open_window(WindowOptions::default(), move |_, cx| {
-            cx.new(|_| WorldView {
-                world: world.clone(),
-            })
-        })
-        .expect("failed to open GPUI window");
+    Application::new().run(|_cx: &mut App| {
+        // Rendering logic will be added in later milestones.
     });
 }
