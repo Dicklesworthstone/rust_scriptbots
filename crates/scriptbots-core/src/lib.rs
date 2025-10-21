@@ -2,10 +2,11 @@
 
 use ordered_float::OrderedFloat;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use thiserror::Error;
 
@@ -224,6 +225,19 @@ struct ActuationDelta {
     position: Position,
     health_delta: f32,
     spiked: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActuationResult {
+    delta: Option<ActuationDelta>,
+    energy: f32,
+    spiked: bool,
+}
+
+#[derive(Debug, Default)]
+struct CombatResult {
+    energy: f32,
+    contributions: Vec<(usize, f32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1030,6 +1044,8 @@ pub struct ScriptBotsConfig {
     pub spike_damage: f32,
     /// Energy cost of deploying a spike.
     pub spike_energy_cost: f32,
+    /// Maximum number of recent tick summaries retained in-memory.
+    pub history_capacity: usize,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
     pub persistence_interval: u32,
 }
@@ -1063,6 +1079,7 @@ impl Default for ScriptBotsConfig {
             spike_radius: 40.0,
             spike_damage: 0.25,
             spike_energy_cost: 0.02,
+            history_capacity: 256,
             persistence_interval: 0,
         }
     }
@@ -1129,9 +1146,10 @@ impl ScriptBotsConfig {
             || self.spike_radius <= 0.0
             || self.spike_damage < 0.0
             || self.spike_energy_cost < 0.0
+            || self.history_capacity == 0
         {
             return Err(WorldStateError::InvalidConfig(
-                "metabolism, reproduction, and sharing parameters must be non-negative, radius positive",
+                "metabolism, reproduction, sharing, and history parameters must be non-negative, radius positive",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -1251,6 +1269,7 @@ pub struct WorldState {
     persistence: Box<dyn WorldPersistence>,
     last_births: usize,
     last_deaths: usize,
+    history: VecDeque<TickSummary>,
 }
 
 impl fmt::Debug for WorldState {
@@ -1283,6 +1302,7 @@ impl WorldState {
             config.world_width as f32,
             config.world_height as f32,
         );
+        let history_capacity = config.history_capacity;
         Ok(Self {
             food: FoodGrid::new(food_w, food_h, config.initial_food)?,
             config,
@@ -1299,6 +1319,7 @@ impl WorldState {
             persistence,
             last_births: 0,
             last_deaths: 0,
+            history: VecDeque::with_capacity(history_capacity),
         })
     }
 
@@ -1356,47 +1377,58 @@ impl WorldState {
         let radius = self.config.sense_radius;
         let radius_sq = radius * radius;
         let neighbor_normalizer = self.config.sense_max_neighbors;
+        let index = &self.index;
 
-        for (idx, agent_id) in handles.iter().enumerate() {
-            let mut nearest_sq = f32::INFINITY;
-            let mut neighbor_count = 0usize;
-            let mut neighbor_energy_sum = 0.0_f32;
-            let mut neighbor_health_sum = 0.0_f32;
+        let sensor_results: Vec<[f32; INPUT_SIZE]> = handles
+            .par_iter()
+            .enumerate()
+            .map(|(idx, _agent_id)| {
+                let mut sensors = [0.0f32; INPUT_SIZE];
+                let mut nearest_sq = f32::INFINITY;
+                let mut neighbor_count = 0usize;
+                let mut neighbor_energy_sum = 0.0_f32;
+                let mut neighbor_health_sum = 0.0_f32;
 
-            self.index.neighbors_within(
-                idx,
-                radius_sq,
-                &mut |other_idx, dist_sq: OrderedFloat<f32>| {
-                    neighbor_count += 1;
-                    let dist_sq_val = dist_sq.into_inner();
-                    if dist_sq_val < nearest_sq {
-                        nearest_sq = dist_sq_val;
-                    }
-                    neighbor_energy_sum += energies[other_idx];
-                    neighbor_health_sum += health_slice[other_idx];
-                },
-            );
+                index.neighbors_within(
+                    idx,
+                    radius_sq,
+                    &mut |other_idx, dist_sq: OrderedFloat<f32>| {
+                        neighbor_count += 1;
+                        let dist_sq_val = dist_sq.into_inner();
+                        if dist_sq_val < nearest_sq {
+                            nearest_sq = dist_sq_val;
+                        }
+                        neighbor_energy_sum += energies[other_idx];
+                        neighbor_health_sum += health_slice[other_idx];
+                    },
+                );
 
-            let nearest_dist = if neighbor_count > 0 {
-                nearest_sq.sqrt()
-            } else {
-                radius
-            };
+                let nearest_dist = if neighbor_count > 0 {
+                    nearest_sq.sqrt()
+                } else {
+                    radius
+                };
 
-            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                runtime.sensors.fill(0.0);
-                runtime.sensors[0] = (1.0 / (1.0 + nearest_dist)).clamp(0.0, 1.0);
-                runtime.sensors[1] = (neighbor_count as f32 / neighbor_normalizer).clamp(0.0, 1.0);
-                runtime.sensors[2] = (health_slice[idx] / 2.0).clamp(0.0, 1.0);
+                sensors.fill(0.0);
+                sensors[0] = (1.0 / (1.0 + nearest_dist)).clamp(0.0, 1.0);
+                sensors[1] = (neighbor_count as f32 / neighbor_normalizer).clamp(0.0, 1.0);
+                sensors[2] = (health_slice[idx] / 2.0).clamp(0.0, 1.0);
                 let self_energy = energies[idx];
-                runtime.sensors[3] = (self_energy / 2.0).clamp(0.0, 1.0);
-                runtime.sensors[4] = (ages_slice[idx] as f32 / 1_000.0).clamp(0.0, 1.0);
+                sensors[3] = (self_energy / 2.0).clamp(0.0, 1.0);
+                sensors[4] = (ages_slice[idx] as f32 / 1_000.0).clamp(0.0, 1.0);
                 if neighbor_count > 0 {
-                    runtime.sensors[5] =
+                    sensors[5] =
                         (neighbor_energy_sum / neighbor_count as f32 / 2.0).clamp(0.0, 1.0);
-                    runtime.sensors[6] =
+                    sensors[6] =
                         (neighbor_health_sum / neighbor_count as f32 / 2.0).clamp(0.0, 1.0);
                 }
+                sensors
+            })
+            .collect();
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                runtime.sensors.copy_from_slice(&sensor_results[idx]);
             }
         }
     }
@@ -1439,123 +1471,106 @@ impl WorldState {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
         let speed_base = self.config.sense_radius * 0.1;
+        let movement_drain = self.config.movement_drain;
+        let metabolism_drain = self.config.metabolism_drain;
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
 
         let positions_snapshot: Vec<Position> = self.agents.columns().positions().to_vec();
         let headings_snapshot: Vec<f32> = self.agents.columns().headings().to_vec();
 
-        let mut deltas: Vec<Option<ActuationDelta>> = vec![None; handles.len()];
+        let runtime = &self.runtime;
+        let results: Vec<ActuationResult> = handles
+            .par_iter()
+            .enumerate()
+            .map(|(idx, agent_id)| {
+                if let Some(runtime) = runtime.get(*agent_id) {
+                    let outputs = runtime.outputs;
+                    let forward = outputs.get(0).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let strafe = outputs.get(1).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let turn = outputs.get(2).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let boost = outputs.get(3).copied().unwrap_or(0.0).clamp(0.0, 1.0);
 
-        for (idx, agent_id) in handles.iter().enumerate() {
-            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                let forward = runtime
-                    .outputs
-                    .get(0)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(-1.0, 1.0);
-                let strafe = runtime
-                    .outputs
-                    .get(1)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(-1.0, 1.0);
-                let turn = runtime
-                    .outputs
-                    .get(2)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(-1.0, 1.0);
-                let boost = runtime
-                    .outputs
-                    .get(3)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
+                    let heading = headings_snapshot[idx] + turn * 0.1;
+                    let cos_h = heading.cos();
+                    let sin_h = heading.sin();
+                    let forward_dx = cos_h * forward;
+                    let forward_dy = sin_h * forward;
+                    let strafe_dx = -sin_h * strafe;
+                    let strafe_dy = cos_h * strafe;
 
-                let heading = headings_snapshot[idx] + turn * 0.1;
-                let cos_h = heading.cos();
-                let sin_h = heading.sin();
-                let forward_dx = cos_h * forward;
-                let forward_dy = sin_h * forward;
-                let strafe_dx = -sin_h * strafe;
-                let strafe_dy = cos_h * strafe;
+                    let speed_scale = speed_base * (1.0 + boost);
+                    let vx = (forward_dx + strafe_dx) * speed_scale;
+                    let vy = (forward_dy + strafe_dy) * speed_scale;
 
-                let speed_scale = speed_base * (1.0 + boost);
-                let vx = (forward_dx + strafe_dx) * speed_scale;
-                let vy = (forward_dy + strafe_dy) * speed_scale;
+                    let mut next_pos = positions_snapshot[idx];
+                    next_pos.x = Self::wrap_position(next_pos.x + vx, width);
+                    next_pos.y = Self::wrap_position(next_pos.y + vy, height);
 
-                let mut next_pos = positions_snapshot[idx];
-                next_pos.x = Self::wrap_position(next_pos.x + vx, width);
-                next_pos.y = Self::wrap_position(next_pos.y + vy, height);
+                    let movement_penalty = movement_drain * (vx.abs() + vy.abs());
+                    let boost_penalty = boost * movement_drain * 0.5;
+                    let metabolism_penalty = metabolism_drain;
+                    let drain = metabolism_penalty + movement_penalty + boost_penalty;
+                    let health_delta = -drain;
+                    let energy = (runtime.energy - drain).max(0.0);
 
-                let movement_penalty = self.config.movement_drain * (vx.abs() + vy.abs());
-                let boost_penalty = boost * self.config.movement_drain * 0.5;
-                let metabolism_penalty = self.config.metabolism_drain;
-                let drain = metabolism_penalty + movement_penalty + boost_penalty;
-                let health_delta = -drain;
+                    let spike_power = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let spiked = spike_power > 0.5;
 
-                runtime.energy = (runtime.energy - drain).max(0.0);
-
-                let spike_power = runtime
-                    .outputs
-                    .get(5)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                runtime.spiked = spike_power > 0.5;
-
-                deltas[idx] = Some(ActuationDelta {
-                    heading,
-                    velocity: Velocity::new(vx, vy),
-                    position: next_pos,
-                    health_delta,
-                    spiked: runtime.spiked,
-                });
-            }
-        }
+                    ActuationResult {
+                        delta: Some(ActuationDelta {
+                            heading,
+                            velocity: Velocity::new(vx, vy),
+                            position: next_pos,
+                            health_delta,
+                            spiked,
+                        }),
+                        energy,
+                        spiked,
+                    }
+                } else {
+                    ActuationResult::default()
+                }
+            })
+            .collect();
 
         let columns = self.agents.columns_mut();
         {
             let headings = columns.headings_mut();
-            for (idx, delta) in deltas.iter().enumerate() {
-                if let Some(delta) = delta {
+            for (idx, result) in results.iter().enumerate() {
+                if let Some(delta) = &result.delta {
                     headings[idx] = delta.heading;
                 }
             }
         }
         {
             let velocities = columns.velocities_mut();
-            for (idx, delta) in deltas.iter().enumerate() {
-                if let Some(delta) = delta {
+            for (idx, result) in results.iter().enumerate() {
+                if let Some(delta) = &result.delta {
                     velocities[idx] = delta.velocity;
                 }
             }
         }
         {
             let healths = columns.health_mut();
-            for (idx, delta) in deltas.iter().enumerate() {
-                if let Some(delta) = delta {
+            for (idx, result) in results.iter().enumerate() {
+                if let Some(delta) = &result.delta {
                     healths[idx] = (healths[idx] + delta.health_delta).clamp(0.0, 2.0);
                 }
             }
         }
         {
             let positions = columns.positions_mut();
-            for (idx, delta) in deltas.iter().enumerate() {
-                if let Some(delta) = delta {
+            for (idx, result) in results.iter().enumerate() {
+                if let Some(delta) = &result.delta {
                     positions[idx] = delta.position;
                 }
             }
         }
 
         for (idx, agent_id) in handles.iter().enumerate() {
-            if let Some(delta) = &deltas[idx] {
-                if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                    runtime.spiked = delta.spiked;
-                }
-            } else if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                runtime.spiked = false;
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                runtime.energy = results[idx].energy;
+                runtime.spiked = results[idx].spiked;
             }
         }
     }
@@ -1665,40 +1680,67 @@ impl WorldState {
         let positions_pairs: Vec<(f32, f32)> = positions.iter().map(|p| (p.x, p.y)).collect();
         let _ = self.index.rebuild(&positions_pairs);
 
-        let mut damage = vec![0.0f32; handles.len()];
+        let spike_damage = self.config.spike_damage;
+        let spike_energy_cost = self.config.spike_energy_cost;
+        let index = &self.index;
+        let runtime = &self.runtime;
 
+        let results: Vec<CombatResult> = handles
+            .par_iter()
+            .enumerate()
+            .map(|(idx, agent_id)| {
+                if let Some(runtime) = runtime.get(*agent_id) {
+                    let energy_before = runtime.energy;
+                    if !runtime.spiked {
+                        return CombatResult {
+                            energy: energy_before,
+                            contributions: Vec::new(),
+                        };
+                    }
+                    let spike_power = runtime
+                        .outputs
+                        .get(5)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                    if spike_power <= f32::EPSILON {
+                        return CombatResult {
+                            energy: energy_before,
+                            contributions: Vec::new(),
+                        };
+                    }
+
+                    let reach = (spike_radius + spike_lengths[idx]).max(1.0);
+                    let reach_sq = reach * reach;
+                    let mut contributions = Vec::new();
+                    index.neighbors_within(
+                        idx,
+                        reach_sq,
+                        &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
+                            contributions.push((other_idx, spike_damage * spike_power));
+                        },
+                    );
+
+                    CombatResult {
+                        energy: (energy_before - spike_energy_cost * spike_power).max(0.0),
+                        contributions,
+                    }
+                } else {
+                    CombatResult::default()
+                }
+            })
+            .collect();
+
+        let mut damage = vec![0.0f32; handles.len()];
         for (idx, agent_id) in handles.iter().enumerate() {
-            let spike_power;
-            {
-                let runtime = match self.runtime.get(*agent_id) {
-                    Some(rt) if rt.spiked => rt,
-                    _ => continue,
-                };
-                spike_power = runtime
-                    .outputs
-                    .get(5)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                if spike_power <= f32::EPSILON {
-                    continue;
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                runtime.energy = results[idx].energy;
+            }
+            for &(other_idx, dmg) in &results[idx].contributions {
+                if let Some(target) = damage.get_mut(other_idx) {
+                    *target += dmg;
                 }
             }
-
-            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                runtime.energy =
-                    (runtime.energy - self.config.spike_energy_cost * spike_power).max(0.0);
-            }
-
-            let reach = (spike_radius + spike_lengths[idx]).max(1.0);
-            let reach_sq = reach * reach;
-            self.index.neighbors_within(
-                idx,
-                reach_sq,
-                &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
-                    damage[other_idx] += self.config.spike_damage * spike_power;
-                },
-            );
         }
 
         let columns = self.agents.columns_mut();
@@ -1930,6 +1972,10 @@ impl WorldState {
             average_health,
         };
         self.persistence.on_tick(&summary);
+        if self.history.len() >= self.config.history_capacity {
+            self.history.pop_front();
+        }
+        self.history.push_back(summary);
         self.last_births = 0;
         self.last_deaths = 0;
     }
@@ -2003,6 +2049,12 @@ impl WorldState {
     /// Toggle the closed-environment flag.
     pub fn set_closed(&mut self, closed: bool) {
         self.closed = closed;
+    }
+
+    /// Iterate over retained tick summaries.
+    #[must_use]
+    pub fn history(&self) -> impl Iterator<Item = &TickSummary> {
+        self.history.iter()
     }
 
     /// Advances the world tick counter, rolling epochs when needed.
@@ -2441,6 +2493,7 @@ mod tests {
         config.spike_damage = 0.0;
         config.spike_energy_cost = 0.0;
         config.persistence_interval = 1;
+        config.history_capacity = 4;
         config.rng_seed = Some(123);
 
         let spy = SpyPersistence::default();
@@ -2459,6 +2512,10 @@ mod tests {
         assert_eq!(summary.births, 0);
         assert_eq!(summary.deaths, 0);
         assert!((summary.average_energy - 1.0).abs() < 1e-6);
+
+        let history: Vec<_> = world.history().cloned().collect();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tick, Tick(1));
     }
 
     #[test]
@@ -2484,6 +2541,8 @@ mod tests {
         config.spike_radius = 1.0;
         config.spike_damage = 0.0;
         config.spike_energy_cost = 0.0;
+        config.persistence_interval = 0;
+        config.history_capacity = 8;
         config.chart_flush_interval = 0;
         config.rng_seed = Some(11);
 

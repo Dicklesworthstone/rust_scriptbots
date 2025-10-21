@@ -61,7 +61,7 @@
 11. **Cleanup**: Remove dead agents using `Vec::retain` (single-threaded) or stable partition maintaining deterministic ordering; recycle IDs as needed.
 
 ## Brain System
-- Define `pub trait Brain: Send + Sync { fn kind(&self) -> BrainKind; fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE]; fn mutate(&mut self, rng: &mut impl Rng, mut_rate: f32, mut_scale: f32); fn crossover(&self, other: &Self, rng: &mut impl Rng) -> Box<dyn Brain>; }`.
+- Define `pub trait Brain: Send + Sync { fn kind(&self) -> BrainKind; fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE]; fn mutate(&mut self, rng: &mut dyn RngCore, mut_rate: f32, mut_scale: f32); fn crossover(&self, other: &dyn Brain, rng: &mut dyn RngCore) -> Option<Box<dyn Brain>>; }`. [Completed: fixed-size outputs + registry adapters]
 - Implementations:
   - `MlpBrain`: Store weights as `Vec<f32>` or `Box<[f32]>`; leverage `ndarray` or manual indexing. Provide `tick` without allocations; optionally use `packed_simd` for vectorization.
   - `DwraonBrain`: Retain 4-connection per node semantics with `Vec<Node>` storing bias, not flags.
@@ -177,7 +177,7 @@
 3. **World Mechanics (Weeks 2-4)**
    - Implement food grid, sensing pipeline (sequential first), reproduction queue, death cleanup.
    - Ensure parity with original via scenario tests (e.g., spike kill distribution).
-4. **Introduce Concurrency (Weeks 4-5)**
+4. **Introduce Concurrency (Weeks 4-5)** [Currently In Progress: parallelization audit]
    - Integrate Rayon, add spatial partition acceleration, verify determinism under multi-thread.
 5. **Brain Ports (Weeks 5-7)**
    - MLP (baseline) complete with mutate/crossover.

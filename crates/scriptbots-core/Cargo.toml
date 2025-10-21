@@ -10,3 +10,4 @@ slotmap = { workspace = true }
 rand = { workspace = true }
 scriptbots-index = { path = "../scriptbots-index" }
 ordered-float = { workspace = true }
+rayon = { workspace = true }

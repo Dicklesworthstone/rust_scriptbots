@@ -1,7 +1,7 @@
 //! Optional modern ML brain backends (Candle, tract-onnx, tch).
 
-use rand::Rng;
-use scriptbots_brain::Brain;
+use scriptbots_brain::{Brain, BrainKind, into_runner};
+use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 
 /// Supported ML backends selected at build time.
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,21 +44,31 @@ impl MlBrain {
 }
 
 impl Brain for MlBrain {
-    fn kind(&self) -> &'static str {
-        match self.kind {
-            MlBackendKind::Candle => "candle",
-            MlBackendKind::Tract => "tract-onnx",
-            MlBackendKind::Tch => "tch",
-            MlBackendKind::None => "ml-placeholder",
-        }
+    fn kind(&self) -> BrainKind {
+        let name = match self.kind {
+            MlBackendKind::Candle => "ml.candle",
+            MlBackendKind::Tract => "ml.tract-onnx",
+            MlBackendKind::Tch => "ml.tch",
+            MlBackendKind::None => "ml.placeholder",
+        };
+        BrainKind::new(name)
     }
 
-    fn tick(&mut self, inputs: &[f32]) -> Vec<f32> {
-        // Placeholder: pass-through until concrete integrations land.
-        inputs.to_vec()
+    fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        // Placeholder: copy the first OUTPUT_SIZE sensors to outputs.
+        let mut outputs = [0.0; OUTPUT_SIZE];
+        let len = OUTPUT_SIZE.min(INPUT_SIZE);
+        outputs[..len].copy_from_slice(&inputs[..len]);
+        outputs
     }
 
-    fn mutate<R: Rng>(&mut self, _rng: &mut R, _rate: f32, _scale: f32) {
+    fn mutate(&mut self, _rng: &mut dyn rand::RngCore, _rate: f32, _scale: f32) {
         // Mutation behavior will be implemented per-backend as we integrate models.
     }
+}
+
+/// Create a boxed brain runner for the active ML backend.
+#[must_use]
+pub fn runner() -> Box<dyn BrainRunner> {
+    into_runner(MlBrain::new())
 }
