@@ -4672,15 +4672,13 @@ impl WorldState {
                     }
                 }
 
-                if macro_enabled {
-                    if let Some(position) = positions.get(idx) {
-                        let env_temperature = sample_temperature(&self.config, position.x);
-                        let discomfort = f64::from(temperature_discomfort(
-                            env_temperature,
-                            runtime.temperature_preference,
-                        ));
-                        temperature_discomfort_stats.update(discomfort);
-                    }
+                if let Some(position) = positions.get(idx).filter(|_| macro_enabled) {
+                    let env_temperature = sample_temperature(&self.config, position.x);
+                    let discomfort = f64::from(temperature_discomfort(
+                        env_temperature,
+                        runtime.temperature_preference,
+                    ));
+                    temperature_discomfort_stats.update(discomfort);
                 }
 
                 if macro_enabled {
