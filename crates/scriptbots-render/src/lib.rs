@@ -1651,6 +1651,18 @@ impl SimulationView {
             return;
         }
 
+        // When settings panel is open, give it exclusive keyboard control
+        // Only allow ToggleSettings (comma) to close the panel
+        if self.settings_panel.open {
+            if let Some(action) = self.bindings.action_for(&event.keystroke) {
+                if matches!(action, CommandAction::ToggleSettings) {
+                    self.invoke_action(action, cx);
+                }
+                // Ignore all other key bindings - settings panel handles them
+            }
+            return;
+        }
+
         if let Some(action) = self.bindings.action_for(&event.keystroke) {
             self.invoke_action(action, cx);
         }
@@ -4699,8 +4711,18 @@ impl SimulationView {
             )
             .child(
                 div()
-                    .text_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w_8()
+                    .h_8()
+                    .rounded_md()
+                    .text_base()
                     .text_color(rgb(0x94a3b8))
+                    .hover(|s| {
+                        s.bg(rgb(0x475569))
+                            .text_color(rgb(0x60a5fa))
+                    })
                     .child(if is_collapsed { "▶" } else { "▼" }),
             );
 
@@ -4844,7 +4866,7 @@ impl SimulationView {
             }
 
             ConfigCategory::Topography => {
-                // Topography has a toggle - hybrid approach with toggle first, then readonly params
+                // Topography has a toggle - hybrid approach with search-filtered toggle, then readonly params
                 let mut container = div()
                     .flex()
                     .flex_col()
@@ -4856,13 +4878,15 @@ impl SimulationView {
                     .border_1()
                     .border_color(rgb(0x1e293b));
 
-                // Add toggle (not filterable - always shown)
-                container = container.child(self.render_param_toggle(
-                    "Enabled",
-                    config.topography_enabled,
-                    "Enable terrain elevation effects",
-                    cx,
-                ));
+                // Add toggle if it matches search filter
+                if self.matches_search("Enabled") || self.matches_search("Enable terrain elevation effects") {
+                    container = container.child(self.render_param_toggle(
+                        "Enabled",
+                        config.topography_enabled,
+                        "Enable terrain elevation effects",
+                        cx,
+                    ));
+                }
 
                 // Add filterable readonly params
                 let params = vec![
