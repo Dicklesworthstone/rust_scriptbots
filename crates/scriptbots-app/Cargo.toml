@@ -8,7 +8,7 @@ anyhow = { workspace = true }
 axum = { version = "0.7.9", features = ["macros", "json"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
-mcp-protocol-sdk = { version = "0.5.1", default-features = false, features = ["http"] }
+mcp-protocol-sdk = { version = "0.5.1", default-features = false, features = ["http", "stdio"] }
 ratatui = { version = "0.30.0-alpha.5" }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 scriptbots-brain = { path = "../scriptbots-brain" }

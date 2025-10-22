@@ -103,7 +103,7 @@
 - Outline serialization format (likely `serde_wasm_bindgen` with compact binary option later).
 - Document error handling expectations (convert `anyhow` to `JsError`).
   - [2025-10-22 Codex] Implemented initial bindings in `scriptbots-web`: `SimHandle` wraps the core world, exposes `init_sim`, `tick`, `snapshot`, and `reset`, returns structured snapshots (agents + summary + world metadata), validates seeds/population, and maps errors to `JsError`.
-  - [2025-10-22 Codex] Added optional config overrides in `InitOptions`, `snapshot_format` toggle (`json`/`binary`), seeded agents with a lightweight wander brain for browser motion, and exposed `default_init_options()` for JS bootstrap.
+  - [2025-10-22 Codex] Added optional config overrides in `InitOptions`, `snapshot_format` toggle (`json`/`binary`), seeded agents with a lightweight wander brain for browser motion, exposed `default_init_options()` for JS bootstrap, and enabled runtime brain switching via `registerBrain` (`wander` | `mlp` | `none`).
   - [2025-10-22 Codex] Introduced a deterministic wasm-vs-native parity test (`wasm_bindgen_test`), comparing tick snapshots to guard against divergence before integrating with JS runtimes.
 
 ### 2.3 Threading Strategy
@@ -137,7 +137,7 @@
 - Data flow: `scriptbots-web` exports snapshot structure; JS/WASM renderer paints to `<canvas>` or WebGPU surface.
 - 2025-10-22: WebGPU spike crate compiled outside the repo (`/tmp/scriptbots-webgpu-proto`); ready for browser benchmarking once hosted locally. FPS/GPU metrics still pending (blocked in headless CLI—needs manual run on a workstation with Chrome 139 / Safari 26 beta).
 - 2025-10-22: Canvas fallback spike scaffolded at `/tmp/canvas-baseline`; renders 10k agents via Canvas2D. Performance profiling (FPS/CPU) still requires manual browser execution (Chrome 139 / Edge 139 / Safari 18).
-- [2025-10-22 Codex] Added `crates/scriptbots-web/web/` demo harness (Canvas2D) consuming the new WASM snapshot shape, with live metrics and reset controls for quick benchmarking; pairs with the wasm parity test for verification.
+- [2025-10-22 Codex] Added `crates/scriptbots-web/web/` demo harness (Canvas/WebGPU) consuming the new WASM snapshot shape, with live metrics, renderer/snapshot toggles, and reset controls for quick benchmarking; pairs with the wasm parity test for verification.
 - **Prototype plan (2025-10-22):**
   - Week 1: WebGPU `wgpu` spike — draw 10k agents + grid, measure FPS on Chrome 139 (Windows) and Safari 26 beta (macOS).
   - Week 1: Canvas2D baseline — JS renderer consuming serialized positions to benchmark fallback CPU cost.

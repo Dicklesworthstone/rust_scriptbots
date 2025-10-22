@@ -23,10 +23,12 @@ The crate exposes the following wasm-bindgen surface:
   - `config`: optional full `ScriptBotsConfig` override (rarely needed; defaults are usually sufficient).
   - `snapshot_format`: `"json"` (default) or `"binary"` (Postcard-encoded `Uint8Array`).
   - `seed_strategy`: `"wander"` (default) to attach lightweight wander brains or `"none"` to start with passive agents for custom registry wiring.
+  - `default_brain`: `"mlp"` to pre-bind agents to the baseline MLP implementation during seeding.
 - `SimHandle::tick(steps: u32) -> JsValue` — advances the simulation and returns either JSON or a `Uint8Array` depending on `snapshot_format`.
 - `SimHandle::snapshot() -> JsValue` — builds a snapshot without ticking (uses the same format toggle).
 - `SimHandle::reset(seed?: number)` — rebuilds the world with an optional seed.
-- `SimHandle::registerBrain(kind: string)` — placeholder for future integration with `scriptbots-brain`; currently returns an error to signal unimplemented functionality.
+- `SimHandle::registerBrain(kind: string)` — installs a brain preset for all agents (`"wander"`, `"mlp"`, or `"none"`).
+- `decode_snapshot_binary(bytes: &[u8]) -> JsValue` — helper exposed for JS callers to convert binary snapshots back into structured data.
 
 Snapshots are deterministic and include:
 

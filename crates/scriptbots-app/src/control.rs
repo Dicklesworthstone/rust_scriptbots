@@ -1,5 +1,6 @@
 use std::sync::{MutexGuard, PoisonError};
 
+use crossfire::channel::TrySendError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -7,6 +8,7 @@ use thiserror::Error;
 use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
 
 use crate::SharedWorld;
+use crate::command::{CommandSender, ControlCommand};
 
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,9 +18,12 @@ pub struct ConfigSnapshot {
 }
 
 impl ConfigSnapshot {
-    fn from_world(world: &ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
-        let config_value =
-            serde_json::to_value(world.clone()).map_err(ControlError::serialization)?;
+    fn from_world(config: &ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
+        Self::from_config(config.clone(), tick)
+    }
+
+    fn from_config(config: ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
+        let config_value = serde_json::to_value(config).map_err(ControlError::serialization)?;
         Ok(Self {
             tick: tick.0,
             config: config_value,
@@ -68,6 +73,10 @@ pub enum ControlError {
     UnknownPath(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("command queue is full; retry later")]
+    CommandQueueFull,
+    #[error("command queue has been closed")]
+    CommandQueueClosed,
 }
 
 impl ControlError {
@@ -86,11 +95,15 @@ impl From<PoisonError<MutexGuard<'_, WorldState>>> for ControlError {
 #[derive(Clone)]
 pub struct ControlHandle {
     shared_world: SharedWorld,
+    commands: CommandSender,
 }
 
 impl ControlHandle {
-    pub fn new(shared_world: SharedWorld) -> Self {
-        Self { shared_world }
+    pub fn new(shared_world: SharedWorld, commands: CommandSender) -> Self {
+        Self {
+            shared_world,
+            commands,
+        }
     }
 
     fn lock_world(&self) -> Result<MutexGuard<'_, WorldState>, ControlError> {
@@ -122,13 +135,16 @@ impl ControlHandle {
         }
 
         let mut world = self.lock_world()?;
+        let current_tick = world.tick();
         let mut config_value =
             serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
         merge_value(&mut config_value, &patch, &mut Vec::new())?;
         let new_config: ScriptBotsConfig =
             serde_json::from_value(config_value).map_err(ControlError::serialization)?;
-        *world.config_mut() = new_config.clone();
-        ConfigSnapshot::from_world(&new_config, world.tick())
+        let snapshot = ConfigSnapshot::from_config(new_config.clone(), current_tick)?;
+        drop(world);
+        self.enqueue(ControlCommand::UpdateConfig(new_config))?;
+        Ok(snapshot)
     }
 
     /// Apply a list of knob updates by path.
@@ -138,6 +154,14 @@ impl ControlHandle {
             insert_path(&mut patch_map, &update.path, update.value.clone())?;
         }
         self.apply_patch(Value::Object(patch_map))
+    }
+
+    fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {
+        match self.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_msg)) => Err(ControlError::CommandQueueFull),
+            Err(TrySendError::Disconnected(_msg)) => Err(ControlError::CommandQueueClosed),
+        }
     }
 }
 
@@ -169,8 +193,15 @@ fn merge_value(
     patch: &Value,
     path: &mut Vec<String>,
 ) -> Result<(), ControlError> {
-    match (target, patch) {
-        (Value::Object(target_map), Value::Object(patch_map)) => {
+    match target {
+        Value::Object(target_map) => {
+            let Value::Object(patch_map) = patch else {
+                return Err(ControlError::InvalidPatch(format!(
+                    "type mismatch at {}",
+                    path.join("."),
+                )));
+            };
+
             for (key, patch_value) in patch_map {
                 path.push(key.clone());
                 let Some(target_value) = target_map.get_mut(key) else {
@@ -181,59 +212,95 @@ fn merge_value(
             }
             Ok(())
         }
-        (Value::Array(_), Value::Array(_))
-        | (Value::Number(_), Value::Number(_))
-        | (Value::String(_), Value::String(_))
-        | (Value::Bool(_), Value::Bool(_))
-        | (Value::Null, _) => {
+        Value::Array(_) => {
+            if matches!(patch, Value::Array(_)) {
+                *target = patch.clone();
+                Ok(())
+            } else {
+                Err(ControlError::InvalidPatch(format!(
+                    "type mismatch at {}",
+                    path.join("."),
+                )))
+            }
+        }
+        Value::Number(_) => match patch {
+            Value::Number(_) => {
+                *target = patch.clone();
+                Ok(())
+            }
+            Value::String(_) => {
+                let Some(text) = patch.as_str() else {
+                    return Err(ControlError::InvalidPatch(path.join(".")));
+                };
+                if target.as_i64().is_some() {
+                    let parsed: i64 = text
+                        .trim()
+                        .parse()
+                        .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
+                    *target = Value::from(parsed);
+                } else if target.as_u64().is_some() {
+                    let parsed: u64 = text
+                        .trim()
+                        .parse()
+                        .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
+                    *target = Value::from(parsed);
+                } else {
+                    let parsed: f64 = text
+                        .trim()
+                        .parse()
+                        .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
+                    *target = Value::from(parsed);
+                }
+                Ok(())
+            }
+            Value::Null => {
+                *target = Value::Null;
+                Ok(())
+            }
+            _ => Err(ControlError::InvalidPatch(format!(
+                "type mismatch at {}",
+                path.join("."),
+            ))),
+        },
+        Value::String(_) => match patch {
+            Value::String(_) | Value::Null => {
+                *target = patch.clone();
+                Ok(())
+            }
+            _ => Err(ControlError::InvalidPatch(format!(
+                "type mismatch at {}",
+                path.join("."),
+            ))),
+        },
+        Value::Bool(_) => match patch {
+            Value::Bool(_) | Value::Null => {
+                *target = patch.clone();
+                Ok(())
+            }
+            Value::String(_) => {
+                let parsed = match patch.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+                    Some(s) if matches!(s.as_str(), "true" | "1" | "yes" | "on") => true,
+                    Some(s) if matches!(s.as_str(), "false" | "0" | "no" | "off") => false,
+                    _ => {
+                        return Err(ControlError::InvalidPatch(format!(
+                            "cannot coerce '{:?}' to bool for {}",
+                            patch,
+                            path.join("."),
+                        )));
+                    }
+                };
+                *target = Value::from(parsed);
+                Ok(())
+            }
+            _ => Err(ControlError::InvalidPatch(format!(
+                "type mismatch at {}",
+                path.join("."),
+            ))),
+        },
+        Value::Null => {
             *target = patch.clone();
             Ok(())
         }
-        (Value::Number(_), Value::String(_)) => {
-            // Allow setting numbers from string representations, matching the existing number kind.
-            let Some(text) = patch.as_str() else {
-                return Err(ControlError::InvalidPatch(path.join(".")));
-            };
-            if target.as_i64().is_some() {
-                let parsed: i64 = text
-                    .trim()
-                    .parse()
-                    .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
-                *target = Value::from(parsed);
-            } else if target.as_u64().is_some() {
-                let parsed: u64 = text
-                    .trim()
-                    .parse()
-                    .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
-                *target = Value::from(parsed);
-            } else {
-                let parsed: f64 = text
-                    .trim()
-                    .parse()
-                    .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
-                *target = Value::from(parsed);
-            }
-            Ok(())
-        }
-        (Value::Bool(_), Value::String(_)) => {
-            let parsed = match patch.as_str().map(|s| s.trim().to_ascii_lowercase()) {
-                Some(s) if matches!(s.as_str(), "true" | "1" | "yes" | "on") => true,
-                Some(s) if matches!(s.as_str(), "false" | "0" | "no" | "off") => false,
-                _ => {
-                    return Err(ControlError::InvalidPatch(format!(
-                        "cannot coerce '{:?}' to bool for {}",
-                        patch,
-                        path.join("."),
-                    )));
-                }
-            };
-            *target = Value::from(parsed);
-            Ok(())
-        }
-        _ => Err(ControlError::InvalidPatch(format!(
-            "type mismatch at {}",
-            path.join("."),
-        ))),
     }
 }
 
@@ -280,14 +347,16 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    fn handle() -> ControlHandle {
+    fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
-        ControlHandle::new(Arc::new(Mutex::new(world)))
+        let (sender, receiver) = crate::command::create_command_bus(4);
+        let handle = ControlHandle::new(Arc::new(Mutex::new(world)), sender);
+        (handle, receiver)
     }
 
     #[test]
     fn patch_updates_single_field() {
-        let handle = handle();
+        let (handle, receiver) = handle();
         let updates = vec![KnobUpdate {
             path: "world_width".to_string(),
             value: Value::from(8_000),
@@ -301,11 +370,15 @@ mod tests {
                 .expect("world_width"),
             8_000
         );
+
+        // ensure queue drained for consistency
+        let mut world = handle.lock_world().expect("world lock");
+        crate::command::drain_pending_commands(&receiver, &mut world);
     }
 
     #[test]
     fn unknown_path_errors() {
-        let handle = handle();
+        let (handle, _receiver) = handle();
         let err = handle
             .apply_updates(&[KnobUpdate {
                 path: "does.not.exist".into(),

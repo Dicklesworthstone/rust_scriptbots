@@ -10,6 +10,7 @@ pub type SharedStorage = Arc<Mutex<Storage>>;
 
 pub mod control;
 pub mod servers;
+pub mod terminal;
 
 pub mod renderer {
     use anyhow::Result;

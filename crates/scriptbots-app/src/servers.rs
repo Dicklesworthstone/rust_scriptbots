@@ -9,13 +9,20 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use axum::{
-    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, patch, post},
+    Json, Router,
 };
-use mcp_protocol_sdk::{prelude::*, transport::stdio::StdioServerTransport};
+use crossfire::channel::TrySendError;
+use mcp_protocol_sdk::{
+    core::error::McpResult,
+    prelude::*,
+    server::mcp_server::McpServer,
+    server::HttpMcpServer,
+    transport::http::HttpServerTransport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -38,12 +45,16 @@ pub struct ControlServerConfig {
 impl Default for ControlServerConfig {
     fn default() -> Self {
         Self {
-            rest_address: "127.0.0.1:8080"
+            rest_address: "127.0.0.1:8088"
                 .parse()
                 .expect("hard-coded loopback socket"),
             swagger_path: "/docs".to_string(),
             rest_enabled: true,
-            mcp_transport: McpTransportConfig::Disabled,
+            mcp_transport: McpTransportConfig::Http {
+                bind_addr: "127.0.0.1:8090"
+                    .parse()
+                    .expect("hard-coded MCP HTTP socket"),
+            },
         }
     }
 }
@@ -77,15 +88,39 @@ impl ControlServerConfig {
             );
         }
 
+        let default_mcp = match config.mcp_transport {
+            McpTransportConfig::Http { bind_addr } => bind_addr,
+            McpTransportConfig::Disabled => "127.0.0.1:8090"
+                .parse()
+                .expect("fallback MCP HTTP socket"),
+        };
+        let mut mcp_bind = default_mcp;
+
+        if let Ok(addr) = env::var("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR") {
+            match addr.parse::<SocketAddr>() {
+                Ok(parsed) => mcp_bind = parsed,
+                Err(err) => warn!(%addr, %err, "invalid SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR; using default"),
+            }
+        }
+
         if let Ok(raw) = env::var("SCRIPTBOTS_CONTROL_MCP") {
-            config.mcp_transport = match raw.trim().to_ascii_lowercase().as_str() {
-                "stdio" => McpTransportConfig::Stdio,
-                "disabled" | "off" | "false" | "0" => McpTransportConfig::Disabled,
-                other => {
-                    warn!(%other, "unknown MCP transport; disabling MCP server");
-                    McpTransportConfig::Disabled
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "disabled" | "off" | "false" | "0" => {
+                    config.mcp_transport = McpTransportConfig::Disabled;
                 }
-            };
+                value if value.is_empty() || value == "http" => {
+                    config.mcp_transport = McpTransportConfig::Http { bind_addr: mcp_bind };
+                }
+                other => match other.parse::<SocketAddr>() {
+                    Ok(parsed) => config.mcp_transport = McpTransportConfig::Http { bind_addr: parsed },
+                    Err(err) => {
+                        warn!(%other, %err, "unknown MCP transport value; disabling MCP server");
+                        config.mcp_transport = McpTransportConfig::Disabled;
+                    }
+                },
+            }
+        } else {
+            config.mcp_transport = McpTransportConfig::Http { bind_addr: mcp_bind };
         }
 
         config
@@ -108,12 +143,19 @@ fn sanitize_swagger_path(path: &str) -> String {
 #[derive(Debug, Clone)]
 pub enum McpTransportConfig {
     Disabled,
-    Stdio,
+    Http { bind_addr: SocketAddr },
 }
 
 impl McpTransportConfig {
     fn is_enabled(&self) -> bool {
         !matches!(self, Self::Disabled)
+    }
+
+    fn bind_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Http { bind_addr } => Some(*bind_addr),
+            Self::Disabled => None,
+        }
     }
 }
 
@@ -502,21 +544,22 @@ async fn run_mcp_server(handle: ControlHandle, transport: McpTransportConfig) ->
     }
 }
 
-fn register_tool(
-    server: &mut McpServer,
+async fn register_tool(
+    server: &McpServer,
     name: &str,
     description: &str,
     schema: Value,
     kind: ControlToolKind,
     handle: ControlHandle,
-) {
-    let tool = Tool {
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        input_schema: Some(schema),
-        handler: Box::new(ControlTool { handle, kind }),
-    };
-    server.add_tool(tool);
+) -> McpResult<()> {
+    server
+        .add_tool(
+            name.to_string(),
+            Some(description.to_string()),
+            schema,
+            ControlTool { handle, kind },
+        )
+        .await
 }
 
 #[derive(Clone)]

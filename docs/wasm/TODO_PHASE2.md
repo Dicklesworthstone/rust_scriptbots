@@ -26,3 +26,19 @@
 - [x] Update project docs
   - [x] Amend `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` for new snapshot formats, brain options, CI steps
   - [x] Add brief note to `README.md` pointing to wasm harness
+- [ ] WebGPU rendering spike (Phase 3.1)
+  - [ ] Implement instanced WebGPU pipeline and benchmark vs Canvas
+  - [ ] Capture FPS/CPU metrics on Chrome + Safari Technology Preview
+  - [ ] Document fallback behaviour and feature detection in harness
+- [ ] Input & camera controls (Phase 3.2)
+  - [ ] Mirror GPUI pan/zoom/pause/selection interactions in web harness
+  - [ ] Add keyboard shortcuts and HUD indicators for control state
+- [ ] Diagnostics overlay parity (Phase 3.4)
+  - [ ] Render tick rate / population charts in browser
+  - [ ] Surface observable toggles (velocity vectors, sensing cones)
+- [ ] Persistence & analytics prototype (Phase 4)
+  - [ ] Implement in-browser snapshot ring buffer with download/export
+  - [ ] Evaluate DuckDB-wasm or IndexedDB fallback for analytics storage
+- [ ] Bundled developer workflow
+  - [ ] Decide on Vite/esbuild/no-bundler approach and codify scripts
+  - [ ] Provide npm/task runner commands for build + serve

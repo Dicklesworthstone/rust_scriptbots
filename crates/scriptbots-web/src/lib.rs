@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result, ensure};
 use js_sys::Uint8Array;
-use postcard::to_allocvec;
+use postcard::{from_bytes, to_allocvec};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use scriptbots_core::{
@@ -422,16 +422,37 @@ pub fn init_sim(config: JsValue) -> Result<SimHandle, JsValue> {
     })
 }
 
-fn seed_agents(world: &mut WorldState, count: usize, strategy: SeedStrategy) -> Result<()> {
-    if matches!(strategy, SeedStrategy::None) || count == 0 {
+fn seed_agents(
+    world: &mut WorldState,
+    count: usize,
+    strategy: SeedStrategy,
+    default_brain: Option<BrainPreset>,
+    mlp_key_cache: &mut Option<u64>,
+) -> Result<()> {
+    if count == 0 {
         return Ok(());
     }
 
     let world_width = world.config().world_width as f32;
     let world_height = world.config().world_height as f32;
 
+    let mlp_key = if matches!(default_brain, Some(BrainPreset::Mlp)) {
+        Some(match mlp_key_cache {
+            Some(key) => *key,
+            None => {
+                let key = world
+                    .brain_registry_mut()
+                    .register(MlpBrain::KIND.as_str(), |rng| MlpBrain::runner(rng));
+                *mlp_key_cache = Some(key);
+                key
+            }
+        })
+    } else {
+        None
+    };
+
     for _ in 0..count {
-        let (agent, brain_seed) = {
+        let (agent, wander_seed) = {
             let rng = world.rng();
             let x = rng.random_range(0.0..world_width);
             let y = rng.random_range(0.0..world_height);
@@ -459,8 +480,10 @@ fn seed_agents(world: &mut WorldState, count: usize, strategy: SeedStrategy) -> 
         };
 
         let id = world.spawn_agent(agent);
-        if matches!(strategy, SeedStrategy::Wander) {
-            bind_brain(world, id, brain_seed)?;
+        if let Some(key) = mlp_key {
+            let _ = world.bind_agent_brain(id, key);
+        } else if matches!(strategy, SeedStrategy::Wander) {
+            bind_wander_brain(world, id, wander_seed)?;
         }
     }
 
@@ -506,6 +529,13 @@ pub fn version() -> String {
 #[wasm_bindgen]
 pub fn default_init_options() -> Result<JsValue, JsValue> {
     to_value(&InitOptions::default()).map_err(js_error)
+}
+
+#[wasm_bindgen]
+pub fn decode_snapshot_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let snapshot: SimulationSnapshot =
+        from_bytes(bytes).map_err(|err| js_error(format!("postcard decode failed: {err}")))?;
+    to_value(&snapshot).map_err(js_error)
 }
 
 fn bind_wander_brain(world: &mut WorldState, agent: AgentId, seed: u64) -> Result<()> {
