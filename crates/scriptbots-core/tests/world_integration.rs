@@ -384,7 +384,22 @@ fn regression_seed_42_matches_baseline() {
     assert_eq!(summary.agent_count, 1);
     assert_eq!(summary.births, 0);
     assert_eq!(summary.deaths, 0);
-    assert!((summary.total_energy - 1.92).abs() < 1e-6);
-    assert!((summary.average_energy - 1.92).abs() < 1e-6);
-    assert!((summary.average_health - 0.920_001_03).abs() < 1e-6);
+    let expected_total_energy = 1.92;
+    let expected_average_energy = 1.92;
+    let expected_average_health = 0.920_001_03;
+    assert!(
+        (summary.total_energy - expected_total_energy).abs() < 1e-6,
+        "expected total energy {expected_total_energy:.6}, got {:.6}",
+        summary.total_energy
+    );
+    assert!(
+        (summary.average_energy - expected_average_energy).abs() < 1e-6,
+        "expected average energy {expected_average_energy:.6}, got {:.6}",
+        summary.average_energy
+    );
+    assert!(
+        (summary.average_health - expected_average_health).abs() < 1e-6,
+        "expected average health {expected_average_health:.6}, got {:.6}",
+        summary.average_health
+    );
 }
