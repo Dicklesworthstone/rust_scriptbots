@@ -84,12 +84,6 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-fn log_mutation(log: &mut Vec<String>, label: &str, before: f32, after: f32) {
-    if (after - before).abs() > 1e-4 {
-        log.push(format!("{label}:{before:.3}->{after:.3}"));
-    }
-}
-
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
@@ -2700,6 +2694,8 @@ impl WorldState {
         let partner_chance = self.config.reproduction_partner_chance;
         let gene_log_capacity = self.config.reproduction_gene_log_capacity;
         let cooldown = self.config.reproduction_cooldown.max(1) as f32;
+        let rate_carnivore = self.config.reproduction_rate_carnivore;
+        let rate_herbivore = self.config.reproduction_rate_herbivore;
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         if handles.is_empty() {
@@ -2723,7 +2719,8 @@ impl WorldState {
                     Some(rt) => rt,
                     None => continue,
                 };
-                let reproduction_rate = self.species_reproduction_rate(runtime.herbivore_tendency);
+                let herb = runtime.herbivore_tendency.clamp(0.0, 1.0);
+                let reproduction_rate = rate_carnivore + (rate_herbivore - rate_carnivore) * herb;
                 runtime.reproduction_counter += reproduction_rate;
                 if runtime.energy < self.config.reproduction_energy_threshold {
                     continue;
@@ -2757,23 +2754,12 @@ impl WorldState {
                 width,
                 height,
             );
-            let mut child_runtime = self.build_child_runtime(
+            let child_runtime = self.build_child_runtime(
                 &parent_runtime_snapshot,
                 partner_runtime.as_ref(),
                 gene_log_capacity,
                 *agent_id,
                 partner_index.map(|j| handles[j]),
-            );
-            child_runtime.push_gene_log(
-                gene_log_capacity,
-                format!(
-                    "spawn parent={:?} partner={} rate={:.2}",
-                    agent_id,
-                    partner_index
-                        .map(|j| format!("{:?}", handles[j]))
-                        .unwrap_or_else(|| "none".to_string()),
-                    self.species_reproduction_rate(parent_runtime_snapshot.herbivore_tendency)
-                ),
             );
             self.pending_spawns.push(SpawnOrder {
                 parent_index: idx,
@@ -2813,12 +2799,6 @@ impl WorldState {
         best.map(|(idx, _)| idx)
     }
 
-    fn species_reproduction_rate(&self, herbivore_factor: f32) -> f32 {
-        let h = herbivore_factor.clamp(0.0, 1.0);
-        let carn = self.config.reproduction_rate_carnivore;
-        carn + (self.config.reproduction_rate_herbivore - carn) * h
-    }
-
     fn stage_spawn_commit(&mut self) {
         if self.pending_spawns.is_empty() {
             return;
@@ -2834,6 +2814,7 @@ impl WorldState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_child_data(
         &mut self,
         parent: &AgentData,

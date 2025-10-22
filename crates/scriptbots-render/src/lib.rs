@@ -1,18 +1,17 @@
 //! GPUI rendering layer for ScriptBots.
 
 use gpui::{
-    App, Application, Background, Bounds, Context, Div, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent,
-    SharedString, Window, WindowBounds, WindowOptions, canvas, div, fill, point, prelude::*, px,
-    rgb, size,
+    App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
+    ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, canvas, div, fill, point,
+    prelude::*, px, rgb, size,
 };
 use scriptbots_core::{
     AgentColumns, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState, MutationRates,
     OUTPUT_SIZE, Position, SelectionState, TickSummary, TraitModifiers, WorldState,
 };
-use std::f32::consts::TAU;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -70,6 +69,9 @@ struct SimulationView {
     inspector: Arc<Mutex<InspectorState>>,
     playback: PlaybackState,
     perf: PerfStats,
+    accessibility: AccessibilitySettings,
+    bindings: InputBindings,
+    key_capture: Option<CommandAction>,
 }
 
 impl SimulationView {
@@ -81,6 +83,9 @@ impl SimulationView {
             inspector: Arc::new(Mutex::new(InspectorState::default())),
             playback: PlaybackState::new(240),
             perf: PerfStats::new(240),
+            accessibility: AccessibilitySettings::default(),
+            bindings: InputBindings::default(),
+            key_capture: None,
         }
     }
 
@@ -108,7 +113,7 @@ impl SimulationView {
             let config = world.config();
             snapshot.world_size = (config.world_width, config.world_height);
             snapshot.history_capacity = config.history_capacity;
-            snapshot.render_frame = RenderFrame::from_world(&world);
+            snapshot.render_frame = RenderFrame::from_world(&world, self.accessibility.palette);
 
             let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
             for summary in world.history() {
@@ -517,6 +522,70 @@ impl SimulationView {
         cx.notify();
     }
 
+    fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if let Some(target) = self.key_capture {
+            if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                self.key_capture = None;
+                cx.notify();
+                return;
+            }
+            self.bindings.assign(target, event.keystroke.clone());
+            self.key_capture = None;
+            info!(
+                "Rebound {} to {}",
+                target.label(),
+                format_keystroke(&event.keystroke)
+            );
+            cx.notify();
+            return;
+        }
+
+        if let Some(action) = self.bindings.action_for(&event.keystroke) {
+            self.invoke_action(action, cx);
+        }
+    }
+
+    fn invoke_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
+        match action {
+            CommandAction::TogglePlayback => self.playback_toggle(cx),
+            CommandAction::GoLive => self.playback_go_live(cx),
+            CommandAction::ToggleBrush => self.toggle_brush_state(cx),
+            CommandAction::ToggleNarration => self.toggle_narration(cx),
+            CommandAction::CyclePalette => self.cycle_palette(cx),
+        }
+    }
+
+    fn toggle_brush_state(&mut self, cx: &mut Context<Self>) {
+        if let Ok(mut inspector) = self.inspector.lock() {
+            let new_state = !inspector.brush_enabled;
+            inspector.brush_enabled = new_state;
+        }
+        cx.notify();
+    }
+
+    fn toggle_narration(&mut self, cx: &mut Context<Self>) {
+        self.accessibility.narration_enabled = !self.accessibility.narration_enabled;
+        if self.accessibility.narration_enabled {
+            info!("Narration enabled");
+        } else {
+            info!("Narration disabled");
+        }
+        cx.notify();
+    }
+
+    fn cycle_palette(&mut self, cx: &mut Context<Self>) {
+        let next = self.accessibility.palette.next();
+        self.accessibility.palette = next;
+        cx.notify();
+    }
+
+    fn set_palette(&mut self, palette: ColorPaletteMode, cx: &mut Context<Self>) {
+        if self.accessibility.palette != palette {
+            self.accessibility.palette = palette;
+            cx.notify();
+        }
+    }
+
     fn playback_restart(&mut self, cx: &mut Context<Self>) {
         self.playback.restart();
         cx.notify();
@@ -666,6 +735,7 @@ impl SimulationView {
             )
             .child(selection_list)
             .child(brush_tools)
+            .child(self.render_accessibility_panel(cx))
             .child(playback_controls)
             .child(detail)
     }
@@ -1050,6 +1120,158 @@ impl SimulationView {
             )
     }
 
+    fn render_accessibility_panel(&self, cx: &mut Context<Self>) -> Div {
+        let palette_buttons: Vec<Div> = ColorPaletteMode::ALL
+            .iter()
+            .map(|mode| {
+                let mode = *mode;
+                let active = self.accessibility.palette == mode;
+                let listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                    this.set_palette(mode, cx);
+                });
+                let preview_color = apply_palette(rgba_from_hex(0x58ff94, 1.0), mode);
+                let preview = div()
+                    .w(px(16.0))
+                    .h(px(8.0))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x1e293b))
+                    .bg(preview_color);
+                let base = div()
+                    .rounded_md()
+                    .border_1()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .flex()
+                    .gap_1()
+                    .items_center()
+                    .child(preview)
+                    .child(mode.label())
+                    .on_mouse_down(MouseButton::Left, listener);
+                if active {
+                    base.border_color(rgb(0x38bdf8))
+                        .bg(rgb(0x1e3a8a))
+                        .text_color(rgb(0xe0f2fe))
+                } else {
+                    base.border_color(rgb(0x1e293b))
+                        .bg(rgb(0x111b2b))
+                        .text_color(rgb(0xcbd5f5))
+                }
+            })
+            .collect();
+
+        let narration_button = {
+            let listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+                this.toggle_narration(cx);
+            });
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(if self.accessibility.narration_enabled {
+                    "Narration: On"
+                } else {
+                    "Narration: Off"
+                })
+                .on_mouse_down(MouseButton::Left, listener);
+            if self.accessibility.narration_enabled {
+                base.border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                base.border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let mut bindings_rows: Vec<Div> = Vec::new();
+        for (action, stroke) in self.bindings.iter() {
+            let capturing = self.key_capture == Some(action);
+            let label = action.label();
+            let binding_text = if capturing {
+                "Press new key...".to_string()
+            } else {
+                format_keystroke(&stroke)
+            };
+            let listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                if this.key_capture == Some(action) {
+                    this.key_capture = None;
+                } else {
+                    this.key_capture = Some(action);
+                }
+                cx.notify();
+            });
+            let button = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(if capturing { "Cancel" } else { "Rebind" })
+                .on_mouse_down(MouseButton::Left, listener);
+            bindings_rows.push(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(label))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(binding_text),
+                    )
+                    .child(button),
+            );
+        }
+
+        if self.key_capture.is_some() {
+            bindings_rows.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xf97316))
+                    .child("Press a key to assign, or Esc to cancel."),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Accessibility"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xcbd5f5))
+                    .child("Color palette"),
+            )
+            .child(div().flex().gap_2().children(palette_buttons))
+            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child("Narration"))
+            .child(narration_button)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xcbd5f5))
+                    .child("Key bindings"),
+            )
+            .children(bindings_rows)
+    }
+
     fn render_inspector_detail(&self, detail: &AgentInspectorDetails) -> Div {
         let sensors_preview: Vec<String> = detail
             .sensors
@@ -1189,6 +1411,18 @@ impl SimulationView {
             inspector.brush_radius,
             if inspector.probe_enabled { "ON" } else { "OFF" }
         ));
+        lines.push(format!(
+            "Palette {} · Narration {}",
+            self.accessibility.palette.label(),
+            if self.accessibility.narration_enabled {
+                "ON"
+            } else {
+                "OFF"
+            }
+        ));
+        if let Some(action) = self.key_capture {
+            lines.push(format!("Rebinding {}...", action.label()));
+        }
 
         let playback = self.playback.status();
         if playback.total > 0 {
@@ -1398,7 +1632,10 @@ impl Render for SimulationView {
                     .child(self.render_canvas(&snapshot, cx))
                     .child(self.render_inspector(&snapshot, cx)),
             )
-            .child(self.render_footer(&snapshot));
+            .child(self.render_footer(&snapshot))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.handle_key_down(event, cx);
+            }));
 
         let perf_snapshot = self.perf.end_frame();
 
@@ -1564,6 +1801,215 @@ impl InspectorSnapshot {
         snapshot.focus_id = focus_id;
         snapshot
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ColorPaletteMode {
+    #[default]
+    Natural,
+    Deuteranopia,
+    Protanopia,
+    Tritanopia,
+    HighContrast,
+}
+
+impl ColorPaletteMode {
+    const ALL: [ColorPaletteMode; 5] = [
+        ColorPaletteMode::Natural,
+        ColorPaletteMode::Deuteranopia,
+        ColorPaletteMode::Protanopia,
+        ColorPaletteMode::Tritanopia,
+        ColorPaletteMode::HighContrast,
+    ];
+
+    fn next(self) -> Self {
+        match self {
+            ColorPaletteMode::Natural => ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Deuteranopia => ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Protanopia => ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::Tritanopia => ColorPaletteMode::HighContrast,
+            ColorPaletteMode::HighContrast => ColorPaletteMode::Natural,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ColorPaletteMode::Natural => "Natural",
+            ColorPaletteMode::Deuteranopia => "Deuteranopia",
+            ColorPaletteMode::Protanopia => "Protanopia",
+            ColorPaletteMode::Tritanopia => "Tritanopia",
+            ColorPaletteMode::HighContrast => "High Contrast",
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct AccessibilitySettings {
+    palette: ColorPaletteMode,
+    narration_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CommandAction {
+    TogglePlayback,
+    GoLive,
+    ToggleBrush,
+    ToggleNarration,
+    CyclePalette,
+}
+
+impl CommandAction {
+    fn label(self) -> &'static str {
+        match self {
+            CommandAction::TogglePlayback => "Toggle playback",
+            CommandAction::GoLive => "Jump to live",
+            CommandAction::ToggleBrush => "Toggle brush",
+            CommandAction::ToggleNarration => "Toggle narration",
+            CommandAction::CyclePalette => "Cycle palette",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct InputBindings {
+    map: BTreeMap<CommandAction, Keystroke>,
+}
+
+impl Default for InputBindings {
+    fn default() -> Self {
+        let mut map = BTreeMap::new();
+        map.insert(
+            CommandAction::TogglePlayback,
+            Keystroke::parse("space").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::GoLive,
+            Keystroke::parse("g").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleBrush,
+            Keystroke::parse("b").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleNarration,
+            Keystroke::parse("n").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::CyclePalette,
+            Keystroke::parse("p").unwrap_or_default(),
+        );
+        Self { map }
+    }
+}
+
+impl InputBindings {
+    fn iter(&self) -> Vec<(CommandAction, Keystroke)> {
+        self.map
+            .iter()
+            .map(|(action, ks)| (*action, ks.clone()))
+            .collect()
+    }
+
+    fn assign(&mut self, action: CommandAction, stroke: Keystroke) {
+        if stroke.key.is_empty() {
+            self.map.insert(action, Keystroke::default());
+            return;
+        }
+
+        let conflict = self.map.iter().find_map(|(other, ks)| {
+            if *other != action && keystrokes_equal(ks, &stroke) {
+                Some(*other)
+            } else {
+                None
+            }
+        });
+
+        if let Some(conflict_action) = conflict {
+            self.map.insert(conflict_action, Keystroke::default());
+        }
+
+        self.map.insert(action, stroke);
+    }
+
+    fn action_for(&self, stroke: &Keystroke) -> Option<CommandAction> {
+        self.map
+            .iter()
+            .find(|(_, binding)| keystrokes_equal(binding, stroke))
+            .map(|(action, _)| *action)
+    }
+}
+
+fn keystrokes_equal(a: &Keystroke, b: &Keystroke) -> bool {
+    if a.key.is_empty() || b.key.is_empty() {
+        return false;
+    }
+
+    if a.modifiers != b.modifiers {
+        return false;
+    }
+
+    let key_matches = a.key.eq_ignore_ascii_case(&b.key)
+        || (a.key.eq_ignore_ascii_case("space") && b.key.trim().is_empty())
+        || (b.key.eq_ignore_ascii_case("space") && a.key.trim().is_empty());
+
+    if key_matches {
+        return true;
+    }
+
+    if let Some(ref key_char) = a.key_char {
+        if key_char.eq_ignore_ascii_case(&b.key) {
+            return true;
+        }
+        if a.key.eq_ignore_ascii_case("space") && key_char.trim().is_empty() {
+            return true;
+        }
+    }
+
+    if let Some(ref key_char) = b.key_char {
+        if key_char.eq_ignore_ascii_case(&a.key) {
+            return true;
+        }
+        if b.key.eq_ignore_ascii_case("space") && key_char.trim().is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn format_keystroke(keystroke: &Keystroke) -> String {
+    if keystroke.key.is_empty() {
+        return "Unbound".to_string();
+    }
+
+    let mut parts = Vec::new();
+    if keystroke.modifiers.control {
+        parts.push("Ctrl".to_string());
+    }
+    if keystroke.modifiers.alt {
+        parts.push("Alt".to_string());
+    }
+    if keystroke.modifiers.shift {
+        parts.push("Shift".to_string());
+    }
+    if keystroke.modifiers.platform {
+        parts.push(if cfg!(target_os = "macos") {
+            "Cmd".to_string()
+        } else {
+            "Super".to_string()
+        });
+    }
+    if keystroke.modifiers.function {
+        parts.push("Fn".to_string());
+    }
+
+    let key = if keystroke.key.len() == 1 {
+        keystroke.key.to_uppercase()
+    } else {
+        keystroke.key.clone()
+    };
+    parts.push(key);
+    parts.join(" + ")
 }
 
 #[derive(Clone)]
@@ -1957,6 +2403,7 @@ struct RenderFrame {
     food_max: f32,
     agents: Vec<AgentRenderData>,
     agent_base_radius: f32,
+    palette: ColorPaletteMode,
 }
 
 #[derive(Clone)]
@@ -1980,7 +2427,7 @@ struct CanvasState {
 }
 
 impl RenderFrame {
-    fn from_world(world: &WorldState) -> Option<Self> {
+    fn from_world(world: &WorldState, palette: ColorPaletteMode) -> Option<Self> {
         let food = world.food();
         let width = food.width();
         let height = food.height();
@@ -2031,6 +2478,7 @@ impl RenderFrame {
             food_max: config.food_max,
             agents,
             agent_base_radius: (config.spike_radius * 0.5).max(12.0),
+            palette,
         })
     }
 }
@@ -2310,7 +2758,10 @@ fn paint_frame(
         rgba_from_hex(0x173f6a, 1.0),
         daylight,
     );
-    window.paint_quad(fill(bounds, Background::from(sky_base)));
+    window.paint_quad(fill(
+        bounds,
+        Background::from(apply_palette(sky_base, frame.palette)),
+    ));
 
     let horizon_height = height_px * 0.35;
     if horizon_height > 1.0 {
@@ -2321,7 +2772,10 @@ fn paint_frame(
             ),
             size(px(width_px), px(horizon_height)),
         );
-        let horizon_color = rgba_from_hex(0xffa94d, (0.12 + 0.25 * daylight).clamp(0.0, 0.3));
+        let horizon_color = apply_palette(
+            rgba_from_hex(0xffa94d, (0.12 + 0.25 * daylight).clamp(0.0, 0.3)),
+            frame.palette,
+        );
         window.paint_quad(fill(horizon_bounds, Background::from(horizon_color)));
     }
 
@@ -2331,7 +2785,10 @@ fn paint_frame(
             point(px(f32::from(origin.x)), px(f32::from(origin.y))),
             size(px(width_px), px(height_px * 0.25)),
         );
-        let aurora_color = rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength);
+        let aurora_color = apply_palette(
+            rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength),
+            frame.palette,
+        );
         window.paint_quad(fill(aurora_bounds, Background::from(aurora_color)));
     }
 
@@ -2353,6 +2810,7 @@ fn paint_frame(
             let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
             let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
             color = scale_rgb(color, shade);
+            color = apply_palette(color, frame.palette);
             let px_x = offset_x + (x as f32 * cell_world * scale);
             let px_y = offset_y + (y as f32 * cell_world * scale);
             let cell_bounds =
@@ -2469,7 +2927,8 @@ fn paint_frame(
         );
         let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
         let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-        let color = agent_color(agent, agent_shade);
+        let mut color = agent_color(agent, agent_shade);
+        color = apply_palette(color, frame.palette);
         window.paint_quad(fill(agent_bounds, Background::from(color)));
     }
 }
@@ -2495,5 +2954,56 @@ fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
         g: (base_g * health_factor * shade).clamp(0.0, 1.0),
         b: (base_b * health_factor * shade).clamp(0.0, 1.0),
         a: 0.9,
+    }
+}
+
+fn apply_palette(color: Rgba, palette: ColorPaletteMode) -> Rgba {
+    match palette {
+        ColorPaletteMode::Natural => color,
+        ColorPaletteMode::Deuteranopia => transform_color(
+            color,
+            [[0.43, 0.72, -0.15], [0.34, 0.57, 0.09], [-0.02, 0.03, 0.97]],
+        ),
+        ColorPaletteMode::Protanopia => transform_color(
+            color,
+            [[0.20, 0.99, -0.19], [0.16, 0.79, 0.04], [0.01, -0.01, 1.00]],
+        ),
+        ColorPaletteMode::Tritanopia => transform_color(
+            color,
+            [[0.95, 0.05, 0.00], [0.00, 0.43, 0.56], [0.00, 0.47, 0.53]],
+        ),
+        ColorPaletteMode::HighContrast => {
+            let luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+            if luminance > 0.5 {
+                Rgba {
+                    r: (color.r + 0.15).min(1.0),
+                    g: (color.g + 0.15).min(1.0),
+                    b: (color.b + 0.15).min(1.0),
+                    a: color.a,
+                }
+            } else {
+                Rgba {
+                    r: (color.r * 0.6).clamp(0.0, 1.0),
+                    g: (color.g * 0.6).clamp(0.0, 1.0),
+                    b: (color.b * 0.6).clamp(0.0, 1.0),
+                    a: color.a,
+                }
+            }
+        }
+    }
+}
+
+fn transform_color(color: Rgba, matrix: [[f32; 3]; 3]) -> Rgba {
+    let r =
+        (color.r * matrix[0][0] + color.g * matrix[0][1] + color.b * matrix[0][2]).clamp(0.0, 1.0);
+    let g =
+        (color.r * matrix[1][0] + color.g * matrix[1][1] + color.b * matrix[1][2]).clamp(0.0, 1.0);
+    let b =
+        (color.r * matrix[2][0] + color.g * matrix[2][1] + color.b * matrix[2][2]).clamp(0.0, 1.0);
+    Rgba {
+        r,
+        g,
+        b,
+        a: color.a,
     }
 }
