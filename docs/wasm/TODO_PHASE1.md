@@ -39,9 +39,9 @@ _Created: 2025-10-22 (UTC). Keep this list exhaustive; mark completion inline wi
   - [ ] Build Canvas baseline prototype and capture metrics.
 
 - [ ] Wasm RNG + Rayon gating
-  - [ ] Enable `getrandom` JS backend via `rand` or workspace feature flags without disturbing native builds.
+  - [x] Enable `getrandom` WebAssembly backend via workspace feature flags (Cargo.toml updated).
   - [ ] Gate Rayon behind feature flag or `cfg` for wasm, documenting fallback path.
-  - [ ] Re-run `cargo check --target wasm32-unknown-unknown` and append findings.
+  - [x] Re-run `cargo check --target wasm32-unknown-unknown` and append findings.
 
 - [x] Security baseline
   - [x] Draft `docs/wasm/SECURITY_NOTES_PHASE1.md` covering COOP/COEP, CSP, SAB requirements.

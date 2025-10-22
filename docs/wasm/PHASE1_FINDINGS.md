@@ -5,18 +5,20 @@ _Date: 2025-10-22 (UTC)_
 ## Command
 - `cargo check --target wasm32-unknown-unknown -p scriptbots-core`
 
-## Outcome
+## Outcome (Initial Run)
 - **Status:** Failed
-- **Primary blocker:** `getrandom` 0.3.4 emits `compile_error!` for `wasm32-unknown-unknown` without the `js`/`wasm_js` configuration, causing dependent crates (`rand`, `rayon`, `slotmap`, etc.) to fail.citeturn5search7
+- **Primary blocker:** `getrandom` 0.3.4 emits `compile_error!` for `wasm32-unknown-unknown` without the `wasm_js` configuration, causing dependent crates (`rand`, `rayon`, `slotmap`, etc.) to fail.citeturn5search7
 - **Secondary noise:** The workspace inherits CPU-specific `RUSTFLAGS` (e.g., `-C target-cpu=znver3`) from host environment which are ignored under wasm targets; warnings are benign but noisy.
 
-## Next Actions
-1. Introduce wasm-friendly RNG configuration:
-   - Enable `getrandom`'s `js` feature via `rand` or per-crate dependency overrides.
-   - Alternatively, switch to `fastrand` or `rand`'s `wasm-bindgen` feature for wasm builds.
-2. Capture CPU flag noise suppression strategy (`RUSTFLAGS` override or target-specific `.cargo/config.toml`).
-3. Re-run `cargo check` after gating `rayon` (single-thread fallback) to surface further blockers.
+## Remediation
+1. Enable `getrandom`'s WebAssembly backend via workspace dependency and add a direct dependency in `scriptbots-core` to ensure feature propagation. ✔ (2025-10-22)
+2. Capture CPU flag noise suppression strategy (`RUSTFLAGS` override or target-specific `.cargo/config.toml`). _Pending._
+3. Gate Rayon behind feature flag or document single-thread fallback prior to runtime testing. _Pending._
+
+## Follow-up Run (2025-10-22)
+- Command: `cargo check --target wasm32-unknown-unknown -p scriptbots-core`
+- Result: **Success** after Step 1 above; no additional blockers surfaced during compilation.
 
 ## Notes
-- No modifications were made to source files; this run was purely diagnostic.
-- Findings should feed into `dependency_audit.csv` mitigation notes and ADR authoring.
+- No source files were modified; only `Cargo.toml` metadata was adjusted.
+- Findings feed into `dependency_audit.csv` mitigation notes and ADR authoring.

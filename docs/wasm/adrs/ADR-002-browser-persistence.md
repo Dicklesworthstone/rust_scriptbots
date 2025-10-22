@@ -13,11 +13,11 @@ Native builds rely on the Rust `duckdb` crate compiled with bundled C++ sources.
 - **Description:** Use the official DuckDB WebAssembly distribution (`@duckdb/duckdb-wasm`) loaded via JS/TS; connect WASM simulation via bindings for inserts/queries.
 - **Pros:** Maintains SQL parity with native DuckDB; supports OPFS-backed persistence; DuckDB team actively maintains WebAssembly build.citeturn0search0
 - **Cons:** Bundle size (multi-megabyte); limited to single-threaded execution; recent npm supply-chain incident (malicious 1.29.2/1.3.3 packages) requires strict version pinning and integrity checks.citeturn0search2turn0search3turn0search7
-- **Operational Notes:** Serve pre-compressed `.wasm`; enforce Subresource Integrity (SRI); monitor DuckDB security advisories; prefer self-hosted binaries rather than CDN when possible.citeturn0search10turn0search2
+- **Operational Notes:** Serve pre-compressed `.wasm`; enforce Subresource Integrity (SRI); monitor DuckDB advisories; prefer self-hosted binaries to avoid CDN tampering.citeturn0search3turn0search7
 
 ### Option B — IndexedDB / OPFS Snapshot Log
 - **Description:** Serialize simulation metrics/snapshots into IndexedDB or Origin Private File System (OPFS) using structured clones or binary blobs.
-- **Pros:** Zero third-party runtime; small bundle footprint; straightforward permission model.citeturn0search1
+- **Pros:** Zero third-party runtime; small bundle footprint; straightforward permission model.citeturn1search0turn1search2
 - **Cons:** Requires custom query tooling; harder to maintain parity with native SQL workflows; potential performance overhead for large binary snapshots.
 
 ### Option C — Headless Remote Persistence

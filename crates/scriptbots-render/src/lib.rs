@@ -1,18 +1,19 @@
 //! GPUI rendering layer for ScriptBots.
 
 use gpui::{
-    Angle, App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba,
-    ScrollDelta, ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, canvas, div,
-    fill, point, prelude::*, px, rgb, size,
+    App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
+    ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, canvas, div, fill, point,
+    prelude::*, px, rgb, size,
 };
 use scriptbots_core::{
     AgentColumns, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState, MutationRates,
-    OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
-    TraitModifiers, Velocity, WorldState,
+    OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TickSummary, TraitModifiers,
+    Velocity, WorldState,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
+    f32::consts::PI,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -25,8 +26,6 @@ use kira::{
     sound::static_sound::{StaticSoundData, StaticSoundSettings},
 };
 
-#[cfg(feature = "audio")]
-use std::f32::consts::PI;
 use tracing::{error, info};
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
@@ -219,35 +218,46 @@ impl SimulationView {
                 format!("Net {}", growth)
             };
 
+            let history = &snapshot.recent_history;
+            let agents_series = sparkline_from_history(history, |entry| entry.agent_count as f32);
+            let growth_series = sparkline_from_history(history, |entry| entry.net_growth() as f32);
+            let energy_series = sparkline_from_history(history, |entry| entry.average_energy);
+            let health_series = sparkline_from_history(history, |entry| entry.average_health);
+
             cards.push(self.metric_card(
                 "Tick",
                 metrics.tick.to_string(),
                 0x38bdf8,
                 Some(format!("Epoch {}", snapshot.epoch)),
+                None,
             ));
             cards.push(self.metric_card(
                 "Agents",
                 metrics.agent_count.to_string(),
                 0x22c55e,
                 Some(format!("{} active", snapshot.agent_count)),
+                agents_series.clone(),
             ));
             cards.push(self.metric_card(
                 "Births / Deaths",
                 format!("{} / {}", metrics.births, metrics.deaths),
                 growth_accent,
                 Some(growth_label),
+                growth_series.clone(),
             ));
             cards.push(self.metric_card(
                 "Avg Energy",
                 format!("{:.2}", metrics.average_energy),
                 0xf59e0b,
                 Some(format!("Total {:.1}", metrics.total_energy)),
+                energy_series.clone(),
             ));
             cards.push(self.metric_card(
                 "Avg Health",
                 format!("{:.2}", metrics.average_health),
                 0x8b5cf6,
                 None,
+                health_series,
             ));
         } else {
             cards.push(
@@ -1514,6 +1524,12 @@ impl SimulationView {
 
         if let Some(vector_state) = VectorHudState::from_snapshot(snapshot) {
             let canvas_state = vector_state.clone();
+            let heading_deg = vector_state.heading_rad.to_degrees();
+            let cohesion = if vector_state.max_speed > f32::EPSILON {
+                (vector_state.vector_magnitude / vector_state.max_speed * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
             let vector_canvas = canvas(
                 move |_, _, _| canvas_state.clone(),
                 move |bounds, state, window, _| paint_vector_hud(bounds, &state, window),
@@ -1537,7 +1553,11 @@ impl SimulationView {
                         .text_xs()
                         .text_color(rgb(0x64748b))
                         .child("Vector HUD gauges"),
-                );
+                )
+                .child(div().text_xs().text_color(rgb(0xa5b4fc)).child(format!(
+                    "Avg speed {:.2} · heading {:+.0}° · cohesion {:>3.0}%",
+                    vector_state.mean_speed, heading_deg, cohesion
+                )));
 
             container = container.child(vector_card);
         }
@@ -1681,8 +1701,22 @@ impl SimulationView {
         value: String,
         accent_hex: u32,
         detail: Option<String>,
+        sparkline: Option<SparklineSeries>,
     ) -> Div {
         let accent = rgb(accent_hex);
+        let accent_rgba = rgba_from_hex(accent_hex, 1.0);
+        let badge_state = MetricBadgeState {
+            accent: accent_rgba,
+        };
+        let badge = canvas(
+            move |_, _, _| badge_state.clone(),
+            move |bounds, state: MetricBadgeState, window, _| {
+                paint_metric_badge(bounds, state, window);
+            },
+        )
+        .w(px(28.0))
+        .h(px(28.0));
+
         let mut card = div()
             .flex()
             .flex_col()
@@ -1694,15 +1728,47 @@ impl SimulationView {
             .shadow_md()
             .p_4()
             .child(
-                div()
-                    .text_xs()
-                    .text_color(accent)
-                    .child(label.to_uppercase()),
+                div().flex().justify_between().items_center().child(
+                    div().flex().items_center().gap_2().child(badge).child(
+                        div()
+                            .text_xs()
+                            .text_color(accent)
+                            .child(label.to_uppercase()),
+                    ),
+                ),
             )
             .child(div().text_3xl().child(value));
 
         if let Some(detail_text) = detail {
             card = card.child(div().text_sm().text_color(rgb(0x94a3b8)).child(detail_text));
+        }
+
+        if let Some(series) = sparkline {
+            let spark_state = SparklineState {
+                values: series.normalized.clone(),
+                accent: accent_rgba,
+                trend: series.trend,
+            };
+            let spark_canvas = canvas(
+                move |_, _, _| spark_state.clone(),
+                move |bounds, state: SparklineState, window, _| {
+                    paint_sparkline(bounds, state, window);
+                },
+            )
+            .h(px(28.0))
+            .w_full();
+
+            card = card.child(
+                div()
+                    .mt(px(6.0))
+                    .rounded_md()
+                    .bg(rgb(0x0a1628))
+                    .border_1()
+                    .border_color(rgb(0x1f2a3d))
+                    .px_3()
+                    .py_2()
+                    .child(spark_canvas),
+            );
         }
 
         card
@@ -1853,7 +1919,13 @@ impl VectorHudState {
                 };
                 let max_speed = max_speed.max(mean_speed).max(1e-3);
 
-                ((avg_vx, avg_vy), mean_speed, vector_magnitude, max_speed, heading_rad)
+                (
+                    (avg_vx, avg_vy),
+                    mean_speed,
+                    vector_magnitude,
+                    max_speed,
+                    heading_rad,
+                )
             })
             .unwrap_or(((0.0, 0.0), 0.0, 0.0, 1.0, 0.0));
 
@@ -1904,12 +1976,65 @@ impl From<&TickSummary> for HudMetrics {
 }
 
 #[derive(Clone)]
+struct SparklineSeries {
+    normalized: Vec<f32>,
+    trend: f32,
+}
+
+#[derive(Clone)]
+struct SparklineState {
+    values: Vec<f32>,
+    accent: Rgba,
+    trend: f32,
+}
+
+#[derive(Clone)]
+struct MetricBadgeState {
+    accent: Rgba,
+}
+
+fn sparkline_from_history<F>(history: &[HudHistoryEntry], map: F) -> Option<SparklineSeries>
+where
+    F: Fn(&HudHistoryEntry) -> f32,
+{
+    if history.len() < 2 {
+        return None;
+    }
+    let mut raw: Vec<f32> = history.iter().map(map).collect();
+    if raw.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let first = raw.first().copied()?;
+    let last = raw.last().copied()?;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for value in &raw {
+        min = min.min(*value);
+        max = max.max(*value);
+    }
+    let span = (max - min).abs().max(1e-5);
+    let normalized: Vec<f32> = if span <= 1e-5 {
+        vec![0.5; raw.len()]
+    } else {
+        raw.iter()
+            .map(|v| ((v - min) / span).clamp(0.0, 1.0))
+            .collect()
+    };
+
+    Some(SparklineSeries {
+        normalized,
+        trend: last - first,
+    })
+}
+
+#[derive(Clone)]
 struct HudHistoryEntry {
     tick: u64,
     agent_count: usize,
     births: usize,
     deaths: usize,
     average_energy: f32,
+    average_health: f32,
 }
 
 impl HudHistoryEntry {
@@ -1926,6 +2051,7 @@ impl From<TickSummary> for HudHistoryEntry {
             births: summary.births,
             deaths: summary.deaths,
             average_energy: summary.average_energy,
+            average_health: summary.average_health,
         }
     }
 }
@@ -2719,12 +2845,34 @@ impl PostProcessingConfig {
         let tick = world.tick().0;
         let day_phase = (tick as f32 * 0.00025).sin() * 0.5 + 0.5;
         let closed_bonus = if world.is_closed() { 0.18 } else { 0.0 };
+        let agent_count = world.agent_count().max(1) as f32;
+        let latest = world.history().last();
+        let (births_ratio, deaths_ratio) = latest
+            .map(|summary| {
+                (
+                    summary.births as f32 / agent_count,
+                    summary.deaths as f32 / agent_count,
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let life_delta = (births_ratio - deaths_ratio).clamp(-1.0, 1.0);
+        let tension = life_delta.abs();
+
         Self {
-            vignette_strength: (0.38 + day_phase * 0.22 + closed_bonus).clamp(0.2, 0.75),
-            bloom_strength: (0.26 + day_phase * 0.3).clamp(0.1, 0.7),
-            scanline_intensity: (0.18 + (1.0 - day_phase) * 0.22 + closed_bonus * 0.35)
-                .clamp(0.08, 0.6),
-            grain_strength: (0.12 + (tick % 4096) as f32 / 4096.0 * 0.08).clamp(0.08, 0.22),
+            vignette_strength: (0.36
+                + day_phase * 0.24
+                + closed_bonus
+                + (-life_delta).max(0.0) * 0.28)
+                .clamp(0.2, 0.82),
+            bloom_strength: (0.24 + day_phase * 0.32 + life_delta.max(0.0) * 0.28)
+                .clamp(0.12, 0.78),
+            scanline_intensity: (0.18
+                + (1.0 - day_phase) * 0.22
+                + closed_bonus * 0.35
+                + (-life_delta).max(0.0) * 0.18)
+                .clamp(0.08, 0.65),
+            grain_strength: (0.11 + (tick % 4096) as f32 / 4096.0 * 0.08 + tension * 0.06)
+                .clamp(0.08, 0.26),
         }
     }
 }
@@ -3121,17 +3269,18 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
         }
 
         let coherence = (velocity_ratio * 100.0).clamp(0.0, 100.0);
-        let ring_inner = radius * 0.55;
-        let mut ring = PathBuilder::stroke(px(1.2 + coherence * 0.02));
-        ring.move_to(point(px(cx + ring_inner), px(cy)));
-        ring.arc(
-            center,
-            px(ring_inner),
-            Angle::radians(0.0),
-            Angle::radians(std::f32::consts::TAU * velocity_ratio),
-        );
-        if let Ok(path) = ring.build() {
-            window.paint_path(path, rgba_from_hex(0x60a5fa, 0.65));
+        if coherence > 1.0 {
+            let ring_inner = radius * 0.55;
+            let mut ring = PathBuilder::stroke(px(1.2 + coherence * 0.02));
+            ring.arc(
+                center,
+                px(ring_inner),
+                Angle::from_degrees(-140.0),
+                Angle::from_degrees(280.0 * velocity_ratio),
+            );
+            if let Ok(path) = ring.build() {
+                window.paint_path(path, rgba_from_hex(0x60a5fa, 0.65));
+            }
         }
     }
 
@@ -3402,18 +3551,14 @@ fn terrain_surface_color(
 
     let mut color = rgba_from_triplet_with_alpha(base, 1.0);
     let brightness = match tile.kind {
-        TerrainKind::DeepWater => (0.42 + daylight * 0.25 + tile.moisture * 0.2)
-            .clamp(0.25, 1.05),
-        TerrainKind::ShallowWater => (0.55 + daylight * 0.35 + tile.moisture * 0.3)
-            .clamp(0.4, 1.25),
-        TerrainKind::Sand => (0.72 + daylight * 0.18 + tile.elevation * 0.35)
-            .clamp(0.45, 1.35),
-        TerrainKind::Grass => (0.62 + daylight * 0.28 + tile.moisture * 0.4)
-            .clamp(0.4, 1.35),
-        TerrainKind::Bloom => (0.68 + daylight * 0.35 + tile.moisture * 0.5)
-            .clamp(0.45, 1.45),
-        TerrainKind::Rock => (0.60 + daylight * 0.22 + tile.slope * 0.45)
-            .clamp(0.35, 1.25),
+        TerrainKind::DeepWater => (0.42 + daylight * 0.25 + tile.moisture * 0.2).clamp(0.25, 1.05),
+        TerrainKind::ShallowWater => {
+            (0.55 + daylight * 0.35 + tile.moisture * 0.3).clamp(0.4, 1.25)
+        }
+        TerrainKind::Sand => (0.72 + daylight * 0.18 + tile.elevation * 0.35).clamp(0.45, 1.35),
+        TerrainKind::Grass => (0.62 + daylight * 0.28 + tile.moisture * 0.4).clamp(0.4, 1.35),
+        TerrainKind::Bloom => (0.68 + daylight * 0.35 + tile.moisture * 0.5).clamp(0.45, 1.45),
+        TerrainKind::Rock => (0.60 + daylight * 0.22 + tile.slope * 0.45).clamp(0.35, 1.25),
     };
     color = scale_rgb(color, brightness);
 
@@ -3469,6 +3614,226 @@ fn terrain_water_caustic_color(
     let mut color = rgba_from_triplet_with_alpha(base, alpha);
     color = scale_rgb(color, 0.9 + tile.moisture * 0.2);
     apply_palette(color, palette)
+}
+
+fn paint_sparkline(bounds: Bounds<Pixels>, state: SparklineState, window: &mut Window) {
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+    let samples = state.values.len();
+    if samples < 2 {
+        return;
+    }
+    let step = width / (samples.saturating_sub(1) as f32);
+
+    let mut fill_builder = PathBuilder::fill();
+    fill_builder.move_to(point(
+        px(f32::from(origin.x)),
+        px(f32::from(origin.y) + height),
+    ));
+    for (idx, value) in state.values.iter().enumerate() {
+        let x = f32::from(origin.x) + step * idx as f32;
+        let y = f32::from(origin.y) + height - value.clamp(0.0, 1.0) * height;
+        fill_builder.line_to(point(px(x), px(y)));
+    }
+    fill_builder.line_to(point(
+        px(f32::from(origin.x) + width),
+        px(f32::from(origin.y) + height),
+    ));
+    fill_builder.close();
+    if let Ok(path) = fill_builder.build() {
+        let mut fill_color = state.accent;
+        fill_color.a = if state.trend >= 0.0 { 0.18 } else { 0.12 };
+        window.paint_path(path, fill_color);
+    }
+
+    let mut stroke_builder = PathBuilder::stroke(px(1.6));
+    for (idx, value) in state.values.iter().enumerate() {
+        let x = f32::from(origin.x) + step * idx as f32;
+        let y = f32::from(origin.y) + height - value.clamp(0.0, 1.0) * height;
+        if idx == 0 {
+            stroke_builder.move_to(point(px(x), px(y)));
+        } else {
+            stroke_builder.line_to(point(px(x), px(y)));
+        }
+    }
+    if let Ok(path) = stroke_builder.build() {
+        let mut stroke_color = state.accent;
+        stroke_color.a = 0.85;
+        window.paint_path(path, stroke_color);
+    }
+
+    let marker_value = state.values.last().copied().unwrap_or(0.5).clamp(0.0, 1.0);
+    let marker_size = 4.0;
+    let marker_x = f32::from(origin.x) + width;
+    let marker_y = f32::from(origin.y) + height - marker_value * height;
+    let marker_bounds = Bounds::new(
+        point(
+            px(marker_x - marker_size * 0.5),
+            px(marker_y - marker_size * 0.5),
+        ),
+        size(px(marker_size), px(marker_size)),
+    );
+    let mut marker_color = state.accent;
+    marker_color.a = 1.0;
+    window.paint_quad(fill(marker_bounds, Background::from(marker_color)));
+}
+
+fn paint_metric_badge(bounds: Bounds<Pixels>, state: MetricBadgeState, window: &mut Window) {
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+    let center_x = f32::from(origin.x) + width * 0.5;
+    let center_y = f32::from(origin.y) + height * 0.5;
+    let radius = width.min(height) * 0.5;
+
+    let mut hex_builder = PathBuilder::fill();
+    for step_idx in 0..6 {
+        let angle = (PI / 3.0) * step_idx as f32 - FRAC_PI_2;
+        let x = center_x + angle.cos() * radius;
+        let y = center_y + angle.sin() * radius;
+        if step_idx == 0 {
+            hex_builder.move_to(point(px(x), px(y)));
+        } else {
+            hex_builder.line_to(point(px(x), px(y)));
+        }
+    }
+    hex_builder.close();
+    if let Ok(path) = hex_builder.build() {
+        let mut outer = state.accent;
+        outer.a = 0.45;
+        window.paint_path(path, outer);
+    }
+
+    let inner_radius = radius * 0.58;
+    let mut diamond = PathBuilder::fill();
+    for idx in 0..4 {
+        let angle = FRAC_PI_2 * idx as f32 + FRAC_PI_4;
+        let x = center_x + angle.cos() * inner_radius;
+        let y = center_y + angle.sin() * inner_radius;
+        if idx == 0 {
+            diamond.move_to(point(px(x), px(y)));
+        } else {
+            diamond.line_to(point(px(x), px(y)));
+        }
+    }
+    diamond.close();
+    if let Ok(path) = diamond.build() {
+        let mut inner = state.accent;
+        inner.a = 0.9;
+        window.paint_path(path, inner);
+    }
+
+    let bar_width = inner_radius * 0.36;
+    let bar_bounds = Bounds::new(
+        point(px(center_x - bar_width * 0.5), px(center_y - inner_radius)),
+        size(px(bar_width), px(inner_radius * 2.0)),
+    );
+    let mut bar_color = state.accent;
+    bar_color.a = 0.65;
+    window.paint_quad(fill(bar_bounds, Background::from(bar_color)));
+}
+
+fn apply_post_processing(
+    frame: &RenderFrame,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    daylight: f32,
+    scale: f32,
+) {
+    let fx = &frame.post_fx;
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width_px = f32::from(size.width).max(1.0);
+    let height_px = f32::from(size.height).max(1.0);
+    let origin_x = f32::from(origin.x);
+    let origin_y = f32::from(origin.y);
+    let palette = frame.palette;
+
+    if fx.vignette_strength > 0.01 {
+        let alpha = (0.22 + (1.0 - daylight) * 0.14) * fx.vignette_strength;
+        let edge_color = apply_palette(rgba_from_hex(0x01040c, alpha.clamp(0.05, 0.55)), palette);
+        let top_bounds = Bounds::new(
+            point(px(origin_x), px(origin_y)),
+            size(px(width_px), px(height_px * 0.18)),
+        );
+        let bottom_bounds = Bounds::new(
+            point(px(origin_x), px(origin_y + height_px * 0.82)),
+            size(px(width_px), px(height_px * 0.18)),
+        );
+        window.paint_quad(fill(top_bounds, Background::from(edge_color)));
+        window.paint_quad(fill(bottom_bounds, Background::from(edge_color)));
+
+        let side_alpha = (alpha * 0.8).clamp(0.04, 0.45);
+        let side_color = apply_palette(rgba_from_hex(0x020816, side_alpha), palette);
+        let side_width = width_px * 0.08;
+        let left_bounds = Bounds::new(
+            point(px(origin_x), px(origin_y)),
+            size(px(side_width), px(height_px)),
+        );
+        let right_bounds = Bounds::new(
+            point(px(origin_x + width_px - side_width), px(origin_y)),
+            size(px(side_width), px(height_px)),
+        );
+        window.paint_quad(fill(left_bounds, Background::from(side_color)));
+        window.paint_quad(fill(right_bounds, Background::from(side_color)));
+    }
+
+    if fx.bloom_strength > 0.01 {
+        let bloom_width = width_px * (0.48 + fx.bloom_strength * 0.36);
+        let bloom_height = height_px * (0.48 + fx.bloom_strength * 0.36);
+        let bloom_bounds = Bounds::new(
+            point(
+                px(origin_x + (width_px - bloom_width) * 0.5),
+                px(origin_y + (height_px - bloom_height) * 0.5),
+            ),
+            size(px(bloom_width), px(bloom_height)),
+        );
+        let bloom_color = apply_palette(
+            lerp_rgba(
+                rgba_from_hex(0x3b82f6, 0.14 * fx.bloom_strength),
+                rgba_from_hex(0x22c55e, 0.10 * fx.bloom_strength),
+                daylight.clamp(0.0, 1.0),
+            ),
+            palette,
+        );
+        window.paint_quad(fill(bloom_bounds, Background::from(bloom_color)));
+    }
+
+    if fx.scanline_intensity > 0.01 {
+        let spacing = (4.5 / scale).clamp(2.0, 7.0);
+        let alpha = (0.07 * fx.scanline_intensity).clamp(0.01, 0.2);
+        let mut y = origin_y;
+        while y < origin_y + height_px {
+            let scanline_bounds =
+                Bounds::new(point(px(origin_x), px(y)), size(px(width_px), px(1.0)));
+            window.paint_quad(fill(
+                scanline_bounds,
+                Background::from(apply_palette(rgba_from_hex(0x020816, alpha), palette)),
+            ));
+            y += spacing;
+        }
+    }
+
+    if fx.grain_strength > 0.01 {
+        let seed = frame.tick.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let grain = fx_noise(seed);
+        let alpha = (0.02 + grain * 0.06) * fx.grain_strength;
+        let grain_color = apply_palette(rgba_from_hex(0xffffff, alpha.clamp(0.01, 0.12)), palette);
+        window.paint_quad(fill(bounds, Background::from(grain_color)));
+    }
+}
+
+fn fx_noise(seed: u64) -> f32 {
+    let mut value = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    value ^= value >> 33;
+    (value as f64 / u64::MAX as f64) as f32
 }
 
 fn paint_frame(
@@ -3709,6 +4074,8 @@ fn paint_frame(
         color = apply_palette(color, frame.palette);
         window.paint_quad(fill(agent_bounds, Background::from(color)));
     }
+
+    apply_post_processing(frame, bounds, window, daylight, scale);
 }
 
 fn food_color(intensity: f32) -> Rgba {

@@ -61,7 +61,7 @@ fn clamp01(value: f32) -> f32 {
 }
 
 fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
-    let mut delta = b - a;
+    let mut delta = a - b;
     let half = extent * 0.5;
     if delta > half {
         delta -= extent;
@@ -2216,8 +2216,8 @@ impl WorldState {
                             return;
                         }
 
-                        let dx = toroidal_delta(position.x, positions[other_idx].x, world_width);
-                        let dy = toroidal_delta(position.y, positions[other_idx].y, world_height);
+                        let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
+                        let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
                         let ang = angle_to(dx, dy);
                         let dist_factor = (radius - dist) / radius;
                         if dist_factor <= 0.0 {
@@ -4442,14 +4442,6 @@ mod tests {
             parent_state.data.position.y,
             world.config().world_height as f32,
         );
-        dbg!(
-            parent_state.data.heading,
-            parent_state.data.position.x,
-            child_state.data.position.x,
-            dx,
-            dy
-        );
-
         assert!(dx < -12.0, "child should spawn behind the parent along x");
         assert!(dy.abs() < 6.0, "child jitter keeps y near parent");
         let child_runtime = world.agent_runtime(child_id).expect("child runtime");
