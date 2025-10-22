@@ -380,17 +380,23 @@ impl SimulationView {
         let canvas_stack = div()
             .relative()
             .flex_1()
-            .on_mouse_down(MouseButton::Middle, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                if event.button == MouseButton::Middle {
-                    this.camera.start_pan(event.position);
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(MouseButton::Middle, cx.listener(|this, event: &MouseUpEvent, _, _| {
-                if event.button == MouseButton::Middle {
-                    this.camera.end_pan();
-                }
-            }))
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    if event.button == MouseButton::Middle {
+                        this.camera.start_pan(event.position);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _, _| {
+                    if event.button == MouseButton::Middle {
+                        this.camera.end_pan();
+                    }
+                }),
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.camera.update_pan(event.position) {
                     cx.notify();

@@ -640,7 +640,7 @@ mod tests {
     use super::*;
     use scriptbots_core::{
         AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
-        PersistenceEventKind, Tick, TickSummary,
+        PersistenceEventKind, Position, Tick, TickSummary,
     };
     use std::{
         fs,
@@ -664,13 +664,16 @@ mod tests {
     }
 
     fn sample_agent(energy: f32) -> AgentState {
-        let mut data = AgentData::default();
-        data.health = energy;
-        data.position.x = 12.0;
-        data.position.y = 34.0;
+        let data = AgentData {
+            position: Position::new(12.0, 34.0),
+            health: energy,
+            ..AgentData::default()
+        };
 
-        let mut runtime = AgentRuntime::default();
-        runtime.energy = energy;
+        let runtime = AgentRuntime {
+            energy,
+            ..AgentRuntime::default()
+        };
 
         AgentState {
             id: scriptbots_core::AgentId::default(),
@@ -750,7 +753,7 @@ mod tests {
         let path_string = path.to_string_lossy().to_string();
         let mut storage = Storage::with_thresholds(&path_string, 1, 1, 1, 1)?;
 
-        let mut batch_one = sample_batch(1, 1.0);
+        let batch_one = sample_batch(1, 1.0);
         storage.persist(&batch_one)?;
         storage.flush()?;
 
