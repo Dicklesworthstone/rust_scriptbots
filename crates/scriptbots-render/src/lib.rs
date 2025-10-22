@@ -515,33 +515,41 @@ impl SimulationView {
             .map(|state| state.clone())
             .unwrap_or_default();
 
-        if let Ok(world) = self.world.lock() {
-            snapshot.tick = world.tick().0;
-            snapshot.epoch = world.epoch();
-            snapshot.is_closed = world.is_closed();
-            snapshot.agent_count = world.agent_count();
+        let analytics_trigger = {
+            let mut trigger: Option<(u64, usize)> = None;
+            if let Ok(world) = self.world.lock() {
+                snapshot.tick = world.tick().0;
+                snapshot.epoch = world.epoch();
+                snapshot.is_closed = world.is_closed();
+                snapshot.agent_count = world.agent_count();
 
-            let config = world.config();
-            snapshot.world_size = (config.world_width, config.world_height);
-            snapshot.history_capacity = config.history_capacity;
-            snapshot.render_frame = RenderFrame::from_world(&world, self.accessibility.palette);
+                let config = world.config();
+                snapshot.world_size = (config.world_width, config.world_height);
+                snapshot.history_capacity = config.history_capacity;
+                snapshot.render_frame = RenderFrame::from_world(&world, self.accessibility.palette);
 
-            let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
-            for summary in world.history() {
-                if ring.len() == 12 {
-                    ring.pop_front();
+                let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
+                for summary in world.history() {
+                    if ring.len() == 12 {
+                        ring.pop_front();
+                    }
+                    ring.push_back(summary.clone());
                 }
-                ring.push_back(summary.clone());
-            }
-            if let Some(latest) = ring.back() {
-                snapshot.summary = Some(HudMetrics::from(latest));
-            }
-            snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
-            snapshot.inspector = InspectorSnapshot::from_world(&world, &inspector_state);
+                if let Some(latest) = ring.back() {
+                    snapshot.summary = Some(HudMetrics::from(latest));
+                }
+                snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
+                snapshot.inspector = InspectorSnapshot::from_world(&world, &inspector_state);
 
-            if let Some(metrics) = snapshot.summary.as_ref() {
-                self.maybe_refresh_analytics(metrics.tick, metrics.agent_count);
+                if let Some(metrics) = snapshot.summary.as_ref() {
+                    trigger = Some((metrics.tick, metrics.agent_count));
+                }
             }
+            trigger
+        };
+
+        if let Some((tick, count)) = analytics_trigger {
+            self.maybe_refresh_analytics(tick, count);
         }
 
         if self.storage.is_some() {
@@ -797,6 +805,180 @@ impl SimulationView {
         let column_count = cards.len().clamp(1, 4) as u16;
 
         div().grid().grid_cols(column_count).gap_4().children(cards)
+    }
+
+    fn render_analytics_panel(&self, snapshot: &HudSnapshot) -> Div {
+        let Some(analytics) = snapshot.analytics.as_ref() else {
+            return div();
+        };
+
+        let total_agents = snapshot
+            .summary
+            .as_ref()
+            .map(|metrics| metrics.agent_count)
+            .unwrap_or(snapshot.agent_count)
+            .max(1);
+
+        let share_display = |count: usize| -> String {
+            let share = (count as f64 / total_agents as f64 * 100.0).clamp(0.0, 100.0);
+            format!("{share:.1}% share")
+        };
+
+        let trophic_cards = vec![
+            self.metric_card(
+                "Carnivores",
+                analytics.carnivores.to_string(),
+                0xcb2a3b,
+                Some(share_display(analytics.carnivores)),
+                None,
+            ),
+            self.metric_card(
+                "Herbivores",
+                analytics.herbivores.to_string(),
+                0x22c55e,
+                Some(share_display(analytics.herbivores)),
+                None,
+            ),
+            self.metric_card(
+                "Hybrids",
+                analytics.hybrids.to_string(),
+                0x8b5cf6,
+                Some(share_display(analytics.hybrids)),
+                None,
+            ),
+        ];
+
+        let trophic_row = div()
+            .grid()
+            .grid_cols(trophic_cards.len() as u16)
+            .gap_4()
+            .children(trophic_cards);
+
+        let resource_panel = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x0e172a))
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .child(div().text_sm().text_color(rgb(0x7dd3fc)).child("Resources"))
+            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                "Total {:.1} · Mean {:.3} · σ {:.3}",
+                analytics.food_total, analytics.food_mean, analytics.food_stddev
+            )))
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                "Δ mean {:.4} · |Δ| {:.4}",
+                analytics.food_delta_mean, analytics.food_delta_mean_abs
+            )));
+
+        let mutation_panel = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x101a2e))
+            .border_1()
+            .border_color(rgb(0x1f2a3d))
+            .child(div().text_sm().text_color(rgb(0xfbbf24)).child("Mutation"))
+            .child(div().text_xs().text_color(rgb(0xfef3c7)).child(format!(
+                "Primary {:.4} ± {:.4}",
+                analytics.mutation_primary_mean, analytics.mutation_primary_stddev
+            )))
+            .child(div().text_xs().text_color(rgb(0xfef3c7)).child(format!(
+                "Secondary {:.4} ± {:.4}",
+                analytics.mutation_secondary_mean, analytics.mutation_secondary_stddev
+            )));
+
+        let behavior_panel = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x111d31))
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .child(div().text_sm().text_color(rgb(0x93c5fd)).child("Behavior"))
+            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                "Sensors μ {:.3} · H {:.3}",
+                analytics.behavior_sensor_mean, analytics.behavior_sensor_entropy
+            )))
+            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                "Outputs μ {:.3} · H {:.3}",
+                analytics.behavior_output_mean, analytics.behavior_output_entropy
+            )));
+
+        let insights_row =
+            div()
+                .flex()
+                .gap_4()
+                .children(vec![resource_panel, mutation_panel, behavior_panel]);
+
+        let mut brain_rows: Vec<Div> = Vec::new();
+        brain_rows.push(
+            div()
+                .flex()
+                .text_xs()
+                .text_color(rgb(0x64748b))
+                .gap_4()
+                .child(div().w(px(140.0)).child("BRAIN"))
+                .child(div().w(px(80.0)).child("COUNT"))
+                .child(div().w(px(80.0)).child("SHARE"))
+                .child(div().w(px(100.0)).child("AVG ENERGY")),
+        );
+
+        if analytics.brain_shares.is_empty() {
+            brain_rows.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("No brain metrics yet"),
+            );
+        } else {
+            for entry in analytics.brain_shares.iter().take(6) {
+                let share = (entry.count as f64 / total_agents as f64 * 100.0).clamp(0.0, 100.0);
+                brain_rows.push(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .items_center()
+                        .text_xs()
+                        .text_color(rgb(0xe2e8f0))
+                        .child(div().w(px(140.0)).child(entry.label.clone()))
+                        .child(div().w(px(80.0)).child(entry.count.to_string()))
+                        .child(div().w(px(80.0)).child(format!("{share:.1}%")))
+                        .child(div().w(px(100.0)).child(format!("{:.3}", entry.avg_energy))),
+                );
+            }
+        }
+
+        let brain_panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x0d1626))
+            .border_1()
+            .border_color(rgb(0x1a2337))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x38bdf8))
+                    .child("Brain Share"),
+            )
+            .children(brain_rows);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(trophic_row)
+            .child(insights_row)
+            .child(brain_panel)
     }
 
     fn render_history(&self, snapshot: &HudSnapshot) -> Div {
@@ -4852,6 +5034,7 @@ impl Render for SimulationView {
             .gap_4()
             .child(self.render_header(&snapshot))
             .child(self.render_summary(&snapshot))
+            .child(self.render_analytics_panel(&snapshot))
             .child(
                 div()
                     .flex()

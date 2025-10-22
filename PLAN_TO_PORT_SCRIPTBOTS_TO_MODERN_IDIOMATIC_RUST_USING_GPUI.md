@@ -158,7 +158,11 @@
   - Maintain compatibility metrics and speciation buckets (NEAT-inspired) to avoid catastrophic mixing of divergent architectures.
 - Pluggable factories:
   - Register brain constructors through a `BrainRegistry` so additional engines (ONNXRuntime, Torch via tch-rs, GPU kernels) can be added behind feature flags without core refactors.
-- Expose CLI/GUI toggles allowing per-run selection of active brain families and evolution knobs (mutation rates, speciation thresholds). [Currently In Progress - GPT-5 Codex 2025-10-22]
+- [Completed - GPT-5 Codex 2025-10-22] Expose runtime control surfaces for selecting brain families and tuning evolution knobs (mutation rates, speciation thresholds, environmental parameters) without rebuilds.
+  - Introduced `ControlHandle`/`KnobEntry` scaffolding shared by REST, CLI, and MCP front-ends for atomic JSON patching of `ScriptBotsConfig` and live snapshots.
+  - Shipped an axum-based REST API (`/api/knobs`, `/api/config`, `/api/knobs/apply`) with generated OpenAPI docs and embedded Swagger UI for operator discovery.
+  - Added a stdio MCP server (`list_knobs`, `get_config`, `apply_updates`, `apply_patch`) so external LLM tooling can orchestrate simulations safely.
+  - Delivered the `scriptbots-control` CLI (clap + reqwest + ratatui) offering scripted updates (`set`, `patch`) and a live dashboard (`watch`) that highlights config deltas while the GPUI shell runs.
 - Diagnostics:
   - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization.
   - Provide debug tooling to render network topologies (layer shapes, activations) inside the inspector panel.

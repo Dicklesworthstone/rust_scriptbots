@@ -27,7 +27,10 @@ rust_scriptbots/
 │   ├── scriptbots-index      # Pluggable spatial indices (grid, rstar, kd-tree)
 │   ├── scriptbots-storage    # DuckDB-backed persistence & analytics hooks
 │   ├── scriptbots-render     # GPUI integration and visual layer (HUD, canvas renderer)
-│   └── scriptbots-app        # Binary crate wiring everything together
+│   ├── scriptbots-app        # Binary crate wiring everything together
+│   └── scriptbots-web        # Sibling WebAssembly harness (wasm-bindgen bindings; experimental)
+└── docs/
+    └── wasm/                 # ADRs, browser matrix, multithreading notes, rendering spikes
 └── original_scriptbots_code_for_reference/  # Upstream C++ snapshot for parity
 ```
 
@@ -40,6 +43,7 @@ rust_scriptbots/
 - **`scriptbots-storage`**: DuckDB persistence with buffered writes (`ticks`, `metrics`, `events`, `agents`) plus analytics helpers (e.g., `top_predators`, `latest_metrics`).
 - **`scriptbots-render`**: GPUI UI layer with a window shell, HUD, canvas renderer for agents/food, selection highlights, and diagnostics overlay.
 - **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env, storage pipeline, installs brains, seeds agents, and launches the GPUI shell.
+- **`scriptbots-web`**: WebAssembly harness exposing bindings to init/tick/reset and snapshot the simulation; consumes `scriptbots-core` with `default-features = false` (sequential fallback; Rayon disabled on wasm).
 
 ## Current status
 - Workspace scaffolding, shared lints, and profiles are in place.
@@ -70,6 +74,12 @@ cargo run -p scriptbots-app
 Set logging verbosity with `RUST_LOG`, for example:
 ```bash
 RUST_LOG=info cargo run -p scriptbots-app
+```
+
+### Build for Web (experimental)
+```bash
+rustup target add wasm32-unknown-unknown
+cargo check --target wasm32-unknown-unknown -p scriptbots-web
 ```
 
 ### Windows quickstart (native)
@@ -160,6 +170,9 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - Inspector: per-agent stats and genome/brain views (scoped to plan milestones).
 - Optional audio via `kira` (feature `audio`).
 
+### Terminal mode (planned)
+An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode (`--mode {auto|gui|terminal}`) with fallback when GPUI cannot start. See the “Terminal Rendering Mode (Emoji TUI)” section in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`.
+
 ## Storage & analytics
 - DuckDB schema (`ticks`, `metrics`, `events`, `agents`) with buffered writes and maintenance (`optimize`, `VACUUM`).
 - Analytics helpers: `latest_metrics`, `top_predators`.
@@ -178,9 +191,15 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - For larger tasks, update `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` inline to mark progress.
 
 ## WebAssembly (sibling crate plan)
-We maintain a separate plan for a browser-targeted sibling app (`scriptbots-web`) that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and the docs under `docs/wasm/` (ADRs, audits, and capability matrix). Initial MVP will run single-threaded with feature-gated dependencies; WebGPU vs Canvas2D rendering is under evaluation.
+We maintain a sibling browser-targeted crate, `scriptbots-web`, that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and `docs/wasm/` (ADRs, audits, capability matrix). Initial MVP runs single-threaded by disabling `scriptbots-core`’s `parallel` feature on wasm; WebGPU vs Canvas2D rendering is under evaluation.
 
 > Quick peek: `crates/scriptbots-web/web/` ships a Canvas demo harness that consumes the wasm snapshots, surfaces live metrics, and can be served locally via `python -m http.server`. Binary snapshots (`snapshot_format: "binary"`) and custom seeding strategies are already wired in for experimentation.
+
+Helpful docs:
+- `docs/wasm/adrs/ADR-001-wasm-rendering.md` — rendering stack decision record
+- `docs/wasm/adrs/ADR-002-browser-persistence.md` — browser persistence approach
+- `docs/wasm/adrs/ADR-004-component-model.md` — component model/WASI Preview assessment
+- `docs/wasm/browser_matrix.csv` — browser capabilities (WebGPU, SAB, SIMD)
 
 ## Licensing
 Licensed under `MIT OR Apache-2.0` (see workspace manifest).

@@ -1,22 +1,38 @@
 use anyhow::Result;
-use scriptbots_app::{ControlRuntime, ControlServerConfig, SharedStorage, SharedWorld};
+use clap::{Parser, ValueEnum};
+use scriptbots_app::{
+    ControlRuntime, ControlServerConfig, SharedStorage, SharedWorld,
+    renderer::{Renderer, RendererContext},
+};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{AgentData, NeuroflowActivationKind, ScriptBotsConfig, WorldState};
 use scriptbots_render::run_demo;
 use scriptbots_storage::StoragePipeline;
 use std::{
-    env,
+    env, fmt,
     sync::{Arc, Mutex},
 };
 use tracing::{info, warn};
 
 fn main() -> Result<()> {
+    let cli = AppCli::parse();
     init_tracing();
-    let (world, _storage) = bootstrap_world()?;
+    let (world, storage) = bootstrap_world()?;
     let control_config = ControlServerConfig::from_env();
     let control_runtime = ControlRuntime::launch(world.clone(), control_config)?;
-    info!("Starting ScriptBots simulation shell");
-    run_demo(world);
+    let (active_mode, renderer) = resolve_renderer(cli.mode)?;
+    info!(
+        requested_mode = cli.mode.as_str(),
+        active_mode = active_mode.as_str(),
+        renderer = renderer.name(),
+        "Starting ScriptBots simulation shell"
+    );
+    let context = RendererContext {
+        world: Arc::clone(&world),
+        storage: Arc::clone(&storage),
+        control_runtime: &control_runtime,
+    };
+    renderer.run(context)?;
     control_runtime.shutdown()?;
     Ok(())
 }
@@ -61,6 +77,74 @@ fn bootstrap_world() -> Result<(SharedWorld, SharedStorage)> {
     }
 
     Ok((Arc::new(Mutex::new(world)), storage))
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "scriptbots-app",
+    version,
+    about = "ScriptBots simulation shell"
+)]
+struct AppCli {
+    /// Rendering mode for the simulation shell (auto detects GPUI fallback).
+    #[arg(
+        long,
+        value_enum,
+        env = "SCRIPTBOTS_MODE",
+        default_value_t = RendererMode::Auto
+    )]
+    mode: RendererMode,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum RendererMode {
+    Auto,
+    Gui,
+    Terminal,
+}
+
+impl RendererMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gui => "gui",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl fmt::Display for RendererMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Renderer>)> {
+    match mode {
+        RendererMode::Auto | RendererMode::Gui => {
+            let renderer: Box<dyn Renderer> = Box::new(GuiRenderer::default());
+            Ok((RendererMode::Gui, renderer))
+        }
+        RendererMode::Terminal => {
+            anyhow::bail!(
+                "terminal renderer mode is not yet implemented; pass --mode gui or omit the flag"
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct GuiRenderer;
+
+impl Renderer for GuiRenderer {
+    fn name(&self) -> &'static str {
+        "gpui"
+    }
+
+    fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
+        run_demo(Arc::clone(&ctx.world), Some(Arc::clone(&ctx.storage)));
+        Ok(())
+    }
 }
 
 fn install_brains(world: &mut WorldState) -> Vec<u64> {
