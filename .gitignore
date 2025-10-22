@@ -10,3 +10,4 @@ scriptbots.db
 toolchains/
 crates/scriptbots-web/web/pkg/
 vendor/
+*.backup

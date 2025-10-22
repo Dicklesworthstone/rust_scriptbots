@@ -4375,7 +4375,7 @@ impl SimulationView {
             .absolute()
             .inset_0()
             .bg(rgb(0x0f172a))
-            .opacity(0.75)
+            .opacity(0.5)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -4460,29 +4460,45 @@ impl SimulationView {
                             )
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(rgb(0x94a3b8))
-                                    .child("Simulation parameters & settings"),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0x94a3b8))
+                                            .child("Simulation parameters & settings"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(rgb(0x334155))
+                                            .text_xs()
+                                            .text_color(rgb(0x94a3b8))
+                                            .child("Press , to toggle"),
+                                    ),
                             ),
                     ),
             )
             .child(
                 div()
-                    .px_3()
+                    .px_4()
                     .py_2()
                     .rounded_lg()
-                    .bg(rgb(0x334155))
-                    .text_sm()
+                    .bg(rgb(0x475569))
+                    .text_base()
                     .text_color(rgb(0xf1f5f9))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x475569)))
+                    .hover(|s| s.bg(rgb(0x64748b)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.toggle_settings(cx);
                         }),
                     )
-                    .child("✕"),
+                    .child("✕ Close"),
             );
 
         // REAL functional search bar - displays current search query and allows filtering
@@ -4705,452 +4721,181 @@ impl SimulationView {
             scriptbots_core::ScriptBotsConfig::default()
         };
 
-        // Match on category and return filtered params directly - clean data-driven approach!
-        let base_container = || {
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .px_4()
-                .py_4()
-                .rounded_lg()
-                .bg(rgb(0x0f172a))
-                .border_1()
-                .border_color(rgb(0x1e293b))
-        };
-
+        // Match on category and return filtered params directly - ULTRA CLEAN data-driven approach!
+        // ONE central filter loop in render_filtered_params handles ALL 60+ parameters!
         match category {
             ConfigCategory::World => {
                 let params = vec![
-                    (
-                        "World Width",
-                        format!("{} units", config.world_width),
-                        "Horizontal extent of the simulation world",
-                    ),
-                    (
-                        "World Height",
-                        format!("{} units", config.world_height),
-                        "Vertical extent of the simulation world",
-                    ),
-                    (
-                        "Food Cell Size",
-                        format!("{} units", config.food_cell_size),
-                        "Size of each food grid cell",
-                    ),
-                    (
-                        "Initial Food",
-                        self.format_float(config.initial_food, 3),
-                        "Starting food in each cell",
-                    ),
-                    (
-                        "RNG Seed",
-                        config
-                            .rng_seed
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "Random".to_string()),
-                        "Random number generator seed",
-                    ),
-                    (
-                        "Chart Flush Interval",
-                        format!("{} ticks", config.chart_flush_interval),
-                        "History chart update frequency",
-                    ),
+                    ("World Width", format!("{} units", config.world_width), "Horizontal extent of the simulation world"),
+                    ("World Height", format!("{} units", config.world_height), "Vertical extent of the simulation world"),
+                    ("Food Cell Size", format!("{} units", config.food_cell_size), "Size of each food grid cell"),
+                    ("Initial Food", self.format_float(config.initial_food, 3), "Starting food in each cell"),
+                    ("RNG Seed", config.rng_seed.map(|s| s.to_string()).unwrap_or_else(|| "Random".to_string()), "Random number generator seed"),
+                    ("Chart Flush Interval", format!("{} ticks", config.chart_flush_interval), "History chart update frequency"),
                 ];
                 self.render_filtered_params(params)
             }
 
-            ConfigCategory::Food => base_container()
-                .child(self.render_param_readonly(
-                    "Respawn Interval",
-                    &format!("{} ticks", config.food_respawn_interval),
-                    "Ticks between food respawn events",
-                ))
-                .child(self.render_param_readonly(
-                    "Respawn Amount",
-                    &self.format_float(config.food_respawn_amount, 3),
-                    "Food added per respawn",
-                ))
-                .child(self.render_param_readonly(
-                    "Maximum Food",
-                    &self.format_float(config.food_max, 3),
-                    "Maximum food per cell",
-                ))
-                .child(self.render_param_readonly(
-                    "Growth Rate",
-                    &self.format_float(config.food_growth_rate, 4),
-                    "Logistic regrowth rate",
-                ))
-                .child(self.render_param_readonly(
-                    "Decay Rate",
-                    &self.format_float(config.food_decay_rate, 4),
-                    "Proportional decay rate",
-                ))
-                .child(self.render_param_readonly(
-                    "Diffusion Rate",
-                    &self.format_float(config.food_diffusion_rate, 3),
-                    "Neighbor exchange rate",
-                ))
-                .child(self.render_param_readonly(
-                    "Intake Rate",
-                    &self.format_float(config.food_intake_rate, 3),
-                    "Agent food consumption rate",
-                ))
-                .child(self.render_param_readonly(
-                    "Sharing Radius",
-                    &self.format_float(config.food_sharing_radius, 1),
-                    "Friendly neighbor sharing distance",
-                ))
-                .child(self.render_param_readonly(
-                    "Sharing Rate",
-                    &self.format_float(config.food_sharing_rate, 3),
-                    "Energy fraction shared per neighbor",
-                ))
-                .child(self.render_param_readonly(
-                    "Transfer Rate",
-                    &self.format_float(config.food_transfer_rate, 4),
-                    "Altruistic sharing amount",
-                ))
-                .child(self.render_param_readonly(
-                    "Sharing Distance",
-                    &self.format_float(config.food_sharing_distance, 1),
-                    "Altruistic sharing threshold",
-                )),
+            ConfigCategory::Food => {
+                let params = vec![
+                    ("Respawn Interval", format!("{} ticks", config.food_respawn_interval), "Ticks between food respawn events"),
+                    ("Respawn Amount", self.format_float(config.food_respawn_amount, 3), "Food added per respawn"),
+                    ("Maximum Food", self.format_float(config.food_max, 3), "Maximum food per cell"),
+                    ("Growth Rate", self.format_float(config.food_growth_rate, 4), "Logistic regrowth rate"),
+                    ("Decay Rate", self.format_float(config.food_decay_rate, 4), "Proportional decay rate"),
+                    ("Diffusion Rate", self.format_float(config.food_diffusion_rate, 3), "Neighbor exchange rate"),
+                    ("Intake Rate", self.format_float(config.food_intake_rate, 3), "Agent food consumption rate"),
+                    ("Sharing Radius", self.format_float(config.food_sharing_radius, 1), "Friendly neighbor sharing distance"),
+                    ("Sharing Rate", self.format_float(config.food_sharing_rate, 3), "Energy fraction shared per neighbor"),
+                    ("Transfer Rate", self.format_float(config.food_transfer_rate, 4), "Altruistic sharing amount"),
+                    ("Sharing Distance", self.format_float(config.food_sharing_distance, 1), "Altruistic sharing threshold"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Agent => base_container()
-                .child(self.render_param_readonly(
-                    "Bot Speed",
-                    &self.format_float(config.bot_speed, 2),
-                    "Base wheel speed multiplier",
-                ))
-                .child(self.render_param_readonly(
-                    "Bot Radius",
-                    &self.format_float(config.bot_radius, 1),
-                    "Agent radius for collisions",
-                ))
-                .child(self.render_param_readonly(
-                    "Boost Multiplier",
-                    &format!("{}×", self.format_float(config.boost_multiplier, 2)),
-                    "Speed boost when activated",
-                ))
-                .child(self.render_param_readonly(
-                    "Sense Radius",
-                    &self.format_float(config.sense_radius, 1),
-                    "Perception range",
-                ))
-                .child(self.render_param_readonly(
-                    "Max Neighbors",
-                    &self.format_float(config.sense_max_neighbors, 0),
-                    "Normalization factor",
-                ))
-                .child(self.render_param_readonly(
-                    "Carnivore Threshold",
-                    &self.format_float(config.carnivore_threshold, 2),
-                    "Herbivore tendency cutoff for carnivores",
-                )),
+            ConfigCategory::Agent => {
+                let params = vec![
+                    ("Bot Speed", self.format_float(config.bot_speed, 2), "Base wheel speed multiplier"),
+                    ("Bot Radius", self.format_float(config.bot_radius, 1), "Agent radius for collisions"),
+                    ("Boost Multiplier", format!("{}×", self.format_float(config.boost_multiplier, 2)), "Speed boost when activated"),
+                    ("Sense Radius", self.format_float(config.sense_radius, 1), "Perception range"),
+                    ("Max Neighbors", self.format_float(config.sense_max_neighbors, 0), "Normalization factor"),
+                    ("Carnivore Threshold", self.format_float(config.carnivore_threshold, 2), "Herbivore tendency cutoff for carnivores"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Metabolism => base_container()
-                .child(self.render_param_readonly(
-                    "Base Drain",
-                    &self.format_float(config.metabolism_drain, 4),
-                    "Baseline energy cost",
-                ))
-                .child(self.render_param_readonly(
-                    "Movement Drain",
-                    &self.format_float(config.movement_drain, 4),
-                    "Cost per velocity",
-                ))
-                .child(self.render_param_readonly(
-                    "Ramp Floor",
-                    &self.format_float(config.metabolism_ramp_floor, 2),
-                    "Energy level for ramping",
-                ))
-                .child(self.render_param_readonly(
-                    "Ramp Rate",
-                    &self.format_float(config.metabolism_ramp_rate, 4),
-                    "Additional drain above floor",
-                ))
-                .child(self.render_param_readonly(
-                    "Boost Penalty",
-                    &self.format_float(config.metabolism_boost_penalty, 4),
-                    "Fixed boost cost",
-                )),
+            ConfigCategory::Metabolism => {
+                let params = vec![
+                    ("Base Drain", self.format_float(config.metabolism_drain, 4), "Baseline energy cost"),
+                    ("Movement Drain", self.format_float(config.movement_drain, 4), "Cost per velocity"),
+                    ("Ramp Floor", self.format_float(config.metabolism_ramp_floor, 2), "Energy level for ramping"),
+                    ("Ramp Rate", self.format_float(config.metabolism_ramp_rate, 4), "Additional drain above floor"),
+                    ("Boost Penalty", self.format_float(config.metabolism_boost_penalty, 4), "Fixed boost cost"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Temperature => base_container()
-                .child(self.render_param_readonly(
-                    "Discomfort Rate",
-                    &self.format_float(config.temperature_discomfort_rate, 4),
-                    "Health drain multiplier",
-                ))
-                .child(self.render_param_readonly(
-                    "Comfort Band",
-                    &format!("±{}", self.format_float(config.temperature_comfort_band, 3)),
-                    "Tolerance threshold",
-                ))
-                .child(self.render_param_readonly(
-                    "Gradient Exponent",
-                    &self.format_float(config.temperature_gradient_exponent, 2),
-                    "Pole-to-equator shaping",
-                ))
-                .child(self.render_param_readonly(
-                    "Discomfort Exp",
-                    &self.format_float(config.temperature_discomfort_exponent, 2),
-                    "Discomfort scaling power",
-                )),
+            ConfigCategory::Temperature => {
+                let params = vec![
+                    ("Discomfort Rate", self.format_float(config.temperature_discomfort_rate, 4), "Health drain multiplier"),
+                    ("Comfort Band", format!("±{}", self.format_float(config.temperature_comfort_band, 3)), "Tolerance threshold"),
+                    ("Gradient Exponent", self.format_float(config.temperature_gradient_exponent, 2), "Pole-to-equator shaping"),
+                    ("Discomfort Exp", self.format_float(config.temperature_discomfort_exponent, 2), "Discomfort scaling power"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Reproduction => base_container()
-                .child(self.render_param_readonly(
-                    "Energy Threshold",
-                    &self.format_float(config.reproduction_energy_threshold, 2),
-                    "Required energy to reproduce",
-                ))
-                .child(self.render_param_readonly(
-                    "Energy Cost",
-                    &self.format_float(config.reproduction_energy_cost, 2),
-                    "Parent's energy deduction",
-                ))
-                .child(self.render_param_readonly(
-                    "Cooldown",
-                    &format!("{} ticks", config.reproduction_cooldown),
-                    "Ticks between reproductions",
-                ))
-                .child(self.render_param_readonly(
-                    "Herbivore Rate",
-                    &format!(
-                        "{}×",
-                        self.format_float(config.reproduction_rate_herbivore, 3)
-                    ),
-                    "Herbivore multiplier",
-                ))
-                .child(self.render_param_readonly(
-                    "Carnivore Rate",
-                    &format!(
-                        "{}×",
-                        self.format_float(config.reproduction_rate_carnivore, 3)
-                    ),
-                    "Carnivore multiplier",
-                ))
-                .child(self.render_param_readonly(
-                    "Child Energy",
-                    &self.format_float(config.reproduction_child_energy, 2),
-                    "Starting energy for child",
-                ))
-                .child(self.render_param_readonly(
-                    "Spawn Jitter",
-                    &format!(
-                        "±{}",
-                        self.format_float(config.reproduction_spawn_jitter, 1)
-                    ),
-                    "Position randomization",
-                ))
-                .child(self.render_param_readonly(
-                    "Spawn Back Distance",
-                    &self.format_float(config.reproduction_spawn_back_distance, 1),
-                    "Child spawn distance behind parent",
-                ))
-                .child(self.render_param_readonly(
-                    "Color Jitter",
-                    &format!(
-                        "±{}",
-                        self.format_float(config.reproduction_color_jitter, 3)
-                    ),
-                    "RGB mutation range",
-                ))
-                .child(self.render_param_readonly(
-                    "Mutation Scale",
-                    &self.format_float(config.reproduction_mutation_scale, 4),
-                    "Trait mutation magnitude",
-                ))
-                .child(self.render_param_readonly(
-                    "Partner Chance",
-                    &format!(
-                        "{}%",
-                        self.format_float(config.reproduction_partner_chance * 100.0, 1)
-                    ),
-                    "Crossover probability",
-                ))
-                .child(self.render_param_readonly(
-                    "Gene Log Capacity",
-                    &format!("{}", config.reproduction_gene_log_capacity),
-                    "Max gene history entries",
-                ))
-                .child(self.render_param_readonly(
-                    "Meta-Mutation Chance",
-                    &format!(
-                        "{}%",
-                        self.format_float(config.reproduction_meta_mutation_chance * 100.0, 1)
-                    ),
-                    "Mutation rate mutation chance",
-                ))
-                .child(self.render_param_readonly(
-                    "Meta-Mutation Scale",
-                    &self.format_float(config.reproduction_meta_mutation_scale, 4),
-                    "Mutation rate change magnitude",
-                )),
+            ConfigCategory::Reproduction => {
+                let params = vec![
+                    ("Energy Threshold", self.format_float(config.reproduction_energy_threshold, 2), "Required energy to reproduce"),
+                    ("Energy Cost", self.format_float(config.reproduction_energy_cost, 2), "Parent's energy deduction"),
+                    ("Cooldown", format!("{} ticks", config.reproduction_cooldown), "Ticks between reproductions"),
+                    ("Herbivore Rate", format!("{}×", self.format_float(config.reproduction_rate_herbivore, 3)), "Herbivore multiplier"),
+                    ("Carnivore Rate", format!("{}×", self.format_float(config.reproduction_rate_carnivore, 3)), "Carnivore multiplier"),
+                    ("Child Energy", self.format_float(config.reproduction_child_energy, 2), "Starting energy for child"),
+                    ("Spawn Jitter", format!("±{}", self.format_float(config.reproduction_spawn_jitter, 1)), "Position randomization"),
+                    ("Spawn Back Distance", self.format_float(config.reproduction_spawn_back_distance, 1), "Child spawn distance behind parent"),
+                    ("Color Jitter", format!("±{}", self.format_float(config.reproduction_color_jitter, 3)), "RGB mutation range"),
+                    ("Mutation Scale", self.format_float(config.reproduction_mutation_scale, 4), "Trait mutation magnitude"),
+                    ("Partner Chance", format!("{}%", self.format_float(config.reproduction_partner_chance * 100.0, 1)), "Crossover probability"),
+                    ("Gene Log Capacity", format!("{}", config.reproduction_gene_log_capacity), "Max gene history entries"),
+                    ("Meta-Mutation Chance", format!("{}%", self.format_float(config.reproduction_meta_mutation_chance * 100.0, 1)), "Mutation rate mutation chance"),
+                    ("Meta-Mutation Scale", self.format_float(config.reproduction_meta_mutation_scale, 4), "Mutation rate change magnitude"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Aging => base_container()
-                .child(self.render_param_readonly(
-                    "Decay Start Age",
-                    &format!("{} ticks", config.aging_health_decay_start),
-                    "Age when decay begins",
-                ))
-                .child(self.render_param_readonly(
-                    "Decay Rate",
-                    &self.format_float(config.aging_health_decay_rate, 5),
-                    "Health loss per tick",
-                ))
-                .child(self.render_param_readonly(
-                    "Decay Max",
-                    &self.format_float(config.aging_health_decay_max, 4),
-                    "Maximum decay per tick",
-                ))
-                .child(self.render_param_readonly(
-                    "Energy Penalty",
-                    &format!(
-                        "{}×",
-                        self.format_float(config.aging_energy_penalty_rate, 3)
-                    ),
-                    "Health-to-energy conversion",
-                )),
+            ConfigCategory::Aging => {
+                let params = vec![
+                    ("Decay Start Age", format!("{} ticks", config.aging_health_decay_start), "Age when decay begins"),
+                    ("Decay Rate", self.format_float(config.aging_health_decay_rate, 5), "Health loss per tick"),
+                    ("Decay Max", self.format_float(config.aging_health_decay_max, 4), "Maximum decay per tick"),
+                    ("Energy Penalty", format!("{}×", self.format_float(config.aging_energy_penalty_rate, 3)), "Health-to-energy conversion"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Combat => base_container()
-                .child(self.render_param_readonly(
-                    "Spike Radius",
-                    &self.format_float(config.spike_radius, 1),
-                    "Base spike collision radius",
-                ))
-                .child(self.render_param_readonly(
-                    "Spike Damage",
-                    &self.format_float(config.spike_damage, 2),
-                    "Damage at full power",
-                ))
-                .child(self.render_param_readonly(
-                    "Spike Energy Cost",
-                    &self.format_float(config.spike_energy_cost, 4),
-                    "Energy cost to deploy",
-                ))
-                .child(self.render_param_readonly(
-                    "Min Length",
-                    &self.format_float(config.spike_min_length, 2),
-                    "Minimum for damage",
-                ))
-                .child(self.render_param_readonly(
-                    "Alignment Cosine",
-                    &self.format_float(config.spike_alignment_cosine, 2),
-                    "Directional threshold",
-                ))
-                .child(self.render_param_readonly(
-                    "Speed Bonus",
-                    &format!("{}×", self.format_float(config.spike_speed_damage_bonus, 3)),
-                    "Velocity scaling",
-                ))
-                .child(self.render_param_readonly(
-                    "Length Bonus",
-                    &format!(
-                        "{}×",
-                        self.format_float(config.spike_length_damage_bonus, 3)
-                    ),
-                    "Length scaling",
-                ))
-                .child(self.render_param_readonly(
-                    "Growth Rate",
-                    &self.format_float(config.spike_growth_rate, 4),
-                    "Spike extension rate",
-                )),
+            ConfigCategory::Combat => {
+                let params = vec![
+                    ("Spike Radius", self.format_float(config.spike_radius, 1), "Base spike collision radius"),
+                    ("Spike Damage", self.format_float(config.spike_damage, 2), "Damage at full power"),
+                    ("Spike Energy Cost", self.format_float(config.spike_energy_cost, 4), "Energy cost to deploy"),
+                    ("Min Length", self.format_float(config.spike_min_length, 2), "Minimum for damage"),
+                    ("Alignment Cosine", self.format_float(config.spike_alignment_cosine, 2), "Directional threshold"),
+                    ("Speed Bonus", format!("{}×", self.format_float(config.spike_speed_damage_bonus, 3)), "Velocity scaling"),
+                    ("Length Bonus", format!("{}×", self.format_float(config.spike_length_damage_bonus, 3)), "Length scaling"),
+                    ("Growth Rate", self.format_float(config.spike_growth_rate, 4), "Spike extension rate"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Carcass => base_container()
-                .child(self.render_param_readonly(
-                    "Distribution Radius",
-                    &self.format_float(config.carcass_distribution_radius, 1),
-                    "Reward share distance",
-                ))
-                .child(self.render_param_readonly(
-                    "Health Reward",
-                    &self.format_float(config.carcass_health_reward, 2),
-                    "Base health given",
-                ))
-                .child(self.render_param_readonly(
-                    "Reproduction Reward",
-                    &self.format_float(config.carcass_reproduction_reward, 1),
-                    "Cooldown reduction",
-                ))
-                .child(self.render_param_readonly(
-                    "Neighbor Exponent",
-                    &self.format_float(config.carcass_neighbor_exponent, 2),
-                    "Sharing normalization",
-                ))
-                .child(self.render_param_readonly(
-                    "Maturity Age",
-                    &format!("{} ticks", config.carcass_maturity_age),
-                    "Full reward age",
-                ))
-                .child(self.render_param_readonly(
-                    "Energy Share",
-                    &format!(
-                        "{}%",
-                        self.format_float(config.carcass_energy_share_rate * 100.0, 1)
-                    ),
-                    "Health-to-energy conversion",
-                ))
-                .child(self.render_param_readonly(
-                    "Indicator Scale",
-                    &self.format_float(config.carcass_indicator_scale, 2),
-                    "Visual pulse intensity",
-                )),
+            ConfigCategory::Carcass => {
+                let params = vec![
+                    ("Distribution Radius", self.format_float(config.carcass_distribution_radius, 1), "Reward share distance"),
+                    ("Health Reward", self.format_float(config.carcass_health_reward, 2), "Base health given"),
+                    ("Reproduction Reward", self.format_float(config.carcass_reproduction_reward, 1), "Cooldown reduction"),
+                    ("Neighbor Exponent", self.format_float(config.carcass_neighbor_exponent, 2), "Sharing normalization"),
+                    ("Maturity Age", format!("{} ticks", config.carcass_maturity_age), "Full reward age"),
+                    ("Energy Share", format!("{}%", self.format_float(config.carcass_energy_share_rate * 100.0, 1)), "Health-to-energy conversion"),
+                    ("Indicator Scale", self.format_float(config.carcass_indicator_scale, 2), "Visual pulse intensity"),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Topography => base_container()
-                .child(self.render_param_toggle(
+            ConfigCategory::Topography => {
+                // Topography has a toggle - hybrid approach with toggle first, then readonly params
+                let mut container = div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .px_4()
+                    .py_4()
+                    .rounded_lg()
+                    .bg(rgb(0x0f172a))
+                    .border_1()
+                    .border_color(rgb(0x1e293b));
+
+                // Add toggle (not filterable - always shown)
+                container = container.child(self.render_param_toggle(
                     "Enabled",
                     config.topography_enabled,
                     "Enable terrain elevation effects",
                     cx,
-                ))
-                .child(self.render_param_readonly(
-                    "Speed Gain",
-                    &self.format_float(config.topography_speed_gain, 3),
-                    "Downhill boost per unit slope",
-                ))
-                .child(self.render_param_readonly(
-                    "Energy Penalty",
-                    &self.format_float(config.topography_energy_penalty, 4),
-                    "Uphill cost per unit slope",
-                )),
+                ));
 
-            ConfigCategory::Population => base_container()
-                .child(self.render_param_readonly(
-                    "Minimum Population",
-                    &format!("{}", config.population_minimum),
-                    "Auto-seed threshold",
-                ))
-                .child(self.render_param_readonly(
-                    "Spawn Interval",
-                    &format!("{} ticks", config.population_spawn_interval),
-                    "Ticks between spawns",
-                ))
-                .child(self.render_param_readonly(
-                    "Spawn Count",
-                    &format!("{}", config.population_spawn_count),
-                    "Agents per interval",
-                ))
-                .child(self.render_param_readonly(
-                    "Crossover Chance",
-                    &format!(
-                        "{}%",
-                        self.format_float(config.population_crossover_chance * 100.0, 1)
-                    ),
-                    "Breed vs. random spawn",
-                )),
+                // Add filterable readonly params
+                let params = vec![
+                    ("Speed Gain", self.format_float(config.topography_speed_gain, 3), "Downhill boost per unit slope"),
+                    ("Energy Penalty", self.format_float(config.topography_energy_penalty, 4), "Uphill cost per unit slope"),
+                ];
 
-            ConfigCategory::Persistence => base_container()
-                .child(self.render_param_readonly(
-                    "Interval",
-                    &format!("{} ticks", config.persistence_interval),
-                    "Database flush frequency",
-                ))
-                .child(self.render_param_readonly(
-                    "History Capacity",
-                    &format!("{}", config.history_capacity),
-                    "In-memory tick summaries",
-                )),
+                for (label, value, desc) in params {
+                    if self.matches_search(label) || self.matches_search(&value) || self.matches_search(desc) {
+                        container = container.child(self.render_param_readonly(label, &value, desc));
+                    }
+                }
+
+                container
+            }
+
+            ConfigCategory::Population => {
+                let params = vec![
+                    ("Minimum Population", format!("{}", config.population_minimum), "Auto-seed threshold"),
+                    ("Spawn Interval", format!("{} ticks", config.population_spawn_interval), "Ticks between spawns"),
+                    ("Spawn Count", format!("{}", config.population_spawn_count), "Agents per interval"),
+                    ("Crossover Chance", format!("{}%", self.format_float(config.population_crossover_chance * 100.0, 1)), "Breed vs. random spawn"),
+                ];
+                self.render_filtered_params(params)
+            }
+
+            ConfigCategory::Persistence => {
+                let params = vec![
+                    ("Interval", format!("{} ticks", config.persistence_interval), "Database flush frequency"),
+                    ("History Capacity", format!("{}", config.history_capacity), "In-memory tick summaries"),
+                ];
+                self.render_filtered_params(params)
+            }
         }
     }
 
@@ -5191,12 +4936,6 @@ impl SimulationView {
                     .child(div().text_sm().text_color(rgb(0xf1f5f9)).child(label_owned))
                     .child(
                         div()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(0x1e293b))
-                            .border_1()
-                            .border_color(rgb(0x334155))
                             .text_sm()
                             .text_color(rgb(0x60a5fa))
                             .child(value_owned),
@@ -5204,8 +4943,8 @@ impl SimulationView {
             )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_sm()
+                    .text_color(rgb(0x94a3b8))
                     .child(description_owned),
             )
     }
