@@ -421,31 +421,33 @@ async fn run_mcp_server(handle: ControlHandle, transport: McpTransportConfig) ->
         McpTransportConfig::Disabled => Ok(()),
         McpTransportConfig::Stdio => {
             info!("Starting MCP stdio server");
-            let mut server = McpServer::new(
+            let server = McpServer::new(
                 "scriptbots-control".to_string(),
                 env!("CARGO_PKG_VERSION").to_string(),
             );
 
             register_tool(
-                &mut server,
+                &server,
                 "list_knobs",
                 "List all exposed configuration knobs",
                 json!({"type": "object", "additionalProperties": false}),
                 ControlToolKind::ListKnobs,
                 handle.clone(),
-            );
+            )
+            .await?;
 
             register_tool(
-                &mut server,
+                &server,
                 "get_config",
                 "Fetch the entire simulation configuration",
                 json!({"type": "object", "additionalProperties": false}),
                 ControlToolKind::GetConfig,
                 handle.clone(),
-            );
+            )
+            .await?;
 
             register_tool(
-                &mut server,
+                &server,
                 "apply_updates",
                 "Apply one or more knob updates by path",
                 json!({
@@ -469,10 +471,11 @@ async fn run_mcp_server(handle: ControlHandle, transport: McpTransportConfig) ->
                 }),
                 ControlToolKind::ApplyUpdates,
                 handle.clone(),
-            );
+            )
+            .await?;
 
             register_tool(
-                &mut server,
+                &server,
                 "apply_patch",
                 "Merge a JSON object patch into the configuration",
                 json!({
@@ -487,7 +490,8 @@ async fn run_mcp_server(handle: ControlHandle, transport: McpTransportConfig) ->
                 }),
                 ControlToolKind::ApplyPatch,
                 handle,
-            );
+            )
+            .await?;
 
             let transport = StdioServerTransport::new();
             server

@@ -3,6 +3,7 @@ use clap::{Parser, ValueEnum};
 use scriptbots_app::{
     ControlRuntime, ControlServerConfig, SharedStorage, SharedWorld,
     renderer::{Renderer, RendererContext},
+    terminal::TerminalRenderer,
 };
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{AgentData, NeuroflowActivationKind, ScriptBotsConfig, WorldState};
@@ -12,7 +13,7 @@ use std::{
     env, fmt,
     sync::{Arc, Mutex},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 fn main() -> Result<()> {
     let cli = AppCli::parse();
@@ -121,14 +122,21 @@ impl fmt::Display for RendererMode {
 
 fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Renderer>)> {
     match mode {
-        RendererMode::Auto | RendererMode::Gui => {
-            let renderer: Box<dyn Renderer> = Box::new(GuiRenderer::default());
-            Ok((RendererMode::Gui, renderer))
-        }
-        RendererMode::Terminal => {
-            anyhow::bail!(
-                "terminal renderer mode is not yet implemented; pass --mode gui or omit the flag"
-            );
+        RendererMode::Gui => Ok((RendererMode::Gui, Box::new(GuiRenderer::default()))),
+        RendererMode::Terminal => Ok((
+            RendererMode::Terminal,
+            Box::new(TerminalRenderer::default()),
+        )),
+        RendererMode::Auto => {
+            if should_use_terminal_mode() {
+                debug!("Auto-selected terminal renderer due to headless environment");
+                Ok((
+                    RendererMode::Terminal,
+                    Box::new(TerminalRenderer::default()),
+                ))
+            } else {
+                Ok((RendererMode::Gui, Box::new(GuiRenderer::default())))
+            }
         }
     }
 }
@@ -145,6 +153,33 @@ impl Renderer for GuiRenderer {
         run_demo(Arc::clone(&ctx.world), Some(Arc::clone(&ctx.storage)));
         Ok(())
     }
+}
+
+fn should_use_terminal_mode() -> bool {
+    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_TERMINAL") {
+        if let Some(flag) = parse_bool(&value) {
+            return flag;
+        }
+    }
+
+    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_GUI") {
+        if let Some(flag) = parse_bool(&value) {
+            if flag {
+                return false;
+            }
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    {
+        let has_display =
+            env::var_os("DISPLAY").is_some() || env::var_os("WAYLAND_DISPLAY").is_some();
+        if !has_display {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn install_brains(world: &mut WorldState) -> Vec<u64> {

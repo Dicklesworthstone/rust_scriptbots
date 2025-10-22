@@ -198,7 +198,7 @@
   - [ ] Implement mutation/crossover suites validated against C++ reference data.
   - [ ] Develop brain registry benchmarking (per-brain tick cost, cache hit rates).
 - **Analytics & Replay**
-  - [ ] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
+  - [Currently In Progress] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
   - [ ] Implement deterministic replay runner (headless) driven by stored events.
   - [ ] Add DuckDB parity queries (population charts, kill ratios, energy histograms) vs. C++ scripts.
   - [ ] Provide CLI tooling to diff runs (Rust vs. C++ baseline) and highlight divergences.
@@ -331,10 +331,10 @@
 - *Feature parity expectations*: document intentionally omitted GPUI features (e.g., advanced camera) and ensure Control Server APIs remain the extension point for deep inspection.
 
 ### Execution TODOs [Currently In Progress]
-- [Currently In Progress] Dependency alignment: ensure `thiserror` is restored, drop redundant `utoipa-axum`, and add terminal-mode crates (`supports-color`, `unicode-width`) gated appropriately.
-- [ ] CLI mode integration: update `resolve_renderer` to prefer terminal mode when headless, and surface structured logs when fallback happens.
-- [ ] Terminal renderer scaffolding: add `terminal` module implementing the `Renderer` trait with screen setup, event loop, and world stepping.
-- [ ] HUD implementation pass 1: render tick/epoch, population metrics, recent summaries, and a coarse emoji world map with palette fallbacks.
-- [ ] Input handling parity: wire pause/resume, speed adjustments, help overlay, and graceful quit to existing control runtime APIs.
+- [Completed - 2025-10-22] Dependency alignment: restored `thiserror`, added terminal dependencies (`supports-color`, ratatui already present), and confirmed no redundant `utoipa-axum` entries remain.
+- [Completed - 2025-10-22] CLI mode integration: `resolve_renderer` now detects headless environments, honors override env vars, and logs terminal fallback activation.
+- [Completed - 2025-10-22] Terminal renderer scaffolding: new `terminal` module implements the shared `Renderer` trait with the crossterm/ratatui event loop.
+- [Completed - 2025-10-22] HUD implementation pass 1: terminal view renders status header, rolling history, and an emoji mini-map with palette fallbacks.
+- [Completed - 2025-10-22] Input handling parity: pause/resume, speed scaling, single-step, help overlay, and quit shortcuts are wired into the control runtime.
 - [ ] Automated testing: add headless smoke test (CI) invoking terminal renderer under `TERM=xterm-256color` to guard regressions.
 - [ ] Documentation updates: README usage section, environment variables, and example captures; note feature flag expectations.
