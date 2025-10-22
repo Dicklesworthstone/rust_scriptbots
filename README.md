@@ -161,6 +161,27 @@ cargo build -p scriptbots-index --features rstar
 cargo build -p scriptbots-brain-ml --features candle
 ```
 
+### Command-line options (scriptbots-app)
+- `--mode {auto|gui|terminal}`: select renderer. Defaults to `auto` and can be set via `SCRIPTBOTS_MODE`.
+  - `auto`: use GPUI when a display is detected; otherwise fall back to terminal.
+  - `gui`: force GPUI; may fail on headless systems.
+  - `terminal`: force emoji TUI.
+
+### Environment variables (quick reference)
+- `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
+- `RAYON_NUM_THREADS` — set simulation thread pool size when `parallel` is enabled.
+- `SCRIPTBOTS_MODE` — `auto|gui|terminal` (renderer selection).
+- `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — hard override renderer detection (`1|true|yes`).
+- `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
+- `SCRIPTBOTS_NEUROFLOW_ENABLED` — `true|false`.
+- `SCRIPTBOTS_NEUROFLOW_HIDDEN` — comma-separated hidden sizes (e.g., `64,32,16`).
+- `SCRIPTBOTS_NEUROFLOW_ACTIVATION` — `tanh|sigmoid|relu`.
+- `SCRIPTBOTS_CONTROL_REST_ADDR` — REST bind address (default `127.0.0.1:8088`).
+- `SCRIPTBOTS_CONTROL_SWAGGER_PATH` — Swagger UI path (default `/docs`).
+- `SCRIPTBOTS_CONTROL_REST_ENABLED` — `true|false`.
+- `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
+- `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
+
 ## Simulation overview
 Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 1. Aging and scheduled tasks
@@ -179,6 +200,13 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - **Stable order of effects**: floating-point reductions and removals are staged and applied in a fixed order for bitwise-stable runs across thread counts.
 - **Per-agent RNG**: seeds derive from a global seed + `AgentId`, keeping behavior stable as populations change and threads vary.
 - **Feature-gated parallelism**: `scriptbots-core` defaults to `parallel` (Rayon), while web builds disable it for single-thread determinism.
+
+#### Reproducible runs (seed control)
+- Set a fixed seed in config: `rng_seed = <u64>`. At runtime you can apply via REST:
+  ```json
+  { "rng_seed": 42 }
+  ```
+- For CPU thread control during profiling, prefer the standard `RAYON_NUM_THREADS` env var.
 
 ### Data model & spatial indexing
 - **SoA layout**: agents use cache-friendly columns (`AgentColumns`) for fast scans during sense/actuation.

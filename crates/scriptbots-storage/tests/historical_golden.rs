@@ -75,6 +75,7 @@ fn make_batch(
         agents,
         births: Vec::new(),
         deaths: Vec::new(),
+        replay_events: Vec::new(),
     }
 }
 

@@ -5,12 +5,12 @@
 extern "system" {}
 
 use duckdb::{Connection, Transaction, params};
-use serde_json::{json, Value};
 use scriptbots_core::{
     AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord, PersistenceBatch,
     PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope,
     WorldPersistence,
 };
+use serde_json::{Value, json};
 use slotmap::Key;
 use std::{
     sync::{Arc, Mutex, OnceLock, mpsc},
