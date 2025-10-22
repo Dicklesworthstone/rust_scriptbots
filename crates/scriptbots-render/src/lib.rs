@@ -1708,6 +1708,26 @@ impl SimulationView {
         cx.notify();
     }
 
+    fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.settings_panel.search_query.clear();
+        info!("Search cleared");
+        cx.notify();
+    }
+
+    fn update_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.settings_panel.search_query = query;
+        info!(query = %self.settings_panel.search_query, "Search query updated");
+        cx.notify();
+    }
+
+    fn matches_search(&self, text: &str) -> bool {
+        if self.settings_panel.search_query.is_empty() {
+            return true; // No search filter - show everything
+        }
+        // Case-insensitive substring search
+        text.to_lowercase().contains(&self.settings_panel.search_query.to_lowercase())
+    }
+
     fn toggle_category_collapse(&mut self, category: ConfigCategory, cx: &mut Context<Self>) {
         if let Some(pos) = self
             .settings_panel
@@ -4355,7 +4375,34 @@ impl SimulationView {
                     // Prevent clicks on panel from propagating to backdrop
                     cx.stop_propagation();
                 }),
-            );
+            )
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                // Handle keyboard input for search when settings panel is open
+                let key = &event.keystroke.key;
+
+                if event.keystroke.key == "backspace" {
+                    // Remove last character from search
+                    let mut query = this.settings_panel.search_query.clone();
+                    query.pop();
+                    this.update_search(query, cx);
+                } else if event.keystroke.key == "escape" {
+                    // Clear search or close panel
+                    if !this.settings_panel.search_query.is_empty() {
+                        this.clear_search(cx);
+                    } else {
+                        this.toggle_settings(cx);
+                    }
+                } else if key.len() == 1
+                    && key
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c.is_whitespace() || "._-".contains(c))
+                {
+                    // Add alphanumeric characters, spaces, and common punctuation to search
+                    let mut query = this.settings_panel.search_query.clone();
+                    query.push_str(key);
+                    this.update_search(query, cx);
+                }
+            }));
 
         let header = div()
             .flex()
@@ -4410,6 +4457,10 @@ impl SimulationView {
                     .child("✕"),
             );
 
+        // REAL functional search bar - displays current search query and allows filtering
+        let search_query = self.settings_panel.search_query.clone();
+        let has_search = !search_query.is_empty();
+
         let search_bar = div()
             .px_6()
             .py_4()
@@ -4425,14 +4476,48 @@ impl SimulationView {
                     .rounded_lg()
                     .bg(rgb(0x1e293b))
                     .border_1()
-                    .border_color(rgb(0x475569))
+                    .border_color(if has_search {
+                        rgb(0x60a5fa)
+                    } else {
+                        rgb(0x475569)
+                    })
                     .child(div().text_color(rgb(0x94a3b8)).child("🔍"))
                     .child(
                         div()
+                            .flex_1()
                             .text_sm()
-                            .text_color(rgb(0x94a3b8))
-                            .child("Search parameters..."),
-                    ),
+                            .text_color(if has_search {
+                                rgb(0xf1f5f9)
+                            } else {
+                                rgb(0x94a3b8)
+                            })
+                            .child(if has_search {
+                                search_query.clone()
+                            } else {
+                                "Type to search parameters... (start typing when panel is open)"
+                                    .to_string()
+                            }),
+                    )
+                    .when(has_search, |div| {
+                        div.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded()
+                                .bg(rgb(0x334155))
+                                .text_xs()
+                                .text_color(rgb(0x94a3b8))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x475569)).text_color(rgb(0xf1f5f9)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.clear_search(cx);
+                                    }),
+                                )
+                                .child("✕ Clear"),
+                        )
+                    }),
             );
 
         // Scrollable container for categories with mouse wheel handling

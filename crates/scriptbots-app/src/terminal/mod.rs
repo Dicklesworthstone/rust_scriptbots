@@ -361,7 +361,10 @@ impl<'a> TerminalApp<'a> {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (KeyCode::Esc, _)
+            | (KeyCode::Char('q'), _)
+            | (KeyCode::Char('Q'), _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 return Ok(true);
             }
             (KeyCode::Char(' '), _) => {

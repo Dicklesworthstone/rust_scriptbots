@@ -7,7 +7,7 @@ use scriptbots_core::{
 };
 use slotmap::Key;
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
 };
 use thiserror::Error;
@@ -17,6 +17,48 @@ const DEFAULT_AGENT_BUFFER: usize = 1024;
 const DEFAULT_EVENT_BUFFER: usize = 256;
 const DEFAULT_METRIC_BUFFER: usize = 256;
 const DEFAULT_LIFECYCLE_BUFFER: usize = 512;
+
+const AGENT_COLUMNS: &[&str] = &[
+    "tick",
+    "agent_id",
+    "generation",
+    "age",
+    "position_x",
+    "position_y",
+    "velocity_x",
+    "velocity_y",
+    "heading",
+    "health",
+    "energy",
+    "color_r",
+    "color_g",
+    "color_b",
+    "spike_length",
+    "boost",
+    "herbivore_tendency",
+    "sound_multiplier",
+    "reproduction_counter",
+    "mutation_rate_primary",
+    "mutation_rate_secondary",
+    "trait_smell",
+    "trait_sound",
+    "trait_hearing",
+    "trait_eye",
+    "trait_blood",
+    "give_intent",
+    "brain_binding",
+    "brain_key",
+    "food_delta",
+    "spiked",
+    "hybrid",
+    "sound_output",
+    "spike_attacker",
+    "spike_victim",
+    "hit_carnivore",
+    "hit_herbivore",
+    "hit_by_carnivore",
+    "hit_by_herbivore",
+];
 
 /// Storage error wrapper.
 #[derive(Debug, Error)]
@@ -507,28 +549,7 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt = tx.prepare(
-            "insert or replace into agents (
-                tick, agent_id, generation, age,
-                position_x, position_y,
-                velocity_x, velocity_y,
-                heading, health, energy,
-                color_r, color_g, color_b,
-                spike_length, boost,
-                herbivore_tendency, sound_multiplier, reproduction_counter,
-                mutation_rate_primary, mutation_rate_secondary,
-                trait_smell, trait_sound, trait_hearing, trait_eye, trait_blood,
-                give_intent, brain_binding, brain_key,
-                food_delta, spiked, hybrid, sound_output,
-                spike_attacker, spike_victim, hit_carnivore, hit_herbivore, hit_by_carnivore,
-                hit_by_herbivore
-            ) values (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )",
-        )?;
+        let mut stmt = tx.prepare(Self::agent_insert_sql())?;
         for row in rows {
             stmt.execute(params![
                 row.tick,
@@ -573,6 +594,20 @@ impl Storage {
             ])?;
         }
         Ok(())
+    }
+
+    fn agent_insert_sql() -> &'static str {
+        static SQL: OnceLock<String> = OnceLock::new();
+        SQL.get_or_init(|| {
+            let columns = AGENT_COLUMNS.join(", ");
+            let placeholders = std::iter::repeat("?")
+                .take(AGENT_COLUMNS.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "insert or replace into agents ({columns}) values ({placeholders})"
+            )
+        })
     }
 
     fn insert_births(tx: &Transaction<'_>, rows: &[BirthRow]) -> Result<(), duckdb::Error> {
