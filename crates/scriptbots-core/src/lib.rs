@@ -4609,6 +4609,12 @@ impl WorldState {
         let mut output_max = RunningStats::default();
         let mut output_entropy = RunningStats::default();
 
+        let mut reproduction_counter_stats = RunningStats::default();
+        let mut temperature_pref_stats = RunningStats::default();
+        let mut age_sum = 0.0f64;
+        let mut age_max = 0u32;
+        let mut boost_count = 0usize;
+
         let mut food_delta_sum = 0.0f64;
         let mut food_delta_abs_sum = 0.0f64;
 
@@ -4617,11 +4623,26 @@ impl WorldState {
 
         let columns = self.agents.columns();
         let healths = columns.health();
+        let ages = columns.ages();
+        let boosts = columns.boosts();
 
         for (idx, agent_id) in handles.iter().enumerate() {
             total_health += healths.get(idx).copied().unwrap_or(0.0);
             if let Some(runtime) = self.runtime.get(*agent_id) {
                 total_energy += runtime.energy;
+
+                if let Some(age) = ages.get(idx).copied() {
+                    age_sum += age as f64;
+                    if age > age_max {
+                        age_max = age;
+                    }
+                }
+                if boosts.get(idx).copied().unwrap_or(false) {
+                    boost_count += 1;
+                }
+
+                reproduction_counter_stats.update(f64::from(runtime.reproduction_counter));
+                temperature_pref_stats.update(f64::from(runtime.temperature_preference));
 
                 if macro_enabled {
                     let herb = clamp01(runtime.herbivore_tendency);
@@ -4789,6 +4810,35 @@ impl WorldState {
                     "food_delta.mean_abs",
                     food_delta_abs_sum / agent_count as f64,
                 ));
+                metrics.push(MetricSample::new(
+                    "population.age.mean",
+                    age_sum / agent_count as f64,
+                ));
+                metrics.push(MetricSample::new("population.age.max", age_max as f64));
+                metrics.push(MetricSample::new(
+                    "behavior.boost.count",
+                    boost_count as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "behavior.boost.ratio",
+                    if agent_count > 0 {
+                        boost_count as f64 / agent_count as f64
+                    } else {
+                        0.0
+                    },
+                ));
+                metrics.push(MetricSample::new(
+                    "reproduction.counter.mean",
+                    reproduction_counter_stats.mean(),
+                ));
+                metrics.push(MetricSample::new(
+                    "temperature.preference.mean",
+                    temperature_pref_stats.mean(),
+                ));
+                metrics.push(MetricSample::new(
+                    "temperature.preference.stddev",
+                    temperature_pref_stats.stddev(),
+                ));
             }
 
             if let Some((total, mean, variance, max)) = summarize_food_grid(self.food.cells()) {
@@ -4879,6 +4929,61 @@ impl WorldState {
         for id in &handles {
             if let Some(runtime) = self.runtime.get_mut(*id) {
                 runtime.food_balance_total += runtime.food_delta;
+            }
+        }
+
+        if lifecycle_enabled && !self.pending_death_records.is_empty() {
+            let mut combat_carnivore = 0usize;
+            let mut combat_herbivore = 0usize;
+            let mut starvation = 0usize;
+            let mut aging = 0usize;
+            let mut unknown = 0usize;
+            for record in &self.pending_death_records {
+                match record.cause {
+                    DeathCause::CombatCarnivore => combat_carnivore += 1,
+                    DeathCause::CombatHerbivore => combat_herbivore += 1,
+                    DeathCause::Starvation => starvation += 1,
+                    DeathCause::Aging => aging += 1,
+                    DeathCause::Unknown => unknown += 1,
+                }
+            }
+            let total = combat_carnivore + combat_herbivore + starvation + aging + unknown;
+            if total > 0 {
+                metrics.push(MetricSample::new(
+                    "mortality.combat_carnivore.count",
+                    combat_carnivore as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "mortality.combat_herbivore.count",
+                    combat_herbivore as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "mortality.starvation.count",
+                    starvation as f64,
+                ));
+                metrics.push(MetricSample::new("mortality.aging.count", aging as f64));
+                metrics.push(MetricSample::new("mortality.unknown.count", unknown as f64));
+                metrics.push(MetricSample::new("mortality.total.count", total as f64));
+                metrics.push(MetricSample::new(
+                    "mortality.combat_carnivore.ratio",
+                    combat_carnivore as f64 / total as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "mortality.combat_herbivore.ratio",
+                    combat_herbivore as f64 / total as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "mortality.starvation.ratio",
+                    starvation as f64 / total as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "mortality.aging.ratio",
+                    aging as f64 / total as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "mortality.unknown.ratio",
+                    unknown as f64 / total as f64,
+                ));
             }
         }
 

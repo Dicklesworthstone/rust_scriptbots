@@ -164,7 +164,7 @@
   - Added a stdio MCP server (`list_knobs`, `get_config`, `apply_updates`, `apply_patch`) so external LLM tooling can orchestrate simulations safely.
   - Delivered the `scriptbots-control` CLI (clap + reqwest + ratatui) offering scripted updates (`set`, `patch`) and a live dashboard (`watch`) that highlights config deltas while the GPUI shell runs.
 - Diagnostics:
-  - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization.
+  - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization. [Currently In Progress - Codex 2025-10-22]
   - Provide debug tooling to render network topologies (layer shapes, activations) inside the inspector panel.
 
 ## Modularity & Extensibility Enhancements

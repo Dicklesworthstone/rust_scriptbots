@@ -910,12 +910,94 @@ impl SimulationView {
                 "Outputs μ {:.3} · H {:.3}",
                 analytics.behavior_output_mean, analytics.behavior_output_entropy
             )));
+        let age_panel = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x101624))
+            .border_1()
+            .border_color(rgb(0x1d2738))
+            .child(div().text_sm().text_color(rgb(0xf59e0b)).child("Age"))
+            .child(div().text_xs().text_color(rgb(0xfef3c7)).child(format!(
+                "Mean {:.2} · Max {:.0}",
+                analytics.age_mean, analytics.age_max
+            )))
+            .child(div().text_xs().text_color(rgb(0xfdba74)).child(format!(
+                "Repro μ {:.2} · Boost {:.1}%",
+                analytics.reproduction_counter_mean,
+                analytics.boost_ratio * 100.0
+            )));
 
-        let insights_row =
+        let temperature_panel = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x121f33))
+            .border_1()
+            .border_color(rgb(0x1f2f46))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x38bdf8))
+                    .child("Temperature"),
+            )
+            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                "Preference μ {:.3} · σ {:.3}",
+                analytics.temperature_preference_mean, analytics.temperature_preference_stddev
+            )));
+
+        let mortality_panel = {
+            let total = analytics.deaths_total.max(1);
+            let make_row = |label: &str, count: usize| {
+                let ratio = (count as f64 / total as f64) * 100.0;
+                let label_text: SharedString = label.to_string().into();
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(0xe2e8f0))
+                    .child(div().child(label_text))
+                    .child(div().child(format!("{count} ({ratio:.1}%)")))
+            };
+
             div()
                 .flex()
-                .gap_4()
-                .children(vec![resource_panel, mutation_panel, behavior_panel]);
+                .flex_col()
+                .gap_1()
+                .p_3()
+                .rounded_lg()
+                .bg(rgb(0x160f24))
+                .border_1()
+                .border_color(rgb(0x27193a))
+                .child(div().text_sm().text_color(rgb(0xf472b6)).child("Mortality"))
+                .child(make_row("Carnivore", analytics.deaths_combat_carnivore))
+                .child(make_row("Herbivore", analytics.deaths_combat_herbivore))
+                .child(make_row("Starvation", analytics.deaths_starvation))
+                .child(make_row("Aging", analytics.deaths_aging))
+                .child(make_row("Other", analytics.deaths_unknown))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child(div().child("Total"))
+                        .child(div().child(analytics.deaths_total.to_string())),
+                )
+        };
+
+        let insights_row = div().grid().grid_cols(3).gap_4().children(vec![
+            resource_panel,
+            mutation_panel,
+            behavior_panel,
+            age_panel,
+            temperature_panel,
+            mortality_panel,
+        ]);
 
         let mut brain_rows: Vec<Div> = Vec::new();
         brain_rows.push(
@@ -4295,19 +4377,12 @@ impl SimulationView {
             );
 
         // Scrollable container for categories with mouse wheel handling
-        // Calculate content height dynamically, use cached viewport height
-        let total_categories = ConfigCategory::all().len();
-        let content_height = self
-            .settings_panel
-            .estimate_content_height(total_categories);
-
-        // Use cached viewport height (conservative 400px default)
-        // CRITICAL: Conservative value prevents blocking content on default 720px window
-        // Actual viewport: window_height - 132px chrome
-        // Trade-off: Allows extra scroll (blank space) vs. blocking content access
+        // Use cached dimensions (updated when panel opens or categories collapse/expand)
+        let content_height = self.settings_panel.content_height;
         let viewport_height = self.settings_panel.viewport_height;
-
         let scroll_offset = self.settings_panel.scroll_offset;
+
+        // Calculate scroll bounds (must match clamp_scroll logic for consistency)
         let max_scroll = (content_height - viewport_height).max(0.0);
         let has_scrollable_content = max_scroll > 1.0;
 
@@ -5091,6 +5166,13 @@ struct HudAnalytics {
     carnivore_avg_energy: f64,
     herbivore_avg_energy: f64,
     hybrid_avg_energy: f64,
+    age_mean: f64,
+    age_max: f64,
+    boost_count: usize,
+    boost_ratio: f64,
+    reproduction_counter_mean: f64,
+    temperature_preference_mean: f64,
+    temperature_preference_stddev: f64,
     food_total: f64,
     food_mean: f64,
     food_stddev: f64,
@@ -5104,6 +5186,12 @@ struct HudAnalytics {
     behavior_sensor_entropy: f64,
     behavior_output_mean: f64,
     behavior_output_entropy: f64,
+    deaths_combat_carnivore: usize,
+    deaths_combat_herbivore: usize,
+    deaths_starvation: usize,
+    deaths_aging: usize,
+    deaths_unknown: usize,
+    deaths_total: usize,
     brain_shares: Vec<BrainShareEntry>,
 }
 
@@ -5116,7 +5204,7 @@ struct BrainShareEntry {
 
 fn parse_analytics(
     tick: u64,
-    _agent_count: usize,
+    agent_count: usize,
     readings: &[MetricReading],
 ) -> Option<HudAnalytics> {
     if readings.is_empty() {
@@ -5137,6 +5225,19 @@ fn parse_analytics(
     let carnivore_avg_energy = value("population.carnivore.avg_energy").unwrap_or(0.0);
     let herbivore_avg_energy = value("population.herbivore.avg_energy").unwrap_or(0.0);
     let hybrid_avg_energy = value("population.hybrid.avg_energy").unwrap_or(0.0);
+    let age_mean = value("population.age.mean").unwrap_or(0.0);
+    let age_max = value("population.age.max").unwrap_or(0.0);
+    let boost_count = as_count("behavior.boost.count");
+    let boost_ratio = value("behavior.boost.ratio").unwrap_or_else(|| {
+        if agent_count > 0 {
+            boost_count as f64 / agent_count as f64
+        } else {
+            0.0
+        }
+    });
+    let reproduction_counter_mean = value("reproduction.counter.mean").unwrap_or(0.0);
+    let temperature_preference_mean = value("temperature.preference.mean").unwrap_or(0.0);
+    let temperature_preference_stddev = value("temperature.preference.stddev").unwrap_or(0.0);
 
     let food_total = value("food.total").unwrap_or(0.0);
     let food_mean = value("food.mean").unwrap_or(0.0);
@@ -5184,6 +5285,21 @@ fn parse_analytics(
     let mut brain_shares: Vec<BrainShareEntry> = brain_map.into_values().collect();
     brain_shares.sort_by(|a, b| b.count.cmp(&a.count));
 
+    let deaths_combat_carnivore = as_count("mortality.combat_carnivore.count");
+    let deaths_combat_herbivore = as_count("mortality.combat_herbivore.count");
+    let deaths_starvation = as_count("mortality.starvation.count");
+    let deaths_aging = as_count("mortality.aging.count");
+    let deaths_unknown = as_count("mortality.unknown.count");
+    let deaths_total = value("mortality.total.count")
+        .map(|v| v.max(0.0).round() as usize)
+        .unwrap_or(
+            deaths_combat_carnivore
+                + deaths_combat_herbivore
+                + deaths_starvation
+                + deaths_aging
+                + deaths_unknown,
+        );
+
     Some(HudAnalytics {
         tick,
         carnivores,
@@ -5192,6 +5308,13 @@ fn parse_analytics(
         carnivore_avg_energy,
         herbivore_avg_energy,
         hybrid_avg_energy,
+        age_mean,
+        age_max,
+        boost_count,
+        boost_ratio,
+        reproduction_counter_mean,
+        temperature_preference_mean,
+        temperature_preference_stddev,
         food_total,
         food_mean,
         food_stddev,
@@ -5205,6 +5328,12 @@ fn parse_analytics(
         behavior_sensor_entropy,
         behavior_output_mean,
         behavior_output_entropy,
+        deaths_combat_carnivore,
+        deaths_combat_herbivore,
+        deaths_starvation,
+        deaths_aging,
+        deaths_unknown,
+        deaths_total,
         brain_shares,
     })
 }
@@ -5629,8 +5758,8 @@ impl SettingsPanelState {
             }
         }
 
-        // Add top/bottom padding for categories container (py_4 = 32px total)
-        total_height + 64.0
+        // Add top/bottom padding for categories container (py_4 = 16px each side = 32px total)
+        total_height + 32.0
     }
 }
 
