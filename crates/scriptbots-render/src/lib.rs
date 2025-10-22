@@ -3,8 +3,8 @@
 use gpui::{
     App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
-    ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, canvas, div, fill, point,
-    prelude::*, px, rgb, size,
+    ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds, WindowOptions, canvas,
+    div, fill, point, prelude::*, px, rgb, size,
 };
 use rand::Rng;
 use scriptbots_core::{
@@ -1720,12 +1720,40 @@ impl SimulationView {
         cx.notify();
     }
 
+    /// Check if text matches the current search query (case-insensitive substring match)
     fn matches_search(&self, text: &str) -> bool {
         if self.settings_panel.search_query.is_empty() {
             return true; // No search filter - show everything
         }
         // Case-insensitive substring search
-        text.to_lowercase().contains(&self.settings_panel.search_query.to_lowercase())
+        text.to_lowercase()
+            .contains(&self.settings_panel.search_query.to_lowercase())
+    }
+
+    /// Render a list of parameters with search filtering - ONE central filter point for ALL 60+ params!
+    fn render_filtered_params(&self, params: Vec<(&str, String, &str)>) -> Div {
+        let mut container = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .px_4()
+            .py_4()
+            .rounded_lg()
+            .bg(rgb(0x0f172a))
+            .border_1()
+            .border_color(rgb(0x1e293b));
+
+        // ✨ SINGLE CENTRALIZED FILTERING LOOP - this replaces 60+ individual checks!
+        for (label, value, desc) in params {
+            if self.matches_search(label)
+                || self.matches_search(&value)
+                || self.matches_search(desc)
+            {
+                container = container.child(self.render_param_readonly(label, &value, desc));
+            }
+        }
+
+        container
     }
 
     fn toggle_category_collapse(&mut self, category: ConfigCategory, cx: &mut Context<Self>) {
@@ -4498,17 +4526,19 @@ impl SimulationView {
                                     .to_string()
                             }),
                     )
-                    .when(has_search, |div| {
-                        div.child(
+                    .when(has_search, |container| {
+                        container.child(
                             div()
                                 .px_2()
                                 .py_1()
-                                .rounded()
+                                .rounded_md()
                                 .bg(rgb(0x334155))
                                 .text_xs()
                                 .text_color(rgb(0x94a3b8))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x475569)).text_color(rgb(0xf1f5f9)))
+                                .hover(|s: StyleRefinement| {
+                                    s.bg(rgb(0x475569)).text_color(rgb(0xf1f5f9))
+                                })
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
@@ -4668,17 +4698,6 @@ impl SimulationView {
     }
 
     fn render_category_parameters(&self, category: ConfigCategory, cx: &mut Context<Self>) -> Div {
-        let params_container = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .px_4()
-            .py_4()
-            .rounded_lg()
-            .bg(rgb(0x0f172a))
-            .border_1()
-            .border_color(rgb(0x1e293b));
-
         // Read current config from world
         let config = if let Ok(world) = self.world.lock() {
             world.config().clone()
@@ -4686,48 +4705,61 @@ impl SimulationView {
             scriptbots_core::ScriptBotsConfig::default()
         };
 
-        let mut container = params_container;
+        // Match on category and return filtered params directly - clean data-driven approach!
+        let base_container = || {
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .px_4()
+                .py_4()
+                .rounded_lg()
+                .bg(rgb(0x0f172a))
+                .border_1()
+                .border_color(rgb(0x1e293b))
+        };
 
-        // Add parameters based on category
-        container = match category {
-            ConfigCategory::World => container
-                .child(self.render_param_readonly(
-                    "World Width",
-                    &format!("{} units", config.world_width),
-                    "Horizontal extent of the simulation world",
-                ))
-                .child(self.render_param_readonly(
-                    "World Height",
-                    &format!("{} units", config.world_height),
-                    "Vertical extent of the simulation world",
-                ))
-                .child(self.render_param_readonly(
-                    "Food Cell Size",
-                    &format!("{} units", config.food_cell_size),
-                    "Size of each food grid cell",
-                ))
-                .child(self.render_param_readonly(
-                    "Initial Food",
-                    &self.format_float(config.initial_food, 3),
-                    "Starting food in each cell",
-                ))
-                .child(
-                    self.render_param_readonly(
+        match category {
+            ConfigCategory::World => {
+                let params = vec![
+                    (
+                        "World Width",
+                        format!("{} units", config.world_width),
+                        "Horizontal extent of the simulation world",
+                    ),
+                    (
+                        "World Height",
+                        format!("{} units", config.world_height),
+                        "Vertical extent of the simulation world",
+                    ),
+                    (
+                        "Food Cell Size",
+                        format!("{} units", config.food_cell_size),
+                        "Size of each food grid cell",
+                    ),
+                    (
+                        "Initial Food",
+                        self.format_float(config.initial_food, 3),
+                        "Starting food in each cell",
+                    ),
+                    (
                         "RNG Seed",
-                        &config
+                        config
                             .rng_seed
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| "Random".to_string()),
                         "Random number generator seed",
                     ),
-                )
-                .child(self.render_param_readonly(
-                    "Chart Flush Interval",
-                    &format!("{} ticks", config.chart_flush_interval),
-                    "History chart update frequency",
-                )),
+                    (
+                        "Chart Flush Interval",
+                        format!("{} ticks", config.chart_flush_interval),
+                        "History chart update frequency",
+                    ),
+                ];
+                self.render_filtered_params(params)
+            }
 
-            ConfigCategory::Food => container
+            ConfigCategory::Food => base_container()
                 .child(self.render_param_readonly(
                     "Respawn Interval",
                     &format!("{} ticks", config.food_respawn_interval),
@@ -4784,7 +4816,7 @@ impl SimulationView {
                     "Altruistic sharing threshold",
                 )),
 
-            ConfigCategory::Agent => container
+            ConfigCategory::Agent => base_container()
                 .child(self.render_param_readonly(
                     "Bot Speed",
                     &self.format_float(config.bot_speed, 2),
@@ -4816,7 +4848,7 @@ impl SimulationView {
                     "Herbivore tendency cutoff for carnivores",
                 )),
 
-            ConfigCategory::Metabolism => container
+            ConfigCategory::Metabolism => base_container()
                 .child(self.render_param_readonly(
                     "Base Drain",
                     &self.format_float(config.metabolism_drain, 4),
@@ -4843,7 +4875,7 @@ impl SimulationView {
                     "Fixed boost cost",
                 )),
 
-            ConfigCategory::Temperature => container
+            ConfigCategory::Temperature => base_container()
                 .child(self.render_param_readonly(
                     "Discomfort Rate",
                     &self.format_float(config.temperature_discomfort_rate, 4),
@@ -4865,7 +4897,7 @@ impl SimulationView {
                     "Discomfort scaling power",
                 )),
 
-            ConfigCategory::Reproduction => container
+            ConfigCategory::Reproduction => base_container()
                 .child(self.render_param_readonly(
                     "Energy Threshold",
                     &self.format_float(config.reproduction_energy_threshold, 2),
@@ -4955,7 +4987,7 @@ impl SimulationView {
                     "Mutation rate change magnitude",
                 )),
 
-            ConfigCategory::Aging => container
+            ConfigCategory::Aging => base_container()
                 .child(self.render_param_readonly(
                     "Decay Start Age",
                     &format!("{} ticks", config.aging_health_decay_start),
@@ -4980,7 +5012,7 @@ impl SimulationView {
                     "Health-to-energy conversion",
                 )),
 
-            ConfigCategory::Combat => container
+            ConfigCategory::Combat => base_container()
                 .child(self.render_param_readonly(
                     "Spike Radius",
                     &self.format_float(config.spike_radius, 1),
@@ -5025,7 +5057,7 @@ impl SimulationView {
                     "Spike extension rate",
                 )),
 
-            ConfigCategory::Carcass => container
+            ConfigCategory::Carcass => base_container()
                 .child(self.render_param_readonly(
                     "Distribution Radius",
                     &self.format_float(config.carcass_distribution_radius, 1),
@@ -5065,7 +5097,7 @@ impl SimulationView {
                     "Visual pulse intensity",
                 )),
 
-            ConfigCategory::Topography => container
+            ConfigCategory::Topography => base_container()
                 .child(self.render_param_toggle(
                     "Enabled",
                     config.topography_enabled,
@@ -5083,7 +5115,7 @@ impl SimulationView {
                     "Uphill cost per unit slope",
                 )),
 
-            ConfigCategory::Population => container
+            ConfigCategory::Population => base_container()
                 .child(self.render_param_readonly(
                     "Minimum Population",
                     &format!("{}", config.population_minimum),
@@ -5108,7 +5140,7 @@ impl SimulationView {
                     "Breed vs. random spawn",
                 )),
 
-            ConfigCategory::Persistence => container
+            ConfigCategory::Persistence => base_container()
                 .child(self.render_param_readonly(
                     "Interval",
                     &format!("{} ticks", config.persistence_interval),
@@ -5119,9 +5151,7 @@ impl SimulationView {
                     &format!("{}", config.history_capacity),
                     "In-memory tick summaries",
                 )),
-        };
-
-        container
+        }
     }
 
     /// Helper to safely format floats with NaN/Inf guards

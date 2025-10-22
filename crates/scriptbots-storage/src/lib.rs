@@ -604,9 +604,7 @@ impl Storage {
                 .take(AGENT_COLUMNS.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "insert or replace into agents ({columns}) values ({placeholders})"
-            )
+            format!("insert or replace into agents ({columns}) values ({placeholders})")
         })
     }
 
