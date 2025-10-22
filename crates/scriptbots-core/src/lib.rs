@@ -2626,7 +2626,9 @@ impl WorldState {
             if penalty <= 0.0 {
                 continue;
             }
-            if energy_scale > 0.0 && let Some(runtime) = self.runtime.get_mut(*agent_id) {
+            if energy_scale <= 0.0 {
+                // no additional energy penalty
+            } else if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 let energy_penalty = penalty * energy_scale;
                 runtime.energy = (runtime.energy - energy_penalty).max(0.0);
                 runtime.food_delta -= energy_penalty;
