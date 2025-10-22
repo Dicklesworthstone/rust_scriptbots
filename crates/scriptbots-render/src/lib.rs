@@ -9,7 +9,7 @@ use gpui::{
 use scriptbots_core::{
     AgentColumns, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState, MutationRates,
     OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
-    TraitModifiers, WorldState,
+    TraitModifiers, Velocity, WorldState,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -1772,6 +1772,11 @@ struct VectorHudState {
     births_ratio: f32,
     deaths_ratio: f32,
     tick_phase: f32,
+    avg_velocity: (f32, f32),
+    mean_speed: f32,
+    vector_magnitude: f32,
+    max_speed: f32,
+    heading_rad: f32,
 }
 
 impl VectorHudState {
@@ -1813,12 +1818,56 @@ impl VectorHudState {
             energy_max = 1.0;
         }
 
+        let (avg_velocity, mean_speed, vector_magnitude, max_speed, heading_rad) = snapshot
+            .render_frame
+            .as_ref()
+            .map(|frame| {
+                if frame.agents.is_empty() {
+                    return ((0.0, 0.0), 0.0, 0.0, 1.0, 0.0);
+                }
+
+                let mut sum_vx = 0.0;
+                let mut sum_vy = 0.0;
+                let mut sum_speed = 0.0;
+                let mut max_speed = 0.0;
+
+                for agent in &frame.agents {
+                    let vel = agent.velocity;
+                    let speed = (vel.vx * vel.vx + vel.vy * vel.vy).sqrt();
+                    sum_vx += vel.vx;
+                    sum_vy += vel.vy;
+                    sum_speed += speed;
+                    max_speed = max_speed.max(speed);
+                }
+
+                let count = frame.agents.len() as f32;
+                let safe_count = if count <= f32::EPSILON { 1.0 } else { count };
+                let avg_vx = sum_vx / safe_count;
+                let avg_vy = sum_vy / safe_count;
+                let mean_speed = sum_speed / safe_count;
+                let vector_magnitude = (avg_vx * avg_vx + avg_vy * avg_vy).sqrt();
+                let heading_rad = if vector_magnitude > f32::EPSILON {
+                    avg_vy.atan2(avg_vx)
+                } else {
+                    0.0
+                };
+                let max_speed = max_speed.max(mean_speed).max(1e-3);
+
+                ((avg_vx, avg_vy), mean_speed, vector_magnitude, max_speed, heading_rad)
+            })
+            .unwrap_or(((0.0, 0.0), 0.0, 0.0, 1.0, 0.0));
+
         Some(Self {
             population_ratio: metrics.agent_count as f32 / max_agents as f32,
             energy_ratio: (metrics.average_energy / energy_max).clamp(0.0, 1.0),
             births_ratio: metrics.births as f32 / max_births as f32,
             deaths_ratio: metrics.deaths as f32 / max_deaths as f32,
             tick_phase: (snapshot.tick % 960) as f32 / 960.0,
+            avg_velocity,
+            mean_speed,
+            vector_magnitude,
+            max_speed,
+            heading_rad,
         })
     }
 }
@@ -2637,6 +2686,7 @@ struct RenderFrame {
     food_max: f32,
     agents: Vec<AgentRenderData>,
     agent_base_radius: f32,
+    post_fx: PostProcessingConfig,
     palette: ColorPaletteMode,
 }
 
@@ -2657,11 +2707,35 @@ struct TerrainTileVisual {
 }
 
 #[derive(Clone)]
+struct PostProcessingConfig {
+    vignette_strength: f32,
+    bloom_strength: f32,
+    scanline_intensity: f32,
+    grain_strength: f32,
+}
+
+impl PostProcessingConfig {
+    fn from_world(world: &WorldState) -> Self {
+        let tick = world.tick().0;
+        let day_phase = (tick as f32 * 0.00025).sin() * 0.5 + 0.5;
+        let closed_bonus = if world.is_closed() { 0.18 } else { 0.0 };
+        Self {
+            vignette_strength: (0.38 + day_phase * 0.22 + closed_bonus).clamp(0.2, 0.75),
+            bloom_strength: (0.26 + day_phase * 0.3).clamp(0.1, 0.7),
+            scanline_intensity: (0.18 + (1.0 - day_phase) * 0.22 + closed_bonus * 0.35)
+                .clamp(0.08, 0.6),
+            grain_strength: (0.12 + (tick % 4096) as f32 / 4096.0 * 0.08).clamp(0.08, 0.22),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct AgentRenderData {
     agent_id: AgentId,
     position: Position,
     color: [f32; 3],
     spike_length: f32,
+    velocity: Velocity,
     health: f32,
     selection: SelectionState,
     indicator: IndicatorState,
@@ -2694,6 +2768,7 @@ impl RenderFrame {
         let colors = columns.colors();
         let spikes = columns.spike_lengths();
         let healths = columns.health();
+        let velocities = columns.velocities();
 
         let agents = arena
             .iter_handles()
@@ -2710,6 +2785,7 @@ impl RenderFrame {
                     position: positions[idx],
                     color: colors[idx],
                     spike_length: spikes[idx],
+                    velocity: velocities[idx],
                     health: healths[idx],
                     selection,
                     indicator,
@@ -2732,6 +2808,7 @@ impl RenderFrame {
             food_max: config.food_max,
             agents,
             agent_base_radius: (config.spike_radius * 0.5).max(12.0),
+            post_fx: PostProcessingConfig::from_world(world),
             palette,
         })
     }
@@ -2779,6 +2856,7 @@ fn build_terrain_frame(layer: &TerrainLayer) -> TerrainFrame {
                 + (tile.elevation - up.elevation).abs()
                 + (tile.elevation - down.elevation).abs())
                 * 0.25;
+            let slope = slope.min(1.0);
 
             tiles.push(TerrainTileVisual {
                 kind: tile.kind,
@@ -2997,6 +3075,66 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
         window.paint_path(path, rgba_from_hex(0xfacc15, 0.75));
     }
 
+    let velocity_ratio = if state.max_speed > f32::EPSILON {
+        (state.vector_magnitude / state.max_speed).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if velocity_ratio > 0.01 {
+        let heading = state.heading_rad;
+        let arrow_length = radius * 0.85 * velocity_ratio;
+        let tip_x = cx + arrow_length * heading.cos();
+        let tip_y = cy + arrow_length * heading.sin();
+
+        let mut arrow = PathBuilder::stroke(px(2.1));
+        arrow.move_to(center);
+        arrow.line_to(point(px(tip_x), px(tip_y)));
+        if let Ok(path) = arrow.build() {
+            window.paint_path(path, rgba_from_hex(0x38bdf8, 0.88));
+        }
+
+        let head_size = (8.0 + velocity_ratio * 18.0).clamp(6.0, 18.0);
+        let left_angle = heading + std::f32::consts::PI - 0.4;
+        let right_angle = heading + std::f32::consts::PI + 0.4;
+
+        let left_point = point(
+            px(tip_x + head_size * left_angle.cos()),
+            px(tip_y + head_size * left_angle.sin()),
+        );
+        let right_point = point(
+            px(tip_x + head_size * right_angle.cos()),
+            px(tip_y + head_size * right_angle.sin()),
+        );
+
+        let mut left_head = PathBuilder::stroke(px(1.4));
+        left_head.move_to(point(px(tip_x), px(tip_y)));
+        left_head.line_to(left_point);
+        if let Ok(path) = left_head.build() {
+            window.paint_path(path, rgba_from_hex(0xe0f2fe, 0.82));
+        }
+
+        let mut right_head = PathBuilder::stroke(px(1.4));
+        right_head.move_to(point(px(tip_x), px(tip_y)));
+        right_head.line_to(right_point);
+        if let Ok(path) = right_head.build() {
+            window.paint_path(path, rgba_from_hex(0xe0f2fe, 0.82));
+        }
+
+        let coherence = (velocity_ratio * 100.0).clamp(0.0, 100.0);
+        let ring_inner = radius * 0.55;
+        let mut ring = PathBuilder::stroke(px(1.2 + coherence * 0.02));
+        ring.move_to(point(px(cx + ring_inner), px(cy)));
+        ring.arc(
+            center,
+            px(ring_inner),
+            Angle::radians(0.0),
+            Angle::radians(std::f32::consts::TAU * velocity_ratio),
+        );
+        if let Ok(path) = ring.build() {
+            window.paint_path(path, rgba_from_hex(0x60a5fa, 0.65));
+        }
+    }
+
     let bar_origin_x = f32::from(origin.x) + 12.0;
     let bar_origin_y = f32::from(origin.y) + height - 18.0;
     let bar_width = (width - 24.0).max(12.0);
@@ -3163,72 +3301,174 @@ impl CameraState {
 }
 
 fn paint_terrain_layer(
-    frame: &RenderFrame,
+    terrain: &TerrainFrame,
     offset_x: f32,
     offset_y: f32,
-    cell_world: f32,
     scale: f32,
     daylight: f32,
+    palette: ColorPaletteMode,
     window: &mut Window,
 ) {
-    let width = frame.food_dimensions.0 as usize;
-    let height = frame.food_dimensions.1 as usize;
+    let width = terrain.dimensions.0 as usize;
+    let height = terrain.dimensions.1 as usize;
     if width == 0 || height == 0 {
         return;
     }
 
+    let cell_world = terrain.cell_size as f32;
     let cell_px = (cell_world * scale).max(1.0);
-    let highlight_shift = (daylight * 0.45 + 0.35).clamp(0.3, 0.9);
+    let highlight_shift = (daylight * 0.45 + 0.35).clamp(0.2, 0.9);
 
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
-            let Some(tile) = frame.terrain_tiles.get(idx) else {
+            let Some(tile) = terrain.tiles.get(idx).copied() else {
                 continue;
             };
 
             let px_x = offset_x + (x as f32 * cell_world * scale);
             let px_y = offset_y + (y as f32 * cell_world * scale);
 
-            let mut base = rgba_from_triplet_with_alpha(tile.base_color, 1.0);
-            let shade = (0.72 + daylight * 0.18 + tile.height_factor * 0.22).clamp(0.45, 1.12);
-            base = scale_rgb(base, shade);
-            base = apply_palette(base, frame.palette);
-
+            let surface = terrain_surface_color(tile, daylight, palette);
             let cell_bounds =
                 Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
-            window.paint_quad(fill(cell_bounds, Background::from(base)));
+            window.paint_quad(fill(cell_bounds, Background::from(surface)));
 
-            if tile.height_factor > 0.62 {
-                let mut builder = PathBuilder::fill();
-                builder.move_to(point(px(px_x), px(px_y)));
-                builder.line_to(point(px(px_x + cell_px * 0.65), px(px_y)));
-                builder.line_to(point(px(px_x), px(px_y + cell_px * 0.55)));
-                builder.line_to(point(px(px_x), px(px_y)));
-                if let Ok(path) = builder.build() {
-                    let sparkle = rgba_from_triplet_with_alpha(
-                        tile.accent_color,
-                        (0.06 + (tile.height_factor - 0.62) * 0.22).clamp(0.02, 0.28),
-                    );
-                    let sparkle = apply_palette(sparkle, frame.palette);
-                    window.paint_path(path, sparkle);
-                }
-            }
-
-            if tile.contour > 0.18 {
-                let stroke_width = (0.5 + tile.contour * 1.05) * scale.clamp(0.5, 2.75);
-                let accent_alpha = (0.12 + tile.contour * highlight_shift).clamp(0.06, 0.45);
-                let accent = rgba_from_triplet_with_alpha(tile.accent_color, accent_alpha);
-                let accent = apply_palette(accent, frame.palette);
-                let mut builder = PathBuilder::stroke(px(stroke_width.min(cell_px * 0.8)));
-                builder.move_to(point(px(px_x), px(px_y + cell_px * 0.15)));
-                builder.line_to(point(px(px_x + cell_px), px(px_y + cell_px * 0.85)));
+            if tile.slope > 0.12 {
+                let stroke_width = (0.55 + tile.slope * 1.1) * scale.clamp(0.6, 3.0);
+                let accent = terrain_slope_accent_color(tile, highlight_shift, palette);
+                let mut builder = PathBuilder::stroke(px(stroke_width.min(cell_px * 0.85)));
+                let diag_bias = if tile.accent > 0.5 {
+                    (0.35, 0.9)
+                } else {
+                    (0.1, 0.65)
+                };
+                builder.move_to(point(px(px_x + cell_px * diag_bias.0), px(px_y)));
+                builder.line_to(point(px(px_x), px(px_y + cell_px * diag_bias.1)));
                 if let Ok(path) = builder.build() {
                     window.paint_path(path, accent);
                 }
             }
+
+            if matches!(tile.kind, TerrainKind::Bloom) && tile.accent > 0.66 {
+                let blossom = terrain_bloom_color(tile, palette);
+                let bloom_size = (cell_px * (0.25 + tile.accent * 0.18)).min(cell_px * 0.6);
+                let half = bloom_size * 0.5;
+                let bloom_bounds = Bounds::new(
+                    point(
+                        px(px_x + cell_px * 0.5 - half),
+                        px(px_y + cell_px * 0.5 - half),
+                    ),
+                    size(px(bloom_size), px(bloom_size)),
+                );
+                window.paint_quad(fill(bloom_bounds, Background::from(blossom)));
+            }
+
+            if matches!(
+                tile.kind,
+                TerrainKind::ShallowWater | TerrainKind::DeepWater
+            ) {
+                let caustic = terrain_water_caustic_color(tile, daylight, palette);
+                let wave_height =
+                    (cell_px * 0.12 + tile.accent * cell_px * 0.18).min(cell_px * 0.35);
+                let mut builder =
+                    PathBuilder::stroke(px((cell_px * 0.08 + tile.accent * 0.18).clamp(0.5, 2.6)));
+                builder.move_to(point(px(px_x), px(px_y + wave_height)));
+                builder.line_to(point(
+                    px(px_x + cell_px),
+                    px(px_y + wave_height * 0.45 + tile.accent * 0.22 * cell_px),
+                ));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, caustic);
+                }
+            }
         }
     }
+}
+
+fn terrain_surface_color(
+    tile: TerrainTileVisual,
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> Rgba {
+    let base = match tile.kind {
+        TerrainKind::DeepWater => [0.05, 0.11, 0.23],
+        TerrainKind::ShallowWater => [0.12, 0.34, 0.46],
+        TerrainKind::Sand => [0.40, 0.33, 0.20],
+        TerrainKind::Grass => [0.20, 0.34, 0.18],
+        TerrainKind::Bloom => [0.18, 0.42, 0.22],
+        TerrainKind::Rock => [0.34, 0.33, 0.41],
+    };
+
+    let mut color = rgba_from_triplet_with_alpha(base, 1.0);
+    let brightness = match tile.kind {
+        TerrainKind::DeepWater => (0.42 + daylight * 0.25 + tile.moisture * 0.2)
+            .clamp(0.25, 1.05),
+        TerrainKind::ShallowWater => (0.55 + daylight * 0.35 + tile.moisture * 0.3)
+            .clamp(0.4, 1.25),
+        TerrainKind::Sand => (0.72 + daylight * 0.18 + tile.elevation * 0.35)
+            .clamp(0.45, 1.35),
+        TerrainKind::Grass => (0.62 + daylight * 0.28 + tile.moisture * 0.4)
+            .clamp(0.4, 1.35),
+        TerrainKind::Bloom => (0.68 + daylight * 0.35 + tile.moisture * 0.5)
+            .clamp(0.45, 1.45),
+        TerrainKind::Rock => (0.60 + daylight * 0.22 + tile.slope * 0.45)
+            .clamp(0.35, 1.25),
+    };
+    color = scale_rgb(color, brightness);
+
+    if matches!(tile.kind, TerrainKind::Bloom | TerrainKind::Grass) {
+        color = scale_rgb(color, 0.9 + tile.moisture * 0.3 + tile.accent * 0.05);
+    } else if matches!(tile.kind, TerrainKind::Sand) {
+        color = scale_rgb(color, 0.9 + tile.accent * 0.08);
+    } else if matches!(tile.kind, TerrainKind::Rock) {
+        color = scale_rgb(color, 0.85 + tile.slope * 0.3);
+    }
+
+    apply_palette(color, palette)
+}
+
+fn terrain_slope_accent_color(
+    tile: TerrainTileVisual,
+    highlight_shift: f32,
+    palette: ColorPaletteMode,
+) -> Rgba {
+    let accent = match tile.kind {
+        TerrainKind::DeepWater => [0.23, 0.58, 0.86],
+        TerrainKind::ShallowWater => [0.45, 0.82, 0.98],
+        TerrainKind::Sand => [0.75, 0.57, 0.29],
+        TerrainKind::Grass => [0.34, 0.66, 0.28],
+        TerrainKind::Bloom => [0.52, 0.86, 0.44],
+        TerrainKind::Rock => [0.78, 0.78, 0.86],
+    };
+    let alpha = (0.09 + tile.slope * highlight_shift).clamp(0.04, 0.42);
+    let mut color = rgba_from_triplet_with_alpha(accent, alpha);
+    color = scale_rgb(color, 0.85 + tile.accent * 0.4);
+    apply_palette(color, palette)
+}
+
+fn terrain_bloom_color(tile: TerrainTileVisual, palette: ColorPaletteMode) -> Rgba {
+    let strength = ((tile.accent - 0.66) * 1.6).clamp(0.0, 1.0);
+    let alpha = (0.12 + strength * 0.28).clamp(0.08, 0.35);
+    let mut color = rgba_from_triplet_with_alpha([0.96, 0.62, 0.84], alpha);
+    color = scale_rgb(color, 0.85 + tile.moisture * 0.35);
+    apply_palette(color, palette)
+}
+
+fn terrain_water_caustic_color(
+    tile: TerrainTileVisual,
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> Rgba {
+    let base = if matches!(tile.kind, TerrainKind::DeepWater) {
+        [0.36, 0.74, 0.96]
+    } else {
+        [0.54, 0.90, 1.0]
+    };
+    let alpha = (0.10 + daylight * 0.12 + tile.accent * 0.18).clamp(0.05, 0.32);
+    let mut color = rgba_from_triplet_with_alpha(base, alpha);
+    color = scale_rgb(color, 0.9 + tile.moisture * 0.2);
+    apply_palette(color, palette)
 }
 
 fn paint_frame(
@@ -3310,10 +3550,16 @@ fn paint_frame(
 
     let food_w = frame.food_dimensions.0 as usize;
     let food_h = frame.food_dimensions.1 as usize;
-    let cell_world = frame.food_cell_size as f32;
     paint_terrain_layer(
-        frame, offset_x, offset_y, cell_world, scale, daylight, window,
+        &frame.terrain,
+        offset_x,
+        offset_y,
+        scale,
+        daylight,
+        frame.palette,
+        window,
     );
+    let cell_world = frame.food_cell_size as f32;
     let cell_px = (cell_world * scale).max(1.0);
     let max_food = frame.food_max.max(f32::EPSILON);
 

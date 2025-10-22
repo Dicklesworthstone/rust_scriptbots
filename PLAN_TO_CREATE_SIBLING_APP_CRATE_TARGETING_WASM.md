@@ -42,6 +42,7 @@
 - Command: `cargo check --target wasm32-unknown-unknown -p scriptbots-core`.
 - Capture and catalogue all compilation blockers (expected: Rayon threading, OS-specific APIs).
 - Produce `PHASE1_FINDINGS.md` summarizing blockers and severity.
+- **Follow-up:** enable `getrandom`’s JS backend and gate Rayon before rerunning check (tracked in `docs/wasm/TODO_PHASE1.md`).
 
 ### 1.2 Dependency Audit [Completed 2025-10-22 — see docs/wasm/dependency_audit.csv]
 - Inventory every crate transitively pulled into `scriptbots-web`; flag categories:
@@ -58,22 +59,22 @@
 - Criteria: wasm support maturity, determinism, performance, developer ergonomics, theming parity.
 - Produce decision record (`ADR-001-wasm-rendering.md`) with trade-offs and chosen path.
 
-### 1.4 Storage Strategy Draft
+### 1.4 Storage Strategy Draft [Completed 2025-10-22 — see docs/wasm/adrs/ADR-002-browser-persistence.md]
 - Research `duckdb-wasm` integration patterns; outline JS glue requirements.
 - Explore IndexedDB or WebAssembly linear-memory journaling as interim solution.
 - Deliverable: `ADR-002-browser-persistence.md`.
 
-### 1.5 Audio Strategy Draft
+### 1.5 Audio Strategy Draft [Completed 2025-10-22 — see docs/wasm/adrs/ADR-003-wasm-audio.md]
 - Review `kira` wasm capabilities; map gaps (streaming, mixing).
 - Decide interim plan: disable audio initially vs integrate alternative (e.g., Web Audio API via `web-sys`).
 - Document in `ADR-003-wasm-audio.md`.
 
-### 1.6 Multithreading Requirements
+### 1.6 Multithreading Requirements [Completed 2025-10-22 — see docs/wasm/multithreading_notes.md]
 - Document prerequisites for enabling `wasm-bindgen-rayon` (SharedArrayBuffer gates, COOP/COEP headers).
 - Decide MVP posture (single-thread fallback vs. multithread-first) and capture rationale.
 - Record hosting requirements (HTTP response headers, service worker interplay).
 
-### 1.7 Component Model & WASI Preview Assessment
+### 1.7 Component Model & WASI Preview Assessment [Completed 2025-10-22 — see docs/wasm/adrs/ADR-004-component-model.md]
 - Investigate `cargo component` support for future interoperability with WASI Preview 2.
 - Summarize trade-offs vs. classic `wasm-bindgen` flow in `ADR-004-component-model.md`.
 - Track upstream stabilization timelines for rustc and browser runtime support.

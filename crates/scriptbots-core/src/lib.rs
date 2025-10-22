@@ -2289,9 +2289,9 @@ impl WorldState {
                 sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
                 sensors[18] = clamp01(hearing);
                 sensors[19] = clamp01(blood);
-                let env_temperature = self.sample_temperature(position.x);
+                let env_temperature = sample_temperature(&self.config, position.x);
                 let discomfort =
-                    self.temperature_discomfort(env_temperature, temperature_preferences[idx]);
+                    temperature_discomfort(env_temperature, temperature_preferences[idx]);
                 sensors[20] = clamp01(discomfort);
                 sensors[21] = clamp01(density[3]);
                 sensors[22] = clamp01(eye_r[3]);
@@ -2523,12 +2523,12 @@ impl WorldState {
         let mut penalties = vec![0.0f32; handles.len()];
 
         for (idx, agent_id) in handles.iter().enumerate() {
-            let env_temperature = self.sample_temperature(positions_snapshot[idx].x);
+            let env_temperature = sample_temperature(&self.config, positions_snapshot[idx].x);
             let Some(runtime) = self.runtime.get(*agent_id) else {
                 continue;
             };
             let mut discomfort =
-                self.temperature_discomfort(env_temperature, runtime.temperature_preference);
+                temperature_discomfort(env_temperature, runtime.temperature_preference);
             if discomfort <= comfort_band {
                 continue;
             }
@@ -4441,6 +4441,13 @@ mod tests {
             child_state.data.position.y,
             parent_state.data.position.y,
             world.config().world_height as f32,
+        );
+        dbg!(
+            parent_state.data.heading,
+            parent_state.data.position.x,
+            child_state.data.position.x,
+            dx,
+            dy
         );
 
         assert!(dx < -12.0, "child should spawn behind the parent along x");

@@ -35,6 +35,13 @@ _Created: 2025-10-22 (UTC). Keep this list exhaustive; mark completion inline wi
   - [x] Create ADR scaffold at `docs/wasm/adrs/ADR-001-wasm-rendering.md`.
   - [x] Document evaluation criteria sourced from latest WebGPU/WebGL guidance.
   - [x] Schedule prototype spikes for WebGPU and Canvas paths (see `docs/wasm/rendering_spike_plan.md`).
+  - [ ] Build WebGPU spike prototype and capture metrics.
+  - [ ] Build Canvas baseline prototype and capture metrics.
+
+- [ ] Wasm RNG + Rayon gating
+  - [ ] Enable `getrandom` JS backend via `rand` or workspace feature flags without disturbing native builds.
+  - [ ] Gate Rayon behind feature flag or `cfg` for wasm, documenting fallback path.
+  - [ ] Re-run `cargo check --target wasm32-unknown-unknown` and append findings.
 
 - [x] Security baseline
   - [x] Draft `docs/wasm/SECURITY_NOTES_PHASE1.md` covering COOP/COEP, CSP, SAB requirements.

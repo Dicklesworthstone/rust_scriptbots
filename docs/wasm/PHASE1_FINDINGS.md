@@ -7,7 +7,7 @@ _Date: 2025-10-22 (UTC)_
 
 ## Outcome
 - **Status:** Failed
-- **Primary blocker:** `getrandom` 0.3.4 emits `compile_error!` for `wasm32-unknown-unknown` without the `js`/`wasm_js` configuration, causing dependent crates (`rand`, `rayon`, `slotmap`, etc.) to fail.
+- **Primary blocker:** `getrandom` 0.3.4 emits `compile_error!` for `wasm32-unknown-unknown` without the `js`/`wasm_js` configuration, causing dependent crates (`rand`, `rayon`, `slotmap`, etc.) to fail.citeturn5search7
 - **Secondary noise:** The workspace inherits CPU-specific `RUSTFLAGS` (e.g., `-C target-cpu=znver3`) from host environment which are ignored under wasm targets; warnings are benign but noisy.
 
 ## Next Actions

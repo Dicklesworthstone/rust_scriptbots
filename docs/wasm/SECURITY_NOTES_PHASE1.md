@@ -3,12 +3,12 @@
 _Date: 2025-10-22 (UTC)_
 
 ## Cross-Origin Isolation (COOP/COEP)
-- Required for enabling WebAssembly threads via `SharedArrayBuffer` on Chrome, Edge, Firefox, and Safari Tech Preview.citeturn1search0turn1search1turn2search0
+- Required for enabling WebAssembly threads via `SharedArrayBuffer` on Chrome, Edge, Firefox, and Safari Tech Preview.citeturn3search0turn3search3turn3search6
 - Headers to set:
   - `Cross-Origin-Opener-Policy: same-origin`
   - `Cross-Origin-Embedder-Policy: require-corp`
 - Assets (including wasm, JS, textures) must be served with `Cross-Origin-Resource-Policy: same-origin` or appropriate `corp` headers.
-- Evaluate service worker impact; ensure worker scripts also respect COEP.
+- Evaluate service worker impact; ensure worker scripts also respect COEP. `coi-serviceworker` helps apply headers during local development.citeturn3search5
 
 ## Content Security Policy (CSP)
 - Baseline recommended policy:
