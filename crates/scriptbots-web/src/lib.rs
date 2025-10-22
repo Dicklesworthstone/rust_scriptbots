@@ -8,6 +8,7 @@ use js_sys::Uint8Array;
 use postcard::{from_bytes, to_allocvec};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, Generation, INPUT_SIZE, OUTPUT_SIZE, Position,
     ScriptBotsConfig, Velocity, WorldState,
@@ -25,6 +26,7 @@ pub struct SimHandle {
 struct Simulation {
     world: WorldState,
     spec: SimSpec,
+    mlp_key: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +55,12 @@ impl Default for SeedStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum BrainPreset {
+    Mlp,
+}
+
 #[derive(Clone)]
 struct SimSpec {
     base_config: ScriptBotsConfig,
@@ -60,6 +68,7 @@ struct SimSpec {
     seed: Option<u64>,
     snapshot_format: SnapshotFormat,
     seed_strategy: SeedStrategy,
+    default_brain: Option<BrainPreset>,
 }
 
 impl SimSpec {

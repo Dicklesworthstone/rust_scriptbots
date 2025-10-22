@@ -141,6 +141,16 @@ impl ControlHandle {
         merge_value(&mut config_value, &patch, &mut Vec::new())?;
         let new_config: ScriptBotsConfig =
             serde_json::from_value(config_value).map_err(ControlError::serialization)?;
+        let (food_w, food_h) = new_config
+            .food_dimensions()
+            .map_err(|err| ControlError::InvalidPatch(err.to_string()))?;
+        let current_dims = (world.food().width(), world.food().height());
+        if current_dims != (food_w, food_h) {
+            return Err(ControlError::InvalidPatch(
+                "changing world dimensions at runtime is not supported; restart the simulation with the new configuration"
+                    .into(),
+            ));
+        }
         let snapshot = ConfigSnapshot::from_config(new_config.clone(), current_tick)?;
         drop(world);
         self.enqueue(ControlCommand::UpdateConfig(new_config))?;
@@ -358,22 +368,21 @@ mod tests {
     fn patch_updates_single_field() {
         let (handle, receiver) = handle();
         let updates = vec![KnobUpdate {
-            path: "world_width".to_string(),
-            value: Value::from(8_000),
+            path: "food_max".to_string(),
+            value: Value::from(0.6),
         }];
         let snapshot = handle.apply_updates(&updates).expect("patch");
-        assert_eq!(
-            snapshot
-                .config
-                .get("world_width")
-                .and_then(Value::as_u64)
-                .expect("world_width"),
-            8_000
-        );
+        let value = snapshot
+            .config
+            .get("food_max")
+            .and_then(Value::as_f64)
+            .expect("food_max");
+        assert!((value - 0.6).abs() < f64::EPSILON);
 
         // ensure queue drained for consistency
         let mut world = handle.lock_world().expect("world lock");
         crate::command::drain_pending_commands(&receiver, &mut world);
+        assert!((world.config().food_max - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -386,5 +395,25 @@ mod tests {
             }])
             .expect_err("unknown path");
         assert!(matches!(err, ControlError::UnknownPath(_)));
+    }
+
+    #[test]
+    fn dimension_updates_are_rejected() {
+        let (handle, _receiver) = handle();
+        let err = handle
+            .apply_updates(&[KnobUpdate {
+                path: "world_width".into(),
+                value: Value::from(8_000),
+            }])
+            .expect_err("dimension update should fail");
+        match err {
+            ControlError::InvalidPatch(message) => {
+                assert!(
+                    message.contains("changing world dimensions"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected InvalidPatch, got {other:?}"),
+        }
     }
 }

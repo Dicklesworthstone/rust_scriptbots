@@ -13,8 +13,10 @@ serde-wasm-bindgen = { workspace = true }
 wasm-bindgen = { workspace = true }
 rand = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core", default-features = false }
+scriptbots-brain = { path = "../scriptbots-brain", default-features = false, features = ["mlp"] }
 slotmap = { workspace = true }
 postcard = { workspace = true }
+js-sys = "0.3.73"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.54"

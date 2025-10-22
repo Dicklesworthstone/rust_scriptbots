@@ -110,11 +110,12 @@ pub enum ControlCommand {
 }
 
 /// Apply a control command to the world state.
-pub fn apply_control_command(world: &mut WorldState, command: ControlCommand) {
+pub fn apply_control_command(
+    world: &mut WorldState,
+    command: ControlCommand,
+) -> Result<(), WorldStateError> {
     match command {
-        ControlCommand::UpdateConfig(config) => {
-            *world.config_mut() = config;
-        }
+        ControlCommand::UpdateConfig(config) => world.apply_config_update(config),
     }
 }
 
@@ -2525,17 +2526,8 @@ impl WorldState {
         let mut terrain_rng = rng.clone();
         let terrain =
             TerrainLayer::generate(food_w, food_h, config.food_cell_size, &mut terrain_rng)?;
-        let mut food = FoodGrid::new(food_w, food_h, config.initial_food)?;
+        let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
         let food_profiles = FoodCellProfile::compute(&config, &terrain);
-        if !food_profiles.is_empty() {
-            let cells = food.cells_mut();
-            for (idx, cell) in cells.iter_mut().enumerate() {
-                let profile = food_profiles
-                    .get(idx)
-                    .expect("food profile should match food grid");
-                *cell = (*cell).min(profile.capacity);
-            }
-        }
         let index = UniformGridIndex::new(
             config.food_cell_size as f32,
             config.world_width as f32,
@@ -5144,6 +5136,58 @@ impl WorldState {
     #[must_use]
     pub fn config_mut(&mut self) -> &mut ScriptBotsConfig {
         &mut self.config
+    }
+
+    /// Apply a new configuration, refreshing derived caches while preserving runtime state.
+    pub fn apply_config_update(
+        &mut self,
+        new_config: ScriptBotsConfig,
+    ) -> Result<(), WorldStateError> {
+        let (food_w, food_h) = new_config.food_dimensions()?;
+        let current_dims = (self.food.width(), self.food.height());
+        if (food_w, food_h) != current_dims {
+            return Err(WorldStateError::InvalidConfig(
+                "changing world dimensions at runtime is not supported; restart with the new configuration",
+            ));
+        }
+
+        let food_profiles = FoodCellProfile::compute(&new_config, &self.terrain);
+        let scratch_len = (food_w as usize) * (food_h as usize);
+        if self.food_scratch.len() != scratch_len {
+            self.food_scratch.resize(scratch_len, 0.0);
+        }
+
+        {
+            let cells = self.food.cells_mut();
+            if !food_profiles.is_empty() {
+                for (idx, cell) in cells.iter_mut().enumerate() {
+                    if let Some(profile) = food_profiles.get(idx) {
+                        if *cell > profile.capacity {
+                            *cell = profile.capacity;
+                        }
+                    } else if *cell > new_config.food_max {
+                        *cell = new_config.food_max;
+                    }
+                }
+            } else {
+                for cell in cells.iter_mut() {
+                    if *cell > new_config.food_max {
+                        *cell = new_config.food_max;
+                    }
+                }
+            }
+        }
+
+        let new_index = UniformGridIndex::new(
+            new_config.food_cell_size as f32,
+            new_config.world_width as f32,
+            new_config.world_height as f32,
+        );
+
+        self.config = new_config;
+        self.food_profiles = food_profiles;
+        self.index = new_index;
+        Ok(())
     }
 
     /// Replace the persistence sink.

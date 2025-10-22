@@ -1,5 +1,9 @@
 //! DuckDB-backed persistence layer for ScriptBots.
 
+#[cfg(target_os = "windows")]
+#[link(name = "rstrtmgr")]
+extern "system" {}
+
 use duckdb::{Connection, Transaction, params};
 use scriptbots_core::{
     AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord, PersistenceBatch,
@@ -600,8 +604,7 @@ impl Storage {
         static SQL: OnceLock<String> = OnceLock::new();
         SQL.get_or_init(|| {
             let columns = AGENT_COLUMNS.join(", ");
-            let placeholders = std::iter::repeat("?")
-                .take(AGENT_COLUMNS.len())
+            let placeholders = std::iter::repeat_n("?", AGENT_COLUMNS.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("insert or replace into agents ({columns}) values ({placeholders})")

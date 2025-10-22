@@ -277,10 +277,8 @@ impl SimulationView {
             let dx = toroidal_delta(point.0, pos.x, extent_x);
             let dy = toroidal_delta(point.1, pos.y, extent_y);
             let dist_sq = dx.mul_add(dx, dy * dy);
-            if dist_sq <= radius_sq {
-                if best.map_or(true, |(_, best_dist)| dist_sq < best_dist) {
-                    best = Some((agent_id, dist_sq));
-                }
+            if dist_sq <= radius_sq && best.is_none_or(|(_, best_dist)| dist_sq < best_dist) {
+                best = Some((agent_id, dist_sq));
             }
         }
 
@@ -304,23 +302,20 @@ impl SimulationView {
                 }
             }
 
-            if let Some(prev) = prev_hover {
-                if let Some(entry) = runtime.get_mut(prev) {
-                    if matches!(entry.selection, SelectionState::Hovered) {
-                        entry.selection = SelectionState::None;
-                        changed = true;
-                    }
-                }
+            if let Some(prev) = prev_hover
+                && let Some(entry) = runtime.get_mut(prev)
+                && matches!(entry.selection, SelectionState::Hovered)
+            {
+                entry.selection = SelectionState::None;
+                changed = true;
             }
         }
 
         if let Ok(mut inspector) = self.inspector.lock() {
-            if inspector.focused_agent.is_some() {
-                inspector.focused_agent = None;
+            if inspector.focused_agent.take().is_some() {
                 changed = true;
             }
-            if inspector.hovered_agent.is_some() {
-                inspector.hovered_agent = None;
+            if inspector.hovered_agent.take().is_some() {
                 changed = true;
             }
         }
@@ -349,93 +344,73 @@ impl SimulationView {
         let mut selection_changed = false;
         let mut candidate_id = None;
         let mut selected_after: Vec<AgentId> = Vec::new();
-        let mut world_applied = false;
 
-        if let Ok(mut world) = self.world.lock() {
-            let pick_radius = self.selection_pick_radius(&world);
-            let candidate = self.pick_agent_near(&world, world_point, pick_radius);
-
-            {
-                let runtime = world.runtime_mut();
-
-                if !extend {
-                    for entry in runtime.values_mut() {
-                        if !matches!(entry.selection, SelectionState::None) {
-                            entry.selection = SelectionState::None;
-                            selection_changed = true;
-                        }
-                    }
-                }
-
-                if let Some(id) = candidate {
-                    if let Some(entry) = runtime.get_mut(id) {
-                        let was_selected = matches!(entry.selection, SelectionState::Selected);
-                        if extend && was_selected {
-                            entry.selection = SelectionState::None;
-                            selection_changed = true;
-                        } else {
-                            if !was_selected {
-                                entry.selection = SelectionState::Selected;
-                                selection_changed = true;
-                            }
-                            candidate_id = Some(id);
-                        }
-                    }
-                } else if !extend {
-                    candidate_id = None;
-                }
-
-                if let Some(prev) = prev_hover {
-                    if let Some(entry) = runtime.get_mut(prev) {
-                        if matches!(entry.selection, SelectionState::Hovered) {
-                            entry.selection = SelectionState::None;
-                            selection_changed = true;
-                        }
-                    }
-                }
-
-                selected_after = runtime
-                    .iter()
-                    .filter_map(|(id, entry)| {
-                        if matches!(entry.selection, SelectionState::Selected) {
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-            }
-
-            world_applied = true;
-        }
-
-        if !world_applied {
-            return false;
-        }
-
-        let mut focus_after = if let Some(id) = candidate_id {
-            if selected_after.contains(&id) {
-                Some(id)
-            } else if extend {
-                None
-            } else {
-                None
-            }
-        } else {
-            None
+        let mut world = match self.world.lock() {
+            Ok(world) => world,
+            Err(_) => return false,
         };
 
-        if extend {
-            if focus_after.is_none() {
-                if let Some(prev) = prior_focus {
-                    if selected_after.contains(&prev) {
-                        focus_after = Some(prev);
+        let pick_radius = self.selection_pick_radius(&world);
+        let candidate = self.pick_agent_near(&world, world_point, pick_radius);
+
+        {
+            let runtime = world.runtime_mut();
+
+            if !extend {
+                for entry in runtime.values_mut() {
+                    if !matches!(entry.selection, SelectionState::None) {
+                        entry.selection = SelectionState::None;
+                        selection_changed = true;
                     }
                 }
             }
-            if focus_after.is_none() {
-                focus_after = selected_after.first().copied();
+
+            if let Some(id) = candidate
+                && let Some(entry) = runtime.get_mut(id)
+            {
+                let was_selected = matches!(entry.selection, SelectionState::Selected);
+                match (extend, was_selected) {
+                    (true, true) => {
+                        entry.selection = SelectionState::None;
+                        selection_changed = true;
+                    }
+                    (_, false) => {
+                        entry.selection = SelectionState::Selected;
+                        selection_changed = true;
+                        candidate_id = Some(id);
+                    }
+                    _ => {
+                        candidate_id = Some(id);
+                    }
+                }
+            } else if !extend {
+                candidate_id = None;
             }
+
+            if let Some(prev) = prev_hover
+                && let Some(entry) = runtime.get_mut(prev)
+                && matches!(entry.selection, SelectionState::Hovered)
+            {
+                entry.selection = SelectionState::None;
+                selection_changed = true;
+            }
+
+            selected_after = runtime
+                .iter()
+                .filter_map(|(id, entry)| {
+                    matches!(entry.selection, SelectionState::Selected).then_some(id)
+                })
+                .collect();
+        }
+
+        drop(world);
+
+        let mut focus_after = candidate_id.filter(|id| selected_after.contains(id));
+
+        if extend {
+            focus_after = focus_after
+                .or_else(|| prior_focus.filter(|prev| selected_after.contains(prev)))
+                .or_else(|| selected_after.first().copied());
         }
 
         let focus_changed = focus_after != prior_focus;
@@ -503,27 +478,25 @@ impl SimulationView {
         if let Ok(mut world) = self.world.lock() {
             let runtime = world.runtime_mut();
 
-            if let Some(prev) = prev_hover {
-                if let Some(entry) = runtime.get_mut(prev) {
-                    if matches!(entry.selection, SelectionState::Hovered) {
-                        entry.selection = SelectionState::None;
-                        selection_changed = true;
-                    }
-                }
+            if let Some(prev) = prev_hover
+                && let Some(entry) = runtime.get_mut(prev)
+                && matches!(entry.selection, SelectionState::Hovered)
+            {
+                entry.selection = SelectionState::None;
+                selection_changed = true;
             }
 
             if let Some(curr) = hovered {
                 if runtime
                     .get(curr)
-                    .map(|entry| matches!(entry.selection, SelectionState::Selected))
-                    .unwrap_or(false)
+                    .is_some_and(|entry| matches!(entry.selection, SelectionState::Selected))
                 {
                     desired = None;
-                } else if let Some(entry) = runtime.get_mut(curr) {
-                    if !matches!(entry.selection, SelectionState::Hovered) {
-                        entry.selection = SelectionState::Hovered;
-                        selection_changed = true;
-                    }
+                } else if let Some(entry) = runtime.get_mut(curr)
+                    && !matches!(entry.selection, SelectionState::Hovered)
+                {
+                    entry.selection = SelectionState::Hovered;
+                    selection_changed = true;
                 }
             }
         } else {
@@ -1563,10 +1536,10 @@ impl SimulationView {
                 .map(|world| world.config().persistence_interval)
                 .unwrap_or(0);
 
-            if current_interval > 0 {
-                if let Ok(mut inspector) = self.inspector.lock() {
-                    inspector.persistence_last_enabled = current_interval;
-                }
+            if current_interval > 0
+                && let Ok(mut inspector) = self.inspector.lock()
+            {
+                inspector.persistence_last_enabled = current_interval;
             }
 
             self.submit_config_update(|config| {
@@ -1654,12 +1627,12 @@ impl SimulationView {
         // When settings panel is open, give it exclusive keyboard control
         // Only allow ToggleSettings (comma) to close the panel
         if self.settings_panel.open {
-            if let Some(action) = self.bindings.action_for(&event.keystroke) {
-                if matches!(action, CommandAction::ToggleSettings) {
-                    self.invoke_action(action, cx);
-                }
-                // Ignore all other key bindings - settings panel handles them
+            if let Some(action) = self.bindings.action_for(&event.keystroke)
+                && matches!(action, CommandAction::ToggleSettings)
+            {
+                self.invoke_action(action, cx);
             }
+            // Ignore all other key bindings - settings panel handles them
             return;
         }
 
@@ -1756,13 +1729,25 @@ impl SimulationView {
             .border_color(rgb(0x1e293b));
 
         // ✨ SINGLE CENTRALIZED FILTERING LOOP - this replaces 60+ individual checks!
+        let mut match_count = 0;
         for (label, value, desc) in params {
             if self.matches_search(label)
                 || self.matches_search(&value)
                 || self.matches_search(desc)
             {
                 container = container.child(self.render_param_readonly(label, &value, desc));
+                match_count += 1;
             }
+        }
+
+        // Show helpful empty state when search returns no results
+        if match_count == 0 && !self.settings_panel.search_query.is_empty() {
+            container = container.child(div().flex().items_center().justify_center().py_8().child(
+                div().text_sm().text_color(rgb(0x64748b)).child(format!(
+                    "No matches for \"{}\"",
+                    self.settings_panel.search_query
+                )),
+            ));
         }
 
         container
@@ -1888,11 +1873,11 @@ impl SimulationView {
 
     fn set_world_closed(&mut self, closed: bool, cx: &mut Context<Self>) {
         let mut updated = false;
-        if let Ok(mut world) = self.world.lock() {
-            if world.is_closed() != closed {
-                world.set_closed(closed);
-                updated = true;
-            }
+        if let Ok(mut world) = self.world.lock()
+            && world.is_closed() != closed
+        {
+            world.set_closed(closed);
+            updated = true;
         }
         if updated {
             info!(closed, "Updated closed environment toggle");
@@ -4386,7 +4371,7 @@ impl SimulationView {
         let backdrop = div()
             .absolute()
             .inset_0()
-            .bg(rgb(0x0f172a))
+            .bg(rgb(0x020617))
             .opacity(0.5)
             .on_mouse_down(
                 MouseButton::Left,
@@ -4454,45 +4439,40 @@ impl SimulationView {
             .border_color(rgb(0x334155))
             .bg(rgb(0x1e293b))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().text_2xl().child("⚙️"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .text_color(rgb(0xf1f5f9))
-                                    .child("Configuration"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(0x94a3b8))
-                                            .child("Simulation parameters & settings"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_md()
-                                            .bg(rgb(0x334155))
-                                            .text_xs()
-                                            .text_color(rgb(0x94a3b8))
-                                            .child("Press , to toggle"),
-                                    ),
-                            ),
-                    ),
+                div().flex().items_center().gap_3().child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xl()
+                                .text_color(rgb(0xf1f5f9))
+                                .child("Configuration"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0x94a3b8))
+                                        .child("Simulation parameters & settings"),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x334155))
+                                        .text_xs()
+                                        .text_color(rgb(0xe0e7ff))
+                                        .child("Press , to toggle"),
+                                ),
+                        ),
+                ),
             )
             .child(
                 div()
@@ -4537,7 +4517,6 @@ impl SimulationView {
                     } else {
                         rgb(0x475569)
                     })
-                    .child(div().text_color(rgb(0x94a3b8)).child("🔍"))
                     .child(
                         div()
                             .flex_1()
@@ -4550,8 +4529,7 @@ impl SimulationView {
                             .child(if has_search {
                                 search_query.clone()
                             } else {
-                                "Type to search parameters... (start typing when panel is open)"
-                                    .to_string()
+                                "Search parameters...".to_string()
                             }),
                     )
                     .when(has_search, |container| {
@@ -4719,10 +4697,7 @@ impl SimulationView {
                     .rounded_md()
                     .text_base()
                     .text_color(rgb(0x94a3b8))
-                    .hover(|s| {
-                        s.bg(rgb(0x475569))
-                            .text_color(rgb(0x60a5fa))
-                    })
+                    .hover(|s| s.bg(rgb(0x475569)).text_color(rgb(0x60a5fa)))
                     .child(if is_collapsed { "▶" } else { "▼" }),
             );
 
@@ -4748,119 +4723,409 @@ impl SimulationView {
         match category {
             ConfigCategory::World => {
                 let params = vec![
-                    ("World Width", format!("{} units", config.world_width), "Horizontal extent of the simulation world"),
-                    ("World Height", format!("{} units", config.world_height), "Vertical extent of the simulation world"),
-                    ("Food Cell Size", format!("{} units", config.food_cell_size), "Size of each food grid cell"),
-                    ("Initial Food", self.format_float(config.initial_food, 3), "Starting food in each cell"),
-                    ("RNG Seed", config.rng_seed.map(|s| s.to_string()).unwrap_or_else(|| "Random".to_string()), "Random number generator seed"),
-                    ("Chart Flush Interval", format!("{} ticks", config.chart_flush_interval), "History chart update frequency"),
+                    (
+                        "World Width",
+                        format!("{} units", config.world_width),
+                        "Horizontal extent of the simulation world",
+                    ),
+                    (
+                        "World Height",
+                        format!("{} units", config.world_height),
+                        "Vertical extent of the simulation world",
+                    ),
+                    (
+                        "Food Cell Size",
+                        format!("{} units", config.food_cell_size),
+                        "Size of each food grid cell",
+                    ),
+                    (
+                        "Initial Food",
+                        self.format_float(config.initial_food, 3),
+                        "Starting food in each cell",
+                    ),
+                    (
+                        "RNG Seed",
+                        config
+                            .rng_seed
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "Random".to_string()),
+                        "Random number generator seed",
+                    ),
+                    (
+                        "Chart Flush Interval",
+                        format!("{} ticks", config.chart_flush_interval),
+                        "History chart update frequency",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Food => {
                 let params = vec![
-                    ("Respawn Interval", format!("{} ticks", config.food_respawn_interval), "Ticks between food respawn events"),
-                    ("Respawn Amount", self.format_float(config.food_respawn_amount, 3), "Food added per respawn"),
-                    ("Maximum Food", self.format_float(config.food_max, 3), "Maximum food per cell"),
-                    ("Growth Rate", self.format_float(config.food_growth_rate, 4), "Logistic regrowth rate"),
-                    ("Decay Rate", self.format_float(config.food_decay_rate, 4), "Proportional decay rate"),
-                    ("Diffusion Rate", self.format_float(config.food_diffusion_rate, 3), "Neighbor exchange rate"),
-                    ("Intake Rate", self.format_float(config.food_intake_rate, 3), "Agent food consumption rate"),
-                    ("Sharing Radius", self.format_float(config.food_sharing_radius, 1), "Friendly neighbor sharing distance"),
-                    ("Sharing Rate", self.format_float(config.food_sharing_rate, 3), "Energy fraction shared per neighbor"),
-                    ("Transfer Rate", self.format_float(config.food_transfer_rate, 4), "Altruistic sharing amount"),
-                    ("Sharing Distance", self.format_float(config.food_sharing_distance, 1), "Altruistic sharing threshold"),
+                    (
+                        "Respawn Interval",
+                        format!("{} ticks", config.food_respawn_interval),
+                        "Ticks between food respawn events",
+                    ),
+                    (
+                        "Respawn Amount",
+                        self.format_float(config.food_respawn_amount, 3),
+                        "Food added per respawn",
+                    ),
+                    (
+                        "Maximum Food",
+                        self.format_float(config.food_max, 3),
+                        "Maximum food per cell",
+                    ),
+                    (
+                        "Growth Rate",
+                        self.format_float(config.food_growth_rate, 4),
+                        "Logistic regrowth rate",
+                    ),
+                    (
+                        "Decay Rate",
+                        self.format_float(config.food_decay_rate, 4),
+                        "Proportional decay rate",
+                    ),
+                    (
+                        "Diffusion Rate",
+                        self.format_float(config.food_diffusion_rate, 3),
+                        "Neighbor exchange rate",
+                    ),
+                    (
+                        "Intake Rate",
+                        self.format_float(config.food_intake_rate, 3),
+                        "Agent food consumption rate",
+                    ),
+                    (
+                        "Sharing Radius",
+                        self.format_float(config.food_sharing_radius, 1),
+                        "Friendly neighbor sharing distance",
+                    ),
+                    (
+                        "Sharing Rate",
+                        self.format_float(config.food_sharing_rate, 3),
+                        "Energy fraction shared per neighbor",
+                    ),
+                    (
+                        "Transfer Rate",
+                        self.format_float(config.food_transfer_rate, 4),
+                        "Altruistic sharing amount",
+                    ),
+                    (
+                        "Sharing Distance",
+                        self.format_float(config.food_sharing_distance, 1),
+                        "Altruistic sharing threshold",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Agent => {
                 let params = vec![
-                    ("Bot Speed", self.format_float(config.bot_speed, 2), "Base wheel speed multiplier"),
-                    ("Bot Radius", self.format_float(config.bot_radius, 1), "Agent radius for collisions"),
-                    ("Boost Multiplier", format!("{}×", self.format_float(config.boost_multiplier, 2)), "Speed boost when activated"),
-                    ("Sense Radius", self.format_float(config.sense_radius, 1), "Perception range"),
-                    ("Max Neighbors", self.format_float(config.sense_max_neighbors, 0), "Normalization factor"),
-                    ("Carnivore Threshold", self.format_float(config.carnivore_threshold, 2), "Herbivore tendency cutoff for carnivores"),
+                    (
+                        "Bot Speed",
+                        self.format_float(config.bot_speed, 2),
+                        "Base wheel speed multiplier",
+                    ),
+                    (
+                        "Bot Radius",
+                        self.format_float(config.bot_radius, 1),
+                        "Agent radius for collisions",
+                    ),
+                    (
+                        "Boost Multiplier",
+                        format!("{}×", self.format_float(config.boost_multiplier, 2)),
+                        "Speed boost when activated",
+                    ),
+                    (
+                        "Sense Radius",
+                        self.format_float(config.sense_radius, 1),
+                        "Perception range",
+                    ),
+                    (
+                        "Max Neighbors",
+                        self.format_float(config.sense_max_neighbors, 0),
+                        "Normalization factor",
+                    ),
+                    (
+                        "Carnivore Threshold",
+                        self.format_float(config.carnivore_threshold, 2),
+                        "Herbivore tendency cutoff for carnivores",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Metabolism => {
                 let params = vec![
-                    ("Base Drain", self.format_float(config.metabolism_drain, 4), "Baseline energy cost"),
-                    ("Movement Drain", self.format_float(config.movement_drain, 4), "Cost per velocity"),
-                    ("Ramp Floor", self.format_float(config.metabolism_ramp_floor, 2), "Energy level for ramping"),
-                    ("Ramp Rate", self.format_float(config.metabolism_ramp_rate, 4), "Additional drain above floor"),
-                    ("Boost Penalty", self.format_float(config.metabolism_boost_penalty, 4), "Fixed boost cost"),
+                    (
+                        "Base Drain",
+                        self.format_float(config.metabolism_drain, 4),
+                        "Baseline energy cost",
+                    ),
+                    (
+                        "Movement Drain",
+                        self.format_float(config.movement_drain, 4),
+                        "Cost per velocity",
+                    ),
+                    (
+                        "Ramp Floor",
+                        self.format_float(config.metabolism_ramp_floor, 2),
+                        "Energy level for ramping",
+                    ),
+                    (
+                        "Ramp Rate",
+                        self.format_float(config.metabolism_ramp_rate, 4),
+                        "Additional drain above floor",
+                    ),
+                    (
+                        "Boost Penalty",
+                        self.format_float(config.metabolism_boost_penalty, 4),
+                        "Fixed boost cost",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Temperature => {
                 let params = vec![
-                    ("Discomfort Rate", self.format_float(config.temperature_discomfort_rate, 4), "Health drain multiplier"),
-                    ("Comfort Band", format!("±{}", self.format_float(config.temperature_comfort_band, 3)), "Tolerance threshold"),
-                    ("Gradient Exponent", self.format_float(config.temperature_gradient_exponent, 2), "Pole-to-equator shaping"),
-                    ("Discomfort Exp", self.format_float(config.temperature_discomfort_exponent, 2), "Discomfort scaling power"),
+                    (
+                        "Discomfort Rate",
+                        self.format_float(config.temperature_discomfort_rate, 4),
+                        "Health drain multiplier",
+                    ),
+                    (
+                        "Comfort Band",
+                        format!("±{}", self.format_float(config.temperature_comfort_band, 3)),
+                        "Tolerance threshold",
+                    ),
+                    (
+                        "Gradient Exponent",
+                        self.format_float(config.temperature_gradient_exponent, 2),
+                        "Pole-to-equator shaping",
+                    ),
+                    (
+                        "Discomfort Exp",
+                        self.format_float(config.temperature_discomfort_exponent, 2),
+                        "Discomfort scaling power",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Reproduction => {
                 let params = vec![
-                    ("Energy Threshold", self.format_float(config.reproduction_energy_threshold, 2), "Required energy to reproduce"),
-                    ("Energy Cost", self.format_float(config.reproduction_energy_cost, 2), "Parent's energy deduction"),
-                    ("Cooldown", format!("{} ticks", config.reproduction_cooldown), "Ticks between reproductions"),
-                    ("Herbivore Rate", format!("{}×", self.format_float(config.reproduction_rate_herbivore, 3)), "Herbivore multiplier"),
-                    ("Carnivore Rate", format!("{}×", self.format_float(config.reproduction_rate_carnivore, 3)), "Carnivore multiplier"),
-                    ("Child Energy", self.format_float(config.reproduction_child_energy, 2), "Starting energy for child"),
-                    ("Spawn Jitter", format!("±{}", self.format_float(config.reproduction_spawn_jitter, 1)), "Position randomization"),
-                    ("Spawn Back Distance", self.format_float(config.reproduction_spawn_back_distance, 1), "Child spawn distance behind parent"),
-                    ("Color Jitter", format!("±{}", self.format_float(config.reproduction_color_jitter, 3)), "RGB mutation range"),
-                    ("Mutation Scale", self.format_float(config.reproduction_mutation_scale, 4), "Trait mutation magnitude"),
-                    ("Partner Chance", format!("{}%", self.format_float(config.reproduction_partner_chance * 100.0, 1)), "Crossover probability"),
-                    ("Gene Log Capacity", format!("{}", config.reproduction_gene_log_capacity), "Max gene history entries"),
-                    ("Meta-Mutation Chance", format!("{}%", self.format_float(config.reproduction_meta_mutation_chance * 100.0, 1)), "Mutation rate mutation chance"),
-                    ("Meta-Mutation Scale", self.format_float(config.reproduction_meta_mutation_scale, 4), "Mutation rate change magnitude"),
+                    (
+                        "Energy Threshold",
+                        self.format_float(config.reproduction_energy_threshold, 2),
+                        "Required energy to reproduce",
+                    ),
+                    (
+                        "Energy Cost",
+                        self.format_float(config.reproduction_energy_cost, 2),
+                        "Parent's energy deduction",
+                    ),
+                    (
+                        "Cooldown",
+                        format!("{} ticks", config.reproduction_cooldown),
+                        "Ticks between reproductions",
+                    ),
+                    (
+                        "Herbivore Rate",
+                        format!(
+                            "{}×",
+                            self.format_float(config.reproduction_rate_herbivore, 3)
+                        ),
+                        "Herbivore multiplier",
+                    ),
+                    (
+                        "Carnivore Rate",
+                        format!(
+                            "{}×",
+                            self.format_float(config.reproduction_rate_carnivore, 3)
+                        ),
+                        "Carnivore multiplier",
+                    ),
+                    (
+                        "Child Energy",
+                        self.format_float(config.reproduction_child_energy, 2),
+                        "Starting energy for child",
+                    ),
+                    (
+                        "Spawn Jitter",
+                        format!(
+                            "±{}",
+                            self.format_float(config.reproduction_spawn_jitter, 1)
+                        ),
+                        "Position randomization",
+                    ),
+                    (
+                        "Spawn Back Distance",
+                        self.format_float(config.reproduction_spawn_back_distance, 1),
+                        "Child spawn distance behind parent",
+                    ),
+                    (
+                        "Color Jitter",
+                        format!(
+                            "±{}",
+                            self.format_float(config.reproduction_color_jitter, 3)
+                        ),
+                        "RGB mutation range",
+                    ),
+                    (
+                        "Mutation Scale",
+                        self.format_float(config.reproduction_mutation_scale, 4),
+                        "Trait mutation magnitude",
+                    ),
+                    (
+                        "Partner Chance",
+                        format!(
+                            "{}%",
+                            self.format_float(config.reproduction_partner_chance * 100.0, 1)
+                        ),
+                        "Crossover probability",
+                    ),
+                    (
+                        "Gene Log Capacity",
+                        format!("{}", config.reproduction_gene_log_capacity),
+                        "Max gene history entries",
+                    ),
+                    (
+                        "Meta-Mutation Chance",
+                        format!(
+                            "{}%",
+                            self.format_float(config.reproduction_meta_mutation_chance * 100.0, 1)
+                        ),
+                        "Mutation rate mutation chance",
+                    ),
+                    (
+                        "Meta-Mutation Scale",
+                        self.format_float(config.reproduction_meta_mutation_scale, 4),
+                        "Mutation rate change magnitude",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Aging => {
                 let params = vec![
-                    ("Decay Start Age", format!("{} ticks", config.aging_health_decay_start), "Age when decay begins"),
-                    ("Decay Rate", self.format_float(config.aging_health_decay_rate, 5), "Health loss per tick"),
-                    ("Decay Max", self.format_float(config.aging_health_decay_max, 4), "Maximum decay per tick"),
-                    ("Energy Penalty", format!("{}×", self.format_float(config.aging_energy_penalty_rate, 3)), "Health-to-energy conversion"),
+                    (
+                        "Decay Start Age",
+                        format!("{} ticks", config.aging_health_decay_start),
+                        "Age when decay begins",
+                    ),
+                    (
+                        "Decay Rate",
+                        self.format_float(config.aging_health_decay_rate, 5),
+                        "Health loss per tick",
+                    ),
+                    (
+                        "Decay Max",
+                        self.format_float(config.aging_health_decay_max, 4),
+                        "Maximum decay per tick",
+                    ),
+                    (
+                        "Energy Penalty",
+                        format!(
+                            "{}×",
+                            self.format_float(config.aging_energy_penalty_rate, 3)
+                        ),
+                        "Health-to-energy conversion",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Combat => {
                 let params = vec![
-                    ("Spike Radius", self.format_float(config.spike_radius, 1), "Base spike collision radius"),
-                    ("Spike Damage", self.format_float(config.spike_damage, 2), "Damage at full power"),
-                    ("Spike Energy Cost", self.format_float(config.spike_energy_cost, 4), "Energy cost to deploy"),
-                    ("Min Length", self.format_float(config.spike_min_length, 2), "Minimum for damage"),
-                    ("Alignment Cosine", self.format_float(config.spike_alignment_cosine, 2), "Directional threshold"),
-                    ("Speed Bonus", format!("{}×", self.format_float(config.spike_speed_damage_bonus, 3)), "Velocity scaling"),
-                    ("Length Bonus", format!("{}×", self.format_float(config.spike_length_damage_bonus, 3)), "Length scaling"),
-                    ("Growth Rate", self.format_float(config.spike_growth_rate, 4), "Spike extension rate"),
+                    (
+                        "Spike Radius",
+                        self.format_float(config.spike_radius, 1),
+                        "Base spike collision radius",
+                    ),
+                    (
+                        "Spike Damage",
+                        self.format_float(config.spike_damage, 2),
+                        "Damage at full power",
+                    ),
+                    (
+                        "Spike Energy Cost",
+                        self.format_float(config.spike_energy_cost, 4),
+                        "Energy cost to deploy",
+                    ),
+                    (
+                        "Min Length",
+                        self.format_float(config.spike_min_length, 2),
+                        "Minimum for damage",
+                    ),
+                    (
+                        "Alignment Cosine",
+                        self.format_float(config.spike_alignment_cosine, 2),
+                        "Directional threshold",
+                    ),
+                    (
+                        "Speed Bonus",
+                        format!("{}×", self.format_float(config.spike_speed_damage_bonus, 3)),
+                        "Velocity scaling",
+                    ),
+                    (
+                        "Length Bonus",
+                        format!(
+                            "{}×",
+                            self.format_float(config.spike_length_damage_bonus, 3)
+                        ),
+                        "Length scaling",
+                    ),
+                    (
+                        "Growth Rate",
+                        self.format_float(config.spike_growth_rate, 4),
+                        "Spike extension rate",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Carcass => {
                 let params = vec![
-                    ("Distribution Radius", self.format_float(config.carcass_distribution_radius, 1), "Reward share distance"),
-                    ("Health Reward", self.format_float(config.carcass_health_reward, 2), "Base health given"),
-                    ("Reproduction Reward", self.format_float(config.carcass_reproduction_reward, 1), "Cooldown reduction"),
-                    ("Neighbor Exponent", self.format_float(config.carcass_neighbor_exponent, 2), "Sharing normalization"),
-                    ("Maturity Age", format!("{} ticks", config.carcass_maturity_age), "Full reward age"),
-                    ("Energy Share", format!("{}%", self.format_float(config.carcass_energy_share_rate * 100.0, 1)), "Health-to-energy conversion"),
-                    ("Indicator Scale", self.format_float(config.carcass_indicator_scale, 2), "Visual pulse intensity"),
+                    (
+                        "Distribution Radius",
+                        self.format_float(config.carcass_distribution_radius, 1),
+                        "Reward share distance",
+                    ),
+                    (
+                        "Health Reward",
+                        self.format_float(config.carcass_health_reward, 2),
+                        "Base health given",
+                    ),
+                    (
+                        "Reproduction Reward",
+                        self.format_float(config.carcass_reproduction_reward, 1),
+                        "Cooldown reduction",
+                    ),
+                    (
+                        "Neighbor Exponent",
+                        self.format_float(config.carcass_neighbor_exponent, 2),
+                        "Sharing normalization",
+                    ),
+                    (
+                        "Maturity Age",
+                        format!("{} ticks", config.carcass_maturity_age),
+                        "Full reward age",
+                    ),
+                    (
+                        "Energy Share",
+                        format!(
+                            "{}%",
+                            self.format_float(config.carcass_energy_share_rate * 100.0, 1)
+                        ),
+                        "Health-to-energy conversion",
+                    ),
+                    (
+                        "Indicator Scale",
+                        self.format_float(config.carcass_indicator_scale, 2),
+                        "Visual pulse intensity",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
@@ -4879,7 +5144,9 @@ impl SimulationView {
                     .border_color(rgb(0x1e293b));
 
                 // Add toggle if it matches search filter
-                if self.matches_search("Enabled") || self.matches_search("Enable terrain elevation effects") {
+                if self.matches_search("Enabled")
+                    || self.matches_search("Enable terrain elevation effects")
+                {
                     container = container.child(self.render_param_toggle(
                         "Enabled",
                         config.topography_enabled,
@@ -4890,13 +5157,25 @@ impl SimulationView {
 
                 // Add filterable readonly params
                 let params = vec![
-                    ("Speed Gain", self.format_float(config.topography_speed_gain, 3), "Downhill boost per unit slope"),
-                    ("Energy Penalty", self.format_float(config.topography_energy_penalty, 4), "Uphill cost per unit slope"),
+                    (
+                        "Speed Gain",
+                        self.format_float(config.topography_speed_gain, 3),
+                        "Downhill boost per unit slope",
+                    ),
+                    (
+                        "Energy Penalty",
+                        self.format_float(config.topography_energy_penalty, 4),
+                        "Uphill cost per unit slope",
+                    ),
                 ];
 
                 for (label, value, desc) in params {
-                    if self.matches_search(label) || self.matches_search(&value) || self.matches_search(desc) {
-                        container = container.child(self.render_param_readonly(label, &value, desc));
+                    if self.matches_search(label)
+                        || self.matches_search(&value)
+                        || self.matches_search(desc)
+                    {
+                        container =
+                            container.child(self.render_param_readonly(label, &value, desc));
                     }
                 }
 
@@ -4905,18 +5184,45 @@ impl SimulationView {
 
             ConfigCategory::Population => {
                 let params = vec![
-                    ("Minimum Population", format!("{}", config.population_minimum), "Auto-seed threshold"),
-                    ("Spawn Interval", format!("{} ticks", config.population_spawn_interval), "Ticks between spawns"),
-                    ("Spawn Count", format!("{}", config.population_spawn_count), "Agents per interval"),
-                    ("Crossover Chance", format!("{}%", self.format_float(config.population_crossover_chance * 100.0, 1)), "Breed vs. random spawn"),
+                    (
+                        "Minimum Population",
+                        format!("{}", config.population_minimum),
+                        "Auto-seed threshold",
+                    ),
+                    (
+                        "Spawn Interval",
+                        format!("{} ticks", config.population_spawn_interval),
+                        "Ticks between spawns",
+                    ),
+                    (
+                        "Spawn Count",
+                        format!("{}", config.population_spawn_count),
+                        "Agents per interval",
+                    ),
+                    (
+                        "Crossover Chance",
+                        format!(
+                            "{}%",
+                            self.format_float(config.population_crossover_chance * 100.0, 1)
+                        ),
+                        "Breed vs. random spawn",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
 
             ConfigCategory::Persistence => {
                 let params = vec![
-                    ("Interval", format!("{} ticks", config.persistence_interval), "Database flush frequency"),
-                    ("History Capacity", format!("{}", config.history_capacity), "In-memory tick summaries"),
+                    (
+                        "Interval",
+                        format!("{} ticks", config.persistence_interval),
+                        "Database flush frequency",
+                    ),
+                    (
+                        "History Capacity",
+                        format!("{}", config.history_capacity),
+                        "In-memory tick summaries",
+                    ),
                 ];
                 self.render_filtered_params(params)
             }
@@ -4958,12 +5264,7 @@ impl SimulationView {
                     .items_center()
                     .justify_between()
                     .child(div().text_sm().text_color(rgb(0xf1f5f9)).child(label_owned))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x60a5fa))
-                            .child(value_owned),
-                    ),
+                    .child(div().text_sm().text_color(rgb(0x60a5fa)).child(value_owned)),
             )
             .child(
                 div()
@@ -4996,33 +5297,23 @@ impl SimulationView {
                     .child(div().text_sm().text_color(rgb(0xf1f5f9)).child(label_owned))
                     .child(
                         div()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(if enabled {
-                                rgb(0x166534)
-                            } else {
-                                rgb(0x7f1d1d)
-                            })
-                            .border_1()
-                            .border_color(if enabled {
-                                rgb(0x22c55e)
-                            } else {
-                                rgb(0xef4444)
-                            })
-                            .text_sm()
+                            .text_xs()
                             .text_color(if enabled {
                                 rgb(0x86efac)
                             } else {
                                 rgb(0xfca5a5)
                             })
-                            .child(if enabled { "ON" } else { "OFF" }),
+                            .child(if enabled {
+                                "✓ ENABLED"
+                            } else {
+                                "○ DISABLED"
+                            }),
                     ),
             )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_sm()
+                    .text_color(rgb(0x94a3b8))
                     .child(description_owned),
             )
     }
@@ -8108,10 +8399,10 @@ fn paint_frame(
         frame.world_size,
         base_scale,
     );
-    if controls.follow_mode != FollowMode::Off {
-        if let Some(target) = follow_target {
-            camera_guard.center_on(target);
-        }
+    if controls.follow_mode != FollowMode::Off
+        && let Some(target) = follow_target
+    {
+        camera_guard.center_on(target);
     }
     drop(camera_guard);
 

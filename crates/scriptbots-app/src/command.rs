@@ -19,7 +19,9 @@ pub fn drain_pending_commands(receiver: &CommandReceiver, world: &mut WorldState
         match receiver.try_recv() {
             Ok(command) => {
                 debug!(?command, "applying control command");
-                apply_control_command(world, command);
+                if let Err(err) = apply_control_command(world, command) {
+                    warn!(?err, "failed to apply control command");
+                }
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,
