@@ -3,12 +3,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
+use js_sys::Uint8Array;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use scriptbots_core::{
-    AgentData, AgentId, BrainBinding, BrainRunner, Generation, INPUT_SIZE, OUTPUT_SIZE, Position,
-    ScriptBotsConfig, Velocity, WorldState,
+    AgentData, AgentId, BrainBinding, BrainRunner, Generation, Position, ScriptBotsConfig,
+    Velocity, WorldState, INPUT_SIZE, OUTPUT_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
@@ -25,11 +26,39 @@ struct Simulation {
     spec: SimSpec,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum SnapshotFormat {
+    Json,
+    Binary,
+}
+
+impl Default for SnapshotFormat {
+    fn default() -> Self {
+        Self::Json
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum SeedStrategy {
+    Wander,
+    None,
+}
+
+impl Default for SeedStrategy {
+    fn default() -> Self {
+        Self::Wander
+    }
+}
+
 #[derive(Clone)]
 struct SimSpec {
     base_config: ScriptBotsConfig,
     initial_population: usize,
     seed: Option<u64>,
+    snapshot_format: SnapshotFormat,
+    seed_strategy: SeedStrategy,
 }
 
 impl SimSpec {

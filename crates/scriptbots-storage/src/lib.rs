@@ -2,7 +2,8 @@
 
 use duckdb::{Connection, Transaction, params};
 use scriptbots_core::{
-    AgentState, BrainBinding, PersistenceBatch, PersistenceEventKind, WorldPersistence,
+    AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord, PersistenceBatch,
+    PersistenceEventKind, WorldPersistence,
 };
 use slotmap::Key;
 use std::{
@@ -15,6 +16,7 @@ const DEFAULT_TICK_BUFFER: usize = 32;
 const DEFAULT_AGENT_BUFFER: usize = 1024;
 const DEFAULT_EVENT_BUFFER: usize = 256;
 const DEFAULT_METRIC_BUFFER: usize = 256;
+const DEFAULT_LIFECYCLE_BUFFER: usize = 512;
 
 /// Storage error wrapper.
 #[derive(Debug, Error)]
@@ -94,10 +96,47 @@ struct AgentRow {
     trait_blood: f64,
     give_intent: f64,
     brain_binding: String,
+    brain_key: Option<i64>,
     food_delta: f64,
     spiked: bool,
     hybrid: bool,
     sound_output: f64,
+    spike_attacker: bool,
+    spike_victim: bool,
+    hit_carnivore: bool,
+    hit_herbivore: bool,
+    hit_by_carnivore: bool,
+    hit_by_herbivore: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BirthRow {
+    tick: i64,
+    agent_id: i64,
+    parent_a: Option<i64>,
+    parent_b: Option<i64>,
+    brain_kind: Option<String>,
+    brain_key: Option<i64>,
+    herbivore_tendency: f64,
+    generation: i64,
+    position_x: f64,
+    position_y: f64,
+    is_hybrid: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DeathRow {
+    tick: i64,
+    agent_id: i64,
+    age: i64,
+    generation: i64,
+    herbivore_tendency: f64,
+    brain_kind: Option<String>,
+    brain_key: Option<i64>,
+    energy: f64,
+    food_balance_total: f64,
+    cause: String,
+    was_hybrid: bool,
     spike_attacker: bool,
     spike_victim: bool,
     hit_carnivore: bool,
@@ -112,6 +151,8 @@ struct StorageBuffer {
     metrics: Vec<MetricRow>,
     events: Vec<EventRow>,
     agents: Vec<AgentRow>,
+    births: Vec<BirthRow>,
+    deaths: Vec<DeathRow>,
 }
 
 impl StorageBuffer {
@@ -120,6 +161,8 @@ impl StorageBuffer {
             && self.metrics.is_empty()
             && self.events.is_empty()
             && self.agents.is_empty()
+            && self.births.is_empty()
+            && self.deaths.is_empty()
     }
 
     fn clear(&mut self) {
@@ -127,6 +170,8 @@ impl StorageBuffer {
         self.metrics.clear();
         self.events.clear();
         self.agents.clear();
+        self.births.clear();
+        self.deaths.clear();
     }
 }
 
@@ -138,6 +183,8 @@ pub struct Storage {
     agent_flush_threshold: usize,
     event_flush_threshold: usize,
     metric_flush_threshold: usize,
+    birth_flush_threshold: usize,
+    death_flush_threshold: usize,
 }
 
 impl Storage {
@@ -151,6 +198,8 @@ impl Storage {
             agent_flush_threshold: DEFAULT_AGENT_BUFFER,
             event_flush_threshold: DEFAULT_EVENT_BUFFER,
             metric_flush_threshold: DEFAULT_METRIC_BUFFER,
+            birth_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
+            death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
         };
         storage.initialize_schema()?;
         Ok(storage)
@@ -173,6 +222,8 @@ impl Storage {
             agent_flush_threshold: agent,
             event_flush_threshold: event,
             metric_flush_threshold: metric,
+            birth_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
+            death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
         };
         storage.initialize_schema()?;
         Ok(storage)
@@ -241,6 +292,7 @@ impl Storage {
                 trait_blood double,
                 give_intent double,
                 brain_binding text,
+                brain_key bigint,
                 food_delta double,
                 spiked boolean,
                 hybrid boolean,
@@ -255,6 +307,77 @@ impl Storage {
             )",
             [],
         )?;
+        let _ = self
+            .conn
+            .execute("alter table agents add column brain_key bigint", []);
+        self.conn.execute(
+            "create table if not exists births (
+                tick bigint,
+                agent_id bigint,
+                parent_a bigint,
+                parent_b bigint,
+                brain_kind text,
+                brain_key bigint,
+                herbivore_tendency double,
+                generation integer,
+                position_x double,
+                position_y double,
+                is_hybrid boolean,
+                primary key (tick, agent_id)
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "create table if not exists deaths (
+                tick bigint,
+                agent_id bigint,
+                age integer,
+                generation integer,
+                herbivore_tendency double,
+                brain_kind text,
+                brain_key bigint,
+                energy double,
+                food_balance_total double,
+                cause text,
+                was_hybrid boolean,
+                spike_attacker boolean,
+                spike_victim boolean,
+                hit_carnivore boolean,
+                hit_herbivore boolean,
+                hit_by_carnivore boolean,
+                hit_by_herbivore boolean,
+                primary key (tick, agent_id)
+            )",
+            [],
+        )?;
+        let _ = self
+            .conn
+            .execute("alter table births add column brain_key bigint", []);
+        let _ = self
+            .conn
+            .execute("alter table births add column is_hybrid boolean", []);
+        let _ = self.conn.execute(
+            "alter table deaths add column food_balance_total double",
+            [],
+        );
+        let _ = self
+            .conn
+            .execute("alter table deaths add column spike_attacker boolean", []);
+        let _ = self
+            .conn
+            .execute("alter table deaths add column spike_victim boolean", []);
+        let _ = self
+            .conn
+            .execute("alter table deaths add column hit_carnivore boolean", []);
+        let _ = self
+            .conn
+            .execute("alter table deaths add column hit_herbivore boolean", []);
+        let _ = self
+            .conn
+            .execute("alter table deaths add column hit_by_carnivore boolean", []);
+        let _ = self
+            .conn
+            .execute("alter table deaths add column hit_by_herbivore boolean", []);
         Ok(())
     }
 
@@ -300,6 +423,14 @@ impl Storage {
                 .push(agent_row_from_snapshot(tick, agent));
         }
 
+        for birth in &payload.births {
+            self.buffer.births.push(birth_row_from_record(birth));
+        }
+
+        for death in &payload.deaths {
+            self.buffer.deaths.push(death_row_from_record(death));
+        }
+
         self.maybe_flush()?;
         Ok(())
     }
@@ -314,6 +445,8 @@ impl Storage {
             || self.buffer.metrics.len() >= self.metric_flush_threshold
             || self.buffer.events.len() >= self.event_flush_threshold
             || self.buffer.agents.len() >= self.agent_flush_threshold
+            || self.buffer.births.len() >= self.birth_flush_threshold
+            || self.buffer.deaths.len() >= self.death_flush_threshold
         {
             self.flush()?;
         }
@@ -385,15 +518,15 @@ impl Storage {
                 herbivore_tendency, sound_multiplier, reproduction_counter,
                 mutation_rate_primary, mutation_rate_secondary,
                 trait_smell, trait_sound, trait_hearing, trait_eye, trait_blood,
-                give_intent, brain_binding,
+                give_intent, brain_binding, brain_key,
                 food_delta, spiked, hybrid, sound_output,
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore, hit_by_carnivore,
                 hit_by_herbivore
             ) values (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
         )?;
         for row in rows {
@@ -426,10 +559,77 @@ impl Storage {
                 row.trait_blood,
                 row.give_intent,
                 row.brain_binding,
+                row.brain_key,
                 row.food_delta,
                 row.spiked,
                 row.hybrid,
                 row.sound_output,
+                row.spike_attacker,
+                row.spike_victim,
+                row.hit_carnivore,
+                row.hit_herbivore,
+                row.hit_by_carnivore,
+                row.hit_by_herbivore,
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn insert_births(tx: &Transaction<'_>, rows: &[BirthRow]) -> Result<(), duckdb::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = tx.prepare(
+            "insert or replace into births (
+                tick, agent_id, parent_a, parent_b,
+                brain_kind, brain_key, herbivore_tendency,
+                generation, position_x, position_y, is_hybrid
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                row.tick,
+                row.agent_id,
+                row.parent_a,
+                row.parent_b,
+                row.brain_kind.as_deref(),
+                row.brain_key,
+                row.herbivore_tendency,
+                row.generation,
+                row.position_x,
+                row.position_y,
+                row.is_hybrid,
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn insert_deaths(tx: &Transaction<'_>, rows: &[DeathRow]) -> Result<(), duckdb::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = tx.prepare(
+            "insert or replace into deaths (
+                tick, agent_id, age, generation,
+                herbivore_tendency, brain_kind, brain_key,
+                energy, food_balance_total, cause, was_hybrid,
+                spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
+                hit_by_carnivore, hit_by_herbivore
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                row.tick,
+                row.agent_id,
+                row.age,
+                row.generation,
+                row.herbivore_tendency,
+                row.brain_kind.as_deref(),
+                row.brain_key,
+                row.energy,
+                row.food_balance_total,
+                &row.cause,
+                row.was_hybrid,
                 row.spike_attacker,
                 row.spike_victim,
                 row.hit_carnivore,
@@ -452,6 +652,8 @@ impl Storage {
         Self::insert_metrics(&tx, &self.buffer.metrics)?;
         Self::insert_events(&tx, &self.buffer.events)?;
         Self::insert_agents(&tx, &self.buffer.agents)?;
+        Self::insert_births(&tx, &self.buffer.births)?;
+        Self::insert_deaths(&tx, &self.buffer.deaths)?;
         tx.commit()?;
         self.buffer.clear();
         Ok(())
@@ -729,6 +931,7 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {
         trait_blood: f64::from(runtime.trait_modifiers.blood),
         give_intent: f64::from(runtime.give_intent),
         brain_binding: brain_binding_to_string(&runtime.brain),
+        brain_key: runtime.brain.registry_key().map(|key| key as i64),
         food_delta: f64::from(runtime.food_delta),
         spiked: runtime.spiked,
         hybrid: runtime.hybrid,
@@ -739,6 +942,58 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {
         hit_herbivore: runtime.combat.hit_herbivore,
         hit_by_carnivore: runtime.combat.was_spiked_by_carnivore,
         hit_by_herbivore: runtime.combat.was_spiked_by_herbivore,
+    }
+}
+
+fn optional_agent_id(id: Option<AgentId>) -> Option<i64> {
+    id.map(|agent_id| agent_id.data().as_ffi() as i64)
+}
+
+fn birth_row_from_record(record: &BirthRecord) -> BirthRow {
+    BirthRow {
+        tick: record.tick.0 as i64,
+        agent_id: record.agent_id.data().as_ffi() as i64,
+        parent_a: optional_agent_id(record.parent_a),
+        parent_b: optional_agent_id(record.parent_b),
+        brain_kind: record.brain_kind.clone(),
+        brain_key: record.brain_key.map(|key| key as i64),
+        herbivore_tendency: f64::from(record.herbivore_tendency),
+        generation: record.generation.0 as i64,
+        position_x: f64::from(record.position.x),
+        position_y: f64::from(record.position.y),
+        is_hybrid: record.is_hybrid,
+    }
+}
+
+fn death_cause_to_string(cause: DeathCause) -> &'static str {
+    match cause {
+        DeathCause::CombatCarnivore => "combat_carnivore",
+        DeathCause::CombatHerbivore => "combat_herbivore",
+        DeathCause::Starvation => "starvation",
+        DeathCause::Aging => "aging",
+        DeathCause::Unknown => "unknown",
+    }
+}
+
+fn death_row_from_record(record: &DeathRecord) -> DeathRow {
+    DeathRow {
+        tick: record.tick.0 as i64,
+        agent_id: record.agent_id.data().as_ffi() as i64,
+        age: record.age as i64,
+        generation: record.generation.0 as i64,
+        herbivore_tendency: f64::from(record.herbivore_tendency),
+        brain_kind: record.brain_kind.clone(),
+        brain_key: record.brain_key.map(|key| key as i64),
+        energy: f64::from(record.energy),
+        food_balance_total: f64::from(record.food_balance_total),
+        cause: death_cause_to_string(record.cause).to_string(),
+        was_hybrid: record.was_hybrid,
+        spike_attacker: record.combat_flags.spike_attacker,
+        spike_victim: record.combat_flags.spike_victim,
+        hit_carnivore: record.combat_flags.hit_carnivore,
+        hit_herbivore: record.combat_flags.hit_herbivore,
+        hit_by_carnivore: record.combat_flags.was_spiked_by_carnivore,
+        hit_by_herbivore: record.combat_flags.was_spiked_by_herbivore,
     }
 }
 
@@ -809,6 +1064,8 @@ mod tests {
             ],
             events: vec![PersistenceEvent::new(PersistenceEventKind::Births, 1)],
             agents: vec![sample_agent(energy)],
+            births: Vec::new(),
+            deaths: Vec::new(),
         }
     }
 

@@ -646,7 +646,10 @@ impl SimulationView {
                 "Avg Energy",
                 self.format_float(metrics.average_energy, 2),
                 0xf59e0b,
-                Some(format!("Total {}", self.format_float(metrics.total_energy, 1))),
+                Some(format!(
+                    "Total {}",
+                    self.format_float(metrics.total_energy, 1)
+                )),
                 energy_series.clone(),
             ));
             cards.push(self.metric_card(
@@ -1312,13 +1315,15 @@ impl SimulationView {
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_panel.open = !self.settings_panel.open;
 
-        // Reset scroll position and recalculate content height when opening panel
+        // Reset scroll position and recalculate dimensions when opening panel
         if self.settings_panel.open {
             self.settings_panel.scroll_offset = 0.0;
             let total_categories = ConfigCategory::all().len();
             self.settings_panel.content_height = self
                 .settings_panel
                 .estimate_content_height(total_categories);
+            // Calculate viewport height from window bounds (full height - header - search bar)
+            self.settings_panel.viewport_height = cx.window_bounds().size.height.0 - 132.0;
         }
 
         info!(open = self.settings_panel.open, "Settings panel toggled");
@@ -1343,11 +1348,13 @@ impl SimulationView {
             self.settings_panel.collapsed_categories.push(category);
         }
 
-        // Update content height estimate and clamp scroll
+        // Update dimensions and clamp scroll
         let total_categories = ConfigCategory::all().len();
         self.settings_panel.content_height = self
             .settings_panel
             .estimate_content_height(total_categories);
+        // Update viewport height in case window was resized
+        self.settings_panel.viewport_height = cx.window_bounds().size.height.0 - 132.0;
         self.settings_panel.clamp_scroll();
 
         #[cfg(feature = "audio")]
@@ -4056,10 +4063,15 @@ impl SimulationView {
             );
 
         // Scrollable container for categories with mouse wheel handling
-        // Calculate content height locally (can't mutate self in render method)
+        // Calculate content height and viewport height dynamically
         let total_categories = ConfigCategory::all().len();
-        let content_height = self.settings_panel.estimate_content_height(total_categories);
-        let viewport_height = self.settings_panel.viewport_height;
+        let content_height = self
+            .settings_panel
+            .estimate_content_height(total_categories);
+
+        // Calculate viewport height from window bounds
+        // Panel layout: full height - header (~64px) - search bar (~68px) = viewport
+        let viewport_height = cx.window_bounds().size.height.0 - 132.0;
 
         let scroll_offset = self.settings_panel.scroll_offset;
         let max_scroll = (content_height - viewport_height).max(0.0);
@@ -4079,7 +4091,8 @@ impl SimulationView {
                 };
 
                 // Update scroll offset with proper bounds
-                this.settings_panel.scroll_offset -= scroll_delta;
+                // Positive delta = scroll down = increase offset to show lower content
+                this.settings_panel.scroll_offset += scroll_delta;
                 this.settings_panel.clamp_scroll();
                 cx.notify();
             }))
@@ -4507,7 +4520,10 @@ impl SimulationView {
                 ))
                 .child(self.render_param_readonly(
                     "Energy Penalty",
-                    &format!("{}×", self.format_float(config.aging_energy_penalty_rate, 3)),
+                    &format!(
+                        "{}×",
+                        self.format_float(config.aging_energy_penalty_rate, 3)
+                    ),
                     "Health-to-energy conversion",
                 )),
 
@@ -4544,7 +4560,10 @@ impl SimulationView {
                 ))
                 .child(self.render_param_readonly(
                     "Length Bonus",
-                    &format!("{}×", self.format_float(config.spike_length_damage_bonus, 3)),
+                    &format!(
+                        "{}×",
+                        self.format_float(config.spike_length_damage_bonus, 3)
+                    ),
                     "Length scaling",
                 ))
                 .child(self.render_param_readonly(
@@ -4629,7 +4648,10 @@ impl SimulationView {
                 ))
                 .child(self.render_param_readonly(
                     "Crossover Chance",
-                    &format!("{}%", self.format_float(config.population_crossover_chance * 100.0, 1)),
+                    &format!(
+                        "{}%",
+                        self.format_float(config.population_crossover_chance * 100.0, 1)
+                    ),
                     "Breed vs. random spawn",
                 )),
 
@@ -5203,7 +5225,9 @@ impl Default for SettingsPanelState {
             preset_name: "Default".to_string(),
             scroll_offset: 0.0,
             content_height: 0.0,
-            viewport_height: 600.0, // Reasonable default
+            // Conservative estimate: typical window (768px) - header (64px) - search (68px) = 636px
+            // Use 700px to accommodate larger windows while being safe for smaller ones
+            viewport_height: 700.0,
         }
     }
 }
@@ -5219,19 +5243,29 @@ impl SettingsPanelState {
         self.scroll_offset = self.scroll_offset.clamp(0.0, self.max_scroll_offset());
     }
 
-    /// Estimate content height based on number of visible categories
-    /// Each category header ~90px, each expanded category ~450px average
-    fn estimate_content_height(&self, total_categories: usize) -> f32 {
-        let collapsed_count = self.collapsed_categories.len();
-        let expanded_count = total_categories.saturating_sub(collapsed_count);
+    /// Calculate accurate content height based on actual parameter counts
+    /// Uses precise measurements from rendered categories
+    fn estimate_content_height(&self, _total_categories: usize) -> f32 {
+        let mut total_height = 0.0;
 
-        // Header ~90px, expanded category ~450px (10 params × ~45px each)
-        let collapsed_height = collapsed_count as f32 * 90.0;
-        let expanded_height = expanded_count as f32 * 450.0;
+        for category in ConfigCategory::all() {
+            let is_collapsed = self.collapsed_categories.contains(&category);
 
-        // Add padding and gaps
-        let total = collapsed_height + expanded_height + 100.0; // 100px for padding/gaps
-        total
+            if is_collapsed {
+                // Collapsed: header (70px) + gap (16px) = 86px
+                total_height += 86.0;
+            } else {
+                // Expanded: header (70px) + params container + gap (16px)
+                // Params container: padding (32px) + params + gaps between params
+                // Each param: ~44px + 12px gap = 56px per param
+                let param_count = category.parameter_count();
+                let params_height = 32.0 + (param_count as f32 * 56.0);
+                total_height += 70.0 + params_height + 16.0;
+            }
+        }
+
+        // Add top/bottom padding for categories container (py_4 = 32px total)
+        total_height + 64.0
     }
 }
 
@@ -5318,6 +5352,24 @@ impl ConfigCategory {
             ConfigCategory::Population,
             ConfigCategory::Persistence,
         ]
+    }
+
+    /// Returns the exact number of parameters displayed in this category
+    fn parameter_count(self) -> usize {
+        match self {
+            ConfigCategory::World => 6, // width, height, food_cell_size, initial_food, rng_seed, chart_flush
+            ConfigCategory::Food => 12, // respawn_interval/amount, growth_interval/amount, decay_interval/amount, diffusion_rate, intake_rate, sharing_radius/rate/transfer/distance
+            ConfigCategory::Agent => 4, // base_speed, boost_multiplier, vision_range, carnivore_threshold
+            ConfigCategory::Metabolism => 5, // drain, movement_drain, ramp_floor, ramp_rate, boost_penalty
+            ConfigCategory::Temperature => 4, // discomfort_rate, comfort_band, gradient_exponent, discomfort_exponent
+            ConfigCategory::Reproduction => 14, // energy_threshold, energy_cost, cooldown, herbivore_rate, carnivore_rate, child_energy, spawn_jitter, spawn_back_distance, color_jitter, mutation_scale, partner_chance, gene_log_capacity, meta_mutation_chance, meta_mutation_scale
+            ConfigCategory::Aging => 4, // decay_start, decay_rate, decay_max, energy_penalty
+            ConfigCategory::Combat => 8, // spike_radius, spike_damage, spike_energy_cost, min_length, alignment_cosine, speed_bonus, length_bonus, growth_rate
+            ConfigCategory::Carcass => 7, // distribution_radius, health_reward, reproduction_reward, neighbor_exponent, maturity_age, energy_share, indicator_scale
+            ConfigCategory::Topography => 3, // enabled, speed_gain, energy_penalty
+            ConfigCategory::Population => 4, // minimum, spawn_interval, spawn_count, crossover_chance
+            ConfigCategory::Persistence => 1, // interval
+        }
     }
 }
 

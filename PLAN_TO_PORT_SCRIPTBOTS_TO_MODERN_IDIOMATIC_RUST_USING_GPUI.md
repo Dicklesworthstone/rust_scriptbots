@@ -172,6 +172,7 @@
 ## Parity Gaps vs. Original ScriptBots (Non-Rendering)
 - **World Mechanics**
   - [Completed - GPT-5 Codex 2025-10-22: added configurable regrowth/decay/diffusion with tests] Reproduce food diffusion/decay curves from `World.cpp` (current respawn is basic pulse).
+  - [Completed - GPT-5 Codex 2025-10-22: Terrain-aware food fertility profiles with capacity/growth modulation plus reproduction bonuses tied to geography] Improve ecological fidelity by deriving per-cell fertility from moisture/elevation/slope, applying nutrient density to grazing energy, and adding regression tests for fertile vs. barren biomes.
   - [Completed - GPT-5 Codex 2025-10-22: spike damage scales with spike length/speed, herbivore vs. carnivore hits emit analytics flags, and death cleanup consumes the pending queue in stable world order] Flesh out combat resolution: spike damage scaling, carnivore/herbivore event flags, queued death cleanup ordering.
   - [Completed - GPT-5 Codex 2025-10-22: species-tuned reproduction rates, hybrid crossover pipeline, spawn jitter parity, gene logging, and lineage tracking with tests] Implement reproduction nuance: crossover/mutation weighting, spawn jitter, gene logging, lineage tracking.
   - [Completed - GPT-5 Codex 2025-10-22: multi-eye vision cones, smell/sound/blood channels, temperature discomfort, clock sensors wired with deterministic tests] Complete sensory modeling: angular vision cones, smell/sound attenuation, change-sensitive synapses.
@@ -228,6 +229,7 @@
 3. **World Mechanics (Weeks 2-4)**
    - Implement food grid, sensing pipeline (sequential first), reproduction queue, death cleanup.
    - Ensure parity with original via scenario tests (e.g., spike kill distribution).
+   - [Completed - GPT-5 Codex 2025-10-22: Terrain-aware food ecology + fertility-weighted reproduction with regression tests]
 4. **Introduce Concurrency (Weeks 4-5)** [Completed: stage_sense/actuation/combat parallelized with Rayon]
    - Integrate Rayon, add spatial partition acceleration, verify determinism under multi-thread.
 5. **Brain Ports (Weeks 5-7)**

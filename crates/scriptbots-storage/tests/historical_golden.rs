@@ -73,6 +73,8 @@ fn make_batch(
         ],
         events,
         agents,
+        births: Vec::new(),
+        deaths: Vec::new(),
     }
 }
 

@@ -147,13 +147,6 @@ async function resetSimulation(populationOverride) {
         world_height: defaults.world_height ?? 720,
     };
 
-    options.config = {
-        ...(defaults.config ?? {}),
-        rng_seed: seed,
-        population_minimum: 0,
-        population_spawn_interval: 0,
-    };
-
     simHandle = init_sim(options);
     appendLog(`Simulation reset (seed=${seed}, population=${populationOverride})`);
 }

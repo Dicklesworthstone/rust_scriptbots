@@ -1,22 +1,29 @@
 use anyhow::Result;
-use scriptbots_app::{SharedStorage, SharedWorld};
+use scriptbots_app::{ControlRuntime, ControlServerConfig, SharedStorage, SharedWorld};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{AgentData, NeuroflowActivationKind, ScriptBotsConfig, WorldState};
 use scriptbots_render::run_demo;
 use scriptbots_storage::StoragePipeline;
-use std::{env, sync::{Arc, Mutex}};
+use std::{
+    env,
+    sync::{Arc, Mutex},
+};
 use tracing::{info, warn};
 
 fn main() -> Result<()> {
     init_tracing();
     let (world, _storage) = bootstrap_world()?;
+    let control_config = ControlServerConfig::from_env();
+    let control_runtime = ControlRuntime::launch(world.clone(), control_config)?;
     info!("Starting ScriptBots simulation shell");
     run_demo(world);
+    control_runtime.shutdown()?;
     Ok(())
 }
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 }

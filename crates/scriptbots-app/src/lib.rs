@@ -11,11 +11,7 @@ pub type SharedStorage = Arc<Mutex<Storage>>;
 pub mod control;
 pub mod servers;
 
-pub use control::{
-    ConfigSnapshot,
-    ControlError,
-    ControlHandle,
-    KnobEntry,
-    KnobKind,
-    KnobUpdate,
+pub use control::{ConfigSnapshot, ControlError, ControlHandle, KnobEntry, KnobKind, KnobUpdate};
+pub use servers::{
+    ConfigPatchRequest, ControlRuntime, ControlServerConfig, KnobApplyRequest, McpTransportConfig,
 };

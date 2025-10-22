@@ -1,0 +1,28 @@
+# Phase 2 WebAssembly TODOs (Codex, 2025-10-22)
+
+- [ ] Guard Rayon usage across wasm pathways
+  - [ ] Audit `scriptbots-core` and consumers for `#[cfg(feature = "parallel")]` coverage
+  - [ ] Ensure workspace avoids linking Rayon for wasm builds (crate features / dependency pruning)
+  - [ ] Add documentation note on disabling parallelism for wasm builds
+- [ ] Extend `scriptbots-web` data interchange options
+  - [ ] Add binary snapshot export (`postcard` or similar) alongside JSON
+  - [ ] Expose snapshot format toggle in `InitOptions`
+  - [ ] Document snapshot APIs in `web/README.md`
+- [ ] Improve brain selection ergonomics for wasm
+  - [ ] Allow JS callers to choose seeding strategy (`wander` vs `none`)
+  - [ ] Stub registration pathway for future `scriptbots-brain` bindings (documented opt-in)
+- [ ] Strengthen parity/regression tests
+  - [ ] Expand wasm-vs-native parity test across multiple seeds/ticks
+  - [ ] Add float tolerance helper (with diagnostics) reused across assertions
+  - [ ] Run parity test under `wasm-pack test --headless`
+- [ ] Integrate wasm tests into CI
+  - [ ] Update `.github/workflows/ci.yml` with `wasm-pack build` + headless Chrome job
+  - [ ] Install Chrome/Chromium on CI runner and cache wasm-pack artifacts
+  - [ ] Ensure job runs on PRs + main branch
+- [ ] Polish Canvas demo harness
+  - [ ] Add lightweight benchmarking log (FPS, TPS over time)
+  - [ ] Document serving instructions (without bundler) & add npm script/Make target
+  - [ ] Clarify reset/seed controls in UI and README
+- [ ] Update project docs
+  - [ ] Amend `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` for new snapshot formats, brain options, CI steps
+  - [ ] Add brief note to `README.md` pointing to wasm harness

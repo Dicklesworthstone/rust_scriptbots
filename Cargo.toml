@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }
 ordered-float = "4.2.0"
 slotmap = { version = "1.0.7", features = ["serde"] }
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
+postcard = { version = "1.0.8", default-features = false, features = ["alloc", "use-std"] }
 
 duckdb = { version = "1.4.1", default-features = false, features = ["bundled"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", branch = "main" }

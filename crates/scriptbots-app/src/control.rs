@@ -17,8 +17,8 @@ pub struct ConfigSnapshot {
 
 impl ConfigSnapshot {
     fn from_world(world: &ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
-        let config_value = serde_json::to_value(world.clone())
-            .map_err(ControlError::serialization)?;
+        let config_value =
+            serde_json::to_value(world.clone()).map_err(ControlError::serialization)?;
         Ok(Self {
             tick: tick.0,
             config: config_value,
@@ -107,8 +107,8 @@ impl ControlHandle {
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
         let world = self.lock_world()?;
         let mut entries = Vec::new();
-        let config_value = serde_json::to_value(world.config().clone())
-            .map_err(ControlError::serialization)?;
+        let config_value =
+            serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
         flatten_value("", &config_value, &mut entries);
         Ok(entries)
     }
@@ -122,11 +122,11 @@ impl ControlHandle {
         }
 
         let mut world = self.lock_world()?;
-        let mut config_value = serde_json::to_value(world.config().clone())
-            .map_err(ControlError::serialization)?;
+        let mut config_value =
+            serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
         merge_value(&mut config_value, &patch, &mut Vec::new())?;
-        let new_config: ScriptBotsConfig = serde_json::from_value(config_value)
-            .map_err(ControlError::serialization)?;
+        let new_config: ScriptBotsConfig =
+            serde_json::from_value(config_value).map_err(ControlError::serialization)?;
         *world.config_mut() = new_config.clone();
         ConfigSnapshot::from_world(&new_config, world.tick())
     }
@@ -154,11 +154,9 @@ fn insert_path(map: &mut Map<String, Value>, path: &str, value: Value) -> Result
         let entry = current
             .entry(segment.clone())
             .or_insert_with(|| Value::Object(Map::new()));
-        current = entry
-            .as_object_mut()
-            .ok_or_else(|| ControlError::InvalidPatch(format!(
-                "intermediate segment '{segment}' is not an object"
-            )))?;
+        current = entry.as_object_mut().ok_or_else(|| {
+            ControlError::InvalidPatch(format!("intermediate segment '{segment}' is not an object"))
+        })?;
         segment = next.to_string();
     }
 
@@ -166,7 +164,11 @@ fn insert_path(map: &mut Map<String, Value>, path: &str, value: Value) -> Result
     Ok(())
 }
 
-fn merge_value(target: &mut Value, patch: &Value, path: &mut Vec<String>) -> Result<(), ControlError> {
+fn merge_value(
+    target: &mut Value,
+    patch: &Value,
+    path: &mut Vec<String>,
+) -> Result<(), ControlError> {
     match (target, patch) {
         (Value::Object(target_map), Value::Object(patch_map)) => {
             for (key, patch_value) in patch_map {
@@ -222,7 +224,7 @@ fn merge_value(target: &mut Value, patch: &Value, path: &mut Vec<String>) -> Res
                         "cannot coerce '{:?}' to bool for {}",
                         patch,
                         path.join("."),
-                    )))
+                    )));
                 }
             };
             *target = Value::from(parsed);

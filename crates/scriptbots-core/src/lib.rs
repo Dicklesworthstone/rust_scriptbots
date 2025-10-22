@@ -158,6 +158,81 @@ impl RunningStats {
     }
 }
 
+fn summarize_signal(values: &[f32]) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let len = values.len() as f64;
+    let mut sum = 0.0f64;
+    let mut max = 0.0f32;
+    let mut positive_sum = 0.0f64;
+    for &value in values {
+        let v = f64::from(value);
+        sum += v;
+        let magnitude = value.abs();
+        if magnitude > max {
+            max = magnitude;
+        }
+        if value > 0.0 {
+            positive_sum += f64::from(value);
+        } else if value < 0.0 {
+            positive_sum += f64::from(-value);
+        }
+    }
+    let mean = sum / len;
+    let peak = max as f64;
+
+    if positive_sum <= f64::EPSILON {
+        return (mean, peak, 0.0);
+    }
+
+    let mut entropy = 0.0f64;
+    for &value in values {
+        let weight = value.abs() as f64 / positive_sum;
+        if weight > 0.0 {
+            entropy -= weight * weight.ln();
+        }
+    }
+    (mean, peak, entropy)
+}
+
+fn sanitize_metric_key(label: &str) -> String {
+    let mut result = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            result.push(ch.to_ascii_lowercase());
+        } else {
+            result.push('_');
+        }
+    }
+    result
+}
+
+fn summarize_food_grid(cells: &[f32]) -> Option<(f64, f64, f64, f32)> {
+    if cells.is_empty() {
+        return None;
+    }
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut max = f32::MIN;
+    for &value in cells {
+        let v = f64::from(value);
+        sum += v;
+        sum_sq += v * v;
+        if value > max {
+            max = value;
+        }
+    }
+    let count = cells.len() as f64;
+    let mean = sum / count;
+    let variance = if count > 1.0 {
+        (sum_sq - sum * mean) / (count - 1.0)
+    } else {
+        0.0
+    };
+    Some((sum, mean, variance.max(0.0), max))
+}
+
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
@@ -2598,7 +2673,6 @@ impl WorldState {
             self.food_scratch[..len].copy_from_slice(cells);
         }
 
-        let max_value = self.config.food_max;
         let previous = &self.food_scratch;
         let cells_mut = self.food.cells_mut();
 
@@ -2610,6 +2684,18 @@ impl WorldState {
                 let right_col = if x + 1 == width { 0 } else { x + 1 };
                 let idx = y * width + x;
                 let mut value = previous[idx];
+                let profile = self
+                    .food_profiles
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(FoodCellProfile {
+                        capacity: self.config.food_max,
+                        growth_multiplier: 1.0,
+                        decay_multiplier: 1.0,
+                        fertility: 0.0,
+                        nutrient_density: 0.3,
+                    });
+                let capacity = profile.capacity.max(0.0);
 
                 if diffusion > 0.0 {
                     let left = previous[y * width + left_col];
@@ -2621,14 +2707,14 @@ impl WorldState {
                 }
 
                 if decay > 0.0 {
-                    value -= decay * value;
+                    value -= decay * profile.decay_multiplier * value;
                 }
 
                 if growth > 0.0 {
-                    value += growth * (max_value - value);
+                    value += growth * profile.growth_multiplier * (capacity - value);
                 }
 
-                cells_mut[idx] = value.clamp(0.0, max_value);
+                cells_mut[idx] = value.clamp(0.0, capacity);
             }
         }
     }
@@ -3141,16 +3227,33 @@ impl WorldState {
         let positions = self.agents.columns().positions().to_vec();
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let mut sharers: Vec<usize> = Vec::new();
+        let food_width = self.food.width() as usize;
+        if food_width == 0 || self.food.height() == 0 {
+            return;
+        }
 
         let intake_rate = self.config.food_intake_rate.max(0.0);
         let waste_rate = self.config.food_waste_rate.max(0.0);
         let reproduction_bonus = self.config.reproduction_food_bonus.max(0.0);
+        let fertility_bonus_scale = self.config.reproduction_fertility_bonus.max(0.0);
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 if intake_rate > 0.0 || waste_rate > 0.0 {
                     let pos = positions[idx];
                     let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
                     let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
+                    let profile_index = (cell_y as usize) * food_width + cell_x as usize;
+                    let profile =
+                        self.food_profiles
+                            .get(profile_index)
+                            .copied()
+                            .unwrap_or(FoodCellProfile {
+                                capacity: self.config.food_max,
+                                growth_multiplier: 1.0,
+                                decay_multiplier: 1.0,
+                                fertility: 0.0,
+                                nutrient_density: 0.3,
+                            });
                     if let Some(cell) = self.food.get_mut(cell_x, cell_y) {
                         let available = *cell;
                         if available > 0.0 {
@@ -3179,10 +3282,15 @@ impl WorldState {
                                 *cell = (available - waste).max(0.0);
                             }
                             if intake > 0.0 {
-                                runtime.energy = (runtime.energy + intake).min(2.0);
-                                runtime.food_delta += intake;
+                                let nutrient = profile.nutrient_density;
+                                let energy_gain = intake * (0.5 + nutrient * 0.5);
+                                runtime.energy = (runtime.energy + energy_gain).min(2.0);
+                                runtime.food_delta += energy_gain;
                                 if reproduction_bonus > 0.0 {
-                                    runtime.reproduction_counter += intake * reproduction_bonus;
+                                    let fertility_multiplier =
+                                        1.0 + profile.fertility * fertility_bonus_scale;
+                                    runtime.reproduction_counter +=
+                                        intake * reproduction_bonus * fertility_multiplier;
                                 }
                             }
                         }
@@ -3661,7 +3769,10 @@ impl WorldState {
             .iter()
             .filter(|result| !result.hits.is_empty())
             .count() as u32;
-        let hits = results.iter().map(|result| result.hits.len() as u32).sum::<u32>();
+        let hits = results
+            .iter()
+            .map(|result| result.hits.len() as u32)
+            .sum::<u32>();
         self.combat_spike_attempts = self.combat_spike_attempts.saturating_add(attempts);
         self.combat_spike_hits = self.combat_spike_hits.saturating_add(hits);
     }
@@ -4445,23 +4556,125 @@ impl WorldState {
         {
             self.last_births = 0;
             self.last_deaths = 0;
+            self.pending_birth_records.clear();
+            self.pending_death_records.clear();
+            self.combat_spike_attempts = 0;
+            self.combat_spike_hits = 0;
             return;
         }
 
-        let agent_count = self.agents.len();
-        let mut total_energy = 0.0;
-        for id in self.agents.iter_handles() {
-            if let Some(runtime) = self.runtime.get(id) {
+        let analytics = self.config.analytics_stride;
+        let macro_enabled = analytics.macro_metrics != 0
+            && next_tick.0.is_multiple_of(analytics.macro_metrics as u64);
+        let behavior_enabled = analytics.behavior_metrics != 0
+            && next_tick
+                .0
+                .is_multiple_of(analytics.behavior_metrics as u64);
+        let lifecycle_enabled = analytics.lifecycle_events != 0
+            && next_tick
+                .0
+                .is_multiple_of(analytics.lifecycle_events as u64);
+
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        let agent_count = handles.len();
+
+        let mut total_energy = 0.0f32;
+        let mut total_health = 0.0f32;
+
+        let mut carnivores = 0usize;
+        let mut herbivores = 0usize;
+        let mut hybrids = 0usize;
+        let mut carnivore_energy = 0.0f64;
+        let mut herbivore_energy = 0.0f64;
+        let mut hybrid_energy = 0.0f64;
+
+        let mut mutation_primary = RunningStats::default();
+        let mut mutation_secondary = RunningStats::default();
+        let mut trait_smell = RunningStats::default();
+        let mut trait_sound = RunningStats::default();
+        let mut trait_hearing = RunningStats::default();
+        let mut trait_eye = RunningStats::default();
+        let mut trait_blood = RunningStats::default();
+        let mut herbivore_tendency_stats = RunningStats::default();
+
+        let mut sensor_mean = RunningStats::default();
+        let mut sensor_max = RunningStats::default();
+        let mut sensor_entropy = RunningStats::default();
+        let mut output_mean = RunningStats::default();
+        let mut output_max = RunningStats::default();
+        let mut output_entropy = RunningStats::default();
+
+        let mut food_delta_sum = 0.0f64;
+        let mut food_delta_abs_sum = 0.0f64;
+
+        let carnivore_threshold = self.config.carnivore_threshold;
+        let mut brain_map: HashMap<String, (usize, f64)> = HashMap::new();
+
+        let columns = self.agents.columns();
+        let healths = columns.health();
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            total_health += healths.get(idx).copied().unwrap_or(0.0);
+            if let Some(runtime) = self.runtime.get(*agent_id) {
                 total_energy += runtime.energy;
+
+                if macro_enabled {
+                    let herb = clamp01(runtime.herbivore_tendency);
+                    herbivore_tendency_stats.update(f64::from(herb));
+                    if runtime.hybrid {
+                        hybrids += 1;
+                        hybrid_energy += f64::from(runtime.energy);
+                    } else if herb >= carnivore_threshold {
+                        herbivores += 1;
+                        herbivore_energy += f64::from(runtime.energy);
+                    } else {
+                        carnivores += 1;
+                        carnivore_energy += f64::from(runtime.energy);
+                    }
+
+                    mutation_primary.update(f64::from(runtime.mutation_rates.primary));
+                    mutation_secondary.update(f64::from(runtime.mutation_rates.secondary));
+                    trait_smell.update(f64::from(runtime.trait_modifiers.smell));
+                    trait_sound.update(f64::from(runtime.trait_modifiers.sound));
+                    trait_hearing.update(f64::from(runtime.trait_modifiers.hearing));
+                    trait_eye.update(f64::from(runtime.trait_modifiers.eye));
+                    trait_blood.update(f64::from(runtime.trait_modifiers.blood));
+
+                    let label = runtime
+                        .brain
+                        .kind()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "unbound".to_string());
+                    let entry = brain_map.entry(label).or_insert((0, 0.0));
+                    entry.0 += 1;
+                    entry.1 += f64::from(runtime.energy);
+                }
+
+                if behavior_enabled {
+                    let (sensor_avg, sensor_peak, sensor_ent) = summarize_signal(&runtime.sensors);
+                    sensor_mean.update(sensor_avg);
+                    sensor_max.update(sensor_peak);
+                    sensor_entropy.update(sensor_ent);
+
+                    let (output_avg, output_peak, output_ent) = summarize_signal(&runtime.outputs);
+                    output_mean.update(output_avg);
+                    output_max.update(output_peak);
+                    output_entropy.update(output_ent);
+                }
+
+                if behavior_enabled || macro_enabled {
+                    let delta = f64::from(runtime.food_delta);
+                    food_delta_sum += delta;
+                    food_delta_abs_sum += delta.abs();
+                }
             }
         }
+
         let average_energy = if agent_count > 0 {
             total_energy / agent_count as f32
         } else {
             0.0
         };
-        let healths = self.agents.columns().health();
-        let total_health: f32 = healths.iter().sum();
         let average_health = if agent_count > 0 {
             total_health / agent_count as f32
         } else {
@@ -4495,7 +4708,137 @@ impl WorldState {
             ));
         }
 
-        let mut events = Vec::with_capacity(2);
+        if macro_enabled {
+            let as_f64 = |value: usize| value as f64;
+            metrics.push(MetricSample::new(
+                "population.carnivore.count",
+                as_f64(carnivores),
+            ));
+            metrics.push(MetricSample::new(
+                "population.herbivore.count",
+                as_f64(herbivores),
+            ));
+            metrics.push(MetricSample::new(
+                "population.hybrid.count",
+                as_f64(hybrids),
+            ));
+
+            if carnivores > 0 {
+                metrics.push(MetricSample::new(
+                    "population.carnivore.avg_energy",
+                    carnivore_energy / as_f64(carnivores),
+                ));
+            }
+            if herbivores > 0 {
+                metrics.push(MetricSample::new(
+                    "population.herbivore.avg_energy",
+                    herbivore_energy / as_f64(herbivores),
+                ));
+            }
+            if hybrids > 0 {
+                metrics.push(MetricSample::new(
+                    "population.hybrid.avg_energy",
+                    hybrid_energy / as_f64(hybrids),
+                ));
+            }
+
+            metrics.push(MetricSample::new(
+                "mutation.primary.mean",
+                mutation_primary.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "mutation.primary.stddev",
+                mutation_primary.stddev(),
+            ));
+            metrics.push(MetricSample::new(
+                "mutation.secondary.mean",
+                mutation_secondary.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "mutation.secondary.stddev",
+                mutation_secondary.stddev(),
+            ));
+            metrics.push(MetricSample::new("traits.smell.mean", trait_smell.mean()));
+            metrics.push(MetricSample::new("traits.sound.mean", trait_sound.mean()));
+            metrics.push(MetricSample::new(
+                "traits.hearing.mean",
+                trait_hearing.mean(),
+            ));
+            metrics.push(MetricSample::new("traits.eye.mean", trait_eye.mean()));
+            metrics.push(MetricSample::new("traits.blood.mean", trait_blood.mean()));
+            metrics.push(MetricSample::new(
+                "herbivore_tendency.mean",
+                herbivore_tendency_stats.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "herbivore_tendency.stddev",
+                herbivore_tendency_stats.stddev(),
+            ));
+
+            if agent_count > 0 {
+                metrics.push(MetricSample::new(
+                    "food_delta.mean",
+                    food_delta_sum / agent_count as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "food_delta.mean_abs",
+                    food_delta_abs_sum / agent_count as f64,
+                ));
+            }
+
+            if let Some((total, mean, variance, max)) = summarize_food_grid(self.food.cells()) {
+                metrics.push(MetricSample::new("food.total", total));
+                metrics.push(MetricSample::new("food.mean", mean));
+                metrics.push(MetricSample::new("food.stddev", variance.sqrt()));
+                metrics.push(MetricSample::from_f32("food.max", max));
+            }
+
+            for (label, (count, energy_sum)) in brain_map {
+                let key = sanitize_metric_key(&label);
+                metrics.push(MetricSample::new(
+                    format!("brain.population.{key}.count"),
+                    count as f64,
+                ));
+                if count > 0 {
+                    metrics.push(MetricSample::new(
+                        format!("brain.population.{key}.avg_energy"),
+                        energy_sum / count as f64,
+                    ));
+                }
+            }
+        }
+
+        if behavior_enabled {
+            metrics.push(MetricSample::new(
+                "behavior.sensors.mean",
+                sensor_mean.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "behavior.sensors.stddev",
+                sensor_mean.stddev(),
+            ));
+            metrics.push(MetricSample::new("behavior.sensors.max", sensor_max.mean()));
+            metrics.push(MetricSample::new(
+                "behavior.sensors.entropy",
+                sensor_entropy.mean(),
+            ));
+
+            metrics.push(MetricSample::new(
+                "behavior.outputs.mean",
+                output_mean.mean(),
+            ));
+            metrics.push(MetricSample::new(
+                "behavior.outputs.stddev",
+                output_mean.stddev(),
+            ));
+            metrics.push(MetricSample::new("behavior.outputs.max", output_max.mean()));
+            metrics.push(MetricSample::new(
+                "behavior.outputs.entropy",
+                output_entropy.mean(),
+            ));
+        }
+
+        let mut events = Vec::with_capacity(4);
         if self.last_births > 0 {
             events.push(PersistenceEvent::new(
                 PersistenceEventKind::Births,
@@ -4508,13 +4851,49 @@ impl WorldState {
                 self.last_deaths,
             ));
         }
+        if self.combat_spike_attempts > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Custom(Cow::Borrowed("spike_attempts")),
+                self.combat_spike_attempts as usize,
+            ));
+        }
+        if self.combat_spike_hits > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Custom(Cow::Borrowed("spike_hits")),
+                self.combat_spike_hits as usize,
+            ));
+        }
 
         let mut agents = Vec::with_capacity(agent_count);
-        for id in self.agents.iter_handles() {
-            if let Some(snapshot) = self.snapshot_agent(id) {
+        for id in &handles {
+            if let Some(snapshot) = self.snapshot_agent(*id) {
                 agents.push(snapshot);
             }
         }
+
+        for id in &handles {
+            if let Some(runtime) = self.runtime.get_mut(*id) {
+                runtime.food_balance_total += runtime.food_delta;
+            }
+        }
+
+        let births = if lifecycle_enabled {
+            std::mem::take(&mut self.pending_birth_records)
+        } else if analytics.lifecycle_events == 0 {
+            self.pending_birth_records.clear();
+            Vec::new()
+        } else {
+            Vec::new()
+        };
+
+        let deaths = if lifecycle_enabled {
+            std::mem::take(&mut self.pending_death_records)
+        } else if analytics.lifecycle_events == 0 {
+            self.pending_death_records.clear();
+            Vec::new()
+        } else {
+            Vec::new()
+        };
 
         let batch = PersistenceBatch {
             summary: summary.clone(),
@@ -4523,6 +4902,8 @@ impl WorldState {
             metrics,
             events,
             agents,
+            births,
+            deaths,
         };
         self.persistence.on_tick(&batch);
         if self.history.len() >= self.config.history_capacity {
@@ -4533,6 +4914,8 @@ impl WorldState {
         self.last_deaths = 0;
         self.carcass_health_distributed = 0.0;
         self.carcass_reproduction_bonus = 0.0;
+        self.combat_spike_attempts = 0;
+        self.combat_spike_hits = 0;
     }
 
     /// Execute one simulation tick pipeline returning emitted events.
@@ -4843,6 +5226,38 @@ mod tests {
             "expected default food_waste_rate to mirror legacy FOODWASTE (0.001)"
         );
         assert!(
+            (config.food_fertility_base - 0.2).abs() < f32::EPSILON,
+            "expected default food_fertility_base to match new terrain baseline (0.2)"
+        );
+        assert!(
+            (config.food_moisture_weight - 0.6).abs() < f32::EPSILON,
+            "expected default food_moisture_weight to match design weight (0.6)"
+        );
+        assert!(
+            (config.food_elevation_weight - 0.4).abs() < f32::EPSILON,
+            "expected default food_elevation_weight to match design weight (0.4)"
+        );
+        assert!(
+            (config.food_slope_weight - 6.0).abs() < f32::EPSILON,
+            "expected default food_slope_weight to match design weight (6.0)"
+        );
+        assert!(
+            (config.food_capacity_base - 0.3).abs() < f32::EPSILON,
+            "expected default food_capacity_base to match design baseline (0.3)"
+        );
+        assert!(
+            (config.food_capacity_fertility - 0.6).abs() < f32::EPSILON,
+            "expected default food_capacity_fertility to match design scale (0.6)"
+        );
+        assert!(
+            (config.food_growth_fertility - 0.7).abs() < f32::EPSILON,
+            "expected default food_growth_fertility to match design scale (0.7)"
+        );
+        assert!(
+            (config.food_decay_infertility - 0.5).abs() < f32::EPSILON,
+            "expected default food_decay_infertility to match design scale (0.5)"
+        );
+        assert!(
             (config.food_transfer_rate - 0.001).abs() < f32::EPSILON,
             "expected default food_transfer_rate to mirror legacy FOODTRANSFER (0.001)"
         );
@@ -4853,6 +5268,10 @@ mod tests {
         assert!(
             (config.reproduction_energy_threshold - 0.65).abs() < f32::EPSILON,
             "expected default reproduction_energy_threshold to mirror legacy health gate (0.65)"
+        );
+        assert!(
+            (config.reproduction_fertility_bonus - 0.5).abs() < f32::EPSILON,
+            "expected default reproduction_fertility_bonus to match design scale (0.5)"
         );
         assert!(
             config.reproduction_energy_cost <= config.reproduction_energy_threshold,
@@ -5692,7 +6111,7 @@ mod tests {
         }
 
         world.pending_deaths.push(victim);
-        world.stage_death_cleanup();
+        world.stage_death_cleanup(Tick::zero());
 
         assert!(
             !world.agents().contains(victim),
@@ -5777,7 +6196,7 @@ mod tests {
         }
 
         world.pending_deaths.push(victim);
-        world.stage_death_cleanup();
+        world.stage_death_cleanup(Tick::zero());
         world.stage_persistence(Tick(1));
 
         let entries = logs.lock().unwrap();
@@ -5812,7 +6231,7 @@ mod tests {
 
     #[test]
     fn herbivores_gain_energy_from_ground_food() {
-        let config = ScriptBotsConfig {
+        let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 200,
             world_height: 200,
             food_cell_size: 10,
@@ -5822,9 +6241,8 @@ mod tests {
             movement_drain: 0.0,
             rng_seed: Some(11),
             ..ScriptBotsConfig::default()
-        };
-
-        let mut world = WorldState::new(config).expect("world");
+        })
+        .expect("world");
         let agent = world.spawn_agent(sample_agent(0));
 
         {
@@ -5845,27 +6263,33 @@ mod tests {
             *cell = 0.2;
         }
 
+        let profile = world.food_profiles[0];
+        let nutrient_density = profile.nutrient_density;
         world.stage_food();
 
         let runtime = world.agent_runtime(agent).unwrap();
         let config = world.config();
+        let fertility_multiplier = 1.0 + profile.fertility * config.reproduction_fertility_bonus;
         let expected_speed_scale = ((1.0_f32 - 0.0_f32).clamp(0.0, 1.0) * 0.7) + 0.3;
         let expected_intake = config.food_intake_rate * expected_speed_scale;
+        let expected_energy_gain = expected_intake * (0.5 + nutrient_density * 0.5);
         assert!(
-            (runtime.energy - (0.5 + expected_intake)).abs() < 1e-6,
-            "expected herbivore energy gain of {expected_intake:.6}, got {}",
+            (runtime.energy - (0.5 + expected_energy_gain)).abs() < 1e-6,
+            "expected herbivore energy gain of {expected_energy_gain:.6}, got {}",
             runtime.energy - 0.5
         );
         assert!(
-            (runtime.food_delta - expected_intake).abs() < 1e-6,
-            "expected food_delta to match intake ({expected_intake:.6}), got {}",
+            (runtime.food_delta - expected_energy_gain).abs() < 1e-6,
+            "expected food_delta to match energy gain ({expected_energy_gain:.6}), got {}",
             runtime.food_delta
         );
         assert!(
-            (runtime.reproduction_counter - expected_intake * config.reproduction_food_bonus).abs()
+            (runtime.reproduction_counter
+                - expected_intake * config.reproduction_food_bonus * fertility_multiplier)
+                .abs()
                 < 1e-6,
             "expected reproduction counter bonus of {:.6}, got {}",
-            expected_intake * config.reproduction_food_bonus,
+            expected_intake * config.reproduction_food_bonus * fertility_multiplier,
             runtime.reproduction_counter
         );
         let cell_value = world.food().get(0, 0).unwrap();
@@ -5880,7 +6304,7 @@ mod tests {
 
     #[test]
     fn carnivores_only_waste_ground_food() {
-        let config = ScriptBotsConfig {
+        let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 200,
             world_height: 200,
             food_cell_size: 10,
@@ -5890,9 +6314,8 @@ mod tests {
             movement_drain: 0.0,
             rng_seed: Some(42),
             ..ScriptBotsConfig::default()
-        };
-
-        let mut world = WorldState::new(config).expect("world");
+        })
+        .expect("world");
         let agent = world.spawn_agent(sample_agent(1));
 
         {
@@ -5935,6 +6358,161 @@ mod tests {
             "expected ground food to waste down to {:.6}, got {:.6}",
             expected_cell,
             cell_value
+        );
+    }
+
+    #[test]
+    fn fertile_terrain_accelerates_regrowth() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            rng_seed: Some(123),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let profiles = world.food_profiles.clone();
+        assert!(
+            !profiles.is_empty(),
+            "expected food profiles to be populated"
+        );
+        let (fertile_idx, infertile_idx) =
+            profiles
+                .iter()
+                .enumerate()
+                .fold((0usize, 0usize), |acc, (idx, profile)| {
+                    let (fertile, infertile) = acc;
+                    let fertile = if profile.fertility > profiles[fertile].fertility {
+                        idx
+                    } else {
+                        fertile
+                    };
+                    let infertile = if profile.fertility < profiles[infertile].fertility {
+                        idx
+                    } else {
+                        infertile
+                    };
+                    (fertile, infertile)
+                });
+        assert!(
+            profiles[fertile_idx].fertility > profiles[infertile_idx].fertility + 0.05,
+            "expected noticeable fertility variation between sampled cells"
+        );
+
+        {
+            let cells = world.food_mut().cells_mut();
+            cells[fertile_idx] = 0.1;
+            cells[infertile_idx] = 0.1;
+        }
+
+        world.apply_food_regrowth();
+
+        let cells = world.food().cells();
+        let fertile_value = cells[fertile_idx];
+        let infertile_value = cells[infertile_idx];
+        assert!(
+            fertile_value > infertile_value + 1e-4,
+            "fertile cell should regrow faster ({} <= {})",
+            fertile_value,
+            infertile_value
+        );
+        assert!(
+            fertile_value <= profiles[fertile_idx].capacity + 1e-6,
+            "fertile cell should respect capacity"
+        );
+    }
+
+    #[test]
+    fn fertile_cells_boost_reproduction_from_grazing() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            rng_seed: Some(456),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let food_width = world.food().width() as usize;
+        assert!(food_width > 0);
+        let profiles = world.food_profiles.clone();
+        let (fertile_idx, infertile_idx) =
+            profiles
+                .iter()
+                .enumerate()
+                .fold((0usize, 0usize), |acc, (idx, profile)| {
+                    let (fertile, infertile) = acc;
+                    let fertile = if profile.fertility > profiles[fertile].fertility {
+                        idx
+                    } else {
+                        fertile
+                    };
+                    let infertile = if profile.fertility < profiles[infertile].fertility {
+                        idx
+                    } else {
+                        infertile
+                    };
+                    (fertile, infertile)
+                });
+        assert!(
+            profiles[fertile_idx].fertility > profiles[infertile_idx].fertility + 0.05,
+            "expected noticeable fertility variation between sampled cells"
+        );
+
+        let fertile_pos = {
+            let x = (fertile_idx % food_width) as f32;
+            let y = (fertile_idx / food_width) as f32;
+            let cell = world.config().food_cell_size as f32;
+            Position::new(x * cell + cell * 0.5, y * cell + cell * 0.5)
+        };
+        let infertile_pos = {
+            let x = (infertile_idx % food_width) as f32;
+            let y = (infertile_idx / food_width) as f32;
+            let cell = world.config().food_cell_size as f32;
+            Position::new(x * cell + cell * 0.5, y * cell + cell * 0.5)
+        };
+
+        let fertile_agent = world.spawn_agent(sample_agent(2));
+        let infertile_agent = world.spawn_agent(sample_agent(3));
+        {
+            let arena = world.agents_mut();
+            let fertile_slot = arena.index_of(fertile_agent).unwrap();
+            let infertile_slot = arena.index_of(infertile_agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[fertile_slot] = fertile_pos;
+            columns.positions_mut()[infertile_slot] = infertile_pos;
+        }
+        for agent in [fertile_agent, infertile_agent] {
+            if let Some(runtime) = world.agent_runtime_mut(agent) {
+                runtime.energy = 0.5;
+                runtime.reproduction_counter = 0.0;
+                runtime.herbivore_tendency = 1.0;
+                runtime.outputs = [0.0; OUTPUT_SIZE];
+            }
+        }
+        {
+            let cells = world.food_mut().cells_mut();
+            cells[fertile_idx] = 0.2;
+            cells[infertile_idx] = 0.2;
+        }
+
+        world.stage_food();
+
+        let fertile_runtime = world.agent_runtime(fertile_agent).unwrap();
+        let infertile_runtime = world.agent_runtime(infertile_agent).unwrap();
+
+        assert!(
+            fertile_runtime.energy > infertile_runtime.energy + 1e-4,
+            "fertile terrain should yield more grazing energy"
+        );
+        assert!(
+            fertile_runtime.reproduction_counter > infertile_runtime.reproduction_counter + 1e-4,
+            "fertile terrain should advance reproduction counter more quickly"
         );
     }
 
@@ -6217,7 +6795,7 @@ mod tests {
         world.pending_deaths.push(ids[3]);
         world.pending_deaths.push(ids[1]);
 
-        world.stage_death_cleanup();
+        world.stage_death_cleanup(Tick::zero());
 
         let survivors: Vec<_> = world.agents().iter_handles().collect();
         assert_eq!(survivors, vec![ids[0], ids[2]]);
