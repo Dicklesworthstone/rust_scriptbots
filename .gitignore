@@ -5,3 +5,6 @@ Cargo.lock
 .vscode
 .DS_Store
 codex_log.txt
+toolchains/windows/
+scriptbots.db
+toolchains/

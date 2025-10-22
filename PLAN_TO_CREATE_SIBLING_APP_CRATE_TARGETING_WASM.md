@@ -89,18 +89,21 @@
 
 ## Phase 2 · Sibling Crate Scaffolding
 
-### 2.1 Workspace Updates (planned, not yet executed)
+### 2.1 Workspace Updates [Currently In Progress — 2025-10-22 Codex]
 - Add new member: `crates/scriptbots-web` (binary or lib crate exporting wasm bindings).
 - Provide README within crate describing build/run steps.
 - Ensure crate uses feature flags to opt out of native-only deps (`default-features = false` when importing).
+  - [2025-10-22 Codex] Added `scriptbots-web` crate skeleton exporting wasm-bindgen bindings; gated to `wasm32` so native checks pass while scaffolding evolves.
 
-### 2.2 `wasm-bindgen` Interface Design
+### 2.2 `wasm-bindgen` Interface Design [Currently In Progress — 2025-10-22 Codex]
 - Define minimal API surface:
   - `init_sim(config_json: JsValue) -> Result<SimHandle>`
   - `tick(handle: SimHandle, delta_ticks: u32) -> JsValue /* snapshot */`
   - `reset(handle, seed)`
 - Outline serialization format (likely `serde_wasm_bindgen` with compact binary option later).
 - Document error handling expectations (convert `anyhow` to `JsError`).
+  - [2025-10-22 Codex] Implemented initial bindings in `scriptbots-web`: `SimHandle` wraps the core world, exposes `init_sim`, `tick`, `snapshot`, and `reset`, returns structured snapshots (agents + summary + world metadata), validates seeds/population, and maps errors to `JsError`.
+  - [2025-10-22 Codex] Added optional config overrides in `InitOptions` and ensured initial seeding binds lightweight wander brains so agents animate under wasm even without native brain crates.
 
 ### 2.3 Threading Strategy
 - Path A (initial): run core simulation single-threaded by feature gating Rayon (e.g., `cfg(not(target_arch = "wasm32"))` in consumer crate only).

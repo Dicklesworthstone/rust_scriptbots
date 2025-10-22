@@ -1,6 +1,26 @@
 [build]
 target = "x86_64-unknown-linux-gnu"
-rustflags = ["-C","link-arg=-fuse-ld=mold","-C","target-cpu=native"]
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
+rustflags = ["-C","link-arg=-fuse-ld=mold","-C","target-cpu=native"]
+
+[env]
+CC_x86_64_pc_windows_gnullvm = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang"
+CXX_x86_64_pc_windows_gnullvm = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang++"
+AR_x86_64_pc_windows_gnullvm = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/llvm-ar"
+CXXFLAGS_x86_64_pc_windows_gnullvm = "-isystem /data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/x86_64-w64-mingw32/include/c++/v1"
+GPUI_FXC_PATH = "/data/projects/rust_scriptbots/toolchains/windows/bin/fxc-wrapper"
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang"
+ar = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/llvm-ar"
+
+[target.x86_64-pc-windows-gnullvm.env]
+CC = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang"
+CXX = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang++"
+AR = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/llvm-ar"
+CC_X86_64_PC_WINDOWS_GNULLVM = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang"
+CXX_X86_64_PC_WINDOWS_GNULLVM = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang++"
+AR_X86_64_PC_WINDOWS_GNULLVM = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/llvm-ar"
+CXXFLAGS_X86_64_PC_WINDOWS_GNULLVM = "-isystem /data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/x86_64-w64-mingw32/include/c++/v1"

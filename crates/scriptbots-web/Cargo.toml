@@ -1,0 +1,16 @@
+[package]
+name = "scriptbots-web"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde-wasm-bindgen = { workspace = true }
+wasm-bindgen = { workspace = true }
+rand = { workspace = true }
+scriptbots-core = { path = "../scriptbots-core", default-features = false }
+slotmap = { workspace = true }

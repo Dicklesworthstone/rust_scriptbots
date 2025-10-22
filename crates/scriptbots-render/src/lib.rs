@@ -107,6 +107,7 @@ struct SimulationView {
     shift_inspect: bool,
     bindings: InputBindings,
     key_capture: Option<CommandAction>,
+    settings_panel: SettingsPanelState,
     #[cfg(feature = "audio")]
     audio: Option<AudioState>,
 }
@@ -137,6 +138,7 @@ impl SimulationView {
             last_sim_instant: Some(Instant::now()),
             shift_inspect: false,
             bindings: InputBindings::default(),
+            settings_panel: SettingsPanelState::default(),
             key_capture: None,
             #[cfg(feature = "audio")]
             audio: AudioState::new()
@@ -1301,7 +1303,44 @@ impl SimulationView {
             CommandAction::ClearSelection => self.clear_selection(cx),
             CommandAction::SelectAll => self.select_all_agents(cx),
             CommandAction::FocusFirstSelected => self.focus_first_selected(cx),
+            CommandAction::ToggleSettings => self.toggle_settings(cx),
         }
+    }
+
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_panel.open = !self.settings_panel.open;
+
+        // Reset scroll position when opening panel
+        if self.settings_panel.open {
+            self.settings_panel.scroll_offset = 0.0;
+        }
+
+        info!(open = self.settings_panel.open, "Settings panel toggled");
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
+        cx.notify();
+    }
+
+    fn toggle_category_collapse(&mut self, category: ConfigCategory, cx: &mut Context<Self>) {
+        if let Some(pos) = self
+            .settings_panel
+            .collapsed_categories
+            .iter()
+            .position(|c| *c == category)
+        {
+            // Category is collapsed, expand it
+            self.settings_panel.collapsed_categories.remove(pos);
+        } else {
+            // Category is expanded, collapse it
+            self.settings_panel.collapsed_categories.push(category);
+        }
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
+        cx.notify();
     }
 
     fn toggle_brush_state(&mut self, cx: &mut Context<Self>) {
@@ -3887,6 +3926,791 @@ impl SimulationView {
 
         card
     }
+
+    fn render_settings_panel(&self, cx: &mut Context<Self>) -> Div {
+        // Modern, world-class settings panel with beautiful design
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .bg(rgb(0x0f172a))
+            .opacity(0.75)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // Click backdrop to close panel (standard modal UX)
+                    this.toggle_settings(cx);
+                }),
+            );
+
+        let panel = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .bottom(px(0.0))
+            .w(px(540.0))
+            .bg(rgb(0x0f172a))
+            .border_r_1()
+            .border_color(rgb(0x334155))
+            .shadow_xl()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    // Prevent clicks on panel from propagating to backdrop
+                    cx.stop_propagation();
+                }),
+            );
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_6()
+            .py_4()
+            .border_b_1()
+            .border_color(rgb(0x334155))
+            .bg(rgb(0x1e293b))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().text_2xl().child("⚙️"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .text_color(rgb(0xf1f5f9))
+                                    .child("Configuration"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x94a3b8))
+                                    .child("Simulation parameters & settings"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(0x334155))
+                    .text_sm()
+                    .text_color(rgb(0xf1f5f9))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x475569)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_settings(cx);
+                        }),
+                    )
+                    .child("✕"),
+            );
+
+        let search_bar = div()
+            .px_6()
+            .py_4()
+            .border_b_1()
+            .border_color(rgb(0x334155))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded_lg()
+                    .bg(rgb(0x1e293b))
+                    .border_1()
+                    .border_color(rgb(0x475569))
+                    .child(div().text_color(rgb(0x94a3b8)).child("🔍"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x94a3b8))
+                            .child("Search parameters..."),
+                    ),
+            );
+
+        // Scrollable container for categories with mouse wheel handling
+        let scroll_offset = self.settings_panel.scroll_offset;
+        let categories_content = div()
+            .flex_1()
+            .overflow_hidden()
+            .relative()
+            .px_6()
+            .py_4()
+            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                // Handle scroll wheel to update offset
+                let scroll_delta = match event.delta {
+                    ScrollDelta::Pixels(delta) => f32::from(delta.y),
+                    ScrollDelta::Lines(lines) => lines.y * 20.0, // ~20px per line
+                };
+
+                // Update scroll offset (negative delta = scroll down = content moves up)
+                this.settings_panel.scroll_offset =
+                    (this.settings_panel.scroll_offset - scroll_delta).max(0.0);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-scroll_offset))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .child(self.render_all_config_categories(cx)),
+            );
+
+        let panel_content = panel
+            .child(header)
+            .child(search_bar)
+            .child(categories_content);
+
+        div()
+            .absolute()
+            .inset_0()
+            .child(backdrop)
+            .child(panel_content)
+    }
+
+    fn render_all_config_categories(&self, cx: &mut Context<Self>) -> Div {
+        let mut container = div().flex().flex_col().gap_4();
+
+        for category in ConfigCategory::all() {
+            container = container.child(self.render_config_category(category, cx));
+        }
+
+        container
+    }
+
+    fn render_config_category(&self, category: ConfigCategory, cx: &mut Context<Self>) -> Div {
+        let is_collapsed = self.settings_panel.collapsed_categories.contains(&category);
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .bg(rgb(0x1e293b))
+            .border_1()
+            .border_color(rgb(0x334155))
+            .hover(|s| s.bg(rgb(0x334155)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.toggle_category_collapse(category, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().text_xl().child(category.icon()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .text_color(rgb(0xf1f5f9))
+                                    .child(category.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x94a3b8))
+                                    .child(category.description()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x94a3b8))
+                    .child(if is_collapsed { "▶" } else { "▼" }),
+            );
+
+        let mut category_div = div().flex().flex_col().gap_2().child(header);
+
+        if !is_collapsed {
+            category_div = category_div.child(self.render_category_parameters(category, cx));
+        }
+
+        category_div
+    }
+
+    fn render_category_parameters(&self, category: ConfigCategory, cx: &mut Context<Self>) -> Div {
+        let params_container = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .px_4()
+            .py_4()
+            .rounded_lg()
+            .bg(rgb(0x0f172a))
+            .border_1()
+            .border_color(rgb(0x1e293b));
+
+        // Read current config from world
+        let config = if let Ok(world) = self.world.lock() {
+            world.config().clone()
+        } else {
+            scriptbots_core::ScriptBotsConfig::default()
+        };
+
+        let mut container = params_container;
+
+        // Add parameters based on category
+        container = match category {
+            ConfigCategory::World => container
+                .child(self.render_param_readonly(
+                    "World Width",
+                    &format!("{} units", config.world_width),
+                    "Horizontal extent of the simulation world",
+                ))
+                .child(self.render_param_readonly(
+                    "World Height",
+                    &format!("{} units", config.world_height),
+                    "Vertical extent of the simulation world",
+                ))
+                .child(self.render_param_readonly(
+                    "Food Cell Size",
+                    &format!("{} units", config.food_cell_size),
+                    "Size of each food grid cell",
+                ))
+                .child(self.render_param_readonly(
+                    "Initial Food",
+                    &self.format_float(config.initial_food, 3),
+                    "Starting food in each cell",
+                ))
+                .child(
+                    self.render_param_readonly(
+                        "RNG Seed",
+                        &config
+                            .rng_seed
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "Random".to_string()),
+                        "Random number generator seed",
+                    ),
+                )
+                .child(self.render_param_readonly(
+                    "Chart Flush Interval",
+                    &format!("{} ticks", config.chart_flush_interval),
+                    "History chart update frequency",
+                )),
+
+            ConfigCategory::Food => container
+                .child(self.render_param_readonly(
+                    "Respawn Interval",
+                    &format!("{} ticks", config.food_respawn_interval),
+                    "Ticks between food respawn events",
+                ))
+                .child(self.render_param_readonly(
+                    "Respawn Amount",
+                    &self.format_float(config.food_respawn_amount, 3),
+                    "Food added per respawn",
+                ))
+                .child(self.render_param_readonly(
+                    "Maximum Food",
+                    &self.format_float(config.food_max, 3),
+                    "Maximum food per cell",
+                ))
+                .child(self.render_param_readonly(
+                    "Growth Rate",
+                    &self.format_float(config.food_growth_rate, 4),
+                    "Logistic regrowth rate",
+                ))
+                .child(self.render_param_readonly(
+                    "Decay Rate",
+                    &self.format_float(config.food_decay_rate, 4),
+                    "Proportional decay rate",
+                ))
+                .child(self.render_param_readonly(
+                    "Diffusion Rate",
+                    &self.format_float(config.food_diffusion_rate, 3),
+                    "Neighbor exchange rate",
+                ))
+                .child(self.render_param_readonly(
+                    "Intake Rate",
+                    &self.format_float(config.food_intake_rate, 3),
+                    "Agent food consumption rate",
+                ))
+                .child(self.render_param_readonly(
+                    "Sharing Radius",
+                    &self.format_float(config.food_sharing_radius, 1),
+                    "Friendly neighbor sharing distance",
+                ))
+                .child(self.render_param_readonly(
+                    "Sharing Rate",
+                    &self.format_float(config.food_sharing_rate, 3),
+                    "Energy fraction shared per neighbor",
+                ))
+                .child(self.render_param_readonly(
+                    "Transfer Rate",
+                    &self.format_float(config.food_transfer_rate, 4),
+                    "Altruistic sharing amount",
+                ))
+                .child(self.render_param_readonly(
+                    "Sharing Distance",
+                    &self.format_float(config.food_sharing_distance, 1),
+                    "Altruistic sharing threshold",
+                )),
+
+            ConfigCategory::Agent => container
+                .child(self.render_param_readonly(
+                    "Bot Speed",
+                    &self.format_float(config.bot_speed, 2),
+                    "Base wheel speed multiplier",
+                ))
+                .child(self.render_param_readonly(
+                    "Bot Radius",
+                    &self.format_float(config.bot_radius, 1),
+                    "Agent radius for collisions",
+                ))
+                .child(self.render_param_readonly(
+                    "Boost Multiplier",
+                    &format!("{}×", self.format_float(config.boost_multiplier, 2)),
+                    "Speed boost when activated",
+                ))
+                .child(self.render_param_readonly(
+                    "Sense Radius",
+                    &self.format_float(config.sense_radius, 1),
+                    "Perception range",
+                ))
+                .child(self.render_param_readonly(
+                    "Max Neighbors",
+                    &self.format_float(config.sense_max_neighbors, 0),
+                    "Normalization factor",
+                ))
+                .child(self.render_param_readonly(
+                    "Carnivore Threshold",
+                    &self.format_float(config.carnivore_threshold, 2),
+                    "Herbivore tendency cutoff for carnivores",
+                )),
+
+            ConfigCategory::Metabolism => container
+                .child(self.render_param_readonly(
+                    "Base Drain",
+                    &format!("{:.4}", config.metabolism_drain),
+                    "Baseline energy cost",
+                ))
+                .child(self.render_param_readonly(
+                    "Movement Drain",
+                    &format!("{:.4}", config.movement_drain),
+                    "Cost per velocity",
+                ))
+                .child(self.render_param_readonly(
+                    "Ramp Floor",
+                    &format!("{:.2}", config.metabolism_ramp_floor),
+                    "Energy level for ramping",
+                ))
+                .child(self.render_param_readonly(
+                    "Ramp Rate",
+                    &format!("{:.4}", config.metabolism_ramp_rate),
+                    "Additional drain above floor",
+                ))
+                .child(self.render_param_readonly(
+                    "Boost Penalty",
+                    &format!("{:.4}", config.metabolism_boost_penalty),
+                    "Fixed boost cost",
+                )),
+
+            ConfigCategory::Temperature => container
+                .child(self.render_param_readonly(
+                    "Discomfort Rate",
+                    &format!("{:.4}", config.temperature_discomfort_rate),
+                    "Health drain multiplier",
+                ))
+                .child(self.render_param_readonly(
+                    "Comfort Band",
+                    &format!("±{:.3}", config.temperature_comfort_band),
+                    "Tolerance threshold",
+                ))
+                .child(self.render_param_readonly(
+                    "Gradient Exponent",
+                    &format!("{:.2}", config.temperature_gradient_exponent),
+                    "Pole-to-equator shaping",
+                ))
+                .child(self.render_param_readonly(
+                    "Discomfort Exp",
+                    &format!("{:.2}", config.temperature_discomfort_exponent),
+                    "Discomfort scaling power",
+                )),
+
+            ConfigCategory::Reproduction => container
+                .child(self.render_param_readonly(
+                    "Energy Threshold",
+                    &self.format_float(config.reproduction_energy_threshold, 2),
+                    "Required energy to reproduce",
+                ))
+                .child(self.render_param_readonly(
+                    "Energy Cost",
+                    &self.format_float(config.reproduction_energy_cost, 2),
+                    "Parent's energy deduction",
+                ))
+                .child(self.render_param_readonly(
+                    "Cooldown",
+                    &format!("{} ticks", config.reproduction_cooldown),
+                    "Ticks between reproductions",
+                ))
+                .child(self.render_param_readonly(
+                    "Herbivore Rate",
+                    &format!(
+                        "{}×",
+                        self.format_float(config.reproduction_rate_herbivore, 3)
+                    ),
+                    "Herbivore multiplier",
+                ))
+                .child(self.render_param_readonly(
+                    "Carnivore Rate",
+                    &format!(
+                        "{}×",
+                        self.format_float(config.reproduction_rate_carnivore, 3)
+                    ),
+                    "Carnivore multiplier",
+                ))
+                .child(self.render_param_readonly(
+                    "Child Energy",
+                    &self.format_float(config.reproduction_child_energy, 2),
+                    "Starting energy for child",
+                ))
+                .child(self.render_param_readonly(
+                    "Spawn Jitter",
+                    &format!(
+                        "±{}",
+                        self.format_float(config.reproduction_spawn_jitter, 1)
+                    ),
+                    "Position randomization",
+                ))
+                .child(self.render_param_readonly(
+                    "Spawn Back Distance",
+                    &self.format_float(config.reproduction_spawn_back_distance, 1),
+                    "Child spawn distance behind parent",
+                ))
+                .child(self.render_param_readonly(
+                    "Color Jitter",
+                    &format!(
+                        "±{}",
+                        self.format_float(config.reproduction_color_jitter, 3)
+                    ),
+                    "RGB mutation range",
+                ))
+                .child(self.render_param_readonly(
+                    "Mutation Scale",
+                    &self.format_float(config.reproduction_mutation_scale, 4),
+                    "Trait mutation magnitude",
+                ))
+                .child(self.render_param_readonly(
+                    "Partner Chance",
+                    &format!(
+                        "{}%",
+                        self.format_float(config.reproduction_partner_chance * 100.0, 1)
+                    ),
+                    "Crossover probability",
+                ))
+                .child(self.render_param_readonly(
+                    "Gene Log Capacity",
+                    &format!("{}", config.reproduction_gene_log_capacity),
+                    "Max gene history entries",
+                ))
+                .child(self.render_param_readonly(
+                    "Meta-Mutation Chance",
+                    &format!(
+                        "{}%",
+                        self.format_float(config.reproduction_meta_mutation_chance * 100.0, 1)
+                    ),
+                    "Mutation rate mutation chance",
+                ))
+                .child(self.render_param_readonly(
+                    "Meta-Mutation Scale",
+                    &self.format_float(config.reproduction_meta_mutation_scale, 4),
+                    "Mutation rate change magnitude",
+                )),
+
+            ConfigCategory::Aging => container
+                .child(self.render_param_readonly(
+                    "Decay Start Age",
+                    &format!("{} ticks", config.aging_health_decay_start),
+                    "Age when decay begins",
+                ))
+                .child(self.render_param_readonly(
+                    "Decay Rate",
+                    &format!("{:.5}", config.aging_health_decay_rate),
+                    "Health loss per tick",
+                ))
+                .child(self.render_param_readonly(
+                    "Decay Max",
+                    &format!("{:.4}", config.aging_health_decay_max),
+                    "Maximum decay per tick",
+                ))
+                .child(self.render_param_readonly(
+                    "Energy Penalty",
+                    &format!("{:.3}×", config.aging_energy_penalty_rate),
+                    "Health-to-energy conversion",
+                )),
+
+            ConfigCategory::Combat => container
+                .child(self.render_param_readonly(
+                    "Spike Radius",
+                    &format!("{:.1}", config.spike_radius),
+                    "Base spike collision radius",
+                ))
+                .child(self.render_param_readonly(
+                    "Spike Damage",
+                    &format!("{:.2}", config.spike_damage),
+                    "Damage at full power",
+                ))
+                .child(self.render_param_readonly(
+                    "Spike Energy Cost",
+                    &format!("{:.4}", config.spike_energy_cost),
+                    "Energy cost to deploy",
+                ))
+                .child(self.render_param_readonly(
+                    "Min Length",
+                    &format!("{:.2}", config.spike_min_length),
+                    "Minimum for damage",
+                ))
+                .child(self.render_param_readonly(
+                    "Alignment Cosine",
+                    &format!("{:.2}", config.spike_alignment_cosine),
+                    "Directional threshold",
+                ))
+                .child(self.render_param_readonly(
+                    "Speed Bonus",
+                    &format!("{:.3}×", config.spike_speed_damage_bonus),
+                    "Velocity scaling",
+                ))
+                .child(self.render_param_readonly(
+                    "Length Bonus",
+                    &format!("{:.3}×", config.spike_length_damage_bonus),
+                    "Length scaling",
+                ))
+                .child(self.render_param_readonly(
+                    "Growth Rate",
+                    &format!("{:.4}", config.spike_growth_rate),
+                    "Spike extension rate",
+                )),
+
+            ConfigCategory::Carcass => container
+                .child(self.render_param_readonly(
+                    "Distribution Radius",
+                    &self.format_float(config.carcass_distribution_radius, 1),
+                    "Reward share distance",
+                ))
+                .child(self.render_param_readonly(
+                    "Health Reward",
+                    &self.format_float(config.carcass_health_reward, 2),
+                    "Base health given",
+                ))
+                .child(self.render_param_readonly(
+                    "Reproduction Reward",
+                    &self.format_float(config.carcass_reproduction_reward, 1),
+                    "Cooldown reduction",
+                ))
+                .child(self.render_param_readonly(
+                    "Neighbor Exponent",
+                    &self.format_float(config.carcass_neighbor_exponent, 2),
+                    "Sharing normalization",
+                ))
+                .child(self.render_param_readonly(
+                    "Maturity Age",
+                    &format!("{} ticks", config.carcass_maturity_age),
+                    "Full reward age",
+                ))
+                .child(self.render_param_readonly(
+                    "Energy Share",
+                    &format!(
+                        "{}%",
+                        self.format_float(config.carcass_energy_share_rate * 100.0, 1)
+                    ),
+                    "Health-to-energy conversion",
+                ))
+                .child(self.render_param_readonly(
+                    "Indicator Scale",
+                    &self.format_float(config.carcass_indicator_scale, 2),
+                    "Visual pulse intensity",
+                )),
+
+            ConfigCategory::Topography => container
+                .child(self.render_param_toggle(
+                    "Enabled",
+                    config.topography_enabled,
+                    "Enable terrain elevation effects",
+                    cx,
+                ))
+                .child(self.render_param_readonly(
+                    "Speed Gain",
+                    &format!("{:.3}", config.topography_speed_gain),
+                    "Downhill boost per unit slope",
+                ))
+                .child(self.render_param_readonly(
+                    "Energy Penalty",
+                    &format!("{:.4}", config.topography_energy_penalty),
+                    "Uphill cost per unit slope",
+                )),
+
+            ConfigCategory::Population => container
+                .child(self.render_param_readonly(
+                    "Minimum Population",
+                    &format!("{}", config.population_minimum),
+                    "Auto-seed threshold",
+                ))
+                .child(self.render_param_readonly(
+                    "Spawn Interval",
+                    &format!("{} ticks", config.population_spawn_interval),
+                    "Ticks between spawns",
+                ))
+                .child(self.render_param_readonly(
+                    "Spawn Count",
+                    &format!("{}", config.population_spawn_count),
+                    "Agents per interval",
+                ))
+                .child(self.render_param_readonly(
+                    "Crossover Chance",
+                    &format!("{:.1}%", config.population_crossover_chance * 100.0),
+                    "Breed vs. random spawn",
+                )),
+
+            ConfigCategory::Persistence => container
+                .child(self.render_param_readonly(
+                    "Interval",
+                    &format!("{} ticks", config.persistence_interval),
+                    "Database flush frequency",
+                ))
+                .child(self.render_param_readonly(
+                    "History Capacity",
+                    &format!("{}", config.history_capacity),
+                    "In-memory tick summaries",
+                )),
+        };
+
+        container
+    }
+
+    /// Helper to safely format floats with NaN/Inf guards
+    fn format_float(&self, value: f32, precision: usize) -> String {
+        if !value.is_finite() {
+            if value.is_nan() {
+                "NaN".to_string()
+            } else if value.is_infinite() {
+                if value.is_sign_positive() {
+                    "∞".to_string()
+                } else {
+                    "-∞".to_string()
+                }
+            } else {
+                "ERR".to_string()
+            }
+        } else {
+            format!("{:.prec$}", value, prec = precision)
+        }
+    }
+
+    fn render_param_readonly(&self, label: &str, value: &str, description: &str) -> Div {
+        let label_owned = label.to_string();
+        let value_owned = value.to_string();
+        let description_owned = description.to_string();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .py_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(rgb(0xf1f5f9)).child(label_owned))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x1e293b))
+                            .border_1()
+                            .border_color(rgb(0x334155))
+                            .text_sm()
+                            .text_color(rgb(0x60a5fa))
+                            .child(value_owned),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(description_owned),
+            )
+    }
+
+    fn render_param_toggle(
+        &self,
+        label: &str,
+        enabled: bool,
+        description: &str,
+        _cx: &mut Context<Self>,
+    ) -> Div {
+        let label_owned = label.to_string();
+        let description_owned = description.to_string();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .py_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(rgb(0xf1f5f9)).child(label_owned))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if enabled {
+                                rgb(0x166534)
+                            } else {
+                                rgb(0x7f1d1d)
+                            })
+                            .border_1()
+                            .border_color(if enabled {
+                                rgb(0x22c55e)
+                            } else {
+                                rgb(0xef4444)
+                            })
+                            .text_sm()
+                            .text_color(if enabled {
+                                rgb(0x86efac)
+                            } else {
+                                rgb(0xfca5a5)
+                            })
+                            .child(if enabled { "ON" } else { "OFF" }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(description_owned),
+            )
+    }
 }
 
 impl Render for SimulationView {
@@ -3928,6 +4752,11 @@ impl Render for SimulationView {
         self.update_audio(&snapshot);
 
         content = content.child(self.render_perf_overlay(perf_snapshot));
+
+        if self.settings_panel.open {
+            content = content.child(self.render_settings_panel(cx));
+        }
+
         content
     }
 }
@@ -4290,6 +5119,128 @@ struct InspectorSnapshot {
     persistence_cached_interval: u32,
 }
 
+/// Settings panel state for configuration management
+#[derive(Clone)]
+struct SettingsPanelState {
+    open: bool,
+    /// Search query for filtering parameters (future feature)
+    #[allow(dead_code)]
+    search_query: String,
+    /// Currently active/focused category (future feature for single-category view)
+    #[allow(dead_code)]
+    active_category: Option<ConfigCategory>,
+    /// List of collapsed categories (hidden parameters)
+    collapsed_categories: Vec<ConfigCategory>,
+    /// List of parameter names that have been modified (future feature for change tracking)
+    #[allow(dead_code)]
+    modified_params: Vec<String>,
+    /// Name of current preset configuration (future feature for save/load)
+    #[allow(dead_code)]
+    preset_name: String,
+    /// Vertical scroll offset for categories content (in pixels)
+    scroll_offset: f32,
+}
+
+impl Default for SettingsPanelState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            search_query: String::new(),
+            active_category: None,
+            collapsed_categories: Vec::new(),
+            modified_params: Vec::new(),
+            preset_name: "Default".to_string(),
+            scroll_offset: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ConfigCategory {
+    World,
+    Food,
+    Agent,
+    Metabolism,
+    Temperature,
+    Reproduction,
+    Aging,
+    Combat,
+    Carcass,
+    Topography,
+    Population,
+    Persistence,
+}
+
+impl ConfigCategory {
+    fn label(self) -> &'static str {
+        match self {
+            ConfigCategory::World => "World",
+            ConfigCategory::Food => "Food Dynamics",
+            ConfigCategory::Agent => "Agent Behavior",
+            ConfigCategory::Metabolism => "Metabolism & Energy",
+            ConfigCategory::Temperature => "Temperature",
+            ConfigCategory::Reproduction => "Reproduction",
+            ConfigCategory::Aging => "Aging",
+            ConfigCategory::Combat => "Combat & Spikes",
+            ConfigCategory::Carcass => "Carcass Sharing",
+            ConfigCategory::Topography => "Topography",
+            ConfigCategory::Population => "Population Control",
+            ConfigCategory::Persistence => "Data Persistence",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            ConfigCategory::World => "🌍",
+            ConfigCategory::Food => "🌾",
+            ConfigCategory::Agent => "🤖",
+            ConfigCategory::Metabolism => "⚡",
+            ConfigCategory::Temperature => "🌡️",
+            ConfigCategory::Reproduction => "🧬",
+            ConfigCategory::Aging => "⏳",
+            ConfigCategory::Combat => "⚔️",
+            ConfigCategory::Carcass => "🦴",
+            ConfigCategory::Topography => "⛰️",
+            ConfigCategory::Population => "👥",
+            ConfigCategory::Persistence => "💾",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            ConfigCategory::World => "World dimensions and grid configuration",
+            ConfigCategory::Food => "Food spawning, growth, decay, and diffusion",
+            ConfigCategory::Agent => "Agent movement, sensing, and base behavior",
+            ConfigCategory::Metabolism => "Energy consumption and metabolism mechanics",
+            ConfigCategory::Temperature => "Environmental temperature and agent comfort",
+            ConfigCategory::Reproduction => "Reproduction mechanics, mutation, and crossover",
+            ConfigCategory::Aging => "Age-related health decay and penalties",
+            ConfigCategory::Combat => "Spike damage, energy costs, and combat mechanics",
+            ConfigCategory::Carcass => "Death rewards and resource distribution",
+            ConfigCategory::Topography => "Terrain elevation effects on movement",
+            ConfigCategory::Population => "Population maintenance and seeding",
+            ConfigCategory::Persistence => "Database storage and analytics",
+        }
+    }
+
+    fn all() -> Vec<Self> {
+        vec![
+            ConfigCategory::World,
+            ConfigCategory::Food,
+            ConfigCategory::Agent,
+            ConfigCategory::Metabolism,
+            ConfigCategory::Temperature,
+            ConfigCategory::Reproduction,
+            ConfigCategory::Aging,
+            ConfigCategory::Combat,
+            ConfigCategory::Carcass,
+            ConfigCategory::Topography,
+            ConfigCategory::Population,
+            ConfigCategory::Persistence,
+        ]
+    }
+}
+
 #[derive(Clone)]
 struct SelectionEvent {
     tick: u64,
@@ -4451,6 +5402,7 @@ enum CommandAction {
     ClearSelection,
     SelectAll,
     FocusFirstSelected,
+    ToggleSettings,
 }
 
 impl CommandAction {
@@ -4477,6 +5429,7 @@ impl CommandAction {
             CommandAction::ClearSelection => "Clear selection",
             CommandAction::SelectAll => "Select all agents",
             CommandAction::FocusFirstSelected => "Focus first selected agent",
+            CommandAction::ToggleSettings => "Toggle settings panel",
         }
     }
 }
@@ -4572,6 +5525,10 @@ impl Default for InputBindings {
         map.insert(
             CommandAction::FocusFirstSelected,
             Keystroke::parse("ctrl+f").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleSettings,
+            Keystroke::parse(",").unwrap_or_default(),
         );
         Self { map }
     }

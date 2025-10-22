@@ -146,7 +146,7 @@
 - Storage tests:
   - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]citeturn1search0
   - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]citeturn1search0turn1search5
-- Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build.
+- Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build. [Completed - GPT-5 Codex 2025-10-22]
 
 ## Advanced Brain Architecture Strategy
 - Trait hierarchy: extend the `Brain` interface with marker traits (`EvolvableBrain`, `TrainableBrain`, `BatchBrain`) so the world loop can branch on capabilities (e.g., some brains may not support online learning).
@@ -222,7 +222,7 @@
    - Initialize workspace via `create-gpui-app --workspace`.
    - Set up linting (`rustfmt`, `clippy`), choose MSRV (Rust 1.81+) to match GPUI requirement.
 2. **Core Data Structures (Weeks 1-2)**
-   - Port `settings.h` constants into `ScriptBotsConfig`.
+   - Port `settings.h` constants into `ScriptBotsConfig`. [Currently In Progress - GPT-5 Codex 2025-10-22]
    - Implement `Vector2` replacement via `glam::Vec2`.
    - Port agent struct, reproduction, mutation logic with unit tests.
 3. **World Mechanics (Weeks 2-4)**

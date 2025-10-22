@@ -1565,7 +1565,7 @@ impl Default for ScriptBotsConfig {
             world_width: 6_000,
             world_height: 6_000,
             food_cell_size: 60,
-            initial_food: 1.0,
+            initial_food: 0.0,
             rng_seed: None,
             chart_flush_interval: 1_000,
             food_respawn_interval: 15,
@@ -4448,6 +4448,12 @@ mod tests {
                 .iter()
                 .all(|&cell| (cell - 2.0).abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn default_config_constructs_world() {
+        let config = ScriptBotsConfig::default();
+        WorldState::new(config).expect("default config should be valid");
     }
 
     #[test]
