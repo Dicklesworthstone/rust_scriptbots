@@ -98,6 +98,12 @@ struct AgentRow {
     spiked: bool,
     hybrid: bool,
     sound_output: f64,
+    spike_attacker: bool,
+    spike_victim: bool,
+    hit_carnivore: bool,
+    hit_herbivore: bool,
+    hit_by_carnivore: bool,
+    hit_by_herbivore: bool,
 }
 
 #[derive(Default)]
@@ -239,6 +245,12 @@ impl Storage {
                 spiked boolean,
                 hybrid boolean,
                 sound_output double,
+                spike_attacker boolean,
+                spike_victim boolean,
+                hit_carnivore boolean,
+                hit_herbivore boolean,
+                hit_by_carnivore boolean,
+                hit_by_herbivore boolean,
                 primary key (tick, agent_id)
             )",
             [],
@@ -374,19 +386,14 @@ impl Storage {
                 mutation_rate_primary, mutation_rate_secondary,
                 trait_smell, trait_sound, trait_hearing, trait_eye, trait_blood,
                 give_intent, brain_binding,
-                food_delta, spiked, hybrid, sound_output
+                food_delta, spiked, hybrid, sound_output,
+                spike_attacker, spike_victim, hit_carnivore, hit_herbivore, hit_by_carnivore,
+                hit_by_herbivore
             ) values (
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
             )",
         )?;
         for row in rows {
@@ -423,6 +430,12 @@ impl Storage {
                 row.spiked,
                 row.hybrid,
                 row.sound_output,
+                row.spike_attacker,
+                row.spike_victim,
+                row.hit_carnivore,
+                row.hit_herbivore,
+                row.hit_by_carnivore,
+                row.hit_by_herbivore,
             ])?;
         }
         Ok(())
@@ -720,6 +733,12 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {
         spiked: runtime.spiked,
         hybrid: runtime.hybrid,
         sound_output: f64::from(runtime.sound_output),
+        spike_attacker: runtime.combat.spike_attacker,
+        spike_victim: runtime.combat.spike_victim,
+        hit_carnivore: runtime.combat.hit_carnivore,
+        hit_herbivore: runtime.combat.hit_herbivore,
+        hit_by_carnivore: runtime.combat.was_spiked_by_carnivore,
+        hit_by_herbivore: runtime.combat.was_spiked_by_herbivore,
     }
 }
 

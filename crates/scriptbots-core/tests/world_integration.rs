@@ -1,4 +1,7 @@
-use scriptbots_core::{AgentData, BrainRunner, ScriptBotsConfig, Tick, TickSummary, WorldState};
+use scriptbots_core::{
+    AgentData, BrainRunner, NUM_EYES, Position, ScriptBotsConfig, Tick, TickSummary,
+    TraitModifiers, WorldState,
+};
 
 #[test]
 fn seeded_world_advances_deterministically() {
@@ -83,6 +86,182 @@ fn registry_executes_custom_brain() {
             .outputs
             .iter()
             .all(|v| (*v - 0.75).abs() < f32::EPSILON)
+    );
+}
+
+#[test]
+fn combat_records_carnivore_event_flags() {
+    #[derive(Clone)]
+    struct SpikeBrain;
+
+    impl BrainRunner for SpikeBrain {
+        fn kind(&self) -> &'static str {
+            "test.spike"
+        }
+
+        fn tick(
+            &mut self,
+            _inputs: &[f32; scriptbots_core::INPUT_SIZE],
+        ) -> [f32; scriptbots_core::OUTPUT_SIZE] {
+            let mut outputs = [0.0; scriptbots_core::OUTPUT_SIZE];
+            outputs[0] = 1.0;
+            outputs[5] = 1.0;
+            outputs
+        }
+    }
+
+    let config = ScriptBotsConfig {
+        world_width: 240,
+        world_height: 240,
+        initial_food: 0.2,
+        food_max: 1.0,
+        spike_damage: 0.5,
+        ..ScriptBotsConfig::default()
+    };
+    let mut world = WorldState::new(config).expect("world");
+
+    let attacker = AgentData {
+        position: Position::new(80.0, 80.0),
+        heading: 0.0,
+        spike_length: 4.0,
+        ..AgentData::default()
+    };
+
+    let victim = AgentData {
+        position: Position::new(95.0, 80.0),
+        heading: std::f32::consts::PI,
+        ..AgentData::default()
+    };
+
+    let attacker_id = world.spawn_agent(attacker);
+    let victim_id = world.spawn_agent(victim);
+
+    let spike_key = world
+        .brain_registry_mut()
+        .register("test.spike", |_rng| Box::new(SpikeBrain));
+    assert!(world.bind_agent_brain(attacker_id, spike_key));
+    if let Some(runtime) = world.agent_runtime_mut(attacker_id) {
+        runtime.herbivore_tendency = 0.1;
+    }
+    if let Some(runtime) = world.agent_runtime_mut(victim_id) {
+        runtime.herbivore_tendency = 0.9;
+    }
+
+    world.step();
+
+    let attacker_runtime = world.agent_runtime(attacker_id).expect("attacker runtime");
+    assert!(attacker_runtime.combat.spike_attacker);
+    assert!(attacker_runtime.combat.hit_herbivore);
+    assert!(!attacker_runtime.combat.hit_carnivore);
+
+    if let Some(victim_snapshot) = world.snapshot_agent(victim_id) {
+        assert!(
+            victim_snapshot.data.health < 1.0,
+            "victim health should drop after spike"
+        );
+        let victim_runtime = world.agent_runtime(victim_id).expect("victim runtime");
+        assert!(victim_runtime.combat.spike_victim);
+        assert!(victim_runtime.combat.was_spiked_by_carnivore);
+        assert!(!victim_runtime.combat.was_spiked_by_herbivore);
+    }
+}
+
+#[test]
+fn sensory_pipeline_populates_expected_channels() {
+    let config = ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        food_cell_size: 20,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        rng_seed: Some(42),
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        ..ScriptBotsConfig::default()
+    };
+
+    let mut world = WorldState::new(config).expect("world");
+    let subject = world.spawn_agent(AgentData::default());
+    let neighbor = world.spawn_agent(AgentData::default());
+
+    {
+        let arena = world.agents_mut();
+        let idx_subject = arena.index_of(subject).expect("subject index");
+        let idx_neighbor = arena.index_of(neighbor).expect("neighbor index");
+        let columns = arena.columns_mut();
+        columns.positions_mut()[idx_subject] = Position::new(80.0, 100.0);
+        columns.positions_mut()[idx_neighbor] = Position::new(120.0, 100.0);
+        columns.headings_mut()[idx_subject] = 0.0;
+        columns.headings_mut()[idx_neighbor] = 0.0;
+        columns.colors_mut()[idx_neighbor] = [1.0, 0.2, 0.2];
+        columns.health_mut()[idx_neighbor] = 0.4;
+    }
+
+    let food_max = world.config().food_max;
+    if let Some(cell) = world.food_mut().get_mut(4, 5) {
+        *cell = food_max * 0.8;
+    }
+
+    if let Some(runtime) = world.runtime_mut().get_mut(subject) {
+        runtime.trait_modifiers = TraitModifiers {
+            smell: 1.0,
+            sound: 1.0,
+            hearing: 1.0,
+            eye: 1.0,
+            blood: 1.0,
+        };
+        runtime.eye_fov = [1.2; NUM_EYES];
+        runtime.eye_direction = [
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+            -std::f32::consts::FRAC_PI_2,
+        ];
+        runtime.temperature_preference = 0.2;
+    }
+
+    if let Some(runtime) = world.runtime_mut().get_mut(neighbor) {
+        runtime.sound_multiplier = 0.9;
+    }
+
+    world.step();
+
+    let sensors = world
+        .agent_runtime(subject)
+        .expect("subject runtime")
+        .sensors;
+
+    assert!(sensors[0] > 0.0, "forward eye intensity should register");
+    assert!(
+        sensors[1] > 0.0 && sensors[1] <= 1.0,
+        "forward eye red channel populated"
+    );
+    let food_sensor = sensors[4];
+    assert!(
+        (food_sensor - 0.8).abs() < 1e-3,
+        "local food sensor reflects configured cell (value={food_sensor})"
+    );
+    assert!(sensors[10] > 0.6, "smell sensor should react to neighbor");
+    assert!(
+        sensors[18] > 0.0,
+        "hearing sensor should pick up neighbor sound"
+    );
+    assert!(
+        sensors[19] > 0.0,
+        "blood sensor should detect wounded neighbor"
+    );
+    assert!(
+        sensors[16] >= 0.0 && sensors[16] <= 1.0,
+        "clock sensor within bounds"
+    );
+    assert!(
+        sensors[20] >= 0.0 && sensors[20] <= 1.0,
+        "temperature discomfort normalized"
+    );
+    assert!(
+        sensors[20] <= 0.1,
+        "temperature discomfort low when preference matches"
     );
 }
 
@@ -205,7 +384,7 @@ fn regression_seed_42_matches_baseline() {
     assert_eq!(summary.agent_count, 1);
     assert_eq!(summary.births, 0);
     assert_eq!(summary.deaths, 0);
-    assert!((summary.total_energy - 1.808_059_6).abs() < 1e-6);
-    assert!((summary.average_energy - 1.808_059_6).abs() < 1e-6);
-    assert!((summary.average_health - 0.808_060_35).abs() < 1e-6);
+    assert!((summary.total_energy - 1.92).abs() < 1e-6);
+    assert!((summary.average_energy - 1.92).abs() < 1e-6);
+    assert!((summary.average_health - 0.920_001_03).abs() < 1e-6);
 }

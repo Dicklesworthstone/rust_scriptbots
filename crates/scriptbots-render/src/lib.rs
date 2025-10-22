@@ -7,12 +7,14 @@ use gpui::{
     rgb, size,
 };
 use scriptbots_core::{
-    AgentColumns, AgentId, AgentRuntime, Generation, INPUT_SIZE, MutationRates, OUTPUT_SIZE,
-    Position, SelectionState, TickSummary, TraitModifiers, WorldState,
+    AgentColumns, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState, MutationRates,
+    OUTPUT_SIZE, Position, SelectionState, TickSummary, TraitModifiers, WorldState,
 };
+use std::f32::consts::TAU;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use tracing::{error, info};
 
@@ -66,6 +68,8 @@ struct SimulationView {
     title: SharedString,
     camera: Arc<Mutex<CameraState>>,
     inspector: Arc<Mutex<InspectorState>>,
+    playback: PlaybackState,
+    perf: PerfStats,
 }
 
 impl SimulationView {
@@ -75,6 +79,8 @@ impl SimulationView {
             title,
             camera: Arc::new(Mutex::new(CameraState::default())),
             inspector: Arc::new(Mutex::new(InspectorState::default())),
+            playback: PlaybackState::new(240),
+            perf: PerfStats::new(240),
         }
     }
 
@@ -85,7 +91,7 @@ impl SimulationView {
             .unwrap_or_default()
     }
 
-    fn snapshot(&self) -> HudSnapshot {
+    fn snapshot(&mut self) -> HudSnapshot {
         let mut snapshot = HudSnapshot::default();
         let inspector_state = self
             .inspector
@@ -117,6 +123,8 @@ impl SimulationView {
             snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
             snapshot.inspector = InspectorSnapshot::from_world(&world, &inspector_state);
         }
+
+        self.playback.record(snapshot.clone());
 
         snapshot
     }
@@ -387,12 +395,19 @@ impl SimulationView {
         let canvas_state = CanvasState {
             frame: frame.clone(),
             camera: Arc::clone(&self.camera),
+            focus_agent: snapshot.inspector.focus_id,
         };
 
         let canvas_element = canvas(
             move |_, _, _| canvas_state.clone(),
             move |bounds, state, window, _| {
-                paint_frame(&state.frame, &state.camera, bounds, window)
+                paint_frame(
+                    &state.frame,
+                    &state.camera,
+                    state.focus_agent,
+                    bounds,
+                    window,
+                )
             },
         )
         .flex_1();
@@ -479,6 +494,54 @@ impl SimulationView {
         cx.notify();
     }
 
+    fn set_brush_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.brush_enabled = enabled;
+        }
+        cx.notify();
+    }
+
+    fn adjust_brush_radius(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if let Ok(mut inspector) = self.inspector.lock() {
+            let mut radius = inspector.brush_radius + delta;
+            radius = radius.clamp(8.0, 256.0);
+            inspector.brush_radius = radius;
+        }
+        cx.notify();
+    }
+
+    fn set_probe_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.probe_enabled = enabled;
+        }
+        cx.notify();
+    }
+
+    fn playback_restart(&mut self, cx: &mut Context<Self>) {
+        self.playback.restart();
+        cx.notify();
+    }
+
+    fn playback_step_back(&mut self, cx: &mut Context<Self>) {
+        self.playback.step_back();
+        cx.notify();
+    }
+
+    fn playback_toggle(&mut self, cx: &mut Context<Self>) {
+        self.playback.toggle_play();
+        cx.notify();
+    }
+
+    fn playback_step_forward(&mut self, cx: &mut Context<Self>) {
+        self.playback.step_forward();
+        cx.notify();
+    }
+
+    fn playback_go_live(&mut self, cx: &mut Context<Self>) {
+        self.playback.go_live();
+        cx.notify();
+    }
+
     fn render_inspector(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         let inspector = &snapshot.inspector;
 
@@ -554,7 +617,8 @@ impl SimulationView {
 
         let selection_list = div().flex().flex_col().gap_2().children(list_children);
 
-        let playback_controls = self.render_inspector_playback_controls();
+        let brush_tools = self.render_inspector_brush_tools(inspector, cx);
+        let playback_controls = self.render_inspector_playback_controls(cx);
 
         let detail = inspector
             .focused
@@ -601,6 +665,7 @@ impl SimulationView {
                     .child(format!("Selected agents: {}", inspector.selected.len())),
             )
             .child(selection_list)
+            .child(brush_tools)
             .child(playback_controls)
             .child(detail)
     }
@@ -659,18 +724,132 @@ impl SimulationView {
             )))
     }
 
-    fn render_inspector_playback_controls(&self) -> Div {
-        let button = |label: &str| {
-            div()
+    fn render_inspector_brush_tools(
+        &self,
+        inspector: &InspectorSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let brush_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_brush_enabled(true, cx);
+        });
+        let brush_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_brush_enabled(false, cx);
+        });
+        let radius_inc = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_brush_radius(8.0, cx);
+        });
+        let radius_dec = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_brush_radius(-8.0, cx);
+        });
+        let probe_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_probe_enabled(true, cx);
+        });
+        let probe_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_probe_enabled(false, cx);
+        });
+
+        let brush_on_button = {
+            let base = div()
                 .rounded_md()
-                .bg(rgb(0x111b2b))
                 .border_1()
-                .border_color(rgb(0x1e293b))
                 .px_2()
                 .py_1()
-                .text_sm()
-                .text_color(rgb(0xcbd5f5))
-                .child(label.to_string())
+                .text_xs()
+                .child("On")
+                .on_mouse_down(MouseButton::Left, brush_on);
+            if inspector.brush_enabled {
+                base.border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                base.border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let brush_off_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Off")
+                .on_mouse_down(MouseButton::Left, brush_off);
+            if !inspector.brush_enabled {
+                base.border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                base.border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let brush_minus_button = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(0xcbd5f5))
+            .child("-")
+            .on_mouse_down(MouseButton::Left, radius_dec);
+
+        let brush_plus_button = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(0xcbd5f5))
+            .child("+")
+            .on_mouse_down(MouseButton::Left, radius_inc);
+
+        let probe_on_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("On")
+                .on_mouse_down(MouseButton::Left, probe_on);
+            if inspector.probe_enabled {
+                base.border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                base.border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let probe_off_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Off")
+                .on_mouse_down(MouseButton::Left, probe_off);
+            if !inspector.probe_enabled {
+                base.border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                base.border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
         };
 
         div()
@@ -687,14 +866,188 @@ impl SimulationView {
                 div()
                     .text_xs()
                     .text_color(rgb(0x94a3b8))
-                    .child("Deterministic playback (todo)"),
+                    .child("Brush Tools"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .children(vec![brush_on_button, brush_off_button]),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child(format!("Radius {:.0}", inspector.brush_radius)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .children(vec![brush_minus_button, brush_plus_button]),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child("Debug probe"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .children(vec![probe_on_button, probe_off_button]),
+                    ),
+            )
+    }
+
+    fn render_inspector_playback_controls(&self, cx: &mut Context<Self>) -> Div {
+        let status = self.playback.status();
+
+        let restart = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.playback_restart(cx);
+        });
+        let prev = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.playback_step_back(cx);
+        });
+        let toggle = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.playback_toggle(cx);
+        });
+        let next = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.playback_step_forward(cx);
+        });
+        let live = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.playback_go_live(cx);
+        });
+
+        let play_label = if status.mode == PlaybackMode::Playing {
+            "⏸"
+        } else {
+            "▶"
+        };
+
+        let style_button = |button: Div, active: bool| {
+            if active {
+                button
+                    .border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                button
+                    .border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let restart_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("⏮")
+                .on_mouse_down(MouseButton::Left, restart);
+            style_button(base, false)
+        };
+
+        let prev_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("⏪")
+                .on_mouse_down(MouseButton::Left, prev);
+            style_button(base, false)
+        };
+
+        let play_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(play_label)
+                .on_mouse_down(MouseButton::Left, toggle);
+            style_button(base, status.mode == PlaybackMode::Playing)
+        };
+
+        let next_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("⏩")
+                .on_mouse_down(MouseButton::Left, next);
+            style_button(base, false)
+        };
+
+        let live_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Live")
+                .on_mouse_down(MouseButton::Left, live);
+            style_button(base, status.mode == PlaybackMode::Live)
+        };
+
+        let frame_summary = if status.total == 0 {
+            "No frames captured yet".to_string()
+        } else {
+            let frame_num = status.index.saturating_add(1);
+            let tick = status.current_tick.unwrap_or(0);
+            format!("Frame {frame_num}/{} · Tick {tick}", status.total)
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Deterministic playback"),
             )
             .child(div().flex().gap_2().children(vec![
-                button("⏮"),
-                button("⏪"),
-                button("▶"),
-                button("⏩"),
+                restart_button,
+                prev_button,
+                play_button,
+                next_button,
+                live_button,
             ]))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xcbd5f5))
+                    .child(frame_summary),
+            )
     }
 
     fn render_inspector_detail(&self, detail: &AgentInspectorDetails) -> Div {
@@ -823,6 +1176,39 @@ impl SimulationView {
             camera.zoom, camera.offset_px.0, camera.offset_px.1
         ));
 
+        let inspector = &snapshot.inspector;
+        if let Some(focus_id) = inspector.focus_id {
+            lines.push(format!("Focus {:?}", focus_id));
+        }
+        if let Some(hover) = inspector.hovered.as_ref() {
+            lines.push(format!("Hover {}", hover.label));
+        }
+        lines.push(format!(
+            "Brush {} · radius {:.0} · Probe {}",
+            if inspector.brush_enabled { "ON" } else { "OFF" },
+            inspector.brush_radius,
+            if inspector.probe_enabled { "ON" } else { "OFF" }
+        ));
+
+        let playback = self.playback.status();
+        if playback.total > 0 {
+            let mode_label = match playback.mode {
+                PlaybackMode::Live => "LIVE",
+                PlaybackMode::Paused => "PAUSED",
+                PlaybackMode::Playing => "PLAY",
+            };
+            let current_tick = playback.current_tick.unwrap_or(snapshot.tick);
+            let total_frames = playback.total;
+            lines.push(format!(
+                "Playback {mode_label} · frame {}/{} · tick {}",
+                playback.index.saturating_add(1),
+                total_frames,
+                current_tick
+            ));
+        } else {
+            lines.push("Playback LIVE · no frames".to_string());
+        }
+
         div()
             .absolute()
             .top(px(12.0))
@@ -837,6 +1223,42 @@ impl SimulationView {
             .gap_1()
             .text_sm()
             .text_color(rgb(0xe2e8f0))
+            .children(lines.into_iter().map(|line| div().child(line)))
+    }
+
+    fn render_perf_overlay(&self, stats: PerfSnapshot) -> Div {
+        let mut lines = Vec::new();
+
+        if stats.sample_count == 0 {
+            lines.push("Performance stats: collecting...".to_string());
+        } else {
+            lines.push(format!(
+                "Frame {:.2} ms ({:.1} fps)",
+                stats.latest_ms, stats.fps
+            ));
+            lines.push(format!(
+                "Avg {:.2} ms · Min {:.2} · Max {:.2}",
+                stats.average_ms, stats.min_ms, stats.max_ms
+            ));
+            lines.push(format!("Samples {}", stats.sample_count));
+        }
+
+        div()
+            .absolute()
+            .top(px(12.0))
+            .right(px(12.0))
+            .bg(rgb(0x111b2b))
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .rounded_md()
+            .shadow_md()
+            .px_3()
+            .py_2()
+            .text_xs()
+            .text_color(rgb(0xcbd5f5))
+            .flex()
+            .flex_col()
+            .gap_1()
             .children(lines.into_iter().map(|line| div().child(line)))
     }
 
@@ -951,10 +1373,14 @@ impl SimulationView {
 
 impl Render for SimulationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let snapshot = self.snapshot();
+        self.perf.begin_frame();
 
-        div()
+        let live_snapshot = self.snapshot();
+        let snapshot = self.playback.snapshot_for_render(live_snapshot);
+
+        let content = div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(0x0f172a))
@@ -972,11 +1398,15 @@ impl Render for SimulationView {
                     .child(self.render_canvas(&snapshot, cx))
                     .child(self.render_inspector(&snapshot, cx)),
             )
-            .child(self.render_footer(&snapshot))
+            .child(self.render_footer(&snapshot));
+
+        let perf_snapshot = self.perf.end_frame();
+
+        content.child(self.render_perf_overlay(perf_snapshot))
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct HudSnapshot {
     tick: u64,
     epoch: u64,
@@ -990,6 +1420,7 @@ struct HudSnapshot {
     inspector: InspectorSnapshot,
 }
 
+#[derive(Clone)]
 struct HudMetrics {
     tick: u64,
     agent_count: usize,
@@ -1020,6 +1451,7 @@ impl From<&TickSummary> for HudMetrics {
     }
 }
 
+#[derive(Clone)]
 struct HudHistoryEntry {
     tick: u64,
     agent_count: usize,
@@ -1242,6 +1674,269 @@ fn rgb_from_triplet(color: [f32; 3]) -> Rgba {
     }
 }
 
+fn rgba_from_triplet_with_alpha(color: [f32; 3], alpha: f32) -> Rgba {
+    Rgba {
+        r: color[0].clamp(0.0, 1.0),
+        g: color[1].clamp(0.0, 1.0),
+        b: color[2].clamp(0.0, 1.0),
+        a: alpha.clamp(0.0, 1.0),
+    }
+}
+
+fn rgba_from_hex(hex: u32, alpha: f32) -> Rgba {
+    let r = ((hex >> 16) & 0xff) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xff) as f32 / 255.0;
+    let b = (hex & 0xff) as f32 / 255.0;
+    Rgba {
+        r,
+        g,
+        b,
+        a: alpha.clamp(0.0, 1.0),
+    }
+}
+
+fn lerp_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    let clamped = t.clamp(0.0, 1.0);
+    Rgba {
+        r: a.r + (b.r - a.r) * clamped,
+        g: a.g + (b.g - a.g) * clamped,
+        b: a.b + (b.b - a.b) * clamped,
+        a: a.a + (b.a - a.a) * clamped,
+    }
+}
+
+fn scale_rgb(color: Rgba, factor: f32) -> Rgba {
+    let clamp = factor.clamp(0.0, 2.0);
+    Rgba {
+        r: (color.r * clamp).clamp(0.0, 1.0),
+        g: (color.g * clamp).clamp(0.0, 1.0),
+        b: (color.b * clamp).clamp(0.0, 1.0),
+        a: color.a,
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PerfSnapshot {
+    latest_ms: f32,
+    average_ms: f32,
+    min_ms: f32,
+    max_ms: f32,
+    sample_count: usize,
+    fps: f32,
+}
+
+struct PerfStats {
+    start: Option<Instant>,
+    samples: VecDeque<f32>,
+    capacity: usize,
+}
+
+impl PerfStats {
+    fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            start: None,
+            samples: VecDeque::with_capacity(cap),
+            capacity: cap,
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        self.start = Some(Instant::now());
+    }
+
+    fn end_frame(&mut self) -> PerfSnapshot {
+        let elapsed_ms = self
+            .start
+            .take()
+            .map(|start| start.elapsed().as_secs_f32() * 1000.0)
+            .unwrap_or(0.0);
+        self.samples.push_back(elapsed_ms);
+        if self.samples.len() > self.capacity {
+            self.samples.pop_front();
+        }
+        self.snapshot(elapsed_ms)
+    }
+
+    fn snapshot(&self, latest: f32) -> PerfSnapshot {
+        if self.samples.is_empty() {
+            return PerfSnapshot {
+                latest_ms: latest,
+                ..PerfSnapshot::default()
+            };
+        }
+
+        let mut min = f32::MAX;
+        let mut max = f32::MIN;
+        let mut sum = 0.0;
+        for &sample in &self.samples {
+            min = min.min(sample);
+            max = max.max(sample);
+            sum += sample;
+        }
+        let count = self.samples.len();
+        let avg = if count > 0 { sum / count as f32 } else { 0.0 };
+        let fps = if latest > f32::EPSILON {
+            1000.0 / latest
+        } else {
+            0.0
+        };
+
+        PerfSnapshot {
+            latest_ms: latest,
+            average_ms: avg,
+            min_ms: if min.is_finite() { min } else { 0.0 },
+            max_ms: if max.is_finite() { max } else { 0.0 },
+            sample_count: count,
+            fps,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaybackMode {
+    Live,
+    Paused,
+    Playing,
+}
+
+#[derive(Clone, Copy)]
+struct PlaybackStatus {
+    mode: PlaybackMode,
+    index: usize,
+    total: usize,
+    current_tick: Option<u64>,
+}
+
+struct PlaybackState {
+    timeline: VecDeque<HudSnapshot>,
+    max_frames: usize,
+    mode: PlaybackMode,
+    pointer: usize,
+}
+
+impl PlaybackState {
+    fn new(max_frames: usize) -> Self {
+        Self {
+            timeline: VecDeque::with_capacity(max_frames),
+            max_frames: max_frames.max(1),
+            mode: PlaybackMode::Live,
+            pointer: 0,
+        }
+    }
+
+    fn record(&mut self, snapshot: HudSnapshot) {
+        if self.timeline.len() == self.max_frames {
+            self.timeline.pop_front();
+            if self.pointer > 0 {
+                self.pointer -= 1;
+            }
+        }
+        self.timeline.push_back(snapshot);
+        let last_index = self.timeline.len().saturating_sub(1);
+        if matches!(self.mode, PlaybackMode::Live) {
+            self.pointer = last_index;
+        } else {
+            self.pointer = self.pointer.min(last_index);
+        }
+    }
+
+    fn snapshot_for_render(&mut self, live: HudSnapshot) -> HudSnapshot {
+        match self.mode {
+            PlaybackMode::Live => live,
+            PlaybackMode::Paused => self.timeline.get(self.pointer).cloned().unwrap_or(live),
+            PlaybackMode::Playing => {
+                if self.timeline.is_empty() {
+                    self.mode = PlaybackMode::Live;
+                    return live;
+                }
+                let snapshot = self
+                    .timeline
+                    .get(self.pointer)
+                    .cloned()
+                    .unwrap_or_else(|| live.clone());
+                if self.pointer + 1 < self.timeline.len() {
+                    self.pointer += 1;
+                } else {
+                    self.mode = PlaybackMode::Live;
+                    self.pointer = self.timeline.len().saturating_sub(1);
+                }
+                snapshot
+            }
+        }
+    }
+
+    fn restart(&mut self) {
+        if self.timeline.is_empty() {
+            return;
+        }
+        self.mode = PlaybackMode::Paused;
+        self.pointer = 0;
+    }
+
+    fn step_back(&mut self) {
+        if self.timeline.is_empty() {
+            return;
+        }
+        self.mode = PlaybackMode::Paused;
+        if self.pointer > 0 {
+            self.pointer -= 1;
+        }
+    }
+
+    fn step_forward(&mut self) {
+        if self.timeline.is_empty() {
+            return;
+        }
+        if self.pointer + 1 < self.timeline.len() {
+            self.pointer += 1;
+            self.mode = PlaybackMode::Paused;
+        } else {
+            self.go_live();
+        }
+    }
+
+    fn toggle_play(&mut self) {
+        match self.mode {
+            PlaybackMode::Live => {
+                if !self.timeline.is_empty() {
+                    self.mode = PlaybackMode::Playing;
+                    self.pointer = 0;
+                }
+            }
+            PlaybackMode::Paused => {
+                if !self.timeline.is_empty() {
+                    self.mode = PlaybackMode::Playing;
+                }
+            }
+            PlaybackMode::Playing => {
+                self.mode = PlaybackMode::Paused;
+            }
+        }
+    }
+
+    fn go_live(&mut self) {
+        self.mode = PlaybackMode::Live;
+        if !self.timeline.is_empty() {
+            self.pointer = self.timeline.len().saturating_sub(1);
+        }
+    }
+
+    fn status(&self) -> PlaybackStatus {
+        let current_tick = self.timeline.get(self.pointer).map(|snap| snap.tick);
+        PlaybackStatus {
+            mode: self.mode,
+            index: if self.timeline.is_empty() {
+                0
+            } else {
+                self.pointer.min(self.timeline.len() - 1)
+            },
+            total: self.timeline.len(),
+            current_tick,
+        }
+    }
+}
+
 fn color_swatch(color: [f32; 3]) -> Div {
     div()
         .w(px(10.0))
@@ -1254,6 +1949,7 @@ fn color_swatch(color: [f32; 3]) -> Div {
 
 #[derive(Clone)]
 struct RenderFrame {
+    tick: u64,
     world_size: (f32, f32),
     food_dimensions: (u32, u32),
     food_cell_size: u32,
@@ -1265,16 +1961,22 @@ struct RenderFrame {
 
 #[derive(Clone)]
 struct AgentRenderData {
+    agent_id: AgentId,
     position: Position,
     color: [f32; 3],
     spike_length: f32,
     health: f32,
+    selection: SelectionState,
+    indicator: IndicatorState,
+    spiked: bool,
+    reproduction_intent: f32,
 }
 
 #[derive(Clone)]
 struct CanvasState {
     frame: RenderFrame,
     camera: Arc<Mutex<CameraState>>,
+    focus_agent: Option<AgentId>,
 }
 
 impl RenderFrame {
@@ -1287,25 +1989,41 @@ impl RenderFrame {
         }
 
         let config = world.config();
-        let columns = world.agents().columns();
+        let arena = world.agents();
+        let columns = arena.columns();
+        let runtime = world.runtime();
 
         let positions = columns.positions();
         let colors = columns.colors();
         let spikes = columns.spike_lengths();
         let healths = columns.health();
 
-        let agents = positions
-            .iter()
+        let agents = arena
+            .iter_handles()
             .enumerate()
-            .map(|(idx, position)| AgentRenderData {
-                position: *position,
-                color: colors[idx],
-                spike_length: spikes[idx],
-                health: healths[idx],
+            .map(|(idx, agent_id)| {
+                let runtime_entry = runtime.get(agent_id);
+                let selection = runtime_entry.map(|rt| rt.selection).unwrap_or_default();
+                let indicator = runtime_entry.map(|rt| rt.indicator).unwrap_or_default();
+                let spiked = runtime_entry.map(|rt| rt.spiked).unwrap_or(false);
+                let reproduction_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
+
+                AgentRenderData {
+                    agent_id,
+                    position: positions[idx],
+                    color: colors[idx],
+                    spike_length: spikes[idx],
+                    health: healths[idx],
+                    selection,
+                    indicator,
+                    spiked,
+                    reproduction_intent,
+                }
             })
             .collect();
 
         Some(Self {
+            tick: world.tick().0,
             world_size: (config.world_width as f32, config.world_height as f32),
             food_dimensions: (width, height),
             food_cell_size: config.food_cell_size,
@@ -1552,6 +2270,7 @@ impl CameraState {
 fn paint_frame(
     frame: &RenderFrame,
     camera: &Arc<Mutex<CameraState>>,
+    focus_agent: Option<AgentId>,
     bounds: Bounds<Pixels>,
     window: &mut Window,
 ) {
@@ -1583,15 +2302,38 @@ fn paint_frame(
     );
     drop(camera_guard);
 
-    window.paint_quad(fill(
-        bounds,
-        Background::from(Rgba {
-            r: 0.03,
-            g: 0.05,
-            b: 0.08,
-            a: 1.0,
-        }),
-    ));
+    let day_phase = frame.tick as f32 * 0.00025;
+    let daylight = day_phase.sin() * 0.5 + 0.5;
+
+    let sky_base = lerp_rgba(
+        rgba_from_hex(0x050b16, 1.0),
+        rgba_from_hex(0x173f6a, 1.0),
+        daylight,
+    );
+    window.paint_quad(fill(bounds, Background::from(sky_base)));
+
+    let horizon_height = height_px * 0.35;
+    if horizon_height > 1.0 {
+        let horizon_bounds = Bounds::new(
+            point(
+                px(f32::from(origin.x)),
+                px(f32::from(origin.y) + height_px - horizon_height),
+            ),
+            size(px(width_px), px(horizon_height)),
+        );
+        let horizon_color = rgba_from_hex(0xffa94d, (0.12 + 0.25 * daylight).clamp(0.0, 0.3));
+        window.paint_quad(fill(horizon_bounds, Background::from(horizon_color)));
+    }
+
+    let aurora_strength = (1.0 - daylight).clamp(0.0, 1.0);
+    if aurora_strength > 0.05 {
+        let aurora_bounds = Bounds::new(
+            point(px(f32::from(origin.x)), px(f32::from(origin.y))),
+            size(px(width_px), px(height_px * 0.25)),
+        );
+        let aurora_color = rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength);
+        window.paint_quad(fill(aurora_bounds, Background::from(aurora_color)));
+    }
 
     let food_w = frame.food_dimensions.0 as usize;
     let food_h = frame.food_dimensions.1 as usize;
@@ -1607,7 +2349,10 @@ fn paint_frame(
                 continue;
             }
             let intensity = (value / max_food).clamp(0.0, 1.0);
-            let color = food_color(intensity);
+            let mut color = food_color(intensity);
+            let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
+            let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
+            color = scale_rgb(color, shade);
             let px_x = offset_x + (x as f32 * cell_world * scale);
             let px_y = offset_y + (y as f32 * cell_world * scale);
             let cell_bounds =
@@ -1622,11 +2367,109 @@ fn paint_frame(
         let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
         let size_px = (dynamic_radius * scale).max(2.0);
         let half = size_px * 0.5;
+
+        let mut highlight_layers: Vec<(f32, Rgba)> = Vec::new();
+        match agent.selection {
+            SelectionState::Selected => highlight_layers.push((
+                1.8,
+                Rgba {
+                    r: 0.20,
+                    g: 0.65,
+                    b: 0.96,
+                    a: 0.35,
+                },
+            )),
+            SelectionState::Hovered => highlight_layers.push((
+                1.4,
+                Rgba {
+                    r: 0.92,
+                    g: 0.58,
+                    b: 0.20,
+                    a: 0.30,
+                },
+            )),
+            SelectionState::None => {}
+        }
+
+        if focus_agent == Some(agent.agent_id) {
+            highlight_layers.push((
+                2.05,
+                Rgba {
+                    r: 0.45,
+                    g: 0.88,
+                    b: 0.97,
+                    a: 0.32,
+                },
+            ));
+        }
+
+        for (factor, highlight) in highlight_layers {
+            let highlight_size = size_px * factor;
+            let highlight_half = highlight_size * 0.5;
+            let highlight_bounds = Bounds::new(
+                point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                size(px(highlight_size), px(highlight_size)),
+            );
+            window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+        }
+
+        if agent.indicator.intensity > 0.05 {
+            let effect = agent.indicator.intensity.clamp(0.0, 1.0);
+            let indicator_size = size_px * (1.2 + effect * 1.4);
+            let indicator_half = indicator_size * 0.5;
+            let indicator_bounds = Bounds::new(
+                point(px(px_x - indicator_half), px(px_y - indicator_half)),
+                size(px(indicator_size), px(indicator_size)),
+            );
+            let indicator_color =
+                rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect);
+            window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
+        }
+
+        if agent.reproduction_intent > 0.2 {
+            let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
+            let pulse_size = size_px * (1.8 + pulse * 1.6);
+            let pulse_half = pulse_size * 0.5;
+            let pulse_bounds = Bounds::new(
+                point(px(px_x - pulse_half), px(px_y - pulse_half)),
+                size(px(pulse_size), px(pulse_size)),
+            );
+            window.paint_quad(fill(
+                pulse_bounds,
+                Background::from(Rgba {
+                    r: 0.88,
+                    g: 0.36,
+                    b: 0.86,
+                    a: 0.18 + 0.28 * pulse,
+                }),
+            ));
+        }
+
+        if agent.spiked {
+            let spike_size = size_px * 2.2;
+            let spike_half = spike_size * 0.5;
+            let spike_bounds = Bounds::new(
+                point(px(px_x - spike_half), px(px_y - spike_half)),
+                size(px(spike_size), px(spike_size)),
+            );
+            window.paint_quad(fill(
+                spike_bounds,
+                Background::from(Rgba {
+                    r: 0.95,
+                    g: 0.25,
+                    b: 0.35,
+                    a: 0.28,
+                }),
+            ));
+        }
+
         let agent_bounds = Bounds::new(
             point(px(px_x - half), px(px_y - half)),
             size(px(size_px), px(size_px)),
         );
-        let color = agent_color(agent);
+        let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
+        let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
+        let color = agent_color(agent, agent_shade);
         window.paint_quad(fill(agent_bounds, Background::from(color)));
     }
 }
@@ -1641,16 +2484,16 @@ fn food_color(intensity: f32) -> Rgba {
     }
 }
 
-fn agent_color(agent: &AgentRenderData) -> Rgba {
+fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
     let base_r = agent.color[0].clamp(0.0, 1.0);
     let base_g = agent.color[1].clamp(0.0, 1.0);
     let base_b = agent.color[2].clamp(0.0, 1.0);
     let health_factor = (agent.health / 2.0).clamp(0.35, 1.0);
 
     Rgba {
-        r: (base_r * health_factor).clamp(0.0, 1.0),
-        g: (base_g * health_factor).clamp(0.0, 1.0),
-        b: (base_b * health_factor).clamp(0.0, 1.0),
+        r: (base_r * health_factor * shade).clamp(0.0, 1.0),
+        g: (base_g * health_factor * shade).clamp(0.0, 1.0),
+        b: (base_b * health_factor * shade).clamp(0.0, 1.0),
         a: 0.9,
     }
 }

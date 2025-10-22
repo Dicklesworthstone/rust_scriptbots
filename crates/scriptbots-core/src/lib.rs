@@ -60,6 +60,36 @@ fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
+fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
+    let mut delta = b - a;
+    let half = extent * 0.5;
+    if delta > half {
+        delta -= extent;
+    } else if delta < -half {
+        delta += extent;
+    }
+    delta
+}
+
+fn angle_to(dx: f32, dy: f32) -> f32 {
+    dy.atan2(dx)
+}
+
+fn angle_difference(a: f32, b: f32) -> f32 {
+    let diff = wrap_signed_angle(a - b);
+    diff.abs()
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn log_mutation(log: &mut Vec<String>, label: &str, before: f32, after: f32) {
+    if (after - before).abs() > 1e-4 {
+        log.push(format!("{label}:{before:.3}->{after:.3}"));
+    }
+}
+
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
@@ -121,6 +151,17 @@ pub enum SelectionState {
     None,
     Hovered,
     Selected,
+}
+
+/// Per-tick combat markers used by UI, analytics, and audio layers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CombatEventFlags {
+    pub spike_attacker: bool,
+    pub spike_victim: bool,
+    pub hit_carnivore: bool,
+    pub hit_herbivore: bool,
+    pub was_spiked_by_carnivore: bool,
+    pub was_spiked_by_herbivore: bool,
 }
 
 /// Runtime brain attachment tracking.
@@ -327,12 +368,14 @@ pub struct AgentRuntime {
     pub outputs: [f32; OUTPUT_SIZE],
     pub indicator: IndicatorState,
     pub selection: SelectionState,
+    pub combat: CombatEventFlags,
     pub food_delta: f32,
     pub spiked: bool,
     pub hybrid: bool,
     pub sound_output: f32,
     pub temperature_preference: f32,
     pub brain: BrainBinding,
+    pub lineage: [Option<AgentId>; 2],
     pub mutation_log: Vec<String>,
 }
 
@@ -353,12 +396,14 @@ impl Default for AgentRuntime {
             outputs: [0.0; OUTPUT_SIZE],
             indicator: IndicatorState::default(),
             selection: SelectionState::None,
+            combat: CombatEventFlags::default(),
             food_delta: 0.0,
             spiked: false,
             hybrid: false,
             sound_output: 0.0,
             temperature_preference: 0.5,
             brain: BrainBinding::default(),
+            lineage: [None, None],
             mutation_log: Vec::new(),
         }
     }
@@ -374,25 +419,45 @@ impl AgentRuntime {
 
     /// Randomize spawn-time traits and sensory configuration.
     pub fn randomize_spawn(&mut self, rng: &mut dyn RngCore) {
-        use rand::Rng;
-
-        self.herbivore_tendency = rng.gen_range(0.0..1.0);
-        self.mutation_rates.primary = rng.gen_range(0.001..0.005);
-        self.mutation_rates.secondary = rng.gen_range(0.03..0.07);
-        self.trait_modifiers.smell = rng.gen_range(0.1..0.5);
-        self.trait_modifiers.sound = rng.gen_range(0.2..0.6);
-        self.trait_modifiers.hearing = rng.gen_range(0.7..1.3);
-        self.trait_modifiers.eye = rng.gen_range(1.0..3.0);
-        self.trait_modifiers.blood = rng.gen_range(1.0..3.0);
-        self.clocks[0] = rng.gen_range(5.0..100.0);
-        self.clocks[1] = rng.gen_range(5.0..100.0);
+        self.herbivore_tendency = rng.random_range(0.0..1.0);
+        self.mutation_rates.primary = rng.random_range(0.001..0.005);
+        self.mutation_rates.secondary = rng.random_range(0.03..0.07);
+        self.trait_modifiers.smell = rng.random_range(0.1..0.5);
+        self.trait_modifiers.sound = rng.random_range(0.2..0.6);
+        self.trait_modifiers.hearing = rng.random_range(0.7..1.3);
+        self.trait_modifiers.eye = rng.random_range(1.0..3.0);
+        self.trait_modifiers.blood = rng.random_range(1.0..3.0);
+        self.clocks[0] = rng.random_range(5.0..100.0);
+        self.clocks[1] = rng.random_range(5.0..100.0);
         for fov in &mut self.eye_fov {
-            *fov = rng.gen_range(0.5..2.0);
+            *fov = rng.random_range(0.5..2.0);
         }
         for dir in &mut self.eye_direction {
-            *dir = rng.gen_range(0.0..FULL_TURN);
+            *dir = rng.random_range(0.0..FULL_TURN);
         }
-        self.temperature_preference = rng.gen_range(0.0..1.0);
+        self.temperature_preference = rng.random_range(0.0..1.0);
+        self.lineage = [None, None];
+    }
+
+    fn push_gene_log(&mut self, capacity: usize, message: impl Into<String>) {
+        if capacity == 0 {
+            return;
+        }
+        let entry = message.into();
+        if entry.is_empty() {
+            return;
+        }
+        if self.mutation_log.len() + 1 > capacity {
+            let remove = self.mutation_log.len() + 1 - capacity;
+            self.mutation_log.drain(0..remove);
+        }
+        self.mutation_log.push(entry);
+    }
+
+    fn log_change(&mut self, capacity: usize, label: &str, before: f32, after: f32) {
+        if (after - before).abs() > 1e-4 {
+            self.push_gene_log(capacity, format!("{label}: {:.3}->{:.3}", before, after));
+        }
     }
 }
 
@@ -416,13 +481,35 @@ struct ActuationDelta {
 struct ActuationResult {
     delta: Option<ActuationDelta>,
     energy: f32,
+    color: [f32; 3],
+    spike_length: f32,
+    sound_level: f32,
+    give_intent: f32,
     spiked: bool,
 }
 
 #[derive(Debug, Default)]
 struct CombatResult {
     energy: f32,
-    contributions: Vec<(usize, f32)>,
+    attacker_carnivore: bool,
+    hit_carnivore: bool,
+    hit_herbivore: bool,
+    total_damage: f32,
+    hits: Vec<CombatHit>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CombatHit {
+    target_idx: usize,
+    damage: f32,
+    attacker_carnivore: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DamageBucket {
+    total: f32,
+    carnivore: f32,
+    herbivore: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -1313,6 +1400,14 @@ pub struct ScriptBotsConfig {
     pub sense_radius: f32,
     /// Normalization factor for counting neighbors.
     pub sense_max_neighbors: f32,
+    /// Base wheel speed produced when outputs saturate.
+    pub bot_speed: f32,
+    /// Half the distance between differential wheels (also used for wrapping vision bias).
+    pub bot_radius: f32,
+    /// Multiplier applied when boost output is triggered.
+    pub boost_multiplier: f32,
+    /// Increment applied to spike length toward its target each tick.
+    pub spike_growth_rate: f32,
     /// Baseline metabolism drain applied each tick.
     pub metabolism_drain: f32,
     /// Fraction of velocity converted to additional energy cost.
@@ -1329,6 +1424,10 @@ pub struct ScriptBotsConfig {
     pub reproduction_energy_cost: f32,
     /// Cooldown in ticks between reproductions.
     pub reproduction_cooldown: u32,
+    /// Herbivore reproduction rate multiplier applied per tick.
+    pub reproduction_rate_herbivore: f32,
+    /// Carnivore reproduction rate multiplier applied per tick.
+    pub reproduction_rate_carnivore: f32,
     /// Starting energy assigned to a child agent.
     pub reproduction_child_energy: f32,
     /// Spatial jitter applied to child spawn positions.
@@ -1337,12 +1436,32 @@ pub struct ScriptBotsConfig {
     pub reproduction_color_jitter: f32,
     /// Scale factor applied to trait mutations.
     pub reproduction_mutation_scale: f32,
+    /// Probability of selecting a second parent for crossover.
+    pub reproduction_partner_chance: f32,
+    /// Distance behind the parent where children spawn before jitter.
+    pub reproduction_spawn_back_distance: f32,
+    /// Maximum number of gene log entries retained per agent.
+    pub reproduction_gene_log_capacity: usize,
+    /// Chance to perturb mutation rates during reproduction.
+    pub reproduction_meta_mutation_chance: f32,
+    /// Magnitude of meta-mutation applied to mutation rates.
+    pub reproduction_meta_mutation_scale: f32,
     /// Base radius used when checking spike impacts.
     pub spike_radius: f32,
     /// Damage applied by a spike at full power.
     pub spike_damage: f32,
     /// Energy cost of deploying a spike.
     pub spike_energy_cost: f32,
+    /// Minimum spike extension required before damage can be applied.
+    pub spike_min_length: f32,
+    /// Cosine threshold for considering a spike aligned with its target.
+    pub spike_alignment_cosine: f32,
+    /// Scalar applied to velocity when scaling spike damage.
+    pub spike_speed_damage_bonus: f32,
+    /// Scalar applied to spike length when scaling damage.
+    pub spike_length_damage_bonus: f32,
+    /// Herbivore tendency threshold separating carnivores from herbivores.
+    pub carnivore_threshold: f32,
     /// Maximum number of recent tick summaries retained in-memory.
     pub history_capacity: usize,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
@@ -1368,6 +1487,10 @@ impl Default for ScriptBotsConfig {
             food_diffusion_rate: 0.15,
             sense_radius: 120.0,
             sense_max_neighbors: 12.0,
+            bot_speed: 0.3,
+            bot_radius: 10.0,
+            boost_multiplier: 2.0,
+            spike_growth_rate: 0.005,
             metabolism_drain: 0.002,
             movement_drain: 0.005,
             food_intake_rate: 0.05,
@@ -1376,13 +1499,25 @@ impl Default for ScriptBotsConfig {
             reproduction_energy_threshold: 1.5,
             reproduction_energy_cost: 0.75,
             reproduction_cooldown: 300,
+            reproduction_rate_herbivore: 1.0,
+            reproduction_rate_carnivore: 1.0,
             reproduction_child_energy: 1.0,
             reproduction_spawn_jitter: 20.0,
             reproduction_color_jitter: 0.05,
             reproduction_mutation_scale: 0.02,
+            reproduction_partner_chance: 0.15,
+            reproduction_spawn_back_distance: 12.0,
+            reproduction_gene_log_capacity: 12,
+            reproduction_meta_mutation_chance: 0.2,
+            reproduction_meta_mutation_scale: 0.5,
             spike_radius: 40.0,
             spike_damage: 0.25,
             spike_energy_cost: 0.02,
+            spike_min_length: 0.2,
+            spike_alignment_cosine: (std::f32::consts::FRAC_PI_8).cos(),
+            spike_speed_damage_bonus: 0.6,
+            spike_length_damage_bonus: 0.75,
+            carnivore_threshold: 0.5,
             history_capacity: 256,
             persistence_interval: 0,
             neuroflow: NeuroflowSettings::default(),
@@ -1476,6 +1611,26 @@ impl ScriptBotsConfig {
                 "food growth/decay must be non-negative and diffusion in [0, 0.25]",
             ));
         }
+        if !(0.0..=1.0).contains(&self.reproduction_partner_chance) {
+            return Err(WorldStateError::InvalidConfig(
+                "reproduction_partner_chance must be within [0, 1]",
+            ));
+        }
+        if self.reproduction_spawn_back_distance < 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "reproduction_spawn_back_distance must be non-negative",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.reproduction_meta_mutation_chance) {
+            return Err(WorldStateError::InvalidConfig(
+                "reproduction_meta_mutation_chance must be within [0, 1]",
+            ));
+        }
+        if self.reproduction_meta_mutation_scale < 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "reproduction_meta_mutation_scale must be non-negative",
+            ));
+        }
         if self.metabolism_drain < 0.0
             || self.movement_drain < 0.0
             || self.food_intake_rate < 0.0
@@ -1487,13 +1642,22 @@ impl ScriptBotsConfig {
             || self.reproduction_spawn_jitter < 0.0
             || self.reproduction_color_jitter < 0.0
             || self.reproduction_mutation_scale < 0.0
+            || self.reproduction_rate_herbivore <= 0.0
+            || self.reproduction_rate_carnivore <= 0.0
             || self.spike_radius <= 0.0
             || self.spike_damage < 0.0
             || self.spike_energy_cost < 0.0
+            || self.spike_min_length < 0.0
+            || self.spike_alignment_cosine <= 0.0
+            || self.spike_alignment_cosine > 1.0
+            || self.spike_speed_damage_bonus < 0.0
+            || self.spike_length_damage_bonus < 0.0
+            || self.carnivore_threshold <= 0.0
+            || self.carnivore_threshold >= 1.0
             || self.history_capacity == 0
         {
             return Err(WorldStateError::InvalidConfig(
-                "metabolism, reproduction, sharing, and history parameters must be non-negative, radius positive",
+                "metabolism, reproduction, sharing, and history parameters must be non-negative; spike and diet thresholds must be within valid ranges",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -1504,6 +1668,26 @@ impl ScriptBotsConfig {
         if self.sense_max_neighbors <= 0.0 {
             return Err(WorldStateError::InvalidConfig(
                 "sense_max_neighbors must be positive",
+            ));
+        }
+        if self.bot_radius <= 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "bot_radius must be positive",
+            ));
+        }
+        if self.bot_speed < 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "bot_speed must be non-negative",
+            ));
+        }
+        if self.boost_multiplier < 1.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "boost_multiplier must be at least 1.0",
+            ));
+        }
+        if self.spike_growth_rate < 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "spike_growth_rate must be non-negative",
             ));
         }
         Ok(dims)
@@ -1766,69 +1950,183 @@ impl WorldState {
         }
 
         let columns = self.agents.columns();
-        let positions_slice = columns.positions();
-        let health_slice = columns.health();
-        let ages_slice = columns.ages();
-        let position_pairs: Vec<(f32, f32)> = positions_slice.iter().map(|p| (p.x, p.y)).collect();
+        let positions = columns.positions();
+        let headings = columns.headings();
+        let velocities = columns.velocities();
+        let colors = columns.colors();
+        let healths = columns.health();
 
+        let position_pairs: Vec<(f32, f32)> = positions.iter().map(|p| (p.x, p.y)).collect();
         if self.index.rebuild(&position_pairs).is_err() {
             return;
         }
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
-        let energies: Vec<f32> = handles
+        let runtime = &self.runtime;
+
+        let trait_modifiers: Vec<TraitModifiers> = handles
             .iter()
-            .map(|id| self.runtime.get(*id).map_or(0.0, |rt| rt.energy))
+            .map(|id| {
+                runtime
+                    .get(*id)
+                    .map_or(TraitModifiers::default(), |rt| rt.trait_modifiers)
+            })
+            .collect();
+        let eye_directions: Vec<[f32; NUM_EYES]> = handles
+            .iter()
+            .map(|id| {
+                runtime
+                    .get(*id)
+                    .map_or([0.0; NUM_EYES], |rt| rt.eye_direction)
+            })
+            .collect();
+        let eye_fov: Vec<[f32; NUM_EYES]> = handles
+            .iter()
+            .map(|id| runtime.get(*id).map_or([1.0; NUM_EYES], |rt| rt.eye_fov))
+            .collect();
+        let clocks: Vec<[f32; 2]> = handles
+            .iter()
+            .map(|id| runtime.get(*id).map_or([50.0, 50.0], |rt| rt.clocks))
+            .collect();
+        let temperature_preferences: Vec<f32> = handles
+            .iter()
+            .map(|id| runtime.get(*id).map_or(0.5, |rt| rt.temperature_preference))
+            .collect();
+        let sound_emitters: Vec<f32> = handles
+            .iter()
+            .map(|id| runtime.get(*id).map_or(0.0, |rt| rt.sound_multiplier))
             .collect();
 
+        let world_width = self.config.world_width as f32;
+        let world_height = self.config.world_height as f32;
         let radius = self.config.sense_radius;
         let radius_sq = radius * radius;
-        let neighbor_normalizer = self.config.sense_max_neighbors;
+        let cell_size = self.config.food_cell_size as f32;
+        let food_width = self.food.width();
+        let food_height = self.food.height();
+        let food_cells = self.food.cells();
+        let food_max = self.config.food_max;
+        let max_speed = (self.config.bot_speed * self.config.boost_multiplier).max(1e-3);
+        let tick_value = self.tick.0 as f32;
         let index = &self.index;
 
         let sensor_results: Vec<[f32; INPUT_SIZE]> = handles
             .par_iter()
             .enumerate()
-            .map(|(idx, _agent_id)| {
+            .map(|(idx, _)| {
                 let mut sensors = [0.0f32; INPUT_SIZE];
-                let mut nearest_sq = f32::INFINITY;
-                let mut neighbor_count = 0usize;
-                let mut neighbor_energy_sum = 0.0_f32;
-                let mut neighbor_health_sum = 0.0_f32;
+                let mut density = [0.0f32; NUM_EYES];
+                let mut eye_r = [0.0f32; NUM_EYES];
+                let mut eye_g = [0.0f32; NUM_EYES];
+                let mut eye_b = [0.0f32; NUM_EYES];
+                let mut smell = 0.0f32;
+                let mut sound = 0.0f32;
+                let mut hearing = 0.0f32;
+                let mut blood = 0.0f32;
+
+                let position = positions[idx];
+                let heading = headings[idx];
+                let traits = trait_modifiers[idx];
+                let eyes_dir = eye_directions[idx];
+                let eyes_fov = eye_fov[idx];
 
                 index.neighbors_within(
                     idx,
                     radius_sq,
                     &mut |other_idx, dist_sq: OrderedFloat<f32>| {
-                        neighbor_count += 1;
-                        let dist_sq_val = dist_sq.into_inner();
-                        if dist_sq_val < nearest_sq {
-                            nearest_sq = dist_sq_val;
+                        if other_idx == idx {
+                            return;
                         }
-                        neighbor_energy_sum += energies[other_idx];
-                        neighbor_health_sum += health_slice[other_idx];
+                        let dist_sq_val = dist_sq.into_inner();
+                        if dist_sq_val <= f32::EPSILON {
+                            return;
+                        }
+                        let dist = dist_sq_val.sqrt();
+                        if dist > radius {
+                            return;
+                        }
+
+                        let dx = toroidal_delta(position.x, positions[other_idx].x, world_width);
+                        let dy = toroidal_delta(position.y, positions[other_idx].y, world_height);
+                        let ang = angle_to(dx, dy);
+                        let dist_factor = (radius - dist) / radius;
+                        if dist_factor <= 0.0 {
+                            return;
+                        }
+
+                        for eye in 0..NUM_EYES {
+                            let view_dir = wrap_signed_angle(heading + eyes_dir[eye]);
+                            let diff = angle_difference(view_dir, ang);
+                            let fov = eyes_fov[eye].max(0.01);
+                            if diff < fov {
+                                let fov_factor = ((fov - diff) / fov).max(0.0);
+                                let intensity =
+                                    traits.eye * fov_factor * dist_factor * (dist / radius);
+                                density[eye] += intensity;
+                                let color = colors[other_idx];
+                                eye_r[eye] += intensity * color[0];
+                                eye_g[eye] += intensity * color[1];
+                                eye_b[eye] += intensity * color[2];
+                            }
+                        }
+
+                        smell += dist_factor;
+
+                        let velocity = velocities[other_idx];
+                        let speed = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
+                        sound += dist_factor * (speed / max_speed).clamp(0.0, 1.0);
+                        hearing += dist_factor * sound_emitters[other_idx];
+
+                        let forward_diff = angle_difference(heading, ang);
+                        if forward_diff < BLOOD_HALF_FOV {
+                            let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
+                            let health = healths[other_idx];
+                            let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
+                            blood += bleed * dist_factor * wound;
+                        }
                     },
                 );
 
-                let nearest_dist = if neighbor_count > 0 {
-                    nearest_sq.sqrt()
-                } else {
-                    radius
-                };
+                smell *= traits.smell;
+                sound *= traits.sound;
+                hearing *= traits.hearing;
+                blood *= traits.blood;
 
-                sensors.fill(0.0);
-                sensors[0] = (1.0 / (1.0 + nearest_dist)).clamp(0.0, 1.0);
-                sensors[1] = (neighbor_count as f32 / neighbor_normalizer).clamp(0.0, 1.0);
-                sensors[2] = (health_slice[idx] / 2.0).clamp(0.0, 1.0);
-                let self_energy = energies[idx];
-                sensors[3] = (self_energy / 2.0).clamp(0.0, 1.0);
-                sensors[4] = (ages_slice[idx] as f32 / 1_000.0).clamp(0.0, 1.0);
-                if neighbor_count > 0 {
-                    sensors[5] =
-                        (neighbor_energy_sum / neighbor_count as f32 / 2.0).clamp(0.0, 1.0);
-                    sensors[6] =
-                        (neighbor_health_sum / neighbor_count as f32 / 2.0).clamp(0.0, 1.0);
-                }
+                let cell_x =
+                    ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
+                let cell_y =
+                    ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
+                let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
+                let food_value = food_cells.get(food_idx).copied().unwrap_or(0.0) / food_max;
+
+                sensors[0] = clamp01(density[0]);
+                sensors[1] = clamp01(eye_r[0]);
+                sensors[2] = clamp01(eye_g[0]);
+                sensors[3] = clamp01(eye_b[0]);
+                sensors[4] = clamp01(food_value);
+                sensors[5] = clamp01(density[1]);
+                sensors[6] = clamp01(eye_r[1]);
+                sensors[7] = clamp01(eye_g[1]);
+                sensors[8] = clamp01(eye_b[1]);
+                sensors[9] = clamp01(sound);
+                sensors[10] = clamp01(smell);
+                sensors[11] = clamp01(healths[idx] * 0.5);
+                sensors[12] = clamp01(density[2]);
+                sensors[13] = clamp01(eye_r[2]);
+                sensors[14] = clamp01(eye_g[2]);
+                sensors[15] = clamp01(eye_b[2]);
+                sensors[16] = (tick_value / clocks[idx][0].max(1.0)).sin().abs();
+                sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
+                sensors[18] = clamp01(hearing);
+                sensors[19] = clamp01(blood);
+                let temperature_sample = (position.x / world_width).clamp(0.0, 1.0);
+                let discomfort =
+                    (2.0 * (temperature_sample - 0.5).abs() - temperature_preferences[idx]).abs();
+                sensors[20] = clamp01(discomfort);
+                sensors[21] = clamp01(density[3]);
+                sensors[22] = clamp01(eye_r[3]);
+                sensors[23] = clamp01(eye_g[3]);
+                sensors[24] = clamp01(eye_b[3]);
                 sensors
             })
             .collect();
@@ -1871,16 +2169,40 @@ impl WorldState {
         v
     }
 
+    fn wrap_delta(origin: f32, target: f32, extent: f32) -> f32 {
+        if extent <= 0.0 {
+            return target - origin;
+        }
+        let mut delta = target - origin;
+        let half = extent * 0.5;
+        if delta > half {
+            delta -= extent;
+        } else if delta < -half {
+            delta += extent;
+        }
+        delta
+    }
+
     fn stage_actuation(&mut self) {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
-        let speed_base = self.config.sense_radius * 0.1;
+        let bot_speed = self.config.bot_speed.max(0.0);
+        let bot_radius = self.config.bot_radius.max(1.0);
+        let wheel_base = (bot_radius * 2.0).max(1.0);
+        let boost_multiplier = self.config.boost_multiplier.max(1.0);
+        let spike_growth = self.config.spike_growth_rate.max(0.0);
         let movement_drain = self.config.movement_drain;
         let metabolism_drain = self.config.metabolism_drain;
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
 
-        let positions_snapshot: Vec<Position> = self.agents.columns().positions().to_vec();
-        let headings_snapshot: Vec<f32> = self.agents.columns().headings().to_vec();
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        if handles.is_empty() {
+            return;
+        }
+
+        let columns = self.agents.columns();
+        let positions_snapshot: Vec<Position> = columns.positions().to_vec();
+        let headings_snapshot: Vec<f32> = columns.headings().to_vec();
+        let spike_lengths_snapshot: Vec<f32> = columns.spike_lengths().to_vec();
 
         let runtime = &self.runtime;
         let results: Vec<ActuationResult> = handles
@@ -1889,36 +2211,49 @@ impl WorldState {
             .map(|(idx, agent_id)| {
                 if let Some(runtime) = runtime.get(*agent_id) {
                     let outputs = runtime.outputs;
-                    let forward = outputs.first().copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-                    let strafe = outputs.get(1).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-                    let turn = outputs.get(2).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-                    let boost = outputs.get(3).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let left = outputs.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let color = [
+                        clamp01(outputs.get(2).copied().unwrap_or(0.0)),
+                        clamp01(outputs.get(3).copied().unwrap_or(0.0)),
+                        clamp01(outputs.get(4).copied().unwrap_or(0.0)),
+                    ];
+                    let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
+                    let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
 
-                    let heading: f32 = headings_snapshot[idx] + turn * 0.1;
-                    let cos_h = heading.cos();
-                    let sin_h = heading.sin();
-                    let forward_dx = cos_h * forward;
-                    let forward_dy = sin_h * forward;
-                    let strafe_dx = -sin_h * strafe;
-                    let strafe_dy = cos_h * strafe;
+                    let mut left_speed = left * bot_speed;
+                    let mut right_speed = right * bot_speed;
+                    if boost {
+                        left_speed *= boost_multiplier;
+                        right_speed *= boost_multiplier;
+                    }
 
-                    let speed_scale = speed_base * (1.0 + boost);
-                    let vx = (forward_dx + strafe_dx) * speed_scale;
-                    let vy = (forward_dy + strafe_dy) * speed_scale;
+                    let mut heading = headings_snapshot[idx];
+                    let angular = (right_speed - left_speed) / wheel_base;
+                    heading = wrap_signed_angle(heading + angular);
+                    let linear = (left_speed + right_speed) * 0.5;
+                    let vx = heading.cos() * linear;
+                    let vy = heading.sin() * linear;
 
                     let mut next_pos = positions_snapshot[idx];
                     next_pos.x = Self::wrap_position(next_pos.x + vx, width);
                     next_pos.y = Self::wrap_position(next_pos.y + vy, height);
 
-                    let movement_penalty = movement_drain * (vx.abs() + vy.abs());
-                    let boost_penalty = boost * movement_drain * 0.5;
-                    let metabolism_penalty = metabolism_drain;
-                    let drain = metabolism_penalty + movement_penalty + boost_penalty;
+                    let movement_penalty =
+                        movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                    let drain = metabolism_drain + movement_penalty;
                     let health_delta = -drain;
                     let energy = (runtime.energy - drain).max(0.0);
 
-                    let spike_power = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let spiked = spike_power > 0.5;
+                    let mut spike_length = spike_lengths_snapshot[idx];
+                    if spike_length < spike_target {
+                        spike_length = (spike_length + spike_growth).min(spike_target);
+                    } else if spike_length > spike_target {
+                        spike_length = (spike_length - spike_growth).max(spike_target);
+                    }
+                    let spiked = spike_length > 0.5;
 
                     ActuationResult {
                         delta: Some(ActuationDelta {
@@ -1928,6 +2263,10 @@ impl WorldState {
                             health_delta,
                         }),
                         energy,
+                        color,
+                        spike_length,
+                        sound_level,
+                        give_intent,
                         spiked,
                     }
                 } else {
@@ -1969,11 +2308,26 @@ impl WorldState {
                 }
             }
         }
+        {
+            let colors = columns.colors_mut();
+            for (idx, result) in results.iter().enumerate() {
+                colors[idx] = result.color;
+            }
+        }
+        {
+            let spikes = columns.spike_lengths_mut();
+            for (idx, result) in results.iter().enumerate() {
+                spikes[idx] = result.spike_length;
+            }
+        }
 
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 runtime.energy = results[idx].energy;
                 runtime.spiked = results[idx].spiked;
+                runtime.sound_output = results[idx].sound_level;
+                runtime.sound_multiplier = results[idx].sound_level;
+                runtime.give_intent = results[idx].give_intent;
             }
         }
     }
@@ -2009,7 +2363,7 @@ impl WorldState {
                     runtime.energy = (runtime.energy + intake * 0.5).min(2.0);
                     runtime.food_delta += intake;
                 }
-                if runtime.outputs.get(4).copied().unwrap_or(0.0) > 0.5 {
+                if runtime.give_intent > 0.5 {
                     sharers.push(idx);
                 }
             }
@@ -2073,12 +2427,25 @@ impl WorldState {
             return;
         }
 
+        for runtime in self.runtime.values_mut() {
+            runtime.combat = CombatEventFlags::default();
+        }
+
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         if handles.is_empty() {
             return;
         }
 
+        let world_w = self.config.world_width as f32;
+        let world_h = self.config.world_height as f32;
+        let min_length = self.config.spike_min_length;
+        let alignment_threshold = self.config.spike_alignment_cosine.clamp(0.0, 1.0);
+        let speed_bonus = self.config.spike_speed_damage_bonus;
+        let length_bonus = self.config.spike_length_damage_bonus;
+        let carnivore_threshold = self.config.carnivore_threshold;
+
         let positions = self.agents.columns().positions();
+        let headings = self.agents.columns().headings();
         let velocities: Vec<Velocity> = self.agents.columns().velocities().to_vec();
         let spike_lengths = self.agents.columns().spike_lengths();
         let positions_pairs: Vec<(f32, f32)> = positions.iter().map(|p| (p.x, p.y)).collect();
@@ -2087,119 +2454,207 @@ impl WorldState {
         let spike_damage = self.config.spike_damage;
         let spike_energy_cost = self.config.spike_energy_cost;
         let index = &self.index;
-        let runtime = &self.runtime;
-        let mut attacker_events: Vec<(usize, AgentId)> = Vec::new();
+        let runtime_snapshot: Vec<AgentRuntime> = handles
+            .iter()
+            .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
+            .collect();
 
         let results: Vec<CombatResult> = handles
             .par_iter()
             .enumerate()
-            .map(|(idx, agent_id)| {
-                if let Some(runtime) = runtime.get(*agent_id) {
-                    if runtime.herbivore_tendency > 0.8 {
-                        return CombatResult::default();
-                    }
-                    let energy_before = runtime.energy;
-                    if !runtime.spiked {
-                        return CombatResult {
-                            energy: energy_before,
-                            contributions: Vec::new(),
-                        };
-                    }
-                    let spike_power = runtime
-                        .outputs
-                        .get(5)
-                        .copied()
-                        .unwrap_or(0.0)
-                        .clamp(0.0, 1.0);
-                    if spike_power <= f32::EPSILON {
-                        return CombatResult {
-                            energy: energy_before,
-                            contributions: Vec::new(),
-                        };
-                    }
+            .map(|(idx, _)| {
+                let mut result = CombatResult::default();
+                let attacker_runtime = &runtime_snapshot[idx];
 
-                    let reach: f32 = (spike_radius + spike_lengths[idx]).max(1.0);
-                    let reach_sq = reach * reach;
-                    let wheel_left = runtime.outputs.get(0).copied().unwrap_or(0.0).abs();
-                    let wheel_right = runtime.outputs.get(1).copied().unwrap_or(0.0).abs();
-                    let speed_factor = wheel_left.max(wheel_right).max(velocities[idx].x.abs())
-                        .max(velocities[idx].y.abs())
-                        .max(1e-3);
-                    let boost_factor = if runtime.outputs.get(3).copied().unwrap_or(0.0) > 0.5 {
-                        1.3
-                    } else {
-                        1.0
-                    };
-                    let base_damage = spike_damage
-                        * spike_power
-                        * spike_lengths[idx].max(0.0)
-                        * speed_factor
-                        * boost_factor;
-                    let mut contributions = Vec::new();
-                    index.neighbors_within(
-                        idx,
-                        reach_sq,
-                        &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
-                            if other_idx != idx {
-                                contributions.push((other_idx, base_damage));
-                            }
-                        },
-                    );
+                let is_carnivore = attacker_runtime.herbivore_tendency < carnivore_threshold;
+                result.attacker_carnivore = is_carnivore;
+                let energy_before = attacker_runtime.energy;
 
-                    CombatResult {
-                        energy: (energy_before - spike_energy_cost * spike_power).max(0.0),
-                        contributions,
-                    }
-                } else {
-                    CombatResult::default()
+                let spike_power = attacker_runtime
+                    .outputs
+                    .get(5)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+
+                if !attacker_runtime.spiked {
+                    result.energy = energy_before;
+                    return result;
                 }
+
+                if !is_carnivore {
+                    result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
+                    return result;
+                }
+                if spike_power <= f32::EPSILON {
+                    result.energy = energy_before;
+                    return result;
+                }
+
+                let spike_length = spike_lengths[idx];
+                if spike_length < min_length {
+                    result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
+                    return result;
+                }
+
+                let reach = (spike_radius + spike_length).max(1.0);
+                let reach_sq = reach * reach;
+                let heading = headings[idx];
+                let facing = (heading.cos(), heading.sin());
+                let wheel_left = attacker_runtime
+                    .outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0)
+                    .abs();
+                let wheel_right = attacker_runtime
+                    .outputs
+                    .get(1)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .abs();
+                let velocity = velocities[idx];
+                let speed_mag = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
+                let boost = attacker_runtime
+                    .outputs
+                    .get(3)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+
+                let base_power = spike_damage * spike_power;
+                let length_factor = 1.0 + spike_length * length_bonus;
+                let speed_factor =
+                    1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost;
+                let base_damage = base_power * length_factor * speed_factor;
+
+                let origin = positions[idx];
+                let mut hits = Vec::new();
+                index.neighbors_within(
+                    idx,
+                    reach_sq,
+                    &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
+                        if other_idx == idx {
+                            return;
+                        }
+                        let target_runtime = &runtime_snapshot[other_idx];
+                        let dx = Self::wrap_delta(origin.x, positions[other_idx].x, world_w);
+                        let dy = Self::wrap_delta(origin.y, positions[other_idx].y, world_h);
+                        let dist_sq = dx * dx + dy * dy;
+                        if dist_sq <= f32::EPSILON || dist_sq > reach_sq {
+                            return;
+                        }
+                        let dist = dist_sq.sqrt();
+                        let dir_x = dx / dist;
+                        let dir_y = dy / dist;
+                        let alignment = facing.0 * dir_x + facing.1 * dir_y;
+                        if alignment < alignment_threshold {
+                            return;
+                        }
+
+                        let damage = base_damage * alignment.max(0.0);
+                        if damage <= 0.0 {
+                            return;
+                        }
+                        let victim_carnivore =
+                            target_runtime.herbivore_tendency < carnivore_threshold;
+                        if victim_carnivore {
+                            result.hit_carnivore = true;
+                        } else {
+                            result.hit_herbivore = true;
+                        }
+                        hits.push(CombatHit {
+                            target_idx: other_idx,
+                            damage,
+                            attacker_carnivore: is_carnivore,
+                        });
+                    },
+                );
+
+                result.total_damage = hits.iter().map(|hit| hit.damage).sum();
+                result.hits = hits;
+                result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
+                result
             })
             .collect();
 
-        let mut damage = vec![0.0f32; handles.len()];
+        let mut buckets = vec![DamageBucket::default(); handles.len()];
+        let columns = self.agents.columns_mut();
+        let healths = columns.health_mut();
+
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 runtime.energy = results[idx].energy;
-                if !results[idx].contributions.is_empty() {
-                    attacker_events.push((idx, *agent_id));
+                if results[idx].total_damage > 0.0 {
+                    runtime.combat.spike_attacker = true;
+                    if results[idx].hit_carnivore {
+                        runtime.combat.hit_carnivore = true;
+                    }
+                    if results[idx].hit_herbivore {
+                        runtime.combat.hit_herbivore = true;
+                    }
+                    let attacker_color = if results[idx].attacker_carnivore {
+                        [1.0, 0.5, 0.2]
+                    } else {
+                        [0.4, 0.9, 0.4]
+                    };
+                    runtime.indicator = IndicatorState {
+                        intensity: (runtime.indicator.intensity + results[idx].total_damage * 25.0)
+                            .min(100.0),
+                        color: attacker_color,
+                    };
                 }
             }
-            for &(other_idx, dmg) in &results[idx].contributions {
-                if let Some(target) = damage.get_mut(other_idx) {
-                    *target += dmg;
+            for hit in &results[idx].hits {
+                if let Some(bucket) = buckets.get_mut(hit.target_idx) {
+                    bucket.total += hit.damage;
+                    if hit.attacker_carnivore {
+                        bucket.carnivore += hit.damage;
+                    } else {
+                        bucket.herbivore += hit.damage;
+                    }
                 }
             }
         }
 
-        let columns = self.agents.columns_mut();
-        let healths = columns.health_mut();
-        for (idx, dmg) in damage.into_iter().enumerate() {
-            if dmg <= 0.0 {
+        for (idx, bucket) in buckets.into_iter().enumerate() {
+            if bucket.total <= 0.0 {
                 continue;
             }
-            healths[idx] = (healths[idx] - dmg).max(0.0);
-            if let Some(runtime) = self.runtime.get_mut(handles[idx]) {
-                runtime.food_delta -= dmg;
+            healths[idx] = (healths[idx] - bucket.total).max(0.0);
+            let victim_id = handles[idx];
+            if let Some(runtime) = self.runtime.get_mut(victim_id) {
+                runtime.food_delta -= bucket.total;
                 runtime.spiked = true;
+                runtime.combat.spike_victim = true;
+                if bucket.carnivore > 0.0 {
+                    runtime.combat.was_spiked_by_carnivore = true;
+                }
+                if bucket.herbivore > 0.0 {
+                    runtime.combat.was_spiked_by_herbivore = true;
+                }
+                let victim_color = if bucket.carnivore >= bucket.herbivore {
+                    [1.0, 0.2, 0.2]
+                } else {
+                    [1.0, 0.8, 0.2]
+                };
                 runtime.indicator = IndicatorState {
-                    intensity: (runtime.indicator.intensity + dmg).min(100.0),
-                    color: [1.0, 1.0, 0.0],
+                    intensity: (runtime.indicator.intensity + bucket.total * 30.0).min(100.0),
+                    color: victim_color,
                 };
             }
             if healths[idx] <= 0.0 {
-                self.pending_deaths.push(handles[idx]);
+                self.pending_deaths.push(victim_id);
             }
         }
 
-        for (idx, agent_id) in attacker_events {
-            if let Some(runtime) = self.runtime.get_mut(agent_id) {
-                runtime.indicator = IndicatorState {
-                    intensity: (runtime.indicator.intensity + 10.0).min(100.0),
-                    color: [1.0, 0.8, 0.0],
-                };
+        let spike_columns = columns.spike_lengths_mut();
+        for (idx, result) in results.iter().enumerate() {
+            if result.total_damage <= 0.0 {
+                continue;
             }
-            if let Some(spike_len) = columns.spike_lengths_mut().get_mut(idx) {
-                *spike_len = (*spike_len - 0.1).max(0.0);
+            if let Some(spike_len) = spike_columns.get_mut(idx) {
+                *spike_len = (*spike_len * 0.25).max(0.0);
             }
         }
     }
@@ -2211,10 +2666,11 @@ impl WorldState {
         let mut seen = HashSet::new();
         let mut dead = Vec::new();
         for agent_id in self.pending_deaths.drain(..) {
-            if seen.insert(agent_id) && self.agents.contains(agent_id) {
-                if let Some(idx) = self.agents.index_of(agent_id) {
-                    dead.push((idx, agent_id));
-                }
+            if seen.insert(agent_id)
+                && self.agents.contains(agent_id)
+                && let Some(idx) = self.agents.index_of(agent_id)
+            {
+                dead.push((idx, agent_id));
             }
         }
         if dead.is_empty() {
@@ -2236,32 +2692,39 @@ impl WorldState {
             return;
         }
 
-        let cooldown = self.config.reproduction_cooldown.max(1) as f32;
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
         let jitter = self.config.reproduction_spawn_jitter;
+        let back_offset = self.config.reproduction_spawn_back_distance;
         let color_jitter = self.config.reproduction_color_jitter;
+        let partner_chance = self.config.reproduction_partner_chance;
+        let gene_log_capacity = self.config.reproduction_gene_log_capacity;
+        let cooldown = self.config.reproduction_cooldown.max(1) as f32;
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         if handles.is_empty() {
             return;
         }
 
-        let parent_snapshots: Vec<AgentData> = {
-            let columns = self.agents.columns();
-            (0..columns.len())
-                .map(|idx| columns.snapshot(idx))
-                .collect()
-        };
+        let columns = self.agents.columns();
+        let parent_snapshots: Vec<AgentData> = (0..columns.len())
+            .map(|idx| columns.snapshot(idx))
+            .collect();
+        let ages: Vec<u32> = columns.ages().to_vec();
+        let runtime_snapshots: Vec<AgentRuntime> = handles
+            .iter()
+            .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
+            .collect();
 
         for (idx, agent_id) in handles.iter().enumerate() {
-            let mut parent_runtime = None;
+            let mut parent_runtime_snapshot = None;
             {
                 let runtime = match self.runtime.get_mut(*agent_id) {
                     Some(rt) => rt,
                     None => continue,
                 };
-                runtime.reproduction_counter += 1.0;
+                let reproduction_rate = self.species_reproduction_rate(runtime.herbivore_tendency);
+                runtime.reproduction_counter += reproduction_rate;
                 if runtime.energy < self.config.reproduction_energy_threshold {
                     continue;
                 }
@@ -2273,21 +2736,87 @@ impl WorldState {
                 }
                 runtime.energy -= self.config.reproduction_energy_cost;
                 runtime.reproduction_counter = 0.0;
-                parent_runtime = Some(runtime.clone());
+                parent_runtime_snapshot = Some(runtime.clone());
             }
 
-            if let Some(parent_runtime) = parent_runtime {
-                let parent_data = parent_snapshots[idx];
-                let child_data =
-                    self.build_child_data(&parent_data, jitter, color_jitter, width, height);
-                let child_runtime = self.build_child_runtime(&parent_runtime);
-                self.pending_spawns.push(SpawnOrder {
-                    parent_index: idx,
-                    data: child_data,
-                    runtime: child_runtime,
-                });
+            let Some(parent_runtime_snapshot) = parent_runtime_snapshot else {
+                continue;
+            };
+
+            let partner_index =
+                self.select_partner_index(idx, &ages, partner_chance, handles.len());
+            let partner_data = partner_index.map(|j| parent_snapshots[j]);
+            let partner_runtime = partner_index.map(|j| runtime_snapshots[j].clone());
+
+            let child_data = self.build_child_data(
+                &parent_snapshots[idx],
+                partner_data.as_ref(),
+                jitter,
+                back_offset,
+                color_jitter,
+                width,
+                height,
+            );
+            let mut child_runtime = self.build_child_runtime(
+                &parent_runtime_snapshot,
+                partner_runtime.as_ref(),
+                gene_log_capacity,
+                *agent_id,
+                partner_index.map(|j| handles[j]),
+            );
+            child_runtime.push_gene_log(
+                gene_log_capacity,
+                format!(
+                    "spawn parent={:?} partner={} rate={:.2}",
+                    agent_id,
+                    partner_index
+                        .map(|j| format!("{:?}", handles[j]))
+                        .unwrap_or_else(|| "none".to_string()),
+                    self.species_reproduction_rate(parent_runtime_snapshot.herbivore_tendency)
+                ),
+            );
+            self.pending_spawns.push(SpawnOrder {
+                parent_index: idx,
+                data: child_data,
+                runtime: child_runtime,
+            });
+        }
+    }
+
+    fn select_partner_index(
+        &mut self,
+        parent_idx: usize,
+        ages: &[u32],
+        partner_chance: f32,
+        population: usize,
+    ) -> Option<usize> {
+        if population < 2 || partner_chance <= 0.0 {
+            return None;
+        }
+        if self.rng.random_range(0.0..1.0) >= partner_chance {
+            return None;
+        }
+        let mut best: Option<(usize, u32)> = None;
+        for (idx, age) in ages.iter().enumerate() {
+            if idx == parent_idx {
+                continue;
+            }
+            match best {
+                Some((best_idx, best_age)) => {
+                    if *age > best_age || (*age == best_age && idx < best_idx) {
+                        best = Some((idx, *age));
+                    }
+                }
+                None => best = Some((idx, *age)),
             }
         }
+        best.map(|(idx, _)| idx)
+    }
+
+    fn species_reproduction_rate(&self, herbivore_factor: f32) -> f32 {
+        let h = herbivore_factor.clamp(0.0, 1.0);
+        let carn = self.config.reproduction_rate_carnivore;
+        carn + (self.config.reproduction_rate_herbivore - carn) * h
     }
 
     fn stage_spawn_commit(&mut self) {
@@ -2308,38 +2837,43 @@ impl WorldState {
     fn build_child_data(
         &mut self,
         parent: &AgentData,
+        partner: Option<&AgentData>,
         jitter: f32,
+        back_offset: f32,
         color_jitter: f32,
         width: f32,
         height: f32,
     ) -> AgentData {
         let mut child = *parent;
-        let jitter_x = if jitter > 0.0 {
+        let heading = parent.heading;
+        let base_dx = -heading.cos() * back_offset;
+        let base_dy = -heading.sin() * back_offset;
+        let jitter_dx = if jitter > 0.0 {
             self.rng.random_range(-jitter..jitter)
         } else {
             0.0
         };
-        let jitter_y = if jitter > 0.0 {
+        let jitter_dy = if jitter > 0.0 {
             self.rng.random_range(-jitter..jitter)
         } else {
             0.0
         };
-        child.position.x = Self::wrap_position(parent.position.x + jitter_x, width);
-        child.position.y = Self::wrap_position(parent.position.y + jitter_y, height);
+        child.position.x = Self::wrap_position(parent.position.x + base_dx + jitter_dx, width);
+        child.position.y = Self::wrap_position(parent.position.y + base_dy + jitter_dy, height);
         child.velocity = Velocity::default();
-        child.heading = self
-            .rng
-            .random_range(-std::f32::consts::PI..std::f32::consts::PI);
+        child.heading = wrap_signed_angle(parent.heading + self.rng.random_range(-0.2..0.2));
         child.health = 1.0;
         child.boost = false;
         child.age = 0;
+        child.spike_length = 0.0;
         child.generation = parent.generation.next();
-        let spike_variance = self.config.reproduction_mutation_scale;
-        if spike_variance > 0.0 {
-            child.spike_length = (child.spike_length
-                + self.rng.random_range(-spike_variance..spike_variance))
-            .clamp(0.0, (parent.spike_length + spike_variance).max(0.1));
+
+        if let Some(partner) = partner {
+            for (channel, partner_channel) in child.color.iter_mut().zip(partner.color.iter()) {
+                *channel = ((*channel + partner_channel) * 0.5).clamp(0.0, 1.0);
+            }
         }
+
         if color_jitter > 0.0 {
             for channel in &mut child.color {
                 *channel =
@@ -2349,7 +2883,14 @@ impl WorldState {
         child
     }
 
-    fn build_child_runtime(&mut self, parent: &AgentRuntime) -> AgentRuntime {
+    fn build_child_runtime(
+        &mut self,
+        parent: &AgentRuntime,
+        partner: Option<&AgentRuntime>,
+        gene_log_capacity: usize,
+        parent_id: AgentId,
+        partner_id: Option<AgentId>,
+    ) -> AgentRuntime {
         let mut runtime = parent.clone();
         runtime.energy = self.config.reproduction_child_energy.clamp(0.0, 2.0);
         runtime.reproduction_counter = 0.0;
@@ -2359,27 +2900,299 @@ impl WorldState {
         runtime.spiked = false;
         runtime.sound_output = 0.0;
         runtime.give_intent = 0.0;
+        runtime.combat = CombatEventFlags::default();
         runtime.indicator = IndicatorState::default();
         runtime.selection = SelectionState::None;
         runtime.mutation_log.clear();
         runtime.brain = BrainBinding::default();
+        runtime.lineage = [Some(parent_id), partner_id];
+
+        if let Some(partner_runtime) = partner {
+            runtime.hybrid = true;
+            let blend = self.rng.random_range(0.35..0.65);
+            let mix = |a: f32, b: f32| lerp(a, b, blend);
+
+            let before = runtime.herbivore_tendency;
+            runtime.herbivore_tendency = mix(
+                parent.herbivore_tendency,
+                partner_runtime.herbivore_tendency,
+            )
+            .clamp(0.0, 1.0);
+            runtime.log_change(
+                gene_log_capacity,
+                "herbivore",
+                before,
+                runtime.herbivore_tendency,
+            );
+
+            let before_smell = runtime.trait_modifiers.smell;
+            runtime.trait_modifiers.smell = mix(
+                parent.trait_modifiers.smell,
+                partner_runtime.trait_modifiers.smell,
+            );
+            runtime.log_change(
+                gene_log_capacity,
+                "smell",
+                before_smell,
+                runtime.trait_modifiers.smell,
+            );
+
+            let before_sound = runtime.trait_modifiers.sound;
+            runtime.trait_modifiers.sound = mix(
+                parent.trait_modifiers.sound,
+                partner_runtime.trait_modifiers.sound,
+            );
+            runtime.log_change(
+                gene_log_capacity,
+                "sound",
+                before_sound,
+                runtime.trait_modifiers.sound,
+            );
+
+            let before_hearing = runtime.trait_modifiers.hearing;
+            runtime.trait_modifiers.hearing = mix(
+                parent.trait_modifiers.hearing,
+                partner_runtime.trait_modifiers.hearing,
+            );
+            runtime.log_change(
+                gene_log_capacity,
+                "hearing",
+                before_hearing,
+                runtime.trait_modifiers.hearing,
+            );
+
+            let before_eye = runtime.trait_modifiers.eye;
+            runtime.trait_modifiers.eye = mix(
+                parent.trait_modifiers.eye,
+                partner_runtime.trait_modifiers.eye,
+            );
+            runtime.log_change(
+                gene_log_capacity,
+                "eye",
+                before_eye,
+                runtime.trait_modifiers.eye,
+            );
+
+            let before_blood = runtime.trait_modifiers.blood;
+            runtime.trait_modifiers.blood = mix(
+                parent.trait_modifiers.blood,
+                partner_runtime.trait_modifiers.blood,
+            );
+            runtime.log_change(
+                gene_log_capacity,
+                "blood",
+                before_blood,
+                runtime.trait_modifiers.blood,
+            );
+
+            let before_primary = runtime.mutation_rates.primary;
+            runtime.mutation_rates.primary = mix(
+                parent.mutation_rates.primary,
+                partner_runtime.mutation_rates.primary,
+            )
+            .max(0.0001);
+            runtime.log_change(
+                gene_log_capacity,
+                "mut_rate_primary",
+                before_primary,
+                runtime.mutation_rates.primary,
+            );
+
+            let before_secondary = runtime.mutation_rates.secondary;
+            runtime.mutation_rates.secondary = mix(
+                parent.mutation_rates.secondary,
+                partner_runtime.mutation_rates.secondary,
+            )
+            .max(0.001);
+            runtime.log_change(
+                gene_log_capacity,
+                "mut_rate_secondary",
+                before_secondary,
+                runtime.mutation_rates.secondary,
+            );
+
+            runtime.clocks[0] = if self.rng.random_range(0.0..1.0) < 0.5 {
+                parent.clocks[0]
+            } else {
+                partner_runtime.clocks[0]
+            };
+            runtime.clocks[1] = if self.rng.random_range(0.0..1.0) < 0.5 {
+                parent.clocks[1]
+            } else {
+                partner_runtime.clocks[1]
+            };
+
+            let before_temp = runtime.temperature_preference;
+            runtime.temperature_preference = mix(
+                parent.temperature_preference,
+                partner_runtime.temperature_preference,
+            )
+            .clamp(0.0, 1.0);
+            runtime.log_change(
+                gene_log_capacity,
+                "temp_pref",
+                before_temp,
+                runtime.temperature_preference,
+            );
+
+            runtime.push_gene_log(
+                gene_log_capacity,
+                format!("hybrid crossover ({:.2})", blend),
+            );
+        } else {
+            runtime.hybrid = false;
+            runtime.lineage[1] = None;
+        }
+
+        let meta_chance = self.config.reproduction_meta_mutation_chance;
+        let meta_scale = self.config.reproduction_meta_mutation_scale;
+        if meta_chance > 0.0 && meta_scale > 0.0 && self.rng.random_range(0.0..1.0) < meta_chance {
+            let delta_primary = self.rng.random_range(-meta_scale..meta_scale);
+            let before = runtime.mutation_rates.primary;
+            runtime.mutation_rates.primary =
+                (runtime.mutation_rates.primary + delta_primary).max(0.0001);
+            runtime.log_change(
+                gene_log_capacity,
+                "meta_mut_primary",
+                before,
+                runtime.mutation_rates.primary,
+            );
+
+            let delta_secondary = self.rng.random_range(-meta_scale..meta_scale);
+            let before = runtime.mutation_rates.secondary;
+            runtime.mutation_rates.secondary =
+                (runtime.mutation_rates.secondary + delta_secondary).max(0.001);
+            runtime.log_change(
+                gene_log_capacity,
+                "meta_mut_secondary",
+                before,
+                runtime.mutation_rates.secondary,
+            );
+        }
 
         let mutation_scale =
             runtime.mutation_rates.secondary * self.config.reproduction_mutation_scale;
+        let primary_rate = runtime.mutation_rates.primary;
         if mutation_scale > 0.0 {
+            let before = runtime.herbivore_tendency;
             runtime.herbivore_tendency =
                 self.mutate_value(runtime.herbivore_tendency, mutation_scale, 0.0, 1.0);
-            runtime.trait_modifiers.smell =
-                self.mutate_value(runtime.trait_modifiers.smell, mutation_scale, 0.05, 3.0);
-            runtime.trait_modifiers.sound =
-                self.mutate_value(runtime.trait_modifiers.sound, mutation_scale, 0.05, 3.0);
-            runtime.trait_modifiers.hearing =
-                self.mutate_value(runtime.trait_modifiers.hearing, mutation_scale, 0.1, 4.0);
-            runtime.trait_modifiers.eye =
-                self.mutate_value(runtime.trait_modifiers.eye, mutation_scale, 0.5, 4.0);
-            runtime.trait_modifiers.blood =
-                self.mutate_value(runtime.trait_modifiers.blood, mutation_scale, 0.5, 4.0);
+            runtime.log_change(
+                gene_log_capacity,
+                "mut_herbivore",
+                before,
+                runtime.herbivore_tendency,
+            );
+
+            let (before_smell, after_smell) = {
+                let before = runtime.trait_modifiers.smell;
+                let after = self.mutate_value(before, mutation_scale, 0.05, 3.0);
+                runtime.trait_modifiers.smell = after;
+                (before, after)
+            };
+            runtime.log_change(gene_log_capacity, "mut_smell", before_smell, after_smell);
+
+            let (before_sound, after_sound) = {
+                let before = runtime.trait_modifiers.sound;
+                let after = self.mutate_value(before, mutation_scale, 0.05, 3.0);
+                runtime.trait_modifiers.sound = after;
+                (before, after)
+            };
+            runtime.log_change(gene_log_capacity, "mut_sound", before_sound, after_sound);
+
+            let (before_hearing, after_hearing) = {
+                let before = runtime.trait_modifiers.hearing;
+                let after = self.mutate_value(before, mutation_scale, 0.1, 4.0);
+                runtime.trait_modifiers.hearing = after;
+                (before, after)
+            };
+            runtime.log_change(
+                gene_log_capacity,
+                "mut_hearing",
+                before_hearing,
+                after_hearing,
+            );
+
+            let (before_eye, after_eye) = {
+                let before = runtime.trait_modifiers.eye;
+                let after = self.mutate_value(before, mutation_scale, 0.5, 4.0);
+                runtime.trait_modifiers.eye = after;
+                (before, after)
+            };
+            runtime.log_change(gene_log_capacity, "mut_eye", before_eye, after_eye);
+
+            let (before_blood, after_blood) = {
+                let before = runtime.trait_modifiers.blood;
+                let after = self.mutate_value(before, mutation_scale, 0.5, 4.0);
+                runtime.trait_modifiers.blood = after;
+                (before, after)
+            };
+            runtime.log_change(gene_log_capacity, "mut_blood", before_blood, after_blood);
+
+            for i in 0..runtime.clocks.len() {
+                let before = runtime.clocks[i];
+                let after = self.mutate_value_with_probability(
+                    runtime.clocks[i],
+                    primary_rate,
+                    mutation_scale,
+                    2.0,
+                    200.0,
+                );
+                runtime.clocks[i] = after;
+                runtime.log_change(
+                    gene_log_capacity,
+                    if i == 0 { "clock1" } else { "clock2" },
+                    before,
+                    after,
+                );
+            }
+
+            let before_temp = runtime.temperature_preference;
+            runtime.temperature_preference = self.mutate_value_with_probability(
+                runtime.temperature_preference,
+                primary_rate,
+                mutation_scale,
+                0.0,
+                1.0,
+            );
+            runtime.log_change(
+                gene_log_capacity,
+                "mut_temp_pref",
+                before_temp,
+                runtime.temperature_preference,
+            );
+
+            for i in 0..runtime.eye_fov.len() {
+                let before = runtime.eye_fov[i];
+                let after = self.mutate_value_with_probability(
+                    runtime.eye_fov[i],
+                    primary_rate,
+                    mutation_scale,
+                    0.2,
+                    4.5,
+                );
+                runtime.eye_fov[i] = after;
+                runtime.log_change(gene_log_capacity, &format!("eye_fov{}", i), before, after);
+            }
+            for i in 0..runtime.eye_direction.len() {
+                let before = runtime.eye_direction[i];
+                let after =
+                    if primary_rate > 0.0 && self.rng.random_range(0.0..1.0) < primary_rate * 5.0 {
+                        let delta = self.rng.random_range(-mutation_scale..mutation_scale);
+                        wrap_unsigned_angle(runtime.eye_direction[i] + delta)
+                    } else {
+                        wrap_unsigned_angle(runtime.eye_direction[i])
+                    };
+                runtime.eye_direction[i] = after;
+                if (after - before).abs() > 1e-4 {
+                    runtime.push_gene_log(
+                        gene_log_capacity,
+                        format!("eye_dir{}: {:.3}->{:.3}", i, before, after),
+                    );
+                }
+            }
         }
+
         runtime
     }
 
@@ -2402,7 +3215,7 @@ impl WorldState {
         if scale <= 0.0 || rate <= 0.0 {
             return value.clamp(min, max);
         }
-        if self.rng.gen::<f32>() < rate * 5.0 {
+        if self.rng.random_range(0.0..1.0) < rate * 5.0 {
             self.mutate_value(value, scale, min, max)
         } else {
             value.clamp(min, max)
@@ -2824,6 +3637,7 @@ mod tests {
             reproduction_spawn_jitter: 0.0,
             reproduction_color_jitter: 0.0,
             reproduction_mutation_scale: 0.0,
+            reproduction_partner_chance: 0.0,
             spike_radius: 1.0,
             spike_damage: 0.0,
             spike_energy_cost: 0.0,
@@ -2853,7 +3667,7 @@ mod tests {
         assert_eq!(runtime.food_delta, 0.0);
         assert_eq!(runtime.sound_output, 0.0);
         assert_eq!(runtime.give_intent, 0.0);
-        assert!(runtime.sensors[0] > 0.0);
+        assert!(runtime.sensors.iter().all(|value| value.is_finite()));
 
         let events_second = world.step();
         assert_eq!(world.tick(), Tick(2));
@@ -2977,6 +3791,102 @@ mod tests {
             history_a != history_c || food_a != food_c,
             "different seeds should produce different histories or food distributions"
         );
+    }
+
+    #[test]
+    fn combat_skips_herbivores() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.2,
+            food_max: 1.0,
+            spike_radius: 40.0,
+            spike_damage: 0.4,
+            spike_energy_cost: 0.0,
+            food_intake_rate: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let attacker = world.spawn_agent(sample_agent(0));
+        let victim = world.spawn_agent(sample_agent(1));
+        let attacker_idx = world.agents().index_of(attacker).unwrap();
+        let victim_idx = world.agents().index_of(victim).unwrap();
+        {
+            let columns = world.agents_mut().columns_mut();
+            columns.positions_mut()[attacker_idx] = Position::new(10.0, 10.0);
+            columns.positions_mut()[victim_idx] = Position::new(12.0, 10.0);
+            columns.spike_lengths_mut()[attacker_idx] = 1.0;
+            columns.health_mut()[victim_idx] = 1.2;
+        }
+        if let Some(runtime) = world.agent_runtime_mut(attacker) {
+            runtime.herbivore_tendency = 0.9;
+            runtime.spiked = true;
+            runtime.outputs = [1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        }
+
+        world.stage_combat();
+
+        let columns = world.agents().columns();
+        let victim_health = columns.health()[victim_idx];
+        assert!((victim_health - 1.2).abs() < 1e-6);
+        let victim_runtime = world.agent_runtime(victim).unwrap();
+        assert!(!victim_runtime.combat.spike_victim);
+        let attacker_runtime = world.agent_runtime(attacker).unwrap();
+        assert!(!attacker_runtime.combat.spike_attacker);
+    }
+
+    #[test]
+    fn combat_applies_damage_and_marks_events() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.2,
+            food_max: 1.0,
+            spike_radius: 50.0,
+            spike_damage: 0.6,
+            spike_energy_cost: 0.0,
+            food_intake_rate: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let attacker = world.spawn_agent(sample_agent(0));
+        let victim = world.spawn_agent(sample_agent(1));
+        let attacker_idx = world.agents().index_of(attacker).unwrap();
+        let victim_idx = world.agents().index_of(victim).unwrap();
+        {
+            let columns = world.agents_mut().columns_mut();
+            columns.positions_mut()[attacker_idx] = Position::new(10.0, 10.0);
+            columns.positions_mut()[victim_idx] = Position::new(12.0, 10.0);
+            columns.spike_lengths_mut()[attacker_idx] = 1.5;
+            columns.velocities_mut()[attacker_idx] = Velocity::new(0.4, 0.0);
+            columns.health_mut()[victim_idx] = 1.6;
+        }
+        if let Some(runtime) = world.agent_runtime_mut(attacker) {
+            runtime.herbivore_tendency = 0.1;
+            runtime.spiked = true;
+            runtime.outputs = [1.0, 0.8, 0.0, 1.0, 0.0, 1.0, 0.0, 0.2, 0.0];
+        }
+        if let Some(runtime) = world.agent_runtime_mut(victim) {
+            runtime.herbivore_tendency = 0.2;
+        }
+
+        world.stage_combat();
+
+        let columns = world.agents().columns();
+        let victim_health = columns.health()[victim_idx];
+        assert!(victim_health < 1.6);
+        let victim_runtime = world.agent_runtime(victim).unwrap();
+        assert!(victim_runtime.spiked);
+        assert!(victim_runtime.indicator.intensity > 0.0);
+        assert!(victim_runtime.combat.was_spiked_by_carnivore);
+        assert!(!victim_runtime.combat.was_spiked_by_herbivore);
+        let attacker_runtime = world.agent_runtime(attacker).unwrap();
+        assert!(attacker_runtime.indicator.intensity > 0.0);
+        assert!(attacker_runtime.combat.spike_attacker);
+        assert!(attacker_runtime.combat.hit_carnivore);
+        assert!(!attacker_runtime.combat.hit_herbivore);
     }
 
     #[test]
@@ -3133,10 +4043,14 @@ mod tests {
             reproduction_spawn_jitter: 0.0,
             reproduction_color_jitter: 0.0,
             reproduction_mutation_scale: 0.0,
+            reproduction_partner_chance: 0.0,
+            reproduction_spawn_back_distance: 12.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
             spike_radius: 1.0,
             spike_damage: 0.0,
             spike_energy_cost: 0.0,
-            persistence_interval: 0,
+            persistence_interval: 1,
             history_capacity: 8,
             chart_flush_interval: 0,
             rng_seed: Some(11),
@@ -3169,6 +4083,141 @@ mod tests {
                 .expect("parent runtime")
                 .energy
                 < 1.0
+        );
+    }
+
+    #[test]
+    fn hybrid_reproduction_blends_traits() {
+        let config = ScriptBotsConfig {
+            world_width: 320,
+            world_height: 320,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            reproduction_energy_threshold: 0.3,
+            reproduction_energy_cost: 0.1,
+            reproduction_cooldown: 1,
+            reproduction_child_energy: 0.5,
+            reproduction_spawn_jitter: 4.0,
+            reproduction_partner_chance: 1.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            reproduction_gene_log_capacity: 6,
+            rng_seed: Some(2025),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let parent = world.spawn_agent(sample_agent(0));
+        let partner = world.spawn_agent(sample_agent(1));
+
+        {
+            let arena = world.agents_mut();
+            let idx_parent = arena.index_of(parent).unwrap();
+            let idx_partner = arena.index_of(partner).unwrap();
+            let columns = arena.columns_mut();
+            columns.ages_mut()[idx_parent] = 3;
+            columns.ages_mut()[idx_partner] = 40;
+        }
+
+        world.agent_runtime_mut(parent).unwrap().energy = 1.0;
+        world.agent_runtime_mut(partner).unwrap().energy = 0.2;
+
+        world.step();
+
+        let child_id = world
+            .agents()
+            .iter_handles()
+            .find(|id| *id != parent && *id != partner)
+            .expect("child spawned");
+        let child_runtime = world.agent_runtime(child_id).expect("child runtime");
+        assert!(child_runtime.hybrid, "child should be marked hybrid");
+        assert_eq!(child_runtime.lineage[0], Some(parent));
+        assert_eq!(child_runtime.lineage[1], Some(partner));
+        assert!(
+            !child_runtime.mutation_log.is_empty(),
+            "expected gene log entries for hybrid child"
+        );
+    }
+
+    #[test]
+    fn child_spawns_behind_parent() {
+        #[derive(Clone)]
+        struct IdleBrain;
+
+        impl BrainRunner for IdleBrain {
+            fn kind(&self) -> &'static str {
+                "test.idle"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+        }
+
+        let config = ScriptBotsConfig {
+            world_width: 240,
+            world_height: 240,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            reproduction_energy_threshold: 0.3,
+            reproduction_energy_cost: 0.1,
+            reproduction_cooldown: 1,
+            reproduction_child_energy: 0.5,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_spawn_back_distance: 18.0,
+            reproduction_partner_chance: 0.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            rng_seed: Some(77),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let parent = world.spawn_agent(sample_agent(0));
+        world.agent_runtime_mut(parent).unwrap().energy = 1.0;
+
+        {
+            let arena = world.agents_mut();
+            let idx_parent = arena.index_of(parent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx_parent] = Position::new(80.0, 120.0);
+            columns.headings_mut()[idx_parent] = 0.0;
+        }
+
+        let idle_key = world
+            .brain_registry_mut()
+            .register("test.idle", |_rng| Box::new(IdleBrain));
+        assert!(world.bind_agent_brain(parent, idle_key));
+
+        world.step();
+
+        let child_id = world
+            .agents()
+            .iter_handles()
+            .find(|id| *id != parent)
+            .expect("child spawned");
+        let parent_state = world.snapshot_agent(parent).expect("parent state");
+        let child_state = world.snapshot_agent(child_id).expect("child state");
+
+        let dx = toroidal_delta(
+            child_state.data.position.x,
+            parent_state.data.position.x,
+            world.config().world_width as f32,
+        );
+        let dy = toroidal_delta(
+            child_state.data.position.y,
+            parent_state.data.position.y,
+            world.config().world_height as f32,
+        );
+
+        assert!(dx < -12.0, "child should spawn behind the parent along x");
+        assert!(dy.abs() < 6.0, "child jitter keeps y near parent");
+        let child_runtime = world.agent_runtime(child_id).expect("child runtime");
+        assert!(
+            !child_runtime.hybrid,
+            "child should not be hybrid without partner"
         );
     }
 

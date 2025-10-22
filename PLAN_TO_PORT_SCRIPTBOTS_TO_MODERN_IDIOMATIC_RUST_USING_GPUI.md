@@ -169,9 +169,9 @@
 ## Parity Gaps vs. Original ScriptBots (Non-Rendering)
 - **World Mechanics**
   - [Completed - GPT-5 Codex 2025-10-22: added configurable regrowth/decay/diffusion with tests] Reproduce food diffusion/decay curves from `World.cpp` (current respawn is basic pulse).
-  - [Currently In Progress - GPT-5 Codex 2025-10-22: porting spike damage scaling, carnivore gating, and deterministic death queues] Flesh out combat resolution: spike damage scaling, carnivore/herbivore event flags, queued death cleanup ordering.
-  - [ ] Implement reproduction nuance: crossover/mutation weighting, spawn jitter, gene logging, lineage tracking.
-  - [Currently In Progress - GPT-5 Codex 2025-10-22: sensory parity work (vision cones, smell/sound attenuation, blood/temperature channels)] Complete sensory modeling: angular vision cones, smell/sound attenuation, change-sensitive synapses.
+  - [Completed - GPT-5 Codex 2025-10-22: spike damage scales with spike length/speed, herbivore vs. carnivore hits emit analytics flags, and death cleanup consumes the pending queue in stable world order] Flesh out combat resolution: spike damage scaling, carnivore/herbivore event flags, queued death cleanup ordering.
+  - [Currently In Progress - GPT-5 Codex 2025-10-22: implementing crossover weighting, lineage tracking, and spawn jitter parity] Implement reproduction nuance: crossover/mutation weighting, spawn jitter, gene logging, lineage tracking.
+  - [Completed - GPT-5 Codex 2025-10-22: multi-eye vision cones, smell/sound/blood channels, temperature discomfort, clock sensors wired with deterministic tests] Complete sensory modeling: angular vision cones, smell/sound attenuation, change-sensitive synapses.
   - [ ] Add energy/aging modifiers (metabolism ramps, age-based decay) to match C++ behavior.
   - [ ] Restore environmental temperature mechanics: apply discomfort-based health drain tied to agents' `temperature_preference`, expose configurable gradients, and extend tests covering equator/edge scenarios.
   - [ ] Reintroduce carcass distribution: when an agent dies (especially from spikes), deterministically share meat resources with nearby carnivores/herbivores using the original age-based scaling and ensure persistence metrics capture these events.
@@ -208,12 +208,11 @@
   - ✅ Canvas renderer for food tiles and agents (health-adjusted color, radius scaling).
   - ✅ Camera controls: middle-click pan, scroll zoom with anchor, HUD readouts for zoom/pan.
 - **Outstanding / Upcoming**
-- [Currently In Progress - GPT-5 Codex 2025-10-22: Selection/hover indicators with canvas highlights, brush tooling UI, and debug probe plumbing.] 
-  - [ ] Selection/hover indicators: canvas highlights, brush tools, debug probes.
-  - [ ] Event overlays: combat flashes, reproduction trails, food diffusion visualization.
-  - [ ] Performance diagnostics: frame timings, GPU stats, logging integration.
-  - [ ] Terrain/lighting polish: tile shading, bloom/post-processing, night/day palettes.
-  - [ ] Input rebinding & accessibility: keyboard remaps, colorblind-safe palettes, narration hooks.
+- [Completed - GPT-5 Codex 2025-10-22: Canvas selection/hover highlights, brush tooling UI stubs, and debug probe toggles (follow-up: hook brush/probe ops to world).]
+  - [Completed - GPT-5 Codex 2025-10-22: Event overlays (combat flashes, reproduction halos, food diffusion glow) with brush/probe telemetry surfaced; follow-up: connect overlays to simulation history buffers.]
+  - [Completed - GPT-5 Codex 2025-10-22: Performance diagnostics panel (frame time/fps tracking, live stats overlay); follow-up: wire GPU backend counters once exposed.]
+  - [Completed - GPT-5 Codex 2025-10-22: Terrain/lighting polish (dynamic sky palette, food tile shading, reproduction/spike VFX); follow-up: hook palettes to configurable themes.]
+  - [Currently In Progress - GPT-5 Codex 2025-10-22: Input rebinding & accessibility (keyboard remaps, colorblind-safe palettes, narration hooks).]
 
 ## Migration Roadmap
 1. **Project Bootstrap (Week 1)**
