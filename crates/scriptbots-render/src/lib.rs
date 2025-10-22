@@ -5851,18 +5851,18 @@ impl ConfigCategory {
     /// Returns the exact number of parameters displayed in this category
     fn parameter_count(self) -> usize {
         match self {
-            ConfigCategory::World => 6, // width, height, food_cell_size, initial_food, rng_seed, chart_flush
-            ConfigCategory::Food => 12, // respawn_interval/amount, growth_interval/amount, decay_interval/amount, diffusion_rate, intake_rate, sharing_radius/rate/transfer/distance
-            ConfigCategory::Agent => 4, // base_speed, boost_multiplier, vision_range, carnivore_threshold
-            ConfigCategory::Metabolism => 5, // drain, movement_drain, ramp_floor, ramp_rate, boost_penalty
-            ConfigCategory::Temperature => 4, // discomfort_rate, comfort_band, gradient_exponent, discomfort_exponent
-            ConfigCategory::Reproduction => 14, // energy_threshold, energy_cost, cooldown, herbivore_rate, carnivore_rate, child_energy, spawn_jitter, spawn_back_distance, color_jitter, mutation_scale, partner_chance, gene_log_capacity, meta_mutation_chance, meta_mutation_scale
-            ConfigCategory::Aging => 4, // decay_start, decay_rate, decay_max, energy_penalty
-            ConfigCategory::Combat => 8, // spike_radius, spike_damage, spike_energy_cost, min_length, alignment_cosine, speed_bonus, length_bonus, growth_rate
-            ConfigCategory::Carcass => 7, // distribution_radius, health_reward, reproduction_reward, neighbor_exponent, maturity_age, energy_share, indicator_scale
-            ConfigCategory::Topography => 3, // enabled, speed_gain, energy_penalty
-            ConfigCategory::Population => 4, // minimum, spawn_interval, spawn_count, crossover_chance
-            ConfigCategory::Persistence => 1, // interval
+            ConfigCategory::World => 5, // ACTUAL: width, height, food_cell_size, initial_food, rng_seed
+            ConfigCategory::Food => 11, // ACTUAL: respawn_interval, respawn_amount, max, growth_rate, decay_rate, diffusion_rate, intake_rate, sharing_radius, sharing_rate, transfer_rate, sharing_distance
+            ConfigCategory::Agent => 6, // ACTUAL: bot_speed, bot_radius, boost_multiplier, sense_radius, sense_max_neighbors, carnivore_threshold
+            ConfigCategory::Metabolism => 5, // ACTUAL: drain, movement_drain, ramp_floor, ramp_rate, boost_penalty
+            ConfigCategory::Temperature => 4, // ACTUAL: discomfort_rate, comfort_band, gradient_exponent, discomfort_exponent
+            ConfigCategory::Reproduction => 14, // ACTUAL: energy_threshold, energy_cost, cooldown, herbivore_rate, carnivore_rate, child_energy, spawn_jitter, spawn_back_distance, color_jitter, mutation_scale, partner_chance, gene_log_capacity, meta_mutation_chance, meta_mutation_scale
+            ConfigCategory::Aging => 4, // ACTUAL: decay_start, decay_rate, decay_max, energy_penalty
+            ConfigCategory::Combat => 8, // ACTUAL: spike_radius, spike_damage, spike_energy_cost, min_length, alignment_cosine, speed_bonus, length_bonus, growth_rate
+            ConfigCategory::Carcass => 7, // ACTUAL: distribution_radius, health_reward, reproduction_reward, neighbor_exponent, maturity_age, energy_share, indicator_scale
+            ConfigCategory::Topography => 3, // ACTUAL: enabled, speed_gain, energy_penalty
+            ConfigCategory::Population => 4, // ACTUAL: minimum, spawn_interval, spawn_count, crossover_chance
+            ConfigCategory::Persistence => 2, // ACTUAL: interval, enabled (2 params visible in render)
         }
     }
 }

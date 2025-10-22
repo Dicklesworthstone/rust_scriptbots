@@ -164,7 +164,7 @@
   - Added a stdio MCP server (`list_knobs`, `get_config`, `apply_updates`, `apply_patch`) so external LLM tooling can orchestrate simulations safely.
   - Delivered the `scriptbots-control` CLI (clap + reqwest + ratatui) offering scripted updates (`set`, `patch`) and a live dashboard (`watch`) that highlights config deltas while the GPUI shell runs.
 - Diagnostics:
-  - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization. [Currently In Progress - Codex 2025-10-22]
+  - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization.
   - Provide debug tooling to render network topologies (layer shapes, activations) inside the inspector panel.
 
 ## Modularity & Extensibility Enhancements
@@ -291,7 +291,7 @@
 - Explore `ratatui-animations` for smooth gauge updates and `ratatui-extras` for mini-charts and tabular dashboards.
 
 ### Implementation Plan
-1. **Trait Abstraction & CLI Wiring** [Currently In Progress - CLI/Renderer refactor]
+1. **Trait Abstraction & CLI Wiring** [Completed - CLI/Renderer refactor 2025-10-22]
    - Define `Renderer` trait in `scriptbots-app` with `fn run(&self, world: SharedWorld, controls: &ControlRuntime) -> Result<()>` and optional teardown hooks.
    - Refactor existing GPUI entry to implement the trait without altering rendering internals.
    - Extend CLI parsing (using `clap` or current argument parser) to accept `--mode` and environment overrides; update `ControlServerConfig` to propagate mode choice.
@@ -329,3 +329,12 @@
 - *Input conflicts*: centralize keybinding definitions shared with GPUI to avoid drift.
 - *Performance drift*: throttle terminal redraws and reuse diffing buffers to minimize CPU usage during long runs.
 - *Feature parity expectations*: document intentionally omitted GPUI features (e.g., advanced camera) and ensure Control Server APIs remain the extension point for deep inspection.
+
+### Execution TODOs [Currently In Progress]
+- [ ] Dependency alignment: ensure `thiserror` is restored, drop redundant `utoipa-axum`, and add terminal-mode crates (`supports-color`, `unicode-width`) gated appropriately.
+- [ ] CLI mode integration: update `resolve_renderer` to prefer terminal mode when headless, and surface structured logs when fallback happens.
+- [ ] Terminal renderer scaffolding: add `terminal` module implementing the `Renderer` trait with screen setup, event loop, and world stepping.
+- [ ] HUD implementation pass 1: render tick/epoch, population metrics, recent summaries, and a coarse emoji world map with palette fallbacks.
+- [ ] Input handling parity: wire pause/resume, speed adjustments, help overlay, and graceful quit to existing control runtime APIs.
+- [ ] Automated testing: add headless smoke test (CI) invoking terminal renderer under `TERM=xterm-256color` to guard regressions.
+- [ ] Documentation updates: README usage section, environment variables, and example captures; note feature flag expectations.

@@ -69,6 +69,7 @@ impl SimSpec {
         seed: Option<u64>,
         snapshot_format: SnapshotFormat,
         seed_strategy: SeedStrategy,
+        default_brain: Option<BrainPreset>,
     ) -> Self {
         Self {
             base_config,
@@ -76,6 +77,7 @@ impl SimSpec {
             seed,
             snapshot_format,
             seed_strategy,
+            default_brain,
         }
     }
 
@@ -97,19 +99,24 @@ impl SimSpec {
 
 impl Simulation {
     fn new(spec: SimSpec) -> Result<Self> {
-        let mut world = WorldState::new(spec.config())
+        let world = WorldState::new(spec.config())
             .context("failed to initialize ScriptBots world state")?;
-        seed_agents(&mut world, spec.initial_population, spec.seed_strategy)?;
-        Ok(Self { world, spec })
+        let mut sim = Self {
+            world,
+            spec,
+            mlp_key: None,
+        };
+        sim.seed_population()?;
+        Ok(sim)
     }
 
     fn reset(&mut self, seed: Option<u64>) -> Result<()> {
         let spec = self.spec.with_seed(seed);
-        let mut world = WorldState::new(spec.config())
+        self.world = WorldState::new(spec.config())
             .context("failed to rebuild ScriptBots world state during reset")?;
-        seed_agents(&mut world, spec.initial_population, spec.seed_strategy)?;
-        self.world = world;
+        self.mlp_key = None;
         self.spec = spec;
+        self.seed_population()?;
         Ok(())
     }
 
@@ -122,6 +129,46 @@ impl Simulation {
 
     fn snapshot(&self) -> SimulationSnapshot {
         SimulationSnapshot::from_world(&self.world)
+    }
+
+    fn seed_population(&mut self) -> Result<()> {
+        seed_agents(
+            &mut self.world,
+            self.spec.initial_population,
+            self.spec.seed_strategy,
+            self.spec.default_brain,
+            &mut self.mlp_key,
+        )
+    }
+
+    fn ensure_mlp_key(&mut self) -> Result<u64> {
+        if let Some(key) = self.mlp_key {
+            return Ok(key);
+        }
+        let key = self
+            .world
+            .brain_registry_mut()
+            .register(MlpBrain::KIND.as_str(), |rng| MlpBrain::runner(rng));
+        self.mlp_key = Some(key);
+        Ok(key)
+    }
+
+    fn bind_brain_to_all(&mut self, key: u64) {
+        let handles: Vec<_> = self.world.agents().iter_handles().collect();
+        for id in handles {
+            let _ = self.world.bind_agent_brain(id, key);
+        }
+    }
+
+    fn apply_wander_to_all(&mut self) {
+        let handles: Vec<_> = self.world.agents().iter_handles().collect();
+        for id in handles {
+            let seed = {
+                let rng = self.world.rng();
+                rng.random::<u64>()
+            };
+            let _ = bind_wander_brain(&mut self.world, id, seed);
+        }
     }
 }
 
@@ -138,6 +185,8 @@ struct InitOptions {
     snapshot_format: Option<SnapshotFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seed_strategy: Option<SeedStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_brain: Option<BrainPreset>,
 }
 
 impl Default for InitOptions {
@@ -150,6 +199,7 @@ impl Default for InitOptions {
             config: None,
             snapshot_format: None,
             seed_strategy: None,
+            default_brain: None,
         }
     }
 }
@@ -172,11 +222,12 @@ impl InitOptions {
             self.seed,
             self.snapshot_format.unwrap_or_default(),
             self.seed_strategy.unwrap_or_default(),
+            self.default_brain,
         )
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SimulationSnapshot {
     tick: u64,
@@ -267,7 +318,7 @@ impl SimulationSnapshot {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotSummary {
     agent_count: usize,
@@ -278,7 +329,7 @@ struct SnapshotSummary {
     average_health: f32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentSnapshot {
     id: u64,
@@ -292,7 +343,7 @@ struct AgentSnapshot {
     boost: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotWorld {
     width: u32,
@@ -324,10 +375,29 @@ impl SimHandle {
     }
 
     #[wasm_bindgen(js_name = registerBrain)]
-    pub fn register_brain_js(&self, _kind: String) -> Result<(), JsValue> {
-        Err(js_error(
-            "registerBrain is not yet implemented; hookup to scriptbots-brain coming in Phase 2.3",
-        ))
+    pub fn register_brain_js(&self, kind: String) -> Result<(), JsValue> {
+        let mut simulation = self.inner.borrow_mut();
+        match kind.as_str() {
+            "mlp" => {
+                let key = simulation.ensure_mlp_key().map_err(js_error)?;
+                simulation.spec.default_brain = Some(BrainPreset::Mlp);
+                simulation.spec.seed_strategy = SeedStrategy::None;
+                simulation.bind_brain_to_all(key);
+                Ok(())
+            }
+            "wander" => {
+                simulation.spec.default_brain = None;
+                simulation.spec.seed_strategy = SeedStrategy::Wander;
+                simulation.apply_wander_to_all();
+                Ok(())
+            }
+            "none" => {
+                simulation.spec.default_brain = None;
+                simulation.spec.seed_strategy = SeedStrategy::None;
+                Ok(())
+            }
+            other => Err(js_error(format!("unknown brain preset: {other}"))),
+        }
     }
 }
 
@@ -438,12 +508,15 @@ pub fn default_init_options() -> Result<JsValue, JsValue> {
     to_value(&InitOptions::default()).map_err(js_error)
 }
 
-fn bind_brain(world: &mut WorldState, agent: AgentId, seed: u64) -> Result<()> {
-    let runtime = world
-        .agent_runtime_mut(agent)
-        .with_context(|| "agent runtime missing while binding wander brain")?;
-    runtime.brain = BrainBinding::with_runner(Box::new(WanderBrain::new(seed)));
-    Ok(())
+fn bind_wander_brain(world: &mut WorldState, agent: AgentId, seed: u64) -> Result<()> {
+    if let Some(runtime) = world.agent_runtime_mut(agent) {
+        runtime.brain = BrainBinding::with_runner(Box::new(WanderBrain::new(seed)));
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "agent runtime missing while binding wander brain"
+        ))
+    }
 }
 
 struct WanderBrain {
@@ -507,12 +580,28 @@ mod tests {
     #[wasm_bindgen_test]
     fn wasm_harness_matches_native_world() {
         let cases = [
-            (480_u32, 360_u32, 32_usize, 24_u32, 8102_u64),
-            (640, 480, 48, 40, 1337),
-            (320, 320, 16, 64, 202501u64),
+            (
+                480_u32,
+                360_u32,
+                32_usize,
+                24_u32,
+                8102_u64,
+                SeedStrategy::Wander,
+                None,
+            ),
+            (
+                640,
+                480,
+                48,
+                40,
+                1337,
+                SeedStrategy::None,
+                Some(BrainPreset::Mlp),
+            ),
+            (320, 320, 16, 64, 202501u64, SeedStrategy::Wander, None),
         ];
 
-        for (width, height, population, ticks, seed) in cases {
+        for (width, height, population, ticks, seed, strategy, default_brain) in cases {
             let mut config = ScriptBotsConfig::default();
             config.world_width = width;
             config.world_height = height;
@@ -520,8 +609,15 @@ mod tests {
 
             // Native world execution
             let mut native_world = WorldState::new(config.clone()).expect("native world");
-            seed_agents(&mut native_world, population, SeedStrategy::Wander)
-                .expect("seed native world");
+            let mut mlp_cache = None;
+            seed_agents(
+                &mut native_world,
+                population,
+                strategy,
+                default_brain,
+                &mut mlp_cache,
+            )
+            .expect("seed native world");
             for _ in 0..ticks {
                 native_world.step();
             }
@@ -533,7 +629,8 @@ mod tests {
                 population,
                 Some(seed),
                 SnapshotFormat::Json,
-                SeedStrategy::Wander,
+                strategy,
+                default_brain,
             ))
             .expect("sim");
             let wasm_snapshot = sim.tick(ticks);
