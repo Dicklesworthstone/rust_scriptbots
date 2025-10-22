@@ -239,7 +239,7 @@
 7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
 - Build GPUI window, canvas renderer, agent inspector UI. [Completed - GPT-5 Codex 2025-10-22: window shell, HUD, canvas renderer, and inspector panel shipped]
    - Implement camera controls, overlays, history chart. [Completed - GPT-5 Codex 2025-10-22: middle-click pan, scroll zoom, overlay HUD, tick-history chart]
-   - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.
+   - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals. [Currently In Progress - GPT-5 Codex 2025-10-22]
 8. **Integration & UX Polish (Weeks 10-11)**
    - Hook actions to simulation, selection workflows, debug overlays.
    - Add metrics HUD, performance counters.
