@@ -42,7 +42,7 @@
 - Command: `cargo check --target wasm32-unknown-unknown -p scriptbots-core`.
 - Capture and catalogue all compilation blockers (expected: Rayon threading, OS-specific APIs).
 - Produce `PHASE1_FINDINGS.md` summarizing blockers and severity.
-- **Follow-up:** enable `getrandom`’s JS backend and gate Rayon before rerunning check (tracked in `docs/wasm/TODO_PHASE1.md`).
+- **Follow-up:** enable `getrandom`’s JS backend and gate Rayon before rerunning check (tracked in `docs/wasm/TODO_PHASE1.md`). CPU-specific `RUSTFLAGS` guidance lives in `docs/wasm/cargo_rustflags_notes.md`.
 
 ### 1.2 Dependency Audit [Completed 2025-10-22 — see docs/wasm/dependency_audit.csv]
 - Inventory every crate transitively pulled into `scriptbots-web`; flag categories:
@@ -69,7 +69,7 @@
 - Decide interim plan: disable audio initially vs integrate alternative (e.g., Web Audio API via `web-sys`).
 - Document in `ADR-003-wasm-audio.md`.
 
-### 1.6 Multithreading Requirements [Completed 2025-10-22 — see docs/wasm/multithreading_notes.md]
+### 1.6 Multithreading Requirements [Completed 2025-10-22 — see docs/wasm/multithreading_notes.md and docs/wasm/rayon_fallback_plan.md]
 - Document prerequisites for enabling `wasm-bindgen-rayon` (SharedArrayBuffer gates, COOP/COEP headers).
 - Decide MVP posture (single-thread fallback vs. multithread-first) and capture rationale.
 - Record hosting requirements (HTTP response headers, service worker interplay).

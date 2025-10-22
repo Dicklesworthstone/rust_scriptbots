@@ -1424,6 +1424,12 @@ pub struct ScriptBotsConfig {
     pub metabolism_drain: f32,
     /// Fraction of velocity converted to additional energy cost.
     pub movement_drain: f32,
+    /// Minimum energy level before metabolism ramping activates.
+    pub metabolism_ramp_floor: f32,
+    /// Additional drain applied per unit energy above the ramp floor.
+    pub metabolism_ramp_rate: f32,
+    /// Fixed drain added when boost output is engaged.
+    pub metabolism_boost_penalty: f32,
     /// Health drain multiplier applied when agents experience temperature discomfort.
     pub temperature_discomfort_rate: f32,
     /// Difference threshold below which temperature discomfort is ignored.
@@ -1466,6 +1472,14 @@ pub struct ScriptBotsConfig {
     pub reproduction_meta_mutation_chance: f32,
     /// Magnitude of meta-mutation applied to mutation rates.
     pub reproduction_meta_mutation_scale: f32,
+    /// Age (in ticks) after which health decay begins to scale.
+    pub aging_health_decay_start: u32,
+    /// Incremental health decay applied per tick beyond the start age.
+    pub aging_health_decay_rate: f32,
+    /// Cap applied to the age-based health decay each tick.
+    pub aging_health_decay_max: f32,
+    /// Multiplier converting health decay into additional energy drain.
+    pub aging_energy_penalty_rate: f32,
     /// Base radius used when checking spike impacts.
     pub spike_radius: f32,
     /// Damage applied by a spike at full power.

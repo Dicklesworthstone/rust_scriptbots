@@ -2812,7 +2812,7 @@ struct RenderFrame {
     food_max: f32,
     agents: Vec<AgentRenderData>,
     agent_base_radius: f32,
-    post_fx: PostProcessingConfig,
+    post_stack: PostProcessStack,
     palette: ColorPaletteMode,
 }
 
@@ -2833,48 +2833,84 @@ struct TerrainTileVisual {
 }
 
 #[derive(Clone)]
-struct PostProcessingConfig {
-    vignette_strength: f32,
-    bloom_strength: f32,
-    scanline_intensity: f32,
-    grain_strength: f32,
+struct PostProcessStack {
+    passes: Vec<PostProcessPass>,
 }
 
-impl PostProcessingConfig {
-    fn from_world(world: &WorldState) -> Self {
-        let tick = world.tick().0;
-        let day_phase = (tick as f32 * 0.00025).sin() * 0.5 + 0.5;
-        let closed_bonus = if world.is_closed() { 0.18 } else { 0.0 };
-        let agent_count = world.agent_count().max(1) as f32;
-        let latest = world.history().last();
-        let (births_ratio, deaths_ratio) = latest
-            .map(|summary| {
-                (
-                    summary.births as f32 / agent_count,
-                    summary.deaths as f32 / agent_count,
-                )
-            })
-            .unwrap_or((0.0, 0.0));
-        let life_delta = (births_ratio - deaths_ratio).clamp(-1.0, 1.0);
-        let tension = life_delta.abs();
+#[derive(Clone, Copy)]
+enum PostProcessPass {
+    Vignette { strength: f32 },
+    Bloom { strength: f32 },
+    Scanlines { intensity: f32, spacing: f32 },
+    FilmGrain { strength: f32, seed: u64 },
+    ColorGrade { lift: f32, gain: f32, temperature: f32 },
+}
 
-        Self {
-            vignette_strength: (0.36
-                + day_phase * 0.24
-                + closed_bonus
-                + (-life_delta).max(0.0) * 0.28)
-                .clamp(0.2, 0.82),
-            bloom_strength: (0.24 + day_phase * 0.32 + life_delta.max(0.0) * 0.28)
-                .clamp(0.12, 0.78),
-            scanline_intensity: (0.18
-                + (1.0 - day_phase) * 0.22
-                + closed_bonus * 0.35
-                + (-life_delta).max(0.0) * 0.18)
-                .clamp(0.08, 0.65),
-            grain_strength: (0.11 + (tick % 4096) as f32 / 4096.0 * 0.08 + tension * 0.06)
-                .clamp(0.08, 0.26),
-        }
-    }
+fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> PostProcessStack {
+    let tick = world.tick().0;
+    let day_phase = (tick as f32 * 0.00025).sin() * 0.5 + 0.5;
+    let closed_bonus = if world.is_closed() { 0.18 } else { 0.0 };
+    let agent_count = world.agent_count().max(1) as f32;
+    let latest = world.history().last();
+    let (births_ratio, deaths_ratio) = latest
+        .map(|summary| {
+            (
+                summary.births as f32 / agent_count,
+                summary.deaths as f32 / agent_count,
+            )
+        })
+        .unwrap_or((0.0, 0.0));
+    let life_delta = (births_ratio - deaths_ratio).clamp(-1.0, 1.0);
+    let tension = life_delta.abs();
+
+    let vignette_strength = (0.36
+        + day_phase * 0.24
+        + closed_bonus
+        + (-life_delta).max(0.0) * 0.28)
+        .clamp(0.2, 0.82);
+    let bloom_strength = (0.24 + day_phase * 0.32 + life_delta.max(0.0) * 0.28)
+        .clamp(0.12, 0.78);
+    let scanline_intensity = (0.18
+        + (1.0 - day_phase) * 0.22
+        + closed_bonus * 0.35
+        + (-life_delta).max(0.0) * 0.18)
+        .clamp(0.08, 0.65);
+    let grain_strength = (0.11 + (tick % 4096) as f32 / 4096.0 * 0.08 + tension * 0.06)
+        .clamp(0.08, 0.26);
+
+    let temperature = match palette {
+        ColorPaletteMode::Natural => 0.08 - life_delta * 0.05,
+        ColorPaletteMode::Deuteranopia => 0.05,
+        ColorPaletteMode::Protanopia => -0.04,
+        ColorPaletteMode::Tritanopia => 0.12,
+        ColorPaletteMode::HighContrast => 0.20,
+    };
+
+    let color_grade = PostProcessPass::ColorGrade {
+        lift: (0.05 + closed_bonus * 0.12 - life_delta * 0.06).clamp(0.0, 0.12),
+        gain: (1.02 + day_phase * 0.08 + life_delta.max(0.0) * 0.12).clamp(1.0, 1.25),
+        temperature,
+    };
+
+    let passes = vec![
+        color_grade,
+        PostProcessPass::Vignette {
+            strength: vignette_strength,
+        },
+        PostProcessPass::Bloom {
+            strength: bloom_strength,
+        },
+        PostProcessPass::Scanlines {
+            intensity: scanline_intensity,
+            spacing: 4.5,
+        },
+        PostProcessPass::FilmGrain {
+            strength: grain_strength,
+            seed: tick,
+        },
+    ];
+
+    PostProcessStack { passes }
 }
 
 #[derive(Clone)]
@@ -2956,7 +2992,7 @@ impl RenderFrame {
             food_max: config.food_max,
             agents,
             agent_base_radius: (config.spike_radius * 0.5).max(12.0),
-            post_fx: PostProcessingConfig::from_world(world),
+            post_stack: build_post_process_stack(world, palette),
             palette,
         })
     }
@@ -3106,9 +3142,9 @@ fn legend_item(color: Rgba, label: &str) -> Div {
 
 fn paint_history_chart(bounds: Bounds<Pixels>, data: &HistoryChartData, window: &mut Window) {
     let origin = bounds.origin;
-    let size = bounds.size;
-    let chart_width = f32::from(size.width).max(1.0);
-    let chart_height = f32::from(size.height).max(1.0);
+    let bounds_size = bounds.size;
+    let chart_width = f32::from(bounds_size.width).max(1.0);
+    let chart_height = f32::from(bounds_size.height).max(1.0);
     let scale_x = chart_width / data.width.max(1.0);
     let scale_y = chart_height / data.height.max(1.0);
 
@@ -3138,11 +3174,39 @@ fn paint_history_chart(bounds: Bounds<Pixels>, data: &HistoryChartData, window: 
     draw_polyline(&data.deaths, rgb(0xef4444));
 }
 
+fn append_arc_polyline(
+    builder: &mut PathBuilder,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_deg: f32,
+    sweep_deg: f32,
+) {
+    let segments = (sweep_deg.abs() / 6.0).ceil().max(1.0) as usize;
+    let start = start_deg.to_radians();
+    let sweep = sweep_deg.to_radians();
+    let step = sweep / segments as f32;
+    for i in 0..=segments {
+        let angle = start + step * i as f32;
+        let x = cx + radius * angle.cos();
+        let y = cy + radius * angle.sin();
+        if i == 0 {
+            builder.move_to(point(px(x), px(y)));
+        } else {
+            builder.line_to(point(px(x), px(y)));
+        }
+    }
+}
+
+fn append_circle_polygon(builder: &mut PathBuilder, cx: f32, cy: f32, radius: f32) {
+    append_arc_polyline(builder, cx, cy, radius, 0.0, 360.0);
+}
+
 fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut Window) {
     let origin = bounds.origin;
-    let size = bounds.size;
-    let width = f32::from(size.width).max(1.0);
-    let height = f32::from(size.height).max(1.0);
+    let bounds_size = bounds.size;
+    let width = f32::from(bounds_size.width).max(1.0);
+    let height = f32::from(bounds_size.height).max(1.0);
 
     let backdrop = rgba_from_hex(0x091220, 0.88);
     window.paint_quad(fill(bounds, Background::from(backdrop)));
@@ -3153,12 +3217,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
     let radius = (width.min(height) * 0.36).max(18.0);
 
     let mut base_arc = PathBuilder::stroke(px(3.2));
-    base_arc.arc(
-        center,
-        px(radius),
-        Angle::from_degrees(-140.0),
-        Angle::from_degrees(280.0),
-    );
+    append_arc_polyline(&mut base_arc, cx, cy, radius, -140.0, 280.0);
     if let Ok(path) = base_arc.build() {
         window.paint_path(path, rgba_from_hex(0x142033, 0.95));
     }
@@ -3166,12 +3225,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
     let progress_deg = 280.0 * state.population_ratio.clamp(0.0, 1.0);
     if progress_deg > 0.5 {
         let mut progress_arc = PathBuilder::stroke(px(4.2));
-        progress_arc.arc(
-            center,
-            px(radius),
-            Angle::from_degrees(-140.0),
-            Angle::from_degrees(progress_deg),
-        );
+        append_arc_polyline(&mut progress_arc, cx, cy, radius, -140.0, progress_deg);
         if let Ok(path) = progress_arc.build() {
             let progress_color = lerp_rgba(
                 rgba_from_hex(0x38bdf8, 0.95),
@@ -3183,12 +3237,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
     }
 
     let mut halo_arc = PathBuilder::stroke(px(1.6));
-    halo_arc.arc(
-        center,
-        px(radius * 1.08),
-        Angle::from_degrees(-140.0),
-        Angle::from_degrees(280.0),
-    );
+    append_arc_polyline(&mut halo_arc, cx, cy, radius * 1.08, -140.0, 280.0);
     if let Ok(path) = halo_arc.build() {
         window.paint_path(path, rgba_from_hex(0x1d3559, 0.25));
     }
@@ -3196,12 +3245,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
     let energy_scale = state.energy_ratio.clamp(0.0, 1.0);
     let inner_radius = radius * (0.46 + energy_scale * 0.18);
     let mut inner_fill = PathBuilder::fill();
-    inner_fill.arc(
-        center,
-        px(inner_radius),
-        Angle::from_degrees(0.0),
-        Angle::from_degrees(360.0),
-    );
+    append_circle_polygon(&mut inner_fill, cx, cy, inner_radius);
     if let Ok(path) = inner_fill.build() {
         let inner_color = lerp_rgba(
             rgba_from_hex(0x122033, 0.92),
@@ -3272,12 +3316,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
         if coherence > 1.0 {
             let ring_inner = radius * 0.55;
             let mut ring = PathBuilder::stroke(px(1.2 + coherence * 0.02));
-            ring.arc(
-                center,
-                px(ring_inner),
-                Angle::from_degrees(-140.0),
-                Angle::from_degrees(280.0 * velocity_ratio),
-            );
+            append_arc_polyline(&mut ring, cx, cy, ring_inner, -140.0, 280.0 * velocity_ratio);
             if let Ok(path) = ring.build() {
                 window.paint_path(path, rgba_from_hex(0x60a5fa, 0.65));
             }
@@ -3618,9 +3657,9 @@ fn terrain_water_caustic_color(
 
 fn paint_sparkline(bounds: Bounds<Pixels>, state: SparklineState, window: &mut Window) {
     let origin = bounds.origin;
-    let size = bounds.size;
-    let width = f32::from(size.width).max(1.0);
-    let height = f32::from(size.height).max(1.0);
+    let bounds_size = bounds.size;
+    let width = f32::from(bounds_size.width).max(1.0);
+    let height = f32::from(bounds_size.height).max(1.0);
     let samples = state.values.len();
     if samples < 2 {
         return;
@@ -3682,9 +3721,9 @@ fn paint_sparkline(bounds: Bounds<Pixels>, state: SparklineState, window: &mut W
 
 fn paint_metric_badge(bounds: Bounds<Pixels>, state: MetricBadgeState, window: &mut Window) {
     let origin = bounds.origin;
-    let size = bounds.size;
-    let width = f32::from(size.width).max(1.0);
-    let height = f32::from(size.height).max(1.0);
+    let bounds_size = bounds.size;
+    let width = f32::from(bounds_size.width).max(1.0);
+    let height = f32::from(bounds_size.height).max(1.0);
     let center_x = f32::from(origin.x) + width * 0.5;
     let center_y = f32::from(origin.y) + height * 0.5;
     let radius = width.min(height) * 0.5;
@@ -3745,9 +3784,9 @@ fn apply_post_processing(
 ) {
     let fx = &frame.post_fx;
     let origin = bounds.origin;
-    let size = bounds.size;
-    let width_px = f32::from(size.width).max(1.0);
-    let height_px = f32::from(size.height).max(1.0);
+    let bounds_size = bounds.size;
+    let width_px = f32::from(bounds_size.width).max(1.0);
+    let height_px = f32::from(bounds_size.height).max(1.0);
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
     let palette = frame.palette;
