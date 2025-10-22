@@ -6,11 +6,27 @@ Thin Canvas harness for exercising the `scriptbots-web` WASM bindings. The setup
 
 ```bash
 wasm-pack build crates/scriptbots-web --target web --out-dir crates/scriptbots-web/web/pkg
+
+# Option A: Python http.server
+cd crates/scriptbots-web/web
+python -m http.server 8000
+
+# Option B: Node (requires npm)
+# npm install --global http-server
+# http-server
 ```
 
-Serve the directory (using `python -m http.server` or your preferred static server) from `crates/scriptbots-web/web` and open `http://localhost:8000/`.
+Open `http://localhost:8000/` and the harness will auto-load the wasm module, display build information, and begin ticking.
 
-The demo exposes live metrics (FPS, ticks/sec, births/deaths, energy/health averages) while rendering agents with color-coded rings for boosts. Use the sliders to tweak simulation speed and population; press **Reset Simulation** to reseed with a new deterministic RNG seed.
+### Controls & metrics
+
+- **Steps / frame**: choose how many simulation ticks to execute per animation frame (default `2`).
+- **Population**: select the spawn count used the next time you reset. The wander brain offers immediate motion for visual feedback.
+- **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
+
+Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
+
+The log pane (bottom of the sidebar) captures bootstrap and performance events so that ad-hoc benchmarking runs can be recorded while iterating on the renderer.
 
 For determinism validation, run the accompanying WASM parity test:
 

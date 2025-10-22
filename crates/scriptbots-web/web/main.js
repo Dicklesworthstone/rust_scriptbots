@@ -17,12 +17,18 @@ const logView = document.getElementById("log");
 const versionEl = document.getElementById("version");
 
 const metrics = {
-    frameCount: 0,
     lastFrameTs: performance.now(),
     lastStatsTs: performance.now(),
+    previousTick: null,
     fps: 0,
     tps: 0,
     tick: 0,
+};
+
+const perfWindow = {
+    frameAcc: 0,
+    tickAcc: 0,
+    lastLog: performance.now(),
 };
 
 let simHandle = null;
@@ -83,7 +89,6 @@ function drawSnapshot(snapshot) {
 }
 
 function updateStats(snapshot, now) {
-    metrics.frameCount += 1;
     const frameDt = now - metrics.lastFrameTs;
     metrics.lastFrameTs = now;
 
@@ -93,12 +98,13 @@ function updateStats(snapshot, now) {
     }
 
     const statsDt = now - metrics.lastStatsTs;
+    const previousTick = metrics.previousTick ?? snapshot.tick;
+    const deltaTicks = snapshot.tick - previousTick;
+    metrics.previousTick = snapshot.tick;
     metrics.tick = snapshot.tick;
 
     if (statsDt >= 500) {
-        const deltaTicks = snapshot.tick - (metrics.previousTick ?? 0);
         metrics.tps = deltaTicks * (1000 / statsDt);
-        metrics.previousTick = snapshot.tick;
         metrics.lastStatsTs = now;
 
         fpsEl.textContent = metrics.fps.toFixed(1);
@@ -109,6 +115,21 @@ function updateStats(snapshot, now) {
         deathsEl.textContent = snapshot.summary.deaths.toLocaleString();
         energyEl.textContent = snapshot.summary.average_energy.toFixed(3);
         healthEl.textContent = snapshot.summary.average_health.toFixed(3);
+    }
+
+    perfWindow.frameAcc += 1;
+    perfWindow.tickAcc += deltaTicks;
+    const logDt = now - perfWindow.lastLog;
+    if (logDt >= 5000) {
+        const durationSeconds = logDt / 1000;
+        const avgFps = perfWindow.frameAcc / durationSeconds;
+        const avgTps = perfWindow.tickAcc / durationSeconds;
+        appendLog(
+            `5s avg — FPS: ${avgFps.toFixed(1)} | TPS: ${avgTps.toFixed(1)} | Population: ${snapshot.summary.agent_count}`,
+        );
+        perfWindow.frameAcc = 0;
+        perfWindow.tickAcc = 0;
+        perfWindow.lastLog = now;
     }
 }
 

@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use anyhow::{ensure, Context, Result};
 use js_sys::Uint8Array;
+use postcard::to_allocvec;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use scriptbots_core::{
@@ -62,11 +63,19 @@ struct SimSpec {
 }
 
 impl SimSpec {
-    fn new(base_config: ScriptBotsConfig, initial_population: usize, seed: Option<u64>) -> Self {
+    fn new(
+        base_config: ScriptBotsConfig,
+        initial_population: usize,
+        seed: Option<u64>,
+        snapshot_format: SnapshotFormat,
+        seed_strategy: SeedStrategy,
+    ) -> Self {
         Self {
             base_config,
             initial_population,
             seed,
+            snapshot_format,
+            seed_strategy,
         }
     }
 
@@ -90,7 +99,7 @@ impl Simulation {
     fn new(spec: SimSpec) -> Result<Self> {
         let mut world = WorldState::new(spec.config())
             .context("failed to initialize ScriptBots world state")?;
-        seed_agents(&mut world, spec.initial_population)?;
+        seed_agents(&mut world, spec.initial_population, spec.seed_strategy)?;
         Ok(Self { world, spec })
     }
 
@@ -98,7 +107,7 @@ impl Simulation {
         let spec = self.spec.with_seed(seed);
         let mut world = WorldState::new(spec.config())
             .context("failed to rebuild ScriptBots world state during reset")?;
-        seed_agents(&mut world, spec.initial_population)?;
+        seed_agents(&mut world, spec.initial_population, spec.seed_strategy)?;
         self.world = world;
         self.spec = spec;
         Ok(())
@@ -125,6 +134,10 @@ struct InitOptions {
     world_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     config: Option<ScriptBotsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_format: Option<SnapshotFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed_strategy: Option<SeedStrategy>,
 }
 
 impl Default for InitOptions {
@@ -135,6 +148,8 @@ impl Default for InitOptions {
             world_width: None,
             world_height: None,
             config: None,
+            snapshot_format: None,
+            seed_strategy: None,
         }
     }
 }
@@ -151,7 +166,13 @@ impl InitOptions {
         config.population_minimum = 0;
         config.population_spawn_interval = 0;
 
-        SimSpec::new(config, self.population, self.seed)
+        SimSpec::new(
+            config,
+            self.population,
+            self.seed,
+            self.snapshot_format.unwrap_or_default(),
+            self.seed_strategy.unwrap_or_default(),
+        )
     }
 }
 
@@ -285,13 +306,14 @@ impl SimHandle {
     pub fn tick_js(&self, steps: u32) -> Result<JsValue, JsValue> {
         let mut simulation = self.inner.borrow_mut();
         let snapshot = simulation.tick(steps);
-        to_value(&snapshot).map_err(js_error)
+        encode_snapshot(&snapshot, simulation.spec.snapshot_format)
     }
 
     #[wasm_bindgen(js_name = snapshot)]
     pub fn snapshot_js(&self) -> Result<JsValue, JsValue> {
         let simulation = self.inner.borrow();
-        to_value(&simulation.snapshot()).map_err(js_error)
+        let snapshot = simulation.snapshot();
+        encode_snapshot(&snapshot, simulation.spec.snapshot_format)
     }
 
     #[wasm_bindgen(js_name = reset)]
@@ -299,6 +321,13 @@ impl SimHandle {
         let seed = normalize_seed(seed).map_err(js_error)?;
         let mut simulation = self.inner.borrow_mut();
         simulation.reset(seed).map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = registerBrain)]
+    pub fn register_brain_js(&self, _kind: String) -> Result<(), JsValue> {
+        Err(js_error(
+            "registerBrain is not yet implemented; hookup to scriptbots-brain coming in Phase 2.3",
+        ))
     }
 }
 
@@ -323,8 +352,8 @@ pub fn init_sim(config: JsValue) -> Result<SimHandle, JsValue> {
     })
 }
 
-fn seed_agents(world: &mut WorldState, count: usize) -> Result<()> {
-    if count == 0 {
+fn seed_agents(world: &mut WorldState, count: usize, strategy: SeedStrategy) -> Result<()> {
+    if matches!(strategy, SeedStrategy::None) || count == 0 {
         return Ok(());
     }
 
@@ -360,7 +389,9 @@ fn seed_agents(world: &mut WorldState, count: usize) -> Result<()> {
         };
 
         let id = world.spawn_agent(agent);
-        bind_brain(world, id, brain_seed)?;
+        if matches!(strategy, SeedStrategy::Wander) {
+            bind_brain(world, id, brain_seed)?;
+        }
     }
 
     Ok(())
@@ -382,6 +413,16 @@ fn normalize_seed(seed: Option<f64>) -> Result<Option<u64>> {
 
 fn js_error(err: impl std::fmt::Display) -> JsValue {
     JsError::new(&err.to_string()).into()
+}
+
+fn encode_snapshot(snapshot: &SimulationSnapshot, format: SnapshotFormat) -> Result<JsValue, JsValue> {
+    match format {
+        SnapshotFormat::Json => to_value(snapshot).map_err(js_error),
+        SnapshotFormat::Binary => {
+            let bytes = to_allocvec(snapshot).map_err(|err| js_error(err.to_string()))?;
+            Ok(Uint8Array::from(bytes.as_slice()).into())
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -462,60 +503,73 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn wasm_harness_matches_native_world() {
-        let mut config = ScriptBotsConfig::default();
-        config.world_width = 480;
-        config.world_height = 360;
-        config.rng_seed = Some(8102);
+        let cases = [
+            (480_u32, 360_u32, 32_usize, 24_u32, 8102_u64),
+            (640, 480, 48, 40, 1337),
+            (320, 320, 16, 64, 202501u64),
+        ];
 
-        let population = 32;
-        let ticks = 24;
+        for (width, height, population, ticks, seed) in cases {
+            let mut config = ScriptBotsConfig::default();
+            config.world_width = width;
+            config.world_height = height;
+            config.rng_seed = Some(seed);
 
-        // Native world execution
-        let mut native_world = WorldState::new(config.clone()).expect("native world");
-        seed_agents(&mut native_world, population).expect("seed native world");
-        for _ in 0..ticks {
-            native_world.step();
-        }
-        let native_snapshot = SimulationSnapshot::from_world(&native_world);
+            // Native world execution
+            let mut native_world = WorldState::new(config.clone()).expect("native world");
+            seed_agents(&mut native_world, population, SeedStrategy::Wander)
+                .expect("seed native world");
+            for _ in 0..ticks {
+                native_world.step();
+            }
+            let native_snapshot = SimulationSnapshot::from_world(&native_world);
 
-        // WASM harness execution (same config + seed)
-        let mut sim = Simulation::new(SimSpec::new(config, population, Some(8102))).expect("sim");
-        let wasm_snapshot = sim.tick(ticks);
+            // WASM harness execution (same config + seed)
+            let mut sim = Simulation::new(SimSpec::new(
+                config,
+                population,
+                Some(seed),
+                SnapshotFormat::Json,
+                SeedStrategy::Wander,
+            ))
+            .expect("sim");
+            let wasm_snapshot = sim.tick(ticks);
 
-        assert_eq!(native_snapshot.tick, wasm_snapshot.tick);
-        assert_eq!(
-            native_snapshot.summary.agent_count,
-            wasm_snapshot.summary.agent_count
-        );
-        assert_eq!(native_snapshot.agents.len(), wasm_snapshot.agents.len());
+            assert_eq!(native_snapshot.tick, wasm_snapshot.tick);
+            assert_eq!(
+                native_snapshot.summary.agent_count,
+                wasm_snapshot.summary.agent_count
+            );
+            assert_eq!(native_snapshot.agents.len(), wasm_snapshot.agents.len());
 
-        assert_float_eq(
-            native_snapshot.summary.total_energy,
-            wasm_snapshot.summary.total_energy,
-        );
-        assert_float_eq(
-            native_snapshot.summary.average_energy,
-            wasm_snapshot.summary.average_energy,
-        );
-        assert_float_eq(
-            native_snapshot.summary.average_health,
-            wasm_snapshot.summary.average_health,
-        );
+            assert_float_eq(
+                native_snapshot.summary.total_energy,
+                wasm_snapshot.summary.total_energy,
+            );
+            assert_float_eq(
+                native_snapshot.summary.average_energy,
+                wasm_snapshot.summary.average_energy,
+            );
+            assert_float_eq(
+                native_snapshot.summary.average_health,
+                wasm_snapshot.summary.average_health,
+            );
 
-        for (expected, actual) in native_snapshot
-            .agents
-            .iter()
-            .zip(wasm_snapshot.agents.iter())
-        {
-            assert_float_eq(expected.position[0], actual.position[0]);
-            assert_float_eq(expected.position[1], actual.position[1]);
-            assert_float_eq(expected.velocity[0], actual.velocity[0]);
-            assert_float_eq(expected.velocity[1], actual.velocity[1]);
-            assert_float_eq(expected.heading, actual.heading);
-            assert_float_eq(expected.health, actual.health);
-            assert_float_eq(expected.energy, actual.energy);
-            assert_float_eq(expected.spike_length, actual.spike_length);
-            assert_eq!(expected.boost, actual.boost);
+            for (expected, actual) in native_snapshot
+                .agents
+                .iter()
+                .zip(wasm_snapshot.agents.iter())
+            {
+                assert_float_eq(expected.position[0], actual.position[0]);
+                assert_float_eq(expected.position[1], actual.position[1]);
+                assert_float_eq(expected.velocity[0], actual.velocity[0]);
+                assert_float_eq(expected.velocity[1], actual.velocity[1]);
+                assert_float_eq(expected.heading, actual.heading);
+                assert_float_eq(expected.health, actual.health);
+                assert_float_eq(expected.energy, actual.energy);
+                assert_float_eq(expected.spike_length, actual.spike_length);
+                assert_eq!(expected.boost, actual.boost);
+            }
         }
     }
 

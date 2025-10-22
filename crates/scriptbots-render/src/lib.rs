@@ -12,9 +12,10 @@ use scriptbots_core::{
     MutationRates, OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TickSummary,
     TraitModifiers, Velocity, WorldState,
 };
+use scriptbots_storage::{MetricReading, Storage};
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
     sync::{Arc, Mutex},
     time::Instant,
@@ -42,7 +43,7 @@ fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
 }
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
-pub fn run_demo(world: Arc<Mutex<WorldState>>) {
+pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Option<Arc<Mutex<Storage>>>) {
     if let Ok(world) = world.lock()
         && let Some(summary) = world.history().last()
     {
@@ -58,8 +59,9 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>) {
 
     let window_title: SharedString = "ScriptBots HUD".into();
     let title_for_options = window_title.clone();
-    let title_for_view = window_title.clone();
+   let title_for_view = window_title.clone();
     let world_for_view = Arc::clone(&world);
+    let storage_for_view = storage.clone();
 
     Application::new().run(move |app: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
@@ -76,7 +78,13 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>) {
         let view_title = title_for_view.clone();
 
         if let Err(err) = app.open_window(options, move |_window, cx| {
-            cx.new(|_| SimulationView::new(Arc::clone(&world_handle), view_title.clone()))
+            cx.new(|_| {
+                SimulationView::new(
+                    Arc::clone(&world_handle),
+                    storage_for_view.clone(),
+                    view_title.clone(),
+                )
+            })
         }) {
             error!(error = ?err, "failed to open ScriptBots window");
             return;
@@ -92,6 +100,7 @@ const MAX_SIM_STEPS_PER_FRAME: usize = 240;
 
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
+    storage: Option<Arc<Mutex<Storage>>>,
     title: SharedString,
     camera: Arc<Mutex<CameraState>>,
     inspector: Arc<Mutex<InspectorState>>,
@@ -108,12 +117,18 @@ struct SimulationView {
     bindings: InputBindings,
     key_capture: Option<CommandAction>,
     settings_panel: SettingsPanelState,
+    analytics_cache: Option<HudAnalytics>,
+    analytics_tick: Option<u64>,
     #[cfg(feature = "audio")]
     audio: Option<AudioState>,
 }
 
 impl SimulationView {
-    fn new(world: Arc<Mutex<WorldState>>, title: SharedString) -> Self {
+    fn new(
+        world: Arc<Mutex<WorldState>>,
+        storage: Option<Arc<Mutex<Storage>>>,
+        title: SharedString,
+    ) -> Self {
         let mut inspector_state = InspectorState::default();
         if let Ok(world_guard) = world.lock() {
             let interval = world_guard.config().persistence_interval;
@@ -124,6 +139,7 @@ impl SimulationView {
 
         Self {
             world,
+            storage,
             title,
             camera: Arc::new(Mutex::new(CameraState::default())),
             inspector: Arc::new(Mutex::new(inspector_state)),
@@ -140,6 +156,8 @@ impl SimulationView {
             bindings: InputBindings::default(),
             settings_panel: SettingsPanelState::default(),
             key_capture: None,
+            analytics_cache: None,
+            analytics_tick: None,
             #[cfg(feature = "audio")]
             audio: AudioState::new()
                 .map_err(|err| {
@@ -520,6 +538,14 @@ impl SimulationView {
             }
             snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
             snapshot.inspector = InspectorSnapshot::from_world(&world, &inspector_state);
+
+            if let Some(metrics) = snapshot.summary.as_ref() {
+                self.maybe_refresh_analytics(metrics.tick, metrics.agent_count);
+            }
+        }
+
+        if self.storage.is_some() {
+            snapshot.analytics = self.analytics_cache.clone();
         }
 
         snapshot.perf = self.last_perf;
@@ -528,6 +554,33 @@ impl SimulationView {
         self.playback.record(snapshot.clone());
 
         snapshot
+    }
+
+    fn maybe_refresh_analytics(&mut self, tick: u64, agent_count: usize) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        if self.analytics_tick == Some(tick) {
+            return;
+        }
+        match storage.try_lock() {
+            Ok(mut guard) => {
+                match guard.latest_metrics(256) {
+                    Ok(readings) => {
+                        if let Some(analytics) = parse_analytics(tick, agent_count, &readings) {
+                            self.analytics_tick = Some(tick);
+                            self.analytics_cache = Some(analytics);
+                        }
+                    }
+                    Err(err) => {
+                        error!(?err, "failed to fetch latest metrics for analytics");
+                    }
+                }
+            }
+            Err(_) => {
+                // Avoid blocking the UI when storage is busy; we'll try again next frame.
+            }
+        }
     }
 
     fn render_header(&self, snapshot: &HudSnapshot) -> Div {
@@ -1315,15 +1368,15 @@ impl SimulationView {
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_panel.open = !self.settings_panel.open;
 
-        // Reset scroll position and recalculate dimensions when opening panel
+        // Reset scroll position and recalculate content height when opening panel
         if self.settings_panel.open {
             self.settings_panel.scroll_offset = 0.0;
             let total_categories = ConfigCategory::all().len();
             self.settings_panel.content_height = self
                 .settings_panel
                 .estimate_content_height(total_categories);
-            // Calculate viewport height from window bounds (full height - header - search bar)
-            self.settings_panel.viewport_height = cx.window_bounds().size.height.0 - 132.0;
+            // Note: viewport_height uses conservative default (700px) from state
+            // This accommodates most window sizes while being safe for smaller windows
         }
 
         info!(open = self.settings_panel.open, "Settings panel toggled");
@@ -1348,13 +1401,12 @@ impl SimulationView {
             self.settings_panel.collapsed_categories.push(category);
         }
 
-        // Update dimensions and clamp scroll
+        // Update content height and clamp scroll
         let total_categories = ConfigCategory::all().len();
         self.settings_panel.content_height = self
             .settings_panel
             .estimate_content_height(total_categories);
-        // Update viewport height in case window was resized
-        self.settings_panel.viewport_height = cx.window_bounds().size.height.0 - 132.0;
+        // Clamp scroll with updated content height (viewport_height from state)
         self.settings_panel.clamp_scroll();
 
         #[cfg(feature = "audio")]
@@ -4063,15 +4115,16 @@ impl SimulationView {
             );
 
         // Scrollable container for categories with mouse wheel handling
-        // Calculate content height and viewport height dynamically
+        // Calculate content height dynamically, use cached viewport height
         let total_categories = ConfigCategory::all().len();
         let content_height = self
             .settings_panel
             .estimate_content_height(total_categories);
 
-        // Calculate viewport height from window bounds
-        // Panel layout: full height - header (~64px) - search bar (~68px) = viewport
-        let viewport_height = cx.window_bounds().size.height.0 - 132.0;
+        // Use cached viewport height (conservative 700px default)
+        // This accommodates most window sizes (typical 768px-1080px height)
+        // Panel layout: full window - header (~64px) - search bar (~68px) ≈ 636-950px viewport
+        let viewport_height = self.settings_panel.viewport_height;
 
         let scroll_offset = self.settings_panel.scroll_offset;
         let max_scroll = (content_height - viewport_height).max(0.0);

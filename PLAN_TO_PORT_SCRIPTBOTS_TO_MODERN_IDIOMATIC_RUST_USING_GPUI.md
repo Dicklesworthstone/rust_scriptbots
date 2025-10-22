@@ -268,3 +268,60 @@
 - Do we need remote observer mode (headless simulation + streaming state to GPUI frontend)?
 - What telemetry is acceptable for release builds (opt-in metrics)?
 - Long term: evaluate advanced vision/AI brain integration once core port is stable.
+
+## Terminal Rendering Mode (Emoji TUI) [Currently In Progress - Terminal Text Renderer]
+
+### Goal
+- Deliver an opt-in, emoji-rich terminal interface that mirrors core simulation insights while preserving GPUI as the primary shell. The terminal renderer must auto-activate when GPUI fails to launch (e.g., headless SSH sessions) and must never regress desktop UX.
+
+### Architectural Tenets
+- Introduce a `Renderer` trait inside `scriptbots-app` that abstracts lifecycle hooks (`init`, `run`, `shutdown`) and surface telemetry contracts shared by both GPUI and terminal backends.
+- Ensure renderers operate on read-only world views via `Arc<Mutex<WorldState>>` and shared control channels so simulation determinism is untouched.
+- Keep dependencies isolated: GPUI stays in `scriptbots-render`; the terminal implementation lives in a new module/crate (`scriptbots-terminal`) compiled behind a `terminal` feature flag.
+- Runtime selection is driven by CLI flag (`--mode {auto|gui|terminal}`) with environment override (`SCRIPTBOTS_MODE`); `auto` attempts GPUI first, falling back to terminal on failure or lack of DISPLAY/Wayland environment.
+
+### Dependency & Capability Survey
+- Adopt `ratatui` (successor to `tui-rs`) for styled widgets, Unicode/emoji support, and terminal layout primitives.
+- Use `crossterm` for cross-platform terminal control (alternate screen, input, color) and `supports-color` to detect 24-bit vs. limited palettes.
+- Add `unicode-width` or `ratatui`'s width utilities to keep emoji-aligned HUD panels.
+- Explore `ratatui-animations` for smooth gauge updates and `ratatui-extras` for mini-charts and tabular dashboards.
+
+### Implementation Plan
+1. **Trait Abstraction & CLI Wiring** [Currently In Progress - CLI/Renderer refactor]
+   - Define `Renderer` trait in `scriptbots-app` with `fn run(&self, world: SharedWorld, controls: &ControlRuntime) -> Result<()>` and optional teardown hooks.
+   - Refactor existing GPUI entry to implement the trait without altering rendering internals.
+   - Extend CLI parsing (using `clap` or current argument parser) to accept `--mode` and environment overrides; update `ControlServerConfig` to propagate mode choice.
+2. **Terminal Renderer Scaffolding**
+   - Create `scriptbots-terminal` module/crate with `ratatui`, `crossterm`, `supports-color`, and `unicode-width` dependencies; gate behind `terminal` feature in workspace.
+   - Implement initialization (alternate screen, input polling) and a rendering loop targeting ~20 FPS with frame timing derived from the simulation tick summaries.
+3. **HUD & Visualization Design**
+   - Build panels for global stats (tick, population, births/deaths, energy averages) using color-coded gauges and sparkline charts.
+   - Render a coarse world mini-map using emoji glyphs for agents/food/terrain; leverage palette downgrades when terminals lack truecolor.
+   - Surface selection/inspector data via tabbed panes, mirroring GPUI inspector fields where practical.
+4. **Event & Input Handling**
+   - Map keyboard shortcuts (pause, speed multiplier, selection cycling) to TUI equivalents; ensure commands feed into existing `ControlRuntime` APIs.
+   - Provide in-terminal help overlay with emoji legends and keybindings.
+5. **Fallback & Detection Logic**
+   - On startup, detect headless environments (missing DISPLAY/Wayland) and log an intent to use terminal mode.
+   - Wrap GPUI launch in error handling; on failure, emit structured tracing and re-run using terminal renderer if enabled.
+   - Ensure failures cascade gracefully with clear messaging when terminal mode is disabled or unsupported.
+6. **Testing & QA**
+   - Add CI job running `cargo test --features terminal` plus a smoke test that boots the terminal renderer in headless mode (using `TERM=xterm-256color`).
+   - Write integration test harness using `ratatui`'s backend recorder (or golden snapshots) to validate layout rendering for canonical world states.
+   - Conduct manual QA across macOS Terminal, iTerm2, Windows Terminal, and Linux SSH to verify emoji palettes and fallback color schemes.
+7. **Documentation & Rollout**
+   - Update `README.md` with usage instructions, feature flags, and screenshots/gifs of the terminal HUD.
+   - Add observability notes (structured logs when mode switches) and highlight that terminal mode is experimental but safe to enable in CI/headless setups.
+   - Coordinate with rendering owners to ensure future GPUI changes keep the shared telemetry surface stable.
+
+### Milestone Targets
+- **M1**: Renderer trait + CLI flag merged; GPUI unchanged but conditional path ready.
+- **M2**: Terminal renderer MVP displaying stats and responding to pause/resume.
+- **M3**: Mini-map, emoji styling, and input parity complete; fallback pathway validated.
+- **M4**: Testing matrix, docs, and release notes published; terminal mode enabled in nightly builds/CI.
+
+### Risks & Mitigations
+- *Terminal capability variance*: mitigate via `supports-color` checks and palette fallback tables.
+- *Input conflicts*: centralize keybinding definitions shared with GPUI to avoid drift.
+- *Performance drift*: throttle terminal redraws and reuse diffing buffers to minimize CPU usage during long runs.
+- *Feature parity expectations*: document intentionally omitted GPUI features (e.g., advanced camera) and ensure Control Server APIs remain the extension point for deep inspection.

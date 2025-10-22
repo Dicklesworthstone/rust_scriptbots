@@ -2639,8 +2639,13 @@ impl WorldState {
         }
         let x = self.rng.random_range(0..width);
         let y = self.rng.random_range(0..height);
+        let idx = (y as usize) * (width as usize) + x as usize;
+        let capacity = self
+            .food_profiles
+            .get(idx)
+            .map_or(self.config.food_max, |profile| profile.capacity);
         if let Some(cell) = self.food.get_mut(x, y) {
-            *cell = (*cell + self.config.food_respawn_amount).min(self.config.food_max);
+            *cell = (*cell + self.config.food_respawn_amount).min(capacity);
             Some((x, y))
         } else {
             None

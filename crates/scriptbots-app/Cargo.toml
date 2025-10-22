@@ -5,15 +5,29 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { version = "0.8", features = ["macros", "json"] }
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+mcp-protocol-sdk = { version = "0.5", default-features = false, features = ["stdio"] }
+ratatui = { version = "0.30.0-alpha.5" }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 scriptbots-brain = { path = "../scriptbots-brain" }
 scriptbots-brain-ml = { path = "../scriptbots-brain-ml", optional = true }
 scriptbots-brain-neuro = { path = "../scriptbots-brain-neuro", optional = true }
 scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-render = { path = "../scriptbots-render" }
 scriptbots-storage = { path = "../scriptbots-storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
+utoipa = { version = "5.1", features = ["macros"] }
+utoipa-axum = "0.2"
+utoipa-swagger-ui = { version = "6.0", features = ["axum"] }
+crossterm = "0.27"
+owo-colors = "4.0"
 
 [features]
 default = []
