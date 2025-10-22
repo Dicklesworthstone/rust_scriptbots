@@ -1,6 +1,10 @@
-use std::io::{self, Stdout};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    fs::{self, File},
+    io::{self, Stdout},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -19,7 +23,9 @@ use ratatui::{
 #[cfg(test)]
 use scriptbots_core::AgentData;
 use scriptbots_core::{AgentColumns, TickSummary, WorldState};
+use serde::Serialize;
 use supports_color::{ColorLevel, Stream, on_cached};
+use tracing::info;
 
 use crate::{
     CommandDrain, CommandSubmit, ControlRuntime, SharedStorage, SharedWorld,
@@ -31,6 +37,8 @@ const MAX_STEPS_PER_FRAME: usize = 240;
 const UI_TICK_MILLIS: u64 = 100;
 const MAP_WIDTH: usize = 48;
 const MAP_HEIGHT: usize = 24;
+const DEFAULT_HEADLESS_FRAMES: usize = 12;
+const MAX_HEADLESS_FRAMES: usize = 360;
 
 pub struct TerminalRenderer {
     tick_interval: Duration,
@@ -53,7 +61,23 @@ impl Renderer for TerminalRenderer {
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
         if std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS").is_some() {
-            return self.run_headless(ctx);
+            let report = self.run_headless(ctx)?;
+            info!(
+                target = "scriptbots::terminal",
+                frames = report.summary.frame_count,
+                ticks_simulated = report.summary.ticks_simulated,
+                final_tick = report.summary.final_tick,
+                final_epoch = report.summary.final_epoch,
+                initial_agents = report.initial.agent_count,
+                final_agents = report.summary.final_agent_count,
+                total_births = report.summary.total_births,
+                total_deaths = report.summary.total_deaths,
+                avg_energy_mean = report.summary.avg_energy_mean,
+                avg_energy_min = report.summary.avg_energy_min,
+                avg_energy_max = report.summary.avg_energy_max,
+                "Terminal headless run completed"
+            );
+            return Ok(());
         }
 
         let mut stdout = io::stdout();
@@ -113,17 +137,37 @@ fn run_event_loop(
 }
 
 impl TerminalRenderer {
-    fn run_headless(&self, ctx: RendererContext<'_>) -> Result<()> {
+    fn run_headless(&self, ctx: RendererContext<'_>) -> Result<HeadlessReport> {
         let backend = ratatui::backend::TestBackend::new(80, 36);
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
+        let mut report = HeadlessReport::new(app.snapshot().clone());
+        let frames = self.headless_frame_budget();
 
-        for _ in 0..5 {
+        for _ in 0..frames {
             app.step_once();
+            report.record(app.snapshot());
             terminal.draw(|frame| app.draw(frame))?;
         }
 
-        Ok(())
+        report.finalize();
+
+        if let Some(path) = report_file_path_from_env() {
+            report.write_json(&path).with_context(|| {
+                format!("failed to write headless report to {}", path.display())
+            })?;
+        }
+
+        Ok(report)
+    }
+
+    fn headless_frame_budget(&self) -> usize {
+        std::env::var("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(MAX_HEADLESS_FRAMES))
+            .unwrap_or(DEFAULT_HEADLESS_FRAMES)
     }
 }
 
@@ -404,6 +448,10 @@ impl<'a> TerminalApp<'a> {
         Ok(false)
     }
 
+    fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
     fn refresh_snapshot(&mut self) {
         if let Ok(world) = self.world.lock() {
             self.snapshot = Snapshot::from_world(&world, &self.palette);
@@ -411,7 +459,7 @@ impl<'a> TerminalApp<'a> {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct Snapshot {
     tick: u64,
     epoch: u64,
@@ -424,7 +472,7 @@ struct Snapshot {
     map_rows: Vec<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct HistoryEntry {
     tick: u64,
     births: usize,
@@ -509,6 +557,140 @@ fn build_map(
         rows.push(row);
     }
     rows
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HeadlessReport {
+    initial: FrameStats,
+    frames: Vec<FrameStats>,
+    summary: ReportSummary,
+}
+
+impl HeadlessReport {
+    fn new(initial_snapshot: Snapshot) -> Self {
+        Self {
+            initial: FrameStats::from_snapshot(&initial_snapshot),
+            frames: Vec::new(),
+            summary: ReportSummary::default(),
+        }
+    }
+
+    fn record(&mut self, snapshot: &Snapshot) {
+        self.frames.push(FrameStats::from_snapshot(snapshot));
+    }
+
+    fn finalize(&mut self) {
+        self.summary = ReportSummary::from(&self.initial, &self.frames);
+    }
+
+    fn write_json(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let file = File::create(path)?;
+        serde_json::to_writer_pretty(file, self).context("failed to serialize headless report")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FrameStats {
+    tick: u64,
+    epoch: u64,
+    agent_count: usize,
+    births: usize,
+    deaths: usize,
+    avg_energy: f32,
+}
+
+impl FrameStats {
+    fn from_snapshot(snapshot: &Snapshot) -> Self {
+        Self {
+            tick: snapshot.tick,
+            epoch: snapshot.epoch,
+            agent_count: snapshot.agent_count,
+            births: snapshot.births,
+            deaths: snapshot.deaths,
+            avg_energy: snapshot.avg_energy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ReportSummary {
+    frame_count: usize,
+    ticks_simulated: u64,
+    final_tick: u64,
+    final_epoch: u64,
+    final_agent_count: usize,
+    total_births: usize,
+    total_deaths: usize,
+    avg_energy_mean: f32,
+    avg_energy_min: f32,
+    avg_energy_max: f32,
+}
+
+impl ReportSummary {
+    fn from(initial: &FrameStats, frames: &[FrameStats]) -> Self {
+        if frames.is_empty() {
+            return Self {
+                frame_count: 0,
+                ticks_simulated: 0,
+                final_tick: initial.tick,
+                final_epoch: initial.epoch,
+                final_agent_count: initial.agent_count,
+                total_births: 0,
+                total_deaths: 0,
+                avg_energy_mean: initial.avg_energy,
+                avg_energy_min: initial.avg_energy,
+                avg_energy_max: initial.avg_energy,
+            };
+        }
+
+        let frame_count = frames.len();
+        let final_stats = frames.last().expect("frame list not empty");
+        let ticks_simulated = final_stats.tick.saturating_sub(initial.tick);
+
+        let total_births = frames.iter().map(|frame| frame.births).sum();
+        let total_deaths = frames.iter().map(|frame| frame.deaths).sum();
+
+        let mut min_energy = f32::INFINITY;
+        let mut max_energy = f32::NEG_INFINITY;
+        let mut energy_sum = 0.0_f32;
+        for frame in frames {
+            let energy = frame.avg_energy;
+            if energy < min_energy {
+                min_energy = energy;
+            }
+            if energy > max_energy {
+                max_energy = energy;
+            }
+            energy_sum += energy;
+        }
+
+        let avg_energy_mean = if frame_count > 0 {
+            energy_sum / frame_count as f32
+        } else {
+            initial.avg_energy
+        };
+
+        Self {
+            frame_count,
+            ticks_simulated,
+            final_tick: final_stats.tick,
+            final_epoch: final_stats.epoch,
+            final_agent_count: final_stats.agent_count,
+            total_births,
+            total_deaths,
+            avg_energy_mean,
+            avg_energy_min: min_energy,
+            avg_energy_max: max_energy,
+        }
+    }
+}
+
+fn report_file_path_from_env() -> Option<PathBuf> {
+    std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT").map(PathBuf::from)
 }
 
 struct Palette {

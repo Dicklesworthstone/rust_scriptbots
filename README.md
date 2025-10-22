@@ -184,10 +184,46 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 ### Terminal mode (planned)
 An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode (`--mode {auto|gui|terminal}`) with fallback when GPUI cannot start. See the “Terminal Rendering Mode (Emoji TUI)” section in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`.
 
+#### Terminal-only mode
+- Force the emoji TUI renderer (useful on headless machines):
+  ```bash
+  SCRIPTBOTS_MODE=terminal cargo run -p scriptbots-app
+  ```
+- Auto fallback: `SCRIPTBOTS_MODE=auto` (default) will drop into terminal mode if no GUI backend is available (e.g., SSH sessions).
+- Override detection:
+  - `SCRIPTBOTS_FORCE_TERMINAL=1` → force terminal even when a display server is present.
+  - `SCRIPTBOTS_FORCE_GUI=1` → keep GPUI even if no display variables are set (may still fail if the OS truly lacks a GUI).
+- CI/headless smoke runs can bypass raw TTY requirements by setting `SCRIPTBOTS_TERMINAL_HEADLESS=1`, which drives the renderer against an in-memory buffer for a few frames.
+
+Keybinds: space (pause), +/- (speed), s (single-step), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy and an emoji world mini-map that adapts to color support.
+
 ## Storage & analytics
 - DuckDB schema (`ticks`, `metrics`, `events`, `agents`) with buffered writes and maintenance (`optimize`, `VACUUM`).
 - Analytics helpers: `latest_metrics`, `top_predators`.
 - Deterministic replay tooling is planned in the roadmap.
+
+### DuckDB tables and usage
+- Tables created automatically on first run:
+  - `ticks(tick, epoch, closed, agent_count, births, deaths, total_energy, average_energy, average_health)`
+  - `metrics(tick, name, value)` (primary key `(tick,name)`)
+  - `events(tick, kind, count)` (primary key `(tick,kind)`)
+  - `agents(tick, agent_id, generation, age, position_x, position_y, velocity_x, velocity_y, heading, health, energy, color_r, color_g, color_b, spike_length, boost, herbivore_tendency, sound_multiplier, reproduction_counter, mutation_rate_primary, mutation_rate_secondary, trait_smell, trait_sound, trait_hearing, trait_eye, trait_blood, give_intent, brain_binding, food_delta, spiked, hybrid, sound_output, spike_attacker, spike_victim, hit_carnivore, hit_herbivore, hit_by_carnivore, hit_by_herbivore)`
+- Example queries:
+  ```sql
+  -- Latest metrics snapshot
+  select m.name, m.value
+  from metrics m
+  where m.tick = (select max(tick) from metrics)
+  order by name;
+
+  -- Top predators by average energy
+  select agent_id, avg(energy) as avg_energy, max(spike_length) as max_spike_length
+  from agents
+  group by agent_id
+  order by avg_energy desc
+  limit 10;
+  ```
+Configuration: persistence buffers flush automatically; call `optimize()` periodically in long sessions (the app pipeline already triggers maintenance).
 
 ## Development workflow
 - **Coding standards**: See `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`. Embrace `Result`-based errors, clear traits, and avoid `unsafe`.
@@ -195,6 +231,43 @@ An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode 
 - **Formatting**: `cargo fmt --all`
 - **Tests**: `cargo test --workspace` (simulation and GPUI tests will be added as systems land)
 - **Profiles**: Release uses LTO, single codegen unit, and abort-on-panic for optimal binaries.
+
+## Runtime control surfaces
+
+### REST Control API (with Swagger UI)
+- Default address: `http://127.0.0.1:8088` (override `SCRIPTBOTS_CONTROL_REST_ADDR`)
+- Swagger UI path: `/docs` (override `SCRIPTBOTS_CONTROL_SWAGGER_PATH`)
+- Enable/disable: `SCRIPTBOTS_CONTROL_REST_ENABLED=true|false`
+- Endpoints:
+  - `GET /api/knobs` → list flattened config knobs
+  - `GET /api/config` → fetch entire config snapshot
+  - `PATCH /api/config` → apply JSON object patch `{ ... }`
+  - `POST /api/knobs/apply` → apply list of `{ path, value }` updates
+
+Example PATCH body:
+```json
+{ "food_max": 0.6, "neuroflow": { "enabled": true, "hidden_layers": [64,32,16], "activation": "relu" } }
+```
+
+### Control CLI (`scriptbots-control`)
+- Points to the REST API (default `SCRIPTBOTS_CONTROL_URL=http://127.0.0.1:8088`):
+```bash
+cargo run -p scriptbots-app --bin control_cli -- list
+cargo run -p scriptbots-app --bin control_cli -- get
+cargo run -p scriptbots-app --bin control_cli -- set neuroflow.enabled true
+cargo run -p scriptbots-app --bin control_cli -- patch --json '{"food_max":0.6}'
+cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
+```
+
+### MCP HTTP server (Model Context Protocol)
+- Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
+- Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.
+- Tools exposed:
+  - `list_knobs` → returns array of knob entries
+  - `get_config` → returns full config snapshot
+  - `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`
+  - `apply_patch` → accepts `{ patch: { ... } }`
+Notes: Only HTTP transport is supported here; stdio/SSE are not used.
 
 ## Contributing
 - Keep changes scoped to the relevant crate; prefer improving existing files over adding new ones unless functionality is genuinely new.

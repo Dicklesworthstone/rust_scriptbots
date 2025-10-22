@@ -2756,18 +2756,12 @@ impl WorldState {
                     value -= decay * profile.decay_multiplier * value;
                 }
 
-                if growth > 0.0 && self.config.food_max > 0.0 {
-                    let normalized = value / self.config.food_max;
-                    let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
-                    value += growth_delta * self.config.food_max;
+                if growth > 0.0 {
+                    value += growth * profile.growth_multiplier * (profile.capacity - value);
                 }
 
-                let mut cap = profile.capacity.max(previous[idx]);
-                let global_cap = self.config.food_max.max(previous[idx]);
-                if cap > global_cap {
-                    cap = global_cap;
-                }
-                cells_mut[idx] = value.clamp(0.0, cap);
+                let capacity = profile.capacity.max(0.0);
+                cells_mut[idx] = value.clamp(0.0, capacity);
             }
         }
     }
@@ -6776,16 +6770,8 @@ mod tests {
                     };
                     (fertile, infertile)
                 });
-        let fertile_fertility = profiles[fertile_idx].fertility;
-        let infertile_fertility = profiles[infertile_idx].fertility;
-        println!(
-            "fertility reproduction stats: fertile={:.4}, infertile={:.4}, delta={:.4}",
-            fertile_fertility,
-            infertile_fertility,
-            fertile_fertility - infertile_fertility
-        );
         assert!(
-            fertile_fertility > infertile_fertility + 0.05,
+            profiles[fertile_idx].fertility > profiles[infertile_idx].fertility + 0.05,
             "expected noticeable fertility variation between sampled cells"
         );
 
