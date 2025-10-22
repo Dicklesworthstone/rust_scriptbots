@@ -5,7 +5,10 @@ use scriptbots_core::{
     AgentState, BrainBinding, PersistenceBatch, PersistenceEventKind, WorldPersistence,
 };
 use slotmap::Key;
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex, mpsc},
+    thread,
+};
 use thiserror::Error;
 
 const DEFAULT_TICK_BUFFER: usize = 32;
@@ -18,6 +21,8 @@ const DEFAULT_METRIC_BUFFER: usize = 256;
 pub enum StorageError {
     #[error("duckdb error: {0}")]
     DuckDb(#[from] duckdb::Error),
+    #[error("storage worker error: {0}")]
+    Worker(String),
 }
 
 /// Summary row written to the `ticks` table.
@@ -540,50 +545,136 @@ pub struct PredatorStats {
     pub last_tick: i64,
 }
 
-/// Shareable wrapper around `Storage` for use in persistence and UI layers.
-#[derive(Clone)]
-pub struct SharedStorage {
-    inner: Arc<Mutex<Storage>>,
+#[derive(Debug)]
+enum StorageCommand {
+    Persist(PersistenceBatch),
+    Flush,
+    Shutdown,
 }
 
-impl SharedStorage {
-    /// Create a new shared handle from an `Arc<Mutex<Storage>>`.
-    #[must_use]
-    pub fn new(inner: Arc<Mutex<Storage>>) -> Self {
-        Self { inner }
+pub struct StoragePipeline {
+    tx: mpsc::Sender<StorageCommand>,
+    storage: Arc<Mutex<Storage>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl StoragePipeline {
+    /// Create an asynchronous pipeline using default buffering thresholds.
+    pub fn new(path: &str) -> Result<Self, StorageError> {
+        Self::with_thresholds(
+            path,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+        )
     }
 
-    /// Borrow the underlying shared storage arc.
+    /// Create an asynchronous pipeline with explicit thresholds.
+    pub fn with_thresholds(
+        path: &str,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+    ) -> Result<Self, StorageError> {
+        let storage = Storage::with_thresholds(path, tick, agent, event, metric)?;
+        Self::from_storage(storage)
+    }
+
+    fn from_storage(storage: Storage) -> Result<Self, StorageError> {
+        let shared = Arc::new(Mutex::new(storage));
+        let (tx, rx) = mpsc::channel::<StorageCommand>();
+        let worker_storage = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("scriptbots-storage-worker".into())
+            .spawn(move || {
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        StorageCommand::Persist(batch) => match worker_storage.lock() {
+                            Ok(mut storage) => {
+                                if let Err(err) = storage.persist(&batch) {
+                                    eprintln!(
+                                        "failed to persist tick {} asynchronously: {err}",
+                                        batch.summary.tick.0
+                                    );
+                                }
+                            }
+                            Err(poisoned) => {
+                                eprintln!(
+                                    "storage mutex poisoned while persisting tick {}",
+                                    batch.summary.tick.0
+                                );
+                                let mut storage = poisoned.into_inner();
+                                if let Err(err) = storage.persist(&batch) {
+                                    eprintln!(
+                                        "failed to persist tick {} after poison: {err}",
+                                        batch.summary.tick.0
+                                    );
+                                }
+                            }
+                        },
+                        StorageCommand::Flush => {
+                            if let Ok(mut storage) = worker_storage.lock()
+                                && let Err(err) = storage.flush()
+                            {
+                                eprintln!("failed to flush storage: {err}");
+                            }
+                        }
+                        StorageCommand::Shutdown => {
+                            if let Ok(mut storage) = worker_storage.lock() {
+                                let _ = storage.flush();
+                            }
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|err| {
+                StorageError::Worker(format!("failed to spawn storage worker thread: {err}"))
+            })?;
+
+        Ok(Self {
+            tx,
+            storage: shared,
+            handle: Some(handle),
+        })
+    }
+
+    /// Exposes shared access to the underlying storage for analytics queries.
     #[must_use]
-    pub fn inner(&self) -> Arc<Mutex<Storage>> {
-        Arc::clone(&self.inner)
+    pub fn storage(&self) -> Arc<Mutex<Storage>> {
+        Arc::clone(&self.storage)
+    }
+
+    /// Request an immediate flush of buffered records.
+    pub fn flush(&self) {
+        let _ = self.tx.send(StorageCommand::Flush);
     }
 }
 
-impl WorldPersistence for SharedStorage {
+impl WorldPersistence for StoragePipeline {
     fn on_tick(&mut self, payload: &PersistenceBatch) {
-        match self.inner.lock() {
-            Ok(mut storage) => {
-                if let Err(err) = storage.persist(payload) {
-                    eprintln!(
-                        "failed to enqueue persistence data for tick {}: {err}",
-                        payload.summary.tick.0
-                    );
-                }
-            }
-            Err(poisoned) => {
-                eprintln!(
-                    "storage mutex poisoned during tick {}: attempting recovery",
-                    payload.summary.tick.0
-                );
-                let mut storage = poisoned.into_inner();
-                if let Err(err) = storage.persist(payload) {
-                    eprintln!(
-                        "failed to enqueue persistence data for tick {} after poison: {err}",
-                        payload.summary.tick.0
-                    );
-                }
-            }
+        if self
+            .tx
+            .send(StorageCommand::Persist(payload.clone()))
+            .is_err()
+        {
+            eprintln!(
+                "storage worker channel closed; tick {} dropped",
+                payload.summary.tick.0
+            );
+        }
+    }
+}
+
+impl Drop for StoragePipeline {
+    fn drop(&mut self) {
+        let _ = self.tx.send(StorageCommand::Shutdown);
+        if let Some(handle) = self.handle.take()
+            && let Err(err) = handle.join()
+        {
+            eprintln!("storage worker thread panicked: {err:?}");
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Traits and adapters for ScriptBots brain implementations.
 
 use rand::RngCore;
-use scriptbots_core::{AgentId, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Tick};
+use scriptbots_core::{AgentId, BrainRunner, Tick, INPUT_SIZE, OUTPUT_SIZE};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
@@ -74,6 +74,7 @@ pub struct BrainTelemetry {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

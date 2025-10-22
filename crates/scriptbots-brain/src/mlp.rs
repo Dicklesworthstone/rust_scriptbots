@@ -7,7 +7,7 @@ use std::any::Any;
 
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 
-use crate::{Brain, BrainKind, into_runner};
+use crate::{into_runner, Brain, BrainKind};
 
 const BRAIN_SIZE: usize = 200;
 const CONNECTIONS: usize = 4;
@@ -208,9 +208,8 @@ impl Brain for MlpBrain {
         }
 
         let mut result = [0.0; OUTPUT_SIZE];
-        for i in 0..OUTPUT_SIZE {
-            let idx = self.nodes.len() - 1 - i;
-            result[i] = self.state[idx].output;
+        for (output, node) in result.iter_mut().zip(self.state.iter().rev()) {
+            *output = node.output;
         }
         result
     }
@@ -251,9 +250,7 @@ impl Brain for MlpBrain {
         if other.kind() != Self::KIND {
             return None;
         }
-        let Some(other) = other.as_any().downcast_ref::<Self>() else {
-            return None;
-        };
+        let other = other.as_any().downcast_ref::<Self>()?;
         let mut child = self.clone();
         for (child_params, other_params) in child.nodes.iter_mut().zip(&other.nodes) {
             if rng.random::<f32>() < 0.5 {
@@ -277,8 +274,8 @@ impl Brain for MlpBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::SmallRng;
+    use rand::SeedableRng;
 
     #[test]
     fn random_brain_has_expected_structure() {

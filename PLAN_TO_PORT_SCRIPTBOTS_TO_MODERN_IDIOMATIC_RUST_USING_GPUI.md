@@ -115,7 +115,7 @@
   - Maintain double buffer (`SimulationSnapshot` with `Arc<[AgentRenderData]>` + `Arc<[FoodCell]>`). UI clones `Arc`s cheaply, ensuring zero-copy render pipeline.
   - Provide interpolation for camera smoothing if we add variable render rate.
 - Storage Sync:
-  - On snapshot publication, enqueue summary records (population counts, resource totals) for DuckDB ingestion, and optionally archive raw agent rows every configurable cadence for replay/debug. Employ DuckDB's Arrow integration for efficient bulk writes when analytics pipelines demand columnar exports.citeturn1search0turn1search5
+  - On snapshot publication, enqueue summary records (population counts, resource totals) for DuckDB ingestion, and optionally archive raw agent rows every configurable cadence for replay/debug. Employ DuckDB's Arrow integration for efficient bulk writes when analytics pipelines demand columnar exports. [Completed - GPT-5 Codex 2025-10-21]citeturn1search0turn1search5
 
 ## Visual Polish & Audio Enhancements
 - Rich terrain & backgrounds: integrate a tilemap or overlay renderer such as `wgpu-tilemap` to stream large ground textures efficiently, enabling biomes, paths, and heatmaps without dropping frame rate.citeturn0search0
@@ -141,8 +141,8 @@
 - Bench harness (`criterion`) measuring ticks/sec at various agent counts.
 - GPUI view tests using `#[gpui::test]` macro to ensure layout compiles and actions dispatch.citeturn0search0
 - Storage tests:
-  - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Currently In Progress - GPT-5 Codex 2025-10-21]citeturn1search0
-  - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs.citeturn1search0turn1search5
+  - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]citeturn1search0
+  - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]citeturn1search0turn1search5
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build.
 
 ## Advanced Brain Architecture Strategy
@@ -186,11 +186,11 @@
    - Seed NeuroFlow weights using the world RNG for deterministic runs. [Completed - GPT-5 Codex 2025-10-21]
    - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Completed - GPT-5 Codex 2025-10-21]
 6. **Persistence Layer (Weeks 7-8)**
-   - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Currently In Progress - GPT-5 Codex 2025-10-21]
-   - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Currently In Progress - GPT-5 Codex 2025-10-21]
+   - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Completed - GPT-5 Codex 2025-10-22]
+   - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Completed - GPT-5 Codex 2025-10-22]
 7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
    - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding complete; canvas renderer + inspector pending]
-   - Implement camera controls, overlays, history chart. [Currently In Progress - GPT-5 Codex 2025-10-21: camera pan/zoom + metrics overlay]
+   - Implement camera controls, overlays, history chart. [Completed - GPT-5 Codex 2025-10-22: camera pan/zoom with cursor-anchored zoom + live HUD overlay]
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.
 8. **Integration & UX Polish (Weeks 10-11)**
    - Hook actions to simulation, selection workflows, debug overlays.
@@ -198,8 +198,8 @@
    - Surface brain controls (selection, evolution rates) and storage toggles in the inspector.
    - Layer in audio cues with `kira`, tie particle/lighting effects to simulation events, and add accessibility options.
 9. **Testing, Benchmarks, Packaging (Weeks 11-12)**
-   - Determinism/regression suite, `cargo bench`.
-   - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries.
+   - Determinism/regression suite, `cargo bench`. [Completed - GPT-5 Codex 2025-10-22]
+   - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries. [Currently In Progress - GPT-5 Codex 2025-10-22]
 
 ## Risks and Mitigations
 - **GPU backend availability**: GPUI is still evolving; focus initial support on macOS/Linux per official guidance, while monitoring upstream platform work.citeturn0search0

@@ -1,0 +1,60 @@
+name: release-builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: scriptbots-linux-x86_64
+          - os: macos-latest
+            artifact: scriptbots-macos-universal
+          - os: windows-latest
+            artifact: scriptbots-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.os }}
+
+      - name: Build release binary
+        run: cargo build --release -p scriptbots-app
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          OUT_DIR="artifacts/${{ matrix.artifact }}"
+          mkdir -p "${OUT_DIR}"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/scriptbots-app.exe "${OUT_DIR}/"
+          else
+            cp target/release/scriptbots-app "${OUT_DIR}/"
+          fi
+          cp README.md "${OUT_DIR}/"
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C artifacts "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz

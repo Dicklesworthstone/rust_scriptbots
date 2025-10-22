@@ -5,7 +5,7 @@ use scriptbots_core::{
     AgentData, BrainBinding, NeuroflowActivationKind, ScriptBotsConfig, WorldState,
 };
 use scriptbots_render::run_demo;
-use scriptbots_storage::{SharedStorage, Storage};
+use scriptbots_storage::{Storage, StoragePipeline};
 use std::{
     env,
     sync::{Arc, Mutex},
@@ -37,9 +37,9 @@ fn bootstrap_world() -> Result<(SharedWorld, SharedStorageArc)> {
     };
     apply_env_overrides(&mut config);
 
-    let storage: SharedStorageArc = Arc::new(Mutex::new(Storage::open("scriptbots.db")?));
-    let persistence = SharedStorage::new(Arc::clone(&storage));
-    let mut world = WorldState::with_persistence(config, Box::new(persistence))?;
+    let pipeline = StoragePipeline::new("scriptbots.db")?;
+    let storage: SharedStorageArc = pipeline.storage();
+    let mut world = WorldState::with_persistence(config, Box::new(pipeline))?;
     let mut rng =
         SmallRng::seed_from_u64(world.config().rng_seed.unwrap_or(0xFACA_DEAF_0123_4567_u64));
     let brain_keys = install_brains(&mut world, &mut rng);
@@ -155,6 +155,25 @@ fn parse_activation(raw: &str) -> Option<NeuroflowActivationKind> {
     }
 }
 
+fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
+    let mut agent = AgentData::default();
+    let spacing = 120.0;
+    for row in 0..4 {
+        for col in 0..4 {
+            agent.position.x = col as f32 * spacing + spacing * 0.5;
+            agent.position.y = row as f32 * spacing + spacing * 0.5;
+            agent.heading = 0.0;
+            agent.spike_length = 10.0;
+            let id = world.spawn_agent(agent);
+            if let Some(runtime) = world.agent_runtime_mut(id)
+                && let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len())
+            {
+                runtime.brain = BrainBinding::Registry { key };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,10 +190,12 @@ mod tests {
     }
 
     fn restore_env(var: &str, previous: Option<String>) {
-        if let Some(value) = previous {
-            std::env::set_var(var, value);
-        } else {
-            std::env::remove_var(var);
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var(var, value);
+            } else {
+                std::env::remove_var(var);
+            }
         }
     }
 
@@ -185,9 +206,11 @@ mod tests {
             let prev_hidden = std::env::var("SCRIPTBOTS_NEUROFLOW_HIDDEN").ok();
             let prev_activation = std::env::var("SCRIPTBOTS_NEUROFLOW_ACTIVATION").ok();
 
-            std::env::set_var("SCRIPTBOTS_NEUROFLOW_ENABLED", "true");
-            std::env::set_var("SCRIPTBOTS_NEUROFLOW_HIDDEN", "64, 32 ,16");
-            std::env::set_var("SCRIPTBOTS_NEUROFLOW_ACTIVATION", "relu");
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_NEUROFLOW_ENABLED", "true");
+                std::env::set_var("SCRIPTBOTS_NEUROFLOW_HIDDEN", "64, 32 ,16");
+                std::env::set_var("SCRIPTBOTS_NEUROFLOW_ACTIVATION", "relu");
+            }
 
             let mut config = ScriptBotsConfig::default();
             apply_env_overrides(&mut config);
@@ -254,24 +277,5 @@ mod tests {
             outputs_one, outputs_two,
             "NeuroFlow outputs should be deterministic for same seed"
         );
-    }
-}
-
-fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
-    let mut agent = AgentData::default();
-    let spacing = 120.0;
-    for row in 0..4 {
-        for col in 0..4 {
-            agent.position.x = col as f32 * spacing + spacing * 0.5;
-            agent.position.y = row as f32 * spacing + spacing * 0.5;
-            agent.heading = 0.0;
-            agent.spike_length = 10.0;
-            let id = world.spawn_agent(agent);
-            if let Some(runtime) = world.agent_runtime_mut(id) {
-                if let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len()) {
-                    runtime.brain = BrainBinding::Registry { key };
-                }
-            }
-        }
     }
 }

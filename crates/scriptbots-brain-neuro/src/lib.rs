@@ -5,12 +5,12 @@
 //! remaining forward-compatible with richer training workflows. The implementation focuses on
 //! inference; mutation currently randomizes weights using the recorded architecture.
 
-use neuroflow::FeedForward;
 use neuroflow::activators::Type;
+use neuroflow::FeedForward;
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use scriptbots_brain::{Brain, BrainKind, into_runner};
+use scriptbots_brain::{into_runner, Brain, BrainKind};
 use scriptbots_core::{BrainRunner, NeuroflowActivationKind, NeuroflowSettings, WorldState};
 
 /// Number of inputs inherited from the simulation sensors.
@@ -19,20 +19,15 @@ const INPUT_SIZE: usize = scriptbots_core::INPUT_SIZE;
 const OUTPUT_SIZE: usize = scriptbots_core::OUTPUT_SIZE;
 
 /// Activation families supported by NeuroFlow.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub enum NeuroflowActivation {
     /// Hyperbolic tangent activation.
+    #[default]
     Tanh,
     /// Logistic sigmoid activation.
     Sigmoid,
     /// Rectified linear unit (ReLU).
     Relu,
-}
-
-impl Default for NeuroflowActivation {
-    fn default() -> Self {
-        Self::Tanh
-    }
 }
 
 impl NeuroflowActivation {
@@ -242,8 +237,8 @@ impl Brain for NeuroflowBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::SmallRng;
+    use rand::SeedableRng;
 
     #[test]
     fn runner_executes_and_returns_outputs() {
