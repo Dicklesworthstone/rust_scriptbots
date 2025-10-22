@@ -35,8 +35,8 @@ _Created: 2025-10-22 (UTC). Keep this list exhaustive; mark completion inline wi
   - [x] Create ADR scaffold at `docs/wasm/adrs/ADR-001-wasm-rendering.md`.
   - [x] Document evaluation criteria sourced from latest WebGPU/WebGL guidance.
   - [x] Schedule prototype spikes for WebGPU and Canvas paths (see `docs/wasm/rendering_spike_plan.md`).
-  - [~] Build WebGPU spike prototype and capture metrics (prep notes in `docs/wasm/spike_webgpu_notes.md`; implementation pending).
-  - [~] Build Canvas baseline prototype and capture metrics (prep notes in `docs/wasm/spike_canvas_notes.md`; implementation pending).
+  - [~] Build WebGPU spike prototype and capture metrics (spike crate built at `/tmp/scriptbots-webgpu-proto`; browser metrics blocked until a GUI environment is available).
+  - [~] Build Canvas baseline prototype and capture metrics (scaffold at `/tmp/canvas-baseline`; metrics collection awaits manual execution with graphical browser).
   - [x] Prepare shared metrics template (`docs/wasm/rendering_metrics_template.csv`).
 
 - [ ] Wasm RNG + Rayon gating

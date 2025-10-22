@@ -73,3 +73,9 @@ split-debuginfo = "unpacked"
 inherits = "release"
 debug = true
 strip = false
+
+[workspace.metadata.dist]
+ci = ["github"]
+
+[[workspace.metadata.dist.product]]
+package = "scriptbots-app"

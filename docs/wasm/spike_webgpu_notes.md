@@ -33,6 +33,23 @@ _Created: 2025-10-22 (UTC)_
    - Increase instance buffer to 25k and 50k agents; measure FPS on Apple M2 (Safari 26 beta) and Windows 11 RTX 3060 (Chrome 139).  
    - Record load time (ms) and wasm bundle size after release build (`wasm-bindgen --out-dir pkg`).
 
+-## Current Status (2025-10-22)
+- ✅ Minimal spike crate created at `/tmp/scriptbots-webgpu-proto` (kept outside the repo). It renders 10k agents as `PointList` sprites using `wgpu` 0.20 + `winit` 0.29 with deterministic RNG seeding.
+- ✅ Builds succeed for native and wasm: `cargo +nightly build --target wasm32-unknown-unknown --release`.
+- ✅ Wasm bindings generated via `wasm-bindgen target/wasm32-unknown-unknown/release/scriptbots_webgpu_proto.wasm --out-dir pkg --target web` (bundle size ~616 KiB unminified).
+- 🚧 Next step: run a static server (e.g., `simple-http-server pkg --watch -i`) and capture FPS/CPU metrics in Chrome 139 (Windows) and Safari 26 beta (macOS). Append results to `docs/wasm/rendering_metrics_template.csv` and ADR-001 once collected. *Blocked in the current CI/CLI session because no graphical browser is available; metrics must be gathered manually on a workstation with WebGPU-capable browsers.*
+- 🚧 Increase vertex buffer to 25k/50k agents and repeat measurements to validate headroom (same manual follow-up requirement as above).
+
+### Commands Recap
+```
+cargo +nightly build --target wasm32-unknown-unknown --release
+
+wasm-bindgen target/wasm32-unknown-unknown/release/scriptbots_webgpu_proto.wasm \
+  --out-dir pkg --target web
+
+simple-http-server pkg --watch -i
+```
+
 ## Deliverables
 - Metrics table stored in `docs/wasm/adrs/ADR-001-wasm-rendering.md` (append under “Research Tasks”).  
 - Raw captures stored in `spikes/webgpu-boids/metrics/*.json` (kept out of repo unless approved).  

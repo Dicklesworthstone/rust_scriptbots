@@ -30,7 +30,7 @@ The native application uses GPUI, which targets desktop platforms via Metal/Vulk
 - **Open Questions:** Acceptable snapshot serialization format and cost of per-frame marshaling.
 
 ## Research Tasks
-- [ ] Benchmark minimal prototypes for each option (agent draw, food grid, HUD) and record FPS/CPU usage.
+- [ ] Benchmark minimal prototypes for each option (agent draw, food grid, HUD) and record FPS/CPU usage. Use `docs/wasm/rendering_metrics_template.csv` to log results consistently.
 - [ ] Measure payload sizes (wasm binary + JS) after tree shaking/minification.
 - [ ] Evaluate developer ergonomics (hot reload, debugging, shader tooling).
 - [ ] Confirm availability of text rendering, gradient fills, and blending modes needed for HUD/overlays.
@@ -44,12 +44,13 @@ The native application uses GPUI, which targets desktop platforms via Metal/Vulk
 
 ## Next Steps
 - Populate `docs/wasm/RESEARCH_LOG.md` with prototype findings.
+- Execute spikes outlined in `docs/wasm/spike_webgpu_notes.md` and `docs/wasm/spike_canvas_notes.md`, capturing metrics via the shared template.
 - Draft comparison table summarizing experimental metrics.
 - Reach consensus in architecture review before Phase 3 begins execution.
 
 ## References
-- Chromium WebGPU overview and origin trials.
-- Apple Safari 26 beta release notes (WebGPU introduction).
-- Firefox 141 release notes (WebGPU on Windows).
+- Chromium WebGPU overview and origin trials (wgpu examples, Learn WGPU tutorials, Chrome WebGPU guide).citeturn0search0turn0search2turn0search3turn0search8
+- WebGPU renderer reference implementation `wgpu-rust-renderer`.citeturn0search5
+- MDN Canvas performance guidance, Chrome rendering performance, and OffscreenCanvas worker guides.citeturn1search0turn1search1turn1search2turn1search3
 
 _Update this ADR as experiments progress; once a direction is chosen, move Status to "Accepted" and capture rationale._***

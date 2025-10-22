@@ -1467,9 +1467,9 @@ pub struct ScriptBotsConfig {
     pub food_sharing_radius: f32,
     /// Fraction of energy shared per neighbor when donating.
     pub food_sharing_rate: f32,
-    /// Constant transfer amount when sharing food.
+    /// Constant amount of energy transferred during altruistic sharing.
     pub food_transfer_rate: f32,
-    /// Distance threshold for sharing food with neighbors.
+    /// Distance threshold for altruistic sharing interactions.
     pub food_sharing_distance: f32,
     /// Energy threshold required before reproduction can trigger.
     pub reproduction_energy_threshold: f32,
@@ -1521,6 +1521,20 @@ pub struct ScriptBotsConfig {
     pub carcass_energy_share_rate: f32,
     /// Intensity scale applied to indicator pulses when feasting on carcasses.
     pub carcass_indicator_scale: f32,
+    /// Whether terrain elevation influences agent locomotion and energy.
+    pub topography_enabled: bool,
+    /// Speed gain applied per unit downhill slope (subtracted when moving uphill).
+    pub topography_speed_gain: f32,
+    /// Additional metabolism drain incurred per unit uphill slope.
+    pub topography_energy_penalty: f32,
+    /// Minimum population size maintained via automatic seeding.
+    pub population_minimum: usize,
+    /// Interval (in ticks) for injecting new agents when the world is open.
+    pub population_spawn_interval: u32,
+    /// Number of agents added per spawn interval.
+    pub population_spawn_count: u32,
+    /// Probability that a spawn interval produces a crossover child instead of a random newcomer.
+    pub population_crossover_chance: f32,
     /// Base radius used when checking spike impacts.
     pub spike_radius: f32,
     /// Damage applied by a spike at full power.
@@ -1605,6 +1619,13 @@ impl Default for ScriptBotsConfig {
             carcass_maturity_age: 5,
             carcass_energy_share_rate: 0.5,
             carcass_indicator_scale: 20.0,
+            topography_enabled: false,
+            topography_speed_gain: 0.35,
+            topography_energy_penalty: 0.002,
+            population_minimum: 0,
+            population_spawn_interval: 100,
+            population_spawn_count: 1,
+            population_crossover_chance: 0.5,
             spike_radius: 40.0,
             spike_damage: 0.25,
             spike_energy_cost: 0.02,
@@ -1764,6 +1785,8 @@ impl ScriptBotsConfig {
             || self.carcass_reproduction_reward < 0.0
             || self.carcass_energy_share_rate < 0.0
             || self.carcass_indicator_scale < 0.0
+            || self.topography_speed_gain < 0.0
+            || self.topography_energy_penalty < 0.0
         {
             return Err(WorldStateError::InvalidConfig(
                 "metabolism, reproduction, sharing, and history parameters must be non-negative; spike and diet thresholds must be within valid ranges",
@@ -1799,6 +1822,16 @@ impl ScriptBotsConfig {
         if self.carcass_maturity_age == 0 {
             return Err(WorldStateError::InvalidConfig(
                 "carcass_maturity_age must be at least 1",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.population_crossover_chance) {
+            return Err(WorldStateError::InvalidConfig(
+                "population_crossover_chance must be within [0, 1]",
+            ));
+        }
+        if self.population_spawn_count == 0 {
+            return Err(WorldStateError::InvalidConfig(
+                "population_spawn_count must be at least 1",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -2021,6 +2054,60 @@ impl TerrainLayer {
         } else {
             None
         }
+    }
+
+    fn tile_wrapped(&self, x: i32, y: i32) -> &TerrainTile {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let ix = ((x % w) + w) % w;
+        let iy = ((y % h) + h) % h;
+        let idx = (iy as usize) * (self.width as usize) + ix as usize;
+        &self.tiles[idx]
+    }
+
+    fn sample_elevation(&self, fx: f32, fy: f32) -> f32 {
+        let width = self.width as f32;
+        let height = self.height as f32;
+        let mut x = fx;
+        let mut y = fy;
+        if width > 0.0 {
+            x = x.rem_euclid(width);
+        }
+        if height > 0.0 {
+            y = y.rem_euclid(height);
+        }
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let tx = x - x0 as f32;
+        let ty = y - y0 as f32;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+
+        let e00 = self.tile_wrapped(x0, y0).elevation;
+        let e10 = self.tile_wrapped(x1, y0).elevation;
+        let e01 = self.tile_wrapped(x0, y1).elevation;
+        let e11 = self.tile_wrapped(x1, y1).elevation;
+
+        let ex0 = e00 + (e10 - e00) * tx;
+        let ex1 = e01 + (e11 - e01) * tx;
+        ex0 + (ex1 - ex0) * ty
+    }
+
+    /// Returns the elevation gradient (∂e/∂x, ∂e/∂y) in world units.
+    pub fn gradient_world(&self, x: f32, y: f32, cell_size: f32) -> (f32, f32) {
+        if cell_size <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let fx = x / cell_size;
+        let fy = y / cell_size;
+        let e_px = self.sample_elevation(fx + 1.0, fy);
+        let e_mx = self.sample_elevation(fx - 1.0, fy);
+        let e_py = self.sample_elevation(fx, fy + 1.0);
+        let e_my = self.sample_elevation(fx, fy - 1.0);
+
+        let grad_x = (e_px - e_mx) * 0.5 / cell_size;
+        let grad_y = (e_py - e_my) * 0.5 / cell_size;
+        (grad_x, grad_y)
     }
 }
 
@@ -2541,6 +2628,11 @@ impl WorldState {
         let spike_lengths_snapshot: Vec<f32> = columns.spike_lengths().to_vec();
 
         let runtime = &self.runtime;
+        let terrain = &self.terrain;
+        let cell_size = self.config.food_cell_size as f32;
+        let topo_enabled = self.config.topography_enabled;
+        let topo_gain = self.config.topography_speed_gain.max(0.0);
+        let topo_penalty = self.config.topography_energy_penalty.max(0.0);
         let results: Vec<ActuationResult> = collect_handles!(handles, |idx, agent_id| {
             if let Some(runtime) = runtime.get(*agent_id) {
                 let outputs = runtime.outputs;
@@ -2566,6 +2658,32 @@ impl WorldState {
                 let mut heading = headings_snapshot[idx];
                 let angular = (right_speed - left_speed) / wheel_base;
                 heading = wrap_signed_angle(heading + angular);
+                let mut slope_along: f32 = 0.0;
+                if topo_enabled && cell_size > 0.0 {
+                    let (grad_x, grad_y) = terrain.gradient_world(
+                        positions_snapshot[idx].x,
+                        positions_snapshot[idx].y,
+                        cell_size,
+                    );
+                    let dir_x = heading.cos();
+                    let dir_y = heading.sin();
+                    slope_along = grad_x * dir_x + grad_y * dir_y;
+                    if topo_gain > 0.0 {
+                        let downhill = (-slope_along).max(0.0);
+                        let uphill = slope_along.max(0.0);
+                        let mut speed_factor: f32 = 1.0;
+                        if downhill > 0.0 {
+                            speed_factor *= 1.0 + downhill * topo_gain;
+                        }
+                        if uphill > 0.0 {
+                            speed_factor /= 1.0 + uphill * topo_gain;
+                        }
+                        speed_factor = speed_factor.clamp(0.4, 1.8);
+                        left_speed *= speed_factor;
+                        right_speed *= speed_factor;
+                    }
+                }
+
                 let linear = (left_speed + right_speed) * 0.5;
                 let vx = heading.cos() * linear;
                 let vy = heading.sin() * linear;
@@ -2583,6 +2701,13 @@ impl WorldState {
                 }
                 if boost && boost_penalty > 0.0 {
                     drain += boost_penalty;
+                }
+                if topo_enabled && topo_penalty > 0.0 {
+                    if slope_along > 0.0 {
+                        drain += slope_along * topo_penalty;
+                    } else if slope_along < 0.0 {
+                        drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
+                    }
                 }
                 let health_delta = -drain;
                 let energy = (runtime.energy - drain).max(0.0);
@@ -2736,32 +2861,36 @@ impl WorldState {
         for runtime in self.runtime.values_mut() {
             runtime.spiked = false;
             runtime.food_delta = 0.0;
-            runtime.sound_output = 0.0;
-            runtime.give_intent = 0.0;
+            runtime.sound_output = runtime.sound_multiplier;
+            runtime.give_intent *= 0.9;
+            if runtime.indicator.intensity > 0.0 {
+                runtime.indicator.intensity = (runtime.indicator.intensity - 1.0).max(0.0);
+                if runtime.indicator.intensity <= 0.0 {
+                    runtime.indicator = IndicatorState::default();
+                }
+            }
         }
     }
 
     fn stage_food(&mut self) {
-        let intake_rate = self.config.food_intake_rate;
-        if intake_rate <= 0.0 {
-            return;
-        }
-
         let cell_size = self.config.food_cell_size as f32;
-        let positions = self.agents.columns().positions();
+        let positions = self.agents.columns().positions().to_vec();
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let mut sharers: Vec<usize> = Vec::new();
 
+        let intake_rate = self.config.food_intake_rate;
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                let pos = positions[idx];
-                let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
-                let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
-                if let Some(cell) = self.food.get_mut(cell_x, cell_y) {
-                    let intake = cell.min(intake_rate);
-                    *cell -= intake;
-                    runtime.energy = (runtime.energy + intake * 0.5).min(2.0);
-                    runtime.food_delta += intake;
+                if intake_rate > 0.0 {
+                    let pos = positions[idx];
+                    let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
+                    let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
+                    if let Some(cell) = self.food.get_mut(cell_x, cell_y) {
+                        let intake = cell.min(intake_rate);
+                        *cell -= intake;
+                        runtime.energy = (runtime.energy + intake * 0.5).min(2.0);
+                        runtime.food_delta += intake;
+                    }
                 }
                 if runtime.give_intent > 0.5 {
                     sharers.push(idx);
@@ -2769,55 +2898,234 @@ impl WorldState {
             }
         }
 
-        if sharers.len() < 2 {
+        if sharers.is_empty() {
             return;
         }
 
-        let radius_sq = self.config.food_sharing_radius * self.config.food_sharing_radius;
-        let share_rate = self.config.food_sharing_rate;
+        let transfer_rate = self.config.food_transfer_rate;
+        if transfer_rate <= 0.0 {
+            return;
+        }
+        let distance = if self.config.food_sharing_distance > 0.0 {
+            self.config.food_sharing_distance
+        } else {
+            self.config.food_sharing_radius
+        };
+        let distance_sq = distance * distance;
+        let world_width = self.config.world_width as f32;
+        let world_height = self.config.world_height as f32;
 
-        for (i, idx_a) in sharers.iter().enumerate() {
-            for idx_b in sharers.iter().skip(i + 1) {
-                let idx_a = *idx_a;
-                let idx_b = *idx_b;
-                let id_a = handles[idx_a];
-                let id_b = handles[idx_b];
-                let pos_a = positions[idx_a];
-                let pos_b = positions[idx_b];
-                let dx = pos_a.x - pos_b.x;
-                let dy = pos_a.y - pos_b.y;
-                if dx * dx + dy * dy <= radius_sq {
-                    let energy_a = self.runtime.get(id_a).map_or(0.0, |r| r.energy);
-                    let energy_b = self.runtime.get(id_b).map_or(0.0, |r| r.energy);
-                    let diff = energy_a - energy_b;
-                    if diff.abs() <= f32::EPSILON {
-                        continue;
-                    }
-                    let transfer = (diff.abs() * 0.5).min(share_rate);
-                    if transfer <= 0.0 {
-                        continue;
-                    }
-                    if diff > 0.0 {
-                        if let Some(runtime_a) = self.runtime.get_mut(id_a) {
-                            runtime_a.energy = (runtime_a.energy - transfer).max(0.0);
-                            runtime_a.food_delta -= transfer;
-                        }
-                        if let Some(runtime_b) = self.runtime.get_mut(id_b) {
-                            runtime_b.energy = (runtime_b.energy + transfer).min(2.0);
-                            runtime_b.food_delta += transfer;
-                        }
+        for &giver_idx in &sharers {
+            let giver_id = handles[giver_idx];
+            for (recipient_idx, recipient_id) in handles.iter().enumerate() {
+                if recipient_idx == giver_idx {
+                    continue;
+                }
+                let dx = toroidal_delta(
+                    positions[recipient_idx].x,
+                    positions[giver_idx].x,
+                    world_width,
+                );
+                let dy = toroidal_delta(
+                    positions[recipient_idx].y,
+                    positions[giver_idx].y,
+                    world_height,
+                );
+                if dx * dx + dy * dy > distance_sq {
+                    continue;
+                }
+                let recipient_energy = match self.runtime.get(*recipient_id) {
+                    Some(runtime) => runtime.energy,
+                    None => continue,
+                };
+                if recipient_energy >= 2.0 - f32::EPSILON {
+                    continue;
+                }
+                let giver_energy = match self.runtime.get(giver_id) {
+                    Some(runtime) => runtime.energy,
+                    None => break,
+                };
+                if giver_energy <= f32::EPSILON {
+                    break;
+                }
+                let capacity = (2.0 - recipient_energy).max(0.0);
+                if capacity <= 0.0 {
+                    continue;
+                }
+                let actual_transfer = transfer_rate.min(giver_energy).min(capacity);
+                if actual_transfer <= 0.0 {
+                    continue;
+                }
+                {
+                    if let Some(giver_runtime) = self.runtime.get_mut(giver_id) {
+                        giver_runtime.energy = (giver_runtime.energy - actual_transfer).max(0.0);
+                        giver_runtime.food_delta -= actual_transfer;
                     } else {
-                        if let Some(runtime_b) = self.runtime.get_mut(id_b) {
-                            runtime_b.energy = (runtime_b.energy - transfer).max(0.0);
-                            runtime_b.food_delta -= transfer;
-                        }
-                        if let Some(runtime_a) = self.runtime.get_mut(id_a) {
-                            runtime_a.energy = (runtime_a.energy + transfer).min(2.0);
-                            runtime_a.food_delta += transfer;
-                        }
+                        break;
                     }
                 }
+                if let Some(recipient_runtime) = self.runtime.get_mut(*recipient_id) {
+                    recipient_runtime.energy =
+                        (recipient_runtime.energy + actual_transfer).min(2.0);
+                    recipient_runtime.food_delta += actual_transfer;
+                }
+                self.pulse_indicator(giver_id, 10.0, [1.0, 1.0, 1.0]);
+                self.pulse_indicator(*recipient_id, 10.0, [1.0, 1.0, 1.0]);
             }
+        }
+    }
+    fn spawn_crossover_agent(&mut self) -> bool {
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        let count = handles.len();
+        if count < 2 {
+            return false;
+        }
+
+        let (idx1, idx2) = {
+            let columns = self.agents.columns();
+            let ages = columns.ages();
+            let mut first = self.rng.random_range(0..count);
+            let mut second = if count > 1 {
+                self.rng.random_range(0..count)
+            } else {
+                first
+            };
+            if count > 1 {
+                while second == first {
+                    second = self.rng.random_range(0..count);
+                }
+            }
+            for (idx, &age) in ages.iter().enumerate() {
+                if age > ages[first] && self.rng.random_range(0.0..1.0) < 0.1 {
+                    first = idx;
+                }
+                if idx != first && age > ages[second] && self.rng.random_range(0.0..1.0) < 0.1 {
+                    second = idx;
+                }
+            }
+            if first == second {
+                second = (second + 1) % count;
+                if second == first {
+                    return false;
+                }
+            }
+            (first, second)
+        };
+
+        let parent_id = handles[idx1];
+        let partner_id = handles[idx2];
+
+        let parent_data = {
+            let columns = self.agents.columns();
+            columns.snapshot(idx1)
+        };
+        let partner_data = {
+            let columns = self.agents.columns();
+            columns.snapshot(idx2)
+        };
+        let parent_runtime = match self.runtime.get(parent_id).cloned() {
+            Some(rt) => rt,
+            None => return false,
+        };
+        let partner_runtime = self.runtime.get(partner_id).cloned();
+
+        let width = self.config.world_width as f32;
+        let height = self.config.world_height as f32;
+        let child_data = self.build_child_data(
+            &parent_data,
+            Some(&partner_data),
+            self.config.reproduction_spawn_jitter,
+            self.config.reproduction_spawn_back_distance,
+            self.config.reproduction_color_jitter,
+            width,
+            height,
+        );
+        let child_runtime = self.build_child_runtime(
+            &parent_runtime,
+            partner_runtime.as_ref(),
+            self.config.reproduction_gene_log_capacity,
+            parent_id,
+            Some(partner_id),
+        );
+
+        let child_id = self.spawn_agent(child_data);
+        if let Some(runtime) = self.runtime.get_mut(child_id) {
+            *runtime = child_runtime;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn stage_population(&mut self, next_tick: Tick) {
+        if self.closed {
+            return;
+        }
+
+        let minimum = self.config.population_minimum;
+        if minimum > 0 {
+            while self.agents.len() < minimum {
+                self.spawn_random_agent();
+            }
+        }
+
+        let interval = self.config.population_spawn_interval;
+        if interval == 0 {
+            return;
+        }
+        if !next_tick.0.is_multiple_of(interval as u64) {
+            return;
+        }
+
+        let spawn_count = self.config.population_spawn_count.max(1);
+        let crossover_chance = self.config.population_crossover_chance.clamp(0.0, 1.0);
+        for _ in 0..spawn_count {
+            let use_crossover = self.agents.len() >= 2
+                && crossover_chance > 0.0
+                && self.rng.random_range(0.0..1.0) < crossover_chance;
+            let spawned = if use_crossover {
+                self.spawn_crossover_agent()
+            } else {
+                false
+            };
+            if !spawned {
+                self.spawn_random_agent();
+            }
+        }
+    }
+
+    fn spawn_random_agent(&mut self) {
+        let width = self.config.world_width as f32;
+        let height = self.config.world_height as f32;
+        let position = Position::new(
+            self.rng.random_range(0.0..width),
+            self.rng.random_range(0.0..height),
+        );
+        let heading = self
+            .rng
+            .random_range(-std::f32::consts::PI..std::f32::consts::PI);
+        let color = [
+            self.rng.random_range(0.0..1.0),
+            self.rng.random_range(0.0..1.0),
+            self.rng.random_range(0.0..1.0),
+        ];
+        let data = AgentData::new(
+            position,
+            Velocity::default(),
+            heading,
+            1.0,
+            color,
+            0.0,
+            false,
+            0,
+            Generation::default(),
+        );
+        let _ = self.spawn_agent(data);
+    }
+    fn pulse_indicator(&mut self, id: AgentId, intensity: f32, color: [f32; 3]) {
+        if let Some(runtime) = self.runtime.get_mut(id) {
+            runtime.indicator.intensity = (runtime.indicator.intensity + intensity).min(100.0);
+            runtime.indicator.color = color;
         }
     }
 
@@ -3867,6 +4175,7 @@ impl WorldState {
         self.stage_combat();
         self.stage_death_cleanup();
         self.stage_reproduction();
+        self.stage_population(next_tick);
         self.stage_spawn_commit();
         self.stage_persistence(next_tick);
 
@@ -5078,6 +5387,149 @@ mod tests {
             world.carcass_reproduction_bonus.abs() < 1e-6,
             "carcass reproduction totals should reset after persistence"
         );
+    }
+
+    #[test]
+    fn food_sharing_uses_constant_transfer_rate() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_transfer_rate: 0.01,
+            food_sharing_distance: 25.0,
+            rng_seed: Some(202),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let giver = world.spawn_agent(sample_agent(0));
+        let receiver = world.spawn_agent(sample_agent(1));
+
+        {
+            let arena = world.agents_mut();
+            let idx_giver = arena.index_of(giver).unwrap();
+            let idx_receiver = arena.index_of(receiver).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx_giver] = Position::new(10.0, 10.0);
+            columns.positions_mut()[idx_receiver] = Position::new(12.0, 10.0);
+        }
+        {
+            let runtime_giver = world.agent_runtime_mut(giver).unwrap();
+            runtime_giver.energy = 1.0;
+            runtime_giver.food_delta = 0.0;
+            runtime_giver.give_intent = 1.0;
+        }
+        {
+            let runtime_receiver = world.agent_runtime_mut(receiver).unwrap();
+            runtime_receiver.energy = 0.5;
+            runtime_receiver.food_delta = 0.0;
+            runtime_receiver.give_intent = 0.0;
+        }
+
+        world.stage_food();
+
+        let giver_runtime = world.agent_runtime(giver).unwrap();
+        let receiver_runtime = world.agent_runtime(receiver).unwrap();
+        assert!(
+            (giver_runtime.energy - 0.99).abs() < 1e-6,
+            "giver energy should decrease by transfer rate"
+        );
+        assert!(
+            (receiver_runtime.energy - 0.51).abs() < 1e-6,
+            "receiver energy should increase by transfer rate"
+        );
+        assert!(
+            (giver_runtime.food_delta + 0.01).abs() < 1e-6,
+            "giver food delta should reflect donation"
+        );
+        assert!(
+            (receiver_runtime.food_delta - 0.01).abs() < 1e-6,
+            "receiver food delta should reflect intake"
+        );
+        assert!(
+            giver_runtime.indicator.intensity > 0.0,
+            "giver indicator should pulse when sharing"
+        );
+        assert!(
+            receiver_runtime.indicator.intensity > 0.0,
+            "receiver indicator should pulse when sharing"
+        );
+        assert!(
+            giver_runtime.give_intent > 0.5,
+            "give intent should persist for downstream consumers"
+        );
+    }
+
+    #[test]
+    fn population_seeding_fills_minimum_when_open() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            population_minimum: 3,
+            population_spawn_interval: 0,
+            rng_seed: Some(111),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        world.step();
+        assert!(
+            world.agent_count() >= 3,
+            "expected minimum population seeding"
+        );
+    }
+
+    #[test]
+    fn population_seeding_respects_closed_flag() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            population_minimum: 3,
+            population_spawn_interval: 10,
+            rng_seed: Some(222),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        world.set_closed(true);
+        world.step();
+        assert_eq!(
+            world.agent_count(),
+            0,
+            "closed world should not seed agents"
+        );
+    }
+
+    #[test]
+    fn population_interval_spawns_agents() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 2,
+            population_spawn_count: 1,
+            population_crossover_chance: 0.0,
+            rng_seed: Some(333),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        world.step();
+        assert_eq!(world.agent_count(), 0, "no spawn on first step");
+        world.step();
+        assert_eq!(world.agent_count(), 1, "expected spawn on interval");
     }
 
     #[test]

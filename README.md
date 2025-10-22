@@ -198,6 +198,17 @@ Licensed under `MIT OR Apache-2.0` (see workspace manifest).
 - **DuckDB file lock errors**: Close any external tools accessing the DB file and retry. Prefer unique DB paths per run while developing.
 - **Determinism regressions**: Ensure you haven't introduced unordered parallel reductions; stage results and apply in a stable commit phase.
 
+## Releases
+- Releases are built via [`cargo dist`](https://github.com/axodotdev/cargo-dist) in the `release-builds` GitHub Actions workflow. Publish a new version by tagging the repository (`git tag v0.x.y && git push origin v0.x.y`) or running the workflow manually with a `tag` input.
+- The workflow produces archives for Linux (`x86_64-unknown-linux-gnu`), Windows (`x86_64-pc-windows-msvc`), and a universal macOS build (Apple Silicon + Intel). Artifacts are uploaded as workflow run assets for review before attaching them to a GitHub Release.
+- **macOS codesigning**: provide the following repository secrets for automatic signing (the job skips codesign if they are absent):
+  - `MACOS_CERT_BASE64`: base64-encoded `.p12` Developer ID certificate.
+  - `MACOS_CERT_PASSWORD`: password used to protect the `.p12`.
+  - `MACOS_SIGNING_IDENTITY`: e.g. `"Developer ID Application: Example Corp (TEAMID1234)"`.
+  - `MACOS_KEYCHAIN_PASSWORD` (optional): override keychain password used on the runner.
+- Certificates are imported into a temporary keychain, the binaries (and `.app` bundles when present) are signed with the supplied identity, and the archives are repackaged. Add notarization credentials later if we adopt automated notarization.
+- Release operators should verify the uploaded artifacts locally (`codesign --verify --deep` on macOS, `shasum -a 256` on every platform) before drafting public releases.
+
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.

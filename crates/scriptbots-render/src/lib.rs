@@ -6,12 +6,14 @@ use gpui::{
     ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, canvas, div, fill, point,
     prelude::*, px, rgb, size,
 };
+use rand::Rng;
 use scriptbots_core::{
-    AgentColumns, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState, MutationRates,
-    OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TickSummary, TraitModifiers,
-    Velocity, WorldState,
+    AgentColumns, AgentData, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState,
+    MutationRates, OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TickSummary,
+    TraitModifiers, Velocity, WorldState,
 };
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, VecDeque},
     f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
     sync::{Arc, Mutex},
@@ -27,6 +29,17 @@ use kira::{
 };
 
 use tracing::{error, info};
+
+fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
+    let mut delta = target - origin;
+    let half = extent * 0.5;
+    if delta > half {
+        delta -= extent;
+    } else if delta < -half {
+        delta += extent;
+    }
+    delta
+}
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
 pub fn run_demo(world: Arc<Mutex<WorldState>>) {
@@ -73,6 +86,10 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>) {
     });
 }
 
+const MAX_SELECTION_EVENTS: usize = 64;
+const SIM_TICK_INTERVAL: f32 = 1.0 / 60.0;
+const MAX_SIM_STEPS_PER_FRAME: usize = 240;
+
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
     title: SharedString,
@@ -80,8 +97,14 @@ struct SimulationView {
     inspector: Arc<Mutex<InspectorState>>,
     playback: PlaybackState,
     perf: PerfStats,
+    last_perf: PerfSnapshot,
     accessibility: AccessibilitySettings,
     debug: DebugOverlayState,
+    selection_events: VecDeque<SelectionEvent>,
+    controls: SimulationControls,
+    sim_accumulator: f32,
+    last_sim_instant: Option<Instant>,
+    shift_inspect: bool,
     bindings: InputBindings,
     key_capture: Option<CommandAction>,
     #[cfg(feature = "audio")]
@@ -105,8 +128,14 @@ impl SimulationView {
             inspector: Arc::new(Mutex::new(inspector_state)),
             playback: PlaybackState::new(240),
             perf: PerfStats::new(240),
+            last_perf: PerfSnapshot::default(),
             accessibility: AccessibilitySettings::default(),
             debug: DebugOverlayState::default(),
+            selection_events: VecDeque::with_capacity(MAX_SELECTION_EVENTS),
+            controls: SimulationControls::default(),
+            sim_accumulator: 0.0,
+            last_sim_instant: Some(Instant::now()),
+            shift_inspect: false,
             bindings: InputBindings::default(),
             key_capture: None,
             #[cfg(feature = "audio")]
@@ -126,7 +155,339 @@ impl SimulationView {
             .unwrap_or_default()
     }
 
+    fn pump_simulation(&mut self) {
+        let now = Instant::now();
+        let last = self.last_sim_instant.unwrap_or(now);
+        self.last_sim_instant = Some(now);
+
+        if self.controls.paused || self.controls.speed_multiplier <= 0.0 {
+            self.sim_accumulator = 0.0;
+            return;
+        }
+
+        let delta = (now - last).as_secs_f32();
+        self.sim_accumulator += delta * self.controls.speed_multiplier;
+
+        let step_interval = SIM_TICK_INTERVAL;
+        if self.sim_accumulator < step_interval {
+            return;
+        }
+
+        let max_accumulator = step_interval * MAX_SIM_STEPS_PER_FRAME as f32;
+        if self.sim_accumulator > max_accumulator {
+            self.sim_accumulator = max_accumulator;
+        }
+
+        let mut steps = (self.sim_accumulator / step_interval).floor() as usize;
+        if steps == 0 {
+            return;
+        }
+        if steps > MAX_SIM_STEPS_PER_FRAME {
+            steps = MAX_SIM_STEPS_PER_FRAME;
+        }
+
+        self.sim_accumulator -= step_interval * steps as f32;
+
+        if let Ok(mut world) = self.world.lock() {
+            for _ in 0..steps {
+                world.step();
+            }
+        }
+    }
+
+    fn canvas_to_world(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        self.camera
+            .lock()
+            .ok()
+            .and_then(|camera| camera.screen_to_world(position))
+    }
+
+    fn selection_pick_radius(&self, world: &WorldState) -> f32 {
+        (world.config().bot_radius * 3.0).max(24.0)
+    }
+
+    fn pick_agent_near(
+        &self,
+        world: &WorldState,
+        point: (f32, f32),
+        radius: f32,
+    ) -> Option<AgentId> {
+        let arena = world.agents();
+        let columns = arena.columns();
+        let positions = columns.positions();
+        let radius_sq = radius * radius;
+        let extent_x = world.config().world_width as f32;
+        let extent_y = world.config().world_height as f32;
+        let mut best: Option<(AgentId, f32)> = None;
+
+        for (idx, agent_id) in arena.iter_handles().enumerate() {
+            let pos = positions[idx];
+            let dx = toroidal_delta(point.0, pos.x, extent_x);
+            let dy = toroidal_delta(point.1, pos.y, extent_y);
+            let dist_sq = dx.mul_add(dx, dy * dy);
+            if dist_sq <= radius_sq {
+                if best.map_or(true, |(_, best_dist)| dist_sq < best_dist) {
+                    best = Some((agent_id, dist_sq));
+                }
+            }
+        }
+
+        best.map(|(id, _)| id)
+    }
+
+    fn clear_all_selections(&mut self) -> bool {
+        let prev_hover = self
+            .inspector
+            .lock()
+            .map(|state| state.hovered_agent)
+            .unwrap_or(None);
+
+        let mut changed = false;
+        if let Ok(mut world) = self.world.lock() {
+            let runtime = world.runtime_mut();
+            for entry in runtime.values_mut() {
+                if !matches!(entry.selection, SelectionState::None) {
+                    entry.selection = SelectionState::None;
+                    changed = true;
+                }
+            }
+
+            if let Some(prev) = prev_hover {
+                if let Some(entry) = runtime.get_mut(prev) {
+                    if matches!(entry.selection, SelectionState::Hovered) {
+                        entry.selection = SelectionState::None;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if let Ok(mut inspector) = self.inspector.lock() {
+            if inspector.focused_agent.is_some() {
+                inspector.focused_agent = None;
+                changed = true;
+            }
+            if inspector.hovered_agent.is_some() {
+                inspector.hovered_agent = None;
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    fn update_selection_from_point(&mut self, position: Point<Pixels>, extend: bool) -> bool {
+        let Some(world_point) = self.canvas_to_world(position) else {
+            if extend {
+                return false;
+            }
+            let cleared = self.clear_all_selections();
+            if cleared {
+                self.record_selection_event(SelectionEventKind::Clear);
+            }
+            return cleared;
+        };
+
+        let (prior_focus, prev_hover) = self
+            .inspector
+            .lock()
+            .map(|state| (state.focused_agent, state.hovered_agent))
+            .unwrap_or((None, None));
+
+        let mut selection_changed = false;
+        let mut candidate_id = None;
+        let mut selected_after: Vec<AgentId> = Vec::new();
+        let mut world_applied = false;
+
+        if let Ok(mut world) = self.world.lock() {
+            let pick_radius = self.selection_pick_radius(&world);
+            let candidate = self.pick_agent_near(&world, world_point, pick_radius);
+
+            {
+                let runtime = world.runtime_mut();
+
+                if !extend {
+                    for entry in runtime.values_mut() {
+                        if !matches!(entry.selection, SelectionState::None) {
+                            entry.selection = SelectionState::None;
+                            selection_changed = true;
+                        }
+                    }
+                }
+
+                if let Some(id) = candidate {
+                    if let Some(entry) = runtime.get_mut(id) {
+                        let was_selected = matches!(entry.selection, SelectionState::Selected);
+                        if extend && was_selected {
+                            entry.selection = SelectionState::None;
+                            selection_changed = true;
+                        } else {
+                            if !was_selected {
+                                entry.selection = SelectionState::Selected;
+                                selection_changed = true;
+                            }
+                            candidate_id = Some(id);
+                        }
+                    }
+                } else if !extend {
+                    candidate_id = None;
+                }
+
+                if let Some(prev) = prev_hover {
+                    if let Some(entry) = runtime.get_mut(prev) {
+                        if matches!(entry.selection, SelectionState::Hovered) {
+                            entry.selection = SelectionState::None;
+                            selection_changed = true;
+                        }
+                    }
+                }
+
+                selected_after = runtime
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        if matches!(entry.selection, SelectionState::Selected) {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            }
+
+            world_applied = true;
+        }
+
+        if !world_applied {
+            return false;
+        }
+
+        let mut focus_after = if let Some(id) = candidate_id {
+            if selected_after.contains(&id) {
+                Some(id)
+            } else if extend {
+                None
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if extend {
+            if focus_after.is_none() {
+                if let Some(prev) = prior_focus {
+                    if selected_after.contains(&prev) {
+                        focus_after = Some(prev);
+                    }
+                }
+            }
+            if focus_after.is_none() {
+                focus_after = selected_after.first().copied();
+            }
+        }
+
+        let focus_changed = focus_after != prior_focus;
+
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.focused_agent = focus_after;
+            inspector.hovered_agent = None;
+        }
+
+        if selection_changed {
+            self.record_selection_event(SelectionEventKind::Click);
+        } else if focus_changed {
+            self.record_selection_event(SelectionEventKind::Focus);
+        }
+
+        selection_changed || focus_changed
+    }
+
+    fn handle_canvas_hover(&mut self, event: &MouseMoveEvent) -> bool {
+        let mut changed = self.set_shift_inspect(event.modifiers.shift);
+        if self.update_hover_from_point(event.position) {
+            changed = true;
+        }
+        changed
+    }
+
+    fn set_shift_inspect(&mut self, active: bool) -> bool {
+        if self.shift_inspect != active {
+            self.shift_inspect = active;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn update_hover_from_point(&mut self, position: Point<Pixels>) -> bool {
+        let hovered = if let Some(world_point) = self.canvas_to_world(position) {
+            if let Ok(world) = self.world.lock() {
+                let radius = self.selection_pick_radius(&world);
+                self.pick_agent_near(&world, world_point, radius)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.apply_hover_change(hovered)
+    }
+
+    fn apply_hover_change(&mut self, hovered: Option<AgentId>) -> bool {
+        let prev_hover = self
+            .inspector
+            .lock()
+            .map(|state| state.hovered_agent)
+            .unwrap_or(None);
+
+        if prev_hover == hovered {
+            return false;
+        }
+
+        let mut desired = hovered;
+        let mut selection_changed = false;
+
+        if let Ok(mut world) = self.world.lock() {
+            let runtime = world.runtime_mut();
+
+            if let Some(prev) = prev_hover {
+                if let Some(entry) = runtime.get_mut(prev) {
+                    if matches!(entry.selection, SelectionState::Hovered) {
+                        entry.selection = SelectionState::None;
+                        selection_changed = true;
+                    }
+                }
+            }
+
+            if let Some(curr) = hovered {
+                if runtime
+                    .get(curr)
+                    .map(|entry| matches!(entry.selection, SelectionState::Selected))
+                    .unwrap_or(false)
+                {
+                    desired = None;
+                } else if let Some(entry) = runtime.get_mut(curr) {
+                    if !matches!(entry.selection, SelectionState::Hovered) {
+                        entry.selection = SelectionState::Hovered;
+                        selection_changed = true;
+                    }
+                }
+            }
+        } else {
+            return false;
+        }
+
+        let mut inspector_changed = false;
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector_changed = inspector.hovered_agent != desired;
+            inspector.hovered_agent = desired;
+        }
+
+        selection_changed || inspector_changed
+    }
     fn snapshot(&mut self) -> HudSnapshot {
+        self.pump_simulation();
         let mut snapshot = HudSnapshot::default();
         let inspector_state = self
             .inspector
@@ -159,6 +520,9 @@ impl SimulationView {
             snapshot.inspector = InspectorSnapshot::from_world(&world, &inspector_state);
         }
 
+        snapshot.perf = self.last_perf;
+        snapshot.controls = self.controls.snapshot();
+
         self.playback.record(snapshot.clone());
 
         snapshot
@@ -181,6 +545,20 @@ impl SimulationView {
             snapshot.tick, snapshot.epoch, snapshot.agent_count
         );
 
+        let badge_canvas = {
+            let state = HeaderBadgeState {
+                phase: snapshot.tick as f32 * 0.02,
+                palette: self.accessibility.palette,
+            };
+            canvas(
+                move |_, _, _| state,
+                move |bounds, state, window, _| paint_header_badge(bounds, state, window),
+            )
+            .w(px(56.0))
+            .h(px(56.0))
+            .flex_none()
+        };
+
         div()
             .flex()
             .justify_between()
@@ -189,10 +567,17 @@ impl SimulationView {
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(div().text_3xl().child(self.title.clone()))
-                    .child(div().text_sm().text_color(rgb(0x94a3b8)).child(subline)),
+                    .items_center()
+                    .gap_3()
+                    .child(badge_canvas)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_3xl().child(self.title.clone()))
+                            .child(div().text_sm().text_color(rgb(0x94a3b8)).child(subline)),
+                    ),
             )
             .child(
                 div()
@@ -294,6 +679,62 @@ impl SimulationView {
                     ),
             );
         }
+
+        let perf = snapshot.perf;
+        let frame_value = if perf.sample_count == 0 {
+            "—".to_string()
+        } else {
+            format!("{:.2} ms", perf.latest_ms)
+        };
+        let frame_detail = if perf.sample_count == 0 {
+            "Collecting samples…".to_string()
+        } else {
+            format!(
+                "avg {:.2} · min {:.2} · max {:.2}",
+                perf.average_ms, perf.min_ms, perf.max_ms
+            )
+        };
+        cards.push(self.metric_card(
+            "Frame Time",
+            frame_value,
+            0x14b8a6,
+            Some(frame_detail),
+            None,
+        ));
+
+        let fps_value = if perf.sample_count == 0 {
+            "—".to_string()
+        } else {
+            format!("{:.1}", perf.fps)
+        };
+        let fps_detail = if perf.sample_count == 0 {
+            "Awaiting samples".to_string()
+        } else {
+            format!("Samples {}", perf.sample_count)
+        };
+        cards.push(self.metric_card("FPS", fps_value, 0xf97316, Some(fps_detail), None));
+
+        let controls = snapshot.controls;
+        let speed_value = if controls.paused {
+            "Paused".to_string()
+        } else {
+            format!("{:.2}×", controls.speed_multiplier)
+        };
+        let bool_label = |value: bool| if value { "On" } else { "Off" };
+        let speed_detail = format!(
+            "Agents {} · Food {} · Outline {} · {}",
+            bool_label(controls.draw_agents),
+            bool_label(controls.draw_food),
+            bool_label(controls.agent_outline),
+            controls.follow_mode.label()
+        );
+        cards.push(self.metric_card(
+            "Sim Controls",
+            speed_value,
+            0x60a5fa,
+            Some(speed_detail),
+            None,
+        ));
 
         let column_count = cards.len().clamp(1, 4) as u16;
 
@@ -438,11 +879,14 @@ impl SimulationView {
         frame: RenderFrame,
         cx: &mut Context<Self>,
     ) -> Div {
+        let follow_target = self.compute_follow_target(&frame, &snapshot.inspector);
         let canvas_state = CanvasState {
             frame: frame.clone(),
             camera: Arc::clone(&self.camera),
             focus_agent: snapshot.inspector.focus_id,
+            controls: snapshot.controls,
             debug: self.debug,
+            follow_target,
         };
 
         let canvas_element = canvas(
@@ -452,7 +896,9 @@ impl SimulationView {
                     &state.frame,
                     &state.camera,
                     state.focus_agent,
+                    state.controls,
                     state.debug,
+                    state.follow_target,
                     bounds,
                     window,
                 )
@@ -463,6 +909,19 @@ impl SimulationView {
         let canvas_stack = div()
             .relative()
             .flex_1()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    let extend = event.modifiers.shift;
+                    let mut changed = this.update_selection_from_point(event.position, extend);
+                    if this.set_shift_inspect(event.modifiers.shift) {
+                        changed = true;
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -481,9 +940,27 @@ impl SimulationView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if let Ok(mut camera) = this.camera.lock()
-                    && camera.update_pan(event.position)
-                {
+                let mut changed = false;
+                let mut panning = false;
+                if let Ok(mut camera) = this.camera.lock() {
+                    if camera.update_pan(event.position) {
+                        changed = true;
+                    }
+                    panning = camera.panning;
+                }
+
+                if panning {
+                    if this.apply_hover_change(None) {
+                        changed = true;
+                    }
+                    if this.set_shift_inspect(false) {
+                        changed = true;
+                    }
+                } else if this.handle_canvas_hover(event) {
+                    changed = true;
+                }
+
+                if changed {
                     cx.notify();
                 }
             }))
@@ -528,6 +1005,28 @@ impl SimulationView {
             .child(footer)
     }
 
+    fn compute_follow_target(
+        &self,
+        frame: &RenderFrame,
+        inspector: &InspectorSnapshot,
+    ) -> Option<Position> {
+        match self.controls.follow_mode {
+            FollowMode::Off => None,
+            FollowMode::Selected => inspector.focus_id.and_then(|id| {
+                frame
+                    .agents
+                    .iter()
+                    .find(|agent| agent.agent_id == id)
+                    .map(|agent| agent.position)
+            }),
+            FollowMode::Oldest => frame
+                .agents
+                .iter()
+                .max_by_key(|agent| agent.age)
+                .map(|agent| agent.position),
+        }
+    }
+
     fn focus_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         if let Ok(mut inspector) = self.inspector.lock() {
             inspector.focused_agent = Some(agent_id);
@@ -563,6 +1062,103 @@ impl SimulationView {
             inspector.probe_enabled = enabled;
         }
         cx.notify();
+    }
+
+    fn set_debug_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.debug.enabled = enabled;
+        cx.notify();
+    }
+
+    fn set_debug_show_velocity(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.debug.show_velocity = enabled;
+        cx.notify();
+    }
+
+    fn set_debug_show_sense_radius(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.debug.show_sense_radius = enabled;
+        cx.notify();
+    }
+
+    fn record_selection_event(&mut self, kind: SelectionEventKind) {
+        let (tick, selected) = if let Ok(world) = self.world.lock() {
+            let mut ids = Vec::new();
+            for (id, entry) in world.runtime().iter() {
+                if matches!(entry.selection, SelectionState::Selected) {
+                    ids.push(id);
+                }
+            }
+            (world.tick().0, ids)
+        } else {
+            (0, Vec::<AgentId>::new())
+        };
+
+        let total = selected.len();
+        let sample = selected.iter().copied().take(5).collect::<Vec<AgentId>>();
+        let event = SelectionEvent {
+            tick,
+            kind,
+            total_selected: total,
+            sample_ids: sample,
+        };
+        if self.selection_events.len() >= MAX_SELECTION_EVENTS {
+            self.selection_events.pop_front();
+        }
+        self.selection_events.push_back(event);
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.clear_all_selections() {
+            self.record_selection_event(SelectionEventKind::Clear);
+            cx.notify();
+        }
+    }
+
+    fn select_all_agents(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        let mut first_selected: Option<AgentId> = None;
+        {
+            if let Ok(mut world) = self.world.lock() {
+                let runtime = world.runtime_mut();
+                for (id, entry) in runtime.iter_mut() {
+                    if entry.selection != SelectionState::Selected {
+                        entry.selection = SelectionState::Selected;
+                        changed = true;
+                    }
+                    if first_selected.is_none() {
+                        first_selected = Some(id);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.record_selection_event(SelectionEventKind::SelectAll);
+            if let Some(id) = first_selected {
+                self.focus_agent(id, cx);
+            } else {
+                cx.notify();
+            }
+        }
+    }
+
+    fn focus_first_selected(&mut self, cx: &mut Context<Self>) {
+        let selected_id = {
+            if let Ok(world) = self.world.lock() {
+                world.runtime().iter().find_map(|(id, entry)| {
+                    if matches!(entry.selection, SelectionState::Selected) {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        };
+
+        if let Some(id) = selected_id {
+            self.focus_agent(id, cx);
+            self.record_selection_event(SelectionEventKind::Focus);
+        }
     }
 
     fn set_persistence_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -686,6 +1282,25 @@ impl SimulationView {
             CommandAction::ToggleBrush => self.toggle_brush_state(cx),
             CommandAction::ToggleNarration => self.toggle_narration(cx),
             CommandAction::CyclePalette => self.cycle_palette(cx),
+            CommandAction::ToggleSimulationPause => self.toggle_simulation_pause(cx),
+            CommandAction::ToggleAgentDraw => self.toggle_agent_draw(cx),
+            CommandAction::ToggleFoodOverlay => self.toggle_food_overlay(cx),
+            CommandAction::ToggleAgentOutline => self.toggle_agent_outline(cx),
+            CommandAction::IncreaseSimulationSpeed => self.adjust_simulation_speed(0.25, cx),
+            CommandAction::DecreaseSimulationSpeed => self.adjust_simulation_speed(-0.25, cx),
+            CommandAction::AddCrossoverAgents => self.spawn_crossover_agent(cx),
+            CommandAction::SpawnCarnivore => self.spawn_agent_with_tendency(0.0, cx),
+            CommandAction::SpawnHerbivore => self.spawn_agent_with_tendency(1.0, cx),
+            CommandAction::ToggleClosedEnvironment => self.toggle_closed_environment(cx),
+            CommandAction::FollowSelected => self.toggle_follow_selected(cx),
+            CommandAction::FollowOldest => self.toggle_follow_oldest(cx),
+            CommandAction::ToggleDebugOverlay => {
+                let enabled = !self.debug.enabled;
+                self.set_debug_enabled(enabled, cx);
+            }
+            CommandAction::ClearSelection => self.clear_selection(cx),
+            CommandAction::SelectAll => self.select_all_agents(cx),
+            CommandAction::FocusFirstSelected => self.focus_first_selected(cx),
         }
     }
 
@@ -713,6 +1328,257 @@ impl SimulationView {
             audio.play(&audio.toggle_sound);
         }
         cx.notify();
+    }
+
+    fn set_simulation_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
+        if self.controls.paused == paused {
+            return;
+        }
+        self.controls.paused = paused;
+        self.sim_accumulator = 0.0;
+        self.last_sim_instant = Some(Instant::now());
+        info!(paused, "Simulation pause state updated");
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
+        cx.notify();
+    }
+
+    fn set_draw_agents(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.controls.draw_agents == enabled {
+            return;
+        }
+        self.controls.draw_agents = enabled;
+        info!(draw_agents = enabled, "Agent rendering toggled");
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
+        cx.notify();
+    }
+
+    fn set_draw_food(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.controls.draw_food == enabled {
+            return;
+        }
+        self.controls.draw_food = enabled;
+        info!(draw_food = enabled, "Food overlay toggled");
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
+        cx.notify();
+    }
+
+    fn set_agent_outline(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.controls.agent_outline == enabled {
+            return;
+        }
+        self.controls.agent_outline = enabled;
+        info!(agent_outline = enabled, "Agent outline toggled");
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
+        cx.notify();
+    }
+
+    fn set_follow_mode(&mut self, mode: FollowMode, cx: &mut Context<Self>) {
+        if self.controls.follow_mode == mode {
+            return;
+        }
+        self.controls.follow_mode = mode;
+        info!(mode = ?mode, "Follow mode updated");
+        cx.notify();
+    }
+
+    fn set_world_closed(&mut self, closed: bool, cx: &mut Context<Self>) {
+        let mut updated = false;
+        if let Ok(mut world) = self.world.lock() {
+            if world.is_closed() != closed {
+                world.set_closed(closed);
+                updated = true;
+            }
+        }
+        if updated {
+            info!(closed, "Updated closed environment toggle");
+            #[cfg(feature = "audio")]
+            if let Some(audio) = self.audio.as_mut() {
+                audio.play(&audio.toggle_sound);
+            }
+            cx.notify();
+        }
+    }
+
+    fn toggle_simulation_pause(&mut self, cx: &mut Context<Self>) {
+        let next = !self.controls.paused;
+        self.set_simulation_paused(next, cx);
+    }
+
+    fn toggle_agent_draw(&mut self, cx: &mut Context<Self>) {
+        let next = !self.controls.draw_agents;
+        self.set_draw_agents(next, cx);
+    }
+
+    fn toggle_food_overlay(&mut self, cx: &mut Context<Self>) {
+        let next = !self.controls.draw_food;
+        self.set_draw_food(next, cx);
+    }
+
+    fn toggle_agent_outline(&mut self, cx: &mut Context<Self>) {
+        let next = !self.controls.agent_outline;
+        self.set_agent_outline(next, cx);
+    }
+
+    fn adjust_simulation_speed(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let mut speed = self.controls.speed_multiplier + delta;
+        speed = speed.clamp(0.25, 4.0);
+        speed = (speed * 100.0).round() / 100.0;
+        if (speed - self.controls.speed_multiplier).abs() > f32::EPSILON {
+            self.controls.speed_multiplier = speed;
+            info!(speed = speed, "Adjusted simulation speed");
+            self.last_sim_instant = Some(Instant::now());
+            #[cfg(feature = "audio")]
+            if let Some(audio) = self.audio.as_mut() {
+                audio.play(&audio.toggle_sound);
+            }
+            cx.notify();
+        }
+    }
+
+    fn spawn_agent_with_tendency(&mut self, herbivore_bias: f32, cx: &mut Context<Self>) {
+        let mut spawned = false;
+        if let Ok(mut world) = self.world.lock() {
+            spawned = self.spawn_agent_with_bias_internal(&mut world, herbivore_bias);
+        }
+        if spawned {
+            cx.notify();
+        }
+    }
+
+    fn spawn_agent_with_bias_internal(&self, world: &mut WorldState, herbivore_bias: f32) -> bool {
+        let width = world.config().world_width as f32;
+        let height = world.config().world_height as f32;
+        if width <= 0.0 || height <= 0.0 {
+            return false;
+        }
+
+        let (pos_x, pos_y, color) = {
+            let rng = world.rng();
+            let x = rng.random_range(0.0..width);
+            let y = rng.random_range(0.0..height);
+            let color = [
+                rng.random_range(0.15..0.95),
+                rng.random_range(0.15..0.95),
+                rng.random_range(0.15..0.95),
+            ];
+            (x, y, color)
+        };
+
+        let mut agent = AgentData::default();
+        agent.position = Position::new(pos_x, pos_y);
+        agent.velocity = Velocity::new(0.0, 0.0);
+        agent.color = color;
+        let agent_id = world.spawn_agent(agent);
+        if let Some(runtime) = world.runtime_mut().get_mut(agent_id) {
+            runtime.herbivore_tendency = herbivore_bias.clamp(0.0, 1.0);
+            runtime.energy = runtime.energy.max(1.0);
+        }
+        info!(agent = ?agent_id, bias = herbivore_bias, "Spawned agent");
+        true
+    }
+
+    fn spawn_crossover_agent(&mut self, cx: &mut Context<Self>) {
+        let mut spawned = false;
+        if let Ok(mut world) = self.world.lock() {
+            let selected: Vec<AgentId> = {
+                let runtime = world.runtime();
+                runtime
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        matches!(entry.selection, SelectionState::Selected).then_some(id)
+                    })
+                    .collect()
+            };
+
+            if selected.len() >= 2 {
+                if let (Some(parent_a), Some(parent_b)) = (
+                    world.snapshot_agent(selected[0]),
+                    world.snapshot_agent(selected[1]),
+                ) {
+                    let mut child = AgentData::default();
+                    child.position = Position::new(
+                        (parent_a.data.position.x + parent_b.data.position.x) * 0.5,
+                        (parent_a.data.position.y + parent_b.data.position.y) * 0.5,
+                    );
+                    child.velocity = Velocity::new(0.0, 0.0);
+                    child.heading = (parent_a.data.heading + parent_b.data.heading) * 0.5;
+                    child.health =
+                        ((parent_a.data.health + parent_b.data.health) * 0.5).clamp(0.5, 2.0);
+                    child.color = [
+                        (parent_a.data.color[0] + parent_b.data.color[0]) * 0.5,
+                        (parent_a.data.color[1] + parent_b.data.color[1]) * 0.5,
+                        (parent_a.data.color[2] + parent_b.data.color[2]) * 0.5,
+                    ];
+                    child.spike_length =
+                        (parent_a.data.spike_length + parent_b.data.spike_length) * 0.5;
+
+                    let child_id = world.spawn_agent(child);
+                    if let Some(runtime) = world.runtime_mut().get_mut(child_id) {
+                        runtime.herbivore_tendency = (parent_a.runtime.herbivore_tendency
+                            + parent_b.runtime.herbivore_tendency)
+                            * 0.5;
+                        runtime.mutation_rates.primary = (parent_a.runtime.mutation_rates.primary
+                            + parent_b.runtime.mutation_rates.primary)
+                            * 0.5;
+                        runtime.mutation_rates.secondary =
+                            (parent_a.runtime.mutation_rates.secondary
+                                + parent_b.runtime.mutation_rates.secondary)
+                                * 0.5;
+                        runtime.indicator.intensity = 0.6;
+                        runtime.indicator.color = [0.2, 0.8, 0.9];
+                    }
+                    info!(child = ?child_id, "Spawned crossover agent");
+                    spawned = true;
+                }
+            }
+
+            if !spawned {
+                spawned = self.spawn_agent_with_bias_internal(&mut world, 0.5);
+            }
+        }
+
+        if spawned {
+            cx.notify();
+        }
+    }
+
+    fn toggle_closed_environment(&mut self, cx: &mut Context<Self>) {
+        let next = {
+            if let Ok(world) = self.world.lock() {
+                !world.is_closed()
+            } else {
+                return;
+            }
+        };
+        self.set_world_closed(next, cx);
+    }
+
+    fn toggle_follow_selected(&mut self, cx: &mut Context<Self>) {
+        let next = match self.controls.follow_mode {
+            FollowMode::Selected => FollowMode::Off,
+            _ => FollowMode::Selected,
+        };
+        self.set_follow_mode(next, cx);
+    }
+
+    fn toggle_follow_oldest(&mut self, cx: &mut Context<Self>) {
+        let next = match self.controls.follow_mode {
+            FollowMode::Oldest => FollowMode::Off,
+            _ => FollowMode::Oldest,
+        };
+        self.set_follow_mode(next, cx);
     }
 
     fn cycle_palette(&mut self, cx: &mut Context<Self>) {
@@ -867,6 +1733,7 @@ impl SimulationView {
         let selection_list = div().flex().flex_col().gap_2().children(list_children);
 
         let brush_tools = self.render_inspector_brush_tools(inspector, cx);
+        let debug_tools = self.render_debug_controls(cx);
         let persistence_controls = self.render_persistence_controls(inspector, cx);
         let playback_controls = self.render_inspector_playback_controls(cx);
 
@@ -914,8 +1781,12 @@ impl SimulationView {
                     .text_color(rgb(0x38bdf8))
                     .child(format!("Selected agents: {}", inspector.selected.len())),
             )
+            .child(self.render_selection_controls(inspector, cx))
+            .child(self.render_selection_log())
+            .child(self.render_simulation_controls(snapshot, cx))
             .child(selection_list)
             .child(brush_tools)
+            .child(debug_tools)
             .child(persistence_controls)
             .child(self.render_accessibility_panel(cx))
             .child(playback_controls)
@@ -1290,6 +2161,786 @@ impl SimulationView {
                     .text_xs()
                     .text_color(rgb(0x64748b))
                     .child("Disabling stores the last interval for quick re-enable."),
+            )
+    }
+
+    fn render_selection_controls(
+        &self,
+        inspector: &InspectorSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let clear = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.clear_selection(cx);
+        });
+        let select_all = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.select_all_agents(cx);
+        });
+        let focus_first = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.focus_first_selected(cx);
+        });
+
+        let clear_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::ClearSelection)
+            .cloned()
+            .unwrap_or_default();
+        let select_all_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::SelectAll)
+            .cloned()
+            .unwrap_or_default();
+        let focus_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::FocusFirstSelected)
+            .cloned()
+            .unwrap_or_default();
+
+        let style_action_button = |button: Div| {
+            button
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x111b2b))
+                .text_color(rgb(0xcbd5f5))
+        };
+
+        let clear_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Clear")
+                .on_mouse_down(MouseButton::Left, clear);
+            style_action_button(base)
+        };
+        let select_all_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Select all")
+                .on_mouse_down(MouseButton::Left, select_all);
+            style_action_button(base)
+        };
+        let focus_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Focus first")
+                .on_mouse_down(MouseButton::Left, focus_first);
+            style_action_button(base)
+        };
+
+        let hover_label = inspector
+            .hovered
+            .as_ref()
+            .map(|entry| entry.label.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let focus_label = inspector
+            .focus_id
+            .map(|id| format!("{id:?}"))
+            .unwrap_or_else(|| "—".to_string());
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Selection tools"),
+            )
+            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                "Selected {} · Hover {} · Focus {}",
+                inspector.selected.len(),
+                hover_label,
+                focus_label
+            )))
+            .child(div().flex().gap_1().children(vec![
+                clear_button,
+                select_all_button,
+                focus_button,
+            ]))
+            .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                "Shortcuts: Clear {} · Select all {} · Focus {}",
+                format_keystroke(&clear_binding),
+                format_keystroke(&select_all_binding),
+                format_keystroke(&focus_binding)
+            )))
+    }
+
+    fn render_selection_log(&self) -> Div {
+        let mut items: Vec<Div> = Vec::new();
+        if self.selection_events.is_empty() {
+            items.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x475569))
+                    .bg(rgb(0x0f172a))
+                    .border_1()
+                    .border_color(rgb(0x1e293b))
+                    .rounded_md()
+                    .px_2()
+                    .py_2()
+                    .child("No recent selection changes"),
+            );
+        } else {
+            for event in self.selection_events.iter().rev().take(8) {
+                let sample = if event.sample_ids.is_empty() {
+                    "—".to_string()
+                } else {
+                    event
+                        .sample_ids
+                        .iter()
+                        .map(|id| format!("{:?}", id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+
+                items.push(
+                    div()
+                        .bg(rgb(0x0f172a))
+                        .border_1()
+                        .border_color(rgb(0x1e293b))
+                        .rounded_md()
+                        .px_2()
+                        .py_2()
+                        .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                            "Tick {} · {} · selected {}",
+                            event.tick,
+                            event.kind.label(),
+                            event.total_selected
+                        )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x64748b))
+                                .child(format!("Sample [{}]", sample)),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Selection history"),
+            )
+            .children(items)
+    }
+
+    fn render_debug_controls(&self, cx: &mut Context<Self>) -> Div {
+        let debug_state = self.debug;
+        let overlay_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::ToggleDebugOverlay)
+            .cloned()
+            .unwrap_or_default();
+
+        let enable_debug = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_debug_enabled(true, cx);
+        });
+        let disable_debug = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_debug_enabled(false, cx);
+        });
+        let show_velocity = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_debug_show_velocity(true, cx);
+        });
+        let hide_velocity = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_debug_show_velocity(false, cx);
+        });
+        let show_sense = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_debug_show_sense_radius(true, cx);
+        });
+        let hide_sense = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_debug_show_sense_radius(false, cx);
+        });
+
+        let style_toggle = |button: Div, active: bool| {
+            if active {
+                button
+                    .border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                button
+                    .border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let overlay_on = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("On")
+                .on_mouse_down(MouseButton::Left, enable_debug);
+            style_toggle(base, debug_state.enabled)
+        };
+        let overlay_off = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Off")
+                .on_mouse_down(MouseButton::Left, disable_debug);
+            style_toggle(base, !debug_state.enabled)
+        };
+        let velocity_on = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("On")
+                .on_mouse_down(MouseButton::Left, show_velocity);
+            style_toggle(base, debug_state.show_velocity)
+        };
+        let velocity_off = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Off")
+                .on_mouse_down(MouseButton::Left, hide_velocity);
+            style_toggle(base, !debug_state.show_velocity)
+        };
+        let sense_on = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("On")
+                .on_mouse_down(MouseButton::Left, show_sense);
+            style_toggle(base, debug_state.show_sense_radius)
+        };
+        let sense_off = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Off")
+                .on_mouse_down(MouseButton::Left, hide_sense);
+            style_toggle(base, !debug_state.show_sense_radius)
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Debug overlays"),
+            )
+            .child(div().flex().gap_2().children(vec![overlay_on, overlay_off]))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child("Velocity arrows"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .children(vec![velocity_on, velocity_off]),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child("Sense radius"),
+                    )
+                    .child(div().flex().gap_2().children(vec![sense_on, sense_off])),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(format!("Shortcut {}", format_keystroke(&overlay_binding))),
+            )
+    }
+
+    fn render_simulation_controls(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+        let controls = snapshot.controls;
+
+        let run_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_simulation_paused(false, cx);
+        });
+        let pause_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_simulation_paused(true, cx);
+        });
+        let slower_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_simulation_speed(-0.25, cx);
+        });
+        let faster_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_simulation_speed(0.25, cx);
+        });
+        let agents_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_draw_agents(true, cx);
+        });
+        let agents_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_draw_agents(false, cx);
+        });
+        let food_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_draw_food(true, cx);
+        });
+        let food_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_draw_food(false, cx);
+        });
+        let outline_on = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_agent_outline(true, cx);
+        });
+        let outline_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_agent_outline(false, cx);
+        });
+        let follow_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_follow_mode(FollowMode::Off, cx);
+        });
+        let follow_selected = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_follow_mode(FollowMode::Selected, cx);
+        });
+        let follow_oldest = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_follow_mode(FollowMode::Oldest, cx);
+        });
+        let spawn_crossover = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.spawn_crossover_agent(cx);
+        });
+        let spawn_carnivore = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.spawn_agent_with_tendency(0.0, cx);
+        });
+        let spawn_herbivore = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.spawn_agent_with_tendency(1.0, cx);
+        });
+        let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_world_closed(true, cx);
+        });
+        let open_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_world_closed(false, cx);
+        });
+
+        let style_toggle = |button: Div, active: bool| {
+            if active {
+                button
+                    .border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a5f))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                button
+                    .border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let pause_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::ToggleSimulationPause)
+            .cloned()
+            .unwrap_or_default();
+        let slower_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::DecreaseSimulationSpeed)
+            .cloned()
+            .unwrap_or_default();
+        let faster_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::IncreaseSimulationSpeed)
+            .cloned()
+            .unwrap_or_default();
+        let draw_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::ToggleAgentDraw)
+            .cloned()
+            .unwrap_or_default();
+        let food_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::ToggleFoodOverlay)
+            .cloned()
+            .unwrap_or_default();
+        let outline_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::ToggleAgentOutline)
+            .cloned()
+            .unwrap_or_default();
+        let crossover_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::AddCrossoverAgents)
+            .cloned()
+            .unwrap_or_default();
+        let carnivore_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::SpawnCarnivore)
+            .cloned()
+            .unwrap_or_default();
+        let herbivore_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::SpawnHerbivore)
+            .cloned()
+            .unwrap_or_default();
+        let closed_binding = self
+            .bindings
+            .map
+            .get(&CommandAction::ToggleClosedEnvironment)
+            .cloned()
+            .unwrap_or_default();
+
+        let run_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Run")
+                .on_mouse_down(MouseButton::Left, run_listener),
+            !controls.paused,
+        );
+        let pause_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!("Pause ({})", format_keystroke(&pause_binding)))
+                .on_mouse_down(MouseButton::Left, pause_listener),
+            controls.paused,
+        );
+
+        let slower_button = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .text_color(rgb(0xcbd5f5))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .child(format!("– ({})", format_keystroke(&slower_binding)))
+            .on_mouse_down(MouseButton::Left, slower_listener);
+        let faster_button = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .text_color(rgb(0xcbd5f5))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .child(format!("+ ({})", format_keystroke(&faster_binding)))
+            .on_mouse_down(MouseButton::Left, faster_listener);
+
+        let agents_on_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Agents ON")
+                .on_mouse_down(MouseButton::Left, agents_on),
+            controls.draw_agents,
+        );
+        let agents_off_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!("Agents OFF ({})", format_keystroke(&draw_binding)))
+                .on_mouse_down(MouseButton::Left, agents_off),
+            !controls.draw_agents,
+        );
+
+        let food_on_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Food ON")
+                .on_mouse_down(MouseButton::Left, food_on),
+            controls.draw_food,
+        );
+        let food_off_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!("Food OFF ({})", format_keystroke(&food_binding)))
+                .on_mouse_down(MouseButton::Left, food_off),
+            !controls.draw_food,
+        );
+
+        let outline_on_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Outline ON")
+                .on_mouse_down(MouseButton::Left, outline_on),
+            controls.agent_outline,
+        );
+        let outline_off_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!(
+                    "Outline OFF ({})",
+                    format_keystroke(&outline_binding)
+                ))
+                .on_mouse_down(MouseButton::Left, outline_off),
+            !controls.agent_outline,
+        );
+
+        let follow_off_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Follow OFF")
+                .on_mouse_down(MouseButton::Left, follow_off),
+            matches!(controls.follow_mode, FollowMode::Off),
+        );
+        let follow_selected_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Follow selected")
+                .on_mouse_down(MouseButton::Left, follow_selected),
+            matches!(controls.follow_mode, FollowMode::Selected),
+        );
+        let follow_oldest_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Follow oldest")
+                .on_mouse_down(MouseButton::Left, follow_oldest),
+            matches!(controls.follow_mode, FollowMode::Oldest),
+        );
+
+        let spawn_row = div().flex().gap_2().children(vec![
+            div()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x111b2b))
+                .text_color(rgb(0xcbd5f5))
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!(
+                    "Crossover ({})",
+                    format_keystroke(&crossover_binding)
+                ))
+                .on_mouse_down(MouseButton::Left, spawn_crossover),
+            div()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x111b2b))
+                .text_color(rgb(0xcbd5f5))
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!(
+                    "Carnivore ({})",
+                    format_keystroke(&carnivore_binding)
+                ))
+                .on_mouse_down(MouseButton::Left, spawn_carnivore),
+            div()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x111b2b))
+                .text_color(rgb(0xcbd5f5))
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!(
+                    "Herbivore ({})",
+                    format_keystroke(&herbivore_binding)
+                ))
+                .on_mouse_down(MouseButton::Left, spawn_herbivore),
+        ]);
+
+        let closed_on_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Closed ON")
+                .on_mouse_down(MouseButton::Left, close_world),
+            snapshot.is_closed,
+        );
+        let closed_off_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(format!(
+                    "Closed OFF ({})",
+                    format_keystroke(&closed_binding)
+                ))
+                .on_mouse_down(MouseButton::Left, open_world),
+            !snapshot.is_closed,
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Simulation controls"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .children(vec![run_button, pause_button]),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child(format!("Speed {:.2}×", controls.speed_multiplier)),
+                    )
+                    .child(slower_button)
+                    .child(faster_button),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .children(vec![agents_on_button, agents_off_button]),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .children(vec![food_on_button, food_off_button]),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .children(vec![outline_on_button, outline_off_button]),
+            )
+            .child(div().flex().gap_2().children(vec![
+                follow_off_button,
+                follow_selected_button,
+                follow_oldest_button,
+            ]))
+            .child(spawn_row)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .children(vec![closed_off_button, closed_on_button]),
             )
     }
 
@@ -1845,6 +3496,37 @@ impl SimulationView {
             "Zoom {:.2}× • Pan ({:.0}, {:.0})",
             camera.zoom, camera.offset_px.0, camera.offset_px.1
         ));
+        lines.push(format!(
+            "Simulation {} · speed {:.2}×",
+            if snapshot.controls.paused {
+                "Paused"
+            } else {
+                "Running"
+            },
+            snapshot.controls.speed_multiplier
+        ));
+        lines.push(format!(
+            "Draw agents {} · food {}",
+            if snapshot.controls.draw_agents {
+                "ON"
+            } else {
+                "OFF"
+            },
+            if snapshot.controls.draw_food {
+                "ON"
+            } else {
+                "OFF"
+            }
+        ));
+        lines.push(format!(
+            "Outline {}",
+            if snapshot.controls.agent_outline {
+                "ON"
+            } else {
+                "OFF"
+            }
+        ));
+        lines.push(snapshot.controls.follow_mode.label().to_string());
 
         let inspector = &snapshot.inspector;
         if let Some(focus_id) = inspector.focus_id {
@@ -1868,6 +3550,24 @@ impl SimulationView {
                 "OFF"
             }
         ));
+
+        if self.debug.enabled {
+            lines.push(format!(
+                "Debug overlay ON · velocity {} · sense {}",
+                if self.debug.show_velocity {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+                if self.debug.show_sense_radius {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            ));
+        } else {
+            lines.push("Debug overlay OFF".to_string());
+        }
         lines.push(format!(
             "Persistence {} · interval {}",
             if inspector.persistence_enabled {
@@ -1883,6 +3583,36 @@ impl SimulationView {
         ));
         if let Some(action) = self.key_capture {
             lines.push(format!("Rebinding {}...", action.label()));
+        }
+
+        if self.shift_inspect {
+            if let Some(hover) = inspector.hovered.as_ref() {
+                lines.push(format!(
+                    "Inspect {} · E {:.2} · H {:.2} · Age {} · Gen {}",
+                    hover.label, hover.energy, hover.health, hover.age, hover.generation.0
+                ));
+            } else if let Some(detail) = inspector.focused.as_ref() {
+                lines.push(format!(
+                    "Inspect {:?} · E {:.2} · H {:.2} · Age {} · Gen {}",
+                    detail.agent_id, detail.energy, detail.health, detail.age, detail.generation.0
+                ));
+                if let Some((best_idx, best_value)) = detail
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+                {
+                    lines.push(format!(
+                        "Outputs max [{}]={:.2} · Mutation {:.3}/{:.3}",
+                        best_idx,
+                        best_value,
+                        detail.mutation_rates.primary,
+                        detail.mutation_rates.secondary
+                    ));
+                }
+            } else {
+                lines.push("Inspect overlay active (no agent)".to_string());
+            }
         }
 
         let playback = self.playback.status();
@@ -2192,6 +3922,7 @@ impl Render for SimulationView {
             }));
 
         let perf_snapshot = self.perf.end_frame();
+        self.last_perf = perf_snapshot;
 
         #[cfg(feature = "audio")]
         self.update_audio(&snapshot);
@@ -2213,6 +3944,8 @@ struct HudSnapshot {
     recent_history: Vec<HudHistoryEntry>,
     render_frame: Option<RenderFrame>,
     inspector: InspectorSnapshot,
+    controls: ControlsSnapshot,
+    perf: PerfSnapshot,
 }
 
 #[derive(Clone)]
@@ -2370,6 +4103,12 @@ struct MetricBadgeState {
 }
 
 #[derive(Clone, Copy)]
+struct HeaderBadgeState {
+    phase: f32,
+    palette: ColorPaletteMode,
+}
+
+#[derive(Clone, Copy)]
 struct DebugOverlayState {
     enabled: bool,
     show_velocity: bool,
@@ -2384,6 +4123,70 @@ impl Default for DebugOverlayState {
             show_sense_radius: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum FollowMode {
+    #[default]
+    Off,
+    Selected,
+    Oldest,
+}
+
+impl FollowMode {
+    fn label(self) -> &'static str {
+        match self {
+            FollowMode::Off => "Follow off",
+            FollowMode::Selected => "Follow selected",
+            FollowMode::Oldest => "Follow oldest",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SimulationControls {
+    paused: bool,
+    draw_agents: bool,
+    draw_food: bool,
+    speed_multiplier: f32,
+    follow_mode: FollowMode,
+    agent_outline: bool,
+}
+
+impl Default for SimulationControls {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            draw_agents: true,
+            draw_food: true,
+            speed_multiplier: 1.0,
+            follow_mode: FollowMode::Off,
+            agent_outline: false,
+        }
+    }
+}
+
+impl SimulationControls {
+    fn snapshot(&self) -> ControlsSnapshot {
+        ControlsSnapshot {
+            paused: self.paused,
+            draw_agents: self.draw_agents,
+            draw_food: self.draw_food,
+            speed_multiplier: self.speed_multiplier,
+            follow_mode: self.follow_mode,
+            agent_outline: self.agent_outline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ControlsSnapshot {
+    paused: bool,
+    draw_agents: bool,
+    draw_food: bool,
+    speed_multiplier: f32,
+    follow_mode: FollowMode,
+    agent_outline: bool,
 }
 
 fn sparkline_from_history<F>(history: &[HudHistoryEntry], map: F) -> Option<SparklineSeries>
@@ -2485,6 +4288,33 @@ struct InspectorSnapshot {
     persistence_enabled: bool,
     persistence_interval: u32,
     persistence_cached_interval: u32,
+}
+
+#[derive(Clone)]
+struct SelectionEvent {
+    tick: u64,
+    kind: SelectionEventKind,
+    total_selected: usize,
+    sample_ids: Vec<AgentId>,
+}
+
+#[derive(Clone, Copy)]
+enum SelectionEventKind {
+    Clear,
+    SelectAll,
+    Click,
+    Focus,
+}
+
+impl SelectionEventKind {
+    fn label(&self) -> &'static str {
+        match self {
+            SelectionEventKind::Clear => "Cleared",
+            SelectionEventKind::SelectAll => "Selected all",
+            SelectionEventKind::Click => "Selection changed",
+            SelectionEventKind::Focus => "Focus updated",
+        }
+    }
 }
 
 impl InspectorSnapshot {
@@ -2605,6 +4435,22 @@ enum CommandAction {
     ToggleBrush,
     ToggleNarration,
     CyclePalette,
+    ToggleSimulationPause,
+    ToggleAgentDraw,
+    ToggleFoodOverlay,
+    ToggleAgentOutline,
+    IncreaseSimulationSpeed,
+    DecreaseSimulationSpeed,
+    AddCrossoverAgents,
+    SpawnCarnivore,
+    SpawnHerbivore,
+    ToggleClosedEnvironment,
+    FollowSelected,
+    FollowOldest,
+    ToggleDebugOverlay,
+    ClearSelection,
+    SelectAll,
+    FocusFirstSelected,
 }
 
 impl CommandAction {
@@ -2615,6 +4461,22 @@ impl CommandAction {
             CommandAction::ToggleBrush => "Toggle brush",
             CommandAction::ToggleNarration => "Toggle narration",
             CommandAction::CyclePalette => "Cycle palette",
+            CommandAction::ToggleSimulationPause => "Toggle simulation pause",
+            CommandAction::ToggleAgentDraw => "Toggle agent drawing",
+            CommandAction::ToggleFoodOverlay => "Toggle food overlay",
+            CommandAction::ToggleAgentOutline => "Toggle agent outline",
+            CommandAction::IncreaseSimulationSpeed => "Increase simulation speed",
+            CommandAction::DecreaseSimulationSpeed => "Decrease simulation speed",
+            CommandAction::AddCrossoverAgents => "Spawn crossover agent",
+            CommandAction::SpawnCarnivore => "Spawn carnivore",
+            CommandAction::SpawnHerbivore => "Spawn herbivore",
+            CommandAction::ToggleClosedEnvironment => "Toggle closed environment",
+            CommandAction::FollowSelected => "Follow selected agent",
+            CommandAction::FollowOldest => "Follow oldest agent",
+            CommandAction::ToggleDebugOverlay => "Toggle debug overlay",
+            CommandAction::ClearSelection => "Clear selection",
+            CommandAction::SelectAll => "Select all agents",
+            CommandAction::FocusFirstSelected => "Focus first selected agent",
         }
     }
 }
@@ -2645,7 +4507,71 @@ impl Default for InputBindings {
         );
         map.insert(
             CommandAction::CyclePalette,
+            Keystroke::parse("ctrl+p").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleSimulationPause,
             Keystroke::parse("p").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleAgentDraw,
+            Keystroke::parse("d").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleFoodOverlay,
+            Keystroke::parse("f").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleAgentOutline,
+            Keystroke::parse("ctrl+shift+o").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::IncreaseSimulationSpeed,
+            Keystroke::parse("shift+=").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::DecreaseSimulationSpeed,
+            Keystroke::parse("-").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::AddCrossoverAgents,
+            Keystroke::parse("a").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::SpawnCarnivore,
+            Keystroke::parse("q").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::SpawnHerbivore,
+            Keystroke::parse("h").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleClosedEnvironment,
+            Keystroke::parse("c").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::FollowSelected,
+            Keystroke::parse("s").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::FollowOldest,
+            Keystroke::parse("o").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ToggleDebugOverlay,
+            Keystroke::parse("shift+f").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::ClearSelection,
+            Keystroke::parse("escape").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::SelectAll,
+            Keystroke::parse("ctrl+a").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::FocusFirstSelected,
+            Keystroke::parse("ctrl+f").unwrap_or_default(),
         );
         Self { map }
     }
@@ -2973,7 +4899,7 @@ fn generate_tone(frequency: f32, duration: f32, amplitude: f32) -> StaticSoundDa
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct PerfSnapshot {
     latest_ms: f32,
     average_ms: f32,
@@ -2981,6 +4907,19 @@ struct PerfSnapshot {
     max_ms: f32,
     sample_count: usize,
     fps: f32,
+}
+
+impl Default for PerfSnapshot {
+    fn default() -> Self {
+        Self {
+            latest_ms: 0.0,
+            average_ms: 0.0,
+            min_ms: 0.0,
+            max_ms: 0.0,
+            sample_count: 0,
+            fps: 0.0,
+        }
+    }
 }
 
 struct PerfStats {
@@ -3221,6 +5160,7 @@ struct RenderFrame {
     food_max: f32,
     agents: Vec<AgentRenderData>,
     agent_base_radius: f32,
+    sense_radius: f32,
     post_stack: PostProcessStack,
     palette: ColorPaletteMode,
 }
@@ -3338,6 +5278,7 @@ struct AgentRenderData {
     spike_length: f32,
     velocity: Velocity,
     health: f32,
+    age: u32,
     selection: SelectionState,
     indicator: IndicatorState,
     spiked: bool,
@@ -3349,7 +5290,9 @@ struct CanvasState {
     frame: RenderFrame,
     camera: Arc<Mutex<CameraState>>,
     focus_agent: Option<AgentId>,
+    controls: ControlsSnapshot,
     debug: DebugOverlayState,
+    follow_target: Option<Position>,
 }
 
 impl RenderFrame {
@@ -3371,6 +5314,7 @@ impl RenderFrame {
         let spikes = columns.spike_lengths();
         let healths = columns.health();
         let velocities = columns.velocities();
+        let ages = columns.ages();
 
         let agents = arena
             .iter_handles()
@@ -3389,6 +5333,7 @@ impl RenderFrame {
                     spike_length: spikes[idx],
                     velocity: velocities[idx],
                     health: healths[idx],
+                    age: ages[idx],
                     selection,
                     indicator,
                     spiked,
@@ -3410,6 +5355,7 @@ impl RenderFrame {
             food_max: config.food_max,
             agents,
             agent_base_radius: (config.spike_radius * 0.5).max(12.0),
+            sense_radius: config.sense_radius,
             post_stack: build_post_process_stack(world, palette),
             palette,
         })
@@ -3912,6 +5858,26 @@ impl CameraState {
         self.last_scale = base_scale * self.zoom;
     }
 
+    fn center_on(&mut self, position: Position) {
+        let scale = self.last_base_scale * self.zoom;
+        if !scale.is_finite() || scale <= f32::EPSILON {
+            return;
+        }
+
+        let center_x = self.last_canvas_origin.0 + self.last_canvas_size.0 * 0.5;
+        let center_y = self.last_canvas_origin.1 + self.last_canvas_size.1 * 0.5;
+        let pad_x = (self.last_canvas_size.0 - self.last_world_size.0 * scale) * 0.5;
+        let pad_y = (self.last_canvas_size.1 - self.last_world_size.1 * scale) * 0.5;
+
+        let world_screen_x =
+            self.last_canvas_origin.0 + pad_x + self.offset_px.0 + position.x * scale;
+        let world_screen_y =
+            self.last_canvas_origin.1 + pad_y + self.offset_px.1 + position.y * scale;
+
+        self.offset_px.0 += center_x - world_screen_x;
+        self.offset_px.1 += center_y - world_screen_y;
+    }
+
     fn screen_to_world(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
         let scale = self.last_scale;
         if scale <= f32::EPSILON {
@@ -4233,6 +6199,55 @@ fn paint_metric_badge(bounds: Bounds<Pixels>, state: MetricBadgeState, window: &
     window.paint_quad(fill(bar_bounds, Background::from(bar_color)));
 }
 
+fn paint_header_badge(bounds: Bounds<Pixels>, state: HeaderBadgeState, window: &mut Window) {
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let cx = f32::from(origin.x) + f32::from(size.width) * 0.5;
+    let cy = f32::from(origin.y) + f32::from(size.height) * 0.5;
+    let radius = f32::from(size.width.min(size.height)) * 0.5 - 1.5;
+
+    let base = apply_palette(rgba_from_hex(0x0f172a, 1.0), state.palette);
+    window.paint_quad(fill(bounds, Background::from(base)));
+
+    let phase = state.phase;
+    let glow_radius = radius * 0.9;
+    for i in 0..5 {
+        let t = i as f32 / 5.0;
+        let angle = phase + t * std::f32::consts::TAU;
+        let px = cx + angle.cos() * glow_radius;
+        let py = cy + angle.sin() * glow_radius;
+        let orb_radius = 6.0 + (angle.sin() * 2.0);
+        let mut orb = PathBuilder::fill();
+        append_circle_polygon(&mut orb, px, py, orb_radius);
+        if let Ok(path) = orb.build() {
+            let color = apply_palette(rgba_from_hex(0x60a5fa, 0.18 + t * 0.2), state.palette);
+            window.paint_path(path, color);
+        }
+    }
+
+    let mut ring = PathBuilder::stroke(px(3.0));
+    append_arc_polyline(&mut ring, cx, cy, radius, 0.0, 360.0);
+    if let Ok(path) = ring.build() {
+        let ring_color = apply_palette(rgba_from_hex(0x38bdf8, 0.85), state.palette);
+        window.paint_path(path, ring_color);
+    }
+
+    let mut inner = PathBuilder::fill();
+    append_circle_polygon(&mut inner, cx, cy, radius * 0.55);
+    if let Ok(path) = inner.build() {
+        let inner_color = apply_palette(rgba_from_hex(0x1d4ed8, 0.5), state.palette);
+        window.paint_path(path, inner_color);
+    }
+
+    let mut pulse = PathBuilder::stroke(px(1.6));
+    let sweep = 140.0 + (phase.sin() + 1.0) * 100.0;
+    append_arc_polyline(&mut pulse, cx, cy, radius * 0.68, -sweep * 0.5, sweep);
+    if let Ok(path) = pulse.build() {
+        let pulse_color = apply_palette(rgba_from_hex(0xfacc15, 0.75), state.palette);
+        window.paint_path(path, pulse_color);
+    }
+}
+
 fn apply_post_processing(
     stack: &PostProcessStack,
     palette: ColorPaletteMode,
@@ -4417,11 +6432,106 @@ fn hashed_noise(seed: u64, row: u64, col: u64) -> f32 {
     (value as f64 / u64::MAX as f64) as f32
 }
 
+fn paint_debug_overlays(
+    frame: &RenderFrame,
+    focus_agent: Option<AgentId>,
+    debug: DebugOverlayState,
+    offset_x: f32,
+    offset_y: f32,
+    scale: f32,
+    window: &mut Window,
+) {
+    if !debug.enabled {
+        return;
+    }
+
+    for agent in &frame.agents {
+        let px_x = offset_x + agent.position.x * scale;
+        let px_y = offset_y + agent.position.y * scale;
+
+        if debug.show_sense_radius
+            && frame.sense_radius > 0.0
+            && matches!(
+                agent.selection,
+                SelectionState::Selected | SelectionState::Hovered
+            )
+        {
+            let radius_px = (frame.sense_radius * scale).max(4.0);
+            let mut circle = PathBuilder::stroke(px(1.4));
+            append_arc_polyline(&mut circle, px_x, px_y, radius_px, 0.0, 360.0);
+            if let Ok(path) = circle.build() {
+                window.paint_path(path, rgba_from_hex(0x38bdf8, 0.35));
+            }
+        }
+
+        if debug.show_velocity {
+            let vx = agent.velocity.vx;
+            let vy = agent.velocity.vy;
+            let speed = (vx * vx + vy * vy).sqrt();
+            if speed > 1e-3 {
+                let norm_x = vx / speed;
+                let norm_y = vy / speed;
+                let min_length = (frame.agent_base_radius * 1.5).max(8.0) * scale;
+                let dynamic_length = (speed * frame.sense_radius)
+                    .clamp(frame.agent_base_radius, frame.sense_radius * 1.5)
+                    * scale;
+                let arrow_length = dynamic_length.max(min_length);
+                let tip_x = px_x + norm_x * arrow_length;
+                let tip_y = px_y + norm_y * arrow_length;
+
+                let mut shaft = PathBuilder::stroke(px(1.6));
+                shaft.move_to(point(px(px_x), px(px_y)));
+                shaft.line_to(point(px(tip_x), px(tip_y)));
+                if let Ok(path) = shaft.build() {
+                    window.paint_path(path, rgba_from_hex(0x22d3ee, 0.85));
+                }
+
+                let head_size = (arrow_length * 0.18).clamp(4.0, 14.0);
+                let angle = vy.atan2(vx);
+                let left_angle = angle + PI - 0.5;
+                let right_angle = angle + PI + 0.5;
+
+                let left_point = point(
+                    px(tip_x + head_size * left_angle.cos()),
+                    px(tip_y + head_size * left_angle.sin()),
+                );
+                let right_point = point(
+                    px(tip_x + head_size * right_angle.cos()),
+                    px(tip_y + head_size * right_angle.sin()),
+                );
+
+                let mut head = PathBuilder::stroke(px(1.2));
+                head.move_to(point(px(tip_x), px(tip_y)));
+                head.line_to(left_point);
+                head.move_to(point(px(tip_x), px(tip_y)));
+                head.line_to(right_point);
+                if let Ok(path) = head.build() {
+                    window.paint_path(path, rgba_from_hex(0xe0f2fe, 0.78));
+                }
+            }
+        }
+
+        if Some(agent.agent_id) == focus_agent {
+            let cross = (frame.agent_base_radius * scale).max(6.0);
+            let mut crosshair = PathBuilder::stroke(px(1.6));
+            crosshair.move_to(point(px(px_x - cross), px(px_y)));
+            crosshair.line_to(point(px(px_x + cross), px(px_y)));
+            crosshair.move_to(point(px(px_x), px(px_y - cross)));
+            crosshair.line_to(point(px(px_x), px(px_y + cross)));
+            if let Ok(path) = crosshair.build() {
+                window.paint_path(path, rgba_from_hex(0xfacc15, 0.9));
+            }
+        }
+    }
+}
+
 fn paint_frame(
     frame: &RenderFrame,
     camera: &Arc<Mutex<CameraState>>,
     focus_agent: Option<AgentId>,
+    controls: ControlsSnapshot,
     debug: DebugOverlayState,
+    follow_target: Option<Position>,
     bounds: Bounds<Pixels>,
     window: &mut Window,
 ) {
@@ -4451,6 +6561,11 @@ fn paint_frame(
         frame.world_size,
         base_scale,
     );
+    if controls.follow_mode != FollowMode::Off {
+        if let Some(target) = follow_target {
+            camera_guard.center_on(target);
+        }
+    }
     drop(camera_guard);
 
     let day_phase = frame.tick as f32 * 0.00025;
@@ -4510,151 +6625,169 @@ fn paint_frame(
     let cell_px = (cell_world * scale).max(1.0);
     let max_food = frame.food_max.max(f32::EPSILON);
 
-    for y in 0..food_h {
-        for x in 0..food_w {
-            let idx = y * food_w + x;
-            let value = frame.food_cells.get(idx).copied().unwrap_or_default();
-            if value <= 0.001 {
-                continue;
+    if controls.draw_food {
+        for y in 0..food_h {
+            for x in 0..food_w {
+                let idx = y * food_w + x;
+                let value = frame.food_cells.get(idx).copied().unwrap_or_default();
+                if value <= 0.001 {
+                    continue;
+                }
+                let intensity = (value / max_food).clamp(0.0, 1.0);
+                let mut color = food_color(intensity);
+                let shade_wave =
+                    ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
+                let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
+                color = scale_rgb(color, shade);
+                color = apply_palette(color, frame.palette);
+                let px_x = offset_x + (x as f32 * cell_world * scale);
+                let px_y = offset_y + (y as f32 * cell_world * scale);
+                let cell_bounds =
+                    Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
+                window.paint_quad(fill(cell_bounds, Background::from(color)));
             }
-            let intensity = (value / max_food).clamp(0.0, 1.0);
-            let mut color = food_color(intensity);
-            let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
-            let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
-            color = scale_rgb(color, shade);
-            color = apply_palette(color, frame.palette);
-            let px_x = offset_x + (x as f32 * cell_world * scale);
-            let px_y = offset_y + (y as f32 * cell_world * scale);
-            let cell_bounds =
-                Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
-            window.paint_quad(fill(cell_bounds, Background::from(color)));
         }
     }
 
-    for agent in &frame.agents {
-        let px_x = offset_x + agent.position.x * scale;
-        let px_y = offset_y + agent.position.y * scale;
-        let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
-        let size_px = (dynamic_radius * scale).max(2.0);
-        let half = size_px * 0.5;
+    if controls.draw_agents {
+        for agent in &frame.agents {
+            let px_x = offset_x + agent.position.x * scale;
+            let px_y = offset_y + agent.position.y * scale;
+            let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
+            let size_px = (dynamic_radius * scale).max(2.0);
+            let half = size_px * 0.5;
 
-        let mut highlight_layers: Vec<(f32, Rgba)> = Vec::new();
-        match agent.selection {
-            SelectionState::Selected => highlight_layers.push((
-                1.8,
-                apply_palette(
+            let mut highlight_layers: Vec<(f32, Rgba)> = Vec::new();
+            match agent.selection {
+                SelectionState::Selected => highlight_layers.push((
+                    1.8,
+                    apply_palette(
+                        Rgba {
+                            r: 0.20,
+                            g: 0.65,
+                            b: 0.96,
+                            a: 0.35,
+                        },
+                        frame.palette,
+                    ),
+                )),
+                SelectionState::Hovered => highlight_layers.push((
+                    1.4,
+                    apply_palette(
+                        Rgba {
+                            r: 0.92,
+                            g: 0.58,
+                            b: 0.20,
+                            a: 0.30,
+                        },
+                        frame.palette,
+                    ),
+                )),
+                SelectionState::None => {}
+            }
+
+            if focus_agent == Some(agent.agent_id) {
+                highlight_layers.push((
+                    2.05,
+                    apply_palette(
+                        Rgba {
+                            r: 0.45,
+                            g: 0.88,
+                            b: 0.97,
+                            a: 0.32,
+                        },
+                        frame.palette,
+                    ),
+                ));
+            }
+
+            for (factor, highlight) in highlight_layers {
+                let highlight_size = size_px * factor;
+                let highlight_half = highlight_size * 0.5;
+                let highlight_bounds = Bounds::new(
+                    point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                    size(px(highlight_size), px(highlight_size)),
+                );
+                window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+            }
+
+            if controls.agent_outline {
+                let outline_radius = (size_px * 0.55).max(3.0);
+                let mut outline = PathBuilder::stroke(px(1.8));
+                append_arc_polyline(&mut outline, px_x, px_y, outline_radius, 0.0, 360.0);
+                if let Ok(path) = outline.build() {
+                    window.paint_path(path, rgba_from_hex(0xffffff, 0.35));
+                }
+            }
+
+            if agent.indicator.intensity > 0.05 {
+                let effect = agent.indicator.intensity.clamp(0.0, 1.0);
+                let indicator_size = size_px * (1.2 + effect * 1.4);
+                let indicator_half = indicator_size * 0.5;
+                let indicator_bounds = Bounds::new(
+                    point(px(px_x - indicator_half), px(px_y - indicator_half)),
+                    size(px(indicator_size), px(indicator_size)),
+                );
+                let indicator_color = apply_palette(
+                    rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect),
+                    frame.palette,
+                );
+                window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
+            }
+
+            if agent.reproduction_intent > 0.2 {
+                let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
+                let pulse_size = size_px * (1.8 + pulse * 1.6);
+                let pulse_half = pulse_size * 0.5;
+                let pulse_bounds = Bounds::new(
+                    point(px(px_x - pulse_half), px(px_y - pulse_half)),
+                    size(px(pulse_size), px(pulse_size)),
+                );
+                let pulse_color = apply_palette(
                     Rgba {
-                        r: 0.20,
-                        g: 0.65,
-                        b: 0.96,
-                        a: 0.35,
+                        r: 0.88,
+                        g: 0.36,
+                        b: 0.86,
+                        a: 0.18 + 0.28 * pulse,
                     },
                     frame.palette,
-                ),
-            )),
-            SelectionState::Hovered => highlight_layers.push((
-                1.4,
-                apply_palette(
+                );
+                window.paint_quad(fill(pulse_bounds, Background::from(pulse_color)));
+            }
+
+            if agent.spiked {
+                let spike_size = size_px * 2.2;
+                let spike_half = spike_size * 0.5;
+                let spike_bounds = Bounds::new(
+                    point(px(px_x - spike_half), px(px_y - spike_half)),
+                    size(px(spike_size), px(spike_size)),
+                );
+                let spike_color = apply_palette(
                     Rgba {
-                        r: 0.92,
-                        g: 0.58,
-                        b: 0.20,
-                        a: 0.30,
+                        r: 0.95,
+                        g: 0.25,
+                        b: 0.35,
+                        a: 0.28,
                     },
                     frame.palette,
-                ),
-            )),
-            SelectionState::None => {}
-        }
+                );
+                window.paint_quad(fill(spike_bounds, Background::from(spike_color)));
+            }
 
-        if focus_agent == Some(agent.agent_id) {
-            highlight_layers.push((
-                2.05,
-                apply_palette(
-                    Rgba {
-                        r: 0.45,
-                        g: 0.88,
-                        b: 0.97,
-                        a: 0.32,
-                    },
-                    frame.palette,
-                ),
-            ));
+            let agent_bounds = Bounds::new(
+                point(px(px_x - half), px(px_y - half)),
+                size(px(size_px), px(size_px)),
+            );
+            let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
+            let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
+            let mut color = agent_color(agent, agent_shade);
+            color = apply_palette(color, frame.palette);
+            window.paint_quad(fill(agent_bounds, Background::from(color)));
         }
+    }
 
-        for (factor, highlight) in highlight_layers {
-            let highlight_size = size_px * factor;
-            let highlight_half = highlight_size * 0.5;
-            let highlight_bounds = Bounds::new(
-                point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                size(px(highlight_size), px(highlight_size)),
-            );
-            window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
-        }
-
-        if agent.indicator.intensity > 0.05 {
-            let effect = agent.indicator.intensity.clamp(0.0, 1.0);
-            let indicator_size = size_px * (1.2 + effect * 1.4);
-            let indicator_half = indicator_size * 0.5;
-            let indicator_bounds = Bounds::new(
-                point(px(px_x - indicator_half), px(px_y - indicator_half)),
-                size(px(indicator_size), px(indicator_size)),
-            );
-            let indicator_color = apply_palette(
-                rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect),
-                frame.palette,
-            );
-            window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
-        }
-
-        if agent.reproduction_intent > 0.2 {
-            let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
-            let pulse_size = size_px * (1.8 + pulse * 1.6);
-            let pulse_half = pulse_size * 0.5;
-            let pulse_bounds = Bounds::new(
-                point(px(px_x - pulse_half), px(px_y - pulse_half)),
-                size(px(pulse_size), px(pulse_size)),
-            );
-            let pulse_color = apply_palette(
-                Rgba {
-                    r: 0.88,
-                    g: 0.36,
-                    b: 0.86,
-                    a: 0.18 + 0.28 * pulse,
-                },
-                frame.palette,
-            );
-            window.paint_quad(fill(pulse_bounds, Background::from(pulse_color)));
-        }
-
-        if agent.spiked {
-            let spike_size = size_px * 2.2;
-            let spike_half = spike_size * 0.5;
-            let spike_bounds = Bounds::new(
-                point(px(px_x - spike_half), px(px_y - spike_half)),
-                size(px(spike_size), px(spike_size)),
-            );
-            let spike_color = apply_palette(
-                Rgba {
-                    r: 0.95,
-                    g: 0.25,
-                    b: 0.35,
-                    a: 0.28,
-                },
-                frame.palette,
-            );
-            window.paint_quad(fill(spike_bounds, Background::from(spike_color)));
-        }
-
-        let agent_bounds = Bounds::new(
-            point(px(px_x - half), px(px_y - half)),
-            size(px(size_px), px(size_px)),
-        );
-        let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
-        let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-        let mut color = agent_color(agent, agent_shade);
-        color = apply_palette(color, frame.palette);
-        window.paint_quad(fill(agent_bounds, Background::from(color)));
+    if controls.draw_agents {
+        paint_debug_overlays(frame, focus_agent, debug, offset_x, offset_y, scale, window);
     }
 
     apply_post_processing(

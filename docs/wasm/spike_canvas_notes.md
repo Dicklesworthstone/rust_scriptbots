@@ -32,6 +32,12 @@ _Created: 2025-10-22 (UTC)_
    - Record FPS (5k/10k/20k agents) for Chrome 139, Edge 139, Safari 18 (WebGL fallback).  
    - Note CPU usage and frame budget (goal ≤16.6ms).
 
+## Current Status (2025-10-22)
+- ✅ Prototype scaffolded at `/tmp/canvas-baseline` (vanilla Vite app). Rendering loop draws 10k agents with deterministic `seedrandom` and HUD displaying current FPS.
+- ✅ Local development dependencies installed (`npm install`, `npm install seedrandom`).
+- 🚧 Browser-based profiling (Chrome/Edge/Safari) still required to populate `docs/wasm/rendering_metrics_template.csv` and ADR-001. Blocked in headless CLI environment; collect metrics manually on a desktop with the spike served via `npm run dev`.
+- 🚧 Scale tests (20k agents, OffscreenCanvas worker) pending manual execution.
+
 ## Deliverables
 - Update `docs/wasm/adrs/ADR-001-wasm-rendering.md` with Canvas metrics alongside WebGPU results.
 - Store benchmark scripts, config, and captured traces under `spikes/canvas-baseline/metrics/` (outside repo unless approved).

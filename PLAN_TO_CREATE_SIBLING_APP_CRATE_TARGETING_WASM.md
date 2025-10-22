@@ -129,6 +129,8 @@
   - Agents (circles with spike indicator)
   - Basic HUD (population counts)
 - Data flow: `scriptbots-web` exports snapshot structure; JS/WASM renderer paints to `<canvas>` or WebGPU surface.
+- 2025-10-22: WebGPU spike crate compiled outside the repo (`/tmp/scriptbots-webgpu-proto`); ready for browser benchmarking once hosted locally. FPS/GPU metrics still pending (blocked in headless CLI—needs manual run on a workstation with Chrome 139 / Safari 26 beta).
+- 2025-10-22: Canvas fallback spike scaffolded at `/tmp/canvas-baseline`; renders 10k agents via Canvas2D. Performance profiling (FPS/CPU) still requires manual browser execution (Chrome 139 / Edge 139 / Safari 18).
 - **Prototype plan (2025-10-22):**
   - Week 1: WebGPU `wgpu` spike — draw 10k agents + grid, measure FPS on Chrome 139 (Windows) and Safari 26 beta (macOS).
   - Week 1: Canvas2D baseline — JS renderer consuming serialized positions to benchmark fallback CPU cost.

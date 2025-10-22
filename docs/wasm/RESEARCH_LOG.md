@@ -11,5 +11,7 @@ _Started: 2025-10-22 (UTC). Append new entries chronologically; include links an
 - **Component model outlook:** Bytecode Alliance roadmap and Rust RFC updates outline WASI Preview 2 progress and `cargo component` tooling; browsers lack component loaders today.citeturn4search0turn4search1turn4search2turn4search3
 - **`getrandom` WebAssembly support:** Requires enabling the `js` feature (pulling in `wasm-bindgen` helpers); otherwise builds fail on `wasm32-unknown-unknown`.citeturn5search7
 - **Cargo target-specific flags:** Use `.cargo/config.toml` or target env vars to override `RUSTFLAGS` per target without touching project manifests.citeturn2search3turn2search4
+- **WebGPU spike crate:** Minimal `wgpu`/`winit` renderer built outside the repo (`/tmp/scriptbots-webgpu-proto`) renders 10k point sprites; release wasm bundle size ≈616 KiB before optimization. Metrics capture still pending.
+- **Canvas fallback spike:** Vite-based prototype (`/tmp/canvas-baseline`) draws 10k agents via Canvas2D with deterministic `seedrandom`; browser metrics will be logged once run on GUI workstation.
 - **WebGPU spike prep:** `wgpu`’s wasm examples (`cargo xtask run-wasm`), Learn WGPU tutorials, and Chrome’s WebGPU guide outline end-to-end browser setup and profiling strategies.citeturn0search0turn0search3turn0search8
 - **Canvas baseline prep:** MDN and Chrome performance docs plus OffscreenCanvas guidance inform batching strategies and worker handoff for Canvas-rendered agents.citeturn1search0turn1search1turn1search2turn1search3

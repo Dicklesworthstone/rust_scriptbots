@@ -119,16 +119,19 @@
 
 ## Visual Polish & Audio Enhancements
 - Rich terrain & backgrounds: integrate a tilemap or overlay renderer such as `wgpu-tilemap` to stream large ground textures efficiently, enabling biomes, paths, and heatmaps without dropping frame rate.citeturn0search0
-- Stylized UI elements: use Vello inside GPUI canvases for high-quality vector icons, rounded panels, and animated HUD elements, giving the interface a modern “game” look while staying GPU-accelerated.citeturn0search4
+- [Completed - GPT-5 Codex 2025-10-22: Terrain elevation now drives downhill momentum/energy costs, with HUD-integrated shading reflecting slopes.]
+- Stylized UI elements: use Vello inside GPUI canvases for high-quality vector icons, rounded panels, and animated HUD elements, giving the interface a modern “game” look while staying GPU-accelerated. [Completed - GPT-5 Codex 2025-10-22: added animated header badge, gradient-styled metric cards, and overlay summaries rendered via GPUI/Vello canvases for consistent theming.]citeturn0search4
 - Particle and lighting effects: reference the `ShadowEngine2D` example for wgpu-driven particles, bloom, and lighting passes, adapting similar shaders to draw energy trails, spike impacts, or weather overlays.citeturn0reddit15
 - Post-processing shaders: batch agent render buffers through compute builders like `cuneus` to add color grading, vignette, or heat shimmer effects without rewriting the entire pipeline.citeturn0reddit18
 - Game-quality audio: adopt the `kira` crate for layered ambient loops, positional effects, and event-driven sound design, using its mixer and timing system to sync audio cues with agent behaviors; expose toggles for audio channels in the GPUI inspector.citeturn2search1turn2search2
-- Accessibility polish: add colorblind-safe palettes and toggleable outline shaders so the simulation remains readable with visual enhancements.
+- Accessibility polish: add colorblind-safe palettes and toggleable outline shaders so the simulation remains readable with visual enhancements. [Completed - GPT-5 Codex 2025-10-22: added HUD inspector overlay toggle (Shift) plus agent outlines and existing palette modes to improve readability.]
+- Procedural sandbox terrain: add an interactive map builder leveraging Wave Function Collapse to synthesize believable topography/biomes with configurable resource strata, oxygen levels, and hazard tuning.
 
 ## Input Mapping and Feature Parity
 - Keyboard:
-  - `P` pause, `D` toggle drawing, `F` show food, `+/-` adjust speed, `A` add crossover agents, `Q/H` spawn carnivore/herbivore, `C` toggle closed environment, `S/O` follow selected/oldest.
+  - `P` pause, `D` toggle drawing, `F` show food, `Ctrl+Shift+O` toggle agent outlines, `+/-` adjust speed, `A` add crossover agents, `Q/H` spawn carnivore/herbivore, `C` toggle closed environment, `S/O` follow selected/oldest.
   - Implement via GPUI action bindings to mutate simulation config entity.
+  - [Completed - GPT-5 Codex 2025-10-22: Holding `Shift` now enables a hover inspector overlay in the HUD for quick agent stats.]
 - Mouse:
   - Right-drag pan, middle-drag zoom, left-click select agent; hold `Shift` to inspect stats overlay.
 - Agent Inspector:
@@ -175,10 +178,10 @@
   - [Completed - GPT-5 Codex 2025-10-22: metabolism ramps & age-based decay wired into actuation/aging with tests] Add energy/aging modifiers (metabolism ramps, age-based decay) to match C++ behavior.
   - [Completed - GPT-5 Codex 2025-10-22: implemented configurable temperature gradients, discomfort drains, and parity tests] Restore environmental temperature mechanics: apply discomfort-based health drain tied to agents' `temperature_preference`, expose configurable gradients, and extend tests covering equator/edge scenarios.
   - [Completed - GPT-5 Codex 2025-10-22: carcass sharing restored with age scaling, energy/reproduction rewards, and persistence metrics] Reintroduce carcass distribution: when an agent dies (especially from spikes), deterministically share meat resources with nearby carnivores/herbivores using the original age-based scaling and ensure persistence metrics capture these events.
-  - [Currently In Progress - GPT-5 Codex 2025-10-22: reconciling food sharing with legacy constant-rate transfer and deterministic ordering] Match food sharing semantics: implement the constant-rate `FOODTRANSFER` giving behavior gated by output 8, include distance checks, and keep deterministic ordering so altruistic strategies mirror the C++ dynamics.
-  - [ ] Reinstate world population seeding: honor the `closed` flag, maintain minimum agent counts, and periodically inject random newcomers or crossover spawns to mirror `addRandomBots`/`addNewByCrossover` scheduling.
-  - [ ] Map output-channel side effects: ease spikes toward requested length, persist `sound_multiplier`/`give_intent`, update indicator pulses on key events, and surface matching config hooks for downstream rendering/audio layers.
-  - [ ] Align locomotion with differential drive physics: interpret outputs[0]/[1] as wheel velocities, derive pose updates/boost scaling from the original formulas, and validate wrapping math against `processOutputs`.
+  - [Completed - GPT-5 Codex 2025-10-22: constant-rate food sharing restored with deterministic ordering and analytics parity] Match food sharing semantics: implement the constant-rate `FOODTRANSFER` giving behavior gated by output 8, include distance checks, and keep deterministic ordering so altruistic strategies mirror the C++ dynamics.
+  - [Completed - GPT-5 Codex 2025-10-22: world population seeding restored with closed-flag enforcement and scheduled spawns] Reinstate world population seeding: honor the `closed` flag, maintain minimum agent counts, and periodically inject random newcomers or crossover spawns to mirror `addRandomBots`/`addNewByCrossover` scheduling.
+  - [Completed - GPT-5 Codex 2025-10-22: output-channel side effects aligned with legacy spike easing, sound multiplier persistence, and indicator pulses] Map output-channel side effects: ease spikes toward requested length, persist `sound_multiplier`/`give_intent`, update indicator pulses on key events, and surface matching config hooks for downstream rendering/audio layers.
+  - [Completed - GPT-5 Codex 2025-10-22: differential drive locomotion aligned with legacy wheel outputs and boost scaling] Align locomotion with differential drive physics: interpret outputs[0]/[1] as wheel velocities, derive pose updates/boost scaling from the original formulas, and validate wrapping math against `processOutputs`.
   - [ ] Port herbivore vs carnivore behaviors: enforce attack restrictions for herbivores, replicate reproduction timers (`REPRATEH/REPRATEC`), and apply diet-based modifiers in food intake and carcass sharing.
   - [ ] Match food consumption math: reuse `FOODINTAKE`, `FOODWASTE`, and speed-dependent gains tied to wheel speeds and herbivore tendency, updating tests to cover stationary vs. fast agents.
   - [ ] Restore modcounter cadence: introduce configurable tick scheduler for aging every 100 ticks, periodic charts/reporting, reproduction gating randomness, and guard against regressions with deterministic seeds.
@@ -236,18 +239,18 @@
 6. **Persistence Layer (Weeks 7-8)**
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Completed - GPT-5 Codex 2025-10-22]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Completed - GPT-5 Codex 2025-10-22]
-7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
+7. **Rendering Layer (Weeks 8-10)** [Completed - GPT-5 Codex 2025-10-22: GPUI stats overlay and controls polished]
 - Build GPUI window, canvas renderer, agent inspector UI. [Completed - GPT-5 Codex 2025-10-22: window shell, HUD, canvas renderer, and inspector panel shipped]
    - Implement camera controls, overlays, history chart. [Completed - GPT-5 Codex 2025-10-22: middle-click pan, scroll zoom, overlay HUD, tick-history chart]
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals. [Completed - GPT-5 Codex 2025-10-22: terrain driven by core layer, velocity-aware vector HUD, palette-aware post FX; follow-up: experiment with GPU shader hooks once GPUI exposes them.]
 8. **Integration & UX Polish (Weeks 10-11)**
-   - Hook actions to simulation, selection workflows, debug overlays. [Currently In Progress - GPT-5 Codex 2025-10-22]
-   - Add metrics HUD, performance counters.
-   - [Currently In Progress - GPT-5 Codex 2025-10-22: Surface brain controls (selection, evolution rates) and storage toggles in the inspector UI.] 
+  - Hook actions to simulation, selection workflows, debug overlays. [Completed - GPT-5 Codex 2025-10-22: left-click/shift multi-select integrated with world runtime, hover highlighting feeds the inspector, selection controls get shortcuts/logging, and the debug overlay now exposes velocity/sense visualisation toggles from the HUD.]
+  - Add metrics HUD, performance counters. [Completed - GPT-5 Codex 2025-10-22: summary grid now includes frame-time/FPS cards backed by rolling PerfStats, plus live simulation state metrics mirrored in the inspector controls.]
+  - [Completed - GPT-5 Codex 2025-10-22: Inspector exposes brain info, mutation rate tuning, and persistence toggles; follow-up: wire actions into shared world event bus.]
   - [Completed - GPT-5 Codex 2025-10-22: Layered `kira` audio cues wired to births/deaths/spikes with accessibility toggles; follow-up: move event capture to shared bus and expand particle sync.]
 9. **Testing, Benchmarks, Packaging (Weeks 11-12)**
    - Determinism/regression suite, `cargo bench`. [Completed - GPT-5 Codex 2025-10-22]
-   - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries. [Currently In Progress - GPT-5 Codex 2025-10-22: blocked until scriptbots-render stabilizes/compiles]
+   - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries. [Completed - GPT-5 Codex 2025-10-22: `cargo dist` workflow now emits platform archives with optional macOS signing and README docs cover the release process; follow-up: add notarization once certificates are in place.]
 
 ## Risks and Mitigations
 - **GPU backend availability**: GPUI is still evolving; focus initial support on macOS/Linux per official guidance, while monitoring upstream platform work.citeturn0search0

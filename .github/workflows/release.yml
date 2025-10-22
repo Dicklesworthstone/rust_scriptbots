@@ -2,6 +2,10 @@ name: release-builds
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.3.0)"
+        required: true
   push:
     tags:
       - "v*"
@@ -13,16 +17,37 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: scriptbots-linux-x86_64
+            target: linux
+            dist-args: "--target x86_64-unknown-linux-gnu"
           - os: macos-latest
-            artifact: scriptbots-macos-universal
+            target: mac-universal
+            dist-args: "--target aarch64-apple-darwin --target x86_64-apple-darwin"
+            extra-targets: "x86_64-apple-darwin"
+            apple: true
           - os: windows-latest
-            artifact: scriptbots-windows-x86_64
+            target: windows
+            dist-args: "--target x86_64-pc-windows-msvc"
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Determine release tag
+        id: release
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "::error::Release tag could not be determined."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -32,29 +57,88 @@ jobs:
           toolchain: stable
           components: clippy,rustfmt
 
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.os }}
-
-      - name: Build release binary
-        run: cargo build --release -p scriptbots-app
-
-      - name: Package artifact
+      - name: Install extra Rust targets
+        if: ${{ matrix.extra-targets != '' }}
         shell: bash
-        run: |
-          OUT_DIR="artifacts/${{ matrix.artifact }}"
-          mkdir -p "${OUT_DIR}"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/release/scriptbots-app.exe "${OUT_DIR}/"
-          else
-            cp target/release/scriptbots-app "${OUT_DIR}/"
-          fi
-          cp README.md "${OUT_DIR}/"
-          tar -czf "${{ matrix.artifact }}.tar.gz" -C artifacts "${{ matrix.artifact }}"
+        run: rustup target add ${{ matrix.extra-targets }}
 
-      - name: Upload artifact
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --locked
+
+      - name: Generate dist manifest
+        run: cargo dist manifest --tag "${{ steps.release.outputs.tag }}" --ci github
+
+      - name: Build release artifacts
+        shell: bash
+        run: cargo dist build ${{ matrix.dist-args }} --artifacts archive --tag "${{ steps.release.outputs.tag }}" --out dist
+
+      - name: Codesign macOS artifacts
+        if: ${{ matrix.apple }}
+        shell: bash
+        env:
+          MACOS_CERT_BASE64: ${{ secrets.MACOS_CERT_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MACOS_CERT_BASE64}" || -z "${MACOS_CERT_PASSWORD}" || -z "${MACOS_SIGNING_IDENTITY}" ]]; then
+            echo "macOS signing secrets not provided; skipping codesign."
+            exit 0
+          fi
+
+          KEYCHAIN="build-signing.keychain"
+          KEYCHAIN_PASSWORD="${MACOS_KEYCHAIN_PASSWORD:-scriptbots}"
+          CERT_P12="signing-cert.p12"
+
+          echo "$MACOS_CERT_BASE64" | base64 --decode > "$CERT_P12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_P12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychain -s "$KEYCHAIN" login.keychain
+
+          for ARCHIVE in dist/*.tar.*; do
+            TMP_DIR=$(mktemp -d)
+            if [[ "$ARCHIVE" == *.tar.xz ]]; then
+              tar -xJf "$ARCHIVE" -C "$TMP_DIR"
+            elif [[ "$ARCHIVE" == *.tar.gz ]]; then
+              tar -xzf "$ARCHIVE" -C "$TMP_DIR"
+            else
+              echo "Skipping unsupported archive format: $ARCHIVE"
+              rm -rf "$TMP_DIR"
+              continue
+            fi
+
+            APP_PATH=$(find "$TMP_DIR" -maxdepth 3 -type d -name "scriptbots-app.app" | head -n 1 || true)
+            if [[ -n "$APP_PATH" ]]; then
+              /usr/bin/codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$APP_PATH"
+              /usr/bin/codesign --verify --deep "$APP_PATH"
+            fi
+
+            BIN_PATH=$(find "$TMP_DIR" -maxdepth 5 -type f -perm -111 -name "scriptbots-app" | head -n 1 || true)
+            if [[ -n "$BIN_PATH" ]]; then
+              /usr/bin/codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$BIN_PATH"
+              /usr/bin/codesign --verify --deep "$BIN_PATH"
+            fi
+
+            rm "$ARCHIVE"
+            (
+              cd "$TMP_DIR"
+              if [[ "$ARCHIVE" == *.tar.xz ]]; then
+                tar -cJf "$OLDPWD/$ARCHIVE" *
+              else
+                tar -czf "$OLDPWD/$ARCHIVE" *
+              fi
+            )
+            rm -rf "$TMP_DIR"
+          done
+
+          security delete-keychain "$KEYCHAIN"
+          rm -f "$CERT_P12"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          name: dist-${{ matrix.target }}
+          path: dist/*
