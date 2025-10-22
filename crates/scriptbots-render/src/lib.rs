@@ -13,7 +13,7 @@ use scriptbots_core::{
 };
 use std::{
     collections::{BTreeMap, VecDeque},
-    f32::consts::PI,
+    f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -1892,10 +1892,10 @@ impl VectorHudState {
                     return ((0.0, 0.0), 0.0, 0.0, 1.0, 0.0);
                 }
 
-                let mut sum_vx = 0.0;
-                let mut sum_vy = 0.0;
-                let mut sum_speed = 0.0;
-                let mut max_speed = 0.0;
+                let mut sum_vx: f32 = 0.0;
+                let mut sum_vy: f32 = 0.0;
+                let mut sum_speed: f32 = 0.0;
+                let mut max_speed: f32 = 0.0;
 
                 for agent in &frame.agents {
                     let vel = agent.velocity;
@@ -1917,13 +1917,13 @@ impl VectorHudState {
                 } else {
                     0.0
                 };
-                let max_speed = max_speed.max(mean_speed).max(1e-3);
+                let max_speed_final = max_speed.max(mean_speed).max(1e-3);
 
                 (
                     (avg_vx, avg_vy),
                     mean_speed,
                     vector_magnitude,
-                    max_speed,
+                    max_speed_final,
                     heading_rad,
                 )
             })
@@ -2839,11 +2839,25 @@ struct PostProcessStack {
 
 #[derive(Clone, Copy)]
 enum PostProcessPass {
-    Vignette { strength: f32 },
-    Bloom { strength: f32 },
-    Scanlines { intensity: f32, spacing: f32 },
-    FilmGrain { strength: f32, seed: u64 },
-    ColorGrade { lift: f32, gain: f32, temperature: f32 },
+    Vignette {
+        strength: f32,
+    },
+    Bloom {
+        strength: f32,
+    },
+    Scanlines {
+        intensity: f32,
+        spacing: f32,
+    },
+    FilmGrain {
+        strength: f32,
+        seed: u64,
+    },
+    ColorGrade {
+        lift: f32,
+        gain: f32,
+        temperature: f32,
+    },
 }
 
 fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> PostProcessStack {
@@ -2863,20 +2877,14 @@ fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> Po
     let life_delta = (births_ratio - deaths_ratio).clamp(-1.0, 1.0);
     let tension = life_delta.abs();
 
-    let vignette_strength = (0.36
-        + day_phase * 0.24
-        + closed_bonus
-        + (-life_delta).max(0.0) * 0.28)
-        .clamp(0.2, 0.82);
-    let bloom_strength = (0.24 + day_phase * 0.32 + life_delta.max(0.0) * 0.28)
-        .clamp(0.12, 0.78);
-    let scanline_intensity = (0.18
-        + (1.0 - day_phase) * 0.22
-        + closed_bonus * 0.35
-        + (-life_delta).max(0.0) * 0.18)
-        .clamp(0.08, 0.65);
-    let grain_strength = (0.11 + (tick % 4096) as f32 / 4096.0 * 0.08 + tension * 0.06)
-        .clamp(0.08, 0.26);
+    let vignette_strength =
+        (0.36 + day_phase * 0.24 + closed_bonus + (-life_delta).max(0.0) * 0.28).clamp(0.2, 0.82);
+    let bloom_strength = (0.24 + day_phase * 0.32 + life_delta.max(0.0) * 0.28).clamp(0.12, 0.78);
+    let scanline_intensity =
+        (0.18 + (1.0 - day_phase) * 0.22 + closed_bonus * 0.35 + (-life_delta).max(0.0) * 0.18)
+            .clamp(0.08, 0.65);
+    let grain_strength =
+        (0.11 + (tick % 4096) as f32 / 4096.0 * 0.08 + tension * 0.06).clamp(0.08, 0.26);
 
     let temperature = match palette {
         ColorPaletteMode::Natural => 0.08 - life_delta * 0.05,
@@ -3286,8 +3294,8 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
         }
 
         let head_size = (8.0 + velocity_ratio * 18.0).clamp(6.0, 18.0);
-        let left_angle = heading + std::f32::consts::PI - 0.4;
-        let right_angle = heading + std::f32::consts::PI + 0.4;
+        let left_angle = heading + PI - 0.4;
+        let right_angle = heading + PI + 0.4;
 
         let left_point = point(
             px(tip_x + head_size * left_angle.cos()),
@@ -3316,7 +3324,14 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
         if coherence > 1.0 {
             let ring_inner = radius * 0.55;
             let mut ring = PathBuilder::stroke(px(1.2 + coherence * 0.02));
-            append_arc_polyline(&mut ring, cx, cy, ring_inner, -140.0, 280.0 * velocity_ratio);
+            append_arc_polyline(
+                &mut ring,
+                cx,
+                cy,
+                ring_inner,
+                -140.0,
+                280.0 * velocity_ratio,
+            );
             if let Ok(path) = ring.build() {
                 window.paint_path(path, rgba_from_hex(0x60a5fa, 0.65));
             }
@@ -3776,102 +3791,186 @@ fn paint_metric_badge(bounds: Bounds<Pixels>, state: MetricBadgeState, window: &
 }
 
 fn apply_post_processing(
-    frame: &RenderFrame,
+    stack: &PostProcessStack,
+    palette: ColorPaletteMode,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     daylight: f32,
     scale: f32,
 ) {
-    let fx = &frame.post_fx;
     let origin = bounds.origin;
     let bounds_size = bounds.size;
     let width_px = f32::from(bounds_size.width).max(1.0);
     let height_px = f32::from(bounds_size.height).max(1.0);
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
-    let palette = frame.palette;
 
-    if fx.vignette_strength > 0.01 {
-        let alpha = (0.22 + (1.0 - daylight) * 0.14) * fx.vignette_strength;
-        let edge_color = apply_palette(rgba_from_hex(0x01040c, alpha.clamp(0.05, 0.55)), palette);
-        let top_bounds = Bounds::new(
-            point(px(origin_x), px(origin_y)),
-            size(px(width_px), px(height_px * 0.18)),
-        );
-        let bottom_bounds = Bounds::new(
-            point(px(origin_x), px(origin_y + height_px * 0.82)),
-            size(px(width_px), px(height_px * 0.18)),
-        );
-        window.paint_quad(fill(top_bounds, Background::from(edge_color)));
-        window.paint_quad(fill(bottom_bounds, Background::from(edge_color)));
+    for pass in &stack.passes {
+        match *pass {
+            PostProcessPass::ColorGrade {
+                lift,
+                gain,
+                temperature,
+            } => {
+                if lift > 0.001 {
+                    let lift_color =
+                        apply_palette(rgba_from_hex(0x02060f, lift.clamp(0.0, 0.2)), palette);
+                    window.paint_quad(fill(bounds, Background::from(lift_color)));
+                }
+                if temperature.abs() > 0.001 {
+                    let temp_hex = if temperature >= 0.0 {
+                        0xffa94d
+                    } else {
+                        0x3b82f6
+                    };
+                    let temp_alpha = temperature.abs().clamp(0.0, 0.25) * 0.6;
+                    if temp_alpha > 0.0 {
+                        let temp_color =
+                            apply_palette(rgba_from_hex(temp_hex, temp_alpha), palette);
+                        window.paint_quad(fill(bounds, Background::from(temp_color)));
+                    }
+                }
+                if gain > 1.0 {
+                    let gain_alpha = (gain - 1.0).clamp(0.0, 0.4);
+                    if gain_alpha > 0.0 {
+                        let gain_bounds = Bounds::new(
+                            point(
+                                px(origin_x + width_px * 0.12),
+                                px(origin_y + height_px * 0.12),
+                            ),
+                            size(px(width_px * 0.76), px(height_px * 0.76)),
+                        );
+                        let gain_color =
+                            apply_palette(rgba_from_hex(0xf1f5f9, gain_alpha * 0.35), palette);
+                        window.paint_quad(fill(gain_bounds, Background::from(gain_color)));
+                    }
+                }
+            }
+            PostProcessPass::Vignette { strength } => {
+                if strength > 0.01 {
+                    let alpha = (0.22 + (1.0 - daylight) * 0.14) * strength;
+                    let edge_color =
+                        apply_palette(rgba_from_hex(0x01040c, alpha.clamp(0.05, 0.55)), palette);
+                    let top_bounds = Bounds::new(
+                        point(px(origin_x), px(origin_y)),
+                        size(px(width_px), px(height_px * 0.18)),
+                    );
+                    let bottom_bounds = Bounds::new(
+                        point(px(origin_x), px(origin_y + height_px * 0.82)),
+                        size(px(width_px), px(height_px * 0.18)),
+                    );
+                    window.paint_quad(fill(top_bounds, Background::from(edge_color)));
+                    window.paint_quad(fill(bottom_bounds, Background::from(edge_color)));
 
-        let side_alpha = (alpha * 0.8).clamp(0.04, 0.45);
-        let side_color = apply_palette(rgba_from_hex(0x020816, side_alpha), palette);
-        let side_width = width_px * 0.08;
-        let left_bounds = Bounds::new(
-            point(px(origin_x), px(origin_y)),
-            size(px(side_width), px(height_px)),
-        );
-        let right_bounds = Bounds::new(
-            point(px(origin_x + width_px - side_width), px(origin_y)),
-            size(px(side_width), px(height_px)),
-        );
-        window.paint_quad(fill(left_bounds, Background::from(side_color)));
-        window.paint_quad(fill(right_bounds, Background::from(side_color)));
-    }
-
-    if fx.bloom_strength > 0.01 {
-        let bloom_width = width_px * (0.48 + fx.bloom_strength * 0.36);
-        let bloom_height = height_px * (0.48 + fx.bloom_strength * 0.36);
-        let bloom_bounds = Bounds::new(
-            point(
-                px(origin_x + (width_px - bloom_width) * 0.5),
-                px(origin_y + (height_px - bloom_height) * 0.5),
-            ),
-            size(px(bloom_width), px(bloom_height)),
-        );
-        let bloom_color = apply_palette(
-            lerp_rgba(
-                rgba_from_hex(0x3b82f6, 0.14 * fx.bloom_strength),
-                rgba_from_hex(0x22c55e, 0.10 * fx.bloom_strength),
-                daylight.clamp(0.0, 1.0),
-            ),
-            palette,
-        );
-        window.paint_quad(fill(bloom_bounds, Background::from(bloom_color)));
-    }
-
-    if fx.scanline_intensity > 0.01 {
-        let spacing = (4.5 / scale).clamp(2.0, 7.0);
-        let alpha = (0.07 * fx.scanline_intensity).clamp(0.01, 0.2);
-        let mut y = origin_y;
-        while y < origin_y + height_px {
-            let scanline_bounds =
-                Bounds::new(point(px(origin_x), px(y)), size(px(width_px), px(1.0)));
-            window.paint_quad(fill(
-                scanline_bounds,
-                Background::from(apply_palette(rgba_from_hex(0x020816, alpha), palette)),
-            ));
-            y += spacing;
+                    let side_alpha = (alpha * 0.8).clamp(0.04, 0.45);
+                    let side_color = apply_palette(rgba_from_hex(0x020816, side_alpha), palette);
+                    let side_width = width_px * 0.08;
+                    let left_bounds = Bounds::new(
+                        point(px(origin_x), px(origin_y)),
+                        size(px(side_width), px(height_px)),
+                    );
+                    let right_bounds = Bounds::new(
+                        point(px(origin_x + width_px - side_width), px(origin_y)),
+                        size(px(side_width), px(height_px)),
+                    );
+                    window.paint_quad(fill(left_bounds, Background::from(side_color)));
+                    window.paint_quad(fill(right_bounds, Background::from(side_color)));
+                }
+            }
+            PostProcessPass::Bloom { strength } => {
+                if strength > 0.01 {
+                    let bloom_width = width_px * (0.48 + strength * 0.36);
+                    let bloom_height = height_px * (0.48 + strength * 0.36);
+                    let bloom_bounds = Bounds::new(
+                        point(
+                            px(origin_x + (width_px - bloom_width) * 0.5),
+                            px(origin_y + (height_px - bloom_height) * 0.5),
+                        ),
+                        size(px(bloom_width), px(bloom_height)),
+                    );
+                    let bloom_color = apply_palette(
+                        lerp_rgba(
+                            rgba_from_hex(0x3b82f6, 0.14 * strength),
+                            rgba_from_hex(0x22c55e, 0.10 * strength),
+                            daylight.clamp(0.0, 1.0),
+                        ),
+                        palette,
+                    );
+                    window.paint_quad(fill(bloom_bounds, Background::from(bloom_color)));
+                }
+            }
+            PostProcessPass::Scanlines { intensity, spacing } => {
+                if intensity > 0.01 {
+                    let spacing_px = (spacing / scale).clamp(2.0, 9.0);
+                    let alpha = (0.07 * intensity).clamp(0.01, 0.2);
+                    let mut y = origin_y;
+                    while y < origin_y + height_px {
+                        let scanline_bounds =
+                            Bounds::new(point(px(origin_x), px(y)), size(px(width_px), px(1.0)));
+                        window.paint_quad(fill(
+                            scanline_bounds,
+                            Background::from(apply_palette(
+                                rgba_from_hex(0x020816, alpha),
+                                palette,
+                            )),
+                        ));
+                        y += spacing_px;
+                    }
+                }
+            }
+            PostProcessPass::FilmGrain { strength, seed } => {
+                if strength > 0.01 {
+                    paint_film_grain(bounds, seed, strength, palette, window);
+                }
+            }
         }
-    }
-
-    if fx.grain_strength > 0.01 {
-        let seed = frame.tick.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let grain = fx_noise(seed);
-        let alpha = (0.02 + grain * 0.06) * fx.grain_strength;
-        let grain_color = apply_palette(rgba_from_hex(0xffffff, alpha.clamp(0.01, 0.12)), palette);
-        window.paint_quad(fill(bounds, Background::from(grain_color)));
     }
 }
 
-fn fx_noise(seed: u64) -> f32 {
-    let mut value = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+fn paint_film_grain(
+    bounds: Bounds<Pixels>,
+    seed: u64,
+    strength: f32,
+    palette: ColorPaletteMode,
+    window: &mut Window,
+) {
+    let origin = bounds.origin;
+    let bounds_size = bounds.size;
+    let width_px = f32::from(bounds_size.width).max(1.0);
+    let height_px = f32::from(bounds_size.height).max(1.0);
+    let cols = (width_px / 24.0).clamp(16.0, 64.0) as u32;
+    let rows = (height_px / 24.0).clamp(12.0, 48.0) as u32;
+    let cell_w = width_px / cols as f32;
+    let cell_h = height_px / rows as f32;
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let noise = hashed_noise(seed, row as u64, col as u64);
+            if noise < 0.2 {
+                continue;
+            }
+            let alpha = (0.02 + noise * 0.06) * strength;
+            if alpha < 0.01 {
+                continue;
+            }
+            let base_hex = if noise > 0.6 { 0xffffff } else { 0x0f172a };
+            let color = apply_palette(rgba_from_hex(base_hex, alpha.clamp(0.01, 0.12)), palette);
+            let x = f32::from(origin.x) + col as f32 * cell_w;
+            let y = f32::from(origin.y) + row as f32 * cell_h;
+            let cell_bounds = Bounds::new(point(px(x), px(y)), size(px(cell_w), px(cell_h)));
+            window.paint_quad(fill(cell_bounds, Background::from(color)));
+        }
+    }
+}
+
+fn hashed_noise(seed: u64, row: u64, col: u64) -> f32 {
+    let mut value = seed.wrapping_add(row.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        ^ col.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value ^= value >> 33;
     value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    value ^= value >> 33;
+    value ^= value >> 29;
     value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    value ^= value >> 33;
+    value ^= value >> 32;
     (value as f64 / u64::MAX as f64) as f32
 }
 
@@ -4114,7 +4213,14 @@ fn paint_frame(
         window.paint_quad(fill(agent_bounds, Background::from(color)));
     }
 
-    apply_post_processing(frame, bounds, window, daylight, scale);
+    apply_post_processing(
+        &frame.post_stack,
+        frame.palette,
+        bounds,
+        window,
+        daylight,
+        scale,
+    );
 }
 
 fn food_color(intensity: f32) -> Rgba {

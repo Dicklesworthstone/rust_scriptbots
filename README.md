@@ -1,13 +1,13 @@
 ## Rust ScriptBots
 
-ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-based evolution simulator. Our objective is to deliver a faithful, deterministic port with a GPU-accelerated UI, pluggable brain implementations, and first-class analytics. This repository is a multi-crate Cargo workspace that separates the simulation core, brains, storage, rendering, and application shell.
+ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-based evolution simulator. Our goal is a faithful, deterministic port with a GPU-accelerated UI, pluggable brain implementations, and first-class analytics. This is a multi-crate Cargo workspace separating simulation core, brains, storage, rendering, and the application shell.
 
-For full design intent and roadmap, see `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` (the project “bible”). We target Linux, macOS, and Windows 11 (native and WSL2), with ongoing validation of UI performance across all three.
+For design intent and the living roadmap, see `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` (the project “bible”). A sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
 
 ### Why this exists
 - **Determinism and safety**: Replace legacy C++/GLUT and global state with idiomatic Rust, zero `unsafe` in v1, and reproducible runs.
-- **Performance at scale**: Use data-parallelism (Rayon) and cache-friendly data layouts to simulate thousands of agents efficiently.
-- **Modern UX**: Swap immediate-mode OpenGL for a declarative, GPU-accelerated GPUI interface with an inspector, overlays, and smooth camera controls.
+- **Performance at scale**: Data-parallelism (Rayon) and cache-friendly layouts to simulate thousands of agents efficiently.
+- **Modern UX**: Declarative, GPU-accelerated GPUI interface with an inspector, overlays, and smooth camera controls.
 - **Observability**: Persist metrics and snapshots to DuckDB for replay, analytics, and regression testing.
 - **Extensibility**: Hot-swap brain implementations (MLP, DWRAON, experimental Assembly, plus optional NeuroFlow) without rewriting the world loop.
 
@@ -20,34 +20,36 @@ rust_scriptbots/
 ├── Cargo.toml                # Workspace manifest, shared deps/lints/profiles
 ├── rust-toolchain.toml       # Pinned toolchain (Rust 1.85)
 ├── crates/
-│   ├── scriptbots-core       # Core types and (future) simulation model/traits
-│   ├── scriptbots-brain      # Brain trait + telemetry; concrete brains later
-│   ├── scriptbots-brain-ml   # Optional ML backends (Candle, Tract, tch) via features
+│   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
+│   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
+│   ├── scriptbots-brain-ml   # Optional ML backends (Candle/Tract/tch), feature-gated
+│   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
 │   ├── scriptbots-index      # Pluggable spatial indices (grid, rstar, kd-tree)
 │   ├── scriptbots-storage    # DuckDB-backed persistence & analytics hooks
-│   ├── scriptbots-render     # GPUI integration and visual layer
+│   ├── scriptbots-render     # GPUI integration and visual layer (HUD, canvas renderer)
 │   └── scriptbots-app        # Binary crate wiring everything together
 └── original_scriptbots_code_for_reference/  # Upstream C++ snapshot for parity
 ```
 
 ### Crate roles
-- **`scriptbots-core`**: Foundational types (e.g., `Tick`, `AgentId`). Will house `WorldState`, `AgentState`, configuration, and the deterministic tick pipeline.
-- **`scriptbots-brain`**: Defines the `Brain` trait and telemetry. Will host concrete brains: `MlpBrain`, `DwraonBrain`, and experimental `AssemblyBrain` behind features.
-- **`scriptbots-brain-ml`**: Optional ML backends (Candle, Tract, tch) for alternative or accelerated brain implementations, all feature-gated.
-- **`scriptbots-index`**: Spatial indexing implementations. Default uniform grid with optional `rstar` (R-tree) and `kd` (kiddo) features.
-- **`scriptbots-storage`**: A thin persistence layer over DuckDB. Currently exposes `Storage::open` and `record_tick`; will evolve to buffered/batched writers and richer schemas.
-- **`scriptbots-render`**: GPUI application scaffolding. Today it boots a minimal `Application`; planned work includes a `WorldView`, canvas-based rendering, overlays, and an inspector.
-- **`scriptbots-app`**: The binary shell. Initializes tracing/logging, config, and orchestrates the simulation/render loop.
+- **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
+- **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
+- **`scriptbots-brain-ml`**: Optional ML backends (Candle, Tract, tch) for alternative/accelerated inference (feature-gated).
+- **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
+- **`scriptbots-index`**: Spatial indexing implementations; default uniform grid, optional `rstar` (R-tree) and `kd` (kiddo).
+- **`scriptbots-storage`**: DuckDB persistence with buffered writes (`ticks`, `metrics`, `events`, `agents`) plus analytics helpers (e.g., `top_predators`, `latest_metrics`).
+- **`scriptbots-render`**: GPUI UI layer with a window shell, HUD, canvas renderer for agents/food, selection highlights, and diagnostics overlay.
+- **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env, storage pipeline, installs brains, seeds agents, and launches the GPUI shell.
 
-## Current status (alpha scaffold)
-- Workspace, profiles, and shared lint settings are in place.
-- `scriptbots-app` starts and initializes tracing; calls a minimal GPUI demo.
-- `scriptbots-render` spins up a bare `gpui::Application` (no views/windows yet).
-- `scriptbots-core` provides initial types; `WorldState`/`AgentState` and the tick loop are not yet implemented.
-- `scriptbots-brain` exposes the `Brain` trait and telemetry; no concrete brains merged yet.
-- `scriptbots-storage` opens DuckDB and records simple per-tick metrics.
+## Current status
+- Workspace scaffolding, shared lints, and profiles are in place.
+- `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
+- `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
+- `scriptbots-brain`: `MlpBrain` available; experimental `assembly` feature; DWRAON planned; registry wiring present.
+- `scriptbots-brain-neuro`: NeuroFlow-backed brain available behind the `neuro` feature (runtime toggles below).
+- `scriptbots-storage`: DuckDB persistence with buffered writes and analytics helpers.
 
-Refer to the migration roadmap in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` for staged milestones (core data structures → world mechanics → concurrency → brains → storage → rendering → integration & polish).
+See the migration roadmap in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` for staged milestones and parity checklists.
 
 ## Getting started
 
@@ -89,21 +91,34 @@ RUST_LOG=info cargo run -p scriptbots-app
 ### Windows via WSL2 (optional)
 - Windows 11 with WSLg supports Linux GUI apps out of the box; GPUI rendering generally works, but performance may vary. If you see blank windows, update your GPU drivers and WSL kernel, then retry.
 
-### Feature flags & variants (current crates)
-- `scriptbots-render`:
-  - `audio` → enables Kira-driven audio output in the render layer (app-level toggle pending wiring).
-- `scriptbots-index` (pluggable spatial indices):
-  - Default: `grid`
-  - Optional: `rstar` (R-tree), `kd` (kiddo-based k-d tree)
+### Feature flags & variants
+- **`scriptbots-app` features**:
+  - `ml` → enable `scriptbots-brain-ml`
+  - `neuro` → enable `scriptbots-brain-neuro`
+  - Example: `cargo run -p scriptbots-app --features neuro`
+- **`scriptbots-render`**:
+  - `audio` → enable Kira-driven audio in the UI layer
+- **`scriptbots-index`** (pluggable spatial indices):
+  - Default: `grid`; optional: `rstar`, `kd`
   - Example: `cargo build -p scriptbots-index --features rstar`
-- `scriptbots-brain-ml` (ML backends for brains):
-  - `candle`, `tract`, `tch` (all optional; off by default)
+- **`scriptbots-brain-ml`** (optional ML backends):
+  - `candle`, `tract`, `tch` (all optional)
   - Examples:
     - `cargo build -p scriptbots-brain-ml --features candle`
     - `cargo build -p scriptbots-brain-ml --features tract`
     - `cargo build -p scriptbots-brain-ml --features tch`
 
-Note: App-level switches to choose specific index/brain backends will be added as integration lands. For now, features can be compiled per-crate while the wiring is implemented.
+Note: App-level switches for brain/index selection are wired in the binary; crate-specific features control availability.
+
+### NeuroFlow runtime configuration (optional)
+If built with the `neuro` feature, runtime toggles can be applied via env vars before launch:
+```bash
+SCRIPTBOTS_NEUROFLOW_ENABLED=true \
+SCRIPTBOTS_NEUROFLOW_HIDDEN="64,32,16" \
+SCRIPTBOTS_NEUROFLOW_ACTIVATION=relu \
+cargo run -p scriptbots-app --features neuro
+```
+Valid activations: `tanh`, `sigmoid`, `relu`.
 
 ### Commands cheat sheet
 ```bash
@@ -125,32 +140,30 @@ cargo build -p scriptbots-index --features rstar
 cargo build -p scriptbots-brain-ml --features candle
 ```
 
-## How the simulation will work (high level)
-The world executes a deterministic, staged tick pipeline:
-1. Aging and periodic tasks
-2. Food respawn and diffusion
-3. Event flag resets
-4. Sense neighbors via a spatial index (uniform grid)
-5. Brain evaluation (`Brain::tick`) for each agent without per-tick allocations
-6. Actuation (movement, colors, sharing, boosting) using double-buffered state
-7. Food intake and sharing with deterministic reductions
-8. Combat and death (queued, then committed)
-9. Reproduction (crossover/mutation) applied in a stable order
-10. Persistence hooks (metrics and snapshots batched to DuckDB)
+## Simulation overview
+Deterministic, staged tick pipeline (seeded RNG; stable ordering):
+1. Aging and scheduled tasks
+2. Food respawn/diffusion
+3. Reset runtime flags
+4. Sense (spatial index snapshot)
+5. Brain tick (no per-tick allocs)
+6. Actuation (double-buffered state)
+7. Food intake/sharing (deterministic reductions)
+8. Combat and death (queued → commit)
+9. Reproduction (mutation/crossover) in stable order
+10. Persistence hooks (batched to DuckDB)
 
-Determinism is preserved by avoiding shared mutable state in parallel sections, gathering results in thread-local buffers, then committing in a defined order.
+## Rendering & UX
+- GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes).
+- Camera controls: pan/zoom; keyboard bindings for pause, draw toggle, speed ±.
+- Overlays: selection highlights, diagnostics panel; charts and advanced overlays are staged in the plan.
+- Inspector: per-agent stats and genome/brain views (scoped to plan milestones).
+- Optional audio via `kira` (feature `audio`).
 
-## Rendering & UX (planned)
-- GPUI window with a canvas renderer for food tiles and agents (circles/spikes).
-- Camera: right-drag pan, middle-drag zoom; keyboard shortcuts (Pause, Toggle Draw, Speed ±, etc.).
-- Overlays: population charts, selection highlights, brain heatmaps, metrics HUD.
-- Inspector: per-agent stats, genome/brain views, mutation history.
-- Audio (via `kira`): optional event-driven cues (reproduction, kills, starvation) with channel toggles.
-
-## Storage & analytics (planned)
-- DuckDB schema for ticks, agents, events, metrics; compacted via batched writers.
-- Deterministic replay tooling (future crate may be introduced) to branch and compare runs.
-- Optional Parquet/Arrow exports for heavy analytics.
+## Storage & analytics
+- DuckDB schema (`ticks`, `metrics`, `events`, `agents`) with buffered writes and maintenance (`optimize`, `VACUUM`).
+- Analytics helpers: `latest_metrics`, `top_predators`.
+- Deterministic replay tooling is planned in the roadmap.
 
 ## Development workflow
 - **Coding standards**: See `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`. Embrace `Result`-based errors, clear traits, and avoid `unsafe`.
@@ -160,9 +173,12 @@ Determinism is preserved by avoiding shared mutable state in parallel sections, 
 - **Profiles**: Release uses LTO, single codegen unit, and abort-on-panic for optimal binaries.
 
 ## Contributing
-- Keep changes scoped to the relevant crate; prefer improving existing files over creating siblings unless functionality is truly new.
-- Add or update documentation where it helps future maintainers understand decisions and invariants.
-- For larger tasks, reference and update `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` inline to mark progress.
+- Keep changes scoped to the relevant crate; prefer improving existing files over adding new ones unless functionality is genuinely new.
+- Update docs where it helps future maintainers understand decisions and invariants.
+- For larger tasks, update `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` inline to mark progress.
+
+## WebAssembly (sibling crate plan)
+We maintain a separate plan for a browser-targeted sibling app (`scriptbots-web`) that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and the docs under `docs/wasm/` (ADRs, audits, and capability matrix). Initial MVP will run single-threaded with feature-gated dependencies; WebGPU vs Canvas2D rendering is under evaluation.
 
 ## Licensing
 Licensed under `MIT OR Apache-2.0` (see workspace manifest).
@@ -183,10 +199,9 @@ Licensed under `MIT OR Apache-2.0` (see workspace manifest).
 - **Determinism regressions**: Ensure you haven't introduced unordered parallel reductions; stage results and apply in a stable commit phase.
 
 ## Roadmap (condensed)
-1. Core data structures (`WorldState`, `AgentState`), config port, and unit tests.
-2. World mechanics (food grid, sensing, reproduction, death cleanup).
-3. Concurrency + spatial indices (uniform grid first; opt-in `rstar`/`kd`).
-4. Brains: MLP baseline; optional ML backends in `scriptbots-brain-ml`.
-5. Persistence layer expansions (DuckDB schema, batched writers, analytics helpers).
-6. Rendering layer: GPUI window, canvas renderer, overlays, inspector, audio (feature-gated).
-7. Integration, UX polish, determinism/benchmark suites, packaging.
+1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
+2. World mechanics and determinism under parallelism; spatial index tuning.
+3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
+4. Storage: extend analytics, add replay hooks and regression tests.
+5. Rendering: HUD/overlays/inspector polish; performance diagnostics.
+6. Packaging/CI: release builds, binaries; wasm sibling crate scaffolding (non-invasive).

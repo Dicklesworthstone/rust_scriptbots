@@ -3,6 +3,10 @@ name = "scriptbots-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -10,5 +14,5 @@ slotmap = { workspace = true }
 rand = { workspace = true }
 scriptbots-index = { path = "../scriptbots-index" }
 ordered-float = { workspace = true }
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }
 getrandom = { workspace = true }

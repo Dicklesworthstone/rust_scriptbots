@@ -460,7 +460,7 @@ impl Storage {
     /// Run database maintenance to optimize and compact storage.
     pub fn optimize(&mut self) -> Result<(), StorageError> {
         self.flush()?;
-        self.conn.execute("PRAGMA optimize_database;", [])?;
+        self.conn.execute("PRAGMA optimize;", [])?;
         self.conn.execute("VACUUM;", [])?;
         Ok(())
     }

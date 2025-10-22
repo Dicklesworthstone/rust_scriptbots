@@ -2,6 +2,7 @@
 
 use ordered_float::OrderedFloat;
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,28 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use thiserror::Error;
+
+#[cfg(feature = "parallel")]
+macro_rules! collect_handles {
+    ($handles:expr, |$idx:ident, $handle:pat_param| $body:expr) => {{
+        ($handles)
+            .par_iter()
+            .enumerate()
+            .map(|($idx, $handle)| $body)
+            .collect::<Vec<_>>()
+    }};
+}
+
+#[cfg(not(feature = "parallel"))]
+macro_rules! collect_handles {
+    ($handles:expr, |$idx:ident, $handle:pat_param| $body:expr) => {{
+        ($handles)
+            .iter()
+            .enumerate()
+            .map(|($idx, $handle)| $body)
+            .collect::<Vec<_>>()
+    }};
+}
 
 new_key_type! {
     /// Stable handle for agents backed by a generational slot map.
@@ -1527,6 +1550,9 @@ impl Default for ScriptBotsConfig {
             spike_growth_rate: 0.005,
             metabolism_drain: 0.002,
             movement_drain: 0.005,
+            metabolism_ramp_floor: 1.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
             temperature_discomfort_rate: 0.0,
             temperature_comfort_band: 0.08,
             temperature_gradient_exponent: 1.0,
@@ -1548,6 +1574,10 @@ impl Default for ScriptBotsConfig {
             reproduction_gene_log_capacity: 12,
             reproduction_meta_mutation_chance: 0.2,
             reproduction_meta_mutation_scale: 0.5,
+            aging_health_decay_start: 12_000,
+            aging_health_decay_rate: 0.0,
+            aging_health_decay_max: 0.0,
+            aging_energy_penalty_rate: 0.0,
             spike_radius: 40.0,
             spike_damage: 0.25,
             spike_energy_cost: 0.02,
@@ -1671,6 +1701,9 @@ impl ScriptBotsConfig {
         }
         if self.metabolism_drain < 0.0
             || self.movement_drain < 0.0
+            || self.metabolism_ramp_floor < 0.0
+            || self.metabolism_ramp_rate < 0.0
+            || self.metabolism_boost_penalty < 0.0
             || self.food_intake_rate < 0.0
             || self.food_sharing_radius <= 0.0
             || self.food_sharing_rate < 0.0
@@ -1694,6 +1727,9 @@ impl ScriptBotsConfig {
             || self.carnivore_threshold >= 1.0
             || self.history_capacity == 0
             || self.temperature_discomfort_rate < 0.0
+            || self.aging_health_decay_rate < 0.0
+            || self.aging_health_decay_max < 0.0
+            || self.aging_energy_penalty_rate < 0.0
         {
             return Err(WorldStateError::InvalidConfig(
                 "metabolism, reproduction, sharing, and history parameters must be non-negative; spike and diet thresholds must be within valid ranges",
@@ -1712,6 +1748,13 @@ impl ScriptBotsConfig {
         if self.temperature_discomfort_exponent <= 0.0 {
             return Err(WorldStateError::InvalidConfig(
                 "temperature_discomfort_exponent must be positive",
+            ));
+        }
+        if self.aging_health_decay_rate > 0.0
+            && self.aging_health_decay_max < self.aging_health_decay_rate
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -2038,8 +2081,70 @@ impl WorldState {
     }
 
     fn stage_aging(&mut self) {
-        for age in self.agents.columns_mut().ages_mut() {
-            *age = age.saturating_add(1);
+        {
+            let columns = self.agents.columns_mut();
+            for age in columns.ages_mut() {
+                *age = age.saturating_add(1);
+            }
+        }
+
+        let rate = self.config.aging_health_decay_rate;
+        if rate <= 0.0 {
+            return;
+        }
+
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        if handles.is_empty() {
+            return;
+        }
+
+        let ages_snapshot = self.agents.columns().ages().to_vec();
+        let mut penalties = vec![0.0f32; handles.len()];
+        let start = self.config.aging_health_decay_start;
+        let max_penalty = self.config.aging_health_decay_max;
+
+        for (idx, age) in ages_snapshot.iter().enumerate() {
+            if *age > start {
+                let over = (*age - start) as f32;
+                let penalty = (over * rate).min(max_penalty);
+                if penalty > 0.0 {
+                    penalties[idx] = penalty;
+                }
+            }
+        }
+
+        if penalties.iter().all(|penalty| *penalty <= 0.0) {
+            return;
+        }
+
+        {
+            let columns = self.agents.columns_mut();
+            let healths = columns.health_mut();
+            for (idx, penalty) in penalties.iter().enumerate() {
+                if *penalty > 0.0 {
+                    healths[idx] = (healths[idx] - *penalty).max(0.0);
+                }
+            }
+        }
+
+        let energy_scale = self.config.aging_energy_penalty_rate.max(0.0);
+        let health_snapshot = self.agents.columns().health().to_vec();
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            let penalty = penalties[idx];
+            if penalty <= 0.0 {
+                continue;
+            }
+            if energy_scale > 0.0 {
+                if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                    let energy_penalty = penalty * energy_scale;
+                    runtime.energy = (runtime.energy - energy_penalty).max(0.0);
+                    runtime.food_delta -= energy_penalty;
+                }
+            }
+            if health_snapshot.get(idx).copied().unwrap_or(0.0) <= 0.0 {
+                self.pending_deaths.push(*agent_id);
+            }
         }
     }
 
@@ -2194,126 +2299,121 @@ impl WorldState {
         let tick_value = self.tick.0 as f32;
         let index = &self.index;
 
-        let sensor_results: Vec<[f32; INPUT_SIZE]> = handles
-            .par_iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                let mut sensors = [0.0f32; INPUT_SIZE];
-                let mut density = [0.0f32; NUM_EYES];
-                let mut eye_r = [0.0f32; NUM_EYES];
-                let mut eye_g = [0.0f32; NUM_EYES];
-                let mut eye_b = [0.0f32; NUM_EYES];
-                let mut smell = 0.0f32;
-                let mut sound = 0.0f32;
-                let mut hearing = 0.0f32;
-                let mut blood = 0.0f32;
+        let sensor_results: Vec<[f32; INPUT_SIZE]> = collect_handles!(handles, |idx, handle| {
+            let _ = handle;
+            let mut sensors = [0.0f32; INPUT_SIZE];
+            let mut density = [0.0f32; NUM_EYES];
+            let mut eye_r = [0.0f32; NUM_EYES];
+            let mut eye_g = [0.0f32; NUM_EYES];
+            let mut eye_b = [0.0f32; NUM_EYES];
+            let mut smell = 0.0f32;
+            let mut sound = 0.0f32;
+            let mut hearing = 0.0f32;
+            let mut blood = 0.0f32;
 
-                let position = positions[idx];
-                let heading = headings[idx];
-                let traits = trait_modifiers[idx];
-                let eyes_dir = eye_directions[idx];
-                let eyes_fov = eye_fov[idx];
+            let position = positions[idx];
+            let heading = headings[idx];
+            let traits = trait_modifiers[idx];
+            let eyes_dir = eye_directions[idx];
+            let eyes_fov = eye_fov[idx];
 
-                index.neighbors_within(
-                    idx,
-                    radius_sq,
-                    &mut |other_idx, dist_sq: OrderedFloat<f32>| {
-                        if other_idx == idx {
-                            return;
+            index.neighbors_within(
+                idx,
+                radius_sq,
+                &mut |other_idx, dist_sq: OrderedFloat<f32>| {
+                    if other_idx == idx {
+                        return;
+                    }
+                    let dist_sq_val = dist_sq.into_inner();
+                    if dist_sq_val <= f32::EPSILON {
+                        return;
+                    }
+                    let dist = dist_sq_val.sqrt();
+                    if dist > radius {
+                        return;
+                    }
+
+                    let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
+                    let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
+                    let ang = angle_to(dx, dy);
+                    let dist_factor = (radius - dist) / radius;
+                    if dist_factor <= 0.0 {
+                        return;
+                    }
+
+                    for eye in 0..NUM_EYES {
+                        let view_dir = wrap_signed_angle(heading + eyes_dir[eye]);
+                        let diff = angle_difference(view_dir, ang);
+                        let fov = eyes_fov[eye].max(0.01);
+                        if diff < fov {
+                            let fov_factor = ((fov - diff) / fov).max(0.0);
+                            let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
+                            density[eye] += intensity;
+                            let color = colors[other_idx];
+                            eye_r[eye] += intensity * color[0];
+                            eye_g[eye] += intensity * color[1];
+                            eye_b[eye] += intensity * color[2];
                         }
-                        let dist_sq_val = dist_sq.into_inner();
-                        if dist_sq_val <= f32::EPSILON {
-                            return;
-                        }
-                        let dist = dist_sq_val.sqrt();
-                        if dist > radius {
-                            return;
-                        }
+                    }
 
-                        let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
-                        let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
-                        let ang = angle_to(dx, dy);
-                        let dist_factor = (radius - dist) / radius;
-                        if dist_factor <= 0.0 {
-                            return;
-                        }
+                    smell += dist_factor;
 
-                        for eye in 0..NUM_EYES {
-                            let view_dir = wrap_signed_angle(heading + eyes_dir[eye]);
-                            let diff = angle_difference(view_dir, ang);
-                            let fov = eyes_fov[eye].max(0.01);
-                            if diff < fov {
-                                let fov_factor = ((fov - diff) / fov).max(0.0);
-                                let intensity =
-                                    traits.eye * fov_factor * dist_factor * (dist / radius);
-                                density[eye] += intensity;
-                                let color = colors[other_idx];
-                                eye_r[eye] += intensity * color[0];
-                                eye_g[eye] += intensity * color[1];
-                                eye_b[eye] += intensity * color[2];
-                            }
-                        }
+                    let velocity = velocities[other_idx];
+                    let speed = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
+                    sound += dist_factor * (speed / max_speed).clamp(0.0, 1.0);
+                    hearing += dist_factor * sound_emitters[other_idx];
 
-                        smell += dist_factor;
+                    let forward_diff = angle_difference(heading, ang);
+                    if forward_diff < BLOOD_HALF_FOV {
+                        let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
+                        let health = healths[other_idx];
+                        let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
+                        blood += bleed * dist_factor * wound;
+                    }
+                },
+            );
 
-                        let velocity = velocities[other_idx];
-                        let speed = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
-                        sound += dist_factor * (speed / max_speed).clamp(0.0, 1.0);
-                        hearing += dist_factor * sound_emitters[other_idx];
+            smell *= traits.smell;
+            sound *= traits.sound;
+            hearing *= traits.hearing;
+            blood *= traits.blood;
 
-                        let forward_diff = angle_difference(heading, ang);
-                        if forward_diff < BLOOD_HALF_FOV {
-                            let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
-                            let health = healths[other_idx];
-                            let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
-                            blood += bleed * dist_factor * wound;
-                        }
-                    },
-                );
+            let cell_x =
+                ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
+            let cell_y =
+                ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
+            let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
+            let food_value = food_cells.get(food_idx).copied().unwrap_or(0.0) / food_max;
 
-                smell *= traits.smell;
-                sound *= traits.sound;
-                hearing *= traits.hearing;
-                blood *= traits.blood;
-
-                let cell_x =
-                    ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
-                let cell_y =
-                    ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
-                let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
-                let food_value = food_cells.get(food_idx).copied().unwrap_or(0.0) / food_max;
-
-                sensors[0] = clamp01(density[0]);
-                sensors[1] = clamp01(eye_r[0]);
-                sensors[2] = clamp01(eye_g[0]);
-                sensors[3] = clamp01(eye_b[0]);
-                sensors[4] = clamp01(food_value);
-                sensors[5] = clamp01(density[1]);
-                sensors[6] = clamp01(eye_r[1]);
-                sensors[7] = clamp01(eye_g[1]);
-                sensors[8] = clamp01(eye_b[1]);
-                sensors[9] = clamp01(sound);
-                sensors[10] = clamp01(smell);
-                sensors[11] = clamp01(healths[idx] * 0.5);
-                sensors[12] = clamp01(density[2]);
-                sensors[13] = clamp01(eye_r[2]);
-                sensors[14] = clamp01(eye_g[2]);
-                sensors[15] = clamp01(eye_b[2]);
-                sensors[16] = (tick_value / clocks[idx][0].max(1.0)).sin().abs();
-                sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
-                sensors[18] = clamp01(hearing);
-                sensors[19] = clamp01(blood);
-                let env_temperature = sample_temperature(&self.config, position.x);
-                let discomfort =
-                    temperature_discomfort(env_temperature, temperature_preferences[idx]);
-                sensors[20] = clamp01(discomfort);
-                sensors[21] = clamp01(density[3]);
-                sensors[22] = clamp01(eye_r[3]);
-                sensors[23] = clamp01(eye_g[3]);
-                sensors[24] = clamp01(eye_b[3]);
-                sensors
-            })
-            .collect();
+            sensors[0] = clamp01(density[0]);
+            sensors[1] = clamp01(eye_r[0]);
+            sensors[2] = clamp01(eye_g[0]);
+            sensors[3] = clamp01(eye_b[0]);
+            sensors[4] = clamp01(food_value);
+            sensors[5] = clamp01(density[1]);
+            sensors[6] = clamp01(eye_r[1]);
+            sensors[7] = clamp01(eye_g[1]);
+            sensors[8] = clamp01(eye_b[1]);
+            sensors[9] = clamp01(sound);
+            sensors[10] = clamp01(smell);
+            sensors[11] = clamp01(healths[idx] * 0.5);
+            sensors[12] = clamp01(density[2]);
+            sensors[13] = clamp01(eye_r[2]);
+            sensors[14] = clamp01(eye_g[2]);
+            sensors[15] = clamp01(eye_b[2]);
+            sensors[16] = (tick_value / clocks[idx][0].max(1.0)).sin().abs();
+            sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
+            sensors[18] = clamp01(hearing);
+            sensors[19] = clamp01(blood);
+            let env_temperature = sample_temperature(&self.config, position.x);
+            let discomfort = temperature_discomfort(env_temperature, temperature_preferences[idx]);
+            sensors[20] = clamp01(discomfort);
+            sensors[21] = clamp01(density[3]);
+            sensors[22] = clamp01(eye_r[3]);
+            sensors[23] = clamp01(eye_g[3]);
+            sensors[24] = clamp01(eye_b[3]);
+            sensors
+        });
 
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
@@ -2377,6 +2477,9 @@ impl WorldState {
         let spike_growth = self.config.spike_growth_rate.max(0.0);
         let movement_drain = self.config.movement_drain;
         let metabolism_drain = self.config.metabolism_drain;
+        let ramp_floor = self.config.metabolism_ramp_floor;
+        let ramp_rate = self.config.metabolism_ramp_rate;
+        let boost_penalty = self.config.metabolism_boost_penalty.max(0.0);
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         if handles.is_empty() {
@@ -2389,75 +2492,78 @@ impl WorldState {
         let spike_lengths_snapshot: Vec<f32> = columns.spike_lengths().to_vec();
 
         let runtime = &self.runtime;
-        let results: Vec<ActuationResult> = handles
-            .par_iter()
-            .enumerate()
-            .map(|(idx, agent_id)| {
-                if let Some(runtime) = runtime.get(*agent_id) {
-                    let outputs = runtime.outputs;
-                    let left = outputs.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let color = [
-                        clamp01(outputs.get(2).copied().unwrap_or(0.0)),
-                        clamp01(outputs.get(3).copied().unwrap_or(0.0)),
-                        clamp01(outputs.get(4).copied().unwrap_or(0.0)),
-                    ];
-                    let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
-                    let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let results: Vec<ActuationResult> = collect_handles!(handles, |idx, agent_id| {
+            if let Some(runtime) = runtime.get(*agent_id) {
+                let outputs = runtime.outputs;
+                let left = outputs.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let color = [
+                    clamp01(outputs.get(2).copied().unwrap_or(0.0)),
+                    clamp01(outputs.get(3).copied().unwrap_or(0.0)),
+                    clamp01(outputs.get(4).copied().unwrap_or(0.0)),
+                ];
+                let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
+                let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
 
-                    let mut left_speed = left * bot_speed;
-                    let mut right_speed = right * bot_speed;
-                    if boost {
-                        left_speed *= boost_multiplier;
-                        right_speed *= boost_multiplier;
-                    }
-
-                    let mut heading = headings_snapshot[idx];
-                    let angular = (right_speed - left_speed) / wheel_base;
-                    heading = wrap_signed_angle(heading + angular);
-                    let linear = (left_speed + right_speed) * 0.5;
-                    let vx = heading.cos() * linear;
-                    let vy = heading.sin() * linear;
-
-                    let mut next_pos = positions_snapshot[idx];
-                    next_pos.x = Self::wrap_position(next_pos.x + vx, width);
-                    next_pos.y = Self::wrap_position(next_pos.y + vy, height);
-
-                    let movement_penalty =
-                        movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
-                    let drain = metabolism_drain + movement_penalty;
-                    let health_delta = -drain;
-                    let energy = (runtime.energy - drain).max(0.0);
-
-                    let mut spike_length = spike_lengths_snapshot[idx];
-                    if spike_length < spike_target {
-                        spike_length = (spike_length + spike_growth).min(spike_target);
-                    } else if spike_length > spike_target {
-                        spike_length = (spike_length - spike_growth).max(spike_target);
-                    }
-                    let spiked = spike_length > 0.5;
-
-                    ActuationResult {
-                        delta: Some(ActuationDelta {
-                            heading,
-                            velocity: Velocity::new(vx, vy),
-                            position: next_pos,
-                            health_delta,
-                        }),
-                        energy,
-                        color,
-                        spike_length,
-                        sound_level,
-                        give_intent,
-                        spiked,
-                    }
-                } else {
-                    ActuationResult::default()
+                let mut left_speed = left * bot_speed;
+                let mut right_speed = right * bot_speed;
+                if boost {
+                    left_speed *= boost_multiplier;
+                    right_speed *= boost_multiplier;
                 }
-            })
-            .collect();
+
+                let mut heading = headings_snapshot[idx];
+                let angular = (right_speed - left_speed) / wheel_base;
+                heading = wrap_signed_angle(heading + angular);
+                let linear = (left_speed + right_speed) * 0.5;
+                let vx = heading.cos() * linear;
+                let vy = heading.sin() * linear;
+
+                let mut next_pos = positions_snapshot[idx];
+                next_pos.x = Self::wrap_position(next_pos.x + vx, width);
+                next_pos.y = Self::wrap_position(next_pos.y + vy, height);
+
+                let movement_penalty =
+                    movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                let mut drain = metabolism_drain + movement_penalty;
+                if ramp_rate > 0.0 {
+                    let active_energy = (runtime.energy - ramp_floor).max(0.0);
+                    drain += active_energy * ramp_rate;
+                }
+                if boost && boost_penalty > 0.0 {
+                    drain += boost_penalty;
+                }
+                let health_delta = -drain;
+                let energy = (runtime.energy - drain).max(0.0);
+
+                let mut spike_length = spike_lengths_snapshot[idx];
+                if spike_length < spike_target {
+                    spike_length = (spike_length + spike_growth).min(spike_target);
+                } else if spike_length > spike_target {
+                    spike_length = (spike_length - spike_growth).max(spike_target);
+                }
+                let spiked = spike_length > 0.5;
+
+                ActuationResult {
+                    delta: Some(ActuationDelta {
+                        heading,
+                        velocity: Velocity::new(vx, vy),
+                        position: next_pos,
+                        health_delta,
+                    }),
+                    energy,
+                    color,
+                    spike_length,
+                    sound_level,
+                    give_intent,
+                    spiked,
+                }
+            } else {
+                ActuationResult::default()
+            }
+        });
 
         let columns = self.agents.columns_mut();
         {
@@ -2704,124 +2810,120 @@ impl WorldState {
             .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
             .collect();
 
-        let results: Vec<CombatResult> = handles
-            .par_iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                let mut result = CombatResult::default();
-                let attacker_runtime = &runtime_snapshot[idx];
+        let results: Vec<CombatResult> = collect_handles!(handles, |idx, handle| {
+            let _ = handle;
+            let mut result = CombatResult::default();
+            let attacker_runtime = &runtime_snapshot[idx];
 
-                let is_carnivore = attacker_runtime.herbivore_tendency < carnivore_threshold;
-                result.attacker_carnivore = is_carnivore;
-                let energy_before = attacker_runtime.energy;
+            let is_carnivore = attacker_runtime.herbivore_tendency < carnivore_threshold;
+            result.attacker_carnivore = is_carnivore;
+            let energy_before = attacker_runtime.energy;
 
-                let spike_power = attacker_runtime
-                    .outputs
-                    .get(5)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
+            let spike_power = attacker_runtime
+                .outputs
+                .get(5)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
 
-                if !attacker_runtime.spiked {
-                    result.energy = energy_before;
-                    return result;
-                }
+            if !attacker_runtime.spiked {
+                result.energy = energy_before;
+                return result;
+            }
 
-                if !is_carnivore {
-                    result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
-                    return result;
-                }
-                if spike_power <= f32::EPSILON {
-                    result.energy = energy_before;
-                    return result;
-                }
-
-                let spike_length = spike_lengths[idx];
-                if spike_length < min_length {
-                    result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
-                    return result;
-                }
-
-                let reach = (spike_radius + spike_length).max(1.0);
-                let reach_sq = reach * reach;
-                let heading = headings[idx];
-                let facing = (heading.cos(), heading.sin());
-                let wheel_left = attacker_runtime
-                    .outputs
-                    .first()
-                    .copied()
-                    .unwrap_or(0.0)
-                    .abs();
-                let wheel_right = attacker_runtime
-                    .outputs
-                    .get(1)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .abs();
-                let velocity = velocities[idx];
-                let speed_mag = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
-                let boost = attacker_runtime
-                    .outputs
-                    .get(3)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-
-                let base_power = spike_damage * spike_power;
-                let length_factor = 1.0 + spike_length * length_bonus;
-                let speed_factor =
-                    1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost;
-                let base_damage = base_power * length_factor * speed_factor;
-
-                let origin = positions[idx];
-                let mut hits = Vec::new();
-                index.neighbors_within(
-                    idx,
-                    reach_sq,
-                    &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
-                        if other_idx == idx {
-                            return;
-                        }
-                        let target_runtime = &runtime_snapshot[other_idx];
-                        let dx = Self::wrap_delta(origin.x, positions[other_idx].x, world_w);
-                        let dy = Self::wrap_delta(origin.y, positions[other_idx].y, world_h);
-                        let dist_sq = dx * dx + dy * dy;
-                        if dist_sq <= f32::EPSILON || dist_sq > reach_sq {
-                            return;
-                        }
-                        let dist = dist_sq.sqrt();
-                        let dir_x = dx / dist;
-                        let dir_y = dy / dist;
-                        let alignment = facing.0 * dir_x + facing.1 * dir_y;
-                        if alignment < alignment_threshold {
-                            return;
-                        }
-
-                        let damage = base_damage * alignment.max(0.0);
-                        if damage <= 0.0 {
-                            return;
-                        }
-                        let victim_carnivore =
-                            target_runtime.herbivore_tendency < carnivore_threshold;
-                        if victim_carnivore {
-                            result.hit_carnivore = true;
-                        } else {
-                            result.hit_herbivore = true;
-                        }
-                        hits.push(CombatHit {
-                            target_idx: other_idx,
-                            damage,
-                            attacker_carnivore: is_carnivore,
-                        });
-                    },
-                );
-
-                result.total_damage = hits.iter().map(|hit| hit.damage).sum();
-                result.hits = hits;
+            if !is_carnivore {
                 result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
-                result
-            })
-            .collect();
+                return result;
+            }
+            if spike_power <= f32::EPSILON {
+                result.energy = energy_before;
+                return result;
+            }
+
+            let spike_length = spike_lengths[idx];
+            if spike_length < min_length {
+                result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
+                return result;
+            }
+
+            let reach = (spike_radius + spike_length).max(1.0);
+            let reach_sq = reach * reach;
+            let heading = headings[idx];
+            let facing = (heading.cos(), heading.sin());
+            let wheel_left = attacker_runtime
+                .outputs
+                .first()
+                .copied()
+                .unwrap_or(0.0)
+                .abs();
+            let wheel_right = attacker_runtime
+                .outputs
+                .get(1)
+                .copied()
+                .unwrap_or(0.0)
+                .abs();
+            let velocity = velocities[idx];
+            let speed_mag = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
+            let boost = attacker_runtime
+                .outputs
+                .get(3)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+
+            let base_power = spike_damage * spike_power;
+            let length_factor = 1.0 + spike_length * length_bonus;
+            let speed_factor =
+                1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost;
+            let base_damage = base_power * length_factor * speed_factor;
+
+            let origin = positions[idx];
+            let mut hits = Vec::new();
+            index.neighbors_within(
+                idx,
+                reach_sq,
+                &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
+                    if other_idx == idx {
+                        return;
+                    }
+                    let target_runtime = &runtime_snapshot[other_idx];
+                    let dx = Self::wrap_delta(origin.x, positions[other_idx].x, world_w);
+                    let dy = Self::wrap_delta(origin.y, positions[other_idx].y, world_h);
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq <= f32::EPSILON || dist_sq > reach_sq {
+                        return;
+                    }
+                    let dist = dist_sq.sqrt();
+                    let dir_x = dx / dist;
+                    let dir_y = dy / dist;
+                    let alignment = facing.0 * dir_x + facing.1 * dir_y;
+                    if alignment < alignment_threshold {
+                        return;
+                    }
+
+                    let damage = base_damage * alignment.max(0.0);
+                    if damage <= 0.0 {
+                        return;
+                    }
+                    let victim_carnivore = target_runtime.herbivore_tendency < carnivore_threshold;
+                    if victim_carnivore {
+                        result.hit_carnivore = true;
+                    } else {
+                        result.hit_herbivore = true;
+                    }
+                    hits.push(CombatHit {
+                        target_idx: other_idx,
+                        damage,
+                        attacker_carnivore: is_carnivore,
+                    });
+                },
+            );
+
+            result.total_damage = hits.iter().map(|hit| hit.damage).sum();
+            result.hits = hits;
+            result.energy = (energy_before - spike_energy_cost * spike_power).max(0.0);
+            result
+        });
 
         let mut buckets = vec![DamageBucket::default(); handles.len()];
         let columns = self.agents.columns_mut();
@@ -2899,7 +3001,7 @@ impl WorldState {
                 continue;
             }
             if let Some(spike_len) = spike_columns.get_mut(idx) {
-                *spike_len = (*spike_len * 0.25).max(0.0);
+                *spike_len = (*spike_len * 0.25).max(0.0_f32);
             }
         }
     }
@@ -4597,6 +4699,117 @@ mod tests {
             runtime.sensors[20] < 1e-6,
             "expected zero discomfort at equator, got {}",
             runtime.sensors[20]
+        );
+    }
+
+    #[test]
+    fn metabolism_ramp_increases_drain() {
+        let config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_floor: 0.25,
+            metabolism_ramp_rate: 0.5,
+            metabolism_boost_penalty: 0.1,
+            rng_seed: Some(11),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let agent = world.spawn_agent(sample_agent(0));
+        world.agent_runtime_mut(agent).unwrap().energy = 1.0;
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.health_mut()[idx] = 1.0;
+        }
+        {
+            let runtime = world.agent_runtime_mut(agent).unwrap();
+            runtime.outputs = [0.0; OUTPUT_SIZE];
+            runtime.outputs[6] = 1.0; // enable boost
+        }
+
+        world.stage_actuation();
+
+        let runtime = world.agent_runtime(agent).expect("runtime");
+        let expected_drain = (1.0 - 0.25) * 0.5 + 0.1;
+        assert!(
+            (runtime.energy - (1.0 - expected_drain)).abs() < 1e-6,
+            "expected energy {:.6}, got {:.6}",
+            1.0 - expected_drain,
+            runtime.energy
+        );
+        let arena = world.agents();
+        let idx = arena.index_of(agent).unwrap();
+        let health = arena.columns().health()[idx];
+        assert!(
+            (health - (1.0 - expected_drain)).abs() < 1e-6,
+            "expected health {:.6}, got {:.6}",
+            1.0 - expected_drain,
+            health
+        );
+    }
+
+    #[test]
+    fn aging_decay_applies_after_threshold() {
+        let config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            aging_health_decay_start: 5,
+            aging_health_decay_rate: 0.02,
+            aging_health_decay_max: 0.05,
+            aging_energy_penalty_rate: 1.5,
+            rng_seed: Some(23),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let agent = world.spawn_agent(sample_agent(0));
+
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.ages_mut()[idx] = 5;
+            columns.health_mut()[idx] = 1.0;
+        }
+        {
+            let runtime = world.agent_runtime_mut(agent).unwrap();
+            runtime.energy = 1.0;
+        }
+
+        world.stage_aging();
+
+        let expected_penalty = 0.02; // age increments to 6 => over=1
+        let expected_energy_penalty = expected_penalty * 1.5;
+
+        {
+            let arena = world.agents();
+            let idx = arena.index_of(agent).unwrap();
+            let ages = arena.columns().ages();
+            assert_eq!(ages[idx], 6);
+            let health = arena.columns().health()[idx];
+            assert!(
+                (health - (1.0 - expected_penalty)).abs() < 1e-6,
+                "expected health {:.6}, got {:.6}",
+                1.0 - expected_penalty,
+                health
+            );
+        }
+        let runtime = world.agent_runtime(agent).unwrap();
+        assert!(
+            (runtime.energy - (1.0 - expected_energy_penalty)).abs() < 1e-6,
+            "expected energy {:.6}, got {:.6}",
+            1.0 - expected_energy_penalty,
+            runtime.energy
         );
     }
 

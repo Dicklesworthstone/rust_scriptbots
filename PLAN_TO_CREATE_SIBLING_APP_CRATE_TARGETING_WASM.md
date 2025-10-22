@@ -122,7 +122,7 @@
 
 ## Phase 3 · Rendering Implementation [Currently In Progress — planning]
 
-### 3.1 Rendering MVP [Currently In Progress — spike scheduling]
+### 3.1 Rendering MVP [Currently In Progress — spike scheduling; see docs/wasm/rendering_spike_plan.md]
 - Chosen stack (from ADR-001) built to render:
   - Food grid heatmap
   - Agents (circles with spike indicator)
