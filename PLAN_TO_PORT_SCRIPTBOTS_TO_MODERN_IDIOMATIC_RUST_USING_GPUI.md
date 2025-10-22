@@ -39,7 +39,7 @@
 - `AgentState`: [Completed: runtime struct + sensor buffers]
   - Scalar fields mapped to Rust primitives (`f32`, `u16`, `bool`).
   - Sensor buffers as `[f32; INPUT_SIZE]`, outputs `[f32; OUTPUT_SIZE]` to avoid heap allocations. [Done via `AgentRuntime::sensors`/`outputs`]
-  - `brain: Box<dyn Brain + Send + Sync>` or enum-based dispatch for zero-cost dynamic dispatch. [Pending: replace temporary `BrainBinding` once registry is wired]
+  - `brain: Box<dyn Brain + Send + Sync>` or enum-based dispatch for zero-cost dynamic dispatch. [Completed - GPT-5 Codex 2025-10-22: replaced `BrainBinding` placeholder with per-agent brain attachments backed by factory registry]
   - History/event info (`indicator`, `sound_output`, `select_state`). [Backed by `IndicatorState`, `SelectionState`, and runtime fields]
   - `id: AgentId` generational slotmap handle to prevent stale references.
 - Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback. [Completed: validation + RNG seeding + defaults]
@@ -58,7 +58,7 @@
 8. **Combat and Death** [Completed: spike collisions & removal queue]: Evaluate spike collisions using spatial index, queue health changes, then apply.
 9. **Reproduction & Spawning** [Completed: queued spawn orders + child mutations]: Collect reproduction events into `Vec<SpawnOrder>`, apply sequentially to maintain deterministic ordering, leveraging `rand_distr` for gaussian mutations.
 10. **Persistence Hooks** [Completed: tick summary + pluggable sink]: Stream agent snapshots, food deltas, and event logs into DuckDB tables using batched transactions (e.g., every N ticks or when buffers exceed threshold). Leverage Arrow/Parquet features for zero-copy exports when advanced analytics are enabled.citeturn1search0turn1search5
-11. **Cleanup**: Remove dead agents using `Vec::retain` (single-threaded) or stable partition maintaining deterministic ordering; recycle IDs as needed.
+11. **Cleanup** [Completed - GPT-5 Codex 2025-10-22: deterministic death queue drains, stable arena retention, runtime cleanup + tests]: Remove dead agents using `Vec::retain` (single-threaded) or stable partition maintaining deterministic ordering; recycle IDs as needed.
 
 ## Brain System
 - Define `pub trait Brain: Send + Sync { fn kind(&self) -> BrainKind; fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE]; fn mutate(&mut self, rng: &mut dyn RngCore, mut_rate: f32, mut_scale: f32); fn crossover(&self, other: &dyn Brain, rng: &mut dyn RngCore) -> Option<Box<dyn Brain>>; }`. [Completed: fixed-size outputs + registry adapters]
@@ -166,6 +166,55 @@
 - Deterministic replay & branching: treat every RNG draw and brain choice as an event stored in DuckDB, enabling branch-and-replay workflows and regression reproduction.
 - Scenario layering: allow configs to be composed (base + biome + experiment) controlling constants, active sensors, brain registries, and UI themes.
 
+## Parity Gaps vs. Original ScriptBots (Non-Rendering)
+- **World Mechanics**
+  - [Completed - GPT-5 Codex 2025-10-22: added configurable regrowth/decay/diffusion with tests] Reproduce food diffusion/decay curves from `World.cpp` (current respawn is basic pulse).
+  - [Currently In Progress - GPT-5 Codex 2025-10-22: porting spike damage scaling, carnivore gating, and deterministic death queues] Flesh out combat resolution: spike damage scaling, carnivore/herbivore event flags, queued death cleanup ordering.
+  - [ ] Implement reproduction nuance: crossover/mutation weighting, spawn jitter, gene logging, lineage tracking.
+  - [Currently In Progress - GPT-5 Codex 2025-10-22: sensory parity work (vision cones, smell/sound attenuation, blood/temperature channels)] Complete sensory modeling: angular vision cones, smell/sound attenuation, change-sensitive synapses.
+  - [ ] Add energy/aging modifiers (metabolism ramps, age-based decay) to match C++ behavior.
+  - [ ] Restore environmental temperature mechanics: apply discomfort-based health drain tied to agents' `temperature_preference`, expose configurable gradients, and extend tests covering equator/edge scenarios.
+  - [ ] Reintroduce carcass distribution: when an agent dies (especially from spikes), deterministically share meat resources with nearby carnivores/herbivores using the original age-based scaling and ensure persistence metrics capture these events.
+  - [ ] Match food sharing semantics: implement the constant-rate `FOODTRANSFER` giving behavior gated by output 8, include distance checks, and keep deterministic ordering so altruistic strategies mirror the C++ dynamics.
+  - [ ] Reinstate world population seeding: honor the `closed` flag, maintain minimum agent counts, and periodically inject random newcomers or crossover spawns to mirror `addRandomBots`/`addNewByCrossover` scheduling.
+  - [ ] Map output-channel side effects: ease spikes toward requested length, persist `sound_multiplier`/`give_intent`, update indicator pulses on key events, and surface matching config hooks for downstream rendering/audio layers.
+  - [ ] Align locomotion with differential drive physics: interpret outputs[0]/[1] as wheel velocities, derive pose updates/boost scaling from the original formulas, and validate wrapping math against `processOutputs`.
+  - [ ] Port herbivore vs carnivore behaviors: enforce attack restrictions for herbivores, replicate reproduction timers (`REPRATEH/REPRATEC`), and apply diet-based modifiers in food intake and carcass sharing.
+  - [ ] Match food consumption math: reuse `FOODINTAKE`, `FOODWASTE`, and speed-dependent gains tied to wheel speeds and herbivore tendency, updating tests to cover stationary vs. fast agents.
+  - [ ] Restore modcounter cadence: introduce configurable tick scheduler for aging every 100 ticks, periodic charts/reporting, reproduction gating randomness, and guard against regressions with deterministic seeds.
+  - [ ] Carry mutation parameter genetics: track per-agent `mutrate1/2`, `temperature_preference`, and trait modifiers, mutating them during reproduction following the C++ meta-mutation rules.
+  - [ ] Build regression tests comparing Rust tick traces against captured C++ snapshots.
+- **Brain Implementations**
+  - [ ] Port DWRAON brain with parity tests and feature gating.
+  - [ ] Port Assembly brain (even if experimental) with determinism guardrails.
+  - [ ] Implement mutation/crossover suites validated against C++ reference data.
+  - [ ] Develop brain registry benchmarking (per-brain tick cost, cache hit rates).
+- **Analytics & Replay**
+  - [ ] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
+  - [ ] Implement deterministic replay runner (headless) driven by stored events.
+  - [ ] Add DuckDB parity queries (population charts, kill ratios, energy histograms) vs. C++ scripts.
+  - [ ] Provide CLI tooling to diff runs (Rust vs. C++ baseline) and highlight divergences.
+- **Feature Toggles & UX Integration (Non-rendering)**
+  - [ ] Surfacing runtime toggles: CLI/ENV for enabling brains, selecting indices, adjusting mechanics.
+  - [ ] Selection and debug hooks: expose APIs to query agent state, highlight subsets (without GPUI coupling).
+  - [ ] Audio hooks: structure event bus for future `kira` integration (without touching render crate yet).
+  - [ ] Accessibility/logging: structured tracing spans, machine-readable summaries for external dashboards.
+
+## Rendering Roadmap Snapshot (Avoid Editing Without Render Owner)
+- **Shipped in Rust GPUI Layer**
+  - ✅ Window bootstrap with configured title/titlebar.
+  - ✅ HUD cards (tick/agents, births/deaths, energy/health) plus quick overlay panel.
+  - ✅ Tick-history table with growth coloring and energy averages.
+  - ✅ Canvas renderer for food tiles and agents (health-adjusted color, radius scaling).
+  - ✅ Camera controls: middle-click pan, scroll zoom with anchor, HUD readouts for zoom/pan.
+- **Outstanding / Upcoming**
+- [Currently In Progress - GPT-5 Codex 2025-10-22: Selection/hover indicators with canvas highlights, brush tooling UI, and debug probe plumbing.] 
+  - [ ] Selection/hover indicators: canvas highlights, brush tools, debug probes.
+  - [ ] Event overlays: combat flashes, reproduction trails, food diffusion visualization.
+  - [ ] Performance diagnostics: frame timings, GPU stats, logging integration.
+  - [ ] Terrain/lighting polish: tile shading, bloom/post-processing, night/day palettes.
+  - [ ] Input rebinding & accessibility: keyboard remaps, colorblind-safe palettes, narration hooks.
+
 ## Migration Roadmap
 1. **Project Bootstrap (Week 1)**
    - Initialize workspace via `create-gpui-app --workspace`.
@@ -182,15 +231,15 @@
 5. **Brain Ports (Weeks 5-7)**
    - MLP (baseline) complete with mutate/crossover. [Completed - GPT-5 Codex 2025-10-21]
    - DWRAON feature gate; assembly brain behind `--features experimental`. [Completed - GPT-5 Codex 2025-10-21]
-   - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds. [Currently In Progress - GPT-5 Codex 2025-10-21]citeturn2search1turn2search2
+   - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds. [Completed - GPT-5 Codex 2025-10-22]citeturn2search1turn2search2
    - Seed NeuroFlow weights using the world RNG for deterministic runs. [Completed - GPT-5 Codex 2025-10-21]
    - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Completed - GPT-5 Codex 2025-10-21]
 6. **Persistence Layer (Weeks 7-8)**
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Completed - GPT-5 Codex 2025-10-22]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Completed - GPT-5 Codex 2025-10-22]
 7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
-   - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding complete; canvas renderer + inspector pending]
-   - Implement camera controls, overlays, history chart. [Completed - GPT-5 Codex 2025-10-22: camera pan/zoom with cursor-anchored zoom + live HUD overlay]
+   - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-22: window shell + HUD + canvas renderer complete; inspector panel pending]
+   - Implement camera controls, overlays, history chart. [Completed - GPT-5 Codex 2025-10-22: middle-click pan, scroll zoom, overlay HUD, tick-history chart]
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.
 8. **Integration & UX Polish (Weeks 10-11)**
    - Hook actions to simulation, selection workflows, debug overlays.
@@ -199,7 +248,7 @@
    - Layer in audio cues with `kira`, tie particle/lighting effects to simulation events, and add accessibility options.
 9. **Testing, Benchmarks, Packaging (Weeks 11-12)**
    - Determinism/regression suite, `cargo bench`. [Completed - GPT-5 Codex 2025-10-22]
-   - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries. [Currently In Progress - GPT-5 Codex 2025-10-22]
+   - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries. [Currently In Progress - GPT-5 Codex 2025-10-22: blocked until scriptbots-render stabilizes/compiles]
 
 ## Risks and Mitigations
 - **GPU backend availability**: GPUI is still evolving; focus initial support on macOS/Linux per official guidance, while monitoring upstream platform work.citeturn0search0

@@ -7,7 +7,7 @@ use std::any::Any;
 
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 
-use crate::{into_runner, Brain, BrainKind};
+use crate::{Brain, BrainKind, into_runner};
 
 const BRAIN_SIZE: usize = 200;
 const CONNECTIONS: usize = 4;
@@ -264,8 +264,8 @@ impl Brain for DwraonBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::SmallRng;
     use rand::SeedableRng;
+    use rand::rngs::SmallRng;
 
     #[test]
     fn random_brain_builds_expected_layout() {

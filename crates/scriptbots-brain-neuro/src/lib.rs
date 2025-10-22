@@ -5,13 +5,14 @@
 //! remaining forward-compatible with richer training workflows. The implementation focuses on
 //! inference; mutation currently randomizes weights using the recorded architecture.
 
-use neuroflow::activators::Type;
 use neuroflow::FeedForward;
+use neuroflow::activators::Type;
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use scriptbots_brain::{into_runner, Brain, BrainKind};
+use scriptbots_brain::{Brain, BrainKind, into_runner};
 use scriptbots_core::{BrainRunner, NeuroflowActivationKind, NeuroflowSettings, WorldState};
+use std::sync::Arc;
 
 /// Number of inputs inherited from the simulation sensors.
 const INPUT_SIZE: usize = scriptbots_core::INPUT_SIZE;
@@ -136,14 +137,13 @@ impl NeuroflowBrain {
 
     /// Register a NeuroFlow brain into the world registry and return its key.
     #[must_use]
-    pub fn register(
-        world: &mut WorldState,
-        config: NeuroflowBrainConfig,
-        rng: &mut dyn RngCore,
-    ) -> u64 {
+    pub fn register(world: &mut WorldState, config: NeuroflowBrainConfig) -> u64 {
+        let config = Arc::new(config);
         world
             .brain_registry_mut()
-            .register(Self::runner(config, rng))
+            .register(Self::KIND.as_str(), move |rng| {
+                Self::runner((*config).clone(), rng)
+            })
     }
 
     fn build_network(config: &NeuroflowBrainConfig, rng: &mut dyn RngCore) -> FeedForward {
@@ -237,8 +237,8 @@ impl Brain for NeuroflowBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::SmallRng;
     use rand::SeedableRng;
+    use rand::rngs::SmallRng;
 
     #[test]
     fn runner_executes_and_returns_outputs() {

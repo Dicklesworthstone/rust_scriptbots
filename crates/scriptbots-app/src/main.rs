@@ -1,9 +1,6 @@
 use anyhow::Result;
-use rand::{SeedableRng, rngs::SmallRng};
 use scriptbots_brain::MlpBrain;
-use scriptbots_core::{
-    AgentData, BrainBinding, NeuroflowActivationKind, ScriptBotsConfig, WorldState,
-};
+use scriptbots_core::{AgentData, NeuroflowActivationKind, ScriptBotsConfig, WorldState};
 use scriptbots_render::run_demo;
 use scriptbots_storage::{Storage, StoragePipeline};
 use std::{
@@ -40,9 +37,7 @@ fn bootstrap_world() -> Result<(SharedWorld, SharedStorageArc)> {
     let pipeline = StoragePipeline::new("scriptbots.db")?;
     let storage: SharedStorageArc = pipeline.storage();
     let mut world = WorldState::with_persistence(config, Box::new(pipeline))?;
-    let mut rng =
-        SmallRng::seed_from_u64(world.config().rng_seed.unwrap_or(0xFACA_DEAF_0123_4567_u64));
-    let brain_keys = install_brains(&mut world, &mut rng);
+    let brain_keys = install_brains(&mut world);
 
     seed_agents(&mut world, &brain_keys);
 
@@ -66,17 +61,25 @@ fn bootstrap_world() -> Result<(SharedWorld, SharedStorageArc)> {
     Ok((Arc::new(Mutex::new(world)), storage))
 }
 
-fn install_brains(world: &mut WorldState, rng: &mut SmallRng) -> Vec<u64> {
+fn install_brains(world: &mut WorldState) -> Vec<u64> {
     let mut keys = Vec::new();
 
-    let mlp_key = world.brain_registry_mut().register(MlpBrain::runner(rng));
+    let mlp_key = world
+        .brain_registry_mut()
+        .register(MlpBrain::KIND.as_str(), |seed_rng| {
+            MlpBrain::runner(seed_rng)
+        });
     keys.push(mlp_key);
 
     #[cfg(feature = "ml")]
     {
+        let label = {
+            let prototype = scriptbots_brain_ml::runner();
+            prototype.kind().to_string()
+        };
         let key = world
             .brain_registry_mut()
-            .register(scriptbots_brain_ml::runner());
+            .register(label, |_seed_rng| scriptbots_brain_ml::runner());
         keys.push(key);
     }
 
@@ -86,7 +89,7 @@ fn install_brains(world: &mut WorldState, rng: &mut SmallRng) -> Vec<u64> {
         let settings = world.config().neuroflow.clone();
         if settings.enabled {
             let config = NeuroflowBrainConfig::from_settings(&settings);
-            let key = NeuroflowBrain::register(world, config, rng);
+            let key = NeuroflowBrain::register(world, config);
             keys.push(key);
         }
     }
@@ -165,10 +168,10 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
             agent.heading = 0.0;
             agent.spike_length = 10.0;
             let id = world.spawn_agent(agent);
-            if let Some(runtime) = world.agent_runtime_mut(id)
-                && let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len())
+            if let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len())
+                && !world.bind_agent_brain(id, key)
             {
-                runtime.brain = BrainBinding::Registry { key };
+                warn!(agent = ?id, key, "Failed to bind brain to seeded agent");
             }
         }
     }
@@ -177,8 +180,6 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "neuro")]
-    use rand::{SeedableRng, rngs::SmallRng};
     use std::sync::{Mutex, OnceLock};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -231,8 +232,7 @@ mod tests {
         let mut config = ScriptBotsConfig::default();
         config.neuroflow.enabled = false;
         let mut world = WorldState::new(config).expect("world");
-        let mut rng = SmallRng::seed_from_u64(7);
-        let keys = install_brains(&mut world, &mut rng);
+        let keys = install_brains(&mut world);
         assert_eq!(
             keys.len(),
             1,
@@ -245,8 +245,7 @@ mod tests {
         config_enabled.neuroflow.activation = NeuroflowActivationKind::Sigmoid;
         config_enabled.rng_seed = Some(99);
         let mut world_enabled = WorldState::new(config_enabled.clone()).expect("world");
-        let mut rng_enabled = SmallRng::seed_from_u64(99);
-        let keys_enabled = install_brains(&mut world_enabled, &mut rng_enabled);
+        let keys_enabled = install_brains(&mut world_enabled);
         assert_eq!(
             keys_enabled.len(),
             2,
@@ -255,21 +254,16 @@ mod tests {
 
         let neuro_key = *keys_enabled.last().expect("neuro key");
         let agent_id = world_enabled.spawn_agent(AgentData::default());
-        if let Some(runtime) = world_enabled.agent_runtime_mut(agent_id) {
-            runtime.brain = BrainBinding::Registry { key: neuro_key };
-        }
+        assert!(world_enabled.bind_agent_brain(agent_id, neuro_key));
         world_enabled.step();
         let outputs_one = world_enabled.agent_runtime(agent_id).unwrap().outputs;
 
         let mut world_repeat = WorldState::new(config_enabled).expect("world");
-        let mut rng_repeat = SmallRng::seed_from_u64(99);
-        let keys_repeat = install_brains(&mut world_repeat, &mut rng_repeat);
+        let keys_repeat = install_brains(&mut world_repeat);
         assert_eq!(keys_repeat.len(), 2);
         let neuro_repeat = *keys_repeat.last().unwrap();
         let agent_repeat = world_repeat.spawn_agent(AgentData::default());
-        if let Some(runtime) = world_repeat.agent_runtime_mut(agent_repeat) {
-            runtime.brain = BrainBinding::Registry { key: neuro_repeat };
-        }
+        assert!(world_repeat.bind_agent_brain(agent_repeat, neuro_repeat));
         world_repeat.step();
         let outputs_two = world_repeat.agent_runtime(agent_repeat).unwrap().outputs;
 

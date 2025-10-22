@@ -680,10 +680,7 @@ impl Drop for StoragePipeline {
 }
 
 fn brain_binding_to_string(binding: &BrainBinding) -> String {
-    match binding {
-        BrainBinding::Unbound => "unbound".to_string(),
-        BrainBinding::Registry { key } => format!("registry:{key}"),
-    }
+    binding.describe().into_owned()
 }
 
 fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {

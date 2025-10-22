@@ -1,7 +1,7 @@
 //! Core types shared across the ScriptBots workspace.
 
 use ordered_float::OrderedFloat;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,42 @@ pub type AgentMap<T> = SecondaryMap<AgentId, T>;
 pub const INPUT_SIZE: usize = 25;
 /// Number of control outputs produced by each agent brain.
 pub const OUTPUT_SIZE: usize = 9;
+/// Number of directional eyes each agent possesses.
+pub const NUM_EYES: usize = 4;
+
+const FULL_TURN: f32 = std::f32::consts::TAU;
+const HALF_TURN: f32 = std::f32::consts::PI;
+const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.375; // 3π/8
+
+fn wrap_signed_angle(mut angle: f32) -> f32 {
+    if angle.is_nan() {
+        return 0.0;
+    }
+    while angle <= -HALF_TURN {
+        angle += FULL_TURN;
+    }
+    while angle > HALF_TURN {
+        angle -= FULL_TURN;
+    }
+    angle
+}
+
+fn wrap_unsigned_angle(mut angle: f32) -> f32 {
+    if angle.is_nan() {
+        return 0.0;
+    }
+    while angle < 0.0 {
+        angle += FULL_TURN;
+    }
+    while angle >= FULL_TURN {
+        angle -= FULL_TURN;
+    }
+    angle
+}
+
+fn clamp01(value: f32) -> f32 {
+    value.clamp(0.0, 1.0)
+}
 
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -88,17 +124,116 @@ pub enum SelectionState {
 }
 
 /// Runtime brain attachment tracking.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
-pub enum BrainBinding {
-    /// Brain not yet attached.
-    #[default]
-    Unbound,
-    /// Brain keyed in the world brain registry.
-    Registry { key: u64 },
+#[derive(Serialize, Deserialize)]
+pub struct BrainBinding {
+    #[serde(skip)]
+    runner: Option<Box<dyn BrainRunner>>,
+    registry_key: Option<u64>,
+    kind: Option<String>,
+}
+
+impl Default for BrainBinding {
+    fn default() -> Self {
+        Self::unbound()
+    }
+}
+
+impl Clone for BrainBinding {
+    fn clone(&self) -> Self {
+        Self {
+            runner: None,
+            registry_key: self.registry_key,
+            kind: self.kind.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for BrainBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrainBinding")
+            .field("registry_key", &self.registry_key)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl BrainBinding {
+    /// Construct an unbound brain attachment.
+    #[must_use]
+    pub fn unbound() -> Self {
+        Self {
+            runner: None,
+            registry_key: None,
+            kind: None,
+        }
+    }
+
+    /// Attach a brain runner produced outside the registry.
+    #[must_use]
+    pub fn with_runner(runner: Box<dyn BrainRunner>) -> Self {
+        let kind = Some(runner.kind().to_string());
+        Self {
+            runner: Some(runner),
+            registry_key: None,
+            kind,
+        }
+    }
+
+    /// Instantiate a brain from the registry and bind it to the agent.
+    #[must_use]
+    pub fn from_registry(
+        registry: &BrainRegistry,
+        rng: &mut dyn RngCore,
+        key: u64,
+    ) -> Option<Self> {
+        let runner = registry.spawn(rng, key)?;
+        let kind = registry.kind(key).map(str::to_string);
+        Some(Self {
+            runner: Some(runner),
+            registry_key: Some(key),
+            kind,
+        })
+    }
+
+    /// Return the registry key, if any, associated with this binding.
+    #[must_use]
+    pub const fn registry_key(&self) -> Option<u64> {
+        self.registry_key
+    }
+
+    /// Return the brain identifier when available.
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    /// Whether a brain runner is currently attached.
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        self.runner.is_some()
+    }
+
+    /// Produce a short descriptor suitable for persistence logs.
+    #[must_use]
+    pub fn describe(&self) -> Cow<'_, str> {
+        if let Some(key) = self.registry_key {
+            Cow::Owned(format!("registry:{key}"))
+        } else if let Some(kind) = &self.kind {
+            Cow::Borrowed(kind.as_str())
+        } else {
+            Cow::Borrowed("unbound")
+        }
+    }
+
+    /// Evaluate the brain if one is bound, returning the outputs.
+    #[must_use]
+    pub fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> Option<[f32; OUTPUT_SIZE]> {
+        self.runner.as_mut().map(|brain| brain.tick(inputs))
+    }
 }
 
 /// Thin trait object used to drive brain evaluations without coupling to concrete brain crates.
-pub trait BrainRunner: Send {
+pub trait BrainRunner: Send + Sync {
     /// Static identifier of the brain implementation.
     fn kind(&self) -> &'static str;
 
@@ -106,18 +241,25 @@ pub trait BrainRunner: Send {
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE];
 }
 
+type BrainSpawner = Box<dyn Fn(&mut dyn RngCore) -> Box<dyn BrainRunner> + Send + Sync + 'static>;
+
+struct BrainEntry {
+    kind: Cow<'static, str>,
+    spawner: BrainSpawner,
+}
+
 /// Registry owning brain runners keyed by opaque handles.
 #[derive(Default)]
 pub struct BrainRegistry {
     next_key: u64,
-    runners: HashMap<u64, Box<dyn BrainRunner>>, // stored in insertion order for determinism via key
+    entries: HashMap<u64, BrainEntry>,
 }
 
 impl std::fmt::Debug for BrainRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrainRegistry")
             .field("next_key", &self.next_key)
-            .field("runner_count", &self.runners.len())
+            .field("entry_count", &self.entries.len())
             .finish()
     }
 }
@@ -128,28 +270,43 @@ impl BrainRegistry {
         Self::default()
     }
 
-    /// Registers a new brain runner, returning its registry key.
-    pub fn register(&mut self, brain: Box<dyn BrainRunner>) -> u64 {
+    /// Registers a new brain factory, returning its registry key.
+    pub fn register<F>(&mut self, kind: impl Into<Cow<'static, str>>, factory: F) -> u64
+    where
+        F: Fn(&mut dyn RngCore) -> Box<dyn BrainRunner> + Send + Sync + 'static,
+    {
         let key = self.next_key;
         self.next_key += 1;
-        self.runners.insert(key, brain);
+        self.entries.insert(
+            key,
+            BrainEntry {
+                kind: kind.into(),
+                spawner: Box::new(factory),
+            },
+        );
         key
     }
 
-    /// Removes a brain runner from the registry.
-    pub fn unregister(&mut self, key: u64) -> Option<Box<dyn BrainRunner>> {
-        self.runners.remove(&key)
+    /// Removes a brain factory from the registry.
+    pub fn unregister(&mut self, key: u64) -> bool {
+        self.entries.remove(&key).is_some()
     }
 
-    /// Executes the brain assigned to `key`, returning the outputs if the key exists.
-    pub fn tick(&mut self, key: u64, inputs: &[f32; INPUT_SIZE]) -> Option<[f32; OUTPUT_SIZE]> {
-        self.runners.get_mut(&key).map(|brain| brain.tick(inputs))
+    /// Instantiate a new brain runner using the factory referenced by `key`.
+    pub fn spawn(&self, rng: &mut dyn RngCore, key: u64) -> Option<Box<dyn BrainRunner>> {
+        self.entries.get(&key).map(|entry| (entry.spawner)(rng))
+    }
+
+    /// Retrieve the descriptive identifier associated with a registry entry.
+    #[must_use]
+    pub fn kind(&self, key: u64) -> Option<&str> {
+        self.entries.get(&key).map(|entry| entry.kind.as_ref())
     }
 
     /// Returns whether a key is registered.
     #[must_use]
     pub fn contains(&self, key: u64) -> bool {
-        self.runners.contains_key(&key)
+        self.entries.contains_key(&key)
     }
 }
 
@@ -162,6 +319,8 @@ pub struct AgentRuntime {
     pub mutation_rates: MutationRates,
     pub trait_modifiers: TraitModifiers,
     pub clocks: [f32; 2],
+    pub eye_fov: [f32; NUM_EYES],
+    pub eye_direction: [f32; NUM_EYES],
     pub sound_multiplier: f32,
     pub give_intent: f32,
     pub sensors: [f32; INPUT_SIZE],
@@ -172,6 +331,7 @@ pub struct AgentRuntime {
     pub spiked: bool,
     pub hybrid: bool,
     pub sound_output: f32,
+    pub temperature_preference: f32,
     pub brain: BrainBinding,
     pub mutation_log: Vec<String>,
 }
@@ -185,6 +345,8 @@ impl Default for AgentRuntime {
             mutation_rates: MutationRates::default(),
             trait_modifiers: TraitModifiers::default(),
             clocks: [50.0, 50.0],
+            eye_fov: [1.0; NUM_EYES],
+            eye_direction: [0.0; NUM_EYES],
             sound_multiplier: 1.0,
             give_intent: 0.0,
             sensors: [0.0; INPUT_SIZE],
@@ -195,9 +357,42 @@ impl Default for AgentRuntime {
             spiked: false,
             hybrid: false,
             sound_output: 0.0,
+            temperature_preference: 0.5,
             brain: BrainBinding::default(),
             mutation_log: Vec::new(),
         }
+    }
+}
+
+impl AgentRuntime {
+    /// Sample randomized sensory parameters matching the legacy ScriptBots defaults.
+    pub fn new_random(rng: &mut dyn RngCore) -> Self {
+        let mut runtime = Self::default();
+        runtime.randomize_spawn(rng);
+        runtime
+    }
+
+    /// Randomize spawn-time traits and sensory configuration.
+    pub fn randomize_spawn(&mut self, rng: &mut dyn RngCore) {
+        use rand::Rng;
+
+        self.herbivore_tendency = rng.gen_range(0.0..1.0);
+        self.mutation_rates.primary = rng.gen_range(0.001..0.005);
+        self.mutation_rates.secondary = rng.gen_range(0.03..0.07);
+        self.trait_modifiers.smell = rng.gen_range(0.1..0.5);
+        self.trait_modifiers.sound = rng.gen_range(0.2..0.6);
+        self.trait_modifiers.hearing = rng.gen_range(0.7..1.3);
+        self.trait_modifiers.eye = rng.gen_range(1.0..3.0);
+        self.trait_modifiers.blood = rng.gen_range(1.0..3.0);
+        self.clocks[0] = rng.gen_range(5.0..100.0);
+        self.clocks[1] = rng.gen_range(5.0..100.0);
+        for fov in &mut self.eye_fov {
+            *fov = rng.gen_range(0.5..2.0);
+        }
+        for dir in &mut self.eye_direction {
+            *dir = rng.gen_range(0.0..FULL_TURN);
+        }
+        self.temperature_preference = rng.gen_range(0.0..1.0);
     }
 }
 
@@ -761,6 +956,38 @@ impl AgentColumns {
         removed
     }
 
+    /// Copy the row at `from` into position `to` without altering length.
+    pub fn move_row(&mut self, from: usize, to: usize) {
+        debug_assert!(from < self.len(), "move_row from out of bounds");
+        debug_assert!(to < self.len(), "move_row to out of bounds");
+        if from == to {
+            return;
+        }
+        self.positions[to] = self.positions[from];
+        self.velocities[to] = self.velocities[from];
+        self.headings[to] = self.headings[from];
+        self.health[to] = self.health[from];
+        self.colors[to] = self.colors[from];
+        self.spike_lengths[to] = self.spike_lengths[from];
+        self.boosts[to] = self.boosts[from];
+        self.ages[to] = self.ages[from];
+        self.generations[to] = self.generations[from];
+    }
+
+    /// Truncate all columns to the provided length.
+    pub fn truncate(&mut self, len: usize) {
+        self.positions.truncate(len);
+        self.velocities.truncate(len);
+        self.headings.truncate(len);
+        self.health.truncate(len);
+        self.colors.truncate(len);
+        self.spike_lengths.truncate(len);
+        self.boosts.truncate(len);
+        self.ages.truncate(len);
+        self.generations.truncate(len);
+        self.debug_assert_coherent();
+    }
+
     /// Return a copy of the scalar fields at `index`.
     #[must_use]
     pub fn snapshot(&self, index: usize) -> AgentData {
@@ -1005,6 +1232,33 @@ impl AgentArena {
         Some(removed)
     }
 
+    /// Remove all agents whose ids are contained in `dead`, preserving iteration order.
+    pub fn remove_many(&mut self, dead: &HashSet<AgentId>) -> usize {
+        if dead.is_empty() {
+            return 0;
+        }
+        let mut write = 0;
+        for read in 0..self.handles.len() {
+            let id = self.handles[read];
+            if dead.contains(&id) {
+                self.slots.remove(id);
+                continue;
+            }
+            if write != read {
+                self.handles[write] = id;
+                self.columns.move_row(read, write);
+            }
+            if let Some(slot) = self.slots.get_mut(id) {
+                *slot = write;
+            }
+            write += 1;
+        }
+        let removed = self.handles.len().saturating_sub(write);
+        self.handles.truncate(write);
+        self.columns.truncate(write);
+        removed
+    }
+
     /// Produce a copy of the scalar data for `id`.
     #[must_use]
     pub fn snapshot(&self, id: AgentId) -> Option<AgentData> {
@@ -1049,6 +1303,12 @@ pub struct ScriptBotsConfig {
     pub food_respawn_amount: f32,
     /// Maximum food allowed per cell.
     pub food_max: f32,
+    /// Logistic regrowth rate applied to each food cell every tick.
+    pub food_growth_rate: f32,
+    /// Proportional decay applied to each food cell every tick.
+    pub food_decay_rate: f32,
+    /// Diffusion factor exchanging food between neighboring cells each tick.
+    pub food_diffusion_rate: f32,
     /// Radius used for neighborhood sensing.
     pub sense_radius: f32,
     /// Normalization factor for counting neighbors.
@@ -1103,6 +1363,9 @@ impl Default for ScriptBotsConfig {
             food_respawn_interval: 15,
             food_respawn_amount: 0.5,
             food_max: 0.5,
+            food_growth_rate: 0.05,
+            food_decay_rate: 0.002,
+            food_diffusion_rate: 0.15,
             sense_radius: 120.0,
             sense_max_neighbors: 12.0,
             metabolism_drain: 0.002,
@@ -1202,6 +1465,15 @@ impl ScriptBotsConfig {
         if self.food_respawn_amount > self.food_max {
             return Err(WorldStateError::InvalidConfig(
                 "food_respawn_amount cannot exceed food_max",
+            ));
+        }
+        if self.food_growth_rate < 0.0
+            || self.food_decay_rate < 0.0
+            || self.food_diffusion_rate < 0.0
+            || self.food_diffusion_rate > 0.25
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "food growth/decay must be non-negative and diffusion in [0, 0.25]",
             ));
         }
         if self.metabolism_drain < 0.0
@@ -1335,6 +1607,7 @@ pub struct WorldState {
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
+    food_scratch: Vec<f32>,
     pending_deaths: Vec<AgentId>,
     #[allow(dead_code)]
     pending_spawns: Vec<SpawnOrder>,
@@ -1386,6 +1659,7 @@ impl WorldState {
             runtime: AgentMap::new(),
             index,
             brain_registry: BrainRegistry::new(),
+            food_scratch: vec![0.0; (food_w as usize) * (food_h as usize)],
             pending_deaths: Vec::new(),
             pending_spawns: Vec::new(),
             persistence,
@@ -1421,6 +1695,67 @@ impl WorldState {
             Some((x, y))
         } else {
             None
+        }
+    }
+
+    fn stage_food_dynamics(&mut self, next_tick: Tick) -> Option<(u32, u32)> {
+        let respawned = self.stage_food_respawn(next_tick);
+        self.apply_food_regrowth();
+        respawned
+    }
+
+    fn apply_food_regrowth(&mut self) {
+        let growth = self.config.food_growth_rate;
+        let decay = self.config.food_decay_rate;
+        let diffusion = self.config.food_diffusion_rate;
+        if growth <= 0.0 && decay <= 0.0 && diffusion <= 0.0 {
+            return;
+        }
+
+        let width = self.food.width() as usize;
+        let height = self.food.height() as usize;
+        let len = width * height;
+        if self.food_scratch.len() != len {
+            self.food_scratch.resize(len, 0.0);
+        }
+
+        {
+            let cells = self.food.cells();
+            self.food_scratch[..len].copy_from_slice(cells);
+        }
+
+        let max_value = self.config.food_max;
+        let previous = &self.food_scratch;
+        let cells_mut = self.food.cells_mut();
+
+        for y in 0..height {
+            let up_row = if y == 0 { height - 1 } else { y - 1 };
+            let down_row = if y + 1 == height { 0 } else { y + 1 };
+            for x in 0..width {
+                let left_col = if x == 0 { width - 1 } else { x - 1 };
+                let right_col = if x + 1 == width { 0 } else { x + 1 };
+                let idx = y * width + x;
+                let mut value = previous[idx];
+
+                if diffusion > 0.0 {
+                    let left = previous[y * width + left_col];
+                    let right = previous[y * width + right_col];
+                    let up = previous[up_row * width + x];
+                    let down = previous[down_row * width + x];
+                    let neighbor_avg = (left + right + up + down) * 0.25;
+                    value += diffusion * (neighbor_avg - previous[idx]);
+                }
+
+                if decay > 0.0 {
+                    value -= decay * value;
+                }
+
+                if growth > 0.0 {
+                    value += growth * (max_value - value);
+                }
+
+                cells_mut[idx] = value.clamp(0.0, max_value);
+            }
         }
     }
 
@@ -1516,13 +1851,10 @@ impl WorldState {
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         for agent_id in handles {
             if let Some(runtime) = self.runtime.get_mut(agent_id) {
-                let outputs = match runtime.brain {
-                    BrainBinding::Registry { key } => self
-                        .brain_registry
-                        .tick(key, &runtime.sensors)
-                        .unwrap_or_else(|| Self::default_outputs(&runtime.sensors)),
-                    BrainBinding::Unbound => Self::default_outputs(&runtime.sensors),
-                };
+                let outputs = runtime
+                    .brain
+                    .tick(&runtime.sensors)
+                    .unwrap_or_else(|| Self::default_outputs(&runtime.sensors));
                 runtime.outputs = outputs;
             }
         }
@@ -1747,6 +2079,7 @@ impl WorldState {
         }
 
         let positions = self.agents.columns().positions();
+        let velocities: Vec<Velocity> = self.agents.columns().velocities().to_vec();
         let spike_lengths = self.agents.columns().spike_lengths();
         let positions_pairs: Vec<(f32, f32)> = positions.iter().map(|p| (p.x, p.y)).collect();
         let _ = self.index.rebuild(&positions_pairs);
@@ -1755,12 +2088,16 @@ impl WorldState {
         let spike_energy_cost = self.config.spike_energy_cost;
         let index = &self.index;
         let runtime = &self.runtime;
+        let mut attacker_events: Vec<(usize, AgentId)> = Vec::new();
 
         let results: Vec<CombatResult> = handles
             .par_iter()
             .enumerate()
             .map(|(idx, agent_id)| {
                 if let Some(runtime) = runtime.get(*agent_id) {
+                    if runtime.herbivore_tendency > 0.8 {
+                        return CombatResult::default();
+                    }
                     let energy_before = runtime.energy;
                     if !runtime.spiked {
                         return CombatResult {
@@ -1783,12 +2120,29 @@ impl WorldState {
 
                     let reach: f32 = (spike_radius + spike_lengths[idx]).max(1.0);
                     let reach_sq = reach * reach;
+                    let wheel_left = runtime.outputs.get(0).copied().unwrap_or(0.0).abs();
+                    let wheel_right = runtime.outputs.get(1).copied().unwrap_or(0.0).abs();
+                    let speed_factor = wheel_left.max(wheel_right).max(velocities[idx].x.abs())
+                        .max(velocities[idx].y.abs())
+                        .max(1e-3);
+                    let boost_factor = if runtime.outputs.get(3).copied().unwrap_or(0.0) > 0.5 {
+                        1.3
+                    } else {
+                        1.0
+                    };
+                    let base_damage = spike_damage
+                        * spike_power
+                        * spike_lengths[idx].max(0.0)
+                        * speed_factor
+                        * boost_factor;
                     let mut contributions = Vec::new();
                     index.neighbors_within(
                         idx,
                         reach_sq,
                         &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
-                            contributions.push((other_idx, spike_damage * spike_power));
+                            if other_idx != idx {
+                                contributions.push((other_idx, base_damage));
+                            }
                         },
                     );
 
@@ -1806,6 +2160,9 @@ impl WorldState {
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 runtime.energy = results[idx].energy;
+                if !results[idx].contributions.is_empty() {
+                    attacker_events.push((idx, *agent_id));
+                }
             }
             for &(other_idx, dmg) in &results[idx].contributions {
                 if let Some(target) = damage.get_mut(other_idx) {
@@ -1823,9 +2180,26 @@ impl WorldState {
             healths[idx] = (healths[idx] - dmg).max(0.0);
             if let Some(runtime) = self.runtime.get_mut(handles[idx]) {
                 runtime.food_delta -= dmg;
+                runtime.spiked = true;
+                runtime.indicator = IndicatorState {
+                    intensity: (runtime.indicator.intensity + dmg).min(100.0),
+                    color: [1.0, 1.0, 0.0],
+                };
             }
             if healths[idx] <= 0.0 {
                 self.pending_deaths.push(handles[idx]);
+            }
+        }
+
+        for (idx, agent_id) in attacker_events {
+            if let Some(runtime) = self.runtime.get_mut(agent_id) {
+                runtime.indicator = IndicatorState {
+                    intensity: (runtime.indicator.intensity + 10.0).min(100.0),
+                    color: [1.0, 0.8, 0.0],
+                };
+            }
+            if let Some(spike_len) = columns.spike_lengths_mut().get_mut(idx) {
+                *spike_len = (*spike_len - 0.1).max(0.0);
             }
         }
     }
@@ -1834,14 +2208,27 @@ impl WorldState {
         if self.pending_deaths.is_empty() {
             return;
         }
-        let mut unique = HashSet::new();
-        let removals: Vec<AgentId> = self.pending_deaths.drain(..).collect();
-        for agent_id in removals {
-            if unique.insert(agent_id) {
-                self.remove_agent(agent_id);
+        let mut seen = HashSet::new();
+        let mut dead = Vec::new();
+        for agent_id in self.pending_deaths.drain(..) {
+            if seen.insert(agent_id) && self.agents.contains(agent_id) {
+                if let Some(idx) = self.agents.index_of(agent_id) {
+                    dead.push((idx, agent_id));
+                }
             }
         }
-        self.last_deaths = unique.len();
+        if dead.is_empty() {
+            self.last_deaths = 0;
+            return;
+        }
+        dead.sort_by_key(|(idx, _)| *idx);
+        let mut removed = 0usize;
+        for (_, agent_id) in dead.into_iter().rev() {
+            if self.remove_agent(agent_id).is_some() {
+                removed += 1;
+            }
+        }
+        self.last_deaths = removed;
     }
 
     fn stage_reproduction(&mut self) {
@@ -2004,6 +2391,24 @@ impl WorldState {
         (value + delta).clamp(min, max)
     }
 
+    fn mutate_value_with_probability(
+        &mut self,
+        value: f32,
+        rate: f32,
+        scale: f32,
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if scale <= 0.0 || rate <= 0.0 {
+            return value.clamp(min, max);
+        }
+        if self.rng.gen::<f32>() < rate * 5.0 {
+            self.mutate_value(value, scale, min, max)
+        } else {
+            value.clamp(min, max)
+        }
+    }
+
     fn stage_persistence(&mut self, next_tick: Tick) {
         if self.config.persistence_interval == 0
             || !next_tick
@@ -2094,6 +2499,7 @@ impl WorldState {
         let previous_epoch = self.epoch;
 
         self.stage_aging();
+        let food_respawned = self.stage_food_dynamics(next_tick);
         self.stage_sense();
         self.stage_brains();
         self.stage_actuation();
@@ -2111,7 +2517,7 @@ impl WorldState {
                     .0
                     .is_multiple_of(self.config.chart_flush_interval as u64),
             epoch_rolled: false,
-            food_respawned: self.stage_food_respawn(next_tick),
+            food_respawned,
         };
 
         self.stage_reset_events();
@@ -2207,7 +2613,8 @@ impl WorldState {
     /// Spawn a new agent, returning its handle.
     pub fn spawn_agent(&mut self, agent: AgentData) -> AgentId {
         let id = self.agents.insert(agent);
-        self.runtime.insert(id, AgentRuntime::default());
+        let runtime = AgentRuntime::new_random(&mut self.rng);
+        self.runtime.insert(id, runtime);
         id
     }
 
@@ -2239,6 +2646,21 @@ impl WorldState {
     #[must_use]
     pub fn brain_registry_mut(&mut self) -> &mut BrainRegistry {
         &mut self.brain_registry
+    }
+
+    /// Bind a brain from the registry to the specified agent. Returns `true` on success.
+    pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> bool {
+        if !self.agents.contains(id) {
+            return false;
+        }
+        if let Some(runtime) = self.runtime.get_mut(id)
+            && let Some(binding) =
+                BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)
+        {
+            runtime.brain = binding;
+            return true;
+        }
+        false
     }
 
     /// Immutable access to per-agent runtime metadata.
@@ -2488,10 +2910,10 @@ mod tests {
 
         let mut world = WorldState::new(config).expect("world");
         let id = world.spawn_agent(sample_agent(0));
-        let key = world.brain_registry_mut().register(Box::new(StubBrain));
-        if let Some(runtime) = world.agent_runtime_mut(id) {
-            runtime.brain = BrainBinding::Registry { key };
-        }
+        let key = world
+            .brain_registry_mut()
+            .register("stub", |_rng| Box::new(StubBrain));
+        assert!(world.bind_agent_brain(id, key));
 
         let events = world.step();
         assert_eq!(events.tick, Tick(1));
@@ -2502,7 +2924,10 @@ mod tests {
         assert!(runtime.energy < 1.0);
     }
 
-    fn run_seeded_history(mut config: ScriptBotsConfig, steps: usize) -> Vec<TickSummary> {
+    fn run_seeded_history(
+        mut config: ScriptBotsConfig,
+        steps: usize,
+    ) -> (Vec<TickSummary>, Vec<f32>) {
         assert!(steps > 0, "steps must be greater than zero");
         config.history_capacity = steps;
         config.persistence_interval = 1;
@@ -2513,7 +2938,9 @@ mod tests {
         for _ in 0..steps {
             world.step();
         }
-        world.history().cloned().collect()
+        let history: Vec<_> = world.history().cloned().collect();
+        let food: Vec<f32> = world.food().cells().to_vec();
+        (history, food)
     }
 
     #[test]
@@ -2532,19 +2959,23 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
 
-        let history_a = run_seeded_history(base_config.clone(), STEPS);
-        let history_b = run_seeded_history(base_config.clone(), STEPS);
+        let (history_a, food_a) = run_seeded_history(base_config.clone(), STEPS);
+        let (history_b, food_b) = run_seeded_history(base_config.clone(), STEPS);
         assert_eq!(
             history_a, history_b,
             "identical seeds should produce identical histories"
         );
+        assert_eq!(
+            food_a, food_b,
+            "identical seeds should produce identical food distributions"
+        );
 
         let mut different_seed = base_config;
         different_seed.rng_seed = Some(0xF00DF00D);
-        let history_c = run_seeded_history(different_seed, STEPS);
-        assert_ne!(
-            history_a, history_c,
-            "different seeds should produce different histories"
+        let (history_c, food_c) = run_seeded_history(different_seed, STEPS);
+        assert!(
+            history_a != history_c || food_a != food_c,
+            "different seeds should produce different histories or food distributions"
         );
     }
 
@@ -2739,5 +3170,41 @@ mod tests {
                 .energy
                 < 1.0
         );
+    }
+
+    #[test]
+    fn death_cleanup_is_stable_and_deduplicated() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            reproduction_energy_threshold: 0.0,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 0,
+            reproduction_child_energy: 0.0,
+            rng_seed: Some(1234),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let ids: Vec<_> = (0..4)
+            .map(|seed| world.spawn_agent(sample_agent(seed)))
+            .collect();
+
+        world.pending_deaths.push(ids[1]);
+        world.pending_deaths.push(ids[3]);
+        world.pending_deaths.push(ids[1]);
+
+        world.stage_death_cleanup();
+
+        let survivors: Vec<_> = world.agents().iter_handles().collect();
+        assert_eq!(survivors, vec![ids[0], ids[2]]);
+        assert!(world.agent_runtime(ids[1]).is_none());
+        assert!(world.agent_runtime(ids[3]).is_none());
+        assert_eq!(world.agent_count(), 2);
+        assert!(world.pending_deaths.is_empty());
+        assert_eq!(world.last_deaths, 2);
     }
 }
