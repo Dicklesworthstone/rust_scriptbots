@@ -1,4 +1,5 @@
-use crossfire::{MAsyncTx, MRx, TryRecvError, TrySendError, detect_backoff_cfg, mpmc};
+use crossfire::mpmc;
+use crossfire::{MAsyncTx, MRx, TryRecvError, TrySendError, detect_backoff_cfg};
 use scriptbots_core::{ControlCommand, WorldState, apply_control_command};
 use std::sync::Arc;
 use tracing::{debug, warn};

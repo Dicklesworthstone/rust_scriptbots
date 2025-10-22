@@ -76,6 +76,17 @@ Set logging verbosity with `RUST_LOG`, for example:
 RUST_LOG=info cargo run -p scriptbots-app
 ```
 
+#### Terminal-only mode
+- Force the emoji TUI renderer (useful on headless machines):
+  ```bash
+  SCRIPTBOTS_MODE=terminal cargo run -p scriptbots-app
+  ```
+- Auto fallback: `SCRIPTBOTS_MODE=auto` (default) will drop into terminal mode if no GUI backend is available (e.g., SSH sessions).
+- Override detection:
+  - `SCRIPTBOTS_FORCE_TERMINAL=1` → force terminal even when a display server is present.
+  - `SCRIPTBOTS_FORCE_GUI=1` → keep GPUI even if no display variables are set (may still fail if the OS truly lacks a GUI).
+- CI/headless smoke runs can bypass raw TTY requirements by setting `SCRIPTBOTS_TERMINAL_HEADLESS=1`, which drives the renderer against an in-memory buffer for a few frames.
+
 ### Build for Web (experimental)
 ```bash
 rustup target add wasm32-unknown-unknown

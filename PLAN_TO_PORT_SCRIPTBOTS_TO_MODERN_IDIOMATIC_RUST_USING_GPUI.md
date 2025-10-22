@@ -337,5 +337,5 @@
 - [Completed - 2025-10-22] Terminal renderer scaffolding: new `terminal` module implements the shared `Renderer` trait with the crossterm/ratatui event loop.
 - [Completed - 2025-10-22] HUD implementation pass 1: terminal view renders status header, rolling history, and an emoji mini-map with palette fallbacks.
 - [Completed - 2025-10-22] Input handling parity: pause/resume, speed scaling, single-step, help overlay, and quit shortcuts are wired into the control runtime.
-- [ ] Automated testing: add headless smoke test (CI) invoking terminal renderer under `TERM=xterm-256color` to guard regressions.
-- [ ] Documentation updates: README usage section, environment variables, and example captures; note feature flag expectations.
+- [Completed - 2025-10-22] Automated testing: headless smoke test runs the `scriptbots-app` binary in terminal mode (`SCRIPTBOTS_TERMINAL_HEADLESS=1`) to guard against regressions.
+- [Completed - 2025-10-22] Documentation updates: README now covers terminal mode flags, fallback behavior, and headless usage tips.

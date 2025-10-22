@@ -1,3 +1,4 @@
+use std::env;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
+    backend::{CrosstermBackend, TestBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -50,6 +51,10 @@ impl Renderer for TerminalRenderer {
     }
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
+        if env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS").is_some() {
+            return self.run_headless(ctx);
+        }
+
         let mut stdout = io::stdout();
         enable_raw_mode().context("failed to enable raw mode")?;
         execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -102,6 +107,21 @@ fn run_event_loop(
     }
 
     Ok(())
+}
+
+impl TerminalRenderer {
+    fn run_headless(&self, ctx: RendererContext<'_>) -> Result<()> {
+        let backend = TestBackend::new(80, 36);
+        let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
+        let mut app = TerminalApp::new(self, ctx);
+
+        for _ in 0..5 {
+            app.step_once();
+            terminal.draw(|frame| app.draw(frame))?;
+        }
+
+        Ok(())
+    }
 }
 
 struct TerminalApp<'a> {
@@ -189,6 +209,14 @@ impl<'a> TerminalApp<'a> {
             }
         }
 
+        self.refresh_snapshot();
+    }
+
+    fn step_once(&mut self) {
+        if let Ok(mut world) = self.world.lock() {
+            (self.command_drain.as_ref())(&mut world);
+            world.step();
+        }
         self.refresh_snapshot();
     }
 
