@@ -1,20 +1,32 @@
 //! GPUI rendering layer for ScriptBots.
 
 use gpui::{
-    App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
-    ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, canvas, div, fill, point,
-    prelude::*, px, rgb, size,
+    Angle, App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba,
+    ScrollDelta, ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, canvas, div,
+    fill, point, prelude::*, px, rgb, size,
 };
 use scriptbots_core::{
     AgentColumns, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState, MutationRates,
-    OUTPUT_SIZE, Position, SelectionState, TickSummary, TraitModifiers, WorldState,
+    OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
+    TraitModifiers, WorldState,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
     time::Instant,
 };
+
+#[cfg(feature = "audio")]
+use kira::{
+    DefaultBackend,
+    frame::Frame,
+    manager::{AudioManager, AudioManagerSettings},
+    sound::static_sound::{StaticSoundData, StaticSoundSettings},
+};
+
+#[cfg(feature = "audio")]
+use std::f32::consts::PI;
 use tracing::{error, info};
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
@@ -72,6 +84,8 @@ struct SimulationView {
     accessibility: AccessibilitySettings,
     bindings: InputBindings,
     key_capture: Option<CommandAction>,
+    #[cfg(feature = "audio")]
+    audio: Option<AudioState>,
 }
 
 impl SimulationView {
@@ -86,6 +100,13 @@ impl SimulationView {
             accessibility: AccessibilitySettings::default(),
             bindings: InputBindings::default(),
             key_capture: None,
+            #[cfg(feature = "audio")]
+            audio: AudioState::new()
+                .map_err(|err| {
+                    error!(?err, "failed to initialize audio manager");
+                    err
+                })
+                .ok(),
         }
     }
 
@@ -560,6 +581,10 @@ impl SimulationView {
             let new_state = !inspector.brush_enabled;
             inspector.brush_enabled = new_state;
         }
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
         cx.notify();
     }
 
@@ -570,12 +595,20 @@ impl SimulationView {
         } else {
             info!("Narration disabled");
         }
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
         cx.notify();
     }
 
     fn cycle_palette(&mut self, cx: &mut Context<Self>) {
         let next = self.accessibility.palette.next();
         self.accessibility.palette = next;
+        #[cfg(feature = "audio")]
+        if let Some(audio) = self.audio.as_mut() {
+            audio.play(&audio.toggle_sound);
+        }
         cx.notify();
     }
 
@@ -609,6 +642,40 @@ impl SimulationView {
     fn playback_go_live(&mut self, cx: &mut Context<Self>) {
         self.playback.go_live();
         cx.notify();
+    }
+
+    #[cfg(feature = "audio")]
+    fn update_audio(&mut self, snapshot: &HudSnapshot) {
+        let audio = match self.audio.as_mut() {
+            Some(audio) => audio,
+            None => return,
+        };
+
+        if self.playback.mode() != PlaybackMode::Live {
+            return;
+        }
+
+        if let Some(summary) = snapshot.summary.as_ref() {
+            if summary.tick != audio.last_tick {
+                if summary.births > audio.last_births {
+                    audio.play(&audio.birth_sound);
+                }
+                if summary.deaths > audio.last_deaths {
+                    audio.play(&audio.death_sound);
+                }
+                audio.last_births = summary.births;
+                audio.last_deaths = summary.deaths;
+                audio.last_tick = summary.tick;
+            }
+        }
+
+        if let Some(frame) = snapshot.render_frame.as_ref() {
+            let spiked = frame.agents.iter().filter(|agent| agent.spiked).count();
+            if spiked > audio.last_spike_count {
+                audio.play(&audio.spike_sound);
+            }
+            audio.last_spike_count = spiked;
+        }
     }
 
     fn render_inspector(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
@@ -1443,21 +1510,58 @@ impl SimulationView {
             lines.push("Playback LIVE · no frames".to_string());
         }
 
+        let mut container = div().flex().gap_3().items_start();
+
+        if let Some(vector_state) = VectorHudState::from_snapshot(snapshot) {
+            let canvas_state = vector_state.clone();
+            let vector_canvas = canvas(
+                move |_, _, _| canvas_state.clone(),
+                move |bounds, state, window, _| paint_vector_hud(bounds, &state, window),
+            )
+            .w(px(148.0))
+            .h(px(108.0));
+
+            let vector_card = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x07111f))
+                .px_3()
+                .py_3()
+                .child(vector_canvas)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x64748b))
+                        .child("Vector HUD gauges"),
+                );
+
+            container = container.child(vector_card);
+        }
+
+        let text_column = div().flex().flex_col().gap_1().children(
+            lines
+                .into_iter()
+                .map(|line| div().text_sm().text_color(rgb(0xe2e8f0)).child(line)),
+        );
+
+        container = container.child(text_column);
+
         div()
             .absolute()
             .top(px(12.0))
             .left(px(12.0))
-            .bg(rgb(0x111b2b))
+            .bg(rgb(0x0b1120))
             .rounded_md()
             .shadow_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
             .px_3()
-            .py_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .text_sm()
-            .text_color(rgb(0xe2e8f0))
-            .children(lines.into_iter().map(|line| div().child(line)))
+            .py_3()
+            .child(container)
     }
 
     fn render_perf_overlay(&self, stats: PerfSnapshot) -> Div {
@@ -1612,7 +1716,7 @@ impl Render for SimulationView {
         let live_snapshot = self.snapshot();
         let snapshot = self.playback.snapshot_for_render(live_snapshot);
 
-        let content = div()
+        let mut content = div()
             .size_full()
             .relative()
             .flex()
@@ -1639,7 +1743,11 @@ impl Render for SimulationView {
 
         let perf_snapshot = self.perf.end_frame();
 
-        content.child(self.render_perf_overlay(perf_snapshot))
+        #[cfg(feature = "audio")]
+        self.update_audio(&snapshot);
+
+        content = content.child(self.render_perf_overlay(perf_snapshot));
+        content
     }
 }
 
@@ -1655,6 +1763,64 @@ struct HudSnapshot {
     recent_history: Vec<HudHistoryEntry>,
     render_frame: Option<RenderFrame>,
     inspector: InspectorSnapshot,
+}
+
+#[derive(Clone)]
+struct VectorHudState {
+    population_ratio: f32,
+    energy_ratio: f32,
+    births_ratio: f32,
+    deaths_ratio: f32,
+    tick_phase: f32,
+}
+
+impl VectorHudState {
+    fn from_snapshot(snapshot: &HudSnapshot) -> Option<Self> {
+        let metrics = snapshot.summary.as_ref()?;
+
+        let max_agents = snapshot
+            .recent_history
+            .iter()
+            .map(|entry| entry.agent_count)
+            .chain(std::iter::once(metrics.agent_count))
+            .max()
+            .unwrap_or(metrics.agent_count)
+            .max(1);
+
+        let max_births = snapshot
+            .recent_history
+            .iter()
+            .map(|entry| entry.births)
+            .chain(std::iter::once(metrics.births))
+            .max()
+            .unwrap_or(metrics.births)
+            .max(1);
+
+        let max_deaths = snapshot
+            .recent_history
+            .iter()
+            .map(|entry| entry.deaths)
+            .chain(std::iter::once(metrics.deaths))
+            .max()
+            .unwrap_or(metrics.deaths)
+            .max(1);
+
+        let mut energy_max = metrics.average_energy.max(0.0);
+        for entry in &snapshot.recent_history {
+            energy_max = energy_max.max(entry.average_energy);
+        }
+        if energy_max <= f32::EPSILON {
+            energy_max = 1.0;
+        }
+
+        Some(Self {
+            population_ratio: metrics.agent_count as f32 / max_agents as f32,
+            energy_ratio: (metrics.average_energy / energy_max).clamp(0.0, 1.0),
+            births_ratio: metrics.births as f32 / max_births as f32,
+            deaths_ratio: metrics.deaths as f32 / max_deaths as f32,
+            tick_phase: (snapshot.tick % 960) as f32 / 960.0,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -1939,6 +2105,48 @@ impl InputBindings {
     }
 }
 
+#[cfg(feature = "audio")]
+struct AudioState {
+    manager: AudioManager<DefaultBackend>,
+    birth_sound: StaticSoundData,
+    death_sound: StaticSoundData,
+    spike_sound: StaticSoundData,
+    toggle_sound: StaticSoundData,
+    last_births: usize,
+    last_deaths: usize,
+    last_spike_count: usize,
+    last_tick: u64,
+}
+
+#[cfg(feature = "audio")]
+impl AudioState {
+    fn new() -> Result<Self, String> {
+        let manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
+            .map_err(|err| format!("{err:?}"))?;
+        let birth_sound = generate_tone(523.25, 0.18, 0.4);
+        let death_sound = generate_tone(196.0, 0.22, 0.45);
+        let spike_sound = generate_tone(880.0, 0.12, 0.35);
+        let toggle_sound = generate_tone(660.0, 0.10, 0.3);
+        Ok(Self {
+            manager,
+            birth_sound,
+            death_sound,
+            spike_sound,
+            toggle_sound,
+            last_births: 0,
+            last_deaths: 0,
+            last_spike_count: 0,
+            last_tick: u64::MAX,
+        })
+    }
+
+    fn play(&mut self, sound: &StaticSoundData) {
+        if let Err(err) = self.manager.play(sound.clone()) {
+            error!(?err, "failed to play audio cue");
+        }
+    }
+}
+
 fn keystrokes_equal(a: &Keystroke, b: &Keystroke) -> bool {
     if a.key.is_empty() || b.key.is_empty() {
         return false;
@@ -2161,6 +2369,27 @@ fn scale_rgb(color: Rgba, factor: f32) -> Rgba {
     }
 }
 
+#[cfg(feature = "audio")]
+const AUDIO_SAMPLE_RATE: u32 = 44_100;
+
+#[cfg(feature = "audio")]
+fn generate_tone(frequency: f32, duration: f32, amplitude: f32) -> StaticSoundData {
+    let total_samples = (duration * AUDIO_SAMPLE_RATE as f32).max(1.0) as usize;
+    let mut frames = Vec::with_capacity(total_samples);
+    for i in 0..total_samples {
+        let t = i as f32 / AUDIO_SAMPLE_RATE as f32;
+        let envelope = (1.0 - t / duration).clamp(0.0, 1.0);
+        let sample = (2.0 * PI * frequency * t).sin() * amplitude * envelope;
+        frames.push(Frame::from_mono(sample));
+    }
+    StaticSoundData {
+        sample_rate: AUDIO_SAMPLE_RATE,
+        frames: frames.into(),
+        settings: StaticSoundSettings::default(),
+        slice: None,
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct PerfSnapshot {
     latest_ms: f32,
@@ -2269,6 +2498,10 @@ impl PlaybackState {
             mode: PlaybackMode::Live,
             pointer: 0,
         }
+    }
+
+    fn mode(&self) -> PlaybackMode {
+        self.mode
     }
 
     fn record(&mut self, snapshot: HudSnapshot) {
@@ -2397,6 +2630,7 @@ fn color_swatch(color: [f32; 3]) -> Div {
 struct RenderFrame {
     tick: u64,
     world_size: (f32, f32),
+    terrain: TerrainFrame,
     food_dimensions: (u32, u32),
     food_cell_size: u32,
     food_cells: Vec<f32>,
@@ -2404,6 +2638,22 @@ struct RenderFrame {
     agents: Vec<AgentRenderData>,
     agent_base_radius: f32,
     palette: ColorPaletteMode,
+}
+
+#[derive(Clone)]
+struct TerrainFrame {
+    dimensions: (u32, u32),
+    cell_size: u32,
+    tiles: Vec<TerrainTileVisual>,
+}
+
+#[derive(Clone, Copy)]
+struct TerrainTileVisual {
+    kind: TerrainKind,
+    elevation: f32,
+    moisture: f32,
+    accent: f32,
+    slope: f32,
 }
 
 #[derive(Clone)]
@@ -2469,17 +2719,81 @@ impl RenderFrame {
             })
             .collect();
 
+        let food_cells = food.cells().to_vec();
+        let terrain = build_terrain_frame(world.terrain());
+
         Some(Self {
             tick: world.tick().0,
             world_size: (config.world_width as f32, config.world_height as f32),
+            terrain,
             food_dimensions: (width, height),
             food_cell_size: config.food_cell_size,
-            food_cells: food.cells().to_vec(),
+            food_cells,
             food_max: config.food_max,
             agents,
             agent_base_radius: (config.spike_radius * 0.5).max(12.0),
             palette,
         })
+    }
+}
+
+fn build_terrain_frame(layer: &TerrainLayer) -> TerrainFrame {
+    let width = layer.width();
+    let height = layer.height();
+    let mut tiles = Vec::with_capacity((width as usize) * (height as usize));
+    let source = layer.tiles();
+    if width == 0 || height == 0 {
+        return TerrainFrame {
+            dimensions: (width, height),
+            cell_size: layer.cell_size(),
+            tiles,
+        };
+    }
+
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let idx = y * width_usize + x;
+            let tile = source[idx];
+
+            let left = if x > 0 { source[idx - 1] } else { tile };
+            let right = if x + 1 < width_usize {
+                source[idx + 1]
+            } else {
+                tile
+            };
+            let up = if y > 0 {
+                source[idx - width_usize]
+            } else {
+                tile
+            };
+            let down = if y + 1 < height_usize {
+                source[idx + width_usize]
+            } else {
+                tile
+            };
+
+            let slope = ((tile.elevation - left.elevation).abs()
+                + (tile.elevation - right.elevation).abs()
+                + (tile.elevation - up.elevation).abs()
+                + (tile.elevation - down.elevation).abs())
+                * 0.25;
+
+            tiles.push(TerrainTileVisual {
+                kind: tile.kind,
+                elevation: tile.elevation,
+                moisture: tile.moisture,
+                accent: tile.accent,
+                slope,
+            });
+        }
+    }
+
+    TerrainFrame {
+        dimensions: (width, height),
+        cell_size: layer.cell_size(),
+        tiles,
     }
 }
 
@@ -2596,6 +2910,139 @@ fn paint_history_chart(bounds: Bounds<Pixels>, data: &HistoryChartData, window: 
     draw_polyline(&data.agents, rgb(0x38bdf8));
     draw_polyline(&data.births, rgb(0x22c55e));
     draw_polyline(&data.deaths, rgb(0xef4444));
+}
+
+fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut Window) {
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+
+    let backdrop = rgba_from_hex(0x091220, 0.88);
+    window.paint_quad(fill(bounds, Background::from(backdrop)));
+
+    let cx = f32::from(origin.x) + width * 0.5;
+    let cy = f32::from(origin.y) + height * 0.52;
+    let center = point(px(cx), px(cy));
+    let radius = (width.min(height) * 0.36).max(18.0);
+
+    let mut base_arc = PathBuilder::stroke(px(3.2));
+    base_arc.arc(
+        center,
+        px(radius),
+        Angle::from_degrees(-140.0),
+        Angle::from_degrees(280.0),
+    );
+    if let Ok(path) = base_arc.build() {
+        window.paint_path(path, rgba_from_hex(0x142033, 0.95));
+    }
+
+    let progress_deg = 280.0 * state.population_ratio.clamp(0.0, 1.0);
+    if progress_deg > 0.5 {
+        let mut progress_arc = PathBuilder::stroke(px(4.2));
+        progress_arc.arc(
+            center,
+            px(radius),
+            Angle::from_degrees(-140.0),
+            Angle::from_degrees(progress_deg),
+        );
+        if let Ok(path) = progress_arc.build() {
+            let progress_color = lerp_rgba(
+                rgba_from_hex(0x38bdf8, 0.95),
+                rgba_from_hex(0x22c55e, 0.95),
+                state.energy_ratio.clamp(0.0, 1.0),
+            );
+            window.paint_path(path, progress_color);
+        }
+    }
+
+    let mut halo_arc = PathBuilder::stroke(px(1.6));
+    halo_arc.arc(
+        center,
+        px(radius * 1.08),
+        Angle::from_degrees(-140.0),
+        Angle::from_degrees(280.0),
+    );
+    if let Ok(path) = halo_arc.build() {
+        window.paint_path(path, rgba_from_hex(0x1d3559, 0.25));
+    }
+
+    let energy_scale = state.energy_ratio.clamp(0.0, 1.0);
+    let inner_radius = radius * (0.46 + energy_scale * 0.18);
+    let mut inner_fill = PathBuilder::fill();
+    inner_fill.arc(
+        center,
+        px(inner_radius),
+        Angle::from_degrees(0.0),
+        Angle::from_degrees(360.0),
+    );
+    if let Ok(path) = inner_fill.build() {
+        let inner_color = lerp_rgba(
+            rgba_from_hex(0x122033, 0.92),
+            rgba_from_hex(0x3b82f6, 0.88),
+            energy_scale,
+        );
+        window.paint_path(path, inner_color);
+    }
+
+    let pointer_deg = -140.0 + 280.0 * state.tick_phase;
+    let pointer_rad = pointer_deg.to_radians();
+    let pointer_radius = radius * 1.02;
+    let px_pointer = cx + pointer_radius * pointer_rad.cos();
+    let py_pointer = cy + pointer_radius * pointer_rad.sin();
+    let mut pointer = PathBuilder::stroke(px(1.8));
+    pointer.move_to(center);
+    pointer.line_to(point(px(px_pointer), px(py_pointer)));
+    if let Ok(path) = pointer.build() {
+        window.paint_path(path, rgba_from_hex(0xfacc15, 0.75));
+    }
+
+    let bar_origin_x = f32::from(origin.x) + 12.0;
+    let bar_origin_y = f32::from(origin.y) + height - 18.0;
+    let bar_width = (width - 24.0).max(12.0);
+    let bar_height = 6.0;
+    let bar_bounds = Bounds::new(
+        point(px(bar_origin_x), px(bar_origin_y)),
+        size(px(bar_width), px(bar_height)),
+    );
+    window.paint_quad(fill(
+        bar_bounds,
+        Background::from(rgba_from_hex(0x132036, 0.95)),
+    ));
+
+    let births_width = bar_width * state.births_ratio.clamp(0.0, 1.0);
+    if births_width > 0.5 {
+        let births_bounds = Bounds::new(
+            point(px(bar_origin_x), px(bar_origin_y)),
+            size(px(births_width), px(bar_height * 0.55)),
+        );
+        window.paint_quad(fill(
+            births_bounds,
+            Background::from(rgba_from_hex(0x22c55e, 0.92)),
+        ));
+    }
+
+    let deaths_width = bar_width * state.deaths_ratio.clamp(0.0, 1.0);
+    if deaths_width > 0.5 {
+        let deaths_bounds = Bounds::new(
+            point(px(bar_origin_x), px(bar_origin_y + bar_height * 0.45)),
+            size(px(deaths_width), px(bar_height * 0.55)),
+        );
+        window.paint_quad(fill(
+            deaths_bounds,
+            Background::from(rgba_from_hex(0xef4444, 0.92)),
+        ));
+    }
+
+    let marker_x = bar_origin_x + bar_width * state.population_ratio.clamp(0.0, 1.0);
+    let marker_bounds = Bounds::new(
+        point(px(marker_x - 1.0), px(bar_origin_y - 4.0)),
+        size(px(2.0), px(bar_height + 8.0)),
+    );
+    window.paint_quad(fill(
+        marker_bounds,
+        Background::from(rgba_from_hex(0x93c5fd, 0.65)),
+    ));
 }
 
 #[derive(Clone)]
@@ -2715,6 +3162,75 @@ impl CameraState {
     }
 }
 
+fn paint_terrain_layer(
+    frame: &RenderFrame,
+    offset_x: f32,
+    offset_y: f32,
+    cell_world: f32,
+    scale: f32,
+    daylight: f32,
+    window: &mut Window,
+) {
+    let width = frame.food_dimensions.0 as usize;
+    let height = frame.food_dimensions.1 as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let cell_px = (cell_world * scale).max(1.0);
+    let highlight_shift = (daylight * 0.45 + 0.35).clamp(0.3, 0.9);
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let Some(tile) = frame.terrain_tiles.get(idx) else {
+                continue;
+            };
+
+            let px_x = offset_x + (x as f32 * cell_world * scale);
+            let px_y = offset_y + (y as f32 * cell_world * scale);
+
+            let mut base = rgba_from_triplet_with_alpha(tile.base_color, 1.0);
+            let shade = (0.72 + daylight * 0.18 + tile.height_factor * 0.22).clamp(0.45, 1.12);
+            base = scale_rgb(base, shade);
+            base = apply_palette(base, frame.palette);
+
+            let cell_bounds =
+                Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
+            window.paint_quad(fill(cell_bounds, Background::from(base)));
+
+            if tile.height_factor > 0.62 {
+                let mut builder = PathBuilder::fill();
+                builder.move_to(point(px(px_x), px(px_y)));
+                builder.line_to(point(px(px_x + cell_px * 0.65), px(px_y)));
+                builder.line_to(point(px(px_x), px(px_y + cell_px * 0.55)));
+                builder.line_to(point(px(px_x), px(px_y)));
+                if let Ok(path) = builder.build() {
+                    let sparkle = rgba_from_triplet_with_alpha(
+                        tile.accent_color,
+                        (0.06 + (tile.height_factor - 0.62) * 0.22).clamp(0.02, 0.28),
+                    );
+                    let sparkle = apply_palette(sparkle, frame.palette);
+                    window.paint_path(path, sparkle);
+                }
+            }
+
+            if tile.contour > 0.18 {
+                let stroke_width = (0.5 + tile.contour * 1.05) * scale.clamp(0.5, 2.75);
+                let accent_alpha = (0.12 + tile.contour * highlight_shift).clamp(0.06, 0.45);
+                let accent = rgba_from_triplet_with_alpha(tile.accent_color, accent_alpha);
+                let accent = apply_palette(accent, frame.palette);
+                let mut builder = PathBuilder::stroke(px(stroke_width.min(cell_px * 0.8)));
+                builder.move_to(point(px(px_x), px(px_y + cell_px * 0.15)));
+                builder.line_to(point(px(px_x + cell_px), px(px_y + cell_px * 0.85)));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, accent);
+                }
+            }
+        }
+    }
+}
+
 fn paint_frame(
     frame: &RenderFrame,
     camera: &Arc<Mutex<CameraState>>,
@@ -2795,6 +3311,9 @@ fn paint_frame(
     let food_w = frame.food_dimensions.0 as usize;
     let food_h = frame.food_dimensions.1 as usize;
     let cell_world = frame.food_cell_size as f32;
+    paint_terrain_layer(
+        frame, offset_x, offset_y, cell_world, scale, daylight, window,
+    );
     let cell_px = (cell_world * scale).max(1.0);
     let max_food = frame.food_max.max(f32::EPSILON);
 
@@ -2830,21 +3349,27 @@ fn paint_frame(
         match agent.selection {
             SelectionState::Selected => highlight_layers.push((
                 1.8,
-                Rgba {
-                    r: 0.20,
-                    g: 0.65,
-                    b: 0.96,
-                    a: 0.35,
-                },
+                apply_palette(
+                    Rgba {
+                        r: 0.20,
+                        g: 0.65,
+                        b: 0.96,
+                        a: 0.35,
+                    },
+                    frame.palette,
+                ),
             )),
             SelectionState::Hovered => highlight_layers.push((
                 1.4,
-                Rgba {
-                    r: 0.92,
-                    g: 0.58,
-                    b: 0.20,
-                    a: 0.30,
-                },
+                apply_palette(
+                    Rgba {
+                        r: 0.92,
+                        g: 0.58,
+                        b: 0.20,
+                        a: 0.30,
+                    },
+                    frame.palette,
+                ),
             )),
             SelectionState::None => {}
         }
@@ -2852,12 +3377,15 @@ fn paint_frame(
         if focus_agent == Some(agent.agent_id) {
             highlight_layers.push((
                 2.05,
-                Rgba {
-                    r: 0.45,
-                    g: 0.88,
-                    b: 0.97,
-                    a: 0.32,
-                },
+                apply_palette(
+                    Rgba {
+                        r: 0.45,
+                        g: 0.88,
+                        b: 0.97,
+                        a: 0.32,
+                    },
+                    frame.palette,
+                ),
             ));
         }
 
@@ -2879,8 +3407,10 @@ fn paint_frame(
                 point(px(px_x - indicator_half), px(px_y - indicator_half)),
                 size(px(indicator_size), px(indicator_size)),
             );
-            let indicator_color =
-                rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect);
+            let indicator_color = apply_palette(
+                rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect),
+                frame.palette,
+            );
             window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
         }
 
@@ -2892,15 +3422,16 @@ fn paint_frame(
                 point(px(px_x - pulse_half), px(px_y - pulse_half)),
                 size(px(pulse_size), px(pulse_size)),
             );
-            window.paint_quad(fill(
-                pulse_bounds,
-                Background::from(Rgba {
+            let pulse_color = apply_palette(
+                Rgba {
                     r: 0.88,
                     g: 0.36,
                     b: 0.86,
                     a: 0.18 + 0.28 * pulse,
-                }),
-            ));
+                },
+                frame.palette,
+            );
+            window.paint_quad(fill(pulse_bounds, Background::from(pulse_color)));
         }
 
         if agent.spiked {
@@ -2910,15 +3441,16 @@ fn paint_frame(
                 point(px(px_x - spike_half), px(px_y - spike_half)),
                 size(px(spike_size), px(spike_size)),
             );
-            window.paint_quad(fill(
-                spike_bounds,
-                Background::from(Rgba {
+            let spike_color = apply_palette(
+                Rgba {
                     r: 0.95,
                     g: 0.25,
                     b: 0.35,
                     a: 0.28,
-                }),
-            ));
+                },
+                frame.palette,
+            );
+            window.paint_quad(fill(spike_bounds, Background::from(spike_color)));
         }
 
         let agent_bounds = Bounds::new(

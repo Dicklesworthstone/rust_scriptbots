@@ -84,6 +84,24 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+fn sample_temperature(config: &ScriptBotsConfig, x: f32) -> f32 {
+    if config.world_width == 0 {
+        return 0.5;
+    }
+    let width = config.world_width as f32;
+    if width <= f32::EPSILON {
+        return 0.5;
+    }
+    let normalized = (x / width).rem_euclid(1.0);
+    let distance = ((normalized - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+    let exponent = config.temperature_gradient_exponent.max(f32::EPSILON);
+    distance.powf(exponent).clamp(0.0, 1.0)
+}
+
+fn temperature_discomfort(env_temperature: f32, preference: f32) -> f32 {
+    (env_temperature - clamp01(preference)).abs()
+}
+
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
@@ -1406,6 +1424,14 @@ pub struct ScriptBotsConfig {
     pub metabolism_drain: f32,
     /// Fraction of velocity converted to additional energy cost.
     pub movement_drain: f32,
+    /// Health drain multiplier applied when agents experience temperature discomfort.
+    pub temperature_discomfort_rate: f32,
+    /// Difference threshold below which temperature discomfort is ignored.
+    pub temperature_comfort_band: f32,
+    /// Exponent shaping the environmental temperature gradient from equator to poles.
+    pub temperature_gradient_exponent: f32,
+    /// Exponent applied to discomfort beyond the comfort band before scaling by the drain rate.
+    pub temperature_discomfort_exponent: f32,
     /// Base rate at which agents siphon food from cells.
     pub food_intake_rate: f32,
     /// Radius used for food sharing with friendly neighbors.
@@ -1487,6 +1513,10 @@ impl Default for ScriptBotsConfig {
             spike_growth_rate: 0.005,
             metabolism_drain: 0.002,
             movement_drain: 0.005,
+            temperature_discomfort_rate: 0.0,
+            temperature_comfort_band: 0.08,
+            temperature_gradient_exponent: 1.0,
+            temperature_discomfort_exponent: 2.0,
             food_intake_rate: 0.05,
             food_sharing_radius: 80.0,
             food_sharing_rate: 0.1,
@@ -1649,9 +1679,25 @@ impl ScriptBotsConfig {
             || self.carnivore_threshold <= 0.0
             || self.carnivore_threshold >= 1.0
             || self.history_capacity == 0
+            || self.temperature_discomfort_rate < 0.0
         {
             return Err(WorldStateError::InvalidConfig(
                 "metabolism, reproduction, sharing, and history parameters must be non-negative; spike and diet thresholds must be within valid ranges",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.temperature_comfort_band) {
+            return Err(WorldStateError::InvalidConfig(
+                "temperature_comfort_band must be within [0, 1]",
+            ));
+        }
+        if self.temperature_gradient_exponent <= 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "temperature_gradient_exponent must be positive",
+            ));
+        }
+        if self.temperature_discomfort_exponent <= 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "temperature_discomfort_exponent must be positive",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -1773,6 +1819,130 @@ impl FoodGrid {
     }
 }
 
+/// Tile-based terrain layer used for rendering biomes and overlays.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerrainLayer {
+    width: u32,
+    height: u32,
+    cell_size: u32,
+    tiles: Vec<TerrainTile>,
+}
+
+impl TerrainLayer {
+    /// Generate a deterministic terrain layer using the supplied RNG.
+    pub fn generate(
+        width: u32,
+        height: u32,
+        cell_size: u32,
+        rng: &mut SmallRng,
+    ) -> Result<Self, WorldStateError> {
+        if width == 0 || height == 0 {
+            return Err(WorldStateError::InvalidConfig(
+                "terrain dimensions must be non-zero",
+            ));
+        }
+
+        let mut tiles = Vec::with_capacity((width as usize) * (height as usize));
+        let width_f = width as f32;
+        let height_f = height as f32;
+
+        for y in 0..height {
+            for x in 0..width {
+                let fx = x as f32 / width_f;
+                let fy = y as f32 / height_f;
+                let distance = ((fx - 0.5).powi(2) + (fy - 0.5).powi(2)).sqrt();
+                let ridge = ((fx - fy).abs() * 0.75).clamp(0.0, 1.0);
+                let base_noise = rng.random_range(0.0..1.0);
+                let accent_noise = rng.random_range(0.0..1.0);
+                let elevation =
+                    (1.0 - distance * 1.5 + base_noise * 0.35 - ridge * 0.2).clamp(0.0, 1.0);
+                let moisture = ((0.5 - (fy - 0.5).abs()) * 1.4
+                    + rng.random_range(0.0..1.0) * 0.4
+                    + ridge * 0.15)
+                    .clamp(0.0, 1.0);
+
+                let kind = if elevation < 0.22 {
+                    TerrainKind::DeepWater
+                } else if elevation < 0.32 {
+                    TerrainKind::ShallowWater
+                } else if elevation < 0.36 {
+                    TerrainKind::Sand
+                } else if elevation > 0.78 {
+                    TerrainKind::Rock
+                } else if moisture > 0.68 {
+                    TerrainKind::Bloom
+                } else {
+                    TerrainKind::Grass
+                };
+
+                tiles.push(TerrainTile {
+                    kind,
+                    elevation,
+                    moisture,
+                    accent: accent_noise,
+                });
+            }
+        }
+
+        Ok(Self {
+            width,
+            height,
+            cell_size,
+            tiles,
+        })
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[must_use]
+    pub const fn cell_size(&self) -> u32 {
+        self.cell_size
+    }
+
+    #[must_use]
+    pub fn tiles(&self) -> &[TerrainTile] {
+        &self.tiles
+    }
+
+    #[must_use]
+    pub fn tile(&self, x: u32, y: u32) -> Option<&TerrainTile> {
+        if x < self.width && y < self.height {
+            let idx = (y as usize) * (self.width as usize) + (x as usize);
+            Some(&self.tiles[idx])
+        } else {
+            None
+        }
+    }
+}
+
+/// Terrain classification for each tile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TerrainKind {
+    DeepWater,
+    ShallowWater,
+    Sand,
+    Grass,
+    Bloom,
+    Rock,
+}
+
+/// Metadata captured for every terrain tile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TerrainTile {
+    pub kind: TerrainKind,
+    pub elevation: f32,
+    pub moisture: f32,
+    pub accent: f32,
+}
+
 /// Aggregate world state shared by the simulation and rendering layers.
 pub struct WorldState {
     config: ScriptBotsConfig,
@@ -1782,6 +1952,7 @@ pub struct WorldState {
     rng: SmallRng,
     agents: AgentArena,
     food: FoodGrid,
+    terrain: TerrainLayer,
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
@@ -1819,7 +1990,11 @@ impl WorldState {
         persistence: Box<dyn WorldPersistence>,
     ) -> Result<Self, WorldStateError> {
         let (food_w, food_h) = config.food_dimensions()?;
-        let rng = config.seeded_rng();
+        let mut rng = config.seeded_rng();
+        let mut terrain_rng = rng.clone();
+        let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
+        let terrain =
+            TerrainLayer::generate(food_w, food_h, config.food_cell_size, &mut terrain_rng)?;
         let index = UniformGridIndex::new(
             config.food_cell_size as f32,
             config.world_width as f32,
@@ -1827,7 +2002,8 @@ impl WorldState {
         );
         let history_capacity = config.history_capacity;
         Ok(Self {
-            food: FoodGrid::new(food_w, food_h, config.initial_food)?,
+            food,
+            terrain,
             config,
             tick: Tick::zero(),
             epoch: 0,
@@ -2113,9 +2289,9 @@ impl WorldState {
                 sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
                 sensors[18] = clamp01(hearing);
                 sensors[19] = clamp01(blood);
-                let temperature_sample = (position.x / world_width).clamp(0.0, 1.0);
+                let env_temperature = self.sample_temperature(position.x);
                 let discomfort =
-                    (2.0 * (temperature_sample - 0.5).abs() - temperature_preferences[idx]).abs();
+                    self.temperature_discomfort(env_temperature, temperature_preferences[idx]);
                 sensors[20] = clamp01(discomfort);
                 sensors[21] = clamp01(density[3]);
                 sensors[22] = clamp01(eye_r[3]);
@@ -2322,6 +2498,67 @@ impl WorldState {
                 runtime.sound_output = results[idx].sound_level;
                 runtime.sound_multiplier = results[idx].sound_level;
                 runtime.give_intent = results[idx].give_intent;
+            }
+        }
+    }
+
+    fn stage_temperature_discomfort(&mut self) {
+        let rate = self.config.temperature_discomfort_rate;
+        if rate <= 0.0 || self.config.world_width == 0 {
+            return;
+        }
+
+        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        if handles.is_empty() {
+            return;
+        }
+
+        let comfort_band = self.config.temperature_comfort_band.clamp(0.0, 1.0);
+        let exponent = self
+            .config
+            .temperature_discomfort_exponent
+            .max(f32::EPSILON);
+
+        let positions_snapshot: Vec<Position> = self.agents.columns().positions().to_vec();
+        let mut penalties = vec![0.0f32; handles.len()];
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            let env_temperature = self.sample_temperature(positions_snapshot[idx].x);
+            let Some(runtime) = self.runtime.get(*agent_id) else {
+                continue;
+            };
+            let mut discomfort =
+                self.temperature_discomfort(env_temperature, runtime.temperature_preference);
+            if discomfort <= comfort_band {
+                continue;
+            }
+            discomfort = (discomfort - comfort_band).max(0.0);
+            let penalty = rate * discomfort.powf(exponent);
+            if penalty > 0.0 {
+                penalties[idx] = penalty;
+            }
+        }
+
+        if penalties.iter().all(|penalty| penalty <= &0.0) {
+            return;
+        }
+
+        let columns = self.agents.columns_mut();
+        let healths = columns.health_mut();
+
+        for (idx, agent_id) in handles.iter().enumerate() {
+            let penalty = penalties[idx];
+            if penalty <= 0.0 {
+                continue;
+            }
+            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                let health = &mut healths[idx];
+                *health = (*health - penalty).max(0.0);
+                runtime.energy = (runtime.energy - penalty).max(0.0);
+                runtime.food_delta -= penalty;
+                if *health <= 0.0 {
+                    self.pending_deaths.push(*agent_id);
+                }
             }
         }
     }
@@ -3297,6 +3534,7 @@ impl WorldState {
         self.stage_sense();
         self.stage_brains();
         self.stage_actuation();
+        self.stage_temperature_discomfort();
         self.stage_food();
         self.stage_combat();
         self.stage_death_cleanup();
@@ -3428,6 +3666,18 @@ impl WorldState {
     #[must_use]
     pub fn food_mut(&mut self) -> &mut FoodGrid {
         &mut self.food
+    }
+
+    /// Immutable access to the terrain tile layer.
+    #[must_use]
+    pub fn terrain(&self) -> &TerrainLayer {
+        &self.terrain
+    }
+
+    /// Mutable access to the terrain layer.
+    #[must_use]
+    pub fn terrain_mut(&mut self) -> &mut TerrainLayer {
+        &mut self.terrain
     }
 
     /// Immutable access to the brain registry.
@@ -4199,6 +4449,141 @@ mod tests {
         assert!(
             !child_runtime.hybrid,
             "child should not be hybrid without partner"
+        );
+    }
+
+    #[test]
+    fn temperature_discomfort_drains_health_and_energy() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.5,
+            temperature_comfort_band: 0.0,
+            temperature_gradient_exponent: 1.0,
+            temperature_discomfort_exponent: 2.0,
+            rng_seed: Some(99),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let agent = world.spawn_agent(sample_agent(0));
+
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx] = Position::new(0.0, 10.0);
+            columns.health_mut()[idx] = 1.0;
+        }
+        {
+            let runtime = world.agent_runtime_mut(agent).unwrap();
+            runtime.temperature_preference = 0.0;
+            runtime.energy = 1.0;
+            runtime.food_delta = 0.0;
+        }
+
+        world.stage_temperature_discomfort();
+
+        {
+            let arena = world.agents();
+            let idx = arena.index_of(agent).unwrap();
+            let health = arena.columns().health()[idx];
+            assert!(
+                (health - 0.5).abs() < 1e-6,
+                "expected health to drop by 0.5, got {health}"
+            );
+        }
+        let runtime = world.agent_runtime(agent).unwrap();
+        assert!(
+            (runtime.energy - 0.5).abs() < 1e-6,
+            "expected energy to mirror temperature drain"
+        );
+
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx] = Position::new(100.0, 10.0);
+            columns.health_mut()[idx] = 1.0;
+        }
+        {
+            let runtime = world.agent_runtime_mut(agent).unwrap();
+            runtime.temperature_preference = 0.0;
+            runtime.energy = 1.0;
+            runtime.food_delta = 0.0;
+        }
+
+        world.stage_temperature_discomfort();
+
+        {
+            let arena = world.agents();
+            let idx = arena.index_of(agent).unwrap();
+            let health = arena.columns().health()[idx];
+            assert!(
+                (health - 1.0).abs() < 1e-6,
+                "expected no health drain at preferred equator temperature"
+            );
+        }
+        let runtime = world.agent_runtime(agent).unwrap();
+        assert!(
+            (runtime.energy - 1.0).abs() < 1e-6,
+            "expected energy to remain unchanged when discomfort is zero"
+        );
+    }
+
+    #[test]
+    fn temperature_gradient_shapes_sensor_values() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            temperature_gradient_exponent: 2.0,
+            rng_seed: Some(7),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let agent = world.spawn_agent(sample_agent(0));
+
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx] = Position::new(50.0, 20.0);
+        }
+        world
+            .agent_runtime_mut(agent)
+            .unwrap()
+            .temperature_preference = 0.0;
+
+        world.stage_sense();
+        let runtime = world.agent_runtime(agent).unwrap();
+        assert!(
+            (runtime.sensors[20] - 0.25).abs() < 1e-6,
+            "expected gradient-shaped discomfort of 0.25, got {}",
+            runtime.sensors[20]
+        );
+
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx] = Position::new(100.0, 20.0);
+        }
+
+        world.stage_sense();
+        let runtime = world.agent_runtime(agent).unwrap();
+        assert!(
+            runtime.sensors[20] < 1e-6,
+            "expected zero discomfort at equator, got {}",
+            runtime.sensors[20]
         );
     }
 
