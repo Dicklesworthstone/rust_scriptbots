@@ -1245,18 +1245,7 @@ impl SimulationView {
 
         let canvas_element = canvas(
             move |_, _, _| canvas_state.clone(),
-            move |bounds, state, window, _| {
-                paint_frame(
-                    &state.frame,
-                    &state.camera,
-                    state.focus_agent,
-                    state.controls,
-                    state.debug,
-                    state.follow_target,
-                    bounds,
-                    window,
-                )
-            },
+            move |bounds, state, window, _| paint_frame(&state, bounds, window),
         )
         .flex_1();
 
@@ -1954,10 +1943,12 @@ impl SimulationView {
             (x, y, color)
         };
 
-        let mut agent = AgentData::default();
-        agent.position = Position::new(pos_x, pos_y);
-        agent.velocity = Velocity::new(0.0, 0.0);
-        agent.color = color;
+        let agent = AgentData {
+            position: Position::new(pos_x, pos_y),
+            velocity: Velocity::new(0.0, 0.0),
+            color,
+            ..AgentData::default()
+        };
         let agent_id = world.spawn_agent(agent);
         if let Some(runtime) = world.runtime_mut().get_mut(agent_id) {
             runtime.herbivore_tendency = herbivore_bias.clamp(0.0, 1.0);
@@ -1980,46 +1971,45 @@ impl SimulationView {
                     .collect()
             };
 
-            if selected.len() >= 2 {
-                if let (Some(parent_a), Some(parent_b)) = (
+            if selected.len() >= 2
+                && let (Some(parent_a), Some(parent_b)) = (
                     world.snapshot_agent(selected[0]),
                     world.snapshot_agent(selected[1]),
-                ) {
-                    let mut child = AgentData::default();
-                    child.position = Position::new(
+                )
+            {
+                let child = AgentData {
+                    position: Position::new(
                         (parent_a.data.position.x + parent_b.data.position.x) * 0.5,
                         (parent_a.data.position.y + parent_b.data.position.y) * 0.5,
-                    );
-                    child.velocity = Velocity::new(0.0, 0.0);
-                    child.heading = (parent_a.data.heading + parent_b.data.heading) * 0.5;
-                    child.health =
-                        ((parent_a.data.health + parent_b.data.health) * 0.5).clamp(0.5, 2.0);
-                    child.color = [
+                    ),
+                    velocity: Velocity::new(0.0, 0.0),
+                    heading: (parent_a.data.heading + parent_b.data.heading) * 0.5,
+                    health: ((parent_a.data.health + parent_b.data.health) * 0.5).clamp(0.5, 2.0),
+                    color: [
                         (parent_a.data.color[0] + parent_b.data.color[0]) * 0.5,
                         (parent_a.data.color[1] + parent_b.data.color[1]) * 0.5,
                         (parent_a.data.color[2] + parent_b.data.color[2]) * 0.5,
-                    ];
-                    child.spike_length =
-                        (parent_a.data.spike_length + parent_b.data.spike_length) * 0.5;
+                    ],
+                    spike_length: (parent_a.data.spike_length + parent_b.data.spike_length) * 0.5,
+                    ..AgentData::default()
+                };
 
-                    let child_id = world.spawn_agent(child);
-                    if let Some(runtime) = world.runtime_mut().get_mut(child_id) {
-                        runtime.herbivore_tendency = (parent_a.runtime.herbivore_tendency
-                            + parent_b.runtime.herbivore_tendency)
-                            * 0.5;
-                        runtime.mutation_rates.primary = (parent_a.runtime.mutation_rates.primary
-                            + parent_b.runtime.mutation_rates.primary)
-                            * 0.5;
-                        runtime.mutation_rates.secondary =
-                            (parent_a.runtime.mutation_rates.secondary
-                                + parent_b.runtime.mutation_rates.secondary)
-                                * 0.5;
-                        runtime.indicator.intensity = 0.6;
-                        runtime.indicator.color = [0.2, 0.8, 0.9];
-                    }
-                    info!(child = ?child_id, "Spawned crossover agent");
-                    spawned = true;
+                let child_id = world.spawn_agent(child);
+                if let Some(runtime) = world.runtime_mut().get_mut(child_id) {
+                    runtime.herbivore_tendency = (parent_a.runtime.herbivore_tendency
+                        + parent_b.runtime.herbivore_tendency)
+                        * 0.5;
+                    runtime.mutation_rates.primary = (parent_a.runtime.mutation_rates.primary
+                        + parent_b.runtime.mutation_rates.primary)
+                        * 0.5;
+                    runtime.mutation_rates.secondary = (parent_a.runtime.mutation_rates.secondary
+                        + parent_b.runtime.mutation_rates.secondary)
+                        * 0.5;
+                    runtime.indicator.intensity = 0.6;
+                    runtime.indicator.color = [0.2, 0.8, 0.9];
                 }
+                info!(child = ?child_id, "Spawned crossover agent");
+                spawned = true;
             }
 
             if !spawned {
@@ -8363,16 +8353,13 @@ fn paint_debug_overlays(
     }
 }
 
-fn paint_frame(
-    frame: &RenderFrame,
-    camera: &Arc<Mutex<CameraState>>,
-    focus_agent: Option<AgentId>,
-    controls: ControlsSnapshot,
-    debug: DebugOverlayState,
-    follow_target: Option<Position>,
-    bounds: Bounds<Pixels>,
-    window: &mut Window,
-) {
+fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
+    let frame = &state.frame;
+    let camera = &state.camera;
+    let focus_agent = state.focus_agent;
+    let controls = state.controls;
+    let debug = state.debug;
+    let follow_target = state.follow_target;
     let origin = bounds.origin;
     let bounds_size = bounds.size;
 

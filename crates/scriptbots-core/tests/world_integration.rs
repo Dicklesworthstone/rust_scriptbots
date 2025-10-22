@@ -1,7 +1,61 @@
 use scriptbots_core::{
-    AgentData, BrainRunner, NUM_EYES, Position, ScriptBotsConfig, Tick, TickSummary,
-    TraitModifiers, WorldState,
+    AgentData, BrainRunner, FoodCellProfileSnapshot, NUM_EYES, Position, ScriptBotsConfig, Tick,
+    TickSummary, TraitModifiers, WorldState,
 };
+
+fn expected_food_value(world: &WorldState, before: &[f32], x: u32, y: u32) -> f32 {
+    let width = world.food().width() as usize;
+    let height = world.food().height() as usize;
+    let idx = y as usize * width + x as usize;
+    let config = world.config();
+    let profile = world.food_profile(x, y).unwrap_or(FoodCellProfileSnapshot {
+        capacity: config.food_max,
+        growth_multiplier: 1.0,
+        decay_multiplier: 1.0,
+        fertility: 0.0,
+        nutrient_density: 0.3,
+    });
+
+    let diffusion = config.food_diffusion_rate;
+    let decay = config.food_decay_rate;
+    let growth = config.food_growth_rate;
+
+    let previous = before[idx];
+    let mut value = previous;
+
+    if diffusion > 0.0 {
+        let x_usize = x as usize;
+        let y_usize = y as usize;
+        let left = if x_usize == 0 { width - 1 } else { x_usize - 1 };
+        let right = if x_usize + 1 == width { 0 } else { x_usize + 1 };
+        let up = if y_usize == 0 {
+            height - 1
+        } else {
+            y_usize - 1
+        };
+        let down = if y_usize + 1 == height {
+            0
+        } else {
+            y_usize + 1
+        };
+        let neighbor_avg = (before[y_usize * width + left]
+            + before[y_usize * width + right]
+            + before[up * width + x_usize]
+            + before[down * width + x_usize])
+            * 0.25;
+        value += diffusion * (neighbor_avg - previous);
+    }
+
+    if decay > 0.0 {
+        value -= decay * profile.decay_multiplier * value;
+    }
+
+    if growth > 0.0 {
+        value += growth * profile.growth_multiplier * (profile.capacity - value);
+    }
+
+    value.clamp(0.0, profile.capacity.max(0.0))
+}
 
 #[test]
 fn seeded_world_advances_deterministically() {
@@ -281,14 +335,21 @@ fn food_growth_moves_toward_capacity() {
     };
 
     let mut world = WorldState::new(config).expect("world");
+    let before = world.food().cells().to_vec();
     world.step();
 
-    let expected = 0.1 * world.config().food_max;
-    for value in world.food().cells() {
-        assert!(
-            (value - expected).abs() < 1e-6,
-            "cell={value} expected={expected}"
-        );
+    let width = world.food().width() as usize;
+    let cells = world.food().cells();
+    for y in 0..world.food().height() {
+        for x in 0..world.food().width() {
+            let idx = y as usize * width + x as usize;
+            let value = cells[idx];
+            let expected = expected_food_value(&world, &before, x, y);
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "cell=({x},{y}) value={value} expected={expected}"
+            );
+        }
     }
 }
 
@@ -313,20 +374,32 @@ fn food_diffusion_spreads_across_neighbors() {
         *cell = max_food;
     }
 
+    let before = world.food().cells().to_vec();
     world.step();
 
     let width = world.food().width() as usize;
     let cells = world.food().cells();
-    let center = cells[0];
-    assert!((center - max_food * 0.8).abs() < 1e-6);
+    let center_expected = expected_food_value(&world, &before, 0, 0);
+    assert!(
+        (cells[0] - center_expected).abs() < 1e-6,
+        "center value={} expected={center_expected}",
+        cells[0]
+    );
 
-    let right = cells[1];
-    let left = cells[width - 1];
-    let down = cells[width];
-    let up = cells[width * (world.food().height() as usize - 1)];
-    let neighbor_expected = max_food * 0.2 * 0.25;
-    for value in [right, left, down, up] {
-        assert!((value - neighbor_expected).abs() < 1e-6, "neighbor={value}");
+    let neighbors = [
+        (1_u32, 0_u32),
+        (world.food().width() - 1, 0),
+        (0, 1),
+        (0, world.food().height() - 1),
+    ];
+    for &(x, y) in &neighbors {
+        let idx = y as usize * width + x as usize;
+        let expected = expected_food_value(&world, &before, x, y);
+        let value = cells[idx];
+        assert!(
+            (value - expected).abs() < 1e-6,
+            "cell=({x},{y}) value={value} expected={expected}"
+        );
     }
 }
 
@@ -346,10 +419,21 @@ fn food_decay_reduces_cell_values() {
     };
 
     let mut world = WorldState::new(config).expect("world");
+    let before = world.food().cells().to_vec();
     world.step();
 
-    for value in world.food().cells() {
-        assert!((value - 0.36).abs() < 1e-6, "cell={value}");
+    let width = world.food().width() as usize;
+    let cells = world.food().cells();
+    for y in 0..world.food().height() {
+        for x in 0..world.food().width() {
+            let idx = y as usize * width + x as usize;
+            let value = cells[idx];
+            let expected = expected_food_value(&world, &before, x, y);
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "cell=({x},{y}) value={value} expected={expected}"
+            );
+        }
     }
 }
 

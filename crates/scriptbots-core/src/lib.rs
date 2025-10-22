@@ -1902,7 +1902,7 @@ pub enum NeuroflowActivationKind {
 
 impl ScriptBotsConfig {
     /// Validates the configuration, returning derived grid dimensions.
-    fn food_dimensions(&self) -> Result<(u32, u32), WorldStateError> {
+    pub fn food_dimensions(&self) -> Result<(u32, u32), WorldStateError> {
         if self.world_width == 0 || self.world_height == 0 {
             return Err(WorldStateError::InvalidConfig(
                 "world dimensions must be non-zero",
@@ -2402,6 +2402,28 @@ struct FoodCellProfile {
     nutrient_density: f32,
 }
 
+/// Public snapshot of derived food cell parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct FoodCellProfileSnapshot {
+    pub capacity: f32,
+    pub growth_multiplier: f32,
+    pub decay_multiplier: f32,
+    pub fertility: f32,
+    pub nutrient_density: f32,
+}
+
+impl From<&FoodCellProfile> for FoodCellProfileSnapshot {
+    fn from(profile: &FoodCellProfile) -> Self {
+        Self {
+            capacity: profile.capacity,
+            growth_multiplier: profile.growth_multiplier,
+            decay_multiplier: profile.decay_multiplier,
+            fertility: profile.fertility,
+            nutrient_density: profile.nutrient_density,
+        }
+    }
+}
+
 impl FoodCellProfile {
     fn compute(config: &ScriptBotsConfig, terrain: &TerrainLayer) -> Vec<FoodCellProfile> {
         let width = terrain.width() as usize;
@@ -2409,6 +2431,7 @@ impl FoodCellProfile {
         if width == 0 || height == 0 {
             return Vec::new();
         }
+
         let mut profiles = Vec::with_capacity(width * height);
         let cell_size = config.food_cell_size as f32;
         let base = config.food_fertility_base;
@@ -2662,6 +2685,19 @@ impl WorldState {
     fn stage_food_dynamics(&mut self, next_tick: Tick) -> Option<(u32, u32)> {
         let respawned = self.stage_food_respawn(next_tick);
         self.apply_food_regrowth();
+        if let Some((x, y)) = respawned {
+            let width = self.food.width() as usize;
+            let idx = (y as usize) * width + x as usize;
+            let capacity = self
+                .food_profiles
+                .get(idx)
+                .map_or(self.config.food_max, |profile| profile.capacity);
+            if let Some(cell) = self.food.get_mut(x, y) {
+                if *cell > capacity {
+                    *cell = capacity;
+                }
+            }
+        }
         respawned
     }
 
@@ -2707,8 +2743,6 @@ impl WorldState {
                         fertility: 0.0,
                         nutrient_density: 0.3,
                     });
-                let capacity = profile.capacity.max(0.0);
-
                 if diffusion > 0.0 {
                     let left = previous[y * width + left_col];
                     let right = previous[y * width + right_col];
@@ -2722,11 +2756,18 @@ impl WorldState {
                     value -= decay * profile.decay_multiplier * value;
                 }
 
-                if growth > 0.0 {
-                    value += growth * profile.growth_multiplier * (capacity - value);
+                if growth > 0.0 && self.config.food_max > 0.0 {
+                    let normalized = value / self.config.food_max;
+                    let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
+                    value += growth_delta * self.config.food_max;
                 }
 
-                cells_mut[idx] = value.clamp(0.0, capacity);
+                let mut cap = profile.capacity.max(previous[idx]);
+                let global_cap = self.config.food_max.max(previous[idx]);
+                if cap > global_cap {
+                    cap = global_cap;
+                }
+                cells_mut[idx] = value.clamp(0.0, cap);
             }
         }
     }
@@ -5287,6 +5328,16 @@ impl WorldState {
         &mut self.food
     }
 
+    /// Return the derived profile for the specified food cell, when available.
+    #[must_use]
+    pub fn food_profile(&self, x: u32, y: u32) -> Option<FoodCellProfileSnapshot> {
+        if x >= self.food.width() || y >= self.food.height() {
+            return None;
+        }
+        let idx = (y as usize) * (self.food.width() as usize) + x as usize;
+        self.food_profiles.get(idx).map(Into::into)
+    }
+
     /// Immutable access to the terrain tile layer.
     #[must_use]
     pub fn terrain(&self) -> &TerrainLayer {
@@ -6725,8 +6776,16 @@ mod tests {
                     };
                     (fertile, infertile)
                 });
+        let fertile_fertility = profiles[fertile_idx].fertility;
+        let infertile_fertility = profiles[infertile_idx].fertility;
+        println!(
+            "fertility reproduction stats: fertile={:.4}, infertile={:.4}, delta={:.4}",
+            fertile_fertility,
+            infertile_fertility,
+            fertile_fertility - infertile_fertility
+        );
         assert!(
-            profiles[fertile_idx].fertility > profiles[infertile_idx].fertility + 0.05,
+            fertile_fertility > infertile_fertility + 0.05,
             "expected noticeable fertility variation between sampled cells"
         );
 

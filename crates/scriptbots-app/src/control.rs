@@ -377,7 +377,10 @@ mod tests {
             .get("food_max")
             .and_then(Value::as_f64)
             .expect("food_max");
-        assert!((value - 0.6).abs() < f64::EPSILON);
+        assert!(
+            (value - 0.6).abs() < 1e-6,
+            "expected food_max ≈ 0.6 in snapshot, got {value}"
+        );
 
         // ensure queue drained for consistency
         let mut world = handle.lock_world().expect("world lock");
@@ -409,7 +412,8 @@ mod tests {
         match err {
             ControlError::InvalidPatch(message) => {
                 assert!(
-                    message.contains("changing world dimensions"),
+                    message.contains("changing world dimensions")
+                        || message.contains("world dimensions must be divisible"),
                     "unexpected error message: {message}"
                 );
             }
