@@ -237,14 +237,14 @@
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Completed - GPT-5 Codex 2025-10-22]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Completed - GPT-5 Codex 2025-10-22]
 7. **Rendering Layer (Weeks 8-10)** [Currently In Progress: GPUI stats overlay]
-   - Build GPUI window, canvas renderer, agent inspector UI. [Currently In Progress - GPT-5 Codex 2025-10-22: window shell + HUD + canvas renderer complete; inspector panel pending]
+- Build GPUI window, canvas renderer, agent inspector UI. [Completed - GPT-5 Codex 2025-10-22: window shell, HUD, canvas renderer, and inspector panel shipped]
    - Implement camera controls, overlays, history chart. [Completed - GPT-5 Codex 2025-10-22: middle-click pan, scroll zoom, overlay HUD, tick-history chart]
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals.
 8. **Integration & UX Polish (Weeks 10-11)**
    - Hook actions to simulation, selection workflows, debug overlays.
    - Add metrics HUD, performance counters.
    - Surface brain controls (selection, evolution rates) and storage toggles in the inspector.
-   - Layer in audio cues with `kira`, tie particle/lighting effects to simulation events, and add accessibility options.
+   - [Currently In Progress - GPT-5 Codex 2025-10-22: Layer in audio cues with `kira`, tie particle/lighting effects to simulation events, and add accessibility options.]
 9. **Testing, Benchmarks, Packaging (Weeks 11-12)**
    - Determinism/regression suite, `cargo bench`. [Completed - GPT-5 Codex 2025-10-22]
    - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries. [Currently In Progress - GPT-5 Codex 2025-10-22: blocked until scriptbots-render stabilizes/compiles]

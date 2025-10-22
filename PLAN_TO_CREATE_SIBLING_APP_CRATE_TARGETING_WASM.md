@@ -36,14 +36,14 @@
 
 ---
 
-## Phase 1 · Feasibility Validation
+## Phase 1 · Feasibility Validation [Currently In Progress]
 
 ### 1.1 Build Dry Run (No Code Changes)
 - Command: `cargo check --target wasm32-unknown-unknown -p scriptbots-core`.
 - Capture and catalogue all compilation blockers (expected: Rayon threading, OS-specific APIs).
 - Produce `PHASE1_FINDINGS.md` summarizing blockers and severity.
 
-### 1.2 Dependency Audit
+### 1.2 Dependency Audit [Currently In Progress]
 - Inventory every crate transitively pulled into `scriptbots-web`; flag categories:
   - ✅ **Pure Rust / wasm-ready**: `serde`, `rand`, `slotmap`, etc.
   - ⚠️ **Requires adaptation**: `rayon`, `tracing` (subscriber support in wasm), `duckdb`.
@@ -67,6 +67,21 @@
 - Review `kira` wasm capabilities; map gaps (streaming, mixing).
 - Decide interim plan: disable audio initially vs integrate alternative (e.g., Web Audio API via `web-sys`).
 - Document in `ADR-003-wasm-audio.md`.
+
+### 1.6 Multithreading Requirements
+- Document prerequisites for enabling `wasm-bindgen-rayon` (SharedArrayBuffer gates, COOP/COEP headers).
+- Decide MVP posture (single-thread fallback vs. multithread-first) and capture rationale.
+- Record hosting requirements (HTTP response headers, service worker interplay).
+
+### 1.7 Component Model & WASI Preview Assessment
+- Investigate `cargo component` support for future interoperability with WASI Preview 2.
+- Summarize trade-offs vs. classic `wasm-bindgen` flow in `ADR-004-component-model.md`.
+- Track upstream stabilization timelines for rustc and browser runtime support.
+
+### 1.8 Browser Capability Matrix [Currently In Progress]
+- Assemble matrix of WebGPU, SharedArrayBuffer, WebAssembly GC, and WASM SIMD availability across target browsers/versions.
+- Capture references (browser release notes, caniuse, WPT dashboards) in `docs/wasm/browser_matrix.csv`.
+- Update matrix quarterly or upon major browser releases; annotate blockers impacting roadmap.
 
 ---
 
@@ -104,7 +119,7 @@
 
 ---
 
-## Phase 3 · Rendering Implementation
+## Phase 3 · Rendering Implementation [Currently In Progress]
 
 ### 3.1 Rendering MVP
 - Chosen stack (from ADR-001) built to render:
