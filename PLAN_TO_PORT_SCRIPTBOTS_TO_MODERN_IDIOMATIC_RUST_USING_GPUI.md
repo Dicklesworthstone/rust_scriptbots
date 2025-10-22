@@ -331,7 +331,7 @@
 - *Feature parity expectations*: document intentionally omitted GPUI features (e.g., advanced camera) and ensure Control Server APIs remain the extension point for deep inspection.
 
 ### Execution TODOs [Currently In Progress]
-- [ ] Dependency alignment: ensure `thiserror` is restored, drop redundant `utoipa-axum`, and add terminal-mode crates (`supports-color`, `unicode-width`) gated appropriately.
+- [Currently In Progress] Dependency alignment: ensure `thiserror` is restored, drop redundant `utoipa-axum`, and add terminal-mode crates (`supports-color`, `unicode-width`) gated appropriately.
 - [ ] CLI mode integration: update `resolve_renderer` to prefer terminal mode when headless, and surface structured logs when fallback happens.
 - [ ] Terminal renderer scaffolding: add `terminal` module implementing the `Renderer` trait with screen setup, event loop, and world stepping.
 - [ ] HUD implementation pass 1: render tick/epoch, population metrics, recent summaries, and a coarse emoji world map with palette fallbacks.

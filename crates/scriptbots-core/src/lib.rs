@@ -4625,6 +4625,12 @@ impl WorldState {
         let healths = columns.health();
         let ages = columns.ages();
         let boosts = columns.boosts();
+        let positions = columns.positions();
+        let generations = columns.generations();
+
+        let mut generation_sum = 0.0f64;
+        let mut generation_max = 0u32;
+        let mut temperature_discomfort_stats = RunningStats::default();
 
         for (idx, agent_id) in handles.iter().enumerate() {
             total_health += healths.get(idx).copied().unwrap_or(0.0);
@@ -4643,6 +4649,24 @@ impl WorldState {
 
                 reproduction_counter_stats.update(f64::from(runtime.reproduction_counter));
                 temperature_pref_stats.update(f64::from(runtime.temperature_preference));
+                if let Some(generation) = generations.get(idx) {
+                    let value = generation.0;
+                    generation_sum += value as f64;
+                    if value > generation_max {
+                        generation_max = value;
+                    }
+                }
+
+                if macro_enabled {
+                    if let Some(position) = positions.get(idx) {
+                        let env_temperature = sample_temperature(&self.config, position.x);
+                        let discomfort = f64::from(temperature_discomfort(
+                            env_temperature,
+                            runtime.temperature_preference,
+                        ));
+                        temperature_discomfort_stats.update(discomfort);
+                    }
+                }
 
                 if macro_enabled {
                     let herb = clamp01(runtime.herbivore_tendency);
@@ -4839,6 +4863,22 @@ impl WorldState {
                     "temperature.preference.stddev",
                     temperature_pref_stats.stddev(),
                 ));
+                metrics.push(MetricSample::new(
+                    "population.generation.mean",
+                    generation_sum / agent_count as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "population.generation.max",
+                    generation_max as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "temperature.discomfort.mean",
+                    temperature_discomfort_stats.mean(),
+                ));
+                metrics.push(MetricSample::new(
+                    "temperature.discomfort.stddev",
+                    temperature_discomfort_stats.stddev(),
+                ));
             }
 
             if let Some((total, mean, variance, max)) = summarize_food_grid(self.food.cells()) {
@@ -4983,6 +5023,23 @@ impl WorldState {
                 metrics.push(MetricSample::new(
                     "mortality.unknown.ratio",
                     unknown as f64 / total as f64,
+                ));
+            }
+        }
+
+        if lifecycle_enabled && !self.pending_birth_records.is_empty() {
+            let total = self.pending_birth_records.len();
+            let hybrid = self
+                .pending_birth_records
+                .iter()
+                .filter(|record| record.is_hybrid)
+                .count();
+            metrics.push(MetricSample::new("births.total.count", total as f64));
+            metrics.push(MetricSample::new("births.hybrid.count", hybrid as f64));
+            if total > 0 {
+                metrics.push(MetricSample::new(
+                    "births.hybrid.ratio",
+                    hybrid as f64 / total as f64,
                 ));
             }
         }

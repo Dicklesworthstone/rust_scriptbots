@@ -921,8 +921,14 @@ impl SimulationView {
             .border_color(rgb(0x1d2738))
             .child(div().text_sm().text_color(rgb(0xf59e0b)).child("Age"))
             .child(div().text_xs().text_color(rgb(0xfef3c7)).child(format!(
-                "Mean {:.2} · Max {:.0}",
-                analytics.age_mean, analytics.age_max
+                "Mean {:.2} · Max {:.0} · Gen μ {:.1}",
+                analytics.age_mean, analytics.age_max, analytics.generation_mean
+            )))
+            .child(div().text_xs().text_color(rgb(0xfdba74)).child(format!(
+                "Gen max {:.0} · Hybrid births {} ({:.1}%)",
+                analytics.generation_max,
+                analytics.births_hybrid,
+                analytics.births_hybrid_ratio * 100.0
             )))
             .child(div().text_xs().text_color(rgb(0xfdba74)).child(format!(
                 "Repro μ {:.2} · Boost {:.1}%",
@@ -948,6 +954,10 @@ impl SimulationView {
             .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
                 "Preference μ {:.3} · σ {:.3}",
                 analytics.temperature_preference_mean, analytics.temperature_preference_stddev
+            )))
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                "Discomfort μ {:.3} · σ {:.3}",
+                analytics.temperature_discomfort_mean, analytics.temperature_discomfort_stddev
             )));
 
         let mortality_panel = {
@@ -5173,6 +5183,8 @@ struct HudAnalytics {
     reproduction_counter_mean: f64,
     temperature_preference_mean: f64,
     temperature_preference_stddev: f64,
+    temperature_discomfort_mean: f64,
+    temperature_discomfort_stddev: f64,
     food_total: f64,
     food_mean: f64,
     food_stddev: f64,
@@ -5186,12 +5198,17 @@ struct HudAnalytics {
     behavior_sensor_entropy: f64,
     behavior_output_mean: f64,
     behavior_output_entropy: f64,
+    generation_mean: f64,
+    generation_max: f64,
     deaths_combat_carnivore: usize,
     deaths_combat_herbivore: usize,
     deaths_starvation: usize,
     deaths_aging: usize,
     deaths_unknown: usize,
     deaths_total: usize,
+    births_total: usize,
+    births_hybrid: usize,
+    births_hybrid_ratio: f64,
     brain_shares: Vec<BrainShareEntry>,
 }
 
@@ -5244,6 +5261,10 @@ fn parse_analytics(
     let food_stddev = value("food.stddev").unwrap_or(0.0);
     let food_delta_mean = value("food_delta.mean").unwrap_or(0.0);
     let food_delta_mean_abs = value("food_delta.mean_abs").unwrap_or(0.0);
+    let temperature_discomfort_mean = value("temperature.discomfort.mean").unwrap_or(0.0);
+    let temperature_discomfort_stddev = value("temperature.discomfort.stddev").unwrap_or(0.0);
+    let generation_mean = value("population.generation.mean").unwrap_or(0.0);
+    let generation_max = value("population.generation.max").unwrap_or(0.0);
 
     let mutation_primary_mean = value("mutation.primary.mean").unwrap_or(0.0);
     let mutation_primary_stddev = value("mutation.primary.stddev").unwrap_or(0.0);
@@ -5299,6 +5320,15 @@ fn parse_analytics(
                 + deaths_aging
                 + deaths_unknown,
         );
+    let births_total = as_count("births.total.count");
+    let births_hybrid = as_count("births.hybrid.count");
+    let births_hybrid_ratio = value("births.hybrid.ratio").unwrap_or_else(|| {
+        if births_total > 0 {
+            births_hybrid as f64 / births_total as f64
+        } else {
+            0.0
+        }
+    });
 
     Some(HudAnalytics {
         tick,
@@ -5315,6 +5345,8 @@ fn parse_analytics(
         reproduction_counter_mean,
         temperature_preference_mean,
         temperature_preference_stddev,
+        temperature_discomfort_mean,
+        temperature_discomfort_stddev,
         food_total,
         food_mean,
         food_stddev,
@@ -5328,12 +5360,17 @@ fn parse_analytics(
         behavior_sensor_entropy,
         behavior_output_mean,
         behavior_output_entropy,
+        generation_mean,
+        generation_max,
         deaths_combat_carnivore,
         deaths_combat_herbivore,
         deaths_starvation,
         deaths_aging,
         deaths_unknown,
         deaths_total,
+        births_total,
+        births_hybrid,
+        births_hybrid_ratio,
         brain_shares,
     })
 }

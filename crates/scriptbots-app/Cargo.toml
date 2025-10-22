@@ -23,8 +23,7 @@ tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
-utoipa = { version = "5.1", features = ["macros"] }
-utoipa-axum = "0.2"
+utoipa = "4.2.3"
 utoipa-swagger-ui = { version = "6.0", features = ["axum"] }
 crossterm = "0.27"
 owo-colors = "4.0"
