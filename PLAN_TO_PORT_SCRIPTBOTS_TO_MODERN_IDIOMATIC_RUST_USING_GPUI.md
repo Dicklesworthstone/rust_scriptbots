@@ -163,6 +163,7 @@
   - Shipped an axum-based REST API (`/api/knobs`, `/api/config`, `/api/knobs/apply`) with generated OpenAPI docs and embedded Swagger UI for operator discovery.
   - Added a stdio MCP server (`list_knobs`, `get_config`, `apply_updates`, `apply_patch`) so external LLM tooling can orchestrate simulations safely.
   - Delivered the `scriptbots-control` CLI (clap + reqwest + ratatui) offering scripted updates (`set`, `patch`) and a live dashboard (`watch`) that highlights config deltas while the GPUI shell runs.
+- [Completed - GPT-5 Codex 2025-10-22] Migrated configuration writes onto a crossfire-backed command bus drained inside the simulation loop and exposed an HTTP MCP server (default `127.0.0.1:8090`) so control surfaces enqueue consistent `ControlCommand`s rather than mutating `WorldState` directly.
 - Diagnostics:
   - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization.
   - Provide debug tooling to render network topologies (layer shapes, activations) inside the inspector panel.

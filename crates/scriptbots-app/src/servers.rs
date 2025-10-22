@@ -9,29 +9,32 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
-    Json, Router,
+    routing::{get, post},
 };
-use crossfire::channel::TrySendError;
 use mcp_protocol_sdk::{
     core::error::McpResult,
     prelude::*,
-    server::mcp_server::McpServer,
-    server::HttpMcpServer,
+    server::{HttpMcpServer, McpServer},
     transport::http::HttpServerTransport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::SharedWorld;
+use crate::command::{
+    CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
+};
 use crate::control::{ConfigSnapshot, ControlError, ControlHandle, KnobEntry, KnobUpdate};
+
+const DEFAULT_MCP_HTTP_ADDR: &str = "127.0.0.1:8090";
 
 /// Configuration for the hosted control surfaces.
 #[derive(Debug, Clone)]
@@ -51,7 +54,7 @@ impl Default for ControlServerConfig {
             swagger_path: "/docs".to_string(),
             rest_enabled: true,
             mcp_transport: McpTransportConfig::Http {
-                bind_addr: "127.0.0.1:8090"
+                bind_address: DEFAULT_MCP_HTTP_ADDR
                     .parse()
                     .expect("hard-coded MCP HTTP socket"),
             },
@@ -88,39 +91,40 @@ impl ControlServerConfig {
             );
         }
 
-        let default_mcp = match config.mcp_transport {
-            McpTransportConfig::Http { bind_addr } => bind_addr,
-            McpTransportConfig::Disabled => "127.0.0.1:8090"
-                .parse()
-                .expect("fallback MCP HTTP socket"),
-        };
-        let mut mcp_bind = default_mcp;
-
+        let mut http_override = None;
         if let Ok(addr) = env::var("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR") {
-            match addr.parse::<SocketAddr>() {
-                Ok(parsed) => mcp_bind = parsed,
-                Err(err) => warn!(%addr, %err, "invalid SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR; using default"),
+            match parse_mcp_socket_addr(&addr) {
+                Some(parsed) => http_override = Some(parsed),
+                None => warn!(%addr, "invalid SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR; ignoring override"),
             }
         }
 
         if let Ok(raw) = env::var("SCRIPTBOTS_CONTROL_MCP") {
-            match raw.trim().to_ascii_lowercase().as_str() {
+            let trimmed = raw.trim();
+            match trimmed.to_ascii_lowercase().as_str() {
                 "disabled" | "off" | "false" | "0" => {
                     config.mcp_transport = McpTransportConfig::Disabled;
                 }
-                value if value.is_empty() || value == "http" => {
-                    config.mcp_transport = McpTransportConfig::Http { bind_addr: mcp_bind };
+                "http" | "" => {
+                    let bind_address = http_override
+                        .or_else(|| parse_mcp_socket_addr(DEFAULT_MCP_HTTP_ADDR))
+                        .expect("valid default MCP HTTP address");
+                    config.mcp_transport = McpTransportConfig::Http { bind_address };
                 }
-                other => match other.parse::<SocketAddr>() {
-                    Ok(parsed) => config.mcp_transport = McpTransportConfig::Http { bind_addr: parsed },
-                    Err(err) => {
-                        warn!(%other, %err, "unknown MCP transport value; disabling MCP server");
+                _other => {
+                    if let Some(addr) = parse_mcp_socket_addr(trimmed) {
+                        config.mcp_transport = McpTransportConfig::Http { bind_address: addr };
+                    } else if let Some(addr) = http_override {
+                        warn!(value = %raw, fallback = %addr, "could not parse SCRIPTBOTS_CONTROL_MCP; using HTTP override");
+                        config.mcp_transport = McpTransportConfig::Http { bind_address: addr };
+                    } else {
+                        warn!(%raw, "unknown MCP transport; disabling MCP server");
                         config.mcp_transport = McpTransportConfig::Disabled;
                     }
-                },
+                }
             }
-        } else {
-            config.mcp_transport = McpTransportConfig::Http { bind_addr: mcp_bind };
+        } else if let Some(addr) = http_override {
+            config.mcp_transport = McpTransportConfig::Http { bind_address: addr };
         }
 
         config
@@ -139,23 +143,34 @@ fn sanitize_swagger_path(path: &str) -> String {
     }
 }
 
+fn parse_mcp_socket_addr(value: &str) -> Option<SocketAddr> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+
+    let normalized = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let host_port = normalized.split('/').next().unwrap_or(normalized);
+    host_port.parse::<SocketAddr>().ok()
+}
+
 /// Supported transports for the MCP server.
 #[derive(Debug, Clone)]
 pub enum McpTransportConfig {
     Disabled,
-    Http { bind_addr: SocketAddr },
+    Http { bind_address: SocketAddr },
 }
 
 impl McpTransportConfig {
     fn is_enabled(&self) -> bool {
         !matches!(self, Self::Disabled)
-    }
-
-    fn bind_addr(&self) -> Option<SocketAddr> {
-        match self {
-            Self::Http { bind_addr } => Some(*bind_addr),
-            Self::Disabled => None,
-        }
     }
 }
 
@@ -167,10 +182,16 @@ pub struct ControlRuntime {
 
 impl ControlRuntime {
     /// Spawn the control runtime on a dedicated Tokio thread.
-    pub fn launch(world: SharedWorld, config: ControlServerConfig) -> Result<Self> {
+    pub fn launch(
+        world: SharedWorld,
+        config: ControlServerConfig,
+    ) -> Result<(Self, CommandDrain, CommandSubmit)> {
+        let (command_tx, command_rx) = create_command_bus(32);
+        let command_drain = make_command_drain(command_rx);
+        let command_submit = make_command_submit(command_tx.clone());
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
-        let handle = ControlHandle::new(world.clone());
+        let handle = ControlHandle::new(world.clone(), command_tx.clone());
 
         let thread = thread::Builder::new()
             .name("scriptbots-control".into())
@@ -191,10 +212,14 @@ impl ControlRuntime {
                 }
             })?;
 
-        Ok(Self {
-            shutdown,
-            thread: Some(thread),
-        })
+        Ok((
+            Self {
+                shutdown,
+                thread: Some(thread),
+            },
+            command_drain,
+            command_submit,
+        ))
     }
 
     /// Trigger a graceful shutdown and block until the background thread exits.
@@ -245,8 +270,9 @@ async fn run_control_servers(
     if config.mcp_transport.is_enabled() {
         let mcp_handle_clone = handle.clone();
         let transport = config.mcp_transport.clone();
+        let mcp_shutdown = shutdown.clone();
         mcp_handle = Some(tokio::spawn(async move {
-            if let Err(err) = run_mcp_server(mcp_handle_clone, transport).await {
+            if let Err(err) = run_mcp_server(mcp_handle_clone, transport, mcp_shutdown).await {
                 error!(?err, "MCP server exited unexpectedly");
             }
         }));
@@ -263,11 +289,8 @@ async fn run_control_servers(
     }
 
     if let Some(handle) = mcp_handle {
-        handle.abort();
         if let Err(err) = handle.await {
-            if !err.is_cancelled() {
-                error!(?err, "MCP server task join error");
-            }
+            error!(?err, "MCP server task join error");
         }
     }
 
@@ -308,7 +331,7 @@ pub struct KnobApplyRequest {
             ErrorResponse
         )
     ),
-    info(title = "ScriptBots Control API", version = env!("CARGO_PKG_VERSION")),
+    info(title = "ScriptBots Control API", version = "0.0.0"),
     tags((name = "control", description = "Runtime configuration controls"))
 )]
 struct ApiDoc;
@@ -350,6 +373,12 @@ impl From<ControlError> for AppError {
             ControlError::InvalidPatch(msg) => Self::bad_request(msg),
             ControlError::Serialization(msg) => Self::internal(msg),
             ControlError::Lock => Self::service_unavailable("world state is currently unavailable"),
+            ControlError::CommandQueueFull => {
+                Self::service_unavailable("command queue is full; retry shortly")
+            }
+            ControlError::CommandQueueClosed => {
+                Self::service_unavailable("command queue is closed")
+            }
         }
     }
 }
@@ -431,7 +460,8 @@ async fn run_rest_server(
 ) -> Result<()> {
     let state = ApiState { handle };
     let swagger_path_static: &'static str = Box::leak(config.swagger_path.clone().into_boxed_str());
-    let openapi = ApiDoc::openapi();
+    let mut openapi = ApiDoc::openapi();
+    openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
 
     let api_router = Router::new()
         .route("/api/knobs", get(get_knobs))
@@ -439,9 +469,11 @@ async fn run_rest_server(
         .route("/api/knobs/apply", post(apply_updates))
         .with_state(state);
 
-    let app = Router::new()
-        .merge(api_router)
-        .merge(SwaggerUi::new(swagger_path_static).url("/api-docs/openapi.json", openapi));
+    let swagger_router: Router<_> = SwaggerUi::new(swagger_path_static)
+        .url("/api-docs/openapi.json", openapi)
+        .into();
+
+    let app = Router::new().merge(api_router).merge(swagger_router);
 
     let listener = tokio::net::TcpListener::bind(config.rest_address)
         .await
@@ -458,38 +490,45 @@ async fn run_rest_server(
         .context("REST control server errored")
 }
 
-async fn run_mcp_server(handle: ControlHandle, transport: McpTransportConfig) -> Result<()> {
+async fn run_mcp_server(
+    handle: ControlHandle,
+    transport: McpTransportConfig,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
     match transport {
         McpTransportConfig::Disabled => Ok(()),
-        McpTransportConfig::Stdio => {
-            info!("Starting MCP stdio server");
-            let server = McpServer::new(
+        McpTransportConfig::Http { bind_address } => {
+            info!(address = %bind_address, "Starting MCP HTTP server");
+            let mut http_server = HttpMcpServer::new(
                 "scriptbots-control".to_string(),
                 env!("CARGO_PKG_VERSION").to_string(),
             );
 
+            let server_arc = http_server.server().await;
             register_tool(
-                &server,
+                server_arc.clone(),
                 "list_knobs",
                 "List all exposed configuration knobs",
                 json!({"type": "object", "additionalProperties": false}),
                 ControlToolKind::ListKnobs,
                 handle.clone(),
             )
-            .await?;
+            .await
+            .map_err(|err| anyhow!("failed to register list_knobs tool: {err}"))?;
 
             register_tool(
-                &server,
+                server_arc.clone(),
                 "get_config",
                 "Fetch the entire simulation configuration",
                 json!({"type": "object", "additionalProperties": false}),
                 ControlToolKind::GetConfig,
                 handle.clone(),
             )
-            .await?;
+            .await
+            .map_err(|err| anyhow!("failed to register get_config tool: {err}"))?;
 
             register_tool(
-                &server,
+                server_arc.clone(),
                 "apply_updates",
                 "Apply one or more knob updates by path",
                 json!({
@@ -514,18 +553,17 @@ async fn run_mcp_server(handle: ControlHandle, transport: McpTransportConfig) ->
                 ControlToolKind::ApplyUpdates,
                 handle.clone(),
             )
-            .await?;
+            .await
+            .map_err(|err| anyhow!("failed to register apply_updates tool: {err}"))?;
 
             register_tool(
-                &server,
+                server_arc,
                 "apply_patch",
                 "Merge a JSON object patch into the configuration",
                 json!({
                     "type": "object",
                     "properties": {
-                        "patch": {
-                            "type": "object"
-                        }
+                        "patch": {"type": "object"}
                     },
                     "required": ["patch"],
                     "additionalProperties": false
@@ -533,26 +571,36 @@ async fn run_mcp_server(handle: ControlHandle, transport: McpTransportConfig) ->
                 ControlToolKind::ApplyPatch,
                 handle,
             )
-            .await?;
+            .await
+            .map_err(|err| anyhow!("failed to register apply_patch tool: {err}"))?;
 
-            let transport = StdioServerTransport::new();
-            server
+            let transport = HttpServerTransport::new(bind_address.to_string());
+            http_server
                 .start(transport)
                 .await
-                .context("MCP stdio server encountered an error")
+                .context("failed to start MCP HTTP server")?;
+
+            info!(address = %bind_address, "MCP HTTP server listening");
+            shutdown.notified().await;
+            http_server
+                .stop()
+                .await
+                .context("failed to stop MCP HTTP server")?;
+            Ok(())
         }
     }
 }
 
 async fn register_tool(
-    server: &McpServer,
+    server: Arc<Mutex<McpServer>>,
     name: &str,
     description: &str,
     schema: Value,
     kind: ControlToolKind,
     handle: ControlHandle,
 ) -> McpResult<()> {
-    server
+    let guard = server.lock().await;
+    guard
         .add_tool(
             name.to_string(),
             Some(description.to_string()),
@@ -648,5 +696,9 @@ fn map_control_error(err: ControlError) -> McpError {
         ControlError::InvalidPatch(msg) => McpError::Validation(msg),
         ControlError::Serialization(msg) => McpError::Internal(msg),
         ControlError::Lock => McpError::Internal("world state is unavailable".into()),
+        ControlError::CommandQueueFull => {
+            McpError::Internal("command queue is full; retry shortly".into())
+        }
+        ControlError::CommandQueueClosed => McpError::Internal("command queue is closed".into()),
     }
 }

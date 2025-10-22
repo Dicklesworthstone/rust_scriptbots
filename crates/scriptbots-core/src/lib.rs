@@ -103,6 +103,21 @@ fn angle_difference(a: f32, b: f32) -> f32 {
     diff.abs()
 }
 
+/// Commands that can be applied to the world from external control surfaces.
+#[derive(Debug, Clone)]
+pub enum ControlCommand {
+    UpdateConfig(ScriptBotsConfig),
+}
+
+/// Apply a control command to the world state.
+pub fn apply_control_command(world: &mut WorldState, command: ControlCommand) {
+    match command {
+        ControlCommand::UpdateConfig(config) => {
+            *world.config_mut() = config;
+        }
+    }
+}
+
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }

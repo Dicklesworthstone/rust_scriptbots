@@ -20,7 +20,8 @@ fn main() -> Result<()> {
     init_tracing();
     let (world, storage) = bootstrap_world()?;
     let control_config = ControlServerConfig::from_env();
-    let control_runtime = ControlRuntime::launch(world.clone(), control_config)?;
+    let (control_runtime, command_drain, command_submit) =
+        ControlRuntime::launch(world.clone(), control_config)?;
     let (active_mode, renderer) = resolve_renderer(cli.mode)?;
     info!(
         requested_mode = cli.mode.as_str(),
@@ -32,6 +33,8 @@ fn main() -> Result<()> {
         world: Arc::clone(&world),
         storage: Arc::clone(&storage),
         control_runtime: &control_runtime,
+        command_drain,
+        command_submit,
     };
     renderer.run(context)?;
     control_runtime.shutdown()?;
@@ -150,7 +153,12 @@ impl Renderer for GuiRenderer {
     }
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
-        run_demo(Arc::clone(&ctx.world), Some(Arc::clone(&ctx.storage)));
+        run_demo(
+            Arc::clone(&ctx.world),
+            Some(Arc::clone(&ctx.storage)),
+            Arc::clone(&ctx.command_drain),
+            Arc::clone(&ctx.command_submit),
+        );
         Ok(())
     }
 }

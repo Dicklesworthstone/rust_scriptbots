@@ -8,6 +8,7 @@ use scriptbots_storage::Storage;
 pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedStorage = Arc<Mutex<Storage>>;
 
+pub mod command;
 pub mod control;
 pub mod servers;
 pub mod terminal;
@@ -15,13 +16,15 @@ pub mod terminal;
 pub mod renderer {
     use anyhow::Result;
 
-    use crate::{ControlRuntime, SharedStorage, SharedWorld};
+    use crate::{CommandDrain, CommandSubmit, ControlRuntime, SharedStorage, SharedWorld};
 
     /// Shared context passed to renderer implementations.
     pub struct RendererContext<'a> {
         pub world: SharedWorld,
         pub storage: SharedStorage,
         pub control_runtime: &'a ControlRuntime,
+        pub command_drain: CommandDrain,
+        pub command_submit: CommandSubmit,
     }
 
     pub trait Renderer {
@@ -33,7 +36,12 @@ pub mod renderer {
     }
 }
 
+pub use command::{
+    CommandDrain, CommandReceiver, CommandSender, CommandSubmit, create_command_bus,
+    drain_pending_commands, make_command_drain, make_command_submit,
+};
 pub use control::{ConfigSnapshot, ControlError, ControlHandle, KnobEntry, KnobKind, KnobUpdate};
+pub use scriptbots_core::ControlCommand;
 pub use servers::{
     ConfigPatchRequest, ControlRuntime, ControlServerConfig, KnobApplyRequest, McpTransportConfig,
 };

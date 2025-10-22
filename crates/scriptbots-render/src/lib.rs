@@ -8,9 +8,9 @@ use gpui::{
 };
 use rand::Rng;
 use scriptbots_core::{
-    AgentColumns, AgentData, AgentId, AgentRuntime, Generation, INPUT_SIZE, IndicatorState,
-    MutationRates, OUTPUT_SIZE, Position, SelectionState, TerrainKind, TerrainLayer, TickSummary,
-    TraitModifiers, Velocity, WorldState,
+    AgentColumns, AgentData, AgentId, AgentRuntime, ControlCommand, Generation, INPUT_SIZE,
+    IndicatorState, MutationRates, OUTPUT_SIZE, Position, ScriptBotsConfig, SelectionState,
+    TerrainKind, TerrainLayer, TickSummary, TraitModifiers, Velocity, WorldState,
 };
 use scriptbots_storage::{MetricReading, Storage};
 use std::{
@@ -29,7 +29,7 @@ use kira::{
     sound::static_sound::{StaticSoundData, StaticSoundSettings},
 };
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
     let mut delta = target - origin;
@@ -43,7 +43,12 @@ fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
 }
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
-pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Option<Arc<Mutex<Storage>>>) {
+pub fn run_demo(
+    world: Arc<Mutex<WorldState>>,
+    storage: Option<Arc<Mutex<Storage>>>,
+    command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+    command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
+) {
     if let Ok(world) = world.lock()
         && let Some(summary) = world.history().last()
     {
@@ -61,6 +66,8 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Option<Arc<Mutex<Storage
     let title_for_options = window_title.clone();
     let title_for_view = window_title.clone();
     let world_for_view = Arc::clone(&world);
+    let drain_for_view = Arc::clone(&command_drain);
+    let submit_for_view = Arc::clone(&command_submit);
     let storage_for_view = storage.clone();
 
     Application::new().run(move |app: &mut App| {
@@ -83,6 +90,8 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Option<Arc<Mutex<Storage
                     Arc::clone(&world_handle),
                     storage_for_view.clone(),
                     view_title.clone(),
+                    Arc::clone(&drain_for_view),
+                    Arc::clone(&submit_for_view),
                 )
             })
         }) {
@@ -102,6 +111,8 @@ struct SimulationView {
     world: Arc<Mutex<WorldState>>,
     storage: Option<Arc<Mutex<Storage>>>,
     title: SharedString,
+    command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+    command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     camera: Arc<Mutex<CameraState>>,
     inspector: Arc<Mutex<InspectorState>>,
     playback: PlaybackState,
@@ -128,6 +139,8 @@ impl SimulationView {
         world: Arc<Mutex<WorldState>>,
         storage: Option<Arc<Mutex<Storage>>>,
         title: SharedString,
+        command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+        command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     ) -> Self {
         let mut inspector_state = InspectorState::default();
         if let Ok(world_guard) = world.lock() {
@@ -141,6 +154,8 @@ impl SimulationView {
             world,
             storage,
             title,
+            command_drain,
+            command_submit,
             camera: Arc::new(Mutex::new(CameraState::default())),
             inspector: Arc::new(Mutex::new(inspector_state)),
             playback: PlaybackState::new(240),
@@ -209,9 +224,26 @@ impl SimulationView {
         self.sim_accumulator -= step_interval * steps as f32;
 
         if let Ok(mut world) = self.world.lock() {
+            (self.command_drain.as_ref())(&mut world);
             for _ in 0..steps {
                 world.step();
             }
+        }
+    }
+
+    fn submit_config_update<F>(&self, update: F)
+    where
+        F: FnOnce(&mut ScriptBotsConfig),
+    {
+        if let Ok(world) = self.world.lock() {
+            let mut new_config = world.config().clone();
+            drop(world);
+            update(&mut new_config);
+            if !(self.command_submit.as_ref())(ControlCommand::UpdateConfig(new_config)) {
+                warn!("failed to enqueue config update from renderer");
+            }
+        } else {
+            warn!("failed to acquire world lock for config update");
         }
     }
 
@@ -819,9 +851,9 @@ impl SimulationView {
             .unwrap_or(snapshot.agent_count)
             .max(1);
 
-        let share_display = |count: usize| -> String {
+        let share_detail = |count: usize, avg_energy: f64| -> String {
             let share = (count as f64 / total_agents as f64 * 100.0).clamp(0.0, 100.0);
-            format!("{share:.1}% share")
+            format!("{share:.1}% share · avg ⚡ {avg_energy:.2}")
         };
 
         let trophic_cards = vec![
@@ -829,21 +861,27 @@ impl SimulationView {
                 "Carnivores",
                 analytics.carnivores.to_string(),
                 0xcb2a3b,
-                Some(share_display(analytics.carnivores)),
+                Some(share_detail(
+                    analytics.carnivores,
+                    analytics.carnivore_avg_energy,
+                )),
                 None,
             ),
             self.metric_card(
                 "Herbivores",
                 analytics.herbivores.to_string(),
                 0x22c55e,
-                Some(share_display(analytics.herbivores)),
+                Some(share_detail(
+                    analytics.herbivores,
+                    analytics.herbivore_avg_energy,
+                )),
                 None,
             ),
             self.metric_card(
                 "Hybrids",
                 analytics.hybrids.to_string(),
                 0x8b5cf6,
-                Some(share_display(analytics.hybrids)),
+                Some(share_detail(analytics.hybrids, analytics.hybrid_avg_energy)),
                 None,
             ),
         ];
@@ -853,6 +891,16 @@ impl SimulationView {
             .grid_cols(trophic_cards.len() as u16)
             .gap_4()
             .children(trophic_cards);
+
+        let meta_bar = div()
+            .flex()
+            .justify_between()
+            .gap_4()
+            .text_xs()
+            .text_color(rgb(0x94a3b8))
+            .child(div().child(format!("Tick {}", analytics.tick)))
+            .child(div().child(format!("Boosts {}", analytics.boost_count)))
+            .child(div().child(format!("Births {}", analytics.births_total)));
 
         let resource_panel = div()
             .flex()
@@ -1068,6 +1116,7 @@ impl SimulationView {
             .flex()
             .flex_col()
             .gap_4()
+            .child(meta_bar)
             .child(trophic_row)
             .child(insights_row)
             .child(brain_panel)
@@ -1504,9 +1553,9 @@ impl SimulationView {
                 })
                 .unwrap_or(60);
 
-            if let Ok(mut world) = self.world.lock() {
-                world.config_mut().persistence_interval = interval;
-            }
+            self.submit_config_update(|config| {
+                config.persistence_interval = interval;
+            });
         } else {
             let current_interval = self
                 .world
@@ -1520,9 +1569,9 @@ impl SimulationView {
                 }
             }
 
-            if let Ok(mut world) = self.world.lock() {
-                world.config_mut().persistence_interval = 0;
-            }
+            self.submit_config_update(|config| {
+                config.persistence_interval = 0;
+            });
         }
 
         cx.notify();
@@ -1557,9 +1606,9 @@ impl SimulationView {
         }
 
         if was_enabled {
-            if let Ok(mut world) = self.world.lock() {
-                world.config_mut().persistence_interval = new_interval;
-            }
+            self.submit_config_update(|config| {
+                config.persistence_interval = new_interval;
+            });
         }
 
         cx.notify();

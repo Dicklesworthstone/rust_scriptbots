@@ -16,11 +16,11 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
-use scriptbots_core::{AgentColumns, Tick, TickSummary, WorldState};
+use scriptbots_core::{AgentColumns, TickSummary, WorldState};
 use supports_color::{ColorLevel, Stream, on_cached};
 
 use crate::{
-    ControlRuntime, SharedStorage, SharedWorld,
+    CommandDrain, CommandSubmit, ControlRuntime, SharedStorage, SharedWorld,
     renderer::{Renderer, RendererContext},
 };
 
@@ -108,6 +108,8 @@ struct TerminalApp<'a> {
     world: SharedWorld,
     _storage: SharedStorage,
     _control: &'a ControlRuntime,
+    command_drain: CommandDrain,
+    _command_submit: CommandSubmit,
     tick_interval: Duration,
     draw_interval: Duration,
     speed_multiplier: f32,
@@ -128,6 +130,8 @@ impl<'a> TerminalApp<'a> {
             world: Arc::clone(&ctx.world),
             _storage: Arc::clone(&ctx.storage),
             _control: ctx.control_runtime,
+            command_drain: Arc::clone(&ctx.command_drain),
+            _command_submit: Arc::clone(&ctx.command_submit),
             tick_interval: renderer.tick_interval,
             draw_interval: renderer.draw_interval,
             speed_multiplier: 1.0,
@@ -179,6 +183,7 @@ impl<'a> TerminalApp<'a> {
         self.sim_accumulator -= step_interval * steps as f32;
 
         if let Ok(mut world) = self.world.lock() {
+            (self.command_drain.as_ref())(&mut world);
             for _ in 0..steps {
                 world.step();
             }
@@ -187,7 +192,7 @@ impl<'a> TerminalApp<'a> {
         self.refresh_snapshot();
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_, CrosstermBackend<Stdout>>) {
+    fn draw(&mut self, frame: &mut Frame<'_>) {
         self.refresh_snapshot();
         let snapshot = self.snapshot.clone();
 
@@ -198,7 +203,7 @@ impl<'a> TerminalApp<'a> {
                 Constraint::Length(7),
                 Constraint::Min(0),
             ])
-            .split(frame.size());
+            .split(frame.area());
 
         self.draw_header(frame, layout[0], &snapshot);
         self.draw_history(frame, layout[1], &snapshot);
@@ -209,12 +214,7 @@ impl<'a> TerminalApp<'a> {
         }
     }
 
-    fn draw_header(
-        &self,
-        frame: &mut Frame<'_, CrosstermBackend<Stdout>>,
-        area: Rect,
-        snapshot: &Snapshot,
-    ) {
+    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let status = format!(
             "Tick {:>6}  Epoch {:>3}  Agents {:>5}  Births {:>4}  Deaths {:>4}  Avg ⚡ {:>6.2}",
             snapshot.tick,
@@ -256,12 +256,7 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_history(
-        &self,
-        frame: &mut Frame<'_, CrosstermBackend<Stdout>>,
-        area: Rect,
-        snapshot: &Snapshot,
-    ) {
+    fn draw_history(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let history_lines: Vec<Line> = snapshot
             .history
             .iter()
@@ -285,12 +280,7 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_map(
-        &self,
-        frame: &mut Frame<'_, CrosstermBackend<Stdout>>,
-        area: Rect,
-        snapshot: &Snapshot,
-    ) {
+    fn draw_map(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let map_lines: Vec<Line> = snapshot
             .map_rows
             .iter()
@@ -309,8 +299,8 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_help(&self, frame: &mut Frame<'_, CrosstermBackend<Stdout>>) {
-        let size = frame.size();
+    fn draw_help(&self, frame: &mut Frame<'_>) {
+        let size = frame.area();
         let help_width = (size.width as f32 * 0.6).round() as u16;
         let help_height = 10;
         let help_x = size.x + (size.width - help_width) / 2;
@@ -542,7 +532,7 @@ impl Palette {
             return "·";
         }
         match self.level {
-            Some(ColorLevel::TrueColor) | Some(ColorLevel::Ansi256) => {
+            Some(level) if level.has_16m || level.has_256 => {
                 if count <= 2 {
                     "🟢"
                 } else if count <= 5 {
@@ -551,7 +541,7 @@ impl Palette {
                     "🔴"
                 }
             }
-            _ => {
+            Some(level) if level.has_basic => {
                 if count <= 2 {
                     "*"
                 } else if count <= 5 {
@@ -560,6 +550,7 @@ impl Palette {
                     "#"
                 }
             }
+            _ => "#",
         }
     }
 }

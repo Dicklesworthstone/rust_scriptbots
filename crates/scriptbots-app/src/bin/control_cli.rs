@@ -13,7 +13,7 @@ use crossterm::{
 };
 use owo_colors::OwoColorize;
 use ratatui::{
-    Terminal,
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -266,7 +266,7 @@ fn build_rows(entries: &[KnobEntry], previous: &HashMap<String, Value>) -> Vec<W
             .unwrap_or(true);
         rows.push(WatchRow {
             path: entry.path.clone(),
-            kind: entry.kind,
+            kind: entry.kind.clone(),
             value: entry.value.clone(),
             changed,
         });
@@ -275,16 +275,11 @@ fn build_rows(entries: &[KnobEntry], previous: &HashMap<String, Value>) -> Vec<W
     rows
 }
 
-fn draw_watch(
-    frame: &mut ratatui::Frame<CrosstermBackend<std::io::Stdout>>,
-    rows: &[WatchRow],
-    error: Option<&str>,
-    interval: Duration,
-) {
+fn draw_watch(frame: &mut Frame<'_>, rows: &[WatchRow], error: Option<&str>, interval: Duration) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(frame.size());
+        .split(frame.area());
 
     let mut header_lines = vec![
         Line::from(vec![
@@ -332,7 +327,7 @@ fn draw_watch(
             Row::new(vec![
                 Span::styled(&row.path, style),
                 Span::styled(
-                    knob_kind_label(row.kind),
+                    knob_kind_label(row.kind.clone()),
                     Style::default()
                         .fg(Color::Blue)
                         .add_modifier(Modifier::ITALIC),
@@ -342,34 +337,36 @@ fn draw_watch(
         })
         .collect();
 
-    let table = Table::new(table_rows)
-        .header(Row::new(vec![
-            Span::styled(
-                "PATH",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "TYPE",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "VALUE",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .block(Block::default().borders(Borders::ALL))
-        .widths(&[
+    let table = Table::new(
+        table_rows,
+        [
             Constraint::Percentage(45),
             Constraint::Length(12),
             Constraint::Percentage(43),
-        ])
-        .column_spacing(2);
+        ],
+    )
+    .header(Row::new(vec![
+        Span::styled(
+            "PATH",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "TYPE",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "VALUE",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL))
+    .column_spacing(2);
 
     frame.render_widget(table, layout[1]);
 }

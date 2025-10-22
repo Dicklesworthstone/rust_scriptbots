@@ -1,17 +1,17 @@
 use std::sync::{MutexGuard, PoisonError};
 
-use crossfire::channel::TrySendError;
+use crossfire::TrySendError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
+use scriptbots_core::{ControlCommand, ScriptBotsConfig, Tick, WorldState};
 
 use crate::SharedWorld;
-use crate::command::{CommandSender, ControlCommand};
+use crate::command::CommandSender;
 
 /// Snapshot of configuration state returned to external clients.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ConfigSnapshot {
     pub tick: u64,
     pub config: Value,
@@ -134,7 +134,7 @@ impl ControlHandle {
             ));
         }
 
-        let mut world = self.lock_world()?;
+        let world = self.lock_world()?;
         let current_tick = world.tick();
         let mut config_value =
             serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
