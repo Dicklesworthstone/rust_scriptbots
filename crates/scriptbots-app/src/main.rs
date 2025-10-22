@@ -125,7 +125,7 @@ impl fmt::Display for RendererMode {
 
 fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Renderer>)> {
     match mode {
-        RendererMode::Gui => Ok((RendererMode::Gui, Box::new(GuiRenderer::default()))),
+        RendererMode::Gui => Ok((RendererMode::Gui, Box::new(GuiRenderer))),
         RendererMode::Terminal => Ok((
             RendererMode::Terminal,
             Box::new(TerminalRenderer::default()),
@@ -138,7 +138,7 @@ fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Rendere
                     Box::new(TerminalRenderer::default()),
                 ))
             } else {
-                Ok((RendererMode::Gui, Box::new(GuiRenderer::default())))
+                Ok((RendererMode::Gui, Box::new(GuiRenderer)))
             }
         }
     }
@@ -164,18 +164,16 @@ impl Renderer for GuiRenderer {
 }
 
 fn should_use_terminal_mode() -> bool {
-    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_TERMINAL") {
-        if let Some(flag) = parse_bool(&value) {
-            return flag;
-        }
+    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_TERMINAL")
+        && let Some(flag) = parse_bool(&value)
+    {
+        return flag;
     }
 
-    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_GUI") {
-        if let Some(flag) = parse_bool(&value) {
-            if flag {
-                return false;
-            }
-        }
+    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_GUI")
+        && matches!(parse_bool(&value), Some(true))
+    {
+        return false;
     }
 
     #[cfg(target_family = "unix")]

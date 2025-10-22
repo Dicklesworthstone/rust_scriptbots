@@ -239,16 +239,18 @@ fn watch_blocking(client: Client, base_url: String, interval: Duration) -> Resul
             .draw(|frame| draw_watch(frame, &rows, last_error.as_deref(), interval))
             .context("failed to draw watch UI")?;
 
-        if event::poll(Duration::from_millis(100)).context("failed to poll terminal events")? {
-            if let Event::Key(key) = event::read().context("failed to read terminal event")? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('r') => {
-                        // Force refresh on demand.
-                        last_refresh = Instant::now() - interval;
-                    }
-                    _ => {}
+        let event_ready =
+            event::poll(Duration::from_millis(100)).context("failed to poll terminal events")?;
+        if event_ready
+            && let Event::Key(key) = event::read().context("failed to read terminal event")?
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('r') => {
+                    // Force refresh on demand.
+                    last_refresh = Instant::now() - interval;
                 }
+                _ => {}
             }
         }
     }

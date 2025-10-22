@@ -237,10 +237,10 @@ impl ControlRuntime {
 impl Drop for ControlRuntime {
     fn drop(&mut self) {
         self.shutdown.notify_waiters();
-        if let Some(handle) = self.thread.take() {
-            if let Err(err) = handle.join() {
-                error!(?err, "control runtime thread panicked during drop");
-            }
+        if let Some(handle) = self.thread.take()
+            && let Err(err) = handle.join()
+        {
+            error!(?err, "control runtime thread panicked during drop");
         }
     }
 }
@@ -282,16 +282,16 @@ async fn run_control_servers(
 
     shutdown.notified().await;
 
-    if let Some(handle) = rest_handle {
-        if let Err(err) = handle.await {
-            error!(?err, "failed to await REST control server task");
-        }
+    if let Some(handle) = rest_handle
+        && let Err(err) = handle.await
+    {
+        error!(?err, "failed to await REST control server task");
     }
 
-    if let Some(handle) = mcp_handle {
-        if let Err(err) = handle.await {
-            error!(?err, "MCP server task join error");
-        }
+    if let Some(handle) = mcp_handle
+        && let Err(err) = handle.await
+    {
+        error!(?err, "MCP server task join error");
     }
 
     Ok(())

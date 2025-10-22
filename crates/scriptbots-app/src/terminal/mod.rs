@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,13 +10,13 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::{CrosstermBackend, TestBackend},
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
-use scriptbots_core::{AgentColumns, TickSummary, WorldState};
+use scriptbots_core::{AgentColumns, AgentData, TickSummary, WorldState};
 use supports_color::{ColorLevel, Stream, on_cached};
 
 use crate::{
@@ -51,7 +50,7 @@ impl Renderer for TerminalRenderer {
     }
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
-        if env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS").is_some() {
+        if std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS").is_some() {
             return self.run_headless(ctx);
         }
 
@@ -96,12 +95,14 @@ fn run_event_loop(
         let timeout = renderer
             .draw_interval
             .saturating_sub(now.duration_since(app.last_event_check));
-        if event::poll(timeout).unwrap_or(false) {
-            if let Event::Key(key) = event::read()? {
-                if app.handle_key(key)? {
-                    break;
-                }
-            }
+        let event_ready = event::poll(timeout).unwrap_or(false);
+        if event_ready
+            && let Event::Key(key) = event::read()?
+            && app.handle_key(key)?
+        {
+            break;
+        }
+        if event_ready {
             app.last_event_check = Instant::now();
         }
     }
@@ -111,7 +112,7 @@ fn run_event_loop(
 
 impl TerminalRenderer {
     fn run_headless(&self, ctx: RendererContext<'_>) -> Result<()> {
-        let backend = TestBackend::new(80, 36);
+        let backend = ratatui::backend::TestBackend::new(80, 36);
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
 
@@ -580,5 +581,34 @@ impl Palette {
             }
             _ => "#",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptbots_core::ScriptBotsConfig;
+
+    #[test]
+    fn map_symbol_without_color_support_falls_back() {
+        let palette = Palette { level: None };
+        assert_eq!(palette.map_symbol(0), "·");
+        assert_eq!(palette.map_symbol(1), "#");
+        assert_eq!(palette.map_symbol(8), "#");
+    }
+
+    #[test]
+    fn snapshot_reflects_world_state() {
+        let config = ScriptBotsConfig::default();
+        let mut world = WorldState::new(config).expect("world");
+        world.spawn_agent(AgentData::default());
+
+        let palette = Palette { level: None };
+        let snapshot = Snapshot::from_world(&world, &palette);
+
+        assert_eq!(snapshot.agent_count, world.agent_count());
+        assert_eq!(snapshot.tick, world.tick().0);
+        assert_eq!(snapshot.map_rows.len(), MAP_HEIGHT);
+        assert!(snapshot.map_rows.iter().all(|row| !row.is_empty()));
     }
 }
