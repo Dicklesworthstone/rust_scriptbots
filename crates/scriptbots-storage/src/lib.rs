@@ -5,9 +5,11 @@
 extern "system" {}
 
 use duckdb::{Connection, Transaction, params};
+use serde_json::{json, Value};
 use scriptbots_core::{
     AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord, PersistenceBatch,
-    PersistenceEventKind, WorldPersistence,
+    PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope,
+    WorldPersistence,
 };
 use slotmap::Key;
 use std::{
@@ -21,6 +23,7 @@ const DEFAULT_AGENT_BUFFER: usize = 1024;
 const DEFAULT_EVENT_BUFFER: usize = 256;
 const DEFAULT_METRIC_BUFFER: usize = 256;
 const DEFAULT_LIFECYCLE_BUFFER: usize = 512;
+const DEFAULT_REPLAY_BUFFER: usize = 1024;
 
 const AGENT_COLUMNS: &[&str] = &[
     "tick",
@@ -191,6 +194,16 @@ struct DeathRow {
     hit_by_herbivore: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ReplayEventRow {
+    tick: i64,
+    seq: i64,
+    agent_id: Option<i64>,
+    scope: String,
+    event_type: String,
+    payload: String,
+}
+
 #[derive(Default)]
 struct StorageBuffer {
     ticks: Vec<TickRow>,
@@ -199,6 +212,7 @@ struct StorageBuffer {
     agents: Vec<AgentRow>,
     births: Vec<BirthRow>,
     deaths: Vec<DeathRow>,
+    replay_events: Vec<ReplayEventRow>,
 }
 
 impl StorageBuffer {
@@ -209,6 +223,7 @@ impl StorageBuffer {
             && self.agents.is_empty()
             && self.births.is_empty()
             && self.deaths.is_empty()
+            && self.replay_events.is_empty()
     }
 
     fn clear(&mut self) {
@@ -218,6 +233,7 @@ impl StorageBuffer {
         self.agents.clear();
         self.births.clear();
         self.deaths.clear();
+        self.replay_events.clear();
     }
 }
 
@@ -231,6 +247,7 @@ pub struct Storage {
     metric_flush_threshold: usize,
     birth_flush_threshold: usize,
     death_flush_threshold: usize,
+    replay_flush_threshold: usize,
 }
 
 impl Storage {
@@ -246,6 +263,7 @@ impl Storage {
             metric_flush_threshold: DEFAULT_METRIC_BUFFER,
             birth_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
             death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
+            replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
         };
         storage.initialize_schema()?;
         Ok(storage)
@@ -270,6 +288,7 @@ impl Storage {
             metric_flush_threshold: metric,
             birth_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
             death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
+            replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
         };
         storage.initialize_schema()?;
         Ok(storage)
@@ -305,6 +324,18 @@ impl Storage {
                 kind text,
                 count integer,
                 primary key (tick, kind)
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "create table if not exists replay_events (
+                tick bigint,
+                seq bigint,
+                agent_id bigint,
+                scope text,
+                event_type text,
+                payload json,
+                primary key (tick, seq)
             )",
             [],
         )?;
@@ -477,6 +508,12 @@ impl Storage {
             self.buffer.deaths.push(death_row_from_record(death));
         }
 
+        for (seq, event) in payload.replay_events.iter().enumerate() {
+            self.buffer
+                .replay_events
+                .push(replay_row_from_event(event, tick, seq));
+        }
+
         self.maybe_flush()?;
         Ok(())
     }
@@ -493,6 +530,7 @@ impl Storage {
             || self.buffer.agents.len() >= self.agent_flush_threshold
             || self.buffer.births.len() >= self.birth_flush_threshold
             || self.buffer.deaths.len() >= self.death_flush_threshold
+            || self.buffer.replay_events.len() >= self.replay_flush_threshold
         {
             self.flush()?;
         }
@@ -677,6 +715,31 @@ impl Storage {
         Ok(())
     }
 
+    fn insert_replay_events(
+        tx: &Transaction<'_>,
+        rows: &[ReplayEventRow],
+    ) -> Result<(), duckdb::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = tx.prepare(
+            "insert or replace into replay_events (
+                tick, seq, agent_id, scope, event_type, payload
+            ) values (?, ?, ?, ?, ?, ?)",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                row.tick,
+                row.seq,
+                row.agent_id,
+                &row.scope,
+                &row.event_type,
+                &row.payload,
+            ])?;
+        }
+        Ok(())
+    }
+
     /// Force flush buffered records to disk.
     pub fn flush(&mut self) -> Result<(), StorageError> {
         if self.buffer.is_empty() {
@@ -690,6 +753,7 @@ impl Storage {
         Self::insert_agents(&tx, &self.buffer.agents)?;
         Self::insert_births(&tx, &self.buffer.births)?;
         Self::insert_deaths(&tx, &self.buffer.deaths)?;
+        Self::insert_replay_events(&tx, &self.buffer.replay_events)?;
         tx.commit()?;
         self.buffer.clear();
         Ok(())
@@ -985,6 +1049,88 @@ fn optional_agent_id(id: Option<AgentId>) -> Option<i64> {
     id.map(|agent_id| agent_id.data().as_ffi() as i64)
 }
 
+fn phase_label(phase: ReplayAgentPhase) -> &'static str {
+    match phase {
+        ReplayAgentPhase::Movement => "movement",
+        ReplayAgentPhase::Reproduction => "reproduction",
+        ReplayAgentPhase::Mutation => "mutation",
+        ReplayAgentPhase::Spawn => "spawn",
+        ReplayAgentPhase::Selection => "selection",
+        ReplayAgentPhase::Misc => "misc",
+    }
+}
+
+fn scope_label(scope: ReplayRngScope) -> String {
+    match scope {
+        ReplayRngScope::World => "world".to_string(),
+        ReplayRngScope::Agent { phase, .. } => {
+            format!("agent:{}", phase_label(phase))
+        }
+    }
+}
+
+fn replay_row_from_event(event: &ReplayEvent, tick: i64, seq: usize) -> ReplayEventRow {
+    let (scope, event_type, payload_value): (String, String, Value) = match &event.kind {
+        ReplayEventKind::BrainOutputs { outputs } => (
+            if event.agent_id.is_some() {
+                "agent:brain"
+            } else {
+                "world:brain"
+            }
+            .to_string(),
+            "brain_outputs".to_string(),
+            json!({ "outputs": outputs }),
+        ),
+        ReplayEventKind::Action {
+            left_wheel,
+            right_wheel,
+            boost,
+            spike_target,
+            sound_level,
+            give_intent,
+        } => (
+            if event.agent_id.is_some() {
+                "agent:action"
+            } else {
+                "world:action"
+            }
+            .to_string(),
+            "action".to_string(),
+            json!({
+                "left_wheel": left_wheel,
+                "right_wheel": right_wheel,
+                "boost": boost,
+                "spike_target": spike_target,
+                "sound_level": sound_level,
+                "give_intent": give_intent,
+            }),
+        ),
+        ReplayEventKind::RngSample {
+            scope,
+            range_min,
+            range_max,
+            value,
+        } => (
+            scope_label(*scope),
+            "rng_sample".to_string(),
+            json!({
+                "range_min": range_min,
+                "range_max": range_max,
+                "value": value,
+            }),
+        ),
+    };
+
+    ReplayEventRow {
+        tick,
+        seq: seq as i64,
+        agent_id: optional_agent_id(event.agent_id),
+        scope,
+        event_type,
+        payload: payload_value.to_string(),
+    }
+}
+
 fn birth_row_from_record(record: &BirthRecord) -> BirthRow {
     BirthRow {
         tick: record.tick.0 as i64,
@@ -1102,6 +1248,7 @@ mod tests {
             agents: vec![sample_agent(energy)],
             births: Vec::new(),
             deaths: Vec::new(),
+            replay_events: Vec::new(),
         }
     }
 

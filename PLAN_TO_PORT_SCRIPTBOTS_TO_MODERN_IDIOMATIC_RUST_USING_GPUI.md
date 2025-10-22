@@ -199,7 +199,7 @@
   - [ ] Implement mutation/crossover suites validated against C++ reference data.
   - [ ] Develop brain registry benchmarking (per-brain tick cost, cache hit rates).
 - **Analytics & Replay**
-  - [Currently In Progress] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
+- [Currently In Progress - GPT-5 Codex 2025-10-22] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
   - [ ] Implement deterministic replay runner (headless) driven by stored events.
   - [ ] Add DuckDB parity queries (population charts, kill ratios, energy histograms) vs. C++ scripts.
   - [ ] Provide CLI tooling to diff runs (Rust vs. C++ baseline) and highlight divergences.

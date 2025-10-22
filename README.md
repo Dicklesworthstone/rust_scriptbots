@@ -174,12 +174,53 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 9. Reproduction (mutation/crossover) in stable order
 10. Persistence hooks (batched to DuckDB)
 
+### Design principles & determinism
+- **Zero undefined behavior**: no `unsafe` in v1; clear ownership and lifetimes.
+- **Stable order of effects**: floating-point reductions and removals are staged and applied in a fixed order for bitwise-stable runs across thread counts.
+- **Per-agent RNG**: seeds derive from a global seed + `AgentId`, keeping behavior stable as populations change and threads vary.
+- **Feature-gated parallelism**: `scriptbots-core` defaults to `parallel` (Rayon), while web builds disable it for single-thread determinism.
+
+### Data model & spatial indexing
+- **SoA layout**: agents use cache-friendly columns (`AgentColumns`) for fast scans during sense/actuation.
+- **Generational IDs**: slotmap-backed `AgentId` prevents stale references and enables stable iteration.
+- **Spatial index**: uniform hash grid by default (opt-in `rstar`/`kd`). Sense builds a read-only snapshot; actuation writes into a double buffer to avoid races.
+
+### Sensors & outputs
+- **Sensors**: multi-eye vision cones (angular), smell/sound/blood channels with attenuation, temperature discomfort, and clock/age cues.
+- **Outputs**: differential drive (wheel velocities), color/indicator pulses, spike length easing, give intent (altruistic food sharing), boost control, sound output.
+- **Mapping**: outputs drive physics and side-effects (e.g., spike damage scales with spike length and speed) and are logged for analytics.
+
+### Brains & evolution
+- **Brain trait** with `tick`/`mutate`/`crossover`; implementations include MLP (production), `dwraon` (feature), `assembly` (experimental).
+- **Brain registry**: per-run registry attaches runners by key, enabling hybrid populations and runtime selection.
+- **Genome & genetics**: genomes capture topology/activations; mutation/crossover create hybrid births with lineage tracking and tests.
+- **NeuroFlow** (optional): deterministic CPU MLP with runtime toggles; seed-stable outputs verified in tests.
+
+### Environment: food, terrain, temperature
+- **Food dynamics**: configurable growth, decay, diffusion, and fertility capacity; speed-based intake and reproduction bonuses mirror legacy behavior.
+- **Topography**: tile-based terrain/elevation influence fertility and movement energy (downhill momentum/energy costs).
+- **Temperature**: gradient and per-agent preference drive discomfort drains; exposed in config and analytics.
+- **Closed worlds & seeding**: enforce closed ecosystems; maintain population floors and scheduled spawns.
+
+### Combat & mortality analytics
+- **Spikes**: damage scales with requested spike length and agent speed; collision resolution is staged for determinism.
+- **Carcass sharing**: meat distribution honors age scaling and diet tendencies; events persisted for analysis.
+- **Analytics**: attacker/victim flags (carnivore/herbivore), births/deaths, hybrid markers, age/boost tracking, and per-tick summaries feed the HUD and DuckDB.
+
 ## Rendering & UX
 - GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes).
 - Camera controls: pan/zoom; keyboard bindings for pause, draw toggle, speed ±.
 - Overlays: selection highlights, diagnostics panel; charts and advanced overlays are staged in the plan.
 - Inspector: per-agent stats and genome/brain views (scoped to plan milestones).
 - Optional audio via `kira` (feature `audio`).
+
+### Accessibility & input
+- **Colorblind-safe palettes** (deuteranopia/protanopia/tritanopia) and a high-contrast mode; UI elements and overlays respect palette transforms.
+- **Keyboard remapping** with conflict resolution and capture mode; discoverable bindings in the HUD.
+- **Narration hooks** prepared for future screen-reader integration; toggles surfaced in the inspector.
+
+### Renderer abstraction
+- The app selects a `Renderer` implementation at runtime (`gpui` or `terminal`) via `--mode {auto|gui|terminal}` or environment variables. Both renderers consume the same world snapshots and control bus.
 
 ### Terminal mode (planned)
 An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode (`--mode {auto|gui|terminal}`) with fallback when GPUI cannot start. See the “Terminal Rendering Mode (Emoji TUI)” section in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`.
@@ -232,6 +273,12 @@ Configuration: persistence buffers flush automatically; call `optimize()` period
 - **Tests**: `cargo test --workspace` (simulation and GPUI tests will be added as systems land)
 - **Profiles**: Release uses LTO, single codegen unit, and abort-on-panic for optimal binaries.
 
+## Testing & CI
+- **Core tests**: unit and property tests for reproduction math, spike damage, food sharing/consumption; determinism tests run seeded scenarios and assert stable summaries.
+- **Render tests**: GPUI compile-time view tests; terminal HUD headless smoke tests (`SCRIPTBOTS_TERMINAL_HEADLESS=1`).
+- **Benchmarks**: `criterion` harness for ticks/sec at various agent counts.
+- **CI**: matrix for macOS 14 and Ubuntu 24.04; wasm job builds `scriptbots-web`, runs parity tests in headless Chromium; release job uses `cargo dist` with optional macOS codesigning.
+
 ## Runtime control surfaces
 
 ### REST Control API (with Swagger UI)
@@ -269,6 +316,18 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
   - `apply_patch` → accepts `{ patch: { ... } }`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
 
+### Configuration knobs (examples)
+All configuration can be inspected and updated at runtime via REST/CLI/MCP. Common knobs:
+- World: `world_width`, `world_height`, `closed`
+- Population: `population_minimum`, `population_spawn_interval`
+- Food: `food_max`, `food_regrowth_rate`, `food_diffusion`, `food_decay`, `fertility_strength`
+- Temperature: `temperature_gradient`, `temperature_offset`
+- Reproduction: `reproduction_rate_carnivore`, `reproduction_rate_herbivore`, `mutation.{primary,secondary}`
+- Traits: `trait_modifiers.{smell,sound,hearing,eye,blood}`
+- NeuroFlow: `neuroflow.{enabled,hidden_layers,activation}`
+
+Use `GET /api/knobs` to discover the full flattened list with current values.
+
 ## Contributing
 - Keep changes scoped to the relevant crate; prefer improving existing files over adding new ones unless functionality is genuinely new.
 - Update docs where it helps future maintainers understand decisions and invariants.
@@ -284,6 +343,11 @@ Helpful docs:
 - `docs/wasm/adrs/ADR-002-browser-persistence.md` — browser persistence approach
 - `docs/wasm/adrs/ADR-004-component-model.md` — component model/WASI Preview assessment
 - `docs/wasm/browser_matrix.csv` — browser capabilities (WebGPU, SAB, SIMD)
+
+### WASM snapshot format & APIs
+- `snapshot_format`: `json` (default) or `binary` (Postcard `Uint8Array`).
+- APIs: `default_init_options()`, `init_sim(options)`, `tick(steps)`, `snapshot()`, `reset(seed?)`, `registerBrain("wander"|"mlp"|"none")`.
+- Determinism: wasm-vs-native parity tests compare snapshots for fixed seeds; single-thread fallback is default (Rayon disabled).
 
 ## Licensing
 Licensed under `MIT OR Apache-2.0` (see workspace manifest).

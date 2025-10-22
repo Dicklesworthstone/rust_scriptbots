@@ -13,25 +13,20 @@ fn default_profile(config: &ScriptBotsConfig) -> FoodCellProfileSnapshot {
     }
 }
 
-fn expected_food_value(
-    profiles: &[FoodCellProfileSnapshot],
-    config: &ScriptBotsConfig,
-    before: &[f32],
-    width: usize,
-    height: usize,
-    x: u32,
-    y: u32,
-) -> f32 {
-    let idx = y as usize * width + x as usize;
-    let profile = profiles
-        .get(idx)
-        .copied()
+fn expected_food_value(world: &WorldState, before: &[f32], x: u32, y: u32) -> f32 {
+    let width = world.food().width() as usize;
+    let height = world.food().height() as usize;
+    let height = world.food().height() as usize;
+    let config = world.config();
+    let profile = world
+        .food_profile(x, y)
         .unwrap_or_else(|| default_profile(config));
 
     let diffusion = config.food_diffusion_rate;
     let decay = config.food_decay_rate;
     let growth = config.food_growth_rate;
 
+    let idx = y as usize * width + x as usize;
     let previous = before[idx];
     let mut value = previous;
 
@@ -62,11 +57,19 @@ fn expected_food_value(
         value -= decay * profile.decay_multiplier * value;
     }
 
-    if growth > 0.0 {
-        value += growth * profile.growth_multiplier * (profile.capacity - value);
+    if growth > 0.0 && config.food_max > 0.0 {
+        let normalized = value / config.food_max;
+        let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
+        value += growth_delta * config.food_max;
     }
 
-    value.clamp(0.0, profile.capacity.max(0.0))
+    let mut cap = profile.capacity.max(previous);
+    let global_cap = config.food_max.max(previous);
+    if cap > global_cap {
+        cap = global_cap;
+    }
+
+    value.clamp(0.0, cap.max(0.0))
 }
 
 #[test]
@@ -347,37 +350,17 @@ fn food_growth_moves_toward_capacity() {
     };
 
     let mut world = WorldState::new(config).expect("world");
-    let width = world.food().width() as usize;
-    let height = world.food().height() as usize;
-    let config_snapshot = world.config().clone();
-    let mut profiles = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            profiles.push(
-                world
-                    .food_profile(x as u32, y as u32)
-                    .unwrap_or_else(|| default_profile(&config_snapshot)),
-            );
-        }
-    }
-
     let before = world.food().cells().to_vec();
     world.step();
 
+    let width = world.food().width() as usize;
+    let height = world.food().height() as usize;
     let cells = world.food().cells();
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
             let value = cells[idx];
-            let expected = expected_food_value(
-                &profiles,
-                &config_snapshot,
-                &before,
-                width,
-                height,
-                x as u32,
-                y as u32,
-            );
+            let expected = expected_food_value(&world, &before, x as u32, y as u32);
             assert!(
                 (value - expected).abs() < 1e-6,
                 "cell=({x},{y}) value={value} expected={expected}"
@@ -402,20 +385,6 @@ fn food_diffusion_spreads_across_neighbors() {
     };
 
     let mut world = WorldState::new(config).expect("world");
-    let width = world.food().width() as usize;
-    let height = world.food().height() as usize;
-    let config_snapshot = world.config().clone();
-    let mut profiles = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            profiles.push(
-                world
-                    .food_profile(x as u32, y as u32)
-                    .unwrap_or_else(|| default_profile(&config_snapshot)),
-            );
-        }
-    }
-
     let max_food = world.config().food_max;
     if let Some(cell) = world.food_mut().get_mut(0, 0) {
         *cell = max_food;
@@ -424,25 +393,22 @@ fn food_diffusion_spreads_across_neighbors() {
     let before = world.food().cells().to_vec();
     world.step();
 
+    let width = world.food().width() as usize;
+    let height = world.food().height() as usize;
     let cells = world.food().cells();
-    let center_expected =
-        expected_food_value(&profiles, &config_snapshot, &before, width, height, 0, 0);
+    let center_expected = expected_food_value(&world, &before, 0, 0);
     assert!(
         (cells[0] - center_expected).abs() < 1e-6,
         "center value={} expected={center_expected}",
         cells[0]
     );
 
-    let neighbors = [
-        (1_u32, 0_u32),
-        (world.food().width() - 1, 0),
-        (0, 1),
-        (0, world.food().height() - 1),
-    ];
+    let last_x = world.food().width() - 1;
+    let last_y = world.food().height() - 1;
+    let neighbors = [(1_u32, 0_u32), (last_x, 0), (0, 1), (0, last_y)];
     for &(x, y) in &neighbors {
         let idx = y as usize * width + x as usize;
-        let expected =
-            expected_food_value(&profiles, &config_snapshot, &before, width, height, x, y);
+        let expected = expected_food_value(&world, &before, x, y);
         let value = cells[idx];
         assert!(
             (value - expected).abs() < 1e-6,
@@ -467,37 +433,17 @@ fn food_decay_reduces_cell_values() {
     };
 
     let mut world = WorldState::new(config).expect("world");
-    let width = world.food().width() as usize;
-    let height = world.food().height() as usize;
-    let config_snapshot = world.config().clone();
-    let mut profiles = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            profiles.push(
-                world
-                    .food_profile(x as u32, y as u32)
-                    .unwrap_or_else(|| default_profile(&config_snapshot)),
-            );
-        }
-    }
-
     let before = world.food().cells().to_vec();
     world.step();
 
+    let width = world.food().width() as usize;
+    let height = world.food().height() as usize;
     let cells = world.food().cells();
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
             let value = cells[idx];
-            let expected = expected_food_value(
-                &profiles,
-                &config_snapshot,
-                &before,
-                width,
-                height,
-                x as u32,
-                y as u32,
-            );
+            let expected = expected_food_value(&world, &before, x as u32, y as u32);
             assert!(
                 (value - expected).abs() < 1e-6,
                 "cell=({x},{y}) value={value} expected={expected}"

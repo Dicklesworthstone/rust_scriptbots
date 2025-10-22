@@ -690,7 +690,13 @@ impl ReportSummary {
 }
 
 fn report_file_path_from_env() -> Option<PathBuf> {
-    std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT").map(PathBuf::from)
+    std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT").and_then(|raw| {
+        if raw.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(raw))
+        }
+    })
 }
 
 struct Palette {

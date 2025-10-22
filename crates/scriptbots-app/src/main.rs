@@ -10,7 +10,8 @@ use scriptbots_core::{AgentData, NeuroflowActivationKind, ScriptBotsConfig, Worl
 use scriptbots_render::run_demo;
 use scriptbots_storage::StoragePipeline;
 use std::{
-    env, fmt,
+    env, fmt, fs,
+    path::Path,
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info, warn};
@@ -56,7 +57,16 @@ fn bootstrap_world() -> Result<(SharedWorld, SharedStorage)> {
     };
     apply_env_overrides(&mut config);
 
-    let pipeline = StoragePipeline::new("scriptbots.db")?;
+    let storage_path =
+        env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
+    if let Some(parent) = Path::new(&storage_path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let pipeline = StoragePipeline::new(&storage_path)?;
     let storage: SharedStorage = pipeline.storage();
     let mut world = WorldState::with_persistence(config, Box::new(pipeline))?;
     let brain_keys = install_brains(&mut world);

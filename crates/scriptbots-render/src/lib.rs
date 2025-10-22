@@ -1704,6 +1704,497 @@ impl SimulationView {
             .contains(&self.settings_panel.search_query.to_lowercase())
     }
 
+    /// Check if any params in a list match the current search query
+    fn has_matching_params(&self, params: &[(&str, String, &str)]) -> bool {
+        if self.settings_panel.search_query.is_empty() {
+            return true; // No search active - always has "matches"
+        }
+        params.iter().any(|(label, value, desc)| {
+            self.matches_search(label) || self.matches_search(value) || self.matches_search(desc)
+        })
+    }
+
+    /// Check if a category has any matching parameters (for conditional rendering during search)
+    /// Note: This duplicates param construction logic to avoid API changes, prioritizing clarity
+    fn category_has_matches(&self, category: ConfigCategory) -> bool {
+        if self.settings_panel.search_query.is_empty() {
+            return true; // No search - show all categories
+        }
+
+        let config = if let Ok(world) = self.world.lock() {
+            world.config().clone()
+        } else {
+            scriptbots_core::ScriptBotsConfig::default()
+        };
+
+        // Special handling for Topography (has toggle + readonly params)
+        if matches!(category, ConfigCategory::Topography) {
+            let toggle_matches = self.matches_search("Enabled")
+                || self.matches_search("Enable terrain elevation effects");
+            let readonly_params = [
+                (
+                    "Speed Gain",
+                    self.format_float(config.topography_speed_gain, 3),
+                    "Downhill boost per unit slope",
+                ),
+                (
+                    "Energy Penalty",
+                    self.format_float(config.topography_energy_penalty, 4),
+                    "Uphill cost per unit slope",
+                ),
+            ];
+            return toggle_matches || self.has_matching_params(&readonly_params);
+        }
+
+        // Check all other categories' params
+        match category {
+            ConfigCategory::World => {
+                let params = [
+                    (
+                        "World Width",
+                        format!("{} units", config.world_width),
+                        "Horizontal extent of the simulation world",
+                    ),
+                    (
+                        "World Height",
+                        format!("{} units", config.world_height),
+                        "Vertical extent of the simulation world",
+                    ),
+                    (
+                        "Food Cell Size",
+                        format!("{} units", config.food_cell_size),
+                        "Size of each food grid cell",
+                    ),
+                    (
+                        "Initial Food",
+                        self.format_float(config.initial_food, 3),
+                        "Starting food in each cell",
+                    ),
+                    (
+                        "RNG Seed",
+                        config
+                            .rng_seed
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "Random".to_string()),
+                        "Random number generator seed",
+                    ),
+                    (
+                        "Chart Flush Interval",
+                        format!("{} ticks", config.chart_flush_interval),
+                        "History chart update frequency",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Food => {
+                let params = [
+                    (
+                        "Respawn Interval",
+                        format!("{} ticks", config.food_respawn_interval),
+                        "Ticks between food respawn events",
+                    ),
+                    (
+                        "Respawn Amount",
+                        self.format_float(config.food_respawn_amount, 3),
+                        "Food added per respawn",
+                    ),
+                    (
+                        "Maximum Food",
+                        self.format_float(config.food_max, 3),
+                        "Maximum food per cell",
+                    ),
+                    (
+                        "Growth Rate",
+                        self.format_float(config.food_growth_rate, 4),
+                        "Logistic regrowth rate",
+                    ),
+                    (
+                        "Decay Rate",
+                        self.format_float(config.food_decay_rate, 4),
+                        "Proportional decay rate",
+                    ),
+                    (
+                        "Diffusion Rate",
+                        self.format_float(config.food_diffusion_rate, 3),
+                        "Neighbor exchange rate",
+                    ),
+                    (
+                        "Intake Rate",
+                        self.format_float(config.food_intake_rate, 3),
+                        "Agent food consumption rate",
+                    ),
+                    (
+                        "Sharing Radius",
+                        self.format_float(config.food_sharing_radius, 1),
+                        "Friendly neighbor sharing distance",
+                    ),
+                    (
+                        "Sharing Rate",
+                        self.format_float(config.food_sharing_rate, 3),
+                        "Energy fraction shared per neighbor",
+                    ),
+                    (
+                        "Transfer Rate",
+                        self.format_float(config.food_transfer_rate, 4),
+                        "Altruistic sharing amount",
+                    ),
+                    (
+                        "Sharing Distance",
+                        self.format_float(config.food_sharing_distance, 1),
+                        "Altruistic sharing threshold",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Agent => {
+                let params = [
+                    (
+                        "Bot Speed",
+                        self.format_float(config.bot_speed, 2),
+                        "Base wheel speed multiplier",
+                    ),
+                    (
+                        "Bot Radius",
+                        self.format_float(config.bot_radius, 1),
+                        "Agent radius for collisions",
+                    ),
+                    (
+                        "Boost Multiplier",
+                        format!("{}×", self.format_float(config.boost_multiplier, 2)),
+                        "Speed boost when activated",
+                    ),
+                    (
+                        "Sense Radius",
+                        self.format_float(config.sense_radius, 1),
+                        "Perception range",
+                    ),
+                    (
+                        "Max Neighbors",
+                        self.format_float(config.sense_max_neighbors, 0),
+                        "Normalization factor",
+                    ),
+                    (
+                        "Carnivore Threshold",
+                        self.format_float(config.carnivore_threshold, 2),
+                        "Herbivore tendency cutoff for carnivores",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Metabolism => {
+                let params = [
+                    (
+                        "Base Drain",
+                        self.format_float(config.metabolism_drain, 4),
+                        "Baseline energy cost",
+                    ),
+                    (
+                        "Movement Drain",
+                        self.format_float(config.movement_drain, 4),
+                        "Cost per velocity",
+                    ),
+                    (
+                        "Ramp Floor",
+                        self.format_float(config.metabolism_ramp_floor, 2),
+                        "Energy level for ramping",
+                    ),
+                    (
+                        "Ramp Rate",
+                        self.format_float(config.metabolism_ramp_rate, 4),
+                        "Additional drain above floor",
+                    ),
+                    (
+                        "Boost Penalty",
+                        self.format_float(config.metabolism_boost_penalty, 4),
+                        "Fixed boost cost",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Temperature => {
+                let params = [
+                    (
+                        "Discomfort Rate",
+                        self.format_float(config.temperature_discomfort_rate, 4),
+                        "Health drain multiplier",
+                    ),
+                    (
+                        "Comfort Band",
+                        format!("±{}", self.format_float(config.temperature_comfort_band, 3)),
+                        "Tolerance threshold",
+                    ),
+                    (
+                        "Gradient Exponent",
+                        self.format_float(config.temperature_gradient_exponent, 2),
+                        "Pole-to-equator shaping",
+                    ),
+                    (
+                        "Discomfort Exp",
+                        self.format_float(config.temperature_discomfort_exponent, 2),
+                        "Discomfort scaling power",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Reproduction => {
+                let params = [
+                    (
+                        "Energy Threshold",
+                        self.format_float(config.reproduction_energy_threshold, 2),
+                        "Required energy to reproduce",
+                    ),
+                    (
+                        "Energy Cost",
+                        self.format_float(config.reproduction_energy_cost, 2),
+                        "Parent's energy deduction",
+                    ),
+                    (
+                        "Cooldown",
+                        format!("{} ticks", config.reproduction_cooldown),
+                        "Ticks between reproductions",
+                    ),
+                    (
+                        "Herbivore Rate",
+                        format!(
+                            "{}×",
+                            self.format_float(config.reproduction_rate_herbivore, 3)
+                        ),
+                        "Herbivore multiplier",
+                    ),
+                    (
+                        "Carnivore Rate",
+                        format!(
+                            "{}×",
+                            self.format_float(config.reproduction_rate_carnivore, 3)
+                        ),
+                        "Carnivore multiplier",
+                    ),
+                    (
+                        "Child Energy",
+                        self.format_float(config.reproduction_child_energy, 2),
+                        "Starting energy for child",
+                    ),
+                    (
+                        "Spawn Jitter",
+                        format!(
+                            "±{}",
+                            self.format_float(config.reproduction_spawn_jitter, 1)
+                        ),
+                        "Position randomization",
+                    ),
+                    (
+                        "Spawn Back Distance",
+                        self.format_float(config.reproduction_spawn_back_distance, 1),
+                        "Child spawn distance behind parent",
+                    ),
+                    (
+                        "Color Jitter",
+                        format!(
+                            "±{}",
+                            self.format_float(config.reproduction_color_jitter, 3)
+                        ),
+                        "RGB mutation range",
+                    ),
+                    (
+                        "Mutation Scale",
+                        self.format_float(config.reproduction_mutation_scale, 4),
+                        "Trait mutation magnitude",
+                    ),
+                    (
+                        "Partner Chance",
+                        format!(
+                            "{}%",
+                            self.format_float(config.reproduction_partner_chance * 100.0, 1)
+                        ),
+                        "Crossover probability",
+                    ),
+                    (
+                        "Gene Log Capacity",
+                        format!("{}", config.reproduction_gene_log_capacity),
+                        "Max gene history entries",
+                    ),
+                    (
+                        "Meta-Mutation Chance",
+                        format!(
+                            "{}%",
+                            self.format_float(config.reproduction_meta_mutation_chance * 100.0, 1)
+                        ),
+                        "Mutation rate mutation chance",
+                    ),
+                    (
+                        "Meta-Mutation Scale",
+                        self.format_float(config.reproduction_meta_mutation_scale, 4),
+                        "Mutation rate change magnitude",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Aging => {
+                let params = [
+                    (
+                        "Decay Start Age",
+                        format!("{} ticks", config.aging_health_decay_start),
+                        "Age when decay begins",
+                    ),
+                    (
+                        "Decay Rate",
+                        self.format_float(config.aging_health_decay_rate, 5),
+                        "Health loss per tick",
+                    ),
+                    (
+                        "Decay Max",
+                        self.format_float(config.aging_health_decay_max, 4),
+                        "Maximum decay per tick",
+                    ),
+                    (
+                        "Energy Penalty",
+                        format!(
+                            "{}×",
+                            self.format_float(config.aging_energy_penalty_rate, 3)
+                        ),
+                        "Health-to-energy conversion",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Combat => {
+                let params = [
+                    (
+                        "Spike Radius",
+                        self.format_float(config.spike_radius, 1),
+                        "Base spike collision radius",
+                    ),
+                    (
+                        "Spike Damage",
+                        self.format_float(config.spike_damage, 2),
+                        "Damage at full power",
+                    ),
+                    (
+                        "Spike Energy Cost",
+                        self.format_float(config.spike_energy_cost, 4),
+                        "Energy cost to deploy",
+                    ),
+                    (
+                        "Min Length",
+                        self.format_float(config.spike_min_length, 2),
+                        "Minimum for damage",
+                    ),
+                    (
+                        "Alignment Cosine",
+                        self.format_float(config.spike_alignment_cosine, 2),
+                        "Directional threshold",
+                    ),
+                    (
+                        "Speed Bonus",
+                        format!("{}×", self.format_float(config.spike_speed_damage_bonus, 3)),
+                        "Velocity scaling",
+                    ),
+                    (
+                        "Length Bonus",
+                        format!(
+                            "{}×",
+                            self.format_float(config.spike_length_damage_bonus, 3)
+                        ),
+                        "Length scaling",
+                    ),
+                    (
+                        "Growth Rate",
+                        self.format_float(config.spike_growth_rate, 4),
+                        "Spike extension rate",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Carcass => {
+                let params = [
+                    (
+                        "Distribution Radius",
+                        self.format_float(config.carcass_distribution_radius, 1),
+                        "Reward share distance",
+                    ),
+                    (
+                        "Health Reward",
+                        self.format_float(config.carcass_health_reward, 2),
+                        "Base health given",
+                    ),
+                    (
+                        "Reproduction Reward",
+                        self.format_float(config.carcass_reproduction_reward, 1),
+                        "Cooldown reduction",
+                    ),
+                    (
+                        "Neighbor Exponent",
+                        self.format_float(config.carcass_neighbor_exponent, 2),
+                        "Sharing normalization",
+                    ),
+                    (
+                        "Maturity Age",
+                        format!("{} ticks", config.carcass_maturity_age),
+                        "Full reward age",
+                    ),
+                    (
+                        "Energy Share",
+                        format!(
+                            "{}%",
+                            self.format_float(config.carcass_energy_share_rate * 100.0, 1)
+                        ),
+                        "Health-to-energy conversion",
+                    ),
+                    (
+                        "Indicator Scale",
+                        self.format_float(config.carcass_indicator_scale, 2),
+                        "Visual pulse intensity",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Topography => unreachable!(), // Handled above
+            ConfigCategory::Population => {
+                let params = [
+                    (
+                        "Minimum Population",
+                        format!("{}", config.population_minimum),
+                        "Auto-seed threshold",
+                    ),
+                    (
+                        "Spawn Interval",
+                        format!("{} ticks", config.population_spawn_interval),
+                        "Ticks between spawns",
+                    ),
+                    (
+                        "Spawn Count",
+                        format!("{}", config.population_spawn_count),
+                        "Agents per interval",
+                    ),
+                    (
+                        "Crossover Chance",
+                        format!(
+                            "{}%",
+                            self.format_float(config.population_crossover_chance * 100.0, 1)
+                        ),
+                        "Breed vs. random spawn",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+            ConfigCategory::Persistence => {
+                let params = [
+                    (
+                        "Interval",
+                        format!("{} ticks", config.persistence_interval),
+                        "Database flush frequency",
+                    ),
+                    (
+                        "History Capacity",
+                        format!("{}", config.history_capacity),
+                        "In-memory tick summaries",
+                    ),
+                ];
+                self.has_matching_params(&params)
+            }
+        }
+    }
+
     /// Render a list of parameters with search filtering - ONE central filter point for ALL 60+ params!
     fn render_filtered_params(&self, params: Vec<(&str, String, &str)>) -> Div {
         let mut container = div()
@@ -1718,25 +2209,13 @@ impl SimulationView {
             .border_color(rgb(0x1e293b));
 
         // ✨ SINGLE CENTRALIZED FILTERING LOOP - this replaces 60+ individual checks!
-        let mut match_count = 0;
         for (label, value, desc) in params {
             if self.matches_search(label)
                 || self.matches_search(&value)
                 || self.matches_search(desc)
             {
                 container = container.child(self.render_param_readonly(label, &value, desc));
-                match_count += 1;
             }
-        }
-
-        // Show helpful empty state when search returns no results
-        if match_count == 0 && !self.settings_panel.search_query.is_empty() {
-            container = container.child(div().flex().items_center().justify_center().py_8().child(
-                div().text_sm().text_color(rgb(0x64748b)).child(format!(
-                    "No matches for \"{}\"",
-                    self.settings_panel.search_query
-                )),
-            ));
         }
 
         container
@@ -2309,7 +2788,7 @@ impl SimulationView {
                             .child(format!("E {:.2}", entry.energy)),
                     ),
             )
-            .child(div().text_xs().text_color(rgb(0xe0e7ff)).child(format!(
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
                 "H {:.2} · Age {} · Gen {}",
                 entry.health, entry.age, entry.generation.0
             )))
@@ -4410,9 +4889,9 @@ impl SimulationView {
                 } else if key.len() == 1
                     && key
                         .chars()
-                        .all(|c| c.is_alphanumeric() || c.is_whitespace() || "._-".contains(c))
+                        .all(|c| c.is_alphanumeric() || c.is_whitespace() || "._-±×%".contains(c))
                 {
-                    // Add alphanumeric characters, spaces, and common punctuation to search
+                    // Add alphanumeric characters, spaces, punctuation, and special chars (±, ×, %) to search
                     let mut query = this.settings_panel.search_query.clone();
                     query.push_str(key);
                     this.update_search(query, cx);
@@ -4458,7 +4937,7 @@ impl SimulationView {
                                         .rounded_md()
                                         .bg(rgb(0x334155))
                                         .text_xs()
-                                        .text_color(rgb(0xe0e7ff))
+                                        .text_color(rgb(0x94a3b8))
                                         .child("Press , to toggle"),
                                 ),
                         ),
@@ -4623,9 +5102,35 @@ impl SimulationView {
 
     fn render_all_config_categories(&self, cx: &mut Context<Self>) -> Div {
         let mut container = div().flex().flex_col().gap_4();
+        let mut rendered_count = 0;
 
+        // Only render categories that have matching parameters during search
         for category in ConfigCategory::all() {
-            container = container.child(self.render_config_category(category, cx));
+            if self.category_has_matches(category) {
+                container = container.child(self.render_config_category(category, cx));
+                rendered_count += 1;
+            }
+        }
+
+        // Global empty state if ALL categories filtered out during search
+        if rendered_count == 0 && !self.settings_panel.search_query.is_empty() {
+            container = container.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .py(px(64.0))
+                    .child(div().text_3xl().child("🔍"))
+                    .child(div().text_base().text_color(rgb(0x94a3b8)).child(format!(
+                        "No parameters match \"{}\"",
+                        self.settings_panel.search_query
+                    )))
+                    .child(div().text_sm().text_color(rgb(0x64748b)).child(
+                        "Try a different search term or clear the search to see all parameters",
+                    )),
+            );
         }
 
         container

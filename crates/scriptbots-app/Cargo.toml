@@ -36,3 +36,7 @@ unicode-width = "0.1"
 default = []
 ml = ["scriptbots-brain-ml"]
 neuro = ["scriptbots-brain-neuro"]
+
+[dev-dependencies]
+tempfile = "3.13"
+duckdb = { workspace = true }
