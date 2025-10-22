@@ -34,6 +34,26 @@ rust_scriptbots/
 └── original_scriptbots_code_for_reference/  # Upstream C++ snapshot for parity
 ```
 
+### Architecture diagram (high-level)
+Data flows left-to-right; control surfaces are orthogonal:
+
+```
+[Brains] <-> [scriptbots-core (WorldState, Tick Pipeline)] <-> [scriptbots-storage]
+    ^                    ^                     ^                     |
+    | BrainRegistry      | AgentSnapshots      | PersistenceBatch    v
+    |                    |                     |                 [DuckDB]
+
+[scriptbots-index] --(spatial queries)--> [core]
+
+[scriptbots-app]
+  |- Renderer (GPUI | Terminal) <-- World snapshots & HUD metrics
+  |- Control runtime (REST | MCP | CLI) --(CommandBus)--> [core]
+
+[scriptbots-web] (wasm)
+  |- wasm-bindgen API (init/tick/snapshot/reset) -> JS renderer (WebGPU/Canvas)
+  |- Determinism parity vs native core
+```
+
 ### Crate roles
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
@@ -250,6 +270,10 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 ### Renderer abstraction
 - The app selects a `Renderer` implementation at runtime (`gpui` or `terminal`) via `--mode {auto|gui|terminal}` or environment variables. Both renderers consume the same world snapshots and control bus.
 
+### Audio system
+- Optional `kira`-backed mixer (feature `audio`) with event-driven cues (births, deaths, spikes) and accessibility toggles.
+- Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
+
 ### Terminal mode (planned)
 An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode (`--mode {auto|gui|terminal}`) with fallback when GPUI cannot start. See the “Terminal Rendering Mode (Emoji TUI)” section in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`.
 
@@ -294,6 +318,41 @@ Keybinds: space (pause), +/- (speed), s (single-step), ?/h (help), q/Esc (quit).
   ```
 Configuration: persistence buffers flush automatically; call `optimize()` periodically in long sessions (the app pipeline already triggers maintenance).
 
+### Advanced analytics cookbook (DuckDB)
+Population trend (10-tick moving average):
+```sql
+with ticks as (
+  select tick, agent_count, row_number() over(order by tick) as rn
+  from ticks
+)
+select t1.tick,
+       avg(t2.agent_count) as population_ma10
+from ticks t1
+join ticks t2 on t2.rn between t1.rn-9 and t1.rn
+group by t1.tick
+order by t1.tick;
+```
+Kill ratios (carnivore vs herbivore):
+```sql
+select sum(case when hit_carnivore then 1 else 0 end) as carnivore_hits,
+       sum(case when hit_herbivore then 1 else 0 end) as herbivore_hits
+from agents;
+```
+Energy histogram at latest tick:
+```sql
+with latest as (select max(tick) as t from agents)
+select width_bucket(energy, 0, 2.0, 20) as bucket,
+       count(*)
+from agents, latest
+where agents.tick = latest.t
+group by bucket
+order by bucket;
+```
+
+### Storage evolution & maintenance
+- Schema compatibility: additive changes only until v1; breaking changes guarded behind feature flags and migration scripts.
+- Maintenance: the storage worker batches inserts and exposes `optimize()`/`VACUUM` hooks; long sessions should call `optimize()` periodically (the app pipeline already schedules it).
+
 ## Development workflow
 - **Coding standards**: See `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`. Embrace `Result`-based errors, clear traits, and avoid `unsafe`.
 - **Linting**: `cargo clippy --workspace --all-targets --all-features -W clippy::all -W clippy::pedantic -W clippy::nursery`
@@ -306,6 +365,12 @@ Configuration: persistence buffers flush automatically; call `optimize()` period
 - **Render tests**: GPUI compile-time view tests; terminal HUD headless smoke tests (`SCRIPTBOTS_TERMINAL_HEADLESS=1`).
 - **Benchmarks**: `criterion` harness for ticks/sec at various agent counts.
 - **CI**: matrix for macOS 14 and Ubuntu 24.04; wasm job builds `scriptbots-web`, runs parity tests in headless Chromium; release job uses `cargo dist` with optional macOS codesigning.
+
+## Performance & profiling
+- CPU profiling (Linux/macOS): run with `RUSTFLAGS='-g'` and use `perf record`/`perf report` or `dtrace`/Instruments; annotate hot paths in sense/actuation.
+- Tracy (optional): integrate client in dev builds to visualize frame times and background worker activity.
+- Threading: tune `RAYON_NUM_THREADS` to match physical cores; verify determinism with seeded runs.
+- Rendering: measure HUD/canvas frame times; avoid per-frame allocations; prefer batched path building.
 
 ## Runtime control surfaces
 
@@ -356,6 +421,11 @@ All configuration can be inspected and updated at runtime via REST/CLI/MCP. Comm
 
 Use `GET /api/knobs` to discover the full flattened list with current values.
 
+### Control bus architecture
+- The app owns a bounded MPMC `CommandBus`; external surfaces (REST, MCP, CLI) enqueue `ControlCommand`s.
+- The simulation drains the queue inside the tick loop before state mutation, guaranteeing coherent updates and avoiding data races.
+- Back-pressure: when the queue is full, commands are rejected with a clear error; clients should retry with jitter.
+
 ## Contributing
 - Keep changes scoped to the relevant crate; prefer improving existing files over adding new ones unless functionality is genuinely new.
 - Update docs where it helps future maintainers understand decisions and invariants.
@@ -376,6 +446,13 @@ Helpful docs:
 - `snapshot_format`: `json` (default) or `binary` (Postcard `Uint8Array`).
 - APIs: `default_init_options()`, `init_sim(options)`, `tick(steps)`, `snapshot()`, `reset(seed?)`, `registerBrain("wander"|"mlp"|"none")`.
 - Determinism: wasm-vs-native parity tests compare snapshots for fixed seeds; single-thread fallback is default (Rayon disabled).
+
+### WASM hosting guide (COOP/COEP)
+- For multithreading (future), browsers require SharedArrayBuffer with headers:
+  - `Cross-Origin-Opener-Policy: same-origin`
+  - `Cross-Origin-Embedder-Policy: require-corp`
+- Local dev: serve with a static server that sets these headers (or use a service worker). For now, single-thread builds avoid the requirement.
+- CI: the wasm job runs parity tests in headless Chromium; see `.github/workflows/ci.yml`.
 
 ## Licensing
 Licensed under `MIT OR Apache-2.0` (see workspace manifest).

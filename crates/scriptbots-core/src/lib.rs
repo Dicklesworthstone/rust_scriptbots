@@ -793,6 +793,56 @@ pub struct DeathRecord {
     pub combat_flags: CombatEventFlags,
 }
 
+/// Agent pipeline stages used to categorize replay RNG scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayAgentPhase {
+    Movement,
+    Reproduction,
+    Mutation,
+    Spawn,
+    Selection,
+    Misc,
+}
+
+/// Identifies where in the simulation a random sample originated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayRngScope {
+    World,
+    Agent {
+        agent_id: AgentId,
+        phase: ReplayAgentPhase,
+    },
+}
+
+/// Detailed event recordings emitted for deterministic replays.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReplayEventKind {
+    BrainOutputs {
+        outputs: Vec<f32>,
+    },
+    Action {
+        left_wheel: f32,
+        right_wheel: f32,
+        boost: bool,
+        spike_target: Option<AgentId>,
+        sound_level: f32,
+        give_intent: f32,
+    },
+    RngSample {
+        scope: ReplayRngScope,
+        range_min: f32,
+        range_max: f32,
+        value: f32,
+    },
+}
+
+/// Lightweight wrapper pairing an agent context with a replay event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayEvent {
+    pub agent_id: Option<AgentId>,
+    pub kind: ReplayEventKind,
+}
+
 /// Aggregate payload forwarded to persistence sinks.
 #[derive(Debug, Clone)]
 pub struct PersistenceBatch {
@@ -804,6 +854,7 @@ pub struct PersistenceBatch {
     pub agents: Vec<AgentState>,
     pub births: Vec<BirthRecord>,
     pub deaths: Vec<DeathRecord>,
+    pub replay_events: Vec<ReplayEvent>,
 }
 
 /// Persistence sink invoked after each tick.
@@ -2508,6 +2559,9 @@ pub struct WorldState {
     pending_spawns: Vec<SpawnOrder>,
     pending_birth_records: Vec<BirthRecord>,
     pending_death_records: Vec<DeathRecord>,
+    #[allow(dead_code)]
+    replay_tick: u64,
+    replay_events: Vec<ReplayEvent>,
     persistence: Box<dyn WorldPersistence>,
     last_births: usize,
     last_deaths: usize,
@@ -2575,6 +2629,8 @@ impl WorldState {
             pending_spawns: Vec::new(),
             pending_birth_records: Vec::new(),
             pending_death_records: Vec::new(),
+            replay_tick: 0,
+            replay_events: Vec::new(),
             persistence,
             last_births: 0,
             last_deaths: 0,
@@ -5111,6 +5167,7 @@ impl WorldState {
             agents,
             births,
             deaths,
+            replay_events: std::mem::take(&mut self.replay_events),
         };
         self.persistence.on_tick(&batch);
         if self.history.len() >= self.config.history_capacity {
