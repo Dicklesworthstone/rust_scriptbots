@@ -4154,25 +4154,25 @@ impl WorldState {
             let child_id = self.spawn_agent(data);
             self.runtime.insert(child_id, runtime);
 
-            if let Some(child_runtime) = self.runtime.get(child_id) {
-                if let Some(idx) = self.agents.index_of(child_id) {
-                    let snapshot = self.agents.columns().snapshot(idx);
-                    let brain_kind = child_runtime.brain.kind().map(str::to_string);
-                    let brain_key = child_runtime.brain.registry_key();
-                    let record = BirthRecord {
-                        tick,
-                        agent_id: child_id,
-                        parent_a: Some(parent_id),
-                        parent_b: partner_id,
-                        brain_kind,
-                        brain_key,
-                        herbivore_tendency: clamp01(child_runtime.herbivore_tendency),
-                        generation: snapshot.generation,
-                        position: snapshot.position,
-                        is_hybrid: child_runtime.hybrid,
-                    };
-                    self.pending_birth_records.push(record);
-                }
+            if let (Some(child_runtime), Some(idx)) =
+                (self.runtime.get(child_id), self.agents.index_of(child_id))
+            {
+                let snapshot = self.agents.columns().snapshot(idx);
+                let brain_kind = child_runtime.brain.kind().map(str::to_string);
+                let brain_key = child_runtime.brain.registry_key();
+                let record = BirthRecord {
+                    tick,
+                    agent_id: child_id,
+                    parent_a: Some(parent_id),
+                    parent_b: partner_id,
+                    brain_kind,
+                    brain_key,
+                    herbivore_tendency: clamp01(child_runtime.herbivore_tendency),
+                    generation: snapshot.generation,
+                    position: snapshot.position,
+                    is_hybrid: child_runtime.hybrid,
+                };
+                self.pending_birth_records.push(record);
             }
         }
     }

@@ -22,12 +22,15 @@ jobs:
           - os: ubuntu-24.04
             run_fmt: true
             run_clippy: true
+            cargo_target: x86_64-unknown-linux-gnu
           - os: macos-14
             run_fmt: false
             run_clippy: false
+            cargo_target: aarch64-apple-darwin
           - os: windows-2022
             run_fmt: false
             run_clippy: false
+            cargo_target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
@@ -41,17 +44,27 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: checks-${{ matrix.os }}-${{ matrix.cargo_target }}
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
       - name: Format check
         if: ${{ matrix.run_fmt }}
         run: cargo fmt --all --check
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
       - name: Clippy
         if: ${{ matrix.run_clippy }}
         run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
       - name: Tests
         run: cargo test --workspace
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
   wasm:
     name: Wasm (ubuntu)
@@ -84,7 +97,12 @@ jobs:
       - name: Resolve Chromium path
         id: chromium
         run: |
-          echo "path=$(node -e \"const { chromium } = require('playwright'); process.stdout.write(chromium.executablePath());\")" >> "$GITHUB_OUTPUT"
+          CHROMIUM_PATH=$(node - <<'NODE'
+          const { chromium } = require('playwright');
+          process.stdout.write(chromium.executablePath());
+          NODE
+          )
+          echo "path=${CHROMIUM_PATH}" >> "$GITHUB_OUTPUT"
 
       - name: wasm-pack build (web target)
         run: wasm-pack build crates/scriptbots-web --target web --out-dir crates/scriptbots-web/web/pkg
