@@ -42,6 +42,7 @@ _Created: 2025-10-22 (UTC). Keep this list exhaustive; mark completion inline wi
   - [x] Enable `getrandom` WebAssembly backend via workspace feature flags (Cargo.toml updated).
   - [ ] Gate Rayon behind feature flag or `cfg` for wasm, documenting fallback path.
   - [x] Re-run `cargo check --target wasm32-unknown-unknown` and append findings.
+  - [ ] Document approach for suppressing CPU-specific `RUSTFLAGS` noise during wasm builds.
 
 - [x] Security baseline
   - [x] Draft `docs/wasm/SECURITY_NOTES_PHASE1.md` covering COOP/COEP, CSP, SAB requirements.
