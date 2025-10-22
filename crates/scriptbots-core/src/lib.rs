@@ -1463,6 +1463,8 @@ pub struct ScriptBotsConfig {
     pub temperature_discomfort_exponent: f32,
     /// Base rate at which agents siphon food from cells.
     pub food_intake_rate: f32,
+    /// Amount of food removed from a cell whenever an agent grazes.
+    pub food_waste_rate: f32,
     /// Radius used for food sharing with friendly neighbors.
     pub food_sharing_radius: f32,
     /// Fraction of energy shared per neighbor when donating.
@@ -1481,6 +1483,8 @@ pub struct ScriptBotsConfig {
     pub reproduction_rate_herbivore: f32,
     /// Carnivore reproduction rate multiplier applied per tick.
     pub reproduction_rate_carnivore: f32,
+    /// Bonus applied to the reproduction counter per unit ground intake.
+    pub reproduction_food_bonus: f32,
     /// Starting energy assigned to a child agent.
     pub reproduction_child_energy: f32,
     /// Spatial jitter applied to child spawn positions.
@@ -1589,16 +1593,18 @@ impl Default for ScriptBotsConfig {
             temperature_comfort_band: 0.08,
             temperature_gradient_exponent: 1.0,
             temperature_discomfort_exponent: 2.0,
-            food_intake_rate: 0.05,
-            food_sharing_radius: 80.0,
+            food_intake_rate: 0.002,
+            food_waste_rate: 0.001,
+            food_sharing_radius: 50.0,
             food_sharing_rate: 0.1,
             food_transfer_rate: 0.001,
-            food_sharing_distance: 100.0,
-            reproduction_energy_threshold: 1.5,
-            reproduction_energy_cost: 0.75,
+            food_sharing_distance: 50.0,
+            reproduction_energy_threshold: 0.65,
+            reproduction_energy_cost: 0.0,
             reproduction_cooldown: 300,
             reproduction_rate_herbivore: 1.0,
             reproduction_rate_carnivore: 1.0,
+            reproduction_food_bonus: 3.0,
             reproduction_child_energy: 1.0,
             reproduction_spawn_jitter: 20.0,
             reproduction_color_jitter: 0.05,
@@ -1718,6 +1724,16 @@ impl ScriptBotsConfig {
                 "food_respawn_amount cannot exceed food_max",
             ));
         }
+        if self.food_waste_rate < 0.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "food_waste_rate must be non-negative",
+            ));
+        }
+        if self.food_waste_rate > self.food_max {
+            return Err(WorldStateError::InvalidConfig(
+                "food_waste_rate cannot exceed food_max",
+            ));
+        }
         if self.food_growth_rate < 0.0
             || self.food_decay_rate < 0.0
             || self.food_diffusion_rate < 0.0
@@ -1753,6 +1769,8 @@ impl ScriptBotsConfig {
             || self.metabolism_ramp_rate < 0.0
             || self.metabolism_boost_penalty < 0.0
             || self.food_intake_rate < 0.0
+            || self.food_waste_rate < 0.0
+            || self.reproduction_food_bonus < 0.0
             || self.food_sharing_radius <= 0.0
             || self.food_sharing_rate < 0.0
             || self.food_transfer_rate < 0.0
@@ -1832,6 +1850,11 @@ impl ScriptBotsConfig {
         if self.population_spawn_count == 0 {
             return Err(WorldStateError::InvalidConfig(
                 "population_spawn_count must be at least 1",
+            ));
+        }
+        if self.reproduction_energy_cost > self.reproduction_energy_threshold {
+            return Err(WorldStateError::InvalidConfig(
+                "reproduction_energy_cost cannot exceed reproduction_energy_threshold",
             ));
         }
         if self.sense_radius <= 0.0 {
@@ -2878,18 +2901,40 @@ impl WorldState {
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let mut sharers: Vec<usize> = Vec::new();
 
-        let intake_rate = self.config.food_intake_rate;
+        let intake_rate = self.config.food_intake_rate.max(0.0);
+        let waste_rate = self.config.food_waste_rate.max(0.0);
+        let reproduction_bonus = self.config.reproduction_food_bonus.max(0.0);
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                if intake_rate > 0.0 {
+                if intake_rate > 0.0 || waste_rate > 0.0 {
                     let pos = positions[idx];
                     let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
                     let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
                     if let Some(cell) = self.food.get_mut(cell_x, cell_y) {
-                        let intake = cell.min(intake_rate);
-                        *cell -= intake;
-                        runtime.energy = (runtime.energy + intake * 0.5).min(2.0);
-                        runtime.food_delta += intake;
+                        let available = *cell;
+                        if available > 0.0 {
+                            let base_intake = available.min(intake_rate);
+                            let waste = available.min(waste_rate);
+                            let herbivore = clamp01(runtime.herbivore_tendency);
+                            let mut intake = 0.0;
+                            if herbivore > 0.0 && base_intake > 0.0 {
+                                let left = runtime.outputs.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                                let right = runtime.outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                                let average_speed = (left.abs() + right.abs()) * 0.5;
+                                let speed_scale = (1.0 - average_speed).clamp(0.0, 1.0) * 0.7 + 0.3;
+                                intake = base_intake * herbivore * speed_scale;
+                            }
+                            if waste > 0.0 {
+                                *cell = (available - waste).max(0.0);
+                            }
+                            if intake > 0.0 {
+                                runtime.energy = (runtime.energy + intake).min(2.0);
+                                runtime.food_delta += intake;
+                                if reproduction_bonus > 0.0 {
+                                    runtime.reproduction_counter += intake * reproduction_bonus;
+                                }
+                            }
+                        }
                     }
                 }
                 if runtime.give_intent > 0.5 {
@@ -4454,6 +4499,51 @@ mod tests {
     fn default_config_constructs_world() {
         let config = ScriptBotsConfig::default();
         WorldState::new(config).expect("default config should be valid");
+    }
+
+    #[test]
+    fn default_config_matches_legacy_food_settings() {
+        let config = ScriptBotsConfig::default();
+        assert!(
+            (config.food_intake_rate - 0.002).abs() < f32::EPSILON,
+            "expected default food_intake_rate to mirror legacy FOODINTAKE (0.002)"
+        );
+        assert!(
+            (config.food_waste_rate - 0.001).abs() < f32::EPSILON,
+            "expected default food_waste_rate to mirror legacy FOODWASTE (0.001)"
+        );
+        assert!(
+            (config.food_transfer_rate - 0.001).abs() < f32::EPSILON,
+            "expected default food_transfer_rate to mirror legacy FOODTRANSFER (0.001)"
+        );
+        assert!(
+            (config.food_sharing_distance - 50.0).abs() < f32::EPSILON,
+            "expected default food_sharing_distance to mirror legacy FOOD_SHARING_DISTANCE (50)"
+        );
+        assert!(
+            (config.reproduction_energy_threshold - 0.65).abs() < f32::EPSILON,
+            "expected default reproduction_energy_threshold to mirror legacy health gate (0.65)"
+        );
+        assert!(
+            config.reproduction_energy_cost <= config.reproduction_energy_threshold,
+            "reproduction_energy_cost should never exceed reproduction_energy_threshold"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_excessive_food_waste() {
+        let mut config = ScriptBotsConfig::default();
+        config.food_waste_rate = config.food_max + 0.1;
+        let err = WorldState::new(config).unwrap_err();
+        match err {
+            WorldStateError::InvalidConfig(message) => {
+                assert!(
+                    message.contains("food_waste_rate"),
+                    "expected food_waste_rate validation error, got {message}"
+                );
+            }
+            other => panic!("expected invalid config error, got {other:?}"),
+        }
     }
 
     #[test]
