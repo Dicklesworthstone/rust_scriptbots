@@ -16,7 +16,9 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
-use scriptbots_core::{AgentColumns, AgentData, TickSummary, WorldState};
+#[cfg(test)]
+use scriptbots_core::AgentData;
+use scriptbots_core::{AgentColumns, TickSummary, WorldState};
 use supports_color::{ColorLevel, Stream, on_cached};
 
 use crate::{
