@@ -1467,6 +1467,10 @@ pub struct ScriptBotsConfig {
     pub food_sharing_radius: f32,
     /// Fraction of energy shared per neighbor when donating.
     pub food_sharing_rate: f32,
+    /// Constant transfer amount when sharing food.
+    pub food_transfer_rate: f32,
+    /// Distance threshold for sharing food with neighbors.
+    pub food_sharing_distance: f32,
     /// Energy threshold required before reproduction can trigger.
     pub reproduction_energy_threshold: f32,
     /// Energy deducted from a parent upon reproduction.
@@ -1574,6 +1578,8 @@ impl Default for ScriptBotsConfig {
             food_intake_rate: 0.05,
             food_sharing_radius: 80.0,
             food_sharing_rate: 0.1,
+            food_transfer_rate: 0.001,
+            food_sharing_distance: 100.0,
             reproduction_energy_threshold: 1.5,
             reproduction_energy_cost: 0.75,
             reproduction_cooldown: 300,
@@ -1728,6 +1734,8 @@ impl ScriptBotsConfig {
             || self.food_intake_rate < 0.0
             || self.food_sharing_radius <= 0.0
             || self.food_sharing_rate < 0.0
+            || self.food_transfer_rate < 0.0
+            || self.food_sharing_distance <= 0.0
             || self.reproduction_energy_threshold < 0.0
             || self.reproduction_energy_cost < 0.0
             || self.reproduction_child_energy < 0.0
@@ -2341,8 +2349,7 @@ impl WorldState {
         let tick_value = self.tick.0 as f32;
         let index = &self.index;
 
-        let sensor_results: Vec<[f32; INPUT_SIZE]> = collect_handles!(handles, |idx, handle| {
-            let _ = handle;
+        let sensor_results: Vec<[f32; INPUT_SIZE]> = collect_handles!(handles, |idx, _handle| {
             let mut sensors = [0.0f32; INPUT_SIZE];
             let mut density = [0.0f32; NUM_EYES];
             let mut eye_r = [0.0f32; NUM_EYES];
@@ -2852,8 +2859,7 @@ impl WorldState {
             .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
             .collect();
 
-        let results: Vec<CombatResult> = collect_handles!(handles, |idx, handle| {
-            let _ = handle;
+        let results: Vec<CombatResult> = collect_handles!(handles, |idx, _handle| {
             let mut result = CombatResult::default();
             let attacker_runtime = &runtime_snapshot[idx];
 
@@ -3071,7 +3077,7 @@ impl WorldState {
         let agent_count = handles.len();
         let mut health_add = vec![0.0f32; agent_count];
         let mut energy_add = vec![0.0f32; agent_count];
-        let mut reproduction_sub = vec![0.0f32; agent_count];
+        let mut reproduction_bonus = vec![0.0f32; agent_count];
         let mut indicator_add = vec![0.0f32; agent_count];
 
         let radius_sq = radius * radius;
@@ -3096,10 +3102,7 @@ impl WorldState {
             if healths.get(victim_index).copied().unwrap_or(1.0) > 0.0 {
                 continue;
             }
-            let victim_pos = positions
-                .get(victim_index)
-                .copied()
-                .unwrap_or_default();
+            let victim_pos = positions.get(victim_index).copied().unwrap_or_default();
             let age = ages.get(victim_index).copied().unwrap_or(0);
             let age_multiplier = if age < maturity_age {
                 (age as f32) / (maturity_age as f32)
@@ -3138,8 +3141,7 @@ impl WorldState {
                         continue;
                     }
                     if health_base > 0.0 {
-                        let share =
-                            health_base * carnivore_factor * age_multiplier / norm;
+                        let share = health_base * carnivore_factor * age_multiplier / norm;
                         if share > 0.0 {
                             health_add[idx] += share;
                             if energy_rate > 0.0 {
@@ -3152,10 +3154,9 @@ impl WorldState {
                         }
                     }
                     if reproduction_base > 0.0 {
-                        let bonus =
-                            reproduction_base * carnivore_factor * age_multiplier / norm;
+                        let bonus = reproduction_base * carnivore_factor * age_multiplier / norm;
                         if bonus > 0.0 {
-                            reproduction_sub[idx] += bonus;
+                            reproduction_bonus[idx] += bonus;
                             self.carcass_reproduction_bonus += bonus;
                             if indicator_scale > 0.0 && health_base <= 0.0 {
                                 indicator_add[idx] += indicator_scale;
@@ -3167,7 +3168,7 @@ impl WorldState {
         }
 
         if health_add.iter().any(|v| *v > 0.0) {
-            let mut columns = self.agents.columns_mut();
+            let columns = self.agents.columns_mut();
             let healths_mut = columns.health_mut();
             for (idx, add) in health_add.iter().enumerate() {
                 if *add > 0.0 {
@@ -3177,7 +3178,7 @@ impl WorldState {
         }
 
         if energy_add.iter().any(|v| *v > 0.0)
-            || reproduction_sub.iter().any(|v| *v > 0.0)
+            || reproduction_bonus.iter().any(|v| *v > 0.0)
             || indicator_add.iter().any(|v| *v > 0.0)
         {
             for (idx, agent_id) in handles.iter().enumerate() {
@@ -3187,10 +3188,9 @@ impl WorldState {
                         runtime.energy = (runtime.energy + energy).min(2.0);
                         runtime.food_delta += energy;
                     }
-                    let repro = reproduction_sub[idx];
+                    let repro = reproduction_bonus[idx];
                     if repro > 0.0 {
-                        runtime.reproduction_counter =
-                            (runtime.reproduction_counter - repro).max(0.0);
+                        runtime.reproduction_counter += repro;
                     }
                     let indicator_bonus = indicator_add[idx];
                     if indicator_bonus > 0.0 {
@@ -3794,11 +3794,23 @@ impl WorldState {
             average_energy,
             average_health,
         };
-        let metrics = vec![
+        let mut metrics = vec![
             MetricSample::from_f32("total_energy", summary.total_energy),
             MetricSample::from_f32("average_energy", summary.average_energy),
             MetricSample::from_f32("average_health", summary.average_health),
         ];
+        if self.carcass_health_distributed > 0.0 {
+            metrics.push(MetricSample::from_f32(
+                "carcass_health_distributed",
+                self.carcass_health_distributed,
+            ));
+        }
+        if self.carcass_reproduction_bonus > 0.0 {
+            metrics.push(MetricSample::from_f32(
+                "carcass_reproduction_bonus",
+                self.carcass_reproduction_bonus,
+            ));
+        }
 
         let mut events = Vec::with_capacity(2);
         if self.last_births > 0 {
@@ -3836,6 +3848,8 @@ impl WorldState {
         self.history.push_back(summary);
         self.last_births = 0;
         self.last_deaths = 0;
+        self.carcass_health_distributed = 0.0;
+        self.carcass_reproduction_bonus = 0.0;
     }
 
     /// Execute one simulation tick pipeline returning emitted events.
@@ -4897,6 +4911,172 @@ mod tests {
             runtime.sensors[20] < 1e-6,
             "expected zero discomfort at equator, got {}",
             runtime.sensors[20]
+        );
+    }
+
+    #[test]
+    fn carcass_distribution_rewards_neighbors() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            carcass_distribution_radius: 50.0,
+            carcass_health_reward: 4.0,
+            carcass_reproduction_reward: 2.0,
+            carcass_neighbor_exponent: 1.0,
+            carcass_maturity_age: 5,
+            carcass_energy_share_rate: 1.0,
+            carcass_indicator_scale: 10.0,
+            rng_seed: Some(314),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let victim = world.spawn_agent(sample_agent(0));
+        let neighbor = world.spawn_agent(sample_agent(1));
+
+        {
+            let arena = world.agents_mut();
+            let idx_victim = arena.index_of(victim).unwrap();
+            let idx_neighbor = arena.index_of(neighbor).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx_victim] = Position::new(10.0, 10.0);
+            columns.positions_mut()[idx_neighbor] = Position::new(12.0, 10.0);
+            columns.ages_mut()[idx_victim] = 10;
+            columns.health_mut()[idx_victim] = 0.0;
+            columns.health_mut()[idx_neighbor] = 0.5;
+        }
+        {
+            let runtime_victim = world.agent_runtime_mut(victim).unwrap();
+            runtime_victim.spiked = true;
+            runtime_victim.energy = 0.0;
+        }
+        {
+            let runtime_neighbor = world.agent_runtime_mut(neighbor).unwrap();
+            runtime_neighbor.herbivore_tendency = 0.0;
+            runtime_neighbor.energy = 0.5;
+            runtime_neighbor.reproduction_counter = 3.0;
+            runtime_neighbor.indicator = IndicatorState::default();
+        }
+
+        world.pending_deaths.push(victim);
+        world.stage_death_cleanup();
+
+        assert!(
+            !world.agents().contains(victim),
+            "victim should be removed after cleanup"
+        );
+        let idx_neighbor = world.agents().index_of(neighbor).unwrap();
+        let columns = world.agents().columns();
+        assert!(
+            (columns.health()[idx_neighbor] - 2.0).abs() < 1e-6,
+            "neighbor health should clamp to 2 after reward"
+        );
+        let runtime_neighbor = world.agent_runtime(neighbor).unwrap();
+        assert!(
+            (runtime_neighbor.energy - 2.0).abs() < 1e-6,
+            "neighbor energy should increase and clamp to 2"
+        );
+        assert!(
+            (runtime_neighbor.reproduction_counter - 5.0).abs() < 1e-6,
+            "reproduction counter should increase by reward"
+        );
+        assert!(
+            runtime_neighbor.indicator.intensity > 0.0,
+            "indicator should pulse after feasting"
+        );
+        assert!(
+            (world.carcass_health_distributed - 4.0).abs() < 1e-6,
+            "carcass health totals should track distributed amount"
+        );
+        assert!(
+            (world.carcass_reproduction_bonus - 2.0).abs() < 1e-6,
+            "carcass reproduction totals should track distributed amount"
+        );
+    }
+
+    #[test]
+    fn carcass_rewards_emit_metrics() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            carcass_distribution_radius: 40.0,
+            carcass_health_reward: 3.0,
+            carcass_reproduction_reward: 1.5,
+            carcass_neighbor_exponent: 1.0,
+            carcass_maturity_age: 5,
+            carcass_energy_share_rate: 0.5,
+            carcass_indicator_scale: 5.0,
+            persistence_interval: 1,
+            rng_seed: Some(99),
+            ..ScriptBotsConfig::default()
+        };
+
+        let spy = SpyPersistence::default();
+        let logs = spy.logs.clone();
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let victim = world.spawn_agent(sample_agent(0));
+        let neighbor = world.spawn_agent(sample_agent(1));
+
+        {
+            let arena = world.agents_mut();
+            let idx_victim = arena.index_of(victim).unwrap();
+            let idx_neighbor = arena.index_of(neighbor).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx_victim] = Position::new(20.0, 20.0);
+            columns.positions_mut()[idx_neighbor] = Position::new(25.0, 20.0);
+            columns.ages_mut()[idx_victim] = 8;
+            columns.health_mut()[idx_victim] = 0.0;
+            columns.health_mut()[idx_neighbor] = 1.0;
+        }
+        {
+            let runtime_victim = world.agent_runtime_mut(victim).unwrap();
+            runtime_victim.spiked = true;
+            runtime_victim.energy = 0.0;
+        }
+        {
+            let runtime_neighbor = world.agent_runtime_mut(neighbor).unwrap();
+            runtime_neighbor.herbivore_tendency = 0.0;
+            runtime_neighbor.energy = 1.0;
+            runtime_neighbor.reproduction_counter = 2.0;
+        }
+
+        world.pending_deaths.push(victim);
+        world.stage_death_cleanup();
+        world.stage_persistence(Tick(1));
+
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let metrics = &entries[0].metrics;
+        let mut found_health = false;
+        let mut found_repro = false;
+        for metric in metrics {
+            match metric.name.as_ref() {
+                "carcass_health_distributed" => {
+                    found_health = true;
+                    assert!(metric.value > 0.0);
+                }
+                "carcass_reproduction_bonus" => {
+                    found_repro = true;
+                    assert!(metric.value > 0.0);
+                }
+                _ => {}
+            }
+        }
+        assert!(found_health, "expected carcass health metric");
+        assert!(found_repro, "expected carcass reproduction metric");
+        assert!(
+            world.carcass_health_distributed.abs() < 1e-6,
+            "carcass totals should reset after persistence"
+        );
+        assert!(
+            world.carcass_reproduction_bonus.abs() < 1e-6,
+            "carcass reproduction totals should reset after persistence"
         );
     }
 

@@ -3,8 +3,8 @@
 _Created: 2025-10-22 (UTC)_
 
 ## Executive Summary
-- Enabling Rayon (or any multithreaded wasm) in browsers requires **cross-origin isolation** (COOP/COEP) so that `SharedArrayBuffer` is available. Chrome and Edge enforce this since Chrome 92; Firefox and Safari Tech Preview follow the same pattern.citeturn3search0turn3search3turn3search6
-- `wasm-bindgen-rayon` 1.2+ provides glue code to spin up a web worker thread pool once cross-origin isolation is active.citeturn3search1turn3search4
+- Enabling Rayon (or any multithreaded wasm) in browsers requires **cross-origin isolation** (COOP/COEP) so that `SharedArrayBuffer` is available. Chrome and Edge enforce this since Chrome 92; Firefox and Safari Tech Preview follow the same pattern.citeturn0search0turn0search1
+- `wasm-bindgen-rayon` 1.2+ provides glue code to spin up a web worker thread pool once cross-origin isolation is active.citeturn1search0
 - If cross-origin isolation cannot be guaranteed (e.g., embedded contexts), we must fall back to single-threaded execution and surface a UX warning.
 
 ## Header Requirements
@@ -14,8 +14,8 @@ Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 Cross-Origin-Resource-Policy: same-origin
 ```
-- COEP can also use the `credentialless` variant to relax CORS for third-party assets; evaluate implications for analytics/runtime CDNs.citeturn3search3
-- Verify `self.crossOriginIsolated === true` at runtime; log failures for telemetry.citeturn3search6
+- COEP can also use the `credentialless` variant to relax CORS for third-party assets; evaluate implications for analytics/runtime CDNs.citeturn0search2
+- Verify `self.crossOriginIsolated === true` at runtime; log failures for telemetry.citeturn3search0
 
 ## Initialization Flow
 1. Main thread loads wasm bundle.
@@ -23,7 +23,7 @@ Cross-Origin-Resource-Policy: same-origin
 3. Await thread pool initialization before invoking simulation entry points.
 
 ## Deployment Considerations
-- Hosting environments without configurable headers (e.g., bare GitHub Pages) require an opt-in service worker shim such as `coi-serviceworker`.citeturn3search5
+- Hosting environments without configurable headers (e.g., bare GitHub Pages) require an opt-in service worker shim such as `coi-serviceworker`.citeturn3search4
 - Document COOP/COEP configuration for each supported CDN (Cloudflare Pages, Netlify, custom Nginx).
 - Record fallback behavior (single-thread mode) metrics to assess prevalence.
 

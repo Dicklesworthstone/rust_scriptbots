@@ -81,6 +81,7 @@ struct SimulationView {
     playback: PlaybackState,
     perf: PerfStats,
     accessibility: AccessibilitySettings,
+    debug: DebugOverlayState,
     bindings: InputBindings,
     key_capture: Option<CommandAction>,
     #[cfg(feature = "audio")]
@@ -105,6 +106,7 @@ impl SimulationView {
             playback: PlaybackState::new(240),
             perf: PerfStats::new(240),
             accessibility: AccessibilitySettings::default(),
+            debug: DebugOverlayState::default(),
             bindings: InputBindings::default(),
             key_capture: None,
             #[cfg(feature = "audio")]
@@ -440,6 +442,7 @@ impl SimulationView {
             frame: frame.clone(),
             camera: Arc::clone(&self.camera),
             focus_agent: snapshot.inspector.focus_id,
+            debug: self.debug,
         };
 
         let canvas_element = canvas(
@@ -449,6 +452,7 @@ impl SimulationView {
                     &state.frame,
                     &state.camera,
                     state.focus_agent,
+                    state.debug,
                     bounds,
                     window,
                 )
@@ -558,6 +562,97 @@ impl SimulationView {
         if let Ok(mut inspector) = self.inspector.lock() {
             inspector.probe_enabled = enabled;
         }
+        cx.notify();
+    }
+
+    fn set_persistence_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled {
+            let interval = self
+                .inspector
+                .lock()
+                .map(|mut inspector| {
+                    inspector.persistence_last_enabled = inspector.persistence_last_enabled.max(1);
+                    inspector.persistence_last_enabled
+                })
+                .unwrap_or(60);
+
+            if let Ok(mut world) = self.world.lock() {
+                world.config_mut().persistence_interval = interval;
+            }
+        } else {
+            let current_interval = self
+                .world
+                .lock()
+                .map(|world| world.config().persistence_interval)
+                .unwrap_or(0);
+
+            if current_interval > 0 {
+                if let Ok(mut inspector) = self.inspector.lock() {
+                    inspector.persistence_last_enabled = current_interval;
+                }
+            }
+
+            if let Ok(mut world) = self.world.lock() {
+                world.config_mut().persistence_interval = 0;
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn adjust_persistence_interval(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let (current_interval, was_enabled) = {
+            if let Ok(world) = self.world.lock() {
+                let interval = world.config().persistence_interval;
+                (interval, interval > 0)
+            } else {
+                (0, false)
+            }
+        };
+
+        let cached_interval = self
+            .inspector
+            .lock()
+            .map(|inspector| inspector.persistence_last_enabled)
+            .unwrap_or(60);
+
+        let base_interval = if was_enabled {
+            current_interval
+        } else {
+            cached_interval
+        };
+
+        let new_interval = ((base_interval as i32) + delta).clamp(1, 10_000) as u32;
+
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.persistence_last_enabled = new_interval;
+        }
+
+        if was_enabled {
+            if let Ok(mut world) = self.world.lock() {
+                world.config_mut().persistence_interval = new_interval;
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn adjust_agent_mutation_rates(
+        &mut self,
+        agent_id: AgentId,
+        delta_primary: f32,
+        delta_secondary: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(mut world) = self.world.lock()
+            && let Some(runtime) = world.runtime_mut().get_mut(agent_id)
+        {
+            runtime.mutation_rates.primary =
+                (runtime.mutation_rates.primary + delta_primary).max(0.0001);
+            runtime.mutation_rates.secondary =
+                (runtime.mutation_rates.secondary + delta_secondary).max(0.0);
+        }
+
         cx.notify();
     }
 
@@ -772,12 +867,13 @@ impl SimulationView {
         let selection_list = div().flex().flex_col().gap_2().children(list_children);
 
         let brush_tools = self.render_inspector_brush_tools(inspector, cx);
+        let persistence_controls = self.render_persistence_controls(inspector, cx);
         let playback_controls = self.render_inspector_playback_controls(cx);
 
         let detail = inspector
             .focused
             .as_ref()
-            .map(|detail| self.render_inspector_detail(detail))
+            .map(|detail| self.render_inspector_detail(detail, cx))
             .unwrap_or_else(|| {
                 div()
                     .text_xs()
@@ -820,6 +916,7 @@ impl SimulationView {
             )
             .child(selection_list)
             .child(brush_tools)
+            .child(persistence_controls)
             .child(self.render_accessibility_panel(cx))
             .child(playback_controls)
             .child(detail)
@@ -1064,6 +1161,135 @@ impl SimulationView {
                             .gap_2()
                             .children(vec![probe_on_button, probe_off_button]),
                     ),
+            )
+    }
+
+    fn render_persistence_controls(
+        &self,
+        inspector: &InspectorSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let enable = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_persistence_enabled(true, cx);
+        });
+        let disable = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.set_persistence_enabled(false, cx);
+        });
+        let inc_small = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_persistence_interval(5, cx);
+        });
+        let dec_small = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_persistence_interval(-5, cx);
+        });
+        let inc_large = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_persistence_interval(25, cx);
+        });
+        let dec_large = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_persistence_interval(-25, cx);
+        });
+
+        let display_interval = if inspector.persistence_enabled {
+            inspector.persistence_interval.max(1)
+        } else {
+            inspector.persistence_cached_interval.max(1)
+        };
+
+        let on_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("On")
+                .on_mouse_down(MouseButton::Left, enable);
+            if inspector.persistence_enabled {
+                base.border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                base.border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        let off_button = {
+            let base = div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Off")
+                .on_mouse_down(MouseButton::Left, disable);
+            if !inspector.persistence_enabled {
+                base.border_color(rgb(0x38bdf8))
+                    .bg(rgb(0x1e3a8a))
+                    .text_color(rgb(0xe0f2fe))
+            } else {
+                base.border_color(rgb(0x1e293b))
+                    .bg(rgb(0x111b2b))
+                    .text_color(rgb(0xcbd5f5))
+            }
+        };
+
+        fn build_interval_button<L>(label: &str, listener: L) -> Div
+        where
+            L: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+        {
+            div()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x111b2b))
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(rgb(0xcbd5f5))
+                .child(label.to_string())
+                .on_mouse_down(MouseButton::Left, listener)
+        }
+
+        let minus_large = build_interval_button("-25", dec_large);
+        let minus_small = build_interval_button("-5", dec_small);
+        let plus_small = build_interval_button("+5", inc_small);
+        let plus_large = build_interval_button("+25", inc_large);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Storage / Persistence"),
+            )
+            .child(div().flex().gap_2().children(vec![on_button, off_button]))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xcbd5f5))
+                    .child(format!("Interval {} ticks", display_interval)),
+            )
+            .child(div().flex().gap_1().children(vec![
+                minus_large,
+                minus_small,
+                plus_small,
+                plus_large,
+            ]))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child("Disabling stores the last interval for quick re-enable."),
             )
     }
 
@@ -1357,7 +1583,11 @@ impl SimulationView {
             .children(bindings_rows)
     }
 
-    fn render_inspector_detail(&self, detail: &AgentInspectorDetails) -> Div {
+    fn render_inspector_detail(
+        &self,
+        detail: &AgentInspectorDetails,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let sensors_preview: Vec<String> = detail
             .sensors
             .iter()
@@ -1427,6 +1657,139 @@ impl SimulationView {
                 OUTPUT_SIZE,
                 outputs_preview.join(", ")
             )))
+            .child(self.render_mutation_controls(detail, cx))
+    }
+
+    fn render_mutation_controls(
+        &self,
+        detail: &AgentInspectorDetails,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let agent_id = detail.agent_id;
+        let primary_step = 0.0005_f32;
+        let secondary_step = 0.01_f32;
+
+        let inc_primary = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_agent_mutation_rates(agent_id, primary_step, 0.0, cx);
+        });
+        let dec_primary = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_agent_mutation_rates(agent_id, -primary_step, 0.0, cx);
+        });
+
+        let agent_id_secondary = detail.agent_id;
+        let inc_secondary = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_agent_mutation_rates(agent_id_secondary, 0.0, secondary_step, cx);
+        });
+        let dec_secondary = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.adjust_agent_mutation_rates(agent_id_secondary, 0.0, -secondary_step, cx);
+        });
+
+        let primary_minus = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(0xcbd5f5))
+            .child("-")
+            .on_mouse_down(MouseButton::Left, dec_primary);
+
+        let primary_plus = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(0xcbd5f5))
+            .child("+")
+            .on_mouse_down(MouseButton::Left, inc_primary);
+
+        let secondary_minus = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(0xcbd5f5))
+            .child("-")
+            .on_mouse_down(MouseButton::Left, dec_secondary);
+
+        let secondary_plus = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x111b2b))
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(0xcbd5f5))
+            .child("+")
+            .on_mouse_down(MouseButton::Left, inc_secondary);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Mutation controls"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child(format!("Primary {:.4}", detail.mutation_rates.primary)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .children(vec![primary_minus, primary_plus]),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child(format!("Secondary {:.3}", detail.mutation_rates.secondary)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .children(vec![secondary_minus, secondary_plus]),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child("Adjusts focused agent mutation rates in ± steps."),
+            )
     }
 
     fn render_canvas_placeholder(&self, snapshot: &HudSnapshot) -> Div {
@@ -1503,6 +1866,19 @@ impl SimulationView {
                 "ON"
             } else {
                 "OFF"
+            }
+        ));
+        lines.push(format!(
+            "Persistence {} · interval {}",
+            if inspector.persistence_enabled {
+                "ON"
+            } else {
+                "OFF"
+            },
+            if inspector.persistence_enabled {
+                inspector.persistence_interval.max(1)
+            } else {
+                inspector.persistence_cached_interval.max(1)
             }
         ));
         if let Some(action) = self.key_capture {
@@ -1993,6 +2369,23 @@ struct MetricBadgeState {
     accent: Rgba,
 }
 
+#[derive(Clone, Copy)]
+struct DebugOverlayState {
+    enabled: bool,
+    show_velocity: bool,
+    show_sense_radius: bool,
+}
+
+impl Default for DebugOverlayState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_velocity: true,
+            show_sense_radius: true,
+        }
+    }
+}
+
 fn sparkline_from_history<F>(history: &[HudHistoryEntry], map: F) -> Option<SparklineSeries>
 where
     F: Fn(&HudHistoryEntry) -> f32,
@@ -2059,6 +2452,7 @@ impl From<TickSummary> for HudHistoryEntry {
 #[derive(Clone)]
 struct InspectorState {
     focused_agent: Option<AgentId>,
+    hovered_agent: Option<AgentId>,
     brush_enabled: bool,
     brush_radius: f32,
     probe_enabled: bool,
@@ -2069,6 +2463,7 @@ impl Default for InspectorState {
     fn default() -> Self {
         Self {
             focused_agent: None,
+            hovered_agent: None,
             brush_enabled: false,
             brush_radius: 48.0,
             probe_enabled: false,
@@ -2954,6 +3349,7 @@ struct CanvasState {
     frame: RenderFrame,
     camera: Arc<Mutex<CameraState>>,
     focus_agent: Option<AgentId>,
+    debug: DebugOverlayState,
 }
 
 impl RenderFrame {
@@ -3515,6 +3911,39 @@ impl CameraState {
         self.last_base_scale = base_scale;
         self.last_scale = base_scale * self.zoom;
     }
+
+    fn screen_to_world(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
+        let scale = self.last_scale;
+        if scale <= f32::EPSILON {
+            return None;
+        }
+        let canvas_x = f32::from(point.x);
+        let canvas_y = f32::from(point.y);
+        let origin_x = self.last_canvas_origin.0;
+        let origin_y = self.last_canvas_origin.1;
+        let canvas_width = self.last_canvas_size.0;
+        let canvas_height = self.last_canvas_size.1;
+        let world_w = self.last_world_size.0;
+        let world_h = self.last_world_size.1;
+
+        let render_w = world_w * scale;
+        let render_h = world_h * scale;
+        let pad_x = (canvas_width - render_w) * 0.5;
+        let pad_y = (canvas_height - render_h) * 0.5;
+
+        let world_x = (canvas_x - origin_x - pad_x - self.offset_px.0) / scale;
+        let world_y = (canvas_y - origin_y - pad_y - self.offset_px.1) / scale;
+
+        if !world_x.is_finite() || !world_y.is_finite() {
+            return None;
+        }
+
+        if world_x < 0.0 || world_y < 0.0 || world_x > world_w || world_y > world_h {
+            return None;
+        }
+
+        Some((world_x, world_y))
+    }
 }
 
 fn paint_terrain_layer(
@@ -3992,6 +4421,7 @@ fn paint_frame(
     frame: &RenderFrame,
     camera: &Arc<Mutex<CameraState>>,
     focus_agent: Option<AgentId>,
+    debug: DebugOverlayState,
     bounds: Bounds<Pixels>,
     window: &mut Window,
 ) {

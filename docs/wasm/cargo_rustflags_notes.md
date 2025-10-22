@@ -7,7 +7,7 @@ _Created: 2025-10-22 (UTC)_
 - We want a deterministic way to suppress non-applicable flags for wasm builds without rewriting developer environment variables.
 
 ## Recommended Approach
-1. Use `.cargo/config.toml` to scope Rust flags by target. Cargo expects per-target `rustflags` to live in `.cargo/config.toml`, not in `Cargo.toml`.citeturn0search0turn0search1
+1. Use `.cargo/config.toml` to scope Rust flags by target. Cargo expects per-target `rustflags` to live in `.cargo/config.toml`, not in `Cargo.toml`.citeturn2search3turn2search4
 2. Create a target stanza disabling host-specific CPU options and optionally enabling wasm-specific cfg flags:
    ```toml
    # .cargo/config.toml
@@ -19,7 +19,7 @@ _Created: 2025-10-22 (UTC)_
    ```
    - Remove host-only `-C target-cpu=…` flags by **not** inheriting `RUSTFLAGS` when building wasm (documented for developers via env wrapper or build script).
    - Optional: add `-C target-feature` entries only if required; otherwise keep minimal.
-3. For CI, set `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS` to override per-job without touching global environment. Cargo respects this environment variable ahead of config files.citeturn0search1
+3. For CI, set `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS` to override per-job without touching global environment. Cargo respects this environment variable ahead of config files.citeturn2search4
 
 ## Next Steps
 - Add `.cargo/config.toml` guidance to `docs/wasm/BUILD_WEB.md` once created.

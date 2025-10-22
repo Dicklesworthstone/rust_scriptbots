@@ -18,7 +18,7 @@ _Created: 2025-10-22 (UTC)_
    features = []
    ```
    Use the same pattern for dependent crates relying on Rayon.
-4. **Threaded wasm path:** Once hosting is cross-origin isolated, optionally re-enable threads with `wasm-bindgen-rayon` by calling `init_thread_pool`. This requires bundling the generated JS glue and ensuring browsers allow SharedArrayBuffer.citeturn3search1turn3search6turn3search0turn3search3
+4. **Threaded wasm path:** Once hosting is cross-origin isolated, optionally re-enable threads with `wasm-bindgen-rayon` by calling `init_thread_pool`. This requires bundling the generated JS glue and ensuring browsers allow SharedArrayBuffer.citeturn1search0turn3search0turn0search1turn0search2
 
 ## Testing Plan
 - Unit test: run existing deterministic tests with `--no-default-features --features ""` to ensure sequential path compiles.

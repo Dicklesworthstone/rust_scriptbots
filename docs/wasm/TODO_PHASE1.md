@@ -35,8 +35,9 @@ _Created: 2025-10-22 (UTC). Keep this list exhaustive; mark completion inline wi
   - [x] Create ADR scaffold at `docs/wasm/adrs/ADR-001-wasm-rendering.md`.
   - [x] Document evaluation criteria sourced from latest WebGPU/WebGL guidance.
   - [x] Schedule prototype spikes for WebGPU and Canvas paths (see `docs/wasm/rendering_spike_plan.md`).
-  - [ ] Build WebGPU spike prototype and capture metrics.
-  - [ ] Build Canvas baseline prototype and capture metrics.
+  - [~] Build WebGPU spike prototype and capture metrics (prep notes in `docs/wasm/spike_webgpu_notes.md`; implementation pending).
+  - [~] Build Canvas baseline prototype and capture metrics (prep notes in `docs/wasm/spike_canvas_notes.md`; implementation pending).
+  - [x] Prepare shared metrics template (`docs/wasm/rendering_metrics_template.csv`).
 
 - [ ] Wasm RNG + Rayon gating
   - [x] Enable `getrandom` WebAssembly backend via workspace feature flags (Cargo.toml updated).
