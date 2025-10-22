@@ -73,6 +73,7 @@
 - Document prerequisites for enabling `wasm-bindgen-rayon` (SharedArrayBuffer gates, COOP/COEP headers).
 - Decide MVP posture (single-thread fallback vs. multithread-first) and capture rationale.
 - Record hosting requirements (HTTP response headers, service worker interplay).
+- **Implementation status:** `scriptbots-core` now exposes a `parallel` feature (enabled by default) with sequential fallbacks, enabling wasm builds to disable Rayon cleanly.
 
 ### 1.7 Component Model & WASI Preview Assessment [Completed 2025-10-22 — see docs/wasm/adrs/ADR-004-component-model.md]
 - Investigate `cargo component` support for future interoperability with WASI Preview 2.

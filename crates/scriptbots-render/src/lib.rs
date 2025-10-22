@@ -89,11 +89,19 @@ struct SimulationView {
 
 impl SimulationView {
     fn new(world: Arc<Mutex<WorldState>>, title: SharedString) -> Self {
+        let mut inspector_state = InspectorState::default();
+        if let Ok(world_guard) = world.lock() {
+            let interval = world_guard.config().persistence_interval;
+            if interval > 0 {
+                inspector_state.persistence_last_enabled = interval;
+            }
+        }
+
         Self {
             world,
             title,
             camera: Arc::new(Mutex::new(CameraState::default())),
-            inspector: Arc::new(Mutex::new(InspectorState::default())),
+            inspector: Arc::new(Mutex::new(inspector_state)),
             playback: PlaybackState::new(240),
             perf: PerfStats::new(240),
             accessibility: AccessibilitySettings::default(),
@@ -1838,7 +1846,6 @@ struct VectorHudState {
     births_ratio: f32,
     deaths_ratio: f32,
     tick_phase: f32,
-    avg_velocity: (f32, f32),
     mean_speed: f32,
     vector_magnitude: f32,
     max_speed: f32,
@@ -1884,12 +1891,12 @@ impl VectorHudState {
             energy_max = 1.0;
         }
 
-        let (avg_velocity, mean_speed, vector_magnitude, max_speed, heading_rad) = snapshot
+        let (mean_speed, vector_magnitude, max_speed, heading_rad) = snapshot
             .render_frame
             .as_ref()
             .map(|frame| {
                 if frame.agents.is_empty() {
-                    return ((0.0, 0.0), 0.0, 0.0, 1.0, 0.0);
+                    return (0.0, 0.0, 1.0, 0.0);
                 }
 
                 let mut sum_vx: f32 = 0.0;
@@ -1919,15 +1926,9 @@ impl VectorHudState {
                 };
                 let max_speed_final = max_speed.max(mean_speed).max(1e-3);
 
-                (
-                    (avg_vx, avg_vy),
-                    mean_speed,
-                    vector_magnitude,
-                    max_speed_final,
-                    heading_rad,
-                )
+                (mean_speed, vector_magnitude, max_speed_final, heading_rad)
             })
-            .unwrap_or(((0.0, 0.0), 0.0, 0.0, 1.0, 0.0));
+            .unwrap_or((0.0, 0.0, 1.0, 0.0));
 
         Some(Self {
             population_ratio: metrics.agent_count as f32 / max_agents as f32,
@@ -1935,7 +1936,6 @@ impl VectorHudState {
             births_ratio: metrics.births as f32 / max_births as f32,
             deaths_ratio: metrics.deaths as f32 / max_deaths as f32,
             tick_phase: (snapshot.tick % 960) as f32 / 960.0,
-            avg_velocity,
             mean_speed,
             vector_magnitude,
             max_speed,
@@ -2000,7 +2000,7 @@ where
     if history.len() < 2 {
         return None;
     }
-    let mut raw: Vec<f32> = history.iter().map(map).collect();
+    let raw: Vec<f32> = history.iter().map(map).collect();
     if raw.iter().any(|v| !v.is_finite()) {
         return None;
     }
@@ -2062,6 +2062,7 @@ struct InspectorState {
     brush_enabled: bool,
     brush_radius: f32,
     probe_enabled: bool,
+    persistence_last_enabled: u32,
 }
 
 impl Default for InspectorState {
@@ -2071,6 +2072,7 @@ impl Default for InspectorState {
             brush_enabled: false,
             brush_radius: 48.0,
             probe_enabled: false,
+            persistence_last_enabled: 60,
         }
     }
 }
@@ -2085,6 +2087,9 @@ struct InspectorSnapshot {
     brush_enabled: bool,
     brush_radius: f32,
     probe_enabled: bool,
+    persistence_enabled: bool,
+    persistence_interval: u32,
+    persistence_cached_interval: u32,
 }
 
 impl InspectorSnapshot {
@@ -2094,8 +2099,16 @@ impl InspectorSnapshot {
             brush_enabled: inspector.brush_enabled,
             brush_radius: inspector.brush_radius,
             probe_enabled: inspector.probe_enabled,
+            persistence_cached_interval: inspector.persistence_last_enabled,
             ..InspectorSnapshot::default()
         };
+
+        let config = world.config();
+        snapshot.persistence_interval = config.persistence_interval;
+        snapshot.persistence_enabled = config.persistence_interval > 0;
+        if !snapshot.persistence_enabled && snapshot.persistence_interval > 0 {
+            snapshot.persistence_cached_interval = snapshot.persistence_interval.max(1);
+        }
 
         let arena = world.agents();
         let runtime = world.runtime();
@@ -2675,6 +2688,7 @@ impl PlaybackState {
         }
     }
 
+    #[allow(dead_code)]
     fn mode(&self) -> PlaybackMode {
         self.mode
     }

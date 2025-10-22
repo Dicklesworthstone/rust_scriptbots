@@ -18,6 +18,7 @@ _Date: 2025-10-22 (UTC)_
 ## Follow-up Run (2025-10-22)
 - Command: `cargo check --target wasm32-unknown-unknown -p scriptbots-core`
 - Result: **Success** after Step 1 above; no additional blockers surfaced during compilation.
+- Additional validation: `cargo check --target wasm32-unknown-unknown -p scriptbots-core --no-default-features` completes (emits host CPU flag warnings, see `docs/wasm/cargo_rustflags_notes.md`).
 
 ## Notes
 - No source files were modified; only `Cargo.toml` metadata was adjusted.

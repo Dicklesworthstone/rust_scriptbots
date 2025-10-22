@@ -40,8 +40,8 @@ _Created: 2025-10-22 (UTC). Keep this list exhaustive; mark completion inline wi
 
 - [ ] Wasm RNG + Rayon gating
   - [x] Enable `getrandom` WebAssembly backend via workspace feature flags (Cargo.toml updated).
-  - [ ] Gate Rayon behind feature flag or `cfg` for wasm, documenting fallback path (see `docs/wasm/rayon_fallback_plan.md`).
-  - [x] Re-run `cargo check --target wasm32-unknown-unknown` and append findings.
+  - [x] Gate Rayon behind feature flag or `cfg` for wasm, documenting fallback path (see `docs/wasm/rayon_fallback_plan.md`).
+  - [x] Re-run `cargo check --target wasm32-unknown-unknown` (with and without default features) and append findings.
   - [x] Document approach for suppressing CPU-specific `RUSTFLAGS` noise during wasm builds (`docs/wasm/cargo_rustflags_notes.md`).
 
 - [x] Security baseline
