@@ -125,6 +125,39 @@ fn temperature_discomfort(env_temperature: f32, preference: f32) -> f32 {
     (env_temperature - clamp01(preference)).abs()
 }
 
+#[derive(Default, Clone)]
+struct RunningStats {
+    count: usize,
+    mean: f64,
+    m2: f64,
+}
+
+impl RunningStats {
+    fn update(&mut self, value: f64) {
+        self.count += 1;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = value - self.mean;
+        self.m2 += delta * delta2;
+    }
+
+    fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    fn variance(&self) -> f64 {
+        if self.count > 1 {
+            self.m2 / (self.count - 1) as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn stddev(&self) -> f64 {
+        self.variance().sqrt()
+    }
+}
+
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
@@ -412,6 +445,7 @@ pub struct AgentRuntime {
     pub brain: BrainBinding,
     pub lineage: [Option<AgentId>; 2],
     pub mutation_log: Vec<String>,
+    pub food_balance_total: f32,
 }
 
 impl Default for AgentRuntime {
@@ -440,6 +474,7 @@ impl Default for AgentRuntime {
             brain: BrainBinding::default(),
             lineage: [None, None],
             mutation_log: Vec::new(),
+            food_balance_total: 0.0,
         }
     }
 }
@@ -551,6 +586,8 @@ struct DamageBucket {
 #[allow(dead_code)]
 struct SpawnOrder {
     parent_index: usize,
+    parent_id: AgentId,
+    partner_id: Option<AgentId>,
     data: AgentData,
     runtime: AgentRuntime,
 }
@@ -623,6 +660,48 @@ impl PersistenceEvent {
     }
 }
 
+/// Reason recorded for an agent death.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DeathCause {
+    CombatCarnivore,
+    CombatHerbivore,
+    Starvation,
+    Aging,
+    Unknown,
+}
+
+/// Metadata captured when an agent is spawned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BirthRecord {
+    pub tick: Tick,
+    pub agent_id: AgentId,
+    pub parent_a: Option<AgentId>,
+    pub parent_b: Option<AgentId>,
+    pub brain_kind: Option<String>,
+    pub brain_key: Option<u64>,
+    pub herbivore_tendency: f32,
+    pub generation: Generation,
+    pub position: Position,
+    pub is_hybrid: bool,
+}
+
+/// Lifecycle summary recorded when an agent is removed from the world.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeathRecord {
+    pub tick: Tick,
+    pub agent_id: AgentId,
+    pub age: u32,
+    pub generation: Generation,
+    pub herbivore_tendency: f32,
+    pub brain_kind: Option<String>,
+    pub brain_key: Option<u64>,
+    pub energy: f32,
+    pub food_balance_total: f32,
+    pub cause: DeathCause,
+    pub was_hybrid: bool,
+    pub combat_flags: CombatEventFlags,
+}
+
 /// Aggregate payload forwarded to persistence sinks.
 #[derive(Debug, Clone)]
 pub struct PersistenceBatch {
@@ -632,6 +711,8 @@ pub struct PersistenceBatch {
     pub metrics: Vec<MetricSample>,
     pub events: Vec<PersistenceEvent>,
     pub agents: Vec<AgentState>,
+    pub births: Vec<BirthRecord>,
+    pub deaths: Vec<DeathRecord>,
 }
 
 /// Persistence sink invoked after each tick.
@@ -854,6 +935,27 @@ impl BrainGenome {
 /// High level simulation clock (ticks processed since boot).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tick(pub u64);
+
+/// Controls analytics sampling cadence for various metric families.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalyticsStride {
+    /// Additional macro-level summaries (population mix, resources).
+    pub macro_metrics: u32,
+    /// Behavior fingerprints and sensor/output aggregates.
+    pub behavior_metrics: u32,
+    /// Birth/death lifecycle event persistence.
+    pub lifecycle_events: u32,
+}
+
+impl Default for AnalyticsStride {
+    fn default() -> Self {
+        Self {
+            macro_metrics: 1,
+            behavior_metrics: 120,
+            lifecycle_events: 1,
+        }
+    }
+}
 
 impl Tick {
     /// Returns the next sequential tick.
@@ -1465,6 +1567,22 @@ pub struct ScriptBotsConfig {
     pub food_intake_rate: f32,
     /// Amount of food removed from a cell whenever an agent grazes.
     pub food_waste_rate: f32,
+    /// Baseline fertility offset applied to every terrain tile before other weights.
+    pub food_fertility_base: f32,
+    /// Weight applied to terrain moisture when computing fertility.
+    pub food_moisture_weight: f32,
+    /// Weight applied to terrain elevation when computing fertility.
+    pub food_elevation_weight: f32,
+    /// Weight applied to local slope magnitude when computing fertility.
+    pub food_slope_weight: f32,
+    /// Minimum fraction of `food_max` available as capacity regardless of fertility.
+    pub food_capacity_base: f32,
+    /// Additional capacity fraction unlocked by perfect fertility.
+    pub food_capacity_fertility: f32,
+    /// Multiplier controlling how strongly fertility accelerates regrowth.
+    pub food_growth_fertility: f32,
+    /// Multiplier controlling how strongly infertility increases decay.
+    pub food_decay_infertility: f32,
     /// Radius used for food sharing with friendly neighbors.
     pub food_sharing_radius: f32,
     /// Fraction of energy shared per neighbor when donating.
@@ -1485,6 +1603,8 @@ pub struct ScriptBotsConfig {
     pub reproduction_rate_carnivore: f32,
     /// Bonus applied to the reproduction counter per unit ground intake.
     pub reproduction_food_bonus: f32,
+    /// Fertility-based multiplier applied to reproduction bonuses.
+    pub reproduction_fertility_bonus: f32,
     /// Starting energy assigned to a child agent.
     pub reproduction_child_energy: f32,
     /// Spatial jitter applied to child spawn positions.
@@ -1559,6 +1679,8 @@ pub struct ScriptBotsConfig {
     pub history_capacity: usize,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
     pub persistence_interval: u32,
+    /// Sampling cadence for analytics families.
+    pub analytics_stride: AnalyticsStride,
     /// NeuroFlow runtime configuration.
     pub neuroflow: NeuroflowSettings,
 }
@@ -1595,6 +1717,14 @@ impl Default for ScriptBotsConfig {
             temperature_discomfort_exponent: 2.0,
             food_intake_rate: 0.002,
             food_waste_rate: 0.001,
+            food_fertility_base: 0.2,
+            food_moisture_weight: 0.6,
+            food_elevation_weight: 0.4,
+            food_slope_weight: 6.0,
+            food_capacity_base: 0.3,
+            food_capacity_fertility: 0.6,
+            food_growth_fertility: 0.7,
+            food_decay_infertility: 0.5,
             food_sharing_radius: 50.0,
             food_sharing_rate: 0.1,
             food_transfer_rate: 0.001,
@@ -1605,6 +1735,7 @@ impl Default for ScriptBotsConfig {
             reproduction_rate_herbivore: 1.0,
             reproduction_rate_carnivore: 1.0,
             reproduction_food_bonus: 3.0,
+            reproduction_fertility_bonus: 0.5,
             reproduction_child_energy: 1.0,
             reproduction_spawn_jitter: 20.0,
             reproduction_color_jitter: 0.05,
@@ -1642,6 +1773,7 @@ impl Default for ScriptBotsConfig {
             carnivore_threshold: 0.5,
             history_capacity: 256,
             persistence_interval: 0,
+            analytics_stride: AnalyticsStride::default(),
             neuroflow: NeuroflowSettings::default(),
         }
     }
@@ -1770,7 +1902,18 @@ impl ScriptBotsConfig {
             || self.metabolism_boost_penalty < 0.0
             || self.food_intake_rate < 0.0
             || self.food_waste_rate < 0.0
+            || self.food_fertility_base < 0.0
+            || self.food_fertility_base > 1.0
+            || self.food_moisture_weight < 0.0
+            || self.food_elevation_weight < 0.0
+            || self.food_slope_weight < 0.0
+            || self.food_capacity_base < 0.0
+            || self.food_capacity_base > 1.0
+            || self.food_capacity_fertility < 0.0
+            || self.food_growth_fertility < 0.0
+            || self.food_decay_infertility < 0.0
             || self.reproduction_food_bonus < 0.0
+            || self.reproduction_fertility_bonus < 0.0
             || self.food_sharing_radius <= 0.0
             || self.food_sharing_rate < 0.0
             || self.food_transfer_rate < 0.0
@@ -1808,6 +1951,11 @@ impl ScriptBotsConfig {
         {
             return Err(WorldStateError::InvalidConfig(
                 "metabolism, reproduction, sharing, and history parameters must be non-negative; spike and diet thresholds must be within valid ranges",
+            ));
+        }
+        if self.food_capacity_base + self.food_capacity_fertility > 1.0 {
+            return Err(WorldStateError::InvalidConfig(
+                "food_capacity_base + food_capacity_fertility must be <= 1.0",
             ));
         }
         if !(0.0..=1.0).contains(&self.temperature_comfort_band) {
@@ -2154,6 +2302,78 @@ pub struct TerrainTile {
     pub accent: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FoodCellProfile {
+    capacity: f32,
+    growth_multiplier: f32,
+    decay_multiplier: f32,
+    fertility: f32,
+    nutrient_density: f32,
+}
+
+impl FoodCellProfile {
+    fn compute(config: &ScriptBotsConfig, terrain: &TerrainLayer) -> Vec<FoodCellProfile> {
+        let width = terrain.width() as usize;
+        let height = terrain.height() as usize;
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+        let mut profiles = Vec::with_capacity(width * height);
+        let cell_size = config.food_cell_size as f32;
+        let base = config.food_fertility_base;
+        let moisture_weight = config.food_moisture_weight;
+        let elevation_weight = config.food_elevation_weight;
+        let slope_weight = config.food_slope_weight;
+        let cap_base = config.food_capacity_base;
+        let cap_fertility = config.food_capacity_fertility;
+        let growth_scale = config.food_growth_fertility;
+        let decay_scale = config.food_decay_infertility;
+
+        for y in 0..height {
+            for x in 0..width {
+                let tile = terrain
+                    .tile(x as u32, y as u32)
+                    .expect("terrain tile should exist");
+                let kind_bonus = terrain_kind_fertility_bonus(tile.kind);
+                let moisture_term = tile.moisture * moisture_weight;
+                let elevation_term = tile.elevation * elevation_weight;
+                let world_x = (x as f32 + 0.5) * cell_size;
+                let world_y = (y as f32 + 0.5) * cell_size;
+                let (grad_x, grad_y) = terrain.gradient_world(world_x, world_y, cell_size);
+                let slope = (grad_x * grad_x + grad_y * grad_y).sqrt();
+                let slope_term = slope * slope_weight;
+                let fertility_raw = base + kind_bonus + moisture_term - elevation_term - slope_term;
+                let fertility = fertility_raw.clamp(0.0, 1.0);
+                let capacity_factor = (cap_base + fertility * cap_fertility).clamp(0.05, 1.0);
+                let growth_multiplier = (0.5 + fertility * growth_scale).clamp(0.1, 5.0);
+                let decay_multiplier = (1.0 + (1.0 - fertility) * decay_scale).max(0.0);
+                let nutrient_density = (0.3 + fertility * 0.7).clamp(0.0, 1.0);
+
+                profiles.push(FoodCellProfile {
+                    capacity: config.food_max * capacity_factor,
+                    growth_multiplier,
+                    decay_multiplier,
+                    fertility,
+                    nutrient_density,
+                });
+            }
+        }
+
+        profiles
+    }
+}
+
+fn terrain_kind_fertility_bonus(kind: TerrainKind) -> f32 {
+    match kind {
+        TerrainKind::Bloom => 0.35,
+        TerrainKind::Grass => 0.2,
+        TerrainKind::Sand => -0.25,
+        TerrainKind::ShallowWater => -0.2,
+        TerrainKind::DeepWater => -0.8,
+        TerrainKind::Rock => -0.45,
+    }
+}
+
 /// Aggregate world state shared by the simulation and rendering layers.
 pub struct WorldState {
     config: ScriptBotsConfig,
@@ -2163,6 +2383,7 @@ pub struct WorldState {
     rng: SmallRng,
     agents: AgentArena,
     food: FoodGrid,
+    food_profiles: Vec<FoodCellProfile>,
     terrain: TerrainLayer,
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
@@ -2171,6 +2392,8 @@ pub struct WorldState {
     pending_deaths: Vec<AgentId>,
     #[allow(dead_code)]
     pending_spawns: Vec<SpawnOrder>,
+    pending_birth_records: Vec<BirthRecord>,
+    pending_death_records: Vec<DeathRecord>,
     persistence: Box<dyn WorldPersistence>,
     last_births: usize,
     last_deaths: usize,
@@ -2179,6 +2402,8 @@ pub struct WorldState {
     carcass_health_distributed: f32,
     #[allow(dead_code)]
     carcass_reproduction_bonus: f32,
+    combat_spike_attempts: u32,
+    combat_spike_hits: u32,
 }
 
 impl fmt::Debug for WorldState {
@@ -2189,6 +2414,7 @@ impl fmt::Debug for WorldState {
             .field("epoch", &self.epoch)
             .field("closed", &self.closed)
             .field("agent_count", &self.agents.len())
+            .field("food_profiles", &self.food_profiles.len())
             .finish()
     }
 }
@@ -2207,9 +2433,19 @@ impl WorldState {
         let (food_w, food_h) = config.food_dimensions()?;
         let rng = config.seeded_rng();
         let mut terrain_rng = rng.clone();
-        let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
         let terrain =
             TerrainLayer::generate(food_w, food_h, config.food_cell_size, &mut terrain_rng)?;
+        let mut food = FoodGrid::new(food_w, food_h, config.initial_food)?;
+        let food_profiles = FoodCellProfile::compute(&config, &terrain);
+        if !food_profiles.is_empty() {
+            let cells = food.cells_mut();
+            for (idx, cell) in cells.iter_mut().enumerate() {
+                let profile = food_profiles
+                    .get(idx)
+                    .expect("food profile should match food grid");
+                *cell = (*cell).min(profile.capacity);
+            }
+        }
         let index = UniformGridIndex::new(
             config.food_cell_size as f32,
             config.world_width as f32,
@@ -2228,15 +2464,20 @@ impl WorldState {
             runtime: AgentMap::new(),
             index,
             brain_registry: BrainRegistry::new(),
+            food_profiles,
             food_scratch: vec![0.0; (food_w as usize) * (food_h as usize)],
             pending_deaths: Vec::new(),
             pending_spawns: Vec::new(),
+            pending_birth_records: Vec::new(),
+            pending_death_records: Vec::new(),
             persistence,
             last_births: 0,
             last_deaths: 0,
             history: VecDeque::with_capacity(history_capacity),
             carcass_health_distributed: 0.0,
             carcass_reproduction_bonus: 0.0,
+            combat_spike_attempts: 0,
+            combat_spike_hits: 0,
         })
     }
 
@@ -3415,6 +3656,14 @@ impl WorldState {
                 *spike_len = (*spike_len * 0.25).max(0.0_f32);
             }
         }
+
+        let attempts = results
+            .iter()
+            .filter(|result| !result.hits.is_empty())
+            .count() as u32;
+        let hits = results.iter().map(|result| result.hits.len() as u32).sum::<u32>();
+        self.combat_spike_attempts = self.combat_spike_attempts.saturating_add(attempts);
+        self.combat_spike_hits = self.combat_spike_hits.saturating_add(hits);
     }
 
     fn distribute_carcass_rewards(&mut self, dead: &[(usize, AgentId)]) {
@@ -3566,7 +3815,7 @@ impl WorldState {
         }
     }
 
-    fn stage_death_cleanup(&mut self) {
+    fn stage_death_cleanup(&mut self, tick: Tick) {
         if self.pending_deaths.is_empty() {
             return;
         }
@@ -3584,6 +3833,49 @@ impl WorldState {
             self.last_deaths = 0;
             return;
         }
+
+        let death_records: Vec<DeathRecord> = {
+            let columns = self.agents.columns();
+            dead.iter()
+                .filter_map(|(idx, agent_id)| {
+                    let data = columns.snapshot(*idx);
+                    let runtime = self.runtime.get(*agent_id)?.clone();
+                    let herbivore = clamp01(runtime.herbivore_tendency);
+                    let brain_kind = runtime.brain.kind().map(str::to_string);
+                    let brain_key = runtime.brain.registry_key();
+                    let cause = if runtime.combat.was_spiked_by_carnivore {
+                        DeathCause::CombatCarnivore
+                    } else if runtime.combat.was_spiked_by_herbivore {
+                        DeathCause::CombatHerbivore
+                    } else if runtime.energy <= f32::EPSILON && runtime.food_delta < 0.0 {
+                        DeathCause::Starvation
+                    } else if data.age >= self.config.aging_health_decay_start {
+                        DeathCause::Aging
+                    } else {
+                        DeathCause::Unknown
+                    };
+
+                    Some(DeathRecord {
+                        tick,
+                        agent_id: *agent_id,
+                        age: data.age,
+                        generation: data.generation,
+                        herbivore_tendency: herbivore,
+                        brain_kind,
+                        brain_key,
+                        energy: runtime.energy,
+                        food_balance_total: runtime.food_balance_total + runtime.food_delta,
+                        cause,
+                        was_hybrid: runtime.hybrid,
+                        combat_flags: runtime.combat,
+                    })
+                })
+                .collect()
+        };
+        if !death_records.is_empty() {
+            self.pending_death_records.extend(death_records);
+        }
+
         dead.sort_by_key(|(idx, _)| *idx);
         self.distribute_carcass_rewards(&dead);
         let mut removed = 0usize;
@@ -3677,6 +3969,8 @@ impl WorldState {
             );
             self.pending_spawns.push(SpawnOrder {
                 parent_index: idx,
+                parent_id: *agent_id,
+                partner_id: partner_index.map(|j| handles[j]),
                 data: child_data,
                 runtime: child_runtime,
             });
@@ -3713,7 +4007,7 @@ impl WorldState {
         best.map(|(idx, _)| idx)
     }
 
-    fn stage_spawn_commit(&mut self) {
+    fn stage_spawn_commit(&mut self, tick: Tick) {
         if self.pending_spawns.is_empty() {
             return;
         }
@@ -3721,9 +4015,35 @@ impl WorldState {
         orders.sort_by_key(|order| order.parent_index);
         self.last_births = orders.len();
         for order in orders {
-            let child_id = self.spawn_agent(order.data);
-            if let Some(runtime) = self.runtime.get_mut(child_id) {
-                *runtime = order.runtime;
+            let SpawnOrder {
+                parent_index: _,
+                parent_id,
+                partner_id,
+                data,
+                runtime,
+            } = order;
+            let child_id = self.spawn_agent(data);
+            self.runtime.insert(child_id, runtime);
+
+            if let Some(child_runtime) = self.runtime.get(child_id) {
+                if let Some(idx) = self.agents.index_of(child_id) {
+                    let snapshot = self.agents.columns().snapshot(idx);
+                    let brain_kind = child_runtime.brain.kind().map(str::to_string);
+                    let brain_key = child_runtime.brain.registry_key();
+                    let record = BirthRecord {
+                        tick,
+                        agent_id: child_id,
+                        parent_a: Some(parent_id),
+                        parent_b: partner_id,
+                        brain_kind,
+                        brain_key,
+                        herbivore_tendency: clamp01(child_runtime.herbivore_tendency),
+                        generation: snapshot.generation,
+                        position: snapshot.position,
+                        is_hybrid: child_runtime.hybrid,
+                    };
+                    self.pending_birth_records.push(record);
+                }
             }
         }
     }
@@ -4228,10 +4548,10 @@ impl WorldState {
         self.stage_temperature_discomfort();
         self.stage_food();
         self.stage_combat();
-        self.stage_death_cleanup();
+        self.stage_death_cleanup(next_tick);
         self.stage_reproduction();
         self.stage_population(next_tick);
-        self.stage_spawn_commit();
+        self.stage_spawn_commit(next_tick);
         self.stage_persistence(next_tick);
 
         let mut events = TickEvents {
@@ -4544,15 +4864,11 @@ mod tests {
     fn config_validation_rejects_excessive_food_waste() {
         let mut config = ScriptBotsConfig::default();
         config.food_waste_rate = config.food_max + 0.1;
-        let error = WorldState::new(config).unwrap_err();
-        if let WorldStateError::InvalidConfig(message) = error {
-            assert!(
-                message.contains("food_waste_rate"),
-                "expected food_waste_rate validation error, got {message}"
-            );
-        } else {
-            panic!("expected invalid config error, got {error:?}");
-        }
+        let WorldStateError::InvalidConfig(message) = WorldState::new(config).unwrap_err();
+        assert!(
+            message.contains("food_waste_rate"),
+            "expected food_waste_rate validation error, got {message}"
+        );
     }
 
     #[test]

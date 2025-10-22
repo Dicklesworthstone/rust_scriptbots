@@ -1,16 +1,11 @@
 use anyhow::Result;
+use scriptbots_app::{SharedStorage, SharedWorld};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{AgentData, NeuroflowActivationKind, ScriptBotsConfig, WorldState};
 use scriptbots_render::run_demo;
-use scriptbots_storage::{Storage, StoragePipeline};
-use std::{
-    env,
-    sync::{Arc, Mutex},
-};
+use scriptbots_storage::StoragePipeline;
+use std::{env, sync::{Arc, Mutex}};
 use tracing::{info, warn};
-
-type SharedWorld = Arc<Mutex<WorldState>>;
-type SharedStorageArc = Arc<Mutex<Storage>>;
 
 fn main() -> Result<()> {
     init_tracing();
@@ -26,7 +21,7 @@ fn init_tracing() {
         .try_init();
 }
 
-fn bootstrap_world() -> Result<(SharedWorld, SharedStorageArc)> {
+fn bootstrap_world() -> Result<(SharedWorld, SharedStorage)> {
     let mut config = ScriptBotsConfig {
         persistence_interval: 60,
         history_capacity: 600,
@@ -35,7 +30,7 @@ fn bootstrap_world() -> Result<(SharedWorld, SharedStorageArc)> {
     apply_env_overrides(&mut config);
 
     let pipeline = StoragePipeline::new("scriptbots.db")?;
-    let storage: SharedStorageArc = pipeline.storage();
+    let storage: SharedStorage = pipeline.storage();
     let mut world = WorldState::with_persistence(config, Box::new(pipeline))?;
     let brain_keys = install_brains(&mut world);
 

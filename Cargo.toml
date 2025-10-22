@@ -46,7 +46,7 @@ rstar = "0.12.2"
 kiddo = "4.2.0"
 neuroflow = "0.2.0"
 serde-wasm-bindgen = "0.6.5"
-wasm-bindgen = { version = "0.2.95", features = ["serde-serialize"] }
+wasm-bindgen = { version = "0.2.104", features = ["serde-serialize"] }
 
 [patch.crates-io]
 num-bigint-dig = { git = "https://github.com/dignifiedquire/num-bigint", rev = "d94efb24354fe56dc799d9979c279a542d2ce195" }

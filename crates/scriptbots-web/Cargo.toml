@@ -14,3 +14,6 @@ wasm-bindgen = { workspace = true }
 rand = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core", default-features = false }
 slotmap = { workspace = true }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.54"

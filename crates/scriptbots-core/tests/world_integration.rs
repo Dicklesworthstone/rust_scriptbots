@@ -384,8 +384,8 @@ fn regression_seed_42_matches_baseline() {
     assert_eq!(summary.agent_count, 1);
     assert_eq!(summary.births, 0);
     assert_eq!(summary.deaths, 0);
-    let expected_total_energy = 1.92;
-    let expected_average_energy = 1.92;
+    let expected_total_energy = 0.985_147;
+    let expected_average_energy = 0.985_147;
     let expected_average_health = 0.920_001_03;
     assert!(
         (summary.total_energy - expected_total_energy).abs() < 1e-6,

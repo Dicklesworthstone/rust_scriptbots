@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ScriptBots Web Demo</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+
+        body {
+            margin: 0;
+            display: grid;
+            grid-template-rows: auto 1fr;
+            min-height: 100vh;
+        }
+
+        header {
+            padding: 0.75rem 1.5rem;
+            background: #111c37;
+            border-bottom: 1px solid #1f2a44;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        header h1 {
+            margin: 0;
+            font-size: 1.1rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        header span {
+            opacity: 0.7;
+            font-size: 0.85rem;
+        }
+
+        main {
+            display: grid;
+            grid-template-columns: 1fr minmax(220px, 280px);
+            gap: 0;
+            overflow: hidden;
+        }
+
+        #sim-container {
+            position: relative;
+            background: radial-gradient(circle at center, rgba(30,58,138,0.12), #0f172a);
+        }
+
+        #sim-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        #stats-panel {
+            background: rgba(15, 23, 42, 0.95);
+            border-left: 1px solid #1f2a44;
+            display: flex;
+            flex-direction: column;
+            padding: 1.25rem 1.5rem;
+            gap: 1.25rem;
+        }
+
+        #stats-panel h2 {
+            margin: 0;
+            font-size: 0.95rem;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            opacity: 0.8;
+        }
+
+        dl {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 0.3rem 0.6rem;
+            margin: 0;
+        }
+
+        dt {
+            opacity: 0.65;
+            font-size: 0.8rem;
+        }
+
+        dd {
+            margin: 0;
+            font-size: 0.9rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        #log {
+            flex: 1;
+            overflow: auto;
+            font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, monospace;
+            font-size: 0.75rem;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid #1f2a44;
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            white-space: pre-wrap;
+        }
+
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .controls label {
+            display: flex;
+            flex-direction: column;
+            font-size: 0.8rem;
+            opacity: 0.8;
+        }
+
+        .controls input[type="range"] {
+            width: 100%;
+        }
+
+        .controls button {
+            padding: 0.6rem 0.8rem;
+            border-radius: 0.4rem;
+            background: #2563eb;
+            color: white;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.1s ease;
+        }
+
+        .controls button:hover {
+            transform: translateY(-1px);
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            background: rgba(37, 99, 235, 0.16);
+            color: #bfdbfe;
+            border: 1px solid rgba(96, 165, 250, 0.35);
+            padding: 0.2rem 0.55rem;
+            border-radius: 999px;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>ScriptBots WASM Harness</h1>
+        <span id="version">initializing…</span>
+    </header>
+    <main>
+        <section id="sim-container">
+            <canvas id="sim-canvas" width="1280" height="720" aria-label="Simulation canvas"></canvas>
+        </section>
+        <aside id="stats-panel">
+            <div class="controls">
+                <div class="chip">Live Metrics</div>
+                <dl>
+                    <dt>FPS</dt>
+                    <dd id="metric-fps">–</dd>
+                    <dt>Ticks / s</dt>
+                    <dd id="metric-tps">–</dd>
+                    <dt>Tick</dt>
+                    <dd id="metric-tick">–</dd>
+                    <dt>Population</dt>
+                    <dd id="metric-population">–</dd>
+                    <dt>Births</dt>
+                    <dd id="metric-births">–</dd>
+                    <dt>Deaths</dt>
+                    <dd id="metric-deaths">–</dd>
+                    <dt>Avg Energy</dt>
+                    <dd id="metric-energy">–</dd>
+                    <dt>Avg Health</dt>
+                    <dd id="metric-health">–</dd>
+                </dl>
+                <label>
+                    Steps per frame
+                    <input id="steps-per-frame" type="range" min="1" max="8" step="1" value="2" />
+                </label>
+                <label>
+                    Population
+                    <input id="population" type="range" min="32" max="1024" step="32" value="256" />
+                </label>
+                <button id="reset-btn" type="button">Reset Simulation</button>
+            </div>
+            <div class="chip">Timeline</div>
+            <div id="log" aria-live="polite"></div>
+        </aside>
+    </main>
+    <script type="module" src="./main.js"></script>
+</body>
+</html>

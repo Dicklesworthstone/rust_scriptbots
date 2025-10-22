@@ -644,14 +644,14 @@ impl SimulationView {
             ));
             cards.push(self.metric_card(
                 "Avg Energy",
-                format!("{:.2}", metrics.average_energy),
+                self.format_float(metrics.average_energy, 2),
                 0xf59e0b,
-                Some(format!("Total {:.1}", metrics.total_energy)),
+                Some(format!("Total {}", self.format_float(metrics.total_energy, 1))),
                 energy_series.clone(),
             ));
             cards.push(self.metric_card(
                 "Avg Health",
-                format!("{:.2}", metrics.average_health),
+                self.format_float(metrics.average_health, 2),
                 0x8b5cf6,
                 None,
                 health_series,
@@ -686,14 +686,16 @@ impl SimulationView {
         let frame_value = if perf.sample_count == 0 {
             "—".to_string()
         } else {
-            format!("{:.2} ms", perf.latest_ms)
+            format!("{} ms", self.format_float(perf.latest_ms, 2))
         };
         let frame_detail = if perf.sample_count == 0 {
             "Collecting samples…".to_string()
         } else {
             format!(
-                "avg {:.2} · min {:.2} · max {:.2}",
-                perf.average_ms, perf.min_ms, perf.max_ms
+                "avg {} · min {} · max {}",
+                self.format_float(perf.average_ms, 2),
+                self.format_float(perf.min_ms, 2),
+                self.format_float(perf.max_ms, 2)
             )
         };
         cards.push(self.metric_card(
@@ -707,7 +709,7 @@ impl SimulationView {
         let fps_value = if perf.sample_count == 0 {
             "—".to_string()
         } else {
-            format!("{:.1}", perf.fps)
+            self.format_float(perf.fps, 1)
         };
         let fps_detail = if perf.sample_count == 0 {
             "Awaiting samples".to_string()
@@ -720,7 +722,7 @@ impl SimulationView {
         let speed_value = if controls.paused {
             "Paused".to_string()
         } else {
-            format!("{:.2}×", controls.speed_multiplier)
+            format!("{}×", self.format_float(controls.speed_multiplier, 2))
         };
         let bool_label = |value: bool| if value { "On" } else { "Off" };
         let speed_detail = format!(
@@ -1310,9 +1312,13 @@ impl SimulationView {
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_panel.open = !self.settings_panel.open;
 
-        // Reset scroll position when opening panel
+        // Reset scroll position and recalculate content height when opening panel
         if self.settings_panel.open {
             self.settings_panel.scroll_offset = 0.0;
+            let total_categories = ConfigCategory::all().len();
+            self.settings_panel.content_height = self
+                .settings_panel
+                .estimate_content_height(total_categories);
         }
 
         info!(open = self.settings_panel.open, "Settings panel toggled");
@@ -1336,6 +1342,14 @@ impl SimulationView {
             // Category is expanded, collapse it
             self.settings_panel.collapsed_categories.push(category);
         }
+
+        // Update content height estimate and clamp scroll
+        let total_categories = ConfigCategory::all().len();
+        self.settings_panel.content_height = self
+            .settings_panel
+            .estimate_content_height(total_categories);
+        self.settings_panel.clamp_scroll();
+
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
             audio.play(&audio.toggle_sound);
@@ -4042,7 +4056,15 @@ impl SimulationView {
             );
 
         // Scrollable container for categories with mouse wheel handling
+        // Calculate content height locally (can't mutate self in render method)
+        let total_categories = ConfigCategory::all().len();
+        let content_height = self.settings_panel.estimate_content_height(total_categories);
+        let viewport_height = self.settings_panel.viewport_height;
+
         let scroll_offset = self.settings_panel.scroll_offset;
+        let max_scroll = (content_height - viewport_height).max(0.0);
+        let has_scrollable_content = max_scroll > 1.0;
+
         let categories_content = div()
             .flex_1()
             .overflow_hidden()
@@ -4056,9 +4078,9 @@ impl SimulationView {
                     ScrollDelta::Lines(lines) => lines.y * 20.0, // ~20px per line
                 };
 
-                // Update scroll offset (negative delta = scroll down = content moves up)
-                this.settings_panel.scroll_offset =
-                    (this.settings_panel.scroll_offset - scroll_delta).max(0.0);
+                // Update scroll offset with proper bounds
+                this.settings_panel.scroll_offset -= scroll_delta;
+                this.settings_panel.clamp_scroll();
                 cx.notify();
             }))
             .child(
@@ -4068,7 +4090,32 @@ impl SimulationView {
                     .left(px(0.0))
                     .right(px(0.0))
                     .child(self.render_all_config_categories(cx)),
-            );
+            )
+            .when(has_scrollable_content, |node| {
+                node.child(
+                    // Visual scroll indicator at bottom
+                    div()
+                        .absolute()
+                        .bottom(px(8.0))
+                        .right(px(16.0))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x1e293b))
+                        .border_1()
+                        .border_color(rgb(0x475569))
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child(format!(
+                            "{:.0}%",
+                            if max_scroll > 0.0 {
+                                (scroll_offset / max_scroll * 100.0).min(100.0)
+                            } else {
+                                0.0
+                            }
+                        )),
+                )
+            });
 
         let panel_content = panel
             .child(header)
@@ -4306,49 +4353,49 @@ impl SimulationView {
             ConfigCategory::Metabolism => container
                 .child(self.render_param_readonly(
                     "Base Drain",
-                    &format!("{:.4}", config.metabolism_drain),
+                    &self.format_float(config.metabolism_drain, 4),
                     "Baseline energy cost",
                 ))
                 .child(self.render_param_readonly(
                     "Movement Drain",
-                    &format!("{:.4}", config.movement_drain),
+                    &self.format_float(config.movement_drain, 4),
                     "Cost per velocity",
                 ))
                 .child(self.render_param_readonly(
                     "Ramp Floor",
-                    &format!("{:.2}", config.metabolism_ramp_floor),
+                    &self.format_float(config.metabolism_ramp_floor, 2),
                     "Energy level for ramping",
                 ))
                 .child(self.render_param_readonly(
                     "Ramp Rate",
-                    &format!("{:.4}", config.metabolism_ramp_rate),
+                    &self.format_float(config.metabolism_ramp_rate, 4),
                     "Additional drain above floor",
                 ))
                 .child(self.render_param_readonly(
                     "Boost Penalty",
-                    &format!("{:.4}", config.metabolism_boost_penalty),
+                    &self.format_float(config.metabolism_boost_penalty, 4),
                     "Fixed boost cost",
                 )),
 
             ConfigCategory::Temperature => container
                 .child(self.render_param_readonly(
                     "Discomfort Rate",
-                    &format!("{:.4}", config.temperature_discomfort_rate),
+                    &self.format_float(config.temperature_discomfort_rate, 4),
                     "Health drain multiplier",
                 ))
                 .child(self.render_param_readonly(
                     "Comfort Band",
-                    &format!("±{:.3}", config.temperature_comfort_band),
+                    &format!("±{}", self.format_float(config.temperature_comfort_band, 3)),
                     "Tolerance threshold",
                 ))
                 .child(self.render_param_readonly(
                     "Gradient Exponent",
-                    &format!("{:.2}", config.temperature_gradient_exponent),
+                    &self.format_float(config.temperature_gradient_exponent, 2),
                     "Pole-to-equator shaping",
                 ))
                 .child(self.render_param_readonly(
                     "Discomfort Exp",
-                    &format!("{:.2}", config.temperature_discomfort_exponent),
+                    &self.format_float(config.temperature_discomfort_exponent, 2),
                     "Discomfort scaling power",
                 )),
 
@@ -4450,59 +4497,59 @@ impl SimulationView {
                 ))
                 .child(self.render_param_readonly(
                     "Decay Rate",
-                    &format!("{:.5}", config.aging_health_decay_rate),
+                    &self.format_float(config.aging_health_decay_rate, 5),
                     "Health loss per tick",
                 ))
                 .child(self.render_param_readonly(
                     "Decay Max",
-                    &format!("{:.4}", config.aging_health_decay_max),
+                    &self.format_float(config.aging_health_decay_max, 4),
                     "Maximum decay per tick",
                 ))
                 .child(self.render_param_readonly(
                     "Energy Penalty",
-                    &format!("{:.3}×", config.aging_energy_penalty_rate),
+                    &format!("{}×", self.format_float(config.aging_energy_penalty_rate, 3)),
                     "Health-to-energy conversion",
                 )),
 
             ConfigCategory::Combat => container
                 .child(self.render_param_readonly(
                     "Spike Radius",
-                    &format!("{:.1}", config.spike_radius),
+                    &self.format_float(config.spike_radius, 1),
                     "Base spike collision radius",
                 ))
                 .child(self.render_param_readonly(
                     "Spike Damage",
-                    &format!("{:.2}", config.spike_damage),
+                    &self.format_float(config.spike_damage, 2),
                     "Damage at full power",
                 ))
                 .child(self.render_param_readonly(
                     "Spike Energy Cost",
-                    &format!("{:.4}", config.spike_energy_cost),
+                    &self.format_float(config.spike_energy_cost, 4),
                     "Energy cost to deploy",
                 ))
                 .child(self.render_param_readonly(
                     "Min Length",
-                    &format!("{:.2}", config.spike_min_length),
+                    &self.format_float(config.spike_min_length, 2),
                     "Minimum for damage",
                 ))
                 .child(self.render_param_readonly(
                     "Alignment Cosine",
-                    &format!("{:.2}", config.spike_alignment_cosine),
+                    &self.format_float(config.spike_alignment_cosine, 2),
                     "Directional threshold",
                 ))
                 .child(self.render_param_readonly(
                     "Speed Bonus",
-                    &format!("{:.3}×", config.spike_speed_damage_bonus),
+                    &format!("{}×", self.format_float(config.spike_speed_damage_bonus, 3)),
                     "Velocity scaling",
                 ))
                 .child(self.render_param_readonly(
                     "Length Bonus",
-                    &format!("{:.3}×", config.spike_length_damage_bonus),
+                    &format!("{}×", self.format_float(config.spike_length_damage_bonus, 3)),
                     "Length scaling",
                 ))
                 .child(self.render_param_readonly(
                     "Growth Rate",
-                    &format!("{:.4}", config.spike_growth_rate),
+                    &self.format_float(config.spike_growth_rate, 4),
                     "Spike extension rate",
                 )),
 
@@ -4555,12 +4602,12 @@ impl SimulationView {
                 ))
                 .child(self.render_param_readonly(
                     "Speed Gain",
-                    &format!("{:.3}", config.topography_speed_gain),
+                    &self.format_float(config.topography_speed_gain, 3),
                     "Downhill boost per unit slope",
                 ))
                 .child(self.render_param_readonly(
                     "Energy Penalty",
-                    &format!("{:.4}", config.topography_energy_penalty),
+                    &self.format_float(config.topography_energy_penalty, 4),
                     "Uphill cost per unit slope",
                 )),
 
@@ -4582,7 +4629,7 @@ impl SimulationView {
                 ))
                 .child(self.render_param_readonly(
                     "Crossover Chance",
-                    &format!("{:.1}%", config.population_crossover_chance * 100.0),
+                    &format!("{}%", self.format_float(config.population_crossover_chance * 100.0, 1)),
                     "Breed vs. random spawn",
                 )),
 
@@ -5139,6 +5186,10 @@ struct SettingsPanelState {
     preset_name: String,
     /// Vertical scroll offset for categories content (in pixels)
     scroll_offset: f32,
+    /// Cached total content height for scroll bounds calculation
+    content_height: f32,
+    /// Cached viewport height for scroll bounds calculation
+    viewport_height: f32,
 }
 
 impl Default for SettingsPanelState {
@@ -5151,7 +5202,36 @@ impl Default for SettingsPanelState {
             modified_params: Vec::new(),
             preset_name: "Default".to_string(),
             scroll_offset: 0.0,
+            content_height: 0.0,
+            viewport_height: 600.0, // Reasonable default
         }
+    }
+}
+
+impl SettingsPanelState {
+    /// Calculate maximum scroll offset based on content and viewport heights
+    fn max_scroll_offset(&self) -> f32 {
+        (self.content_height - self.viewport_height).max(0.0)
+    }
+
+    /// Clamp scroll offset to valid bounds
+    fn clamp_scroll(&mut self) {
+        self.scroll_offset = self.scroll_offset.clamp(0.0, self.max_scroll_offset());
+    }
+
+    /// Estimate content height based on number of visible categories
+    /// Each category header ~90px, each expanded category ~450px average
+    fn estimate_content_height(&self, total_categories: usize) -> f32 {
+        let collapsed_count = self.collapsed_categories.len();
+        let expanded_count = total_categories.saturating_sub(collapsed_count);
+
+        // Header ~90px, expanded category ~450px (10 params × ~45px each)
+        let collapsed_height = collapsed_count as f32 * 90.0;
+        let expanded_height = expanded_count as f32 * 450.0;
+
+        // Add padding and gaps
+        let total = collapsed_height + expanded_height + 100.0; // 100px for padding/gaps
+        total
     }
 }
 

@@ -158,7 +158,7 @@
   - Maintain compatibility metrics and speciation buckets (NEAT-inspired) to avoid catastrophic mixing of divergent architectures.
 - Pluggable factories:
   - Register brain constructors through a `BrainRegistry` so additional engines (ONNXRuntime, Torch via tch-rs, GPU kernels) can be added behind feature flags without core refactors.
-  - Expose CLI/GUI toggles allowing per-run selection of active brain families and evolution knobs (mutation rates, speciation thresholds).
+- Expose CLI/GUI toggles allowing per-run selection of active brain families and evolution knobs (mutation rates, speciation thresholds). [Currently In Progress - GPT-5 Codex 2025-10-22]
 - Diagnostics:
   - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization.
   - Provide debug tooling to render network topologies (layer shapes, activations) inside the inspector panel.
@@ -222,7 +222,7 @@
    - Initialize workspace via `create-gpui-app --workspace`.
    - Set up linting (`rustfmt`, `clippy`), choose MSRV (Rust 1.81+) to match GPUI requirement.
 2. **Core Data Structures (Weeks 1-2)**
-   - Port `settings.h` constants into `ScriptBotsConfig`. [Currently In Progress - GPT-5 Codex 2025-10-22]
+   - Port `settings.h` constants into `ScriptBotsConfig`. [Completed - GPT-5 Codex 2025-10-22: aligned default food/reproduction constants with legacy values and added validation tests]
    - Implement `Vector2` replacement via `glam::Vec2`.
    - Port agent struct, reproduction, mutation logic with unit tests.
 3. **World Mechanics (Weeks 2-4)**

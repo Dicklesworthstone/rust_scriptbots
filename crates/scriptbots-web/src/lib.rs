@@ -422,3 +422,82 @@ fn sensor(inputs: &[f32; INPUT_SIZE], idx: usize) -> f32 {
 fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptbots_core::ScriptBotsConfig;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn wasm_harness_matches_native_world() {
+        let mut config = ScriptBotsConfig::default();
+        config.world_width = 480;
+        config.world_height = 360;
+        config.rng_seed = Some(8102);
+
+        let population = 32;
+        let ticks = 24;
+
+        // Native world execution
+        let mut native_world = WorldState::new(config.clone()).expect("native world");
+        seed_agents(&mut native_world, population).expect("seed native world");
+        for _ in 0..ticks {
+            native_world.step();
+        }
+        let native_snapshot = SimulationSnapshot::from_world(&native_world);
+
+        // WASM harness execution (same config + seed)
+        let mut sim = Simulation::new(SimSpec::new(config, population, Some(8102))).expect("sim");
+        let wasm_snapshot = sim.tick(ticks);
+
+        assert_eq!(native_snapshot.tick, wasm_snapshot.tick);
+        assert_eq!(
+            native_snapshot.summary.agent_count,
+            wasm_snapshot.summary.agent_count
+        );
+        assert_eq!(native_snapshot.agents.len(), wasm_snapshot.agents.len());
+
+        assert_float_eq(
+            native_snapshot.summary.total_energy,
+            wasm_snapshot.summary.total_energy,
+        );
+        assert_float_eq(
+            native_snapshot.summary.average_energy,
+            wasm_snapshot.summary.average_energy,
+        );
+        assert_float_eq(
+            native_snapshot.summary.average_health,
+            wasm_snapshot.summary.average_health,
+        );
+
+        for (expected, actual) in native_snapshot
+            .agents
+            .iter()
+            .zip(wasm_snapshot.agents.iter())
+        {
+            assert_float_eq(expected.position[0], actual.position[0]);
+            assert_float_eq(expected.position[1], actual.position[1]);
+            assert_float_eq(expected.velocity[0], actual.velocity[0]);
+            assert_float_eq(expected.velocity[1], actual.velocity[1]);
+            assert_float_eq(expected.heading, actual.heading);
+            assert_float_eq(expected.health, actual.health);
+            assert_float_eq(expected.energy, actual.energy);
+            assert_float_eq(expected.spike_length, actual.spike_length);
+            assert_eq!(expected.boost, actual.boost);
+        }
+    }
+
+    fn assert_float_eq(left: f32, right: f32) {
+        let delta = (left - right).abs();
+        assert!(
+            delta <= 1e-5,
+            "expected {:.6} ~= {:.6} (Δ={:.6})",
+            left,
+            right,
+            delta
+        );
+    }
+}

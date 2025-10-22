@@ -8,3 +8,4 @@ codex_log.txt
 toolchains/windows/
 scriptbots.db
 toolchains/
+crates/scriptbots-web/web/pkg/
