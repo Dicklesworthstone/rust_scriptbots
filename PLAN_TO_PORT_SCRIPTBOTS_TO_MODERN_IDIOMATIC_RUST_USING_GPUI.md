@@ -141,7 +141,7 @@
 - Bench harness (`criterion`) measuring ticks/sec at various agent counts.
 - GPUI view tests using `#[gpui::test]` macro to ensure layout compiles and actions dispatch.citeturn0search0
 - Storage tests:
-  - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency.citeturn1search0
+  - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Currently In Progress - GPT-5 Codex 2025-10-21]citeturn1search0
   - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs.citeturn1search0turn1search5
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build.
 
@@ -183,8 +183,8 @@
    - MLP (baseline) complete with mutate/crossover. [Completed - GPT-5 Codex 2025-10-21]
    - DWRAON feature gate; assembly brain behind `--features experimental`. [Completed - GPT-5 Codex 2025-10-21]
    - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds. [Currently In Progress - GPT-5 Codex 2025-10-21]citeturn2search1turn2search2
-   - Seed NeuroFlow weights using the world RNG for deterministic runs. [Currently In Progress - GPT-5 Codex 2025-10-21]
-   - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Currently In Progress - GPT-5 Codex 2025-10-21]
+   - Seed NeuroFlow weights using the world RNG for deterministic runs. [Completed - GPT-5 Codex 2025-10-21]
+   - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Completed - GPT-5 Codex 2025-10-21]
 6. **Persistence Layer (Weeks 7-8)**
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Currently In Progress - GPT-5 Codex 2025-10-21]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Currently In Progress - GPT-5 Codex 2025-10-21]

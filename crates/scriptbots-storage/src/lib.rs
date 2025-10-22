@@ -638,74 +638,141 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
-    use std::fs;
-    use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use scriptbots_core::{
+        AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
+        PersistenceEventKind, Tick, TickSummary,
+    };
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    #[derive(Default)]
-    struct CapturePersistence {
-        batches: Arc<Mutex<Vec<PersistenceBatch>>>,
+    fn temp_db_path(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        path.push(format!(
+            "{}-{}-{}.duckdb",
+            prefix,
+            std::process::id(),
+            timestamp
+        ));
+        path
     }
 
-    impl WorldPersistence for CapturePersistence {
-        fn on_tick(&mut self, payload: &PersistenceBatch) {
-            self.batches.lock().unwrap().push(payload.clone());
+    fn sample_agent(energy: f32) -> AgentState {
+        let mut data = AgentData::default();
+        data.health = energy;
+        data.position.x = 12.0;
+        data.position.y = 34.0;
+
+        let mut runtime = AgentRuntime::default();
+        runtime.energy = energy;
+
+        AgentState {
+            id: scriptbots_core::AgentId::default(),
+            data,
+            runtime,
+        }
+    }
+
+    fn sample_batch(tick: u64, energy: f32) -> PersistenceBatch {
+        PersistenceBatch {
+            summary: TickSummary {
+                tick: Tick(tick),
+                agent_count: 1,
+                births: 1,
+                deaths: 0,
+                total_energy: energy,
+                average_energy: energy,
+                average_health: 1.0,
+            },
+            epoch: 3,
+            closed: false,
+            metrics: vec![
+                MetricSample::from_f32("total_energy", energy),
+                MetricSample::from_f32("average_energy", energy),
+                MetricSample::from_f32("average_health", 1.0),
+            ],
+            events: vec![PersistenceEvent::new(PersistenceEventKind::Births, 1)],
+            agents: vec![sample_agent(energy)],
         }
     }
 
     #[test]
-    fn storage_flushes_persistence_batch() {
-        let config = ScriptBotsConfig {
-            persistence_interval: 1,
-            history_capacity: 4,
-            ..ScriptBotsConfig::default()
-        };
-        let capture = CapturePersistence::default();
-        let batches = capture.batches.clone();
-        let mut world =
-            WorldState::with_persistence(config, Box::new(capture)).expect("world creation");
-        world.spawn_agent(AgentData::default());
-        world.step();
+    fn persist_batch_writes_all_tables() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-persist");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::with_thresholds(&path_string, 1, 1, 1, 1)?;
 
-        let batch = {
-            let guard = batches.lock().unwrap();
-            guard.first().cloned().expect("captured batch")
-        };
-
-        let filename = format!(
-            "scriptbots-storage-test-{}-{}.duckdb",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(filename);
-        let path_str = path.to_string_lossy().to_string();
-
-        let mut storage = Storage::with_thresholds(&path_str, 1, 1, 1, 1).expect("storage");
-        storage.enqueue(&batch).expect("enqueue");
-        storage.flush().expect("flush");
+        let batch = sample_batch(42, 5.5);
+        storage.persist(&batch)?;
+        storage.flush()?;
 
         let tick_count: i64 = storage
             .conn
-            .query_row("select count(*) from ticks", [], |row| row.get(0))
-            .expect("tick count");
+            .query_row("select count(*) from ticks", [], |row| row.get(0))?;
         assert_eq!(tick_count, 1);
 
-        let agent_count: i64 = storage
-            .conn
-            .query_row("select count(*) from agents", [], |row| row.get(0))
-            .expect("agent count");
-        assert_eq!(agent_count, batch.agents.len() as i64);
-
-        let metric_count: i64 = storage
-            .conn
-            .query_row("select count(*) from metrics", [], |row| row.get(0))
-            .expect("metric count");
+        let metric_count: i64 =
+            storage
+                .conn
+                .query_row("select count(*) from metrics", [], |row| row.get(0))?;
         assert_eq!(metric_count, batch.metrics.len() as i64);
 
+        let event_count: i64 =
+            storage
+                .conn
+                .query_row("select count(*) from events", [], |row| row.get(0))?;
+        assert_eq!(event_count, batch.events.len() as i64);
+
+        let agent_count: i64 =
+            storage
+                .conn
+                .query_row("select count(*) from agents", [], |row| row.get(0))?;
+        assert_eq!(agent_count, batch.agents.len() as i64);
+
+        let latest = storage.latest_metrics(8)?;
+        assert_eq!(latest.len(), batch.metrics.len());
+        assert!(latest.iter().all(|m| m.tick == 42));
+
+        drop(storage);
         let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn top_predators_tracks_average_energy() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-predators");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let mut batch_one = sample_batch(1, 1.0);
+        storage.persist(&batch_one)?;
+        storage.flush()?;
+
+        let mut batch_two = sample_batch(2, 3.0);
+        if let Some(agent) = batch_two.agents.first_mut() {
+            agent.data.spike_length = 2.5;
+        }
+        storage.persist(&batch_two)?;
+        storage.flush()?;
+
+        let metrics = storage.latest_metrics(4)?;
+        assert_eq!(metrics.len(), 3);
+        assert!(metrics.iter().all(|reading| reading.tick == 2));
+
+        let predators = storage.top_predators(4)?;
+        assert!(!predators.is_empty());
+        let leader = &predators[0];
+        assert!((leader.avg_energy - 2.0).abs() < 1e-6);
+        assert_eq!(leader.last_tick, 2);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
+        Ok(())
     }
 }

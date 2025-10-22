@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rand::{rngs::SmallRng, SeedableRng};
+use rand::{SeedableRng, rngs::SmallRng};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
     AgentData, BrainBinding, NeuroflowActivationKind, ScriptBotsConfig, WorldState,
@@ -152,6 +152,108 @@ fn parse_activation(raw: &str) -> Option<NeuroflowActivationKind> {
         "sigmoid" => Some(NeuroflowActivationKind::Sigmoid),
         "relu" => Some(NeuroflowActivationKind::Relu),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "neuro")]
+    use rand::{SeedableRng, rngs::SmallRng};
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_env_lock<F: FnOnce()>(f: F) {
+        let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().expect("env mutex poisoned");
+        f();
+    }
+
+    fn restore_env(var: &str, previous: Option<String>) {
+        if let Some(value) = previous {
+            std::env::set_var(var, value);
+        } else {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn env_overrides_apply_expected_settings() {
+        with_env_lock(|| {
+            let prev_enabled = std::env::var("SCRIPTBOTS_NEUROFLOW_ENABLED").ok();
+            let prev_hidden = std::env::var("SCRIPTBOTS_NEUROFLOW_HIDDEN").ok();
+            let prev_activation = std::env::var("SCRIPTBOTS_NEUROFLOW_ACTIVATION").ok();
+
+            std::env::set_var("SCRIPTBOTS_NEUROFLOW_ENABLED", "true");
+            std::env::set_var("SCRIPTBOTS_NEUROFLOW_HIDDEN", "64, 32 ,16");
+            std::env::set_var("SCRIPTBOTS_NEUROFLOW_ACTIVATION", "relu");
+
+            let mut config = ScriptBotsConfig::default();
+            apply_env_overrides(&mut config);
+
+            assert!(config.neuroflow.enabled);
+            assert_eq!(config.neuroflow.hidden_layers, vec![64, 32, 16]);
+            assert_eq!(config.neuroflow.activation, NeuroflowActivationKind::Relu);
+
+            restore_env("SCRIPTBOTS_NEUROFLOW_ENABLED", prev_enabled);
+            restore_env("SCRIPTBOTS_NEUROFLOW_HIDDEN", prev_hidden);
+            restore_env("SCRIPTBOTS_NEUROFLOW_ACTIVATION", prev_activation);
+        });
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn neuroflow_installation_respects_toggle() {
+        let mut config = ScriptBotsConfig::default();
+        config.neuroflow.enabled = false;
+        let mut world = WorldState::new(config).expect("world");
+        let mut rng = SmallRng::seed_from_u64(7);
+        let keys = install_brains(&mut world, &mut rng);
+        assert_eq!(
+            keys.len(),
+            1,
+            "NeuroFlow brain should not register when disabled"
+        );
+
+        let mut config_enabled = ScriptBotsConfig::default();
+        config_enabled.neuroflow.enabled = true;
+        config_enabled.neuroflow.hidden_layers = vec![12, 6];
+        config_enabled.neuroflow.activation = NeuroflowActivationKind::Sigmoid;
+        config_enabled.rng_seed = Some(99);
+        let mut world_enabled = WorldState::new(config_enabled.clone()).expect("world");
+        let mut rng_enabled = SmallRng::seed_from_u64(99);
+        let keys_enabled = install_brains(&mut world_enabled, &mut rng_enabled);
+        assert_eq!(
+            keys_enabled.len(),
+            2,
+            "Expected both MLP and NeuroFlow brains"
+        );
+
+        let neuro_key = *keys_enabled.last().expect("neuro key");
+        let agent_id = world_enabled.spawn_agent(AgentData::default());
+        if let Some(runtime) = world_enabled.agent_runtime_mut(agent_id) {
+            runtime.brain = BrainBinding::Registry { key: neuro_key };
+        }
+        world_enabled.step();
+        let outputs_one = world_enabled.agent_runtime(agent_id).unwrap().outputs;
+
+        let mut world_repeat = WorldState::new(config_enabled).expect("world");
+        let mut rng_repeat = SmallRng::seed_from_u64(99);
+        let keys_repeat = install_brains(&mut world_repeat, &mut rng_repeat);
+        assert_eq!(keys_repeat.len(), 2);
+        let neuro_repeat = *keys_repeat.last().unwrap();
+        let agent_repeat = world_repeat.spawn_agent(AgentData::default());
+        if let Some(runtime) = world_repeat.agent_runtime_mut(agent_repeat) {
+            runtime.brain = BrainBinding::Registry { key: neuro_repeat };
+        }
+        world_repeat.step();
+        let outputs_two = world_repeat.agent_runtime(agent_repeat).unwrap().outputs;
+
+        assert_eq!(
+            outputs_one, outputs_two,
+            "NeuroFlow outputs should be deterministic for same seed"
+        );
     }
 }
 

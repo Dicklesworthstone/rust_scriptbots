@@ -5,13 +5,12 @@
 //! remaining forward-compatible with richer training workflows. The implementation focuses on
 //! inference; mutation currently randomizes weights using the recorded architecture.
 
-use neuroflow::activators::Type;
 use neuroflow::FeedForward;
+use neuroflow::activators::Type;
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use scriptbots_brain::{into_runner, Brain, BrainKind};
+use scriptbots_brain::{Brain, BrainKind, into_runner};
 use scriptbots_core::{BrainRunner, NeuroflowActivationKind, NeuroflowSettings, WorldState};
 
 /// Number of inputs inherited from the simulation sensors.
@@ -93,6 +92,24 @@ pub struct NeuroflowBrain {
     inputs: Vec<f64>,
 }
 
+#[derive(Serialize)]
+struct LayerSeed {
+    v: Vec<f64>,
+    y: Vec<f64>,
+    delta: Vec<f64>,
+    prev_delta: Vec<f64>,
+    w: Vec<Vec<f64>>,
+}
+
+#[derive(Serialize)]
+struct FeedForwardSeed {
+    layers: Vec<LayerSeed>,
+    learn_rate: f64,
+    momentum: f64,
+    error: f64,
+    act_type: Type,
+}
+
 impl std::fmt::Debug for NeuroflowBrain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NeuroflowBrain")
@@ -134,15 +151,51 @@ impl NeuroflowBrain {
             .register(Self::runner(config, rng))
     }
 
-    fn build_network(config: &NeuroflowBrainConfig, _rng: &mut dyn RngCore) -> FeedForward {
-        let mut layers = Vec::with_capacity(config.hidden_layers.len() + 2);
-        layers.push(INPUT_SIZE as i32);
-        for &size in &config.hidden_layers {
-            layers.push(size as i32);
-        }
-        layers.push(OUTPUT_SIZE as i32);
+    fn build_network(config: &NeuroflowBrainConfig, rng: &mut dyn RngCore) -> FeedForward {
+        let mut architecture: Vec<i32> = Vec::with_capacity(config.hidden_layers.len() + 2);
+        architecture.push(INPUT_SIZE as i32);
+        architecture.extend(
+            config
+                .hidden_layers
+                .iter()
+                .copied()
+                .map(|layer| layer as i32),
+        );
+        architecture.push(OUTPUT_SIZE as i32);
 
-        let mut network = FeedForward::new(&layers);
+        let mut layers = Vec::with_capacity(architecture.len().saturating_sub(1));
+        for window in architecture.windows(2) {
+            let inputs = window[0] as usize;
+            let outputs = window[1] as usize;
+            let mut neurons = Vec::with_capacity(outputs);
+            for _ in 0..outputs {
+                let mut weights = Vec::with_capacity(inputs + 1);
+                for _ in 0..=inputs {
+                    weights.push(rng.random_range(-1.0..1.0));
+                }
+                neurons.push(weights);
+            }
+
+            layers.push(LayerSeed {
+                v: vec![0.0; outputs],
+                y: vec![0.0; outputs],
+                delta: vec![0.0; outputs],
+                prev_delta: vec![0.0; outputs],
+                w: neurons,
+            });
+        }
+
+        let seed = FeedForwardSeed {
+            layers,
+            learn_rate: config.learning_rate,
+            momentum: config.momentum,
+            error: 0.0,
+            act_type: config.activation.to_type(),
+        };
+
+        let value = serde_json::to_value(&seed).expect("serialize neuroflow seed");
+        let mut network: FeedForward =
+            serde_json::from_value(value).expect("construct neuroflow network");
         network
             .activation(config.activation.to_type())
             .learning_rate(config.learning_rate)
@@ -189,8 +242,8 @@ impl Brain for NeuroflowBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::SmallRng;
     use rand::SeedableRng;
+    use rand::rngs::SmallRng;
 
     #[test]
     fn runner_executes_and_returns_outputs() {

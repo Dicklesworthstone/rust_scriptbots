@@ -1,16 +1,19 @@
 //! GPUI rendering layer for ScriptBots.
 
 use gpui::{
-    App, Application, Bounds, Context, Div, SharedString, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    App, Application, Background, Bounds, Context, Div, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollDelta, ScrollWheelEvent, SharedString,
+    Window, WindowBounds, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
-use scriptbots_core::{TickSummary, WorldState};
-use scriptbots_storage::{MetricReading, PredatorStats, Storage};
-use std::sync::{Arc, Mutex};
-use tracing::{error, info, warn};
+use scriptbots_core::{Position, TickSummary, WorldState};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
+use tracing::{error, info};
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
-pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Arc<Mutex<Storage>>) {
+pub fn run_demo(world: Arc<Mutex<WorldState>>) {
     if let Ok(world) = world.lock()
         && let Some(summary) = world.history().last()
     {
@@ -28,7 +31,6 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Arc<Mutex<Storage>>) {
     let title_for_options = window_title.clone();
     let title_for_view = window_title.clone();
     let world_for_view = Arc::clone(&world);
-    let storage_for_view = Arc::clone(&storage);
 
     Application::new().run(move |app: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
@@ -42,17 +44,10 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Arc<Mutex<Storage>>) {
         }
 
         let world_handle = Arc::clone(&world_for_view);
-        let storage_handle = Arc::clone(&storage_for_view);
         let view_title = title_for_view.clone();
 
         if let Err(err) = app.open_window(options, move |_window, cx| {
-            cx.new(|_| {
-                SimulationView::new(
-                    Arc::clone(&world_handle),
-                    Arc::clone(&storage_handle),
-                    view_title.clone(),
-                )
-            })
+            cx.new(|_| SimulationView::new(Arc::clone(&world_handle), view_title.clone()))
         }) {
             error!(error = ?err, "failed to open ScriptBots window");
             return;
@@ -64,26 +59,23 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Arc<Mutex<Storage>>) {
 
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
-    storage: Arc<Mutex<Storage>>,
     title: SharedString,
+    camera: CameraState,
 }
 
 impl SimulationView {
-    fn new(
-        world: Arc<Mutex<WorldState>>,
-        storage: Arc<Mutex<Storage>>,
-        title: SharedString,
-    ) -> Self {
+    fn new(world: Arc<Mutex<WorldState>>, title: SharedString) -> Self {
         Self {
             world,
-            storage,
             title,
+            camera: CameraState::default(),
         }
     }
 
     fn snapshot(&self) -> HudSnapshot {
         let mut snapshot = HudSnapshot::default();
-        let history: Vec<TickSummary> = if let Ok(world) = self.world.lock() {
+
+        if let Ok(world) = self.world.lock() {
             snapshot.tick = world.tick().0;
             snapshot.epoch = world.epoch();
             snapshot.is_closed = world.is_closed();
@@ -92,39 +84,19 @@ impl SimulationView {
             let config = world.config();
             snapshot.world_size = (config.world_width, config.world_height);
             snapshot.history_capacity = config.history_capacity;
+            snapshot.render_frame = RenderFrame::from_world(&world);
 
-            let collected: Vec<TickSummary> = world.history().cloned().collect();
-            if let Some(latest) = collected.last() {
+            let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
+            for summary in world.history() {
+                if ring.len() == 12 {
+                    ring.pop_front();
+                }
+                ring.push_back(summary.clone());
+            }
+            if let Some(latest) = ring.back() {
                 snapshot.summary = Some(HudMetrics::from(latest));
             }
-            collected
-        } else {
-            Vec::new()
-        };
-
-        snapshot.recent_history = history
-            .iter()
-            .rev()
-            .take(12)
-            .map(HudHistoryEntry::from)
-            .collect();
-
-        if let Ok(mut storage) = self.storage.lock() {
-            match storage.latest_metrics(6) {
-                Ok(metrics) => snapshot
-                    .storage_metrics
-                    .extend(metrics.into_iter().map(HudStorageMetric::from)),
-                Err(err) => warn!(?err, "failed to load latest metrics"),
-            }
-
-            match storage.top_predators(5) {
-                Ok(predators) => snapshot
-                    .top_predators
-                    .extend(predators.into_iter().map(HudPredator::from)),
-                Err(err) => warn!(?err, "failed to load top predators"),
-            }
-        } else {
-            warn!("storage mutex poisoned while collecting snapshot");
+            snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
         }
 
         snapshot
@@ -196,7 +168,7 @@ impl SimulationView {
 
             cards.push(self.metric_card(
                 "Tick",
-                format!("{}", metrics.tick),
+                metrics.tick.to_string(),
                 0x38bdf8,
                 Some(format!("Epoch {}", snapshot.epoch)),
             ));
@@ -253,108 +225,6 @@ impl SimulationView {
         let column_count = cards.len().clamp(1, 4) as u16;
 
         div().grid().grid_cols(column_count).gap_4().children(cards)
-    }
-
-    fn render_analytics(&self, snapshot: &HudSnapshot) -> Div {
-        div()
-            .flex()
-            .gap_4()
-            .flex_wrap()
-            .child(self.render_storage_metrics(&snapshot.storage_metrics))
-            .child(self.render_top_predators(&snapshot.top_predators))
-    }
-
-    fn render_storage_metrics(&self, metrics: &[HudStorageMetric]) -> Div {
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .rounded_lg()
-            .bg(rgb(0x0b1220))
-            .p_4()
-            .min_w(px(360.0))
-            .flex_grow()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x94a3b8))
-                    .child("DuckDB Metrics"),
-            );
-
-        if metrics.is_empty() {
-            return card.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x64748b))
-                    .child("Awaiting persisted metrics..."),
-            );
-        }
-
-        let accents = [0x38bdf8, 0xa855f7, 0x22c55e, 0xfbbf24];
-        let mut grid = div().flex().flex_wrap().gap_3();
-        for (idx, metric) in metrics.iter().enumerate() {
-            let accent = accents[idx % accents.len()];
-            grid = grid.child(self.metric_card(
-                &metric.name,
-                format!("{:.3}", metric.value),
-                accent,
-                Some(format!("tick {}", metric.tick)),
-            ));
-        }
-        card.child(grid)
-    }
-
-    fn render_top_predators(&self, predators: &[HudPredator]) -> Div {
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .rounded_lg()
-            .bg(rgb(0x0b1220))
-            .p_4()
-            .min_w(px(360.0))
-            .flex_grow()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x94a3b8))
-                    .child("Top Predators"),
-            );
-
-        if predators.is_empty() {
-            return card.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x64748b))
-                    .child("No predator data persisted yet."),
-            );
-        }
-
-        let mut list = div().flex().flex_col().gap_2();
-        for (rank, predator) in predators.iter().enumerate() {
-            let badge = format!("#{:02}", rank + 1);
-            let content = format!(
-                "Agent {} • avg energy {:.2} • spike {:.1} • last tick {}",
-                predator.agent_id,
-                predator.avg_energy,
-                predator.max_spike_length,
-                predator.last_tick
-            );
-            list = list.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .bg(rgb(0x111827))
-                    .rounded_md()
-                    .px_3()
-                    .py_2()
-                    .child(div().text_sm().text_color(rgb(0xfacc15)).child(badge))
-                    .child(div().text_sm().text_color(rgb(0xe2e8f0)).child(content)),
-            );
-        }
-
-        card.child(list)
     }
 
     fn render_history(&self, snapshot: &HudSnapshot) -> Div {
@@ -480,6 +350,89 @@ impl SimulationView {
             .children(rows)
     }
 
+    fn render_canvas(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+        if let Some(frame) = snapshot.render_frame.clone() {
+            self.render_canvas_world(snapshot, frame, cx)
+        } else {
+            self.render_canvas_placeholder(snapshot)
+        }
+    }
+
+    fn render_canvas_world(
+        &self,
+        snapshot: &HudSnapshot,
+        frame: RenderFrame,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let canvas_state = CanvasState {
+            frame: frame.clone(),
+            camera: self.camera.clone(),
+        };
+
+        let canvas_element = canvas(
+            move |_, _, _| canvas_state.clone(),
+            move |bounds, state, window, _| {
+                paint_frame(&state.frame, &state.camera, bounds, window)
+            },
+        )
+        .flex_1();
+
+        let canvas_stack = div()
+            .relative()
+            .flex_1()
+            .on_mouse_down(MouseButton::Middle, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if event.button == MouseButton::Middle {
+                    this.camera.start_pan(event.position);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(MouseButton::Middle, cx.listener(|this, event: &MouseUpEvent, _, _| {
+                if event.button == MouseButton::Middle {
+                    this.camera.end_pan();
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.camera.update_pan(event.position) {
+                    cx.notify();
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                if this.camera.apply_scroll(event) {
+                    cx.notify();
+                }
+            }))
+            .child(canvas_element)
+            .child(self.render_overlay(snapshot));
+
+        let footer = div()
+            .text_xs()
+            .text_color(rgb(0x475569))
+            .flex()
+            .justify_between()
+            .child(format!(
+                "World {:.0}×{:.0} units • Zoom {:.2}×",
+                frame.world_size.0, frame.world_size.1, self.camera.zoom,
+            ))
+            .child(format!(
+                "Pan X {:.1}, Y {:.1}",
+                self.camera.offset_px.0, self.camera.offset_px.1
+            ));
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(0x0ea5e9))
+            .bg(rgb(0x0b1120))
+            .shadow_lg()
+            .p_4()
+            .gap_3()
+            .child(canvas_stack)
+            .child(footer)
+    }
+
     fn render_canvas_placeholder(&self, snapshot: &HudSnapshot) -> Div {
         div()
             .flex()
@@ -510,6 +463,44 @@ impl SimulationView {
                 "Latest tick #{}, {} agents",
                 snapshot.tick, snapshot.agent_count
             )))
+    }
+
+    fn render_overlay(&self, snapshot: &HudSnapshot) -> Div {
+        let mut lines: Vec<String> = if let Some(summary) = snapshot.summary.as_ref() {
+            vec![
+                format!("Tick {} (epoch {})", summary.tick, snapshot.epoch),
+                format!(
+                    "Agents {} • Births {} • Deaths {}",
+                    summary.agent_count, summary.births, summary.deaths
+                ),
+                format!(
+                    "Avg energy {:.2} • Avg health {:.2}",
+                    summary.average_energy, summary.average_health
+                ),
+            ]
+        } else {
+            vec![format!("Tick {} • epoch {}", snapshot.tick, snapshot.epoch)]
+        };
+        lines.push(format!(
+            "Zoom {:.2}× • Pan ({:.0}, {:.0})",
+            self.camera.zoom, self.camera.offset_px.0, self.camera.offset_px.1
+        ));
+
+        div()
+            .absolute()
+            .top(px(12.0))
+            .left(px(12.0))
+            .bg(rgb(0x111b2b))
+            .rounded_md()
+            .shadow_md()
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_sm()
+            .text_color(rgb(0xe2e8f0))
+            .children(lines.into_iter().map(|line| div().child(line)))
     }
 
     fn render_footer(&self, snapshot: &HudSnapshot) -> Div {
@@ -564,7 +555,7 @@ impl SimulationView {
 }
 
 impl Render for SimulationView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.snapshot();
 
         div()
@@ -577,14 +568,13 @@ impl Render for SimulationView {
             .gap_4()
             .child(self.render_header(&snapshot))
             .child(self.render_summary(&snapshot))
-            .child(self.render_analytics(&snapshot))
             .child(
                 div()
                     .flex()
                     .gap_4()
                     .flex_1()
                     .child(self.render_history(&snapshot))
-                    .child(self.render_canvas_placeholder(&snapshot)),
+                    .child(self.render_canvas(&snapshot, cx)),
             )
             .child(self.render_footer(&snapshot))
     }
@@ -600,8 +590,7 @@ struct HudSnapshot {
     agent_count: usize,
     summary: Option<HudMetrics>,
     recent_history: Vec<HudHistoryEntry>,
-    storage_metrics: Vec<HudStorageMetric>,
-    top_predators: Vec<HudPredator>,
+    render_frame: Option<RenderFrame>,
 }
 
 struct HudMetrics {
@@ -648,8 +637,8 @@ impl HudHistoryEntry {
     }
 }
 
-impl From<&TickSummary> for HudHistoryEntry {
-    fn from(summary: &TickSummary) -> Self {
+impl From<TickSummary> for HudHistoryEntry {
+    fn from(summary: TickSummary) -> Self {
         Self {
             tick: summary.tick.0,
             agent_count: summary.agent_count,
@@ -660,36 +649,236 @@ impl From<&TickSummary> for HudHistoryEntry {
     }
 }
 
-struct HudStorageMetric {
-    name: String,
-    value: f64,
-    tick: i64,
+#[derive(Clone)]
+struct RenderFrame {
+    world_size: (f32, f32),
+    food_dimensions: (u32, u32),
+    food_cell_size: u32,
+    food_cells: Vec<f32>,
+    food_max: f32,
+    agents: Vec<AgentRenderData>,
+    agent_base_radius: f32,
 }
 
-impl From<MetricReading> for HudStorageMetric {
-    fn from(metric: MetricReading) -> Self {
+#[derive(Clone)]
+struct AgentRenderData {
+    position: Position,
+    color: [f32; 3],
+    spike_length: f32,
+    health: f32,
+}
+
+#[derive(Clone)]
+struct CanvasState {
+    frame: RenderFrame,
+    camera: CameraState,
+}
+
+impl RenderFrame {
+    fn from_world(world: &WorldState) -> Option<Self> {
+        let food = world.food();
+        let width = food.width();
+        let height = food.height();
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let config = world.config();
+        let columns = world.agents().columns();
+
+        let positions = columns.positions();
+        let colors = columns.colors();
+        let spikes = columns.spike_lengths();
+        let healths = columns.health();
+
+        let agents = positions
+            .iter()
+            .enumerate()
+            .map(|(idx, position)| AgentRenderData {
+                position: *position,
+                color: colors[idx],
+                spike_length: spikes[idx],
+                health: healths[idx],
+            })
+            .collect();
+
+        Some(Self {
+            world_size: (config.world_width as f32, config.world_height as f32),
+            food_dimensions: (width, height),
+            food_cell_size: config.food_cell_size,
+            food_cells: food.cells().to_vec(),
+            food_max: config.food_max,
+            agents,
+            agent_base_radius: (config.spike_radius * 0.5).max(12.0),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CameraState {
+    offset_px: (f32, f32),
+    zoom: f32,
+    panning: bool,
+    pan_anchor: Option<Point<Pixels>>,
+}
+
+impl Default for CameraState {
+    fn default() -> Self {
         Self {
-            name: metric.name,
-            value: metric.value,
-            tick: metric.tick,
+            offset_px: (0.0, 0.0),
+            zoom: Self::default_zoom(),
+            panning: false,
+            pan_anchor: None,
         }
     }
 }
 
-struct HudPredator {
-    agent_id: u64,
-    avg_energy: f64,
-    max_spike_length: f64,
-    last_tick: i64,
+impl CameraState {
+    const MIN_ZOOM: f32 = 0.4;
+    const MAX_ZOOM: f32 = 2.5;
+    fn default_zoom() -> f32 {
+        1.0
+    }
+
+    fn start_pan(&mut self, cursor: Point<Pixels>) {
+        self.panning = true;
+        self.pan_anchor = Some(cursor);
+    }
+
+    fn update_pan(&mut self, cursor: Point<Pixels>) -> bool {
+        if !self.panning {
+            return false;
+        }
+        if let Some(anchor) = self.pan_anchor {
+            let dx = f32::from(cursor.x) - f32::from(anchor.x);
+            let dy = f32::from(cursor.y) - f32::from(anchor.y);
+            if dx.abs() > f32::EPSILON || dy.abs() > f32::EPSILON {
+                self.offset_px.0 += dx;
+                self.offset_px.1 += dy;
+                self.pan_anchor = Some(cursor);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn end_pan(&mut self) {
+        self.panning = false;
+        self.pan_anchor = None;
+    }
+
+    fn apply_scroll(&mut self, event: &ScrollWheelEvent) -> bool {
+        let scroll_y = match event.delta {
+            ScrollDelta::Pixels(delta) => -f32::from(delta.y) / 120.0,
+            ScrollDelta::Lines(lines) => -lines.y,
+        };
+        if scroll_y.abs() < 0.01 {
+            return false;
+        }
+        let old_zoom = self.zoom;
+        self.zoom = (self.zoom * (1.0 + scroll_y * 0.1)).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        if (self.zoom - old_zoom).abs() < f32::EPSILON {
+            return false;
+        }
+        let ratio = self.zoom / old_zoom;
+        self.offset_px.0 *= ratio;
+        self.offset_px.1 *= ratio;
+        true
+    }
 }
 
-impl From<PredatorStats> for HudPredator {
-    fn from(stats: PredatorStats) -> Self {
-        Self {
-            agent_id: stats.agent_id,
-            avg_energy: stats.avg_energy,
-            max_spike_length: stats.max_spike_length,
-            last_tick: stats.last_tick,
+fn paint_frame(
+    frame: &RenderFrame,
+    camera: &CameraState,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let origin = bounds.origin;
+    let bounds_size = bounds.size;
+
+    let world_w = frame.world_size.0.max(1.0);
+    let world_h = frame.world_size.1.max(1.0);
+
+    let width_px = f32::from(bounds_size.width).max(1.0);
+    let height_px = f32::from(bounds_size.height).max(1.0);
+
+    let base_scale = (width_px / world_w).min(height_px / world_h).max(0.000_1);
+    let scale = base_scale * camera.zoom;
+    let render_w = world_w * scale;
+    let render_h = world_h * scale;
+    let pad_x = (width_px - render_w) * 0.5;
+    let pad_y = (height_px - render_h) * 0.5;
+    let offset_x = f32::from(origin.x) + pad_x + camera.offset_px.0;
+    let offset_y = f32::from(origin.y) + pad_y + camera.offset_px.1;
+
+    window.paint_quad(fill(
+        bounds,
+        Background::from(Rgba {
+            r: 0.03,
+            g: 0.05,
+            b: 0.08,
+            a: 1.0,
+        }),
+    ));
+
+    let food_w = frame.food_dimensions.0 as usize;
+    let food_h = frame.food_dimensions.1 as usize;
+    let cell_world = frame.food_cell_size as f32;
+    let cell_px = (cell_world * scale).max(1.0);
+    let max_food = frame.food_max.max(f32::EPSILON);
+
+    for y in 0..food_h {
+        for x in 0..food_w {
+            let idx = y * food_w + x;
+            let value = frame.food_cells.get(idx).copied().unwrap_or_default();
+            if value <= 0.001 {
+                continue;
+            }
+            let intensity = (value / max_food).clamp(0.0, 1.0);
+            let color = food_color(intensity);
+            let px_x = offset_x + (x as f32 * cell_world * scale);
+            let px_y = offset_y + (y as f32 * cell_world * scale);
+            let cell_bounds =
+                Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
+            window.paint_quad(fill(cell_bounds, Background::from(color)));
         }
+    }
+
+    for agent in &frame.agents {
+        let px_x = offset_x + agent.position.x * scale;
+        let px_y = offset_y + agent.position.y * scale;
+        let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
+        let size_px = (dynamic_radius * scale).max(2.0);
+        let half = size_px * 0.5;
+        let agent_bounds = Bounds::new(
+            point(px(px_x - half), px(px_y - half)),
+            size(px(size_px), px(size_px)),
+        );
+        let color = agent_color(agent);
+        window.paint_quad(fill(agent_bounds, Background::from(color)));
+    }
+}
+
+fn food_color(intensity: f32) -> Rgba {
+    let clamped = intensity.clamp(0.0, 1.0);
+    Rgba {
+        r: 0.06 + 0.25 * clamped,
+        g: 0.22 + 0.55 * clamped,
+        b: 0.12 + 0.25 * clamped,
+        a: 0.2 + 0.45 * clamped,
+    }
+}
+
+fn agent_color(agent: &AgentRenderData) -> Rgba {
+    let base_r = agent.color[0].clamp(0.0, 1.0);
+    let base_g = agent.color[1].clamp(0.0, 1.0);
+    let base_b = agent.color[2].clamp(0.0, 1.0);
+    let health_factor = (agent.health / 2.0).clamp(0.35, 1.0);
+
+    Rgba {
+        r: (base_r * health_factor).clamp(0.0, 1.0),
+        g: (base_g * health_factor).clamp(0.0, 1.0),
+        b: (base_b * health_factor).clamp(0.0, 1.0),
+        a: 0.9,
     }
 }

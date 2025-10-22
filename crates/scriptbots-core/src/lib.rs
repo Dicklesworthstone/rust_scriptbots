@@ -1,11 +1,11 @@
 //! Core types shared across the ScriptBots workspace.
 
 use ordered_float::OrderedFloat;
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
-use slotmap::{new_key_type, SecondaryMap, SlotMap};
+use slotmap::{SecondaryMap, SlotMap, new_key_type};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -1557,7 +1557,7 @@ impl WorldState {
             .map(|(idx, agent_id)| {
                 if let Some(runtime) = runtime.get(*agent_id) {
                     let outputs = runtime.outputs;
-                    let forward = outputs.get(0).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let forward = outputs.first().copied().unwrap_or(0.0).clamp(-1.0, 1.0);
                     let strafe = outputs.get(1).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
                     let turn = outputs.get(2).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
                     let boost = outputs.get(3).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -2044,16 +2044,11 @@ impl WorldState {
             average_energy,
             average_health,
         };
-        let mut metrics = Vec::with_capacity(3);
-        metrics.push(MetricSample::from_f32("total_energy", summary.total_energy));
-        metrics.push(MetricSample::from_f32(
-            "average_energy",
-            summary.average_energy,
-        ));
-        metrics.push(MetricSample::from_f32(
-            "average_health",
-            summary.average_health,
-        ));
+        let metrics = vec![
+            MetricSample::from_f32("total_energy", summary.total_energy),
+            MetricSample::from_f32("average_energy", summary.average_energy),
+            MetricSample::from_f32("average_health", summary.average_health),
+        ];
 
         let mut events = Vec::with_capacity(2);
         if self.last_births > 0 {
@@ -2112,7 +2107,9 @@ impl WorldState {
         let mut events = TickEvents {
             tick: next_tick,
             charts_flushed: self.config.chart_flush_interval > 0
-                && next_tick.0 % self.config.chart_flush_interval as u64 == 0,
+                && next_tick
+                    .0
+                    .is_multiple_of(self.config.chart_flush_interval as u64),
             epoch_rolled: false,
             food_respawned: self.stage_food_respawn(next_tick),
         };
@@ -2165,7 +2162,6 @@ impl WorldState {
     }
 
     /// Iterate over retained tick summaries.
-    #[must_use]
     pub fn history(&self) -> impl Iterator<Item = &TickSummary> {
         self.history.iter()
     }
@@ -2173,7 +2169,7 @@ impl WorldState {
     /// Advances the world tick counter, rolling epochs when needed.
     pub fn advance_tick(&mut self) {
         self.tick = self.tick.next();
-        if self.tick.0 % 10_000 == 0 {
+        if self.tick.0.is_multiple_of(10_000) {
             self.epoch += 1;
         }
     }
@@ -2291,7 +2287,7 @@ mod tests {
             health: 1.0 + seed as f32,
             color: [seed as f32, seed as f32 + 0.5, seed as f32 + 1.0],
             spike_length: seed as f32 * 2.0,
-            boost: seed % 2 == 0,
+            boost: seed.is_multiple_of(2),
             age: seed,
             generation: Generation(seed),
         }
@@ -2344,10 +2340,11 @@ mod tests {
         assert_eq!(grid.get(2, 0), Some(3.0));
         assert!(grid.get(5, 0).is_none());
         grid.fill(2.0);
-        assert!(grid
-            .cells()
-            .iter()
-            .all(|&cell| (cell - 2.0).abs() < f32::EPSILON));
+        assert!(
+            grid.cells()
+                .iter()
+                .all(|&cell| (cell - 2.0).abs() < f32::EPSILON)
+        );
     }
 
     #[test]

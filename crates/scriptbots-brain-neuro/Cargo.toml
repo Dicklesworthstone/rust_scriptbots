@@ -7,5 +7,6 @@ edition = "2024"
 neuroflow = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 scriptbots-brain = { path = "../scriptbots-brain" }
 scriptbots-core = { path = "../scriptbots-core" }
