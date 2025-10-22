@@ -17,32 +17,32 @@ _Created: 2025-10-22 (UTC). Keep this list exhaustive; mark completion inline wi
 
 ## Tasks
 
-- [~] Maintain planning doc status markers
-  - [~] Update `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` with `[Currently In Progress]` tags for active subsections.
+- [x] Maintain planning doc status markers
+  - [x] Update `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` with `[Currently In Progress]` tags for active subsections.
   - [ ] Refresh markers when tasks exit Phase 1.
 
-- [~] Dependency audit deliverables
-  - [~] Run `cargo tree --workspace --edges normal,build,dev` to gather dependency graph.
-  - [ ] Parse and classify dependencies into `dependency_audit.csv`.
-  - [ ] Document blockers/owners in `PHASE1_FINDINGS.md`.
+- [x] Dependency audit deliverables
+  - [x] Run `cargo tree --workspace --edges normal,build,dev` to gather dependency graph.
+  - [x] Parse and classify dependencies into `dependency_audit.csv`.
+  - [x] Document blockers/owners in `PHASE1_FINDINGS.md`.
 
-- [ ] Browser capability matrix
-  - [ ] Collect WebGPU / SharedArrayBuffer / SIMD availability data with citations.
-  - [ ] Populate `docs/wasm/browser_matrix.csv`.
-  - [ ] Note refresh cadence and triggers in the matrix header.
+- [x] Browser capability matrix
+  - [x] Collect WebGPU / SharedArrayBuffer / SIMD availability data with citations.
+  - [x] Populate `docs/wasm/browser_matrix.csv`.
+  - [x] Note refresh cadence and triggers in the matrix header.
 
-- [ ] ADR-001 rendering experiments
-  - [ ] Create ADR scaffold at `docs/wasm/adrs/ADR-001-wasm-rendering.md`.
-  - [ ] Document evaluation criteria sourced from latest WebGPU/WebGL guidance.
-  - [ ] Schedule prototype spikes for WebGPU and Canvas paths.
+- [~] ADR-001 rendering experiments
+  - [x] Create ADR scaffold at `docs/wasm/adrs/ADR-001-wasm-rendering.md`.
+  - [x] Document evaluation criteria sourced from latest WebGPU/WebGL guidance.
+  - [x] Schedule prototype spikes for WebGPU and Canvas paths (see `docs/wasm/rendering_spike_plan.md`).
 
-- [ ] Security baseline
-  - [ ] Draft `docs/wasm/SECURITY_NOTES_PHASE1.md` covering COOP/COEP, CSP, SAB requirements.
-  - [ ] Capture references (Chrome, Mozilla, W3C) for header guidance.
+- [x] Security baseline
+  - [x] Draft `docs/wasm/SECURITY_NOTES_PHASE1.md` covering COOP/COEP, CSP, SAB requirements.
+  - [x] Capture references (Chrome, Mozilla, W3C) for header guidance.
 
-- [ ] Research log
-  - [ ] Initialize `docs/wasm/RESEARCH_LOG.md` with date-stamped entries.
-  - [ ] Record links and summaries for all findings generated today.
+- [x] Research log
+  - [x] Initialize `docs/wasm/RESEARCH_LOG.md` with date-stamped entries.
+  - [x] Record links and summaries for all findings generated today.
 
 - [ ] Reporting
   - [ ] Summarize completed work and outstanding items in final agent response for traceability.

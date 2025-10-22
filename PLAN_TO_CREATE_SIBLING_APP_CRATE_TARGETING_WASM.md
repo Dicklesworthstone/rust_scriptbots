@@ -38,12 +38,12 @@
 
 ## Phase 1 · Feasibility Validation [Currently In Progress]
 
-### 1.1 Build Dry Run (No Code Changes)
+### 1.1 Build Dry Run (No Code Changes) [Completed 2025-10-22 — see docs/wasm/PHASE1_FINDINGS.md]
 - Command: `cargo check --target wasm32-unknown-unknown -p scriptbots-core`.
 - Capture and catalogue all compilation blockers (expected: Rayon threading, OS-specific APIs).
 - Produce `PHASE1_FINDINGS.md` summarizing blockers and severity.
 
-### 1.2 Dependency Audit [Currently In Progress]
+### 1.2 Dependency Audit [Completed 2025-10-22 — see docs/wasm/dependency_audit.csv]
 - Inventory every crate transitively pulled into `scriptbots-web`; flag categories:
   - ✅ **Pure Rust / wasm-ready**: `serde`, `rand`, `slotmap`, etc.
   - ⚠️ **Requires adaptation**: `rayon`, `tracing` (subscriber support in wasm), `duckdb`.
@@ -78,7 +78,7 @@
 - Summarize trade-offs vs. classic `wasm-bindgen` flow in `ADR-004-component-model.md`.
 - Track upstream stabilization timelines for rustc and browser runtime support.
 
-### 1.8 Browser Capability Matrix [Currently In Progress]
+### 1.8 Browser Capability Matrix [Completed 2025-10-22 — see docs/wasm/browser_matrix.csv; review quarterly]
 - Assemble matrix of WebGPU, SharedArrayBuffer, WebAssembly GC, and WASM SIMD availability across target browsers/versions.
 - Capture references (browser release notes, caniuse, WPT dashboards) in `docs/wasm/browser_matrix.csv`.
 - Update matrix quarterly or upon major browser releases; annotate blockers impacting roadmap.
@@ -119,14 +119,19 @@
 
 ---
 
-## Phase 3 · Rendering Implementation [Currently In Progress]
+## Phase 3 · Rendering Implementation [Currently In Progress — planning]
 
-### 3.1 Rendering MVP
+### 3.1 Rendering MVP [Currently In Progress — spike scheduling]
 - Chosen stack (from ADR-001) built to render:
   - Food grid heatmap
   - Agents (circles with spike indicator)
   - Basic HUD (population counts)
 - Data flow: `scriptbots-web` exports snapshot structure; JS/WASM renderer paints to `<canvas>` or WebGPU surface.
+- **Prototype plan (2025-10-22):**
+  - Week 1: WebGPU `wgpu` spike — draw 10k agents + grid, measure FPS on Chrome 139 (Windows) and Safari 26 beta (macOS).
+  - Week 1: Canvas2D baseline — JS renderer consuming serialized positions to benchmark fallback CPU cost.
+  - Week 2: Compare bundle sizes, shader complexity, and input latency; capture in ADR-001.
+- Assignments pending: Rendering Lead to own WebGPU spike; secondary contributor for Canvas baseline.
 
 ### 3.2 Input & Camera Controls
 - Map existing controls (pan, zoom, pause) to browser events:
