@@ -2918,8 +2918,18 @@ impl WorldState {
                             let herbivore = clamp01(runtime.herbivore_tendency);
                             let mut intake = 0.0;
                             if herbivore > 0.0 && base_intake > 0.0 {
-                                let left = runtime.outputs.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                                let right = runtime.outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                                let left = runtime
+                                    .outputs
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(0.0)
+                                    .clamp(0.0, 1.0);
+                                let right = runtime
+                                    .outputs
+                                    .get(1)
+                                    .copied()
+                                    .unwrap_or(0.0)
+                                    .clamp(0.0, 1.0);
                                 let average_speed = (left.abs() + right.abs()) * 0.5;
                                 let speed_scale = (1.0 - average_speed).clamp(0.0, 1.0) * 0.7 + 0.3;
                                 intake = base_intake * herbivore * speed_scale;
@@ -4534,15 +4544,14 @@ mod tests {
     fn config_validation_rejects_excessive_food_waste() {
         let mut config = ScriptBotsConfig::default();
         config.food_waste_rate = config.food_max + 0.1;
-        let err = WorldState::new(config).unwrap_err();
-        match err {
-            WorldStateError::InvalidConfig(message) => {
-                assert!(
-                    message.contains("food_waste_rate"),
-                    "expected food_waste_rate validation error, got {message}"
-                );
-            }
-            other => panic!("expected invalid config error, got {other:?}"),
+        let error = WorldState::new(config).unwrap_err();
+        if let WorldStateError::InvalidConfig(message) = error {
+            assert!(
+                message.contains("food_waste_rate"),
+                "expected food_waste_rate validation error, got {message}"
+            );
+        } else {
+            panic!("expected invalid config error, got {error:?}");
         }
     }
 
@@ -5482,6 +5491,134 @@ mod tests {
         assert!(
             world.carcass_reproduction_bonus.abs() < 1e-6,
             "carcass reproduction totals should reset after persistence"
+        );
+    }
+
+    #[test]
+    fn herbivores_gain_energy_from_ground_food() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            rng_seed: Some(11),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let agent = world.spawn_agent(sample_agent(0));
+
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx] = Position::new(5.0, 5.0);
+        }
+        {
+            let runtime = world.agent_runtime_mut(agent).unwrap();
+            runtime.energy = 0.5;
+            runtime.reproduction_counter = 0.0;
+            runtime.herbivore_tendency = 1.0;
+            runtime.outputs[0] = 0.0;
+            runtime.outputs[1] = 0.0;
+        }
+        if let Some(cell) = world.food_mut().get_mut(0, 0) {
+            *cell = 0.2;
+        }
+
+        world.stage_food();
+
+        let runtime = world.agent_runtime(agent).unwrap();
+        let config = world.config();
+        let expected_speed_scale = ((1.0_f32 - 0.0_f32).clamp(0.0, 1.0) * 0.7) + 0.3;
+        let expected_intake = config.food_intake_rate * expected_speed_scale;
+        assert!(
+            (runtime.energy - (0.5 + expected_intake)).abs() < 1e-6,
+            "expected herbivore energy gain of {expected_intake:.6}, got {}",
+            runtime.energy - 0.5
+        );
+        assert!(
+            (runtime.food_delta - expected_intake).abs() < 1e-6,
+            "expected food_delta to match intake ({expected_intake:.6}), got {}",
+            runtime.food_delta
+        );
+        assert!(
+            (runtime.reproduction_counter - expected_intake * config.reproduction_food_bonus).abs()
+                < 1e-6,
+            "expected reproduction counter bonus of {:.6}, got {}",
+            expected_intake * config.reproduction_food_bonus,
+            runtime.reproduction_counter
+        );
+        let cell_value = world.food().get(0, 0).unwrap();
+        let expected_cell = (0.2 - config.food_waste_rate).max(0.0);
+        assert!(
+            (cell_value - expected_cell).abs() < 1e-6,
+            "expected cell value {:.6}, got {:.6}",
+            expected_cell,
+            cell_value
+        );
+    }
+
+    #[test]
+    fn carnivores_only_waste_ground_food() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let agent = world.spawn_agent(sample_agent(1));
+
+        {
+            let arena = world.agents_mut();
+            let idx = arena.index_of(agent).unwrap();
+            let columns = arena.columns_mut();
+            columns.positions_mut()[idx] = Position::new(15.0, 5.0);
+        }
+        {
+            let runtime = world.agent_runtime_mut(agent).unwrap();
+            runtime.energy = 0.5;
+            runtime.reproduction_counter = 1.0;
+            runtime.herbivore_tendency = 0.0;
+            runtime.outputs[0] = 0.0;
+            runtime.outputs[1] = 0.0;
+        }
+        if let Some(cell) = world.food_mut().get_mut(1, 0) {
+            *cell = 0.15;
+        }
+
+        world.stage_food();
+
+        let runtime = world.agent_runtime(agent).unwrap();
+        assert!(
+            (runtime.energy - 0.5).abs() < 1e-6,
+            "carnivore energy should remain unchanged when grazing ground food"
+        );
+        assert!(
+            (runtime.food_delta).abs() < 1e-6,
+            "carnivore food_delta should remain zero when not gaining intake"
+        );
+        assert!(
+            (runtime.reproduction_counter - 1.0).abs() < 1e-6,
+            "carnivore reproduction counter should remain unchanged by ground food waste"
+        );
+        let cell_value = world.food().get(1, 0).unwrap();
+        let expected_cell = (0.15 - world.config().food_waste_rate).max(0.0);
+        assert!(
+            (cell_value - expected_cell).abs() < 1e-6,
+            "expected ground food to waste down to {:.6}, got {:.6}",
+            expected_cell,
+            cell_value
         );
     }
 
