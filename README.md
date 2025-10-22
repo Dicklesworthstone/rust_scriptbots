@@ -180,6 +180,8 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 ## WebAssembly (sibling crate plan)
 We maintain a separate plan for a browser-targeted sibling app (`scriptbots-web`) that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and the docs under `docs/wasm/` (ADRs, audits, and capability matrix). Initial MVP will run single-threaded with feature-gated dependencies; WebGPU vs Canvas2D rendering is under evaluation.
 
+> Quick peek: `crates/scriptbots-web/web/` ships a Canvas demo harness that consumes the wasm snapshots, surfaces live metrics, and can be served locally via `python -m http.server`. Binary snapshots (`snapshot_format: "binary"`) and custom seeding strategies are already wired in for experimentation.
+
 ## Licensing
 Licensed under `MIT OR Apache-2.0` (see workspace manifest).
 

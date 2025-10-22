@@ -6430,6 +6430,48 @@ mod tests {
     }
 
     #[test]
+    fn respawn_respects_local_capacity() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 1,
+            food_respawn_amount: 1.0,
+            food_max: 1.0,
+            food_capacity_base: 0.1,
+            food_capacity_fertility: 0.0,
+            food_growth_fertility: 0.0,
+            food_decay_infertility: 0.0,
+            rng_seed: Some(789),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let width = world.food().width() as usize;
+        assert!(width > 0);
+        let capacity = world.food_profiles[0].capacity;
+        assert!(
+            capacity < world.config().food_max,
+            "capacity baseline should be below global cap"
+        );
+
+        world.food_mut().cells_mut()[0] = 0.0;
+        let (rx, ry) = world
+            .stage_food_dynamics(Tick(1))
+            .expect("respawn event expected");
+        let idx = (ry as usize) * width + rx as usize;
+        let capacity = world.food_profiles[idx].capacity;
+        let cell_value = world.food().cells()[idx];
+        assert!(
+            cell_value <= capacity + 1e-6,
+            "respawned value {:.6} should not exceed local capacity {:.6}",
+            cell_value,
+            capacity
+        );
+    }
+
+    #[test]
     fn fertile_cells_boost_reproduction_from_grazing() {
         let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 200,

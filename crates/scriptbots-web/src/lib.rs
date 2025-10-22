@@ -3,14 +3,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use js_sys::Uint8Array;
 use postcard::to_allocvec;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use scriptbots_core::{
-    AgentData, AgentId, BrainBinding, BrainRunner, Generation, Position, ScriptBotsConfig,
-    Velocity, WorldState, INPUT_SIZE, OUTPUT_SIZE,
+    AgentData, AgentId, BrainBinding, BrainRunner, Generation, INPUT_SIZE, OUTPUT_SIZE, Position,
+    ScriptBotsConfig, Velocity, WorldState,
 };
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
@@ -415,7 +415,10 @@ fn js_error(err: impl std::fmt::Display) -> JsValue {
     JsError::new(&err.to_string()).into()
 }
 
-fn encode_snapshot(snapshot: &SimulationSnapshot, format: SnapshotFormat) -> Result<JsValue, JsValue> {
+fn encode_snapshot(
+    snapshot: &SimulationSnapshot,
+    format: SnapshotFormat,
+) -> Result<JsValue, JsValue> {
     match format {
         SnapshotFormat::Json => to_value(snapshot).map_err(js_error),
         SnapshotFormat::Binary => {

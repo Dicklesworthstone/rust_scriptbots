@@ -103,13 +103,14 @@
 - Outline serialization format (likely `serde_wasm_bindgen` with compact binary option later).
 - Document error handling expectations (convert `anyhow` to `JsError`).
   - [2025-10-22 Codex] Implemented initial bindings in `scriptbots-web`: `SimHandle` wraps the core world, exposes `init_sim`, `tick`, `snapshot`, and `reset`, returns structured snapshots (agents + summary + world metadata), validates seeds/population, and maps errors to `JsError`.
-  - [2025-10-22 Codex] Added optional config overrides in `InitOptions`, seeded agents with a lightweight wander brain for browser motion, and exposed `default_init_options()` for JS bootstrap.
+  - [2025-10-22 Codex] Added optional config overrides in `InitOptions`, `snapshot_format` toggle (`json`/`binary`), seeded agents with a lightweight wander brain for browser motion, and exposed `default_init_options()` for JS bootstrap.
   - [2025-10-22 Codex] Introduced a deterministic wasm-vs-native parity test (`wasm_bindgen_test`), comparing tick snapshots to guard against divergence before integrating with JS runtimes.
 
 ### 2.3 Threading Strategy
 - Path A (initial): run core simulation single-threaded by feature gating Rayon (e.g., `cfg(not(target_arch = "wasm32"))` in consumer crate only).
 - Path B (later): integrate `wasm-bindgen-rayon` for multithreaded wasm with thread pool initialization from JS.
 - Document gating macros and environment initialization sequence.
+  - [2025-10-22 Codex] Documented seed strategy toggle (`wander` vs `none`) to keep wasm builds deterministic while leaving room for future brain registrations.
 
 ### 2.4 Determinism Harness
 - Design comparison test:
@@ -122,6 +123,7 @@
 - Add GitHub Actions job (or equivalent) building wasm target with `wasm-pack build`.
 - Run parity test in headless Chromium via `wasm-pack test --headless --chrome`.
 - Cache `wasm-pack` artifacts to minimize build times.
+  - [2025-10-22 Codex] Added `wasm` job to CI: installs wasm-pack, provisions Playwright Chromium, runs `wasm-pack build` and headless Chrome parity tests on Ubuntu.
 
 ---
 

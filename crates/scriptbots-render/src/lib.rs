@@ -59,7 +59,7 @@ pub fn run_demo(world: Arc<Mutex<WorldState>>, storage: Option<Arc<Mutex<Storage
 
     let window_title: SharedString = "ScriptBots HUD".into();
     let title_for_options = window_title.clone();
-   let title_for_view = window_title.clone();
+    let title_for_view = window_title.clone();
     let world_for_view = Arc::clone(&world);
     let storage_for_view = storage.clone();
 
@@ -564,19 +564,17 @@ impl SimulationView {
             return;
         }
         match storage.try_lock() {
-            Ok(mut guard) => {
-                match guard.latest_metrics(256) {
-                    Ok(readings) => {
-                        if let Some(analytics) = parse_analytics(tick, agent_count, &readings) {
-                            self.analytics_tick = Some(tick);
-                            self.analytics_cache = Some(analytics);
-                        }
-                    }
-                    Err(err) => {
-                        error!(?err, "failed to fetch latest metrics for analytics");
+            Ok(mut guard) => match guard.latest_metrics(256) {
+                Ok(readings) => {
+                    if let Some(analytics) = parse_analytics(tick, agent_count, &readings) {
+                        self.analytics_tick = Some(tick);
+                        self.analytics_cache = Some(analytics);
                     }
                 }
-            }
+                Err(err) => {
+                    error!(?err, "failed to fetch latest metrics for analytics");
+                }
+            },
             Err(_) => {
                 // Avoid blocking the UI when storage is busy; we'll try again next frame.
             }
@@ -1375,8 +1373,8 @@ impl SimulationView {
             self.settings_panel.content_height = self
                 .settings_panel
                 .estimate_content_height(total_categories);
-            // Note: viewport_height uses conservative default (700px) from state
-            // This accommodates most window sizes while being safe for smaller windows
+            // Note: viewport_height uses conservative default (400px) from state
+            // This ensures content is never blocked, at cost of allowing blank space on large windows
         }
 
         info!(open = self.settings_panel.open, "Settings panel toggled");
@@ -4121,9 +4119,10 @@ impl SimulationView {
             .settings_panel
             .estimate_content_height(total_categories);
 
-        // Use cached viewport height (conservative 700px default)
-        // This accommodates most window sizes (typical 768px-1080px height)
-        // Panel layout: full window - header (~64px) - search bar (~68px) ≈ 636-950px viewport
+        // Use cached viewport height (conservative 400px default)
+        // CRITICAL: Conservative value prevents blocking content on default 720px window
+        // Actual viewport: window_height - 132px chrome
+        // Trade-off: Allows extra scroll (blank space) vs. blocking content access
         let viewport_height = self.settings_panel.viewport_height;
 
         let scroll_offset = self.settings_panel.scroll_offset;
@@ -4892,11 +4891,139 @@ struct HudSnapshot {
     history_capacity: usize,
     agent_count: usize,
     summary: Option<HudMetrics>,
+    analytics: Option<HudAnalytics>,
     recent_history: Vec<HudHistoryEntry>,
     render_frame: Option<RenderFrame>,
     inspector: InspectorSnapshot,
     controls: ControlsSnapshot,
     perf: PerfSnapshot,
+}
+
+#[derive(Clone)]
+struct HudAnalytics {
+    tick: u64,
+    carnivores: usize,
+    herbivores: usize,
+    hybrids: usize,
+    carnivore_avg_energy: f64,
+    herbivore_avg_energy: f64,
+    hybrid_avg_energy: f64,
+    food_total: f64,
+    food_mean: f64,
+    food_stddev: f64,
+    food_delta_mean: f64,
+    food_delta_mean_abs: f64,
+    mutation_primary_mean: f64,
+    mutation_primary_stddev: f64,
+    mutation_secondary_mean: f64,
+    mutation_secondary_stddev: f64,
+    behavior_sensor_mean: f64,
+    behavior_sensor_entropy: f64,
+    behavior_output_mean: f64,
+    behavior_output_entropy: f64,
+    brain_shares: Vec<BrainShareEntry>,
+}
+
+#[derive(Clone)]
+struct BrainShareEntry {
+    label: String,
+    count: usize,
+    avg_energy: f64,
+}
+
+fn parse_analytics(
+    tick: u64,
+    _agent_count: usize,
+    readings: &[MetricReading],
+) -> Option<HudAnalytics> {
+    if readings.is_empty() {
+        return None;
+    }
+
+    let mut metrics = HashMap::with_capacity(readings.len());
+    for reading in readings {
+        metrics.insert(reading.name.clone(), reading.value);
+    }
+
+    let value = |key: &str| metrics.get(key).copied();
+    let as_count = |key: &str| value(key).unwrap_or(0.0).max(0.0).round() as usize;
+    let carnivores = as_count("population.carnivore.count");
+    let herbivores = as_count("population.herbivore.count");
+    let hybrids = as_count("population.hybrid.count");
+
+    let carnivore_avg_energy = value("population.carnivore.avg_energy").unwrap_or(0.0);
+    let herbivore_avg_energy = value("population.herbivore.avg_energy").unwrap_or(0.0);
+    let hybrid_avg_energy = value("population.hybrid.avg_energy").unwrap_or(0.0);
+
+    let food_total = value("food.total").unwrap_or(0.0);
+    let food_mean = value("food.mean").unwrap_or(0.0);
+    let food_stddev = value("food.stddev").unwrap_or(0.0);
+    let food_delta_mean = value("food_delta.mean").unwrap_or(0.0);
+    let food_delta_mean_abs = value("food_delta.mean_abs").unwrap_or(0.0);
+
+    let mutation_primary_mean = value("mutation.primary.mean").unwrap_or(0.0);
+    let mutation_primary_stddev = value("mutation.primary.stddev").unwrap_or(0.0);
+    let mutation_secondary_mean = value("mutation.secondary.mean").unwrap_or(0.0);
+    let mutation_secondary_stddev = value("mutation.secondary.stddev").unwrap_or(0.0);
+
+    let behavior_sensor_mean = value("behavior.sensors.mean").unwrap_or(0.0);
+    let behavior_sensor_entropy = value("behavior.sensors.entropy").unwrap_or(0.0);
+    let behavior_output_mean = value("behavior.outputs.mean").unwrap_or(0.0);
+    let behavior_output_entropy = value("behavior.outputs.entropy").unwrap_or(0.0);
+
+    let mut brain_map: HashMap<String, BrainShareEntry> = HashMap::new();
+    for (name, &metric_value) in &metrics {
+        if let Some(rest) = name.strip_prefix("brain.population.") {
+            if let Some(label) = rest.strip_suffix(".count") {
+                let entry = brain_map
+                    .entry(label.to_string())
+                    .or_insert(BrainShareEntry {
+                        label: label.to_string(),
+                        count: 0,
+                        avg_energy: 0.0,
+                    });
+                entry.count = metric_value.max(0.0).round() as usize;
+                continue;
+            }
+            if let Some(label) = rest.strip_suffix(".avg_energy") {
+                let entry = brain_map
+                    .entry(label.to_string())
+                    .or_insert(BrainShareEntry {
+                        label: label.to_string(),
+                        count: 0,
+                        avg_energy: 0.0,
+                    });
+                entry.avg_energy = metric_value;
+            }
+        }
+    }
+
+    let mut brain_shares: Vec<BrainShareEntry> = brain_map.into_values().collect();
+    brain_shares.sort_by(|a, b| b.count.cmp(&a.count));
+
+    Some(HudAnalytics {
+        tick,
+        carnivores,
+        herbivores,
+        hybrids,
+        carnivore_avg_energy,
+        herbivore_avg_energy,
+        hybrid_avg_energy,
+        food_total,
+        food_mean,
+        food_stddev,
+        food_delta_mean,
+        food_delta_mean_abs,
+        mutation_primary_mean,
+        mutation_primary_stddev,
+        mutation_secondary_mean,
+        mutation_secondary_stddev,
+        behavior_sensor_mean,
+        behavior_sensor_entropy,
+        behavior_output_mean,
+        behavior_output_entropy,
+        brain_shares,
+    })
 }
 
 #[derive(Clone)]
@@ -5278,9 +5405,11 @@ impl Default for SettingsPanelState {
             preset_name: "Default".to_string(),
             scroll_offset: 0.0,
             content_height: 0.0,
-            // Conservative estimate: typical window (768px) - header (64px) - search (68px) = 636px
-            // Use 700px to accommodate larger windows while being safe for smaller ones
-            viewport_height: 700.0,
+            // CRITICAL: Must use conservative (small) value to prevent blocking content access
+            // Default window: 720px - chrome (132px) = 588px actual viewport
+            // Use 400px to ensure scrolling works even on small windows (600px)
+            // Trade-off: Shows blank space on large windows vs. blocking content (blank space is acceptable)
+            viewport_height: 400.0,
         }
     }
 }

@@ -51,3 +51,43 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  wasm:
+    name: Wasm (ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright Chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: 0
+        run: |
+          npm install --no-save playwright
+          npx playwright install chromium
+
+      - name: Resolve Chromium path
+        id: chromium
+        run: |
+          echo "path=$(node -e \"const { chromium } = require('playwright'); process.stdout.write(chromium.executablePath());\")" >> "$GITHUB_OUTPUT"
+
+      - name: wasm-pack build (web target)
+        run: wasm-pack build crates/scriptbots-web --target web --out-dir crates/scriptbots-web/web/pkg
+
+      - name: wasm-pack test (headless Chrome)
+        env:
+          CHROMIUM: ${{ steps.chromium.outputs.path }}
+        run: wasm-pack test crates/scriptbots-web --headless --chrome
