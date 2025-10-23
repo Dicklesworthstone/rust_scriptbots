@@ -23,10 +23,9 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
 };
-#[cfg(test)]
-use scriptbots_core::AgentData;
 use scriptbots_core::{AgentId, TerrainKind, TerrainLayer, TickSummary, WorldState};
 use serde::Serialize;
+use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::info;
 

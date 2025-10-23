@@ -8,20 +8,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use axum::response::sse::{Event, Sse};
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    body::Body,
-};
-use axum::response::sse::{Event, Sse};
-use futures_util::stream::{Stream, StreamExt};
-use std::convert::Infallible;
-use std::time::Duration;
-use tokio_stream::wrappers::IntervalStream;
     routing::{get, post},
 };
+use futures_util::stream::{Stream, StreamExt};
 use mcp_protocol_sdk::{
     core::error::McpResult,
     prelude::*,
@@ -30,7 +25,9 @@ use mcp_protocol_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::{convert::Infallible, time::Duration};
 use tokio::sync::{Mutex, Notify};
+use tokio_stream::wrappers::IntervalStream;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -40,6 +37,7 @@ use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };
 use crate::control::{ConfigSnapshot, ControlError, ControlHandle, KnobEntry, KnobUpdate};
+use scriptbots_core::TickSummaryDto;
 
 const DEFAULT_MCP_HTTP_ADDR: &str = "127.0.0.1:8090";
 
@@ -430,7 +428,7 @@ async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot
 )]
 async fn get_latest_tick_summary(
     State(state): State<ApiState>,
-) -> Result<Json<scriptbots_core::TickSummaryDto>, AppError> {
+) -> Result<Json<TickSummaryDto>, AppError> {
     let summary = state.handle.latest_summary()?;
     Ok(Json(summary.into()))
 }
@@ -442,21 +440,25 @@ async fn get_latest_tick_summary(
     tag = "control",
     responses((status = 200, description = "SSE stream of tick summaries"))
 )]
-async fn stream_ticks_sse(State(state): State<ApiState>) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+async fn stream_ticks_sse(
+    State(state): State<ApiState>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let handle = state.handle.clone();
-    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
-        let handle = handle.clone();
-        async move {
-            let event = match handle.latest_summary() {
-                Ok(summary) => {
-                    let json = serde_json::to_string(&scriptbots_core::TickSummaryDto::from(summary)).unwrap_or_else(|_| "{}".to_string());
-                    Event::default().data(json)
-                }
-                Err(_) => Event::default().data("{}"),
-            };
-            Ok::<Event, Infallible>(event)
-        }
-    });
+    let stream =
+        IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
+            let handle = handle.clone();
+            async move {
+                let event = match handle.latest_summary() {
+                    Ok(summary) => {
+                        let json = serde_json::to_string(&TickSummaryDto::from(summary))
+                            .unwrap_or_else(|_| "{}".to_string());
+                        Event::default().data(json)
+                    }
+                    Err(_) => Event::default().data("{}"),
+                };
+                Ok::<Event, Infallible>(event)
+            }
+        });
     Ok(Sse::new(stream))
 }
 

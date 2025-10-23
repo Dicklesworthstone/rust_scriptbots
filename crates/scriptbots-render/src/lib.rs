@@ -202,7 +202,11 @@ impl SimulationView {
                 if let Some(limit) = threshold {
                     if world.agent_count() as u32 <= limit {
                         self.controls.paused = true;
-                        info!(limit, count = world.agent_count(), "Auto-paused due to population threshold");
+                        info!(
+                            limit,
+                            count = world.agent_count(),
+                            "Auto-paused due to population threshold"
+                        );
                     }
                 }
             }

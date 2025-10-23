@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
+use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     ControlRuntime, ControlServerConfig, SharedStorage, SharedWorld,
     renderer::{Renderer, RendererContext},
@@ -14,7 +15,6 @@ use scriptbots_core::{
 use scriptbots_render::run_demo;
 use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
-use ron::ser::PrettyConfig as RonPrettyConfig;
 use std::{
     collections::HashMap,
     env, fmt, fs,
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (world, storage) = bootstrap_world(&cli, config)?;
+    let (world, storage) = bootstrap_world(config)?;
     let control_config = ControlServerConfig::from_env();
     let (control_runtime, command_drain, command_submit) =
         ControlRuntime::launch(world.clone(), control_config)?;
@@ -68,7 +68,7 @@ fn init_tracing() {
         .try_init();
 }
 
-fn bootstrap_world(cli: &AppCli, config: ScriptBotsConfig) -> Result<(SharedWorld, SharedStorage)> {
+fn bootstrap_world(config: ScriptBotsConfig) -> Result<(SharedWorld, SharedStorage)> {
     let storage_path =
         env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
     if let Some(parent) = Path::new(&storage_path)
@@ -113,7 +113,48 @@ fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
     };
     config = apply_config_layers(config, &cli.config_layers)?;
     apply_env_overrides(&mut config);
+    if let Some(limit) = cli.auto_pause_below {
+        config.control.auto_pause_population_below = Some(limit);
+    }
     Ok(config)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigEmitOutcome {
+    Continue,
+    Exit,
+}
+
+fn maybe_emit_config(cli: &AppCli, config: &ScriptBotsConfig) -> Result<Option<ConfigEmitOutcome>> {
+    if !cli.print_config && cli.write_config.is_none() {
+        return Ok(None);
+    }
+
+    let rendered = match cli.config_format {
+        ConfigFormat::Json => serde_json::to_string_pretty(config)?,
+        ConfigFormat::Toml => toml::to_string_pretty(config)?,
+        ConfigFormat::Ron => ron::ser::to_string_pretty(config, RonPrettyConfig::new())?,
+    };
+
+    if cli.print_config {
+        println!("{}", rendered);
+    }
+
+    if let Some(path) = cli.write_config.as_ref() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, rendered.as_bytes())?;
+        info!(path = %path.display(), "Wrote composed configuration to file");
+    }
+
+    let outcome = if cli.config_only {
+        ConfigEmitOutcome::Exit
+    } else {
+        ConfigEmitOutcome::Continue
+    };
+
+    Ok(Some(outcome))
 }
 
 #[derive(Parser, Debug)]
@@ -149,6 +190,13 @@ struct AppCli {
     /// Limit the number of ticks simulated during replay verification.
     #[arg(long = "tick-limit", value_name = "TICKS", requires = "replay_db")]
     tick_limit: Option<u64>,
+    /// Auto-pause when population is at or below this count.
+    #[arg(
+        long = "auto-pause-below",
+        value_name = "COUNT",
+        env = "SCRIPTBOTS_AUTO_PAUSE_BELOW"
+    )]
+    auto_pause_below: Option<u32>,
     /// Print the composed configuration in the selected format.
     #[arg(long = "print-config", action = ArgAction::SetTrue)]
     print_config: bool,
@@ -311,7 +359,7 @@ fn should_use_terminal_mode() -> bool {
     false
 }
 
-fn run_replay_cli(cli: &AppCli) -> Result<()> {
+fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
     let db_path = cli
         .replay_db
         .as_ref()
@@ -330,7 +378,6 @@ fn run_replay_cli(cli: &AppCli) -> Result<()> {
         .tick_limit
         .unwrap_or(recorded_max_tick.max(events_max_tick));
 
-    let config = compose_config(cli)?;
     if config.rng_seed.is_none() {
         warn!(
             "config_rng_seed" = false,
@@ -338,7 +385,7 @@ fn run_replay_cli(cli: &AppCli) -> Result<()> {
         );
     }
 
-    let replay_run = run_headless_simulation(&config, tick_limit)?;
+    let replay_run = run_headless_simulation(config, tick_limit)?;
     let simulated_tick_count = replay_run.summaries.len() as u64;
     debug!(
         simulated_ticks = simulated_tick_count,
@@ -897,6 +944,68 @@ activation = "Tanh"
         let replay = run_headless_simulation(&config, max_tick).expect("replay run");
         let diff = diff_event_stream(&recorded_events, &replay.events);
         assert!(diff.is_none(), "expected replay to match persisted events");
+    }
+
+    #[test]
+    fn write_config_honors_format_and_exit_flag() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("effective.toml");
+        let cli = AppCli {
+            mode: RendererMode::Auto,
+            config_layers: Vec::new(),
+            replay_db: None,
+            compare_db: None,
+            tick_limit: None,
+            auto_pause_below: None,
+            print_config: false,
+            write_config: Some(output.clone()),
+            config_format: ConfigFormat::Toml,
+            config_only: true,
+        };
+
+        let config = ScriptBotsConfig {
+            world_width: 1234,
+            world_height: 5678,
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        };
+
+        let outcome = maybe_emit_config(&cli, &config)
+            .expect("emit config")
+            .expect("expected emit outcome");
+        assert_eq!(outcome, ConfigEmitOutcome::Exit);
+
+        let written = fs::read_to_string(&output).expect("read output");
+        assert!(written.contains("world_width = 1234"));
+        assert!(written.contains("rng_seed = 42"));
+    }
+
+    #[test]
+    fn emit_config_continue_when_not_config_only() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("effective.ron");
+        let cli = AppCli {
+            mode: RendererMode::Auto,
+            config_layers: Vec::new(),
+            replay_db: None,
+            compare_db: None,
+            tick_limit: None,
+            auto_pause_below: None,
+            print_config: false,
+            write_config: Some(output.clone()),
+            config_format: ConfigFormat::Ron,
+            config_only: false,
+        };
+
+        let config = ScriptBotsConfig::default();
+
+        let outcome = maybe_emit_config(&cli, &config)
+            .expect("emit config")
+            .expect("expected emit outcome");
+        assert_eq!(outcome, ConfigEmitOutcome::Continue);
+
+        let written = fs::read_to_string(&output).expect("read output");
+        assert!(written.contains("world_width"));
     }
 
     fn restore_env(var: &str, previous: Option<String>) {

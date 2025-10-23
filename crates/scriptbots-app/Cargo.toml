@@ -19,7 +19,10 @@ scriptbots-render = { path = "../scriptbots-render" }
 scriptbots-storage = { path = "../scriptbots-storage" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+futures-util = "0.3.31"
+tokio-stream = "0.1.16"
 slotmap = { workspace = true }
+duckdb = { workspace = true }
 supports-color = "3.0"
 thiserror = { workspace = true }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal"] }
@@ -32,6 +35,7 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 crossterm = "0.27"
 owo-colors = "4.0"
 unicode-width = "0.1"
+csv = { workspace = true }
 ron = "0.8"
 toml = "0.8"
 
@@ -42,4 +46,3 @@ neuro = ["scriptbots-brain-neuro"]
 
 [dev-dependencies]
 tempfile = "3.13"
-duckdb = { workspace = true }

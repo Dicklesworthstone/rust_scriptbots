@@ -1,8 +1,6 @@
 //! Core types shared across the ScriptBots workspace.
 
 use ordered_float::OrderedFloat;
-#[cfg(feature = "parallel")]
-use once_cell::sync::OnceLock;
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -12,6 +10,8 @@ use slotmap::{SecondaryMap, SlotMap, new_key_type};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+#[cfg(feature = "parallel")]
+use std::sync::OnceLock;
 use thiserror::Error;
 
 #[cfg(feature = "parallel")]
@@ -107,7 +107,9 @@ fn configure_parallelism() {
             limit = 1;
         }
 
-        std::env::set_var("RAYON_NUM_THREADS", limit.to_string());
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", limit.to_string());
+        }
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(limit)
             .thread_name(|idx| format!("scriptbots-worker-{idx}"))
@@ -750,6 +752,46 @@ pub struct TickSummary {
     pub total_energy: f32,
     pub average_energy: f32,
     pub average_health: f32,
+}
+
+/// Serializable representation of [`TickSummary`] for API surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TickSummaryDto {
+    pub tick: u64,
+    pub agent_count: usize,
+    pub births: usize,
+    pub deaths: usize,
+    pub total_energy: f32,
+    pub average_energy: f32,
+    pub average_health: f32,
+}
+
+impl From<TickSummary> for TickSummaryDto {
+    fn from(summary: TickSummary) -> Self {
+        Self {
+            tick: summary.tick.0,
+            agent_count: summary.agent_count,
+            births: summary.births,
+            deaths: summary.deaths,
+            total_energy: summary.total_energy,
+            average_energy: summary.average_energy,
+            average_health: summary.average_health,
+        }
+    }
+}
+
+impl From<TickSummaryDto> for TickSummary {
+    fn from(dto: TickSummaryDto) -> Self {
+        Self {
+            tick: Tick(dto.tick),
+            agent_count: dto.agent_count,
+            births: dto.births,
+            deaths: dto.deaths,
+            total_energy: dto.total_energy,
+            average_energy: dto.average_energy,
+            average_health: dto.average_health,
+        }
+    }
 }
 
 /// Scalar metric sampled during persistence.

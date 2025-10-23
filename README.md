@@ -465,10 +465,12 @@ cargo run -p scriptbots-app --bin control_cli -- get
 cargo run -p scriptbots-app --bin control_cli -- set neuroflow.enabled true
 cargo run -p scriptbots-app --bin control_cli -- patch --json '{"food_max":0.6}'
 cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
+cargo run -p scriptbots-app --bin control_cli -- export metrics --db scriptbots.db --last 1000 --out latest_metrics.csv
 ```
 
 ### Scenario layering & deterministic replay CLI
 - **Layered configs**: pass one or more `--config path/to/file.toml` (or `.ron`) flags—or set `SCRIPTBOTS_CONFIG` with semicolon-separated paths—to build scenarios from reusable fragments (e.g., `base.toml → arctic_biome.toml → evolution_study.toml`). Layers merge in order before env overrides, unlocking repeatable experiments without editing code.
+- **Config inspection**: add `--print-config` to dump the merged configuration (default JSON) or `--write-config output.toml` to persist it; choose `--config-format json|toml|ron` and combine with `--config-only` for a dry run in CI/tooling workflows.
 - **Replay verification**: `cargo run -p scriptbots-app -- --replay-db run.duckdb [--compare-db candidate.duckdb] [--tick-limit 500]` loads persisted events, re-simulates ticks headlessly, and reports colored diffs (tick/sequence mismatches, event payload divergences) together with event-type counts.
 - **Storage helpers**: DuckDB accessors (`max_tick`, `load_replay_events`, `replay_event_counts`) underpin the CLI so analytics pipelines or external tools can reuse the same deterministic data.
 

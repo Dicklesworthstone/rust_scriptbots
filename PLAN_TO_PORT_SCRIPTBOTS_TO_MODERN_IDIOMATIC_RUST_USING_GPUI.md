@@ -214,7 +214,7 @@
   - [ ] Provide CLI tooling to diff runs (Rust vs. C++ baseline) and highlight divergences.
 - **Feature Toggles & UX Integration (Non-rendering)**
   - [Completed - GPT-5 Codex 2025-10-23: Added layered scenario configs (`--config` / `SCRIPTBOTS_CONFIG`) merging TOML/RON files ahead of env overrides] Surfacing runtime toggles: CLI/ENV for enabling brains, selecting indices, adjusting mechanics.
-  - [Currently In Progress - GPT-5 Codex 2025-10-23] Provide config inspection tooling (print/write/dry-run) so layered scenarios are easy to audit.
+  - [Completed - GPT-5 Codex 2025-10-23: Added `--print-config`, `--write-config`, `--config-format`, and `--config-only` flags so scenarios can be audited or exported without launching the sim] Provide config inspection tooling (print/write/dry-run) so layered scenarios are easy to audit.
   - [ ] Selection and debug hooks: expose APIs to query agent state, highlight subsets (without GPUI coupling).
   - [ ] Audio hooks: structure event bus for future `kira` integration (without touching render crate yet).
   - [ ] Accessibility/logging: structured tracing spans, machine-readable summaries for external dashboards.
@@ -308,11 +308,16 @@ These scoped additions improve usability, insight, and experiment velocity witho
 
 ### 3) Auto‑pause on conditions [Currently In Progress - 2025-10-23]
 - Purpose: stop at interesting moments automatically.
-- MVP: triggers: population < X, first spike kill, age > Y.
-- Surfaces: HUD panel with checkboxes/thresholds; TUI toggles; REST patch `control.auto_pause.*` keys.
+- MVP: triggers: population < X (implemented), first spike kill, age > Y.
+- Surfaces: HUD panel with checkboxes/thresholds; TUI toggles; REST patch `control.auto_pause.*` keys; CLI `--auto-pause-below <COUNT>`.
 - Data/Perf: O(1) checks in tick summary; deterministic.
 - Testing: seeded scenarios that cross thresholds → assert paused.
 - Complexity: S.
+
+Implementation progress [2025-10-23]:
+- Config: added `control.auto_pause_population_below: Option<u32>` in `ScriptBotsConfig`.
+- Terminal & GPUI: main render loops set paused when `agent_count <= limit`.
+- CLI: `--auto-pause-below` (env `SCRIPTBOTS_AUTO_PAUSE_BELOW`) wires into config at startup.
 
 ### 4) Event feed (birth/kill/combat)
 - Purpose: narrative understanding; lightweight teaching log.
@@ -372,10 +377,10 @@ These scoped additions improve usability, insight, and experiment velocity witho
 
 ### 11) NDJSON tick tail endpoint [Currently In Progress - 2025-10-23]
 - Purpose: easy streaming to dashboards/scripts without websockets.
-- MVP: `GET /api/stream/ticks?fields=tick,agents,births,deaths` returns NDJSON.
+- MVP: `GET /api/ticks/latest` (JSON), `GET /api/ticks/stream` (SSE; emits JSON objects periodically).
 - Surfaces: REST only; docs example with `curl`.
 - Data/Perf: send from in‑memory summaries; backpressure via chunked responses.
-- Testing: integration test reading N lines; cancellation.
+- Testing: integration test reading N events; cancellation.
 - Complexity: S.
 
 ### 12) Screenshot/export (GUI + TUI)
@@ -386,7 +391,7 @@ These scoped additions improve usability, insight, and experiment velocity witho
 - Testing: files exist with non‑zero bytes; deterministic filenames with seed/tick.
 - Complexity: S.
 
-### 13) Quick CSV exports
+### 13) Quick CSV exports [Completed - 2025-10-23 Codex: added `scriptbots-control export` for ticks/metrics CSV dumps]
 - Purpose: spreadsheet‑friendly metrics without opening DuckDB.
 - MVP: CLI `export metrics --last 1000 --out metrics.csv`; similar for `ticks`.
 - Surfaces: CLI; REST `GET /api/export/metrics.csv` (optional).
