@@ -8,10 +8,11 @@ use scriptbots_app::{
 };
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
-    AgentData, NeuroflowActivationKind, ReplayEventKind, ScriptBotsConfig, TickSummary, WorldState,
+    AgentData, NeuroflowActivationKind, ReplayEventKind, ScriptBotsConfig, TickSummary,
+    WorldPersistence, WorldState,
 };
 use scriptbots_render::run_demo;
-use scriptbots_storage::{PersistedReplayEvent, ReplayEventCount, Storage, StoragePipeline};
+use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
 use std::{
     collections::HashMap,
@@ -292,9 +293,8 @@ fn run_replay_cli(cli: &AppCli) -> Result<()> {
         .expect("replay_db required to enter replay mode");
     let db_display = db_path.display().to_string();
 
-    let mut storage = Storage::open(&db_display).with_context(|| {
-        format!("failed to open replay database {db_display}")
-    })?;
+    let mut storage = Storage::open(&db_display)
+        .with_context(|| format!("failed to open replay database {db_display}"))?;
     let recorded_max_tick = storage.max_tick()?.unwrap_or(0);
     let persisted_events = storage.load_replay_events()?;
     let recorded_counts = storage.replay_event_counts()?;
@@ -307,7 +307,10 @@ fn run_replay_cli(cli: &AppCli) -> Result<()> {
 
     let config = compose_config(cli)?;
     if config.rng_seed.is_none() {
-        warn!("config_rng_seed" = false, "Replay config has no rng_seed; deterministic verification may fail");
+        warn!(
+            "config_rng_seed" = false,
+            "Replay config has no rng_seed; deterministic verification may fail"
+        );
     }
 
     let replay_run = run_headless_simulation(&config, tick_limit)?;
@@ -358,9 +361,8 @@ fn run_replay_cli(cli: &AppCli) -> Result<()> {
 
     if let Some(compare_path) = cli.compare_db.as_ref() {
         let compare_display = compare_path.display().to_string();
-        let mut other = Storage::open(&compare_display).with_context(|| {
-            format!("failed to open comparison database {compare_display}")
-        })?;
+        let mut other = Storage::open(&compare_display)
+            .with_context(|| format!("failed to open comparison database {compare_display}"))?;
         let other_events = other.load_replay_events()?;
         let other_counts = other.replay_event_counts()?;
         drop(other);
@@ -400,7 +402,12 @@ struct ReplayCollector {
 impl ReplayCollector {
     fn new() -> (Self, Arc<Mutex<Vec<ReplayTickRecord>>>) {
         let ticks = Arc::new(Mutex::new(Vec::new()));
-        (Self { ticks: Arc::clone(&ticks) }, ticks)
+        (
+            Self {
+                ticks: Arc::clone(&ticks),
+            },
+            ticks,
+        )
     }
 }
 
@@ -540,7 +547,7 @@ fn count_event_kinds(events: &[PersistedReplayEvent]) -> HashMap<&'static str, u
 }
 
 fn report_divergence(left_label: &str, right_label: &str, divergence: Divergence) -> Result<()> {
-    let marker = "✖".red().bold();
+    let marker = "✖".red().bold().to_string();
     match divergence.kind {
         DivergenceKind::TickMismatch => {
             if let (Some(exp), Some(act)) = (&divergence.expected, &divergence.actual) {
@@ -568,14 +575,8 @@ fn report_divergence(left_label: &str, right_label: &str, divergence: Divergence
                     exp.tick.red(),
                     exp.seq.red()
                 );
-                println!(
-                    "    expected: {}",
-                    format_replay_event(&exp.event).yellow()
-                );
-                println!(
-                    "    actual:   {}",
-                    format_replay_event(&act.event).yellow()
-                );
+                println!("    expected: {}", format_replay_event(&exp.event).yellow());
+                println!("    actual:   {}", format_replay_event(&act.event).yellow());
             }
         }
         DivergenceKind::MissingActual => {
@@ -617,13 +618,7 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             give_intent,
         } => format!(
             "Action(agent={:?}, lw={:.3}, rw={:.3}, boost={}, spike={:?}, sound={:.3}, give={:.3})",
-            event.agent_id,
-            left_wheel,
-            right_wheel,
-            boost,
-            spike_target,
-            sound_level,
-            give_intent
+            event.agent_id, left_wheel, right_wheel, boost, spike_target, sound_level, give_intent
         ),
         ReplayEventKind::RngSample {
             scope,
@@ -649,25 +644,17 @@ fn print_event_counts(
         if let Some(baseline) = reference {
             let baseline_value = baseline.get(key).copied().unwrap_or(0);
             let delta = value as i64 - baseline_value as i64;
+            let delta_fmt = format!("Δ {delta:+}");
             let delta_str = if delta == 0 {
-                format!("Δ {delta:+}").yellow()
+                delta_fmt.as_str().yellow().to_string()
             } else if delta > 0 {
-                format!("Δ {delta:+}").green()
+                delta_fmt.as_str().green().to_string()
             } else {
-                format!("Δ {delta:+}").red()
+                delta_fmt.as_str().red().to_string()
             };
-            println!(
-                "    {:<14} {:>8} ({})",
-                key,
-                value,
-                delta_str
-            );
+            println!("    {:<14} {:>8} ({delta_str})", key, value);
         } else {
-            println!(
-                "    {:<14} {:>8}",
-                key,
-                value
-            );
+            println!("    {:<14} {:>8}", key, value);
         }
     }
 }
@@ -791,7 +778,10 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scriptbots_storage::{Storage, StoragePipeline};
+    use std::fs;
     use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -799,6 +789,89 @@ mod tests {
         let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = lock.lock().expect("env mutex poisoned");
         f();
+    }
+
+    #[test]
+    fn layered_configs_apply_in_order() {
+        let dir = tempdir().expect("tempdir");
+        let base_path = dir.path().join("base.toml");
+        fs::write(
+            &base_path,
+            r#"
+persistence_interval = 120
+rng_seed = 1337
+
+[neuroflow]
+enabled = true
+hidden_layers = [64, 32]
+activation = "Tanh"
+"#,
+        )
+        .expect("write base layer");
+
+        let overlay_path = dir.path().join("overlay.ron");
+        fs::write(
+            &overlay_path,
+            "(history_capacity: 1024, neuroflow: (hidden_layers: [8, 4], activation: \"Sigmoid\"), world_width: 2048)",
+        )
+        .expect("write overlay layer");
+
+        let base_config = ScriptBotsConfig {
+            persistence_interval: 60,
+            history_capacity: 600,
+            ..ScriptBotsConfig::default()
+        };
+
+        let layered = apply_config_layers(base_config, &[base_path, overlay_path])
+            .expect("apply config layers");
+
+        assert_eq!(layered.persistence_interval, 120);
+        assert_eq!(layered.history_capacity, 1024);
+        assert_eq!(layered.world_width, 2048);
+        assert_eq!(layered.rng_seed, Some(1337));
+        assert!(layered.neuroflow.enabled);
+        assert_eq!(layered.neuroflow.hidden_layers, vec![8, 4]);
+        assert_eq!(
+            layered.neuroflow.activation,
+            NeuroflowActivationKind::Sigmoid
+        );
+    }
+
+    #[test]
+    fn headless_replay_matches_storage() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("replay.duckdb");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let config = ScriptBotsConfig {
+            world_width: 600,
+            world_height: 600,
+            food_cell_size: 60,
+            persistence_interval: 1,
+            history_capacity: 128,
+            rng_seed: Some(0xA1B2C3D4),
+            ..ScriptBotsConfig::default()
+        };
+
+        {
+            let pipeline = StoragePipeline::with_thresholds(&db_str, 1, 1, 1, 1).expect("pipeline");
+            let mut world =
+                WorldState::with_persistence(config.clone(), Box::new(pipeline)).expect("world");
+            let keys = install_brains(&mut world);
+            seed_agents(&mut world, &keys);
+            for _ in 0..16 {
+                world.step();
+            }
+        }
+
+        let mut storage = Storage::open(&db_str).expect("open storage");
+        let recorded_events = storage.load_replay_events().expect("load events");
+        let max_tick = storage.max_tick().expect("max tick").unwrap_or(0);
+        drop(storage);
+
+        let replay = run_headless_simulation(&config, max_tick).expect("replay run");
+        let diff = diff_event_stream(&recorded_events, &replay.events);
+        assert!(diff.is_none(), "expected replay to match persisted events");
     }
 
     fn restore_env(var: &str, previous: Option<String>) {

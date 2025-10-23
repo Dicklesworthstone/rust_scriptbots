@@ -1,4 +1,6 @@
 use std::{
+    cmp::Ordering,
+    collections::VecDeque,
     fs::{self, File},
     io::{self, Stdout},
     path::{Path, PathBuf},
@@ -18,12 +20,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
 };
 #[cfg(test)]
 use scriptbots_core::AgentData;
-use scriptbots_core::{AgentColumns, TickSummary, WorldState};
+use scriptbots_core::{AgentColumns, AgentId, TerrainKind, TerrainLayer, TickSummary, WorldState};
 use serde::Serialize;
+use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::info;
 
@@ -35,10 +38,10 @@ use crate::{
 const TARGET_SIM_HZ: f32 = 60.0;
 const MAX_STEPS_PER_FRAME: usize = 240;
 const UI_TICK_MILLIS: u64 = 100;
-const MAP_WIDTH: usize = 48;
-const MAP_HEIGHT: usize = 24;
 const DEFAULT_HEADLESS_FRAMES: usize = 12;
 const MAX_HEADLESS_FRAMES: usize = 360;
+const EVENT_LOG_CAPACITY: usize = 16;
+const LEADERBOARD_LIMIT: usize = 6;
 
 pub struct TerminalRenderer {
     tick_interval: Duration,
@@ -187,12 +190,22 @@ struct TerminalApp<'a> {
     last_draw: Instant,
     last_event_check: Instant,
     palette: Palette,
+    terrain: TerrainView,
+    event_log: VecDeque<EventEntry>,
+    last_event_tick: u64,
     snapshot: Snapshot,
 }
 
 impl<'a> TerminalApp<'a> {
     fn new(renderer: &TerminalRenderer, ctx: RendererContext<'a>) -> Self {
         let palette = Palette::detect();
+        let terrain = {
+            let world = ctx
+                .world
+                .lock()
+                .expect("world mutex poisoned while capturing terrain");
+            TerrainView::from(world.terrain())
+        };
         let mut app = Self {
             world: Arc::clone(&ctx.world),
             _storage: Arc::clone(&ctx.storage),
@@ -209,6 +222,9 @@ impl<'a> TerminalApp<'a> {
             last_draw: Instant::now(),
             last_event_check: Instant::now(),
             palette,
+            terrain,
+            event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
+            last_event_tick: 0,
             snapshot: Snapshot::default(),
         };
         app.refresh_snapshot();
@@ -264,18 +280,34 @@ impl<'a> TerminalApp<'a> {
         self.refresh_snapshot();
         let snapshot = self.snapshot.clone();
 
-        let layout = Layout::default()
+        let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(7),
-                Constraint::Min(0),
-            ])
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
             .split(frame.area());
 
-        self.draw_header(frame, layout[0], &snapshot);
-        self.draw_history(frame, layout[1], &snapshot);
-        self.draw_map(frame, layout[2], &snapshot);
+        self.draw_header(frame, outer[0], &snapshot);
+
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(outer[1]);
+
+        self.draw_map(frame, body[0], &snapshot);
+
+        let sidebar = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(body[1].height.saturating_sub(15))),
+                Constraint::Min(5),
+            ])
+            .split(body[1]);
+
+        self.draw_stats(frame, sidebar[0], &snapshot);
+        self.draw_trends(frame, sidebar[1], &snapshot);
+        self.draw_leaderboard(frame, sidebar[2], &snapshot);
+        self.draw_events(frame, sidebar[3], &snapshot);
 
         if self.help_visible {
             self.draw_help(frame);
@@ -284,13 +316,15 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let status = format!(
-            "Tick {:>6}  Epoch {:>3}  Agents {:>5}  Births {:>4}  Deaths {:>4}  Avg ⚡ {:>6.2}",
+            "Tick {:>6}  Epoch {:>3}  Agents {:>5}  Δ+{:>3}/Δ-{:>3}  Avg⚡ {:>5.2}  Avg❤ {:>5.2}  Food {:>5.2}",
             snapshot.tick,
             snapshot.epoch,
             snapshot.agent_count,
             snapshot.births,
             snapshot.deaths,
             snapshot.avg_energy,
+            snapshot.avg_health,
+            snapshot.food.mean,
         );
 
         let paused_flag = if self.paused {
@@ -315,6 +349,16 @@ impl<'a> TerminalApp<'a> {
         line.spans.push(Span::raw("  "));
         line.spans.push(paused_flag);
         line.spans.push(mode_span);
+        line.spans.push(Span::raw("  "));
+        line.spans.push(Span::styled(
+            format!(
+                "Boosted {:>3}  Hybrids {:>3}  Avg Age {:>5.1}",
+                snapshot.boosted_count,
+                snapshot.hybrid_count,
+                snapshot.avg_age
+            ),
+            self.palette.accent_style(),
+        ));
 
         let paragraph = Paragraph::new(line).block(
             Block::default()
@@ -324,37 +368,115 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_history(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
-        let history_lines: Vec<Line> = snapshot
-            .history
-            .iter()
-            .map(|entry| {
-                Line::from(vec![
-                    Span::raw(format!("t{:>6} ", entry.tick)),
-                    Span::styled(
-                        format!("Δ+{:>3} Δ-{:>3} ", entry.births, entry.deaths),
-                        self.palette.accent_style(),
-                    ),
-                    Span::raw(format!("⚡ {:>6.2}", entry.avg_energy)),
-                ])
-            })
-            .collect();
+    fn draw_stats(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let diet = snapshot.diet_split;
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("Population ", self.palette.header_style()),
+            Span::raw(format!("{:>5}", snapshot.agent_count)),
+            Span::raw("   "),
+            Span::styled("H:", self.palette.diet_style(DietClass::Herbivore)),
+            Span::raw(format!("{:>3}", diet.herbivores)),
+            Span::raw("  "),
+            Span::styled("O:", self.palette.diet_style(DietClass::Omnivore)),
+            Span::raw(format!("{:>3}", diet.omnivores)),
+            Span::raw("  "),
+            Span::styled("C:", self.palette.diet_style(DietClass::Carnivore)),
+            Span::raw(format!("{:>3}", diet.carnivores)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Energy ", self.palette.header_style()),
+            Span::raw(format!(
+                "avg {:>5.2}  min {:>5.2}  max {:>5.2}",
+                snapshot.avg_energy, snapshot.energy_min, snapshot.energy_max
+            )),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Health ", self.palette.header_style()),
+            Span::raw(format!("avg {:>5.2}", snapshot.avg_health)),
+            Span::raw("  "),
+            Span::styled("Boosted ", self.palette.accent_style()),
+            Span::raw(format!("{:>3}", snapshot.boosted_count)),
+            Span::raw("  "),
+            Span::styled("Hybrids ", self.palette.accent_style()),
+            Span::raw(format!("{:>3}", snapshot.hybrid_count)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Age ", self.palette.header_style()),
+            Span::raw(format!(
+                "avg {:>5.1}  max {:>3}",
+                snapshot.avg_age, snapshot.max_age
+            )),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Food ", self.palette.header_style()),
+            Span::raw(format!("mean {:>5.2}", snapshot.food.mean)),
+        ]));
 
-        let paragraph = Paragraph::new(Text::from(history_lines)).block(
+        let paragraph = Paragraph::new(Text::from(lines)).block(
             Block::default()
-                .title(self.palette.title("Recent History"))
+                .title(self.palette.title("Vital Stats"))
                 .borders(Borders::ALL),
         );
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_map(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
-        let map_lines: Vec<Line> = snapshot
-            .map_rows
+    fn draw_trends(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let block = Block::default()
+            .title(self.palette.title("Population & Energy Trends"))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.height == 0 {
+            return;
+        }
+
+        let trend_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+
+        let pop_data: Vec<u64> = snapshot
+            .history
             .iter()
-            .map(|row| Line::raw(row.clone()))
+            .rev()
+            .map(|entry| entry.population as u64)
+            .collect();
+        let energy_data: Vec<u64> = snapshot
+            .history
+            .iter()
+            .rev()
+            .map(|entry| (entry.avg_energy.max(0.0) * 100.0) as u64)
             .collect();
 
+        if !pop_data.is_empty() {
+            let spark = Sparkline::default()
+                .style(self.palette.population_spark_style())
+                .data(&pop_data);
+            frame.render_widget(spark, trend_layout[0]);
+        }
+        if !energy_data.is_empty() {
+            let spark = Sparkline::default()
+                .style(self.palette.energy_spark_style())
+                .data(&energy_data);
+            frame.render_widget(spark, trend_layout[1]);
+        }
+
+        let trend_text = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Last Tick ", self.palette.header_style()),
+                Span::raw(format!(
+                    "Δ+{:>2} Δ-{:>2}",
+                    snapshot.births, snapshot.deaths
+                )),
+            ]),
+        ])
+        .block(Block::default());
+        frame.render_widget(trend_text, trend_layout[2]);
+    }
+
+    fn draw_map(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let title = format!(
             "World Map {}×{}",
             snapshot.world_size.0, snapshot.world_size.1
@@ -362,9 +484,107 @@ impl<'a> TerminalApp<'a> {
         let block = Block::default()
             .title(self.palette.title(title))
             .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        let paragraph = Paragraph::new(Text::from(map_lines)).block(block);
-        frame.render_widget(paragraph, area);
+        if inner.width < 2 || inner.height < 2 {
+            return;
+        }
+
+        let width = inner.width as usize;
+        let height = inner.height as usize;
+        let mut grid = vec![CellGlyph::default(); width * height];
+        let mut occupancy = vec![CellOccupancy::default(); width * height];
+
+        for y in 0..height {
+            for x in 0..width {
+                let u = (x as f32 + 0.5) / width as f32;
+                let v = (y as f32 + 0.5) / height as f32;
+                let terrain = self.terrain.sample(u, v);
+                let food_level = snapshot.food.sample(u, v);
+                let (glyph, style) = self.palette.terrain_symbol(terrain, food_level);
+                grid[y * width + x] = CellGlyph { ch: glyph, style };
+            }
+        }
+
+        for agent in &snapshot.agents {
+            let x = (agent.position.0 * width as f32)
+                .floor()
+                .clamp(0.0, (width - 1) as f32) as usize;
+            let y = (agent.position.1 * height as f32)
+                .floor()
+                .clamp(0.0, (height - 1) as f32) as usize;
+            let idx = y * width + x;
+            let cell = &mut occupancy[idx];
+            cell.add(agent.diet, agent.boosted, agent.energy);
+            let base = grid[idx].style;
+            let (glyph, style) = self.palette.agent_symbol(cell, base);
+            grid[idx].ch = glyph;
+            grid[idx].style = style;
+        }
+
+        let mut lines = Vec::with_capacity(height);
+        for y in 0..height {
+            let mut spans = Vec::with_capacity(width);
+            for x in 0..width {
+                let cell = &grid[y * width + x];
+                spans.push(Span::styled(cell.ch.to_string(), cell.style));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        let paragraph = Paragraph::new(Text::from(lines));
+        frame.render_widget(paragraph, inner);
+    }
+
+    fn draw_leaderboard(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let items: Vec<ListItem> = snapshot
+            .leaderboard
+            .iter()
+            .map(|entry| {
+                let mut spans = Vec::new();
+                spans.push(Span::styled(
+                    format!("#{:<4}", entry.label),
+                    self.palette.header_style(),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    match entry.diet {
+                        DietClass::Herbivore => "H ",
+                        DietClass::Omnivore => "O ",
+                        DietClass::Carnivore => "C ",
+                    },
+                    self.palette.diet_style(entry.diet),
+                ));
+                spans.push(Span::raw(format!(
+                    "⚡{:>5.2} ❤{:>5.2} age {:>3} gen {:>2}",
+                    entry.energy, entry.health, entry.age, entry.generation
+                )));
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let block = Block::default()
+            .title(self.palette.title("Top Survivors"))
+            .borders(Borders::ALL);
+        frame.render_widget(List::new(items).block(block), area);
+    }
+
+    fn draw_events(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
+        let events: Vec<ListItem> = self
+            .event_log
+            .iter()
+            .rev()
+            .map(|entry| {
+                let style = self.palette.event_style(entry.kind);
+                let text = format!("[t{:>6}] {}", entry.tick, entry.message);
+                ListItem::new(Span::styled(text, style))
+            })
+            .collect();
+        let block = Block::default()
+            .title(self.palette.title("Recent Events"))
+            .borders(Borders::ALL);
+        frame.render_widget(List::new(events).block(block), area);
     }
 
     fn draw_help(&self, frame: &mut Frame<'_>) {
@@ -444,8 +664,66 @@ impl<'a> TerminalApp<'a> {
 
     fn refresh_snapshot(&mut self) {
         if let Ok(world) = self.world.lock() {
-            self.snapshot = Snapshot::from_world(&world, &self.palette);
+            let new_snapshot = Snapshot::from_world(&world);
+            self.ingest_events(&new_snapshot);
+            self.snapshot = new_snapshot;
         }
+    }
+
+    fn ingest_events(&mut self, new_snapshot: &Snapshot) {
+        if new_snapshot.tick <= self.last_event_tick && new_snapshot.tick <= self.snapshot.tick {
+            return;
+        }
+
+        if new_snapshot.tick > self.last_event_tick {
+            if new_snapshot.births > 0 {
+                let plural = if new_snapshot.births == 1 { "" } else { "s" };
+                self.push_event(
+                    new_snapshot.tick,
+                    EventKind::Birth,
+                    format!("{} birth{}", new_snapshot.births, plural),
+                );
+            }
+            if new_snapshot.deaths > 0 {
+                let plural = if new_snapshot.deaths == 1 { "" } else { "s" };
+                self.push_event(
+                    new_snapshot.tick,
+                    EventKind::Death,
+                    format!("{} death{}", new_snapshot.deaths, plural),
+                );
+            }
+        }
+
+        if new_snapshot.tick > self.snapshot.tick {
+            let delta =
+                new_snapshot.agent_count as i64 - self.snapshot.agent_count as i64;
+            if delta > 0 {
+                self.push_event(
+                    new_snapshot.tick,
+                    EventKind::Population,
+                    format!("Population +{}", delta),
+                );
+            } else if delta < 0 {
+                self.push_event(
+                    new_snapshot.tick,
+                    EventKind::Population,
+                    format!("Population {}", delta),
+                );
+            }
+        }
+
+        self.last_event_tick = new_snapshot.tick;
+    }
+
+    fn push_event(&mut self, tick: u64, kind: EventKind, message: impl Into<String>) {
+        if self.event_log.len() >= EVENT_LOG_CAPACITY {
+            self.event_log.pop_front();
+        }
+        self.event_log.push_back(EventEntry {
+            tick,
+            kind,
+            message: message.into(),
+        });
     }
 }
 
@@ -457,9 +735,19 @@ struct Snapshot {
     births: usize,
     deaths: usize,
     avg_energy: f32,
+    avg_health: f32,
+    avg_age: f32,
+    max_age: u32,
+    boosted_count: usize,
+    hybrid_count: usize,
+    energy_min: f32,
+    energy_max: f32,
     history: Vec<HistoryEntry>,
     world_size: (u32, u32),
-    map_rows: Vec<String>,
+    diet_split: DietSplit,
+    agents: Vec<AgentViz>,
+    leaderboard: Vec<LeaderboardEntry>,
+    food: FoodView,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -468,12 +756,223 @@ struct HistoryEntry {
     births: usize,
     deaths: usize,
     avg_energy: f32,
+    population: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DietSplit {
+    herbivores: usize,
+    omnivores: usize,
+    carnivores: usize,
+}
+
+impl DietSplit {
+    fn total(&self) -> usize {
+        self.herbivores + self.omnivores + self.carnivores
+    }
+
+    fn increment(&mut self, class: DietClass) {
+        match class {
+            DietClass::Herbivore => self.herbivores += 1,
+            DietClass::Omnivore => self.omnivores += 1,
+            DietClass::Carnivore => self.carnivores += 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DietClass {
+    Herbivore,
+    Omnivore,
+    Carnivore,
+}
+
+impl DietClass {
+    fn from_tendency(tendency: f32) -> Self {
+        if tendency <= 0.33 {
+            DietClass::Herbivore
+        } else if tendency >= 0.66 {
+            DietClass::Carnivore
+        } else {
+            DietClass::Omnivore
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AgentViz {
+    id: u64,
+    position: (f32, f32),
+    heading: f32,
+    diet: DietClass,
+    energy: f32,
+    health: f32,
+    age: u32,
+    generation: u32,
+    boosted: bool,
+    spike_length: f32,
+    tendency: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LeaderboardEntry {
+    label: u64,
+    diet: DietClass,
+    energy: f32,
+    health: f32,
+    age: u32,
+    generation: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FoodView {
+    width: u32,
+    height: u32,
+    cells: Vec<f32>,
+    max: f32,
+    mean: f32,
+}
+
+impl FoodView {
+    fn sample(&self, u: f32, v: f32) -> f32 {
+        if self.width == 0 || self.height == 0 || self.cells.is_empty() {
+            return 0.0;
+        }
+        let x = ((u.clamp(0.0, 0.9999)) * self.width as f32).floor() as usize;
+        let y = ((v.clamp(0.0, 0.9999)) * self.height as f32).floor() as usize;
+        let idx = y.saturating_mul(self.width as usize) + x;
+        let value = *self.cells.get(idx).unwrap_or(&0.0);
+        if self.max <= f32::EPSILON {
+            0.0
+        } else {
+            (value / self.max).clamp(0.0, 1.0)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TerrainView {
+    width: u32,
+    height: u32,
+    kinds: Vec<TerrainKind>,
+}
+
+impl TerrainView {
+    fn from(terrain: &TerrainLayer) -> Self {
+        Self {
+            width: terrain.width(),
+            height: terrain.height(),
+            kinds: terrain.tiles().iter().map(|tile| tile.kind).collect(),
+        }
+    }
+
+    fn sample(&self, u: f32, v: f32) -> TerrainKind {
+        if self.width == 0 || self.height == 0 || self.kinds.is_empty() {
+            return TerrainKind::Grass;
+        }
+        let x = ((u.clamp(0.0, 0.9999)) * self.width as f32).floor() as usize;
+        let y = ((v.clamp(0.0, 0.9999)) * self.height as f32).floor() as usize;
+        let idx = y.saturating_mul(self.width as usize) + x;
+        self.kinds.get(idx).copied().unwrap_or(TerrainKind::Grass)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CellGlyph {
+    ch: char,
+    style: Style,
+}
+
+impl Default for CellGlyph {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            style: Style::default(),
+        }
+    }
+}
+
+struct CellOccupancy {
+    herbivores: u16,
+    omnivores: u16,
+    carnivores: u16,
+    boosted: bool,
+    top_energy: f32,
+    top_class: DietClass,
+}
+
+impl Default for CellOccupancy {
+    fn default() -> Self {
+        Self {
+            herbivores: 0,
+            omnivores: 0,
+            carnivores: 0,
+            boosted: false,
+            top_energy: 0.0,
+            top_class: DietClass::Omnivore,
+        }
+    }
+}
+
+impl CellOccupancy {
+    fn add(&mut self, class: DietClass, boosted: bool, energy: f32) {
+        match class {
+            DietClass::Herbivore => self.herbivores = self.herbivores.saturating_add(1),
+            DietClass::Omnivore => self.omnivores = self.omnivores.saturating_add(1),
+            DietClass::Carnivore => self.carnivores = self.carnivores.saturating_add(1),
+        }
+        if boosted {
+            self.boosted = true;
+        }
+        if energy >= self.top_energy {
+            self.top_energy = energy;
+            self.top_class = class;
+        }
+    }
+
+    fn total(&self) -> u16 {
+        self.herbivores
+            .saturating_add(self.omnivores)
+            .saturating_add(self.carnivores)
+    }
+
+    fn dominant(&self) -> DietClass {
+        let mut best = (self.herbivores, DietClass::Herbivore);
+        if self.omnivores > best.0 {
+            best = (self.omnivores, DietClass::Omnivore);
+        }
+        if self.carnivores > best.0 {
+            best = (self.carnivores, DietClass::Carnivore);
+        }
+        if best.0 == 0 {
+            self.top_class
+        } else {
+            best.1
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EventEntry {
+    tick: u64,
+    message: String,
+    kind: EventKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EventKind {
+    Birth,
+    Death,
+    Population,
+    Info,
 }
 
 impl Snapshot {
-    fn from_world(world: &WorldState, palette: &Palette) -> Self {
+    fn from_world(world: &WorldState) -> Self {
         let config = world.config();
         let agent_count = world.agent_count();
+        let world_width = config.world_width.max(1) as f32;
+        let world_height = config.world_height.max(1) as f32;
 
         let summaries: Vec<TickSummary> = world.history().cloned().collect();
         let summary = summaries.last().cloned().unwrap_or_else(|| TickSummary {
@@ -489,21 +988,126 @@ impl Snapshot {
         let history = summaries
             .iter()
             .rev()
-            .take(8)
+            .take(32)
             .map(|entry| HistoryEntry {
                 tick: entry.tick.0,
                 births: entry.births,
                 deaths: entry.deaths,
                 avg_energy: entry.average_energy,
+                population: entry.agent_count,
             })
             .collect();
 
-        let map_rows = build_map(
-            world.agents().columns(),
-            config.world_width,
-            config.world_height,
-            palette,
-        );
+        let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+        let columns = world.agents().columns();
+        let runtimes = world.runtime();
+
+        let mut agents = Vec::with_capacity(handles.len());
+        let mut diet_split = DietSplit::default();
+        let mut boosted_count = 0usize;
+        let mut hybrid_count = 0usize;
+        let mut energy_min = f32::INFINITY;
+        let mut energy_max = f32::NEG_INFINITY;
+        let mut health_acc = 0.0_f32;
+        let mut age_acc = 0.0_f64;
+        let mut max_age = 0u32;
+
+        for (idx, id) in handles.iter().enumerate() {
+            let position = columns.positions()[idx];
+            let health = columns.health()[idx];
+            let age = columns.ages()[idx];
+            let generation = columns.generations()[idx].0;
+            let spike_length = columns.spike_lengths()[idx];
+            let runtime = runtimes.get(*id);
+
+            let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
+            let diet = runtime
+                .map(|rt| DietClass::from_tendency(rt.herbivore_tendency))
+                .unwrap_or(DietClass::Omnivore);
+            let boosted = runtime.map(|rt| rt.boosted).unwrap_or(false);
+            let hybrid = runtime.map(|rt| rt.hybrid).unwrap_or(false);
+            let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
+
+            diet_split.increment(diet);
+            if boosted {
+                boosted_count += 1;
+            }
+            if hybrid {
+                hybrid_count += 1;
+            }
+
+            energy_min = energy_min.min(energy);
+            energy_max = energy_max.max(energy);
+            health_acc += health;
+            age_acc += f64::from(age);
+            max_age = max_age.max(age);
+
+            let normalized_x = (position.x / world_width).rem_euclid(1.0).clamp(0.0, 0.9999);
+            let normalized_y = (position.y / world_height).rem_euclid(1.0).clamp(0.0, 0.9999);
+
+            agents.push(AgentViz {
+                id: id.data().as_ffi(),
+                position: (normalized_x, normalized_y),
+                heading: columns.headings()[idx],
+                diet,
+                energy,
+                health,
+                age,
+                generation,
+                boosted,
+                spike_length,
+                tendency,
+            });
+        }
+
+        let avg_health = if agent_count > 0 {
+            health_acc / agent_count as f32
+        } else {
+            0.0
+        };
+        let avg_age = if agent_count > 0 {
+            (age_acc / agent_count as f64) as f32
+        } else {
+            0.0
+        };
+
+        if !energy_min.is_finite() {
+            energy_min = 0.0;
+        }
+        if !energy_max.is_finite() {
+            energy_max = 0.0;
+        }
+
+        let mut leaderboard: Vec<LeaderboardEntry> = agents
+            .iter()
+            .map(|agent| LeaderboardEntry {
+                label: agent.id,
+                diet: agent.diet,
+                energy: agent.energy,
+                health: agent.health,
+                age: agent.age,
+                generation: agent.generation,
+            })
+            .collect();
+
+        leaderboard.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| b.health.partial_cmp(&a.health).unwrap_or(Ordering::Equal))
+        });
+        leaderboard.truncate(LEADERBOARD_LIMIT);
+
+        let food_grid = world.food();
+        let food_cells = food_grid.cells().to_vec();
+        let food_max = food_cells
+            .iter()
+            .fold(0.0_f32, |acc, value| acc.max(*value));
+        let food_mean = if food_cells.is_empty() {
+            0.0
+        } else {
+            food_cells.iter().sum::<f32>() / food_cells.len() as f32
+        };
 
         Self {
             tick: summary.tick.0,
@@ -512,41 +1116,27 @@ impl Snapshot {
             births: summary.births,
             deaths: summary.deaths,
             avg_energy: summary.average_energy,
+            avg_health,
+            avg_age,
+            max_age,
+            boosted_count,
+            hybrid_count,
+            energy_min,
+            energy_max,
             history,
             world_size: (config.world_width, config.world_height),
-            map_rows,
+            diet_split,
+            agents,
+            leaderboard,
+            food: FoodView {
+                width: food_grid.width(),
+                height: food_grid.height(),
+                cells: food_cells,
+                max: food_max,
+                mean: food_mean,
+            },
         }
     }
-}
-
-fn build_map(
-    columns: &AgentColumns,
-    world_width: u32,
-    world_height: u32,
-    palette: &Palette,
-) -> Vec<String> {
-    let mut cells = vec![0usize; MAP_WIDTH * MAP_HEIGHT];
-    let width = world_width.max(1) as f32;
-    let height = world_height.max(1) as f32;
-
-    for position in columns.positions() {
-        let x = (position.x / width).clamp(0.0, 0.9999) * MAP_WIDTH as f32;
-        let y = (position.y / height).clamp(0.0, 0.9999) * MAP_HEIGHT as f32;
-        let xi = x.floor() as usize;
-        let yi = y.floor() as usize;
-        cells[yi * MAP_WIDTH + xi] += 1;
-    }
-
-    let mut rows = Vec::with_capacity(MAP_HEIGHT);
-    for y in 0..MAP_HEIGHT {
-        let mut row = String::with_capacity(MAP_WIDTH * 2);
-        for x in 0..MAP_WIDTH {
-            let count = cells[y * MAP_WIDTH + x];
-            row.push_str(palette.map_symbol(count));
-        }
-        rows.push(row);
-    }
-    rows
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -739,46 +1329,96 @@ impl Palette {
         Span::styled(title.into(), self.header_style())
     }
 
-    fn map_symbol(&self, count: usize) -> &'static str {
-        if count == 0 {
-            return "·";
+    fn diet_style(&self, diet: DietClass) -> Style {
+        Style::default().fg(self.diet_color(diet))
+    }
+
+    fn population_spark_style(&self) -> Style {
+        Style::default().fg(Color::Green)
+    }
+
+    fn energy_spark_style(&self) -> Style {
+        Style::default().fg(Color::Yellow)
+    }
+
+    fn event_style(&self, kind: EventKind) -> Style {
+        let color = match kind {
+            EventKind::Birth => Color::Green,
+            EventKind::Death => Color::Red,
+            EventKind::Population => Color::Yellow,
+            EventKind::Info => Color::Cyan,
+        };
+        Style::default().fg(color)
+    }
+
+    fn has_color(&self) -> bool {
+        self.level.is_some()
+    }
+
+    fn diet_color(&self, diet: DietClass) -> Color {
+        match diet {
+            DietClass::Herbivore => Color::Green,
+            DietClass::Omnivore => Color::Yellow,
+            DietClass::Carnivore => Color::Red,
         }
-        match self.level {
-            Some(level) if level.has_16m || level.has_256 => {
-                if count <= 2 {
-                    "🟢"
-                } else if count <= 5 {
-                    "🟠"
-                } else {
-                    "🔴"
-                }
-            }
-            Some(level) if level.has_basic => {
-                if count <= 2 {
-                    "*"
-                } else if count <= 5 {
-                    "+"
-                } else {
-                    "#"
-                }
-            }
-            _ => "#",
+    }
+
+    fn terrain_symbol(&self, kind: TerrainKind, food_level: f32) -> (char, Style) {
+        let rich_color = self.level.map_or(false, |level| level.has_16m || level.has_256);
+        let (glyph, fg, bg) = match kind {
+            TerrainKind::DeepWater => ('≈', Color::Cyan, Color::Blue),
+            TerrainKind::ShallowWater => ('~', Color::Cyan, Color::DarkBlue),
+            TerrainKind::Sand => ('·', Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
+            TerrainKind::Grass => ('"', Color::LightGreen, if rich_color { Color::Rgb(30, 90, 30) } else { Color::Green }),
+            TerrainKind::Bloom => ('*', Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
+            TerrainKind::Rock => ('^', Color::Gray, if rich_color { Color::Rgb(70, 70, 70) } else { Color::DarkGray }),
+        };
+        let mut style = Style::default().fg(fg);
+        if self.has_color() {
+            style = style.bg(bg);
         }
+        if food_level > 0.66 {
+            style = style.add_modifier(Modifier::BOLD);
+        } else if food_level < 0.2 {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        (glyph, style)
+    }
+
+    fn agent_symbol(&self, occupancy: &CellOccupancy, base: Style) -> (char, Style) {
+        let total = occupancy.total();
+        let class = if total == 0 {
+            DietClass::Omnivore
+        } else {
+            occupancy.dominant()
+        };
+        let mut glyph = match class {
+            DietClass::Herbivore => 'h',
+            DietClass::Omnivore => 'o',
+            DietClass::Carnivore => 'c',
+        };
+
+        if total > 3 {
+            glyph = '@';
+        } else if total > 1 {
+            glyph = glyph.to_ascii_uppercase();
+        }
+
+        let mut style = base.fg(self.diet_color(class));
+        if occupancy.boosted || total > 1 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if total > 3 {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        (glyph, style)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::ScriptBotsConfig;
-
-    #[test]
-    fn map_symbol_without_color_support_falls_back() {
-        let palette = Palette { level: None };
-        assert_eq!(palette.map_symbol(0), "·");
-        assert_eq!(palette.map_symbol(1), "#");
-        assert_eq!(palette.map_symbol(8), "#");
-    }
+    use scriptbots_core::{AgentData, ScriptBotsConfig};
 
     #[test]
     fn snapshot_reflects_world_state() {
@@ -786,12 +1426,11 @@ mod tests {
         let mut world = WorldState::new(config).expect("world");
         world.spawn_agent(AgentData::default());
 
-        let palette = Palette { level: None };
-        let snapshot = Snapshot::from_world(&world, &palette);
+        let snapshot = Snapshot::from_world(&world);
 
         assert_eq!(snapshot.agent_count, world.agent_count());
         assert_eq!(snapshot.tick, world.tick().0);
-        assert_eq!(snapshot.map_rows.len(), MAP_HEIGHT);
-        assert!(snapshot.map_rows.iter().all(|row| !row.is_empty()));
+        assert_eq!(snapshot.agents.len(), world.agent_count());
+        assert_eq!(snapshot.world_size.0, world.config().world_width);
     }
 }

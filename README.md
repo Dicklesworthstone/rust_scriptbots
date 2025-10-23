@@ -4,6 +4,20 @@ ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-bas
 
 For design intent and the living roadmap, see `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` (the project “bible”). A sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
 
+### Philosophy & purpose
+- **Why this exists**: ScriptBots is a minimalist artificial life laboratory. By rebuilding the original simulator with rigorously deterministic Rust systems, we can observe, measure, and reproduce emergent behavior at scale—without undefined behavior or global state muddying results.
+- **What we learn**: How simple sensory channels and local rules produce complex population dynamics—cooperation vs. predation, resource gradients shaping migration, lineage divergence under different mutation schedules, and the role of perception in survival.
+- **LLM-in-the-loop science**: The REST API, CLI, and MCP HTTP server expose the full control surface (knobs, patches, snapshots). This lets an external LLM agent act as an autonomous lab assistant: steering experiments, sweeping parameter spaces, logging observations into DuckDB, and drafting human-readable reports.
+  - Example workflows:
+    - Parameter sweeps: vary `mutation.{primary,secondary}` and temperature gradients; record birth/death ratios and equilibrium populations.
+    - Interventions: toggle `closed` worlds, inject carnivore cohorts, or freeze food diffusion to test resilience.
+    - Reporting: ingest DuckDB tables to auto-generate charts/tables describing discovered phenomena (e.g., altruistic giving thresholds that stabilize mixed diets).
+- **A brain testbed**: The `Brain` trait and registry allow swapping decision engines—handwritten controllers, MLP/DWRAON/Assembly, or NeuroFlow—while holding the environment constant. This enables fair comparisons of:
+  - Perception encoding (multi-eye vision, smell/sound/blood) and how architectures exploit them.
+  - Locomotion control (differential drive) and energy/health trade-offs.
+  - Evolutionary operators (mutation/crossover) and speciation pressures.
+- **Reproducible research**: Deterministic pipelines + a growing replay roadmap mean results can be shared and re-run bit-for-bit, making the project a solid platform for pedagogy, papers, and benchmarking new brain designs.
+
 ### Why this exists
 - **Determinism and safety**: Replace legacy C++/GLUT and global state with idiomatic Rust, zero `unsafe` in v1, and reproducible runs.
 - **Performance at scale**: Data-parallelism (Rayon) and cache-friendly layouts to simulate thousands of agents efficiently.
@@ -35,24 +49,62 @@ rust_scriptbots/
 ```
 
 ### Architecture diagram (high-level)
-Data flows left-to-right; control surfaces are orthogonal:
+Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 
 ```
-[Brains] <-> [scriptbots-core (WorldState, Tick Pipeline)] <-> [scriptbots-storage]
-    ^                    ^                     ^                     |
-    | BrainRegistry      | AgentSnapshots      | PersistenceBatch    v
-    |                    |                     |                 [DuckDB]
-
-[scriptbots-index] --(spatial queries)--> [core]
-
-[scriptbots-app]
-  |- Renderer (GPUI | Terminal) <-- World snapshots & HUD metrics
-  |- Control runtime (REST | MCP | CLI) --(CommandBus)--> [core]
-
-[scriptbots-web] (wasm)
-  |- wasm-bindgen API (init/tick/snapshot/reset) -> JS renderer (WebGPU/Canvas)
-  |- Determinism parity vs native core
+                           ┌───────────────────────────────────────┐
+                           │  scriptbots-brain family              │
+                           │  (brain, brain-ml, brain-neuro)       │
+                           └──────────────┬────────────────────────┘
+                                          │ BrainRegistry (attach by key)
+┌──────────────────────────────────────────▼──────────────────────────────────────────┐
+│                  scriptbots-core (WorldState, Tick Pipeline)                        │
+│  - SoA AgentColumns · Spatial index (scriptbots-index)                              │
+│  - Deterministic: sense → brains → actuation → persistence hooks                    │
+└───────────────┬───────────────────────────┬───────────────────────────┬─────────────┘
+                │ AgentSnapshots            │ PersistenceBatch          │ CommandDrain (in-tick)
+                │                           │                           │
+        ┌───────▼────────┐           ┌──────▼──────────┐          ┌─────▼──────────┐
+        │ Renderer (GUI) │           │ scriptbots-     │          │ CommandBus     │
+        │ GPUI window    │           │ storage         │          │ (crossfire MPMC)│
+        │ or Terminal TUI│           │  StoragePipeline│          └─────┬───────────┘
+        │ (console text) │           │  (async worker) │                │
+        └───────┬────────┘           └──────┬──────────┘                │
+                │ World snapshots     └──────┬──────────┘                │
+                │ HUD metrics                 │                          │
+        ┌───────▼────────┐                   │                           │
+        │ scriptbots-    │                   ▼                           │
+        │ render         │             ┌────────────┐                     │
+        └────────────────┘             │  DuckDB    │                     │
+                                       └────────────┘                     │
+                                                                          │
+                                 ┌─────────────────────────────────────────▼────────────────────┐
+                                 │ scriptbots-app (orchestrator)                                │
+                                 │ - launches ControlRuntime (Tokio thread)                     │
+                                 │ - selects Renderer (CLI flag/env)                            │
+                                 │ - seeds world, installs brains, primes history               │
+                                 └───────────────┬───────────────────────────────┬──────────────┘
+                                                 │ REST (axum + Swagger UI)      │ MCP HTTP (mcp_protocol_sdk)
+                                                 │ /api/knobs /api/config        │ tools: list_knobs,get_config,
+                                                 │ /api/knobs/apply PATCH config │ apply_updates,apply_patch
+                                                 │                               │
+                                                 │                               │
+                                          ┌──────▼───────┐                       │
+                                          │ control_cli  │ (reqwest; TUI watch)  │
+                                          │ list/get/set │  -> REST               │
+                                          └──────────────┘                       │
+                                                                                 │
+┌────────────────────────────────────────────────────────────────────────────────▼─────────────┐
+│ scriptbots-web (wasm)                                                                          │
+│ - wasm-bindgen: default_init_options/init_sim/tick/snapshot/reset/registerBrain                │
+│ - snapshot_format: json | binary (Postcard) · wasm-vs-native parity tests                      │
+│ - feeds JS renderer (WebGPU/Canvas)                                                            │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+- Background workers: StoragePipeline (async writer) and ControlRuntime (Tokio) are isolated; the core drains commands inside the tick loop for deterministic application.
+- Renderers are read-only consumers of world snapshots; they do not mutate simulation state directly.
+- Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
 
 ### Crate roles
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
@@ -415,6 +467,11 @@ cargo run -p scriptbots-app --bin control_cli -- patch --json '{"food_max":0.6}'
 cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
 ```
 
+### Scenario layering & deterministic replay CLI
+- **Layered configs**: pass one or more `--config path/to/file.toml` (or `.ron`) flags—or set `SCRIPTBOTS_CONFIG` with semicolon-separated paths—to build scenarios from reusable fragments (e.g., `base.toml → arctic_biome.toml → evolution_study.toml`). Layers merge in order before env overrides, unlocking repeatable experiments without editing code.
+- **Replay verification**: `cargo run -p scriptbots-app -- --replay-db run.duckdb [--compare-db candidate.duckdb] [--tick-limit 500]` loads persisted events, re-simulates ticks headlessly, and reports colored diffs (tick/sequence mismatches, event payload divergences) together with event-type counts.
+- **Storage helpers**: DuckDB accessors (`max_tick`, `load_replay_events`, `replay_event_counts`) underpin the CLI so analytics pipelines or external tools can reuse the same deterministic data.
+
 ### MCP HTTP server (Model Context Protocol)
 - Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
 - Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.
@@ -506,7 +563,6 @@ Licensed under `MIT OR Apache-2.0` (see workspace manifest).
 - This Rust port is an independent, from-scratch implementation guided by parity goals and modern Rust/GPUI best practices.
 
 ## FAQ
-- **Does it run a full simulation today?** Not yet. The scaffolding builds and runs; core simulation, UI, and brains are being implemented incrementally.
 - **What platforms are supported?** Linux, macOS, and Windows 11 are targeted. Windows is supported natively (MSVC toolchain) and via WSL2. Early UI milestones may see platform-specific polish arriving at different times.
 - **Where do I start hacking?** `scriptbots-core` for the world model; `scriptbots-render` for the GPUI view; `scriptbots-brain` for brain interfaces; `scriptbots-storage` for persistence.
 

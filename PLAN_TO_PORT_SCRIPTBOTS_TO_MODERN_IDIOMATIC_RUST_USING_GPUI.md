@@ -199,12 +199,12 @@
   - [ ] Implement mutation/crossover suites validated against C++ reference data.
   - [ ] Develop brain registry benchmarking (per-brain tick cost, cache hit rates).
 - **Analytics & Replay**
-- [Currently In Progress - GPT-5 Codex 2025-10-22] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
-  - [ ] Implement deterministic replay runner (headless) driven by stored events.
+- [Completed - GPT-5 Codex 2025-10-23: Storage exposes `load_replay_events`/`max_tick`/`replay_event_counts`; `scriptbots-app` ships headless replay CLI (`--replay-db`, `--compare-db`, `--tick-limit`) with colored divergence diagnostics] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
+  - [Completed - GPT-5 Codex 2025-10-23: Deterministic replay runner records per-tick events via `ReplayCollector` and verifies against DuckDB logs.]
   - [ ] Add DuckDB parity queries (population charts, kill ratios, energy histograms) vs. C++ scripts.
   - [ ] Provide CLI tooling to diff runs (Rust vs. C++ baseline) and highlight divergences.
 - **Feature Toggles & UX Integration (Non-rendering)**
-  - [ ] Surfacing runtime toggles: CLI/ENV for enabling brains, selecting indices, adjusting mechanics.
+- [Completed - GPT-5 Codex 2025-10-23: Added layered scenario configs (`--config` / `SCRIPTBOTS_CONFIG`) merging TOML/RON files ahead of env overrides] Surfacing runtime toggles: CLI/ENV for enabling brains, selecting indices, adjusting mechanics.
   - [ ] Selection and debug hooks: expose APIs to query agent state, highlight subsets (without GPUI coupling).
   - [ ] Audio hooks: structure event bus for future `kira` integration (without touching render crate yet).
   - [ ] Accessibility/logging: structured tracing spans, machine-readable summaries for external dashboards.
@@ -318,6 +318,71 @@
    - Update `README.md` with usage instructions, feature flags, and screenshots/gifs of the terminal HUD.
    - Add observability notes (structured logs when mode switches) and highlight that terminal mode is experimental but safe to enable in CI/headless setups.
    - Coordinate with rendering owners to ensure future GPUI changes keep the shared telemetry surface stable.
+
+### Library survey & selections (2025-10)
+- Terminal UI framework: adopt `ratatui` (active fork of `tui`) for composable widgets (Block, Paragraph, Table, Chart, Sparkline) and a stable API surface.
+- Terminal backend & input: `crossterm` for cross-platform input/colors/alternate screen; headless testing via `ratatui::backend::TestBackend`.
+- Color capability detection: `supports-color` to differentiate truecolor/256/basic and downgrade palettes deterministically.
+- Unicode handling: `unicode-width` and `unicode-segmentation` to ensure aligned glyphs (including emoji) across terminals.
+- Logging in-UI: integrate a simple log viewer panel backed by `tracing` ring buffer; prefer custom widget over `tui-logger` to avoid hard ties to the legacy `tui` crate.
+- Charts: start with `ratatui::widgets::{Chart,Sparkline}`; if we need advanced plots, evaluate a `plotters` adapter rendered into a `ratatui` Canvas.
+- Optional inline images (behind feature flags, non-default):
+  - `viuer` (kitty/iTerm2 graphics protocol) for preview screenshots when supported.
+  - `sixel-rs` for DEC SIXEL-capable terminals (xterm, mlterm); both gated behind detection + explicit opt-in.
+
+### Visual design spec
+- Layout (80×36 minimum target):
+  - Header (3 rows): tick, epoch, agents, births/deaths, avg energy; status flags (RUNNING/PAUSED), speed multiplier.
+  - History panel (7 rows): rolling last N ticks with Δbirths/Δdeaths sparkline and average energy trend.
+  - World mini-map (remaining rows): emoji-aware heatmap using density-based symbols; palette-aware fallback to ASCII (`*`, `+`, `#`).
+  - Help overlay: modal panel with keybindings and palette legend.
+- Glyph strategy:
+  - Truecolor: use colored emojis (🟢 🟠 🔴) or shaded blocks (▁ ▂ ▃ ▄ ▅ ▆ ▇ █) based on density.
+  - 256/basic color: ASCII or shaded blocks with limited palette; ensure contrast ≥ WCAG AA equivalent.
+- Color system:
+  - Palettes: Natural, Deuteranopia, Protanopia, Tritanopia, HighContrast; apply consistent transforms to header, history, and map symbols.
+  - Deterministic palette downgrade based on `supports-color` result; never rely on ad-hoc terminal heuristics.
+
+### Performance targets & scheduling
+- Target 60 Hz simulation stepping with an interactive UI draw budget of ~10 Hz (configurable). Cap per-frame simulation steps to maintain responsiveness (already implemented via accumulator and MAX_STEPS_PER_FRAME).
+- Avoid allocations in the draw path; reuse buffers for map rows and sparkline points.
+- Use `event::poll` with small timeouts; batch redraw when multiple events arrive in a single scheduling quantum.
+
+### Input & accessibility
+- Keys (already mapped): pause (`space`), speed ± (`+`/`-`), single-step (`s`), help (`?`/`h`), quit (`q`/`Esc`).
+- Planned: cycle palettes (`p`), toggle density mode (emoji/block/ascii), toggle map overlays (biome/food/terrain), selection cycling.
+- Headless mode: `SCRIPTBOTS_TERMINAL_HEADLESS=1` renders to `TestBackend` for CI snapshots.
+
+### Data plumbing & control
+- The renderer consumes an immutable `Snapshot` built from `WorldState`; do not lock the world longer than necessary.
+- Control commands (pause, speed changes, selection) are submitted via the `CommandBus`; the world drains in-tick to preserve determinism.
+
+### Compatibility & fallbacks
+- Capability matrix (macOS Terminal, iTerm2, Windows Terminal, Linux SSH):
+  - Emoji availability varies; always provide ASCII/block fallbacks.
+  - Truecolor vs 256 colors: detect and downgrade palettes; never assume 24‑bit.
+  - Inline image protocols (kitty/iTerm2/SIXEL) are opt-in only and not required for MVP.
+
+### Testing & QA (expanded)
+- Golden snapshot tests: compare textual mini-map and header lines against fixtures for a seeded world; allow small diffs when palette modes change.
+- Input loop tests: simulate key events and assert state transitions (paused, speed multiplier, help overlay) without requiring a real TTY.
+- Performance guard: micro-benchmark drawing functions to assert ≤ 2 ms per draw on CI hardware baseline.
+
+### Deliverables & milestones (revised)
+- M2 (Renderer MVP):
+  - Header/history/map renderers implemented with palette support and deterministic downgrades.
+  - CI smoke test using `SCRIPTBOTS_TERMINAL_HEADLESS=1` producing stable snapshots.
+- M3 (Parity & overlays):
+  - Overlays for food/biome/terrain density; selection cycling; palette cycling; density mode switch.
+  - Basic log viewer panel fed by `tracing` ring buffer.
+- M4 (Polish & optional graphics):
+  - Advanced charts (Chart widget or plotters-backed canvas), configurable themes, optional inline images (kitty/SIXEL) behind feature flags.
+  - Documentation with animated asciicasts and keybinding tables.
+
+### Risks & mitigations (terminal-specific)
+- Terminal heterogeneity → mitigate with strict capability detection and exhaustive fallbacks.
+- Emoji rendering width inconsistencies → rely on `unicode-width`/`unicode-segmentation`; prefer block glyphs when misalignment detected.
+- CPU hotspots in large worlds → cap draw frequency; cache map bins; precompute row strings.
 
 ### Milestone Targets
 - **M1**: Renderer trait + CLI flag merged; GPUI unchanged but conditional path ready.

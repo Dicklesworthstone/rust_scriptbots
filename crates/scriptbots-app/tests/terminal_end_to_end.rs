@@ -43,6 +43,7 @@ impl Drop for EnvCleanup {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct FrameStatsDto {
     tick: u64,
@@ -53,6 +54,7 @@ struct FrameStatsDto {
     avg_energy: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ReportSummaryDto {
     frame_count: usize,
@@ -282,7 +284,7 @@ fn terminal_headless_generates_report() -> Result<()> {
         );
         let history: Vec<_> = guard.history().cloned().collect();
         assert!(
-            history.len() as usize >= frames,
+            history.len() >= frames,
             "world history should retain per-tick summaries (len={})",
             history.len()
         );
@@ -544,7 +546,7 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
 
         let history: Vec<_> = guard.history().cloned().collect();
         assert!(
-            history.len() as usize >= frames,
+            history.len() >= frames,
             "history should capture each simulated tick (len={})",
             history.len()
         );
