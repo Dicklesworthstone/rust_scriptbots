@@ -3440,8 +3440,8 @@ mod map_sandbox {
     fn coordinate_noise(seed: u64, coord: Coord) -> f32 {
         let mut value = seed
             .wrapping_mul(0x9e3779b185ebca87)
-            .wrapping_add(coord.x as u64 * 0xc2b2ae3d27d4eb4f)
-            .wrapping_add(coord.y as u64 * 0x165667b19e3779f9);
+            .wrapping_add((coord.x as u64).wrapping_mul(0xc2b2ae3d27d4eb4f))
+            .wrapping_add((coord.y as u64).wrapping_mul(0x165667b19e3779f9));
         value ^= value >> 30;
         value = value.wrapping_mul(0xbf58476d1ce4e5b9);
         value ^= value >> 27;
