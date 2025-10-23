@@ -12,6 +12,9 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 slotmap = { workspace = true }
 rand = { workspace = true }
+wfc = { workspace = true }
+direction = { workspace = true }
+rand08 = { workspace = true }
 scriptbots-index = { path = "../scriptbots-index" }
 ordered-float = { workspace = true }
 rayon = { workspace = true, optional = true }

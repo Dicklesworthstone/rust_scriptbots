@@ -37,6 +37,9 @@ getrandom = { version = "0.3.4", features = ["wasm_js"] }
 postcard = { version = "1.0.8", default-features = false, features = ["alloc", "use-std"] }
 num_cpus = "1.16.0"
 csv = "1.2.2"
+wfc = "0.10.7"
+direction = "0.18.0"
+rand08 = { package = "rand", version = "0.8.5" }
 
 duckdb = { version = "1.4.1", default-features = false, features = ["bundled"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", branch = "main" }

@@ -2519,15 +2519,47 @@ impl TerrainLayer {
                     TerrainKind::Grass
                 };
 
+                let fertility_bias = default_tile_fertility_bias(kind, elevation, moisture);
+                let temperature_bias = default_tile_temperature_bias(fy);
+                let palette_index = default_tile_palette_index(kind);
+
                 tiles.push(TerrainTile {
                     kind,
                     elevation,
                     moisture,
                     accent: accent_noise,
+                    fertility_bias,
+                    temperature_bias,
+                    palette_index,
                 });
             }
         }
 
+        Ok(Self {
+            width,
+            height,
+            cell_size,
+            tiles,
+        })
+    }
+
+    pub fn from_tiles(
+        width: u32,
+        height: u32,
+        cell_size: u32,
+        tiles: Vec<TerrainTile>,
+    ) -> Result<Self, WorldStateError> {
+        if width == 0 || height == 0 {
+            return Err(WorldStateError::InvalidConfig(
+                "terrain dimensions must be non-zero",
+            ));
+        }
+        let expected = (width as usize) * (height as usize);
+        if tiles.len() != expected {
+            return Err(WorldStateError::InvalidConfig(
+                "terrain tile count does not match dimensions",
+            ));
+        }
         Ok(Self {
             width,
             height,
@@ -2621,8 +2653,30 @@ impl TerrainLayer {
     }
 }
 
+fn default_tile_fertility_bias(kind: TerrainKind, elevation: f32, moisture: f32) -> f32 {
+    let kind_bonus = terrain_kind_fertility_bonus(kind);
+    let moisture_term = (moisture - 0.5) * 0.35;
+    let elevation_term = (elevation - 0.5) * 0.4;
+    (kind_bonus + 0.5 + moisture_term - elevation_term).clamp(0.0, 1.0)
+}
+
+fn default_tile_temperature_bias(normalized_y: f32) -> f32 {
+    (1.0 - normalized_y).clamp(0.0, 1.0)
+}
+
+fn default_tile_palette_index(kind: TerrainKind) -> u16 {
+    match kind {
+        TerrainKind::DeepWater => 0,
+        TerrainKind::ShallowWater => 1,
+        TerrainKind::Sand => 2,
+        TerrainKind::Grass => 3,
+        TerrainKind::Bloom => 4,
+        TerrainKind::Rock => 5,
+    }
+}
+
 /// Terrain classification for each tile.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TerrainKind {
     DeepWater,
     ShallowWater,
@@ -2639,6 +2693,12 @@ pub struct TerrainTile {
     pub elevation: f32,
     pub moisture: f32,
     pub accent: f32,
+    #[serde(default)]
+    pub fertility_bias: f32,
+    #[serde(default)]
+    pub temperature_bias: f32,
+    #[serde(default)]
+    pub palette_index: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
