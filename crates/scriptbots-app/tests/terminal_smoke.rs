@@ -71,7 +71,7 @@ fn strip_ansi(input: &str) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
             if let Some('[') = chars.next() {
-                while let Some(code) = chars.next() {
+                for code in chars.by_ref() {
                     if ('@'..='~').contains(&code) {
                         break;
                     }

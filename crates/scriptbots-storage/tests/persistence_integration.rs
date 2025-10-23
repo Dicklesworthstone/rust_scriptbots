@@ -52,6 +52,21 @@ fn storage_persists_metrics_roundtrip() {
         "top predators should not exceed requested limit"
     );
 
+    let max_tick = guard.max_tick().expect("max tick");
+    assert!(max_tick.is_some(), "expected ticks recorded");
+
+    let replay_events = guard.load_replay_events().expect("replay events");
+    assert!(
+        !replay_events.is_empty(),
+        "expected at least one replay event"
+    );
+
+    let counts = guard.replay_event_counts().expect("replay event counts");
+    assert!(
+        !counts.is_empty(),
+        "expected replay event counts to be populated"
+    );
+
     drop(guard);
     let _ = fs::remove_file(&path);
 }

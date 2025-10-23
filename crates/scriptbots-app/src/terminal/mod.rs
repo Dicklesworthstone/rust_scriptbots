@@ -219,35 +219,28 @@ impl<'a> TerminalApp<'a> {
         let delta = now - self.last_tick;
         self.last_tick = now;
 
+        let mut steps = 0usize;
         let effective_speed = if self.paused {
             0.0
         } else {
             self.speed_multiplier.max(0.0)
         };
 
-        if effective_speed <= f32::EPSILON {
-            return;
-        }
-
         let step_interval = self.tick_interval.as_secs_f32();
-        if step_interval <= f32::EPSILON {
-            return;
+        if effective_speed > f32::EPSILON && step_interval > f32::EPSILON {
+            self.sim_accumulator += delta.as_secs_f32() * effective_speed;
+            let max_accumulator = step_interval * MAX_STEPS_PER_FRAME as f32;
+            if self.sim_accumulator > max_accumulator {
+                self.sim_accumulator = max_accumulator;
+            }
+            steps = (self.sim_accumulator / step_interval).floor() as usize;
+            if steps > MAX_STEPS_PER_FRAME {
+                steps = MAX_STEPS_PER_FRAME;
+            }
+            if steps > 0 {
+                self.sim_accumulator -= step_interval * steps as f32;
+            }
         }
-
-        self.sim_accumulator += delta.as_secs_f32() * effective_speed;
-        let max_accumulator = step_interval * MAX_STEPS_PER_FRAME as f32;
-        if self.sim_accumulator > max_accumulator {
-            self.sim_accumulator = max_accumulator;
-        }
-
-        let mut steps = (self.sim_accumulator / step_interval).floor() as usize;
-        if steps == 0 {
-            return;
-        }
-        if steps > MAX_STEPS_PER_FRAME {
-            steps = MAX_STEPS_PER_FRAME;
-        }
-        self.sim_accumulator -= step_interval * steps as f32;
 
         if let Ok(mut world) = self.world.lock() {
             (self.command_drain.as_ref())(&mut world);
@@ -432,12 +425,9 @@ impl<'a> TerminalApp<'a> {
                 }
             }
             (KeyCode::Char('s'), _) => {
-                if let Ok(mut world) = self.world.lock() {
-                    world.step();
-                }
+                self.step_once();
                 self.paused = true;
                 self.speed_multiplier = 0.0;
-                self.refresh_snapshot();
             }
             (KeyCode::Char('?') | KeyCode::Char('h'), _) => {
                 self.help_visible = !self.help_visible;

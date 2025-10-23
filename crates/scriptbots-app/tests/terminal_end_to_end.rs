@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -13,6 +13,8 @@ use scriptbots_storage::{Storage, StoragePipeline};
 use serde_json::Value;
 use tempfile::tempdir;
 use tracing::Level;
+
+static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct EnvCleanup {
     keys: Vec<String>,
@@ -43,6 +45,11 @@ impl Drop for EnvCleanup {
 
 #[test]
 fn terminal_headless_generates_report() -> Result<()> {
+    let _env_guard = ENV_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env guard");
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter("scriptbots_app=info,scriptbots_core=warn")
         .with_max_level(Level::INFO)
@@ -64,14 +71,16 @@ fn terminal_headless_generates_report() -> Result<()> {
     let report_env = report_path.to_string_lossy().into_owned();
     env.set("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT", &report_env);
 
-    let mut config = ScriptBotsConfig::default();
-    config.food_cell_size = 32;
-    config.world_width = 160;
-    config.world_height = 96;
-    config.population_minimum = 0;
-    config.population_spawn_interval = 0;
-    config.history_capacity = 512;
-    config.rng_seed = Some(0xDEC0_DEAD);
+    let mut config = ScriptBotsConfig {
+        food_cell_size: 32,
+        world_width: 160,
+        world_height: 96,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        history_capacity: 512,
+        rng_seed: Some(0xDEC0_DEAD),
+        ..ScriptBotsConfig::default()
+    };
 
     let mut world = WorldState::new(config.clone())?;
     let mut rng = SmallRng::seed_from_u64(0xBAD5_EED5);
@@ -206,6 +215,11 @@ fn terminal_headless_generates_report() -> Result<()> {
 
 #[test]
 fn terminal_headless_applies_control_updates() -> Result<()> {
+    let _env_guard = ENV_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env guard");
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter("scriptbots_app=info,scriptbots_core=warn")
         .with_max_level(Level::INFO)
@@ -229,15 +243,17 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
     env.set("RUST_LOG", "info");
     env.set("RUST_LOG_STYLE", "never");
 
-    let mut config = ScriptBotsConfig::default();
-    config.world_width = 200;
-    config.world_height = 140;
-    config.food_cell_size = 20;
-    config.population_minimum = 0;
-    config.population_spawn_interval = 0;
-    config.persistence_interval = 1;
+    let mut config = ScriptBotsConfig {
+        world_width: 200,
+        world_height: 140,
+        food_cell_size: 20,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        persistence_interval: 1,
+        rng_seed: Some(0x51EED5),
+        ..ScriptBotsConfig::default()
+    };
     config.analytics_stride.behavior_metrics = 24;
-    config.rng_seed = Some(0x51EED5);
 
     let mut world = WorldState::new(config.clone())?;
     let pipeline = StoragePipeline::with_thresholds(

@@ -815,7 +815,7 @@ pub enum ReplayRngScope {
 }
 
 /// Detailed event recordings emitted for deterministic replays.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReplayEventKind {
     BrainOutputs {
         outputs: Vec<f32>,
@@ -837,7 +837,7 @@ pub enum ReplayEventKind {
 }
 
 /// Lightweight wrapper pairing an agent context with a replay event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayEvent {
     pub agent_id: Option<AgentId>,
     pub kind: ReplayEventKind,
@@ -2749,9 +2749,7 @@ impl WorldState {
                 .get(idx)
                 .map_or(self.config.food_max, |profile| profile.capacity);
             if let Some(cell) = self.food.get_mut(x, y) {
-                if *cell > capacity {
-                    *cell = capacity;
-                }
+                *cell = (*cell).min(capacity);
             }
         }
         respawned
@@ -2787,7 +2785,8 @@ impl WorldState {
                 let left_col = if x == 0 { width - 1 } else { x - 1 };
                 let right_col = if x + 1 == width { 0 } else { x + 1 };
                 let idx = y * width + x;
-                let mut value = previous[idx];
+                let previous_value = previous[idx];
+                let mut value = previous_value;
                 let profile = self
                     .food_profiles
                     .get(idx)
@@ -2805,18 +2804,26 @@ impl WorldState {
                     let up = previous[up_row * width + x];
                     let down = previous[down_row * width + x];
                     let neighbor_avg = (left + right + up + down) * 0.25;
-                    value += diffusion * (neighbor_avg - previous[idx]);
+                    value += diffusion * (neighbor_avg - previous_value);
                 }
 
                 if decay > 0.0 {
                     value -= decay * profile.decay_multiplier * value;
                 }
 
-                if growth > 0.0 {
-                    value += growth * profile.growth_multiplier * (profile.capacity - value);
+                if growth > 0.0 && self.config.food_max > 0.0 {
+                    let normalized = value / self.config.food_max;
+                    let growth_delta =
+                        growth * profile.growth_multiplier * (1.0 - normalized);
+                    value += growth_delta * self.config.food_max;
                 }
 
-                let capacity = profile.capacity.max(0.0);
+                let mut capacity = profile.capacity.max(previous_value);
+                let global_cap = self.config.food_max.max(previous_value);
+                if capacity > global_cap {
+                    capacity = global_cap;
+                }
+                capacity = capacity.max(0.0);
                 cells_mut[idx] = value.clamp(0.0, capacity);
             }
         }

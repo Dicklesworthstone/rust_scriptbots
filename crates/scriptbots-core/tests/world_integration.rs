@@ -16,7 +16,6 @@ fn default_profile(config: &ScriptBotsConfig) -> FoodCellProfileSnapshot {
 fn expected_food_value(world: &WorldState, before: &[f32], x: u32, y: u32) -> f32 {
     let width = world.food().width() as usize;
     let height = world.food().height() as usize;
-    let height = world.food().height() as usize;
     let config = world.config();
     let profile = world
         .food_profile(x, y)
@@ -351,7 +350,7 @@ fn food_growth_moves_toward_capacity() {
 
     let mut world = WorldState::new(config).expect("world");
     let before = world.food().cells().to_vec();
-    world.step();
+   world.step();
 
     let width = world.food().width() as usize;
     let height = world.food().height() as usize;

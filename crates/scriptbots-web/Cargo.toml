@@ -20,3 +20,9 @@ js-sys = "0.3.73"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.54"
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-sat-f2i-conversions"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-sat-f2i-conversions"]

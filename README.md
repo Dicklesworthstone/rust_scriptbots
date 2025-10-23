@@ -270,6 +270,13 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 ### Renderer abstraction
 - The app selects a `Renderer` implementation at runtime (`gpui` or `terminal`) via `--mode {auto|gui|terminal}` or environment variables. Both renderers consume the same world snapshots and control bus.
 
+### Keyboard shortcuts (GUI)
+- Playback: `space` pause/resume, `+`/`-` speed up/down, `s` single-step
+- Views: `d` toggle drawing, `f` toggle food overlay, `Ctrl+Shift+O` toggle agent outlines
+- Spawning: `a` add crossover agents, `q`/`h` spawn carnivore/herbivore
+- World: `c` toggle closed environment, `o` follow oldest, `s` follow selected
+- Accessibility: `p` cycle color palettes (with keyboard rebinding support)
+
 ### Audio system
 - Optional `kira`-backed mixer (feature `audio`) with event-driven cues (births, deaths, spikes) and accessibility toggles.
 - Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
@@ -372,6 +379,15 @@ order by bucket;
 - Threading: tune `RAYON_NUM_THREADS` to match physical cores; verify determinism with seeded runs.
 - Rendering: measure HUD/canvas frame times; avoid per-frame allocations; prefer batched path building.
 
+## Tracing & logging
+- Logging uses `tracing` with `RUST_LOG` filters (e.g., `RUST_LOG=info,scriptbots_core=debug`).
+- Categories of interest:
+  - `scriptbots_core::world` — tick summaries, seeding, closed/open flips
+  - `scriptbots_storage` — flushes, optimize/vacuum
+  - `scriptbots_app::servers` — REST and MCP server lifecycle, tool invocations
+  - `scriptbots_render` — window lifecycle, input bindings
+- Prefer structured fields (e.g., `tick = summary.tick.0`) for machine-readable logs. Avoid panics in production; release profile uses `panic = abort`.
+
 ## Runtime control surfaces
 
 ### REST Control API (with Swagger UI)
@@ -410,11 +426,29 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
 
 ## Configuration files & scenarios
-- Configuration is deserialized into `ScriptBotsConfig` (TOML/RON planned). Scenario layering will allow composing base + biome + experiment. Until file loading lands, use REST/CLI to tweak knobs at runtime and persist your chosen values externally.
+- **Current state**: all configuration changes flow through the control surfaces (REST, MCP HTTP, CLI). Values persist only for the lifetime of the session unless you export them yourself.
+- **Planned**: upcoming releases will load layered configuration files (TOML/RON) so experiments can stack reusable building blocks (e.g., base world defaults → biome overrides → study-specific tweaks).
+  ```text
+  base.toml → arctic_biome.toml → evolution_study.toml
+  ```
+- **Workaround today**: capture the desired configuration via the REST API (`GET /api/config`), version it externally, and apply deltas back with `PATCH /api/config` or the CLI.
+- **Value**: researchers gain repeatable, composable scenarios without hand-editing large monolithic files, making it easy to swap biomes, mutation parameters, or analytics presets on demand.
 
-## Deterministic replay (planned)
-- Event-log schema will capture per-tick snapshots and critical RNG draws/brain outputs to enable headless replay and branch/diff workflows.
-- CLI tooling will compare Rust runs vs the C++ baseline and surface divergences with DuckDB-backed reports.
+## Deterministic replay roadmap
+- **Already implemented**
+  - ✅ Event-log schema (`replay_events` table) storing every tick’s RNG scope, brain outputs, and actions.
+  - ✅ Type-safe encoding for replay artifacts shared by storage and analytics crates.
+  - ✅ Storage plumbing to persist replay batches alongside standard metrics.
+- **Planned**
+  - ❌ Headless replay runner capable of deterministic re-simulation from stored events.
+  - ❌ Branch/diff workflows comparing Rust vs. Rust PR builds vs. the legacy C++ baseline.
+  - ❌ CLI tooling that surfaces divergence reports and snapshot diffs.
+  - ❌ DuckDB-backed analysis views for quick triage of regressions and experiment outcomes.
+- **Use cases**
+  - Parity testing between the Rust port and the original C++ implementation.
+  - Regression prevention by replaying critical seeds in CI or pre-merge checks.
+  - Debugging elusive bugs by reproducing exact agent decisions tick-by-tick.
+  - Long-running research experiments that demand bitwise-stable replays.
 
 ## Security & operations
 - REST and MCP servers bind to loopback by default. If you expose them externally, front with TLS and configure CORS appropriately. The WASM path requires COOP/COEP headers only when enabling multithreading; single-thread builds avoid this.

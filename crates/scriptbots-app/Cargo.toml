@@ -31,6 +31,8 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 crossterm = "0.27"
 owo-colors = "4.0"
 unicode-width = "0.1"
+ron = "0.8"
+toml = "0.8"
 
 [features]
 default = []

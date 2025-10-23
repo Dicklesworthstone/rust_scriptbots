@@ -10,7 +10,7 @@ use scriptbots_core::{
     PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope,
     WorldPersistence,
 };
-use serde_json::{Value, json};
+use serde_json::{self, Value, json};
 use slotmap::Key;
 use std::{
     sync::{Arc, Mutex, OnceLock, mpsc},
@@ -74,6 +74,12 @@ pub enum StorageError {
     DuckDb(#[from] duckdb::Error),
     #[error("storage worker error: {0}")]
     Worker(String),
+    #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
+    ReplayParse {
+        tick: i64,
+        seq: i64,
+        reason: String,
+    },
 }
 
 /// Summary row written to the `ticks` table.
@@ -202,6 +208,21 @@ struct ReplayEventRow {
     scope: String,
     event_type: String,
     payload: String,
+}
+
+/// Aggregate event count grouped by replay event type.
+#[derive(Debug, Clone)]
+pub struct ReplayEventCount {
+    pub event_type: String,
+    pub count: u64,
+}
+
+/// Replay event reconstructed from persisted storage.
+#[derive(Debug, Clone)]
+pub struct PersistedReplayEvent {
+    pub tick: u64,
+    pub seq: u64,
+    pub event: ReplayEvent,
 }
 
 #[derive(Default)]
@@ -767,6 +788,67 @@ impl Storage {
         Ok(())
     }
 
+    /// Return the maximum tick recorded in the `ticks` table, if any.
+    pub fn max_tick(&mut self) -> Result<Option<u64>, StorageError> {
+        self.flush()?;
+        let mut stmt = self.conn.prepare("select max(tick) from ticks")?;
+        let mut rows = stmt.query([])?;
+        let value = match rows.next()? {
+            Some(row) => row.get::<_, Option<i64>>(0)?,
+            None => None,
+        };
+        Ok(value.map(|tick| tick as u64))
+    }
+
+    /// Load all replay events ordered by tick/sequence and reconstruct their payloads.
+    pub fn load_replay_events(&mut self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
+        self.flush()?;
+        let mut stmt = self.conn.prepare(
+            "select tick, seq, agent_id, scope, event_type, payload
+             from replay_events
+             order by tick asc, seq asc",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            let replay_row = ReplayEventRow {
+                tick: row.get(0)?,
+                seq: row.get(1)?,
+                agent_id: row.get(2)?,
+                scope: row.get(3)?,
+                event_type: row.get(4)?,
+                payload: row.get(5)?,
+            };
+            let event = replay_event_from_row(&replay_row)?;
+            events.push(PersistedReplayEvent {
+                tick: replay_row.tick as u64,
+                seq: replay_row.seq as u64,
+                event,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Return counts of replay events grouped by event type.
+    pub fn replay_event_counts(&mut self) -> Result<Vec<ReplayEventCount>, StorageError> {
+        self.flush()?;
+        let mut stmt = self.conn.prepare(
+            "select event_type, count(*) as total
+             from replay_events
+             group by event_type
+             order by event_type",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut counts = Vec::new();
+        while let Some(row) = rows.next()? {
+            counts.push(ReplayEventCount {
+                event_type: row.get(0)?,
+                count: row.get::<_, i64>(1)? as u64,
+            });
+        }
+        Ok(counts)
+    }
+
     /// Return agents ranked by average energy across all recorded ticks.
     pub fn top_predators(&mut self, limit: usize) -> Result<Vec<PredatorStats>, StorageError> {
         self.flush()?;
@@ -862,7 +944,7 @@ pub struct PredatorStats {
 
 #[derive(Debug)]
 enum StorageCommand {
-    Persist(PersistenceBatch),
+    Persist(Box<PersistenceBatch>),
     Flush,
     Shutdown,
 }
@@ -908,23 +990,25 @@ impl StoragePipeline {
                     match command {
                         StorageCommand::Persist(batch) => match worker_storage.lock() {
                             Ok(mut storage) => {
+                                let tick = batch.summary.tick.0;
                                 if let Err(err) = storage.persist(&batch) {
                                     eprintln!(
                                         "failed to persist tick {} asynchronously: {err}",
-                                        batch.summary.tick.0
+                                        tick
                                     );
                                 }
                             }
                             Err(poisoned) => {
+                                let tick = batch.summary.tick.0;
                                 eprintln!(
                                     "storage mutex poisoned while persisting tick {}",
-                                    batch.summary.tick.0
+                                    tick
                                 );
                                 let mut storage = poisoned.into_inner();
                                 if let Err(err) = storage.persist(&batch) {
                                     eprintln!(
                                         "failed to persist tick {} after poison: {err}",
-                                        batch.summary.tick.0
+                                        tick
                                     );
                                 }
                             }
@@ -972,7 +1056,7 @@ impl WorldPersistence for StoragePipeline {
     fn on_tick(&mut self, payload: &PersistenceBatch) {
         if self
             .tx
-            .send(StorageCommand::Persist(payload.clone()))
+            .send(StorageCommand::Persist(Box::new(payload.clone())))
             .is_err()
         {
             eprintln!(
@@ -1129,6 +1213,164 @@ fn replay_row_from_event(event: &ReplayEvent, tick: i64, seq: usize) -> ReplayEv
         event_type,
         payload: payload_value.to_string(),
     }
+}
+
+fn decode_agent_id(raw: Option<i64>, tick: i64, seq: i64) -> Result<Option<AgentId>, StorageError> {
+    match raw {
+        Some(value) if value < 0 => Err(StorageError::ReplayParse {
+            tick,
+            seq,
+            reason: format!("negative agent id {value}"),
+        }),
+        Some(value) => Ok(Some(AgentId::from_ffi(value as u64))),
+        None => Ok(None),
+    }
+}
+
+fn agent_id_from_u64(value: u64, tick: i64, seq: i64) -> Result<AgentId, StorageError> {
+    if value > i64::MAX as u64 {
+        return Err(StorageError::ReplayParse {
+            tick,
+            seq,
+            reason: format!("agent id {value} exceeds supported range"),
+        });
+    }
+    Ok(AgentId::from_ffi(value))
+}
+
+fn parse_payload<T>(row: &ReplayEventRow) -> Result<T, StorageError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(&row.payload).map_err(|err| StorageError::ReplayParse {
+        tick: row.tick,
+        seq: row.seq,
+        reason: format!("failed to deserialize payload: {err}"),
+    })
+}
+
+fn parse_agent_phase(label: &str) -> Option<ReplayAgentPhase> {
+    match label {
+        "movement" => Some(ReplayAgentPhase::Movement),
+        "reproduction" => Some(ReplayAgentPhase::Reproduction),
+        "mutation" => Some(ReplayAgentPhase::Mutation),
+        "spawn" => Some(ReplayAgentPhase::Spawn),
+        "selection" => Some(ReplayAgentPhase::Selection),
+        "misc" => Some(ReplayAgentPhase::Misc),
+        _ => None,
+    }
+}
+
+fn parse_rng_scope(
+    scope: &str,
+    agent_id: Option<AgentId>,
+    row: &ReplayEventRow,
+) -> Result<ReplayRngScope, StorageError> {
+    if scope == "world" {
+        return Ok(ReplayRngScope::World);
+    }
+
+    if let Some(phase_label) = scope.strip_prefix("agent:") {
+        let agent_id = agent_id.ok_or_else(|| StorageError::ReplayParse {
+            tick: row.tick,
+            seq: row.seq,
+            reason: "agent-scoped RNG sample missing agent_id".to_string(),
+        })?;
+        let phase = parse_agent_phase(phase_label).ok_or_else(|| StorageError::ReplayParse {
+            tick: row.tick,
+            seq: row.seq,
+            reason: format!("unknown agent phase '{phase_label}'"),
+        })?;
+        return Ok(ReplayRngScope::Agent { agent_id, phase });
+    }
+
+    Err(StorageError::ReplayParse {
+        tick: row.tick,
+        seq: row.seq,
+        reason: format!("unknown replay scope '{scope}'"),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BrainOutputsPayload {
+    outputs: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionPayload {
+    left_wheel: f32,
+    right_wheel: f32,
+    boost: bool,
+    spike_target: Option<u64>,
+    sound_level: f32,
+    give_intent: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RngSamplePayload {
+    range_min: f32,
+    range_max: f32,
+    value: f32,
+}
+
+fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageError> {
+    let agent_id = decode_agent_id(row.agent_id, row.tick, row.seq)?;
+    let kind = match row.event_type.as_str() {
+        "brain_outputs" => {
+            if row.scope.starts_with("agent:") && agent_id.is_none() {
+                return Err(StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "brain outputs missing agent_id".to_string(),
+                });
+            }
+            let payload: BrainOutputsPayload = parse_payload(row)?;
+            ReplayEventKind::BrainOutputs {
+                outputs: payload.outputs,
+            }
+        }
+        "action" => {
+            if row.scope.starts_with("agent:") && agent_id.is_none() {
+                return Err(StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "action event missing agent_id".to_string(),
+                });
+            }
+            let payload: ActionPayload = parse_payload(row)?;
+            let spike_target = match payload.spike_target {
+                Some(raw) => Some(agent_id_from_u64(raw, row.tick, row.seq)?),
+                None => None,
+            };
+            ReplayEventKind::Action {
+                left_wheel: payload.left_wheel,
+                right_wheel: payload.right_wheel,
+                boost: payload.boost,
+                spike_target,
+                sound_level: payload.sound_level,
+                give_intent: payload.give_intent,
+            }
+        }
+        "rng_sample" => {
+            let payload: RngSamplePayload = parse_payload(row)?;
+            let scope = parse_rng_scope(&row.scope, agent_id, row)?;
+            ReplayEventKind::RngSample {
+                scope,
+                range_min: payload.range_min,
+                range_max: payload.range_max,
+                value: payload.value,
+            }
+        }
+        other => {
+            return Err(StorageError::ReplayParse {
+                tick: row.tick,
+                seq: row.seq,
+                reason: format!("unknown event type '{other}'"),
+            })
+        }
+    };
+
+    Ok(ReplayEvent { agent_id, kind })
 }
 
 fn birth_row_from_record(record: &BirthRecord) -> BirthRow {
