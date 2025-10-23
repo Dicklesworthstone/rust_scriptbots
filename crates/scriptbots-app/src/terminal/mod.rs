@@ -27,7 +27,6 @@ use ratatui::{
 use scriptbots_core::AgentData;
 use scriptbots_core::{AgentId, TerrainKind, TerrainLayer, TickSummary, WorldState};
 use serde::Serialize;
-use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::info;
 
@@ -1479,7 +1478,7 @@ impl Palette {
     fn terrain_symbol(&self, kind: TerrainKind, food_level: f32) -> (char, Style) {
         let rich_color = self
             .level
-            .map_or(false, |level| level.has_16m || level.has_256);
+            .is_some_and(|level| level.has_16m || level.has_256);
         let (glyph, fg, bg) = match kind {
             TerrainKind::DeepWater => ('≈', Color::Cyan, Color::Blue),
             TerrainKind::ShallowWater => (

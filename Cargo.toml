@@ -84,3 +84,5 @@ ci = ["github"]
 
 [[workspace.metadata.dist.product]]
 package = "scriptbots-app"
+once_cell = "1.19.0"
+num_cpus = "1.16.0"

@@ -1,6 +1,8 @@
 //! Core types shared across the ScriptBots workspace.
 
 use ordered_float::OrderedFloat;
+#[cfg(feature = "parallel")]
+use once_cell::sync::OnceLock;
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -11,6 +13,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use thiserror::Error;
+
+#[cfg(feature = "parallel")]
+static RAYON_LIMIT_GUARD: OnceLock<()> = OnceLock::new();
 
 #[cfg(feature = "parallel")]
 macro_rules! collect_handles {
@@ -78,6 +83,49 @@ fn wrap_unsigned_angle(mut angle: f32) -> f32 {
     }
     angle
 }
+
+#[cfg(feature = "parallel")]
+fn configure_parallelism() {
+    use std::cmp::max;
+
+    RAYON_LIMIT_GUARD.get_or_init(|| {
+        if std::env::var("RAYON_NUM_THREADS").is_ok() {
+            return;
+        }
+
+        let cpu_count = max(1, num_cpus::get_physical());
+        let env_limit = std::env::var("SCRIPTBOTS_MAX_THREADS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0);
+
+        let mut limit = env_limit.unwrap_or_else(|| default_thread_budget(cpu_count));
+        if limit > cpu_count {
+            limit = cpu_count;
+        }
+        if limit == 0 {
+            limit = 1;
+        }
+
+        std::env::set_var("RAYON_NUM_THREADS", limit.to_string());
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(limit)
+            .thread_name(|idx| format!("scriptbots-worker-{idx}"))
+            .build_global();
+    });
+}
+
+#[cfg(feature = "parallel")]
+fn default_thread_budget(cpu_count: usize) -> usize {
+    match cpu_count {
+        0 | 1 | 2 => 1,
+        3 | 4 => 2,
+        _ => 4,
+    }
+}
+
+#[cfg(not(feature = "parallel"))]
+fn configure_parallelism() {}
 
 fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
@@ -2616,6 +2664,7 @@ impl WorldState {
         config: ScriptBotsConfig,
         persistence: Box<dyn WorldPersistence>,
     ) -> Result<Self, WorldStateError> {
+        configure_parallelism();
         let (food_w, food_h) = config.food_dimensions()?;
         let rng = config.seeded_rng();
         let mut terrain_rng = rng.clone();

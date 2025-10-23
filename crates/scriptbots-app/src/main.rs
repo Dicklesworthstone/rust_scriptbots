@@ -14,6 +14,7 @@ use scriptbots_core::{
 use scriptbots_render::run_demo;
 use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
+use ron::ser::PrettyConfig as RonPrettyConfig;
 use std::{
     collections::HashMap,
     env, fmt, fs,
@@ -25,12 +26,19 @@ use tracing::{debug, info, warn};
 fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
+    let config = compose_config(&cli)?;
+    if let Some(outcome) = maybe_emit_config(&cli, &config)? {
+        if matches!(outcome, ConfigEmitOutcome::Exit) {
+            return Ok(());
+        }
+    }
+
     if cli.replay_db.is_some() {
-        run_replay_cli(&cli)?;
+        run_replay_cli(&cli, &config)?;
         return Ok(());
     }
 
-    let (world, storage) = bootstrap_world(&cli)?;
+    let (world, storage) = bootstrap_world(&cli, config)?;
     let control_config = ControlServerConfig::from_env();
     let (control_runtime, command_drain, command_submit) =
         ControlRuntime::launch(world.clone(), control_config)?;
@@ -60,9 +68,7 @@ fn init_tracing() {
         .try_init();
 }
 
-fn bootstrap_world(cli: &AppCli) -> Result<(SharedWorld, SharedStorage)> {
-    let config = compose_config(cli)?;
-
+fn bootstrap_world(cli: &AppCli, config: ScriptBotsConfig) -> Result<(SharedWorld, SharedStorage)> {
     let storage_path =
         env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
     if let Some(parent) = Path::new(&storage_path)
@@ -143,6 +149,25 @@ struct AppCli {
     /// Limit the number of ticks simulated during replay verification.
     #[arg(long = "tick-limit", value_name = "TICKS", requires = "replay_db")]
     tick_limit: Option<u64>,
+    /// Print the composed configuration in the selected format.
+    #[arg(long = "print-config", action = ArgAction::SetTrue)]
+    print_config: bool,
+    /// Write the composed configuration to the provided path (directories created as needed).
+    #[arg(long = "write-config", value_name = "FILE")]
+    write_config: Option<PathBuf>,
+    /// Output format for `--print-config` / `--write-config`.
+    #[arg(long = "config-format", value_enum, default_value_t = ConfigFormat::Json)]
+    config_format: ConfigFormat,
+    /// Exit immediately after emitting configuration output.
+    #[arg(long = "config-only", action = ArgAction::SetTrue)]
+    config_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum ConfigFormat {
+    Json,
+    Toml,
+    Ron,
 }
 
 fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<ScriptBotsConfig> {
@@ -812,7 +837,7 @@ activation = "Tanh"
         let overlay_path = dir.path().join("overlay.ron");
         fs::write(
             &overlay_path,
-            "(history_capacity: 1024, neuroflow: (hidden_layers: [8, 4], activation: \"Sigmoid\"), world_width: 2048)",
+            r#"{ history_capacity: 1024, neuroflow: { hidden_layers: [8, 4], activation: "Sigmoid" }, world_width: 2048 }"#,
         )
         .expect("write overlay layer");
 

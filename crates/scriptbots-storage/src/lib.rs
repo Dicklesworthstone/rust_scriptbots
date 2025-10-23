@@ -2,7 +2,7 @@
 
 #[cfg(target_os = "windows")]
 #[link(name = "rstrtmgr")]
-extern "system" {}
+unsafe extern "system" {}
 
 use duckdb::{Connection, Transaction, params};
 use scriptbots_core::{
