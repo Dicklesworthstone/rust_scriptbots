@@ -114,7 +114,7 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     child1.env("SCRIPTBOTS_DET_RUN", "1");
     child1.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
     child1.env("RAYON_NUM_THREADS", "1");
-    if let Some(seed) = std::env::var("SCRIPTBOTS_DET_SEED").ok() {
+    if let Ok(seed) = std::env::var("SCRIPTBOTS_DET_SEED") {
         child1.env("SCRIPTBOTS_RNG_SEED", seed);
     }
     let out1 = child1.output().context("failed to run det child 1")?;
@@ -1113,6 +1113,7 @@ activation = "Sigmoid"
             write_config: Some(output.clone()),
             config_format: ConfigFormat::Toml,
             config_only: true,
+            det_check: None,
         };
 
         let config = ScriptBotsConfig {
@@ -1150,6 +1151,7 @@ activation = "Sigmoid"
             write_config: Some(output.clone()),
             config_format: ConfigFormat::Ron,
             config_only: false,
+            det_check: None,
         };
 
         let config = ScriptBotsConfig::default();

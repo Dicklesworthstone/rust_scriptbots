@@ -1933,6 +1933,10 @@ pub struct ScriptBotsConfig {
     pub reproduction_energy_cost: f32,
     /// Cooldown in ticks between reproductions.
     pub reproduction_cooldown: u32,
+    /// Interval (in ticks) controlling when reproduction attempts are evaluated. `0` allows attempts every tick.
+    pub reproduction_attempt_interval: u32,
+    /// Probability that a ready agent reproduces when the attempt cadence fires.
+    pub reproduction_attempt_chance: f32,
     /// Herbivore reproduction rate multiplier applied per tick.
     pub reproduction_rate_herbivore: f32,
     /// Carnivore reproduction rate multiplier applied per tick.
@@ -1959,6 +1963,8 @@ pub struct ScriptBotsConfig {
     pub reproduction_meta_mutation_chance: f32,
     /// Magnitude of meta-mutation applied to mutation rates.
     pub reproduction_meta_mutation_scale: f32,
+    /// Number of ticks between age increments and associated aging checks.
+    pub aging_tick_interval: u32,
     /// Age (in ticks) after which health decay begins to scale.
     pub aging_health_decay_start: u32,
     /// Incremental health decay applied per tick beyond the start age.
@@ -2070,6 +2076,8 @@ impl Default for ScriptBotsConfig {
             reproduction_energy_threshold: 0.65,
             reproduction_energy_cost: 0.0,
             reproduction_cooldown: 300,
+            reproduction_attempt_interval: 15,
+            reproduction_attempt_chance: 0.1,
             reproduction_rate_herbivore: 1.0,
             reproduction_rate_carnivore: 1.0,
             reproduction_food_bonus: 3.0,
@@ -2083,6 +2091,7 @@ impl Default for ScriptBotsConfig {
             reproduction_gene_log_capacity: 12,
             reproduction_meta_mutation_chance: 0.2,
             reproduction_meta_mutation_scale: 0.5,
+            aging_tick_interval: 100,
             aging_health_decay_start: 12_000,
             aging_health_decay_rate: 0.0,
             aging_health_decay_max: 0.0,
@@ -2263,6 +2272,7 @@ impl ScriptBotsConfig {
             || self.reproduction_spawn_jitter < 0.0
             || self.reproduction_color_jitter < 0.0
             || self.reproduction_mutation_scale < 0.0
+            || !(0.0..=1.0).contains(&self.reproduction_attempt_chance)
             || self.reproduction_rate_herbivore <= 0.0
             || self.reproduction_rate_carnivore <= 0.0
             || self.spike_radius <= 0.0
@@ -2277,6 +2287,7 @@ impl ScriptBotsConfig {
             || self.carnivore_threshold >= 1.0
             || self.history_capacity == 0
             || self.temperature_discomfort_rate < 0.0
+            || self.aging_tick_interval == 0
             || self.aging_health_decay_rate < 0.0
             || self.aging_health_decay_max < 0.0
             || self.aging_energy_penalty_rate < 0.0
@@ -2706,10 +2717,9 @@ mod map_sandbox {
         TerrainKind, TerrainLayer, TerrainTile, default_tile_fertility_bias,
         default_tile_palette_index,
     };
-    use direction::{CardinalDirection, CardinalDirectionTable, CardinalDirections};
+    use direction::{CardinalDirection, CardinalDirectionTable};
     use rand08::{SeedableRng, rngs::StdRng};
     use serde::{Deserialize, Serialize};
-    use serde_json;
     use std::collections::{HashMap, HashSet};
     use std::hash::{DefaultHasher, Hasher};
     use std::num::NonZeroU32;
@@ -3158,11 +3168,12 @@ mod map_sandbox {
                             attempts: success_attempt,
                         })?;
                 let idx = pattern_id as usize;
-                let tile = self.compiled_tiles.get(idx).ok_or_else(|| {
-                    MapGenerationError::Contradiction {
-                        attempts: success_attempt,
-                    }
-                })?;
+                let tile =
+                    self.compiled_tiles
+                        .get(idx)
+                        .ok_or(MapGenerationError::Contradiction {
+                            attempts: success_attempt,
+                        })?;
                 let accent_noise = coordinate_noise(seed, coord);
                 let accent = (tile.accent + accent_noise * 0.35).clamp(0.0, 1.0);
                 tiles.push(TerrainTile {
@@ -3232,7 +3243,7 @@ mod map_sandbox {
         let compiled_tiles = spec
             .tiles
             .iter()
-            .map(|tile| compile_tile(tile))
+            .map(compile_tile)
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut rules = Vec::with_capacity(compiled_tiles.len());
@@ -3261,7 +3272,7 @@ mod map_sandbox {
             .enumerate()
             .map(|(idx, tile)| {
                 let mut neighbors = CardinalDirectionTable::default();
-                for direction in CardinalDirections {
+                for direction in direction::CardinalDirections {
                     let resolved = rules[idx][direction].resolve(compiled_tiles.len());
                     if resolved.is_empty() {
                         return Err(MapGenerationError::EmptyAdjacency {
@@ -3282,33 +3293,35 @@ mod map_sandbox {
     fn compile_tile(tile: &TileSpec) -> Result<CompiledTile, MapGenerationError> {
         let elevation = tile
             .elevation
-            .unwrap_or_else(|| default_elevation_for_kind(tile.terrain_kind));
+            .unwrap_or(default_elevation_for_kind(tile.terrain_kind));
         let moisture = tile
             .moisture
-            .unwrap_or_else(|| default_moisture_for_kind(tile.terrain_kind));
-        let fertility_bias = tile
-            .fertility_bias
-            .unwrap_or_else(|| default_tile_fertility_bias(tile.terrain_kind, elevation, moisture));
+            .unwrap_or(default_moisture_for_kind(tile.terrain_kind));
+        let fertility_bias = tile.fertility_bias.unwrap_or(default_tile_fertility_bias(
+            tile.terrain_kind,
+            elevation,
+            moisture,
+        ));
         let temperature_bias = tile.temperature_bias.unwrap_or(0.5);
         let accent = tile.accent.unwrap_or(0.5);
         let palette_index = tile
             .palette_index
-            .unwrap_or_else(|| default_tile_palette_index(tile.terrain_kind));
+            .unwrap_or(default_tile_palette_index(tile.terrain_kind));
         let permeability = tile
             .permeability
-            .unwrap_or_else(|| default_permeability_for_kind(tile.terrain_kind));
+            .unwrap_or(default_permeability_for_kind(tile.terrain_kind));
         let runoff_bias = tile
             .runoff_bias
-            .unwrap_or_else(|| default_runoff_bias_for_kind(tile.terrain_kind));
+            .unwrap_or(default_runoff_bias_for_kind(tile.terrain_kind));
         let basin_rank = tile
             .basin_rank
-            .unwrap_or_else(|| default_basin_rank_for_kind(tile.terrain_kind));
+            .unwrap_or(default_basin_rank_for_kind(tile.terrain_kind));
         let channel_priority = tile
             .channel_priority
-            .unwrap_or_else(|| default_channel_priority_for_kind(tile.terrain_kind));
+            .unwrap_or(default_channel_priority_for_kind(tile.terrain_kind));
         let swim_cost = tile
             .swim_cost
-            .unwrap_or_else(|| default_swim_cost_for_kind(tile.terrain_kind));
+            .unwrap_or(default_swim_cost_for_kind(tile.terrain_kind));
 
         Ok(CompiledTile {
             id: tile.id.clone(),
@@ -3569,8 +3582,7 @@ mod map_sandbox {
         }
 
         let mut initial_water_depth = Vec::with_capacity(len);
-        for idx in 0..len {
-            let hyd = &hydrology_tiles[idx];
+        for hyd in hydrology_tiles.iter().take(len) {
             let base_depth = hyd.basin_rank * 0.25 + hyd.runoff_bias.max(0.0) * 0.05;
             let permeability_discount = hyd.permeability * 0.1;
             let depth = (base_depth - permeability_discount).clamp(0.0, 0.6);

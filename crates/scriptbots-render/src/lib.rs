@@ -198,31 +198,33 @@ impl SimulationView {
         self.last_sim_instant = Some(now);
 
         // Auto-pause: honor control config thresholds without mutating world state directly.
-        if !self.controls.paused {
-            if let Ok(world) = self.world.lock() {
-                let control = world.config().control.clone();
-                let agent_count = world.agent_count();
-                let max_age = world.last_max_age();
-                let spike_hits = world.last_spike_hits();
-                drop(world);
+        if !self.controls.paused
+            && let Ok(world) = self.world.lock()
+        {
+            let control = world.config().control.clone();
+            let agent_count = world.agent_count();
+            let max_age = world.last_max_age();
+            let spike_hits = world.last_spike_hits();
+            drop(world);
 
-                let mut reason: Option<String> = None;
-                if control.auto_pause_on_spike_hit && spike_hits > 0 {
-                    reason = Some(format!("spike hits detected ({})", spike_hits));
-                } else if let Some(age_limit) = control.auto_pause_age_above {
-                    if max_age >= age_limit {
-                        reason = Some(format!("max age {} ≥ {}", max_age, age_limit));
-                    }
-                } else if let Some(limit) = control.auto_pause_population_below {
-                    if agent_count as u32 <= limit {
-                        reason = Some(format!("population {} ≤ {}", agent_count, limit));
-                    }
-                }
+            let mut reason: Option<String> = None;
+            if control.auto_pause_on_spike_hit && spike_hits > 0 {
+                reason = Some(format!("spike hits detected ({})", spike_hits));
+            } else if let Some(age_limit) = control
+                .auto_pause_age_above
+                .filter(|&limit| max_age >= limit)
+            {
+                reason = Some(format!("max age {} ≥ {}", max_age, age_limit));
+            } else if let Some(limit) = control
+                .auto_pause_population_below
+                .filter(|&limit| agent_count as u32 <= limit)
+            {
+                reason = Some(format!("population {} ≤ {}", agent_count, limit));
+            }
 
-                if let Some(reason) = reason {
-                    self.controls.paused = true;
-                    info!(reason = %reason, "Auto-paused due to control settings");
-                }
+            if let Some(reason) = reason {
+                self.controls.paused = true;
+                info!(reason = %reason, "Auto-paused due to control settings");
             }
         }
 

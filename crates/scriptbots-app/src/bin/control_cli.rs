@@ -681,10 +681,7 @@ where
             .await
             .context("failed to deserialize control API response")
     } else {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unavailable>".to_string());
+        let body = response.text().await.unwrap_or("<unavailable>".to_string());
         bail!("control API request failed ({status}): {body}");
     }
 }

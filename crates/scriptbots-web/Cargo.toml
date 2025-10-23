@@ -21,6 +21,9 @@ js-sys = "0.3.73"
 [dev-dependencies]
 wasm-bindgen-test = "0.3.54"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2.16", features = ["js"] }
+
 [package.metadata.wasm-pack.profile.dev]
 wasm-opt = ["-O", "--enable-bulk-memory"]
 

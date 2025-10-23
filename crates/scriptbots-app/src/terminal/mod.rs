@@ -853,7 +853,7 @@ impl<'a> TerminalApp<'a> {
                 };
                 write!(file, "{}", glyph)?;
             }
-            write!(file, "\n")?;
+            writeln!(file)?;
         }
         Ok(())
     }
@@ -948,20 +948,22 @@ impl<'a> TerminalApp<'a> {
                 "Auto-pause: spike hits detected ({})",
                 self.snapshot.spike_hits
             ));
-        } else if let Some(age_limit) = control.auto_pause_age_above {
-            if self.snapshot.max_age >= age_limit {
-                reason = Some(format!(
-                    "Auto-pause: max age {} ≥ {}",
-                    self.snapshot.max_age, age_limit
-                ));
-            }
-        } else if let Some(limit) = control.auto_pause_population_below {
-            if self.snapshot.agent_count as u32 <= limit {
-                reason = Some(format!(
-                    "Auto-pause: population {} ≤ {}",
-                    self.snapshot.agent_count, limit
-                ));
-            }
+        } else if let Some(age_limit) = control
+            .auto_pause_age_above
+            .filter(|&limit| self.snapshot.max_age >= limit)
+        {
+            reason = Some(format!(
+                "Auto-pause: max age {} ≥ {}",
+                self.snapshot.max_age, age_limit
+            ));
+        } else if let Some(limit) = control
+            .auto_pause_population_below
+            .filter(|&limit| self.snapshot.agent_count as u32 <= limit)
+        {
+            reason = Some(format!(
+                "Auto-pause: population {} ≤ {}",
+                self.snapshot.agent_count, limit
+            ));
         }
 
         if let Some(reason) = reason {

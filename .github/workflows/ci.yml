@@ -36,11 +36,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install mold linker
+      - name: Install mold linker and system deps
         if: ${{ matrix.os == 'ubuntu-24.04' }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -84,10 +91,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install mold linker
+      - name: Install mold linker and system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
