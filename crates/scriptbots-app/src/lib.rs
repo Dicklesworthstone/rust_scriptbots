@@ -40,7 +40,9 @@ pub use command::{
     CommandDrain, CommandReceiver, CommandSender, CommandSubmit, create_command_bus,
     drain_pending_commands, make_command_drain, make_command_submit,
 };
-pub use control::{ConfigSnapshot, ControlError, ControlHandle, KnobEntry, KnobKind, KnobUpdate};
+pub use control::{
+    ConfigSnapshot, ControlError, ControlHandle, HydrologySnapshot, KnobEntry, KnobKind, KnobUpdate,
+};
 pub use scriptbots_core::ControlCommand;
 pub use servers::{
     ConfigPatchRequest, ControlRuntime, ControlServerConfig, KnobApplyRequest, McpTransportConfig,

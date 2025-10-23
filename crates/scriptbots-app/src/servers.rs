@@ -39,7 +39,7 @@ use crate::command::{
 };
 use crate::control::{
     AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClass, EventEntry, EventKind,
-    KnobEntry, KnobUpdate, Scoreboard,
+    HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard,
 };
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
@@ -376,6 +376,7 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
         patch_config,
         apply_updates,
         get_latest_tick_summary,
+        get_hydrology_snapshot,
         stream_ticks_sse,
         get_events_tail,
         get_scoreboard,
@@ -398,7 +399,8 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
             EventKind,
             DietClass,
             AgentScoreEntry,
-            Scoreboard
+            Scoreboard,
+            HydrologySnapshot
         )
     ),
     info(title = "ScriptBots Control API", version = "0.0.0"),
@@ -415,6 +417,13 @@ impl AppError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }
@@ -496,6 +505,24 @@ async fn get_latest_tick_summary(
 ) -> Result<Json<TickSummaryDto>, AppError> {
     let summary = state.handle.latest_summary()?;
     Ok(Json(summary.into()))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/hydrology",
+    tag = "control",
+    responses(
+        (status = 200, body = HydrologySnapshot),
+        (status = 404, description = "Hydrology state unavailable")
+    )
+)]
+async fn get_hydrology_snapshot(
+    State(state): State<ApiState>,
+) -> Result<Json<HydrologySnapshot>, AppError> {
+    match state.handle.hydrology_snapshot()? {
+        Some(snapshot) => Ok(Json(snapshot)),
+        None => Err(AppError::not_found("hydrology state unavailable")),
+    }
 }
 
 /// Stream latest tick summaries as Server-Sent Events (SSE).
@@ -671,6 +698,7 @@ async fn run_rest_server(
         // Tick summaries (JSON one-shot and SSE stream)
         .route("/api/ticks/latest", get(get_latest_tick_summary))
         .route("/api/ticks/stream", get(stream_ticks_sse))
+        .route("/api/hydrology", get(get_hydrology_snapshot))
         // Event tail and scoreboard
         .route("/api/events/tail", get(get_events_tail))
         .route("/api/scoreboard", get(get_scoreboard))

@@ -23,9 +23,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table},
 };
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use scriptbots_app::{
-    ConfigPatchRequest, ConfigSnapshot, KnobApplyRequest, KnobEntry, KnobKind, KnobUpdate,
+    ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest, KnobEntry, KnobKind,
+    KnobUpdate,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -98,6 +99,8 @@ enum Command {
         /// Preset name to apply (see `presets`).
         name: String,
     },
+    /// Show hydrology metrics and raw layers.
+    Hydrology,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -142,6 +145,7 @@ async fn main() -> Result<()> {
                 Command::ApplyPreset { name } => {
                     presets_apply(&client, &cli.base_url, &name).await?
                 }
+                Command::Hydrology => hydrology_command(&client, &cli.base_url).await?,
             }
         }
     }

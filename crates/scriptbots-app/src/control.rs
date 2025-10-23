@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use scriptbots_core::{ControlCommand, ScriptBotsConfig, Tick, WorldState};
+use scriptbots_core::{ControlCommand, HydrologyFlowDirection, HydrologyState, ScriptBotsConfig, Tick, WorldState};
 
 use crate::SharedWorld;
 use crate::command::CommandSender;
@@ -30,6 +30,71 @@ impl ConfigSnapshot {
             tick: tick.0,
             config: config_value,
         })
+    }
+}
+
+/// Snapshot describing the current hydrology state.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct HydrologySnapshot {
+    pub width: u32,
+    pub height: u32,
+    pub total_water_depth: f32,
+    pub mean_water_depth: f32,
+    pub flooded_shallow_count: u32,
+    pub flooded_deep_count: u32,
+    pub shallow_threshold: f32,
+    pub deep_threshold: f32,
+    #[schema(value_type = Vec<f32>)]
+    pub water_depth: Vec<f32>,
+    #[schema(value_type = Vec<String>)]
+    pub flow_directions: Vec<String>,
+    #[schema(value_type = Vec<u32>)]
+    pub basin_ids: Vec<u32>,
+    #[schema(value_type = Vec<f32>)]
+    pub accumulation: Vec<f32>,
+    #[schema(value_type = Vec<f32>)]
+    pub spill_elevation: Vec<f32>,
+}
+
+impl HydrologySnapshot {
+    const SHALLOW_THRESHOLD: f32 = 0.05;
+    const DEEP_THRESHOLD: f32 = 0.2;
+
+    fn from_state(state: &HydrologyState) -> Self {
+        let total_water_depth = state.total_water_depth();
+        let cell_count = state.cell_count().max(1) as f32;
+        let (shallow, deep) =
+            state.flooded_cell_counts(Self::SHALLOW_THRESHOLD, Self::DEEP_THRESHOLD);
+
+        let flow_directions = state
+            .field()
+            .flow_directions()
+            .iter()
+            .map(|direction| match direction {
+                HydrologyFlowDirection::North => "N",
+                HydrologyFlowDirection::South => "S",
+                HydrologyFlowDirection::East => "E",
+                HydrologyFlowDirection::West => "W",
+                HydrologyFlowDirection::None => "-",
+            }
+            .to_string())
+            .collect();
+
+        Self {
+            width: state.width(),
+            height: state.height(),
+            total_water_depth,
+            mean_water_depth: total_water_depth / cell_count,
+            flooded_shallow_count: shallow as u32,
+            flooded_deep_count: deep as u32,
+            shallow_threshold: Self::SHALLOW_THRESHOLD,
+            deep_threshold: Self::DEEP_THRESHOLD,
+            water_depth: state.water_depth().to_vec(),
+            flow_directions,
+            basin_ids: state.field().basin_ids().to_vec(),
+            accumulation: state.field().accumulation().to_vec(),
+            spill_elevation: state.field().spill_elevation().to_vec(),
+        }
     }
 }
 
@@ -136,6 +201,12 @@ impl ControlHandle {
                 spike_hits: 0,
             })
         }
+    }
+
+    /// Retrieve a snapshot of the current hydrology state, if available.
+    pub fn hydrology_snapshot(&self) -> Result<Option<HydrologySnapshot>, ControlError> {
+        let world = self.lock_world()?;
+        Ok(world.hydrology().map(HydrologySnapshot::from_state))
     }
 
     /// Flatten the configuration into individual knob descriptors for discovery.
