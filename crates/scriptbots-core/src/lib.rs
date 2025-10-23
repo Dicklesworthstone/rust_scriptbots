@@ -3901,8 +3901,7 @@ impl TickCadence {
     }
 
     fn reproduction_window(&self, tick: Tick) -> bool {
-        self.reproduction_interval == 0
-            || tick.0.is_multiple_of(self.reproduction_interval as u64)
+        self.reproduction_interval == 0 || tick.0.is_multiple_of(self.reproduction_interval as u64)
     }
 
     fn reproduction_chance(&self) -> f32 {
@@ -5563,9 +5562,7 @@ impl WorldState {
             if reproduction_chance <= 0.0 {
                 continue;
             }
-            if reproduction_chance < 1.0
-                && self.rng.random_range(0.0..1.0) >= reproduction_chance
-            {
+            if reproduction_chance < 1.0 && self.rng.random_range(0.0..1.0) >= reproduction_chance {
                 continue;
             }
 
@@ -7247,6 +7244,74 @@ mod tests {
         assert!(!events_second.epoch_rolled);
     }
 
+    #[test]
+    fn aging_respects_tick_cadence() {
+        let config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            aging_tick_interval: 5,
+            chart_flush_interval: 0,
+            rng_seed: Some(11),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        world.spawn_agent(sample_agent(0));
+
+        let mut ages = Vec::new();
+        for _ in 0..10 {
+            world.step();
+            ages.push(world.agents().columns().ages()[0]);
+        }
+
+        assert!(ages.iter().take(4).all(|age| *age == 0));
+        assert_eq!(ages[4], 1);
+        assert!(ages.iter().skip(5).take(4).all(|age| *age == 1));
+        assert_eq!(ages[9], 2);
+    }
+
+    #[test]
+    fn chart_history_uses_cadence() {
+        let config = ScriptBotsConfig {
+            world_width: 150,
+            world_height: 150,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            chart_flush_interval: 3,
+            history_capacity: 8,
+            aging_tick_interval: 1,
+            rng_seed: Some(13),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        world.spawn_agent(sample_agent(0));
+
+        let mut flushed = Vec::new();
+        for _ in 0..6 {
+            let events = world.step();
+            if events.charts_flushed {
+                flushed.push(events.tick.0);
+            }
+        }
+
+        assert_eq!(flushed, vec![3, 6]);
+        let history: Vec<_> = world.history().cloned().collect();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].tick, Tick(3));
+        assert_eq!(history[1].tick, Tick(6));
+    }
+
     struct StubBrain;
 
     impl BrainRunner for StubBrain {
@@ -7659,6 +7724,96 @@ mod tests {
                 .energy
                 < 1.0
         );
+    }
+
+    #[test]
+    fn reproduction_respects_tick_cadence() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            reproduction_energy_threshold: 0.2,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 3,
+            reproduction_attempt_chance: 1.0,
+            reproduction_child_energy: 0.0,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_mutation_scale: 0.0,
+            reproduction_partner_chance: 0.0,
+            aging_tick_interval: 1,
+            chart_flush_interval: 0,
+            rng_seed: Some(21),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        world.spawn_agent(sample_agent(0));
+
+        let mut counts = Vec::new();
+        for _ in 0..6 {
+            world.step();
+            counts.push(world.agent_count());
+        }
+
+        assert_eq!(counts, vec![1, 1, 2, 2, 2, 3]);
+    }
+
+    fn reproduction_tick_sequence(mut config: ScriptBotsConfig, steps: usize) -> Vec<u64> {
+        assert!(steps > 0, "steps must be positive");
+        config.history_capacity = steps.max(config.history_capacity);
+        let mut world = WorldState::new(config).expect("world");
+        world.spawn_agent(sample_agent(0));
+        let mut ticks = Vec::new();
+        let mut last_count = world.agent_count();
+        for _ in 0..steps {
+            let events = world.step();
+            let count = world.agent_count();
+            if count > last_count {
+                ticks.push(events.tick.0);
+            }
+            last_count = count;
+        }
+        ticks
+    }
+
+    #[test]
+    fn reproduction_gate_is_seed_deterministic() {
+        let base = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            reproduction_energy_threshold: 0.2,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 2,
+            reproduction_attempt_chance: 0.65,
+            reproduction_child_energy: 0.0,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_mutation_scale: 0.0,
+            reproduction_partner_chance: 0.0,
+            aging_tick_interval: 1,
+            chart_flush_interval: 0,
+            rng_seed: Some(1312),
+            ..ScriptBotsConfig::default()
+        };
+
+        let ticks_a = reproduction_tick_sequence(base.clone(), 24);
+        let ticks_b = reproduction_tick_sequence(base.clone(), 24);
+        assert_eq!(ticks_a, ticks_b);
+        assert!(!ticks_a.is_empty());
     }
 
     #[test]
