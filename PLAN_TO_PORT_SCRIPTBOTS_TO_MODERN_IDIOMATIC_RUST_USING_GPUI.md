@@ -395,7 +395,7 @@ Implementation notes [2025-10-23]:
 
 ### 12) Screenshot/export (GUI + TUI) [Currently In Progress - 2025-10-23]
 - Purpose: reporting and bug repro.
-- MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`. [Started: Terminal HUD adds 'S' to save ASCII snapshot under `screenshots/frame_<tick>.txt`; help overlay updated.]
+- MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`. [Started: Terminal HUD adds 'S' to save ASCII snapshot under `screenshots/frame_<tick>.txt`; help overlay updated. CLI `scriptbots-control screenshot --out FILE [--png]` added. REST: `GET /api/screenshot/ascii|png`. PNG currently returns a minimal placeholder image until GPUI hook is wired.]
 - Surfaces: HUD button + hotkey; TUI `S` key; CLI `control_cli screenshot`.
 - Data/Perf: file I/O off main tick; enqueue to worker.
 - Testing: files exist with non‑zero bytes; deterministic filenames with seed/tick.

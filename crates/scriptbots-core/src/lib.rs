@@ -2709,6 +2709,7 @@ mod map_sandbox {
     use direction::{CardinalDirection, CardinalDirectionTable, CardinalDirections};
     use rand08::{SeedableRng, rngs::StdRng};
     use serde::{Deserialize, Serialize};
+    use serde_json;
     use std::collections::{HashMap, HashSet};
     use std::hash::{DefaultHasher, Hasher};
     use std::num::NonZeroU32;
@@ -3437,9 +3438,11 @@ mod map_sandbox {
     }
 
     fn compute_tileset_hash(spec: &TilesetSpec) -> u64 {
-        let canonical = serde_json::to_vec(spec).unwrap_or_default();
         let mut hasher = DefaultHasher::new();
-        hasher.write(&canonical);
+        match serde_json::to_vec(spec) {
+            Ok(bytes) => hasher.write(&bytes),
+            Err(_) => hasher.write_u64(spec.tiles.len() as u64),
+        }
         hasher.finish()
     }
 

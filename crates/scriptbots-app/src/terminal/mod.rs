@@ -771,9 +771,17 @@ impl<'a> TerminalApp<'a> {
             }
             (KeyCode::Char('S'), _) => {
                 if let Err(err) = self.save_ascii_snapshot() {
-                    self.push_event(self.snapshot.tick, EventKind::Error, format!("Screenshot failed: {err}"));
+                    self.push_event(
+                        self.snapshot.tick,
+                        EventKind::Info,
+                        format!("Screenshot failed: {err}"),
+                    );
                 } else {
-                    self.push_event(self.snapshot.tick, EventKind::Info, "Saved ASCII screenshot");
+                    self.push_event(
+                        self.snapshot.tick,
+                        EventKind::Info,
+                        "Saved ASCII screenshot",
+                    );
                 }
             }
             (KeyCode::Char('b'), _) => {
@@ -826,16 +834,23 @@ impl<'a> TerminalApp<'a> {
             for x in 0..width {
                 let u = (x as f32 + 0.5) / width as f32;
                 let v = (y as f32 + 0.5) / height as f32;
-                let terrain = self.terrain.sample(u, v);
+                let terrain_kind = self.terrain.sample(u, v);
                 let food = self.snapshot.food.sample(u, v);
-                let ch = match terrain.kind {
-                    TerrainKind::Water => '~',
+                let ch = match terrain_kind {
+                    TerrainKind::DeepWater => '~',
+                    TerrainKind::ShallowWater => '=',
                     TerrainKind::Sand => '.',
                     TerrainKind::Grass => ',',
+                    TerrainKind::Bloom => '*',
                     TerrainKind::Rock => '^',
-                    TerrainKind::Snow => '*',
                 };
-                let glyph = if food > 0.66 { '#' } else if food > 0.33 { '+' } else { ch };
+                let glyph = if food > 0.66 {
+                    '#'
+                } else if food > 0.33 {
+                    '+'
+                } else {
+                    ch
+                };
                 write!(file, "{}", glyph)?;
             }
             write!(file, "\n")?;
@@ -1267,6 +1282,7 @@ enum EventKind {
     Death,
     Population,
     Info,
+    Error,
 }
 
 impl Snapshot {
@@ -1676,6 +1692,7 @@ impl Palette {
             EventKind::Death => Color::Red,
             EventKind::Population => Color::Yellow,
             EventKind::Info => Color::Cyan,
+            EventKind::Error => Color::Red,
         };
         Style::default().fg(color)
     }

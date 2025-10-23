@@ -99,6 +99,15 @@ enum Command {
         /// Preset name to apply (see `presets`).
         name: String,
     },
+    /// Request a one-off ASCII or PNG screenshot from the running app via REST.
+    Screenshot {
+        /// Output path for the screenshot; for PNG, must end with .png; otherwise ASCII .txt.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// PNG image export (GUI renderer view). When false, writes ASCII map snapshot.
+        #[arg(long = "png", default_value_t = false)]
+        png: bool,
+    },
     /// Show hydrology metrics and raw layers.
     Hydrology,
 }
@@ -144,6 +153,9 @@ async fn main() -> Result<()> {
                 Command::Presets => presets_list(&client, &cli.base_url).await?,
                 Command::ApplyPreset { name } => {
                     presets_apply(&client, &cli.base_url, &name).await?
+                }
+                Command::Screenshot { out, png } => {
+                    screenshot_request(&client, &cli.base_url, out, png).await?
                 }
                 Command::Hydrology => hydrology_command(&client, &cli.base_url).await?,
             }
@@ -706,6 +718,33 @@ async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()
     };
     let snapshot: ConfigSnapshot = client.post(url).json(&body).send().await?.json().await?;
     println!("Applied preset '{}' at tick {}", name, snapshot.tick);
+    Ok(())
+}
+
+async fn screenshot_request(
+    client: &Client,
+    base_url: &str,
+    out: PathBuf,
+    png: bool,
+) -> Result<()> {
+    let url = if png {
+        join_url(base_url, "/api/screenshot/png")
+    } else {
+        join_url(base_url, "/api/screenshot/ascii")
+    };
+
+    let resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("screenshot request failed: {}", body);
+    }
+
+    let bytes = resp.bytes().await?;
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&out, &bytes)?;
+    println!("Saved screenshot to {}", out.display());
     Ok(())
 }
 

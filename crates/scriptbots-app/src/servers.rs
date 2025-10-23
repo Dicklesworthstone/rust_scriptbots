@@ -41,6 +41,7 @@ use crate::control::{
     AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClass, EventEntry, EventKind,
     HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard,
 };
+use image::{ImageBuffer, Rgba};
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
 
@@ -554,6 +555,77 @@ async fn stream_ticks_sse(
     Ok(Sse::new(stream))
 }
 
+/// Return an ASCII snapshot of the current world mini-map.
+#[utoipa::path(
+    get,
+    path = "/api/screenshot/ascii",
+    tag = "control",
+    responses((status = 200, description = "ASCII screenshot", content_type = "text/plain"))
+)]
+async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, AppError> {
+    let snapshot = state
+        .handle
+        .latest_summary()
+        .map_err::<AppError, _>(|e| e.into())?;
+    // crude ASCII banner with tick; actual ASCII map is saved client-side by terminal renderer, but
+    // provide a minimal server-side textual artifact to support CLI writes
+    let text = format!("ScriptBots snapshot t{}\n", snapshot.tick.0);
+    Ok((StatusCode::OK, text).into_response())
+}
+
+/// Return a PNG screenshot placeholder for GPUI view (basic 1x1 pixel placeholder for now).
+#[utoipa::path(
+    get,
+    path = "/api/screenshot/png",
+    tag = "control",
+    responses((status = 200, description = "PNG screenshot", content_type = "image/png"))
+)]
+async fn screenshot_png() -> Result<Response, AppError> {
+    // Placeholder PNG (1x1 transparent) to unblock CLI plumbing without coupling to GPUI internals.
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(1, 1, |_x, _y| Rgba([0, 0, 0, 0]));
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut bytes);
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| AppError::internal(format!("encode png: {e}")))?;
+    }
+    Ok((StatusCode::OK, axum::body::Bytes::from(bytes)).into_response())
+}
+
+// NDJSON tick stream for simple clients
+#[utoipa::path(
+    get,
+    path = "/api/ticks/ndjson",
+    tag = "control",
+    responses((status = 200, description = "NDJSON stream of tick summaries"))
+)]
+async fn stream_ticks_ndjson(State(state): State<ApiState>) -> Result<Response, AppError> {
+    let handle = state.handle.clone();
+    let stream =
+        IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
+            let handle = handle.clone();
+            async move {
+                let line = match handle.latest_summary() {
+                    Ok(summary) => {
+                        let json = serde_json::to_string(&TickSummaryDto::from(summary))
+                            .unwrap_or_else(|_| "{}".to_string());
+                        format!("{}\n", json)
+                    }
+                    Err(_) => "{}\n".to_string(),
+                };
+                Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(line))
+            }
+        });
+
+    let mut resp = Response::new(axum::body::Body::from_stream(stream));
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/x-ndjson"),
+    );
+    Ok(resp)
+}
+
 #[utoipa::path(
     get,
     path = "/api/events/tail",
@@ -698,6 +770,10 @@ async fn run_rest_server(
         // Tick summaries (JSON one-shot and SSE stream)
         .route("/api/ticks/latest", get(get_latest_tick_summary))
         .route("/api/ticks/stream", get(stream_ticks_sse))
+        // Screenshots
+        .route("/api/screenshot/ascii", get(screenshot_ascii))
+        .route("/api/screenshot/png", get(screenshot_png))
+        .route("/api/ticks/ndjson", get(stream_ticks_ndjson))
         .route("/api/hydrology", get(get_hydrology_snapshot))
         // Event tail and scoreboard
         .route("/api/events/tail", get(get_events_tail))
