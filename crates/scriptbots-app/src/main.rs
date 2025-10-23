@@ -646,11 +646,11 @@ fn print_event_counts(
             let delta = value as i64 - baseline_value as i64;
             let delta_fmt = format!("Δ {delta:+}");
             let delta_colored = if delta == 0 {
-                delta_fmt.clone().yellow()
+                format!("{}", delta_fmt.yellow())
             } else if delta > 0 {
-                delta_fmt.clone().green()
+                format!("{}", delta_fmt.green())
             } else {
-                delta_fmt.clone().red()
+                format!("{}", delta_fmt.red())
             };
             println!("    {:<14} {:>8} ({delta_colored})", key, value);
         } else {
