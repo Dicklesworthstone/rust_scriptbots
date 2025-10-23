@@ -67,6 +67,9 @@ fn main() -> Result<()> {
         }
     }
 
+    // Apply OS-level priority niceness where supported.
+    apply_process_niceness(cli.low_power)?;
+
     // Renderer debug toggles
     if cli.debug_watermark {
         unsafe { std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1"); }
@@ -121,6 +124,37 @@ fn main() -> Result<()> {
     };
     renderer.run(context)?;
     control_runtime.shutdown()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_process_niceness(low_power: bool) -> Result<()> {
+    use libc::{id_t, setpriority, PRIO_PROCESS};
+    // Always reduce CPU priority a bit when low_power; otherwise keep default niceness.
+    if low_power {
+        unsafe {
+            // niceness +10 (lower priority); ignore errors on restricted environments
+            let _ = setpriority(PRIO_PROCESS as i32, 0 as id_t, 10);
+        }
+    }
+    // Best-effort I/O niceness via ionice class 3 (idle) where available.
+    // There is no stable libc wrapper; attempt calling the ionice syscall number is fragile.
+    // We intentionally skip ionice here and rely on OS tools if needed.
+    Ok(())
+}
+
+#[cfg(windows)]
+fn apply_process_niceness(low_power: bool) -> Result<()> {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+    };
+    unsafe {
+        let handle = GetCurrentProcess();
+        let class = if low_power { BELOW_NORMAL_PRIORITY_CLASS } else { 0 };
+        if class != 0 {
+            let _ = SetPriorityClass(handle, class);
+        }
+    }
     Ok(())
 }
 

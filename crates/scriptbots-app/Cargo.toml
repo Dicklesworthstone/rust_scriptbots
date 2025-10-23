@@ -39,6 +39,8 @@ csv = { workspace = true }
 ron = "0.8"
 toml = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
+libc = { version = "0.2", optional = false }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Threading"], optional = false }
 
 [features]
 default = []
