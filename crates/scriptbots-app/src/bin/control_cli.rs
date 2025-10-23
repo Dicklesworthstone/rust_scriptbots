@@ -28,7 +28,6 @@ use scriptbots_app::{
     ConfigPatchRequest, ConfigSnapshot, KnobApplyRequest, KnobEntry, KnobKind, KnobUpdate,
 };
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Parser, Debug)]

@@ -25,6 +25,7 @@ use mcp_protocol_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use scriptbots_core::PresetKind;
 use std::{convert::Infallible, time::Duration};
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::IntervalStream;
@@ -555,9 +556,8 @@ async fn get_config_audit(
     responses((status = 200, body = PresetList))
 )]
 async fn list_presets() -> Result<Json<PresetList>, AppError> {
-    Ok(Json(PresetList {
-        presets: preset_names(),
-    }))
+    let presets = PresetKind::all().iter().map(|p| p.as_str()).collect();
+    Ok(Json(PresetList { presets }))
 }
 
 #[utoipa::path(
@@ -571,35 +571,11 @@ async fn apply_preset(
     State(state): State<ApiState>,
     Json(payload): Json<PresetApplyRequest>,
 ) -> Result<Json<ConfigSnapshot>, AppError> {
-    let Some(patch) = preset_patch(&payload.name) else {
+    let Some(kind) = PresetKind::from_name(&payload.name) else {
         return Err(AppError::bad_request(format!("unknown preset: {}", payload.name)));
     };
-    let snapshot = state.handle.apply_patch(patch)?;
+    let snapshot = state.handle.apply_patch(kind.patch())?;
     Ok(Json(snapshot))
-}
-
-fn preset_names() -> Vec<&'static str> {
-    vec!["arctic", "boom_bust", "closed_world"]
-}
-
-fn preset_patch(name: &str) -> Option<Value> {
-    match name {
-        "arctic" => Some(json!({
-            "temperature_gradient_exponent": 1.6,
-            "food_max": 0.35,
-            "food_growth_rate": 0.03
-        })),
-        "boom_bust" => Some(json!({
-            "food_growth_rate": 0.12,
-            "food_decay_rate": 0.01,
-            "population_spawn_interval": 60
-        })),
-        "closed_world" => Some(json!({
-            "population_minimum": 0,
-            "population_spawn_interval": 0
-        })),
-        _ => None,
-    }
 }
 
 async fn run_rest_server(
@@ -814,7 +790,7 @@ impl ToolHandler for ControlTool {
     async fn call(&self, arguments: HashMap<String, Value>) -> McpResult<ToolResult> {
         match self.kind {
             ControlToolKind::ListPresets => {
-                let presets = preset_names();
+                let presets: Vec<&'static str> = PresetKind::all().iter().map(|p| p.as_str()).collect();
                 Ok(make_tool_result(presets)?)
             }
             ControlToolKind::ApplyPreset => {
@@ -822,9 +798,9 @@ impl ToolHandler for ControlTool {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| McpError::Validation("missing 'name' field".into()))?;
-                let patch = preset_patch(name_value)
+                let kind = PresetKind::from_name(name_value)
                     .ok_or_else(|| McpError::Validation(format!("unknown preset: {}", name_value)))?;
-                let snapshot = self.handle.apply_patch(patch).map_err(map_control_error)?;
+                let snapshot = self.handle.apply_patch(kind.patch()).map_err(map_control_error)?;
                 Ok(make_tool_result(snapshot)?)
             }
             ControlToolKind::ListKnobs => {

@@ -7,6 +7,7 @@ use gpui::{
     div, fill, point, prelude::*, px, rgb, size,
 };
 use rand::Rng;
+use scriptbots_core::PresetKind;
 use scriptbots_core::{
     AgentColumns, AgentData, AgentId, AgentRuntime, ControlCommand, Generation, INPUT_SIZE,
     IndicatorState, MutationRates, OUTPUT_SIZE, Position, ScriptBotsConfig, SelectionState,
@@ -6333,22 +6334,7 @@ impl Default for DebugOverlayState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PresetKind {
-    Arctic,
-    BoomBust,
-    ClosedWorld,
-}
-
-impl PresetKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Arctic => "arctic",
-            Self::BoomBust => "boom_bust",
-            Self::ClosedWorld => "closed_world",
-        }
-    }
-}
+// PresetKind comes from core now
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum FollowMode {

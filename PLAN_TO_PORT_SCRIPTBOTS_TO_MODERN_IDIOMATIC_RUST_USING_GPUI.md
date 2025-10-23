@@ -464,7 +464,7 @@ Implementation notes [2025-10-23]:
 
 ---
 
-## Sandbox Map Creator (Wave Function Collapse) — Comprehensive Roadmap
+## Sandbox Map Creator (Wave Function Collapse) — Comprehensive Roadmap [Currently In Progress - GPT-5 Codex 2025-10-23]
 
 ### Purpose & Outcomes
 - Provide an interactive, deterministic sandbox for generating and editing world maps using Wave Function Collapse (WFC) and complementary procedural techniques.
@@ -472,7 +472,7 @@ Implementation notes [2025-10-23]:
 - Expose REST/MCP/CLI knobs for automated sweeps; ship example tilesets and recipes for visually appealing results.
 
 ### Scope (MVP → Advanced)
-1) MVP (rule-based WFC)
+1) MVP (rule-based WFC) [Currently In Progress - GPT-5 Codex 2025-10-23]
    - Tileset-driven WFC (adjacency matrices, rotations/reflections, weights), CPU implementation.
    - Deterministic generation (seeded RNG), resolution presets (e.g., 64×64, 128×128, 256×256).
    - Export to core layers: `TerrainLayer` (enum per tile) and `fertility: Grid<f32>` (0..1); optional temperature mask.

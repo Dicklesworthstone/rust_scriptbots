@@ -806,6 +806,80 @@ impl From<TickSummaryDto> for TickSummary {
     }
 }
 
+// --- Centralized preset definitions and helpers ---
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum PresetKind {
+    Arctic,
+    BoomBust,
+    ClosedWorld,
+}
+
+impl PresetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PresetKind::Arctic => "arctic",
+            PresetKind::BoomBust => "boom_bust",
+            PresetKind::ClosedWorld => "closed_world",
+        }
+    }
+
+    pub fn all() -> &'static [PresetKind] {
+        const ALL: &[PresetKind] = &[
+            PresetKind::Arctic,
+            PresetKind::BoomBust,
+            PresetKind::ClosedWorld,
+        ];
+        ALL
+    }
+
+    pub fn from_name(name: &str) -> Option<PresetKind> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "arctic" => Some(PresetKind::Arctic),
+            "boom_bust" | "boombust" | "boom-bust" => Some(PresetKind::BoomBust),
+            "closed_world" | "closedworld" | "closed-world" => Some(PresetKind::ClosedWorld),
+            _ => None,
+        }
+    }
+
+    pub fn apply_to_config(self, config: &mut ScriptBotsConfig) {
+        match self {
+            PresetKind::Arctic => {
+                config.temperature_gradient_exponent = 1.6;
+                config.food_max = 0.35;
+                config.food_growth_rate = 0.03;
+            }
+            PresetKind::BoomBust => {
+                config.food_growth_rate = 0.12;
+                config.food_decay_rate = 0.01;
+                config.population_spawn_interval = 60;
+            }
+            PresetKind::ClosedWorld => {
+                config.population_minimum = 0;
+                config.population_spawn_interval = 0;
+            }
+        }
+    }
+
+    pub fn patch(self) -> serde_json::Value {
+        match self {
+            PresetKind::Arctic => serde_json::json!({
+                "temperature_gradient_exponent": 1.6,
+                "food_max": 0.35,
+                "food_growth_rate": 0.03
+            }),
+            PresetKind::BoomBust => serde_json::json!({
+                "food_growth_rate": 0.12,
+                "food_decay_rate": 0.01,
+                "population_spawn_interval": 60
+            }),
+            PresetKind::ClosedWorld => serde_json::json!({
+                "population_minimum": 0,
+                "population_spawn_interval": 0
+            }),
+        }
+    }
+}
+
 /// Scalar metric sampled during persistence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricSample {
