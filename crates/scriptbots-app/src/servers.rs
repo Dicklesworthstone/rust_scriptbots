@@ -23,9 +23,9 @@ use mcp_protocol_sdk::{
     server::{HttpMcpServer, McpServer},
     transport::http::HttpServerTransport,
 };
+use scriptbots_core::PresetKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use scriptbots_core::PresetKind;
 use std::{convert::Infallible, time::Duration};
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::IntervalStream;
@@ -572,7 +572,10 @@ async fn apply_preset(
     Json(payload): Json<PresetApplyRequest>,
 ) -> Result<Json<ConfigSnapshot>, AppError> {
     let Some(kind) = PresetKind::from_name(&payload.name) else {
-        return Err(AppError::bad_request(format!("unknown preset: {}", payload.name)));
+        return Err(AppError::bad_request(format!(
+            "unknown preset: {}",
+            payload.name
+        )));
     };
     let snapshot = state.handle.apply_patch(kind.patch())?;
     Ok(Json(snapshot))
@@ -790,7 +793,8 @@ impl ToolHandler for ControlTool {
     async fn call(&self, arguments: HashMap<String, Value>) -> McpResult<ToolResult> {
         match self.kind {
             ControlToolKind::ListPresets => {
-                let presets: Vec<&'static str> = PresetKind::all().iter().map(|p| p.as_str()).collect();
+                let presets: Vec<&'static str> =
+                    PresetKind::all().iter().map(|p| p.as_str()).collect();
                 Ok(make_tool_result(presets)?)
             }
             ControlToolKind::ApplyPreset => {
@@ -798,9 +802,13 @@ impl ToolHandler for ControlTool {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| McpError::Validation("missing 'name' field".into()))?;
-                let kind = PresetKind::from_name(name_value)
-                    .ok_or_else(|| McpError::Validation(format!("unknown preset: {}", name_value)))?;
-                let snapshot = self.handle.apply_patch(kind.patch()).map_err(map_control_error)?;
+                let kind = PresetKind::from_name(name_value).ok_or_else(|| {
+                    McpError::Validation(format!("unknown preset: {}", name_value))
+                })?;
+                let snapshot = self
+                    .handle
+                    .apply_patch(kind.patch())
+                    .map_err(map_control_error)?;
                 Ok(make_tool_result(snapshot)?)
             }
             ControlToolKind::ListKnobs => {

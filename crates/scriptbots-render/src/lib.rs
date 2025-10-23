@@ -2968,8 +2968,6 @@ impl SimulationView {
             }
         };
 
-        
-
         div()
             .flex()
             .flex_col()
@@ -3953,14 +3951,11 @@ impl SimulationView {
                         .child(label)
                         .on_mouse_down(MouseButton::Left, listener)
                 };
-                div()
-                    .flex()
-                    .gap_2()
-                    .children(vec![
-                        apply("Arctic", PresetKind::Arctic),
-                        apply("Boom–Bust", PresetKind::BoomBust),
-                        apply("Closed World", PresetKind::ClosedWorld),
-                    ])
+                div().flex().gap_2().children(vec![
+                    apply("Arctic", PresetKind::Arctic),
+                    apply("Boom–Bust", PresetKind::BoomBust),
+                    apply("Closed World", PresetKind::ClosedWorld),
+                ])
             })
     }
 

@@ -139,7 +139,9 @@ async fn main() -> Result<()> {
                 }
                 Command::Export { .. } => unreachable!("handled in outer match"),
                 Command::Presets => presets_list(&client, &cli.base_url).await?,
-                Command::ApplyPreset { name } => presets_apply(&client, &cli.base_url, &name).await?,
+                Command::ApplyPreset { name } => {
+                    presets_apply(&client, &cli.base_url, &name).await?
+                }
             }
         }
     }
@@ -673,7 +675,9 @@ where
 
 async fn presets_list(client: &Client, base_url: &str) -> Result<()> {
     #[derive(serde::Deserialize)]
-    struct PresetList { presets: Vec<String> }
+    struct PresetList {
+        presets: Vec<String>,
+    }
     let url = join_url(base_url, "/api/presets");
     let list: PresetList = client.get(url).send().await?.json().await?;
     if list.presets.is_empty() {
@@ -689,9 +693,13 @@ async fn presets_list(client: &Client, base_url: &str) -> Result<()> {
 
 async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()> {
     #[derive(serde::Serialize)]
-    struct Apply { name: String }
+    struct Apply {
+        name: String,
+    }
     let url = join_url(base_url, "/api/presets/apply");
-    let body = Apply { name: name.to_string() };
+    let body = Apply {
+        name: name.to_string(),
+    };
     let snapshot: ConfigSnapshot = client.post(url).json(&body).send().await?.json().await?;
     println!("Applied preset '{}' at tick {}", name, snapshot.tick);
     Ok(())

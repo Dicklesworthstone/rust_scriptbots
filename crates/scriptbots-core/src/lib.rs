@@ -2701,6 +2701,571 @@ pub struct TerrainTile {
     pub palette_index: u16,
 }
 
+mod map_sandbox {
+    use super::{
+        default_tile_fertility_bias, default_tile_palette_index, TerrainKind, TerrainLayer,
+        TerrainTile,
+    };
+    use direction::{CardinalDirection, CardinalDirectionTable, CardinalDirections};
+    use rand08::{Rng, SeedableRng, rngs::StdRng};
+    use serde::{Deserialize, Serialize};
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{DefaultHasher, Hasher};
+    use std::num::NonZeroU32;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use wfc::{
+        retry::{self, RetryOwnAll},
+        Coord, GlobalStats, PatternDescription, PatternTable, RunOwnAll, Size, Wave,
+    };
+
+    const DEFAULT_RETRY_BUDGET: usize = 32;
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum MapGenerationError {
+        #[error("tileset contains no tiles")]
+        EmptyTileset,
+        #[error("duplicate tile id `{0}` in tileset")]
+        DuplicateTileId(String),
+        #[error("adjacency references unknown tile `{0}`")]
+        UnknownTile(String),
+        #[error("adjacency uses invalid direction `{0}`")]
+        InvalidDirection(String),
+        #[error("tile `{0}` weight must be greater than zero")]
+        InvalidTileWeight(String),
+        #[error("no compatible neighbors remain for tile `{tile}` toward `{direction:?}`")]
+        EmptyAdjacency {
+            tile: String,
+            direction: CardinalDirection,
+        },
+        #[error("generation failed after {attempts} attempts due to contradictions")]
+        Contradiction { attempts: usize },
+        #[error("terrain dimensions must be non-zero")]
+        InvalidDimensions,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TilesetSpec {
+        pub id: String,
+        #[serde(default)]
+        pub label: Option<String>,
+        #[serde(default)]
+        pub description: Option<String>,
+        #[serde(default)]
+        pub tiles: Vec<TileSpec>,
+        #[serde(default)]
+        pub adjacency: Vec<AdjacencySpec>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TileSpec {
+        pub id: String,
+        #[serde(default)]
+        pub label: Option<String>,
+        #[serde(default = "TileSpec::default_weight")]
+        pub weight: u32,
+        pub terrain_kind: TerrainKind,
+        #[serde(default)]
+        pub fertility_bias: Option<f32>,
+        #[serde(default)]
+        pub temperature_bias: Option<f32>,
+        #[serde(default)]
+        pub elevation: Option<f32>,
+        #[serde(default)]
+        pub moisture: Option<f32>,
+        #[serde(default)]
+        pub accent: Option<f32>,
+        #[serde(default)]
+        pub palette_index: Option<u16>,
+    }
+
+    impl TileSpec {
+        const fn default_weight() -> u32 {
+            1
+        }
+
+        fn weight(&self) -> Result<NonZeroU32, MapGenerationError> {
+            NonZeroU32::new(self.weight)
+                .ok_or_else(|| MapGenerationError::InvalidTileWeight(self.id.clone()))
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AdjacencySpec {
+        pub tile_a: String,
+        pub side_a: String,
+        pub tile_b: String,
+        pub side_b: String,
+        #[serde(default = "AdjacencySpec::default_allowed")]
+        pub allowed: bool,
+    }
+
+    impl AdjacencySpec {
+        const fn default_allowed() -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    pub enum MapGeneratorKind {
+        RuleBased,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct MapArtifactMetadata {
+        pub generator: MapGeneratorKind,
+        pub tileset_id: String,
+        pub tileset_hash: u64,
+        pub seed: u64,
+        pub width: u32,
+        pub height: u32,
+        pub attempt_count: usize,
+        pub succeeded_on: usize,
+        pub generated_at_epoch_ms: u128,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ScalarField {
+        width: u32,
+        height: u32,
+        values: Vec<f32>,
+    }
+
+    impl ScalarField {
+        pub fn new(width: u32, height: u32, values: Vec<f32>) -> Self {
+            debug_assert_eq!(values.len(), (width as usize) * (height as usize));
+            Self {
+                width,
+                height,
+                values,
+            }
+        }
+
+        pub fn width(&self) -> u32 {
+            self.width
+        }
+
+        pub fn height(&self) -> u32 {
+            self.height
+        }
+
+        pub fn values(&self) -> &[f32] {
+            &self.values
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct MapArtifact {
+        terrain: TerrainLayer,
+        fertility: Option<ScalarField>,
+        temperature: Option<ScalarField>,
+        metadata: MapArtifactMetadata,
+    }
+
+    impl MapArtifact {
+        pub fn terrain(&self) -> &TerrainLayer {
+            &self.terrain
+        }
+
+        pub fn fertility(&self) -> Option<&ScalarField> {
+            self.fertility.as_ref()
+        }
+
+        pub fn temperature(&self) -> Option<&ScalarField> {
+            self.temperature.as_ref()
+        }
+
+        pub fn metadata(&self) -> &MapArtifactMetadata {
+            &self.metadata
+        }
+    }
+
+    #[derive(Clone)]
+    struct CompiledTile {
+        id: String,
+        _label: Option<String>,
+        terrain_kind: TerrainKind,
+        weight: NonZeroU32,
+        fertility_bias: f32,
+        temperature_bias: f32,
+        elevation: f32,
+        moisture: f32,
+        accent: f32,
+        palette_index: u16,
+    }
+
+    #[derive(Default, Clone)]
+    struct DirectionRule {
+        explicit_allows: bool,
+        allowed: HashSet<usize>,
+        forbidden: HashSet<usize>,
+    }
+
+    impl DirectionRule {
+        fn allow(&mut self, idx: usize) {
+            if !self.explicit_allows {
+                self.explicit_allows = true;
+                self.allowed.clear();
+            }
+            self.allowed.insert(idx);
+            self.forbidden.remove(&idx);
+        }
+
+        fn forbid(&mut self, idx: usize) {
+            if self.explicit_allows {
+                self.allowed.remove(&idx);
+            } else {
+                self.forbidden.insert(idx);
+            }
+        }
+
+        fn resolve(&self, population: usize) -> Vec<usize> {
+            let mut entries = if self.explicit_allows {
+                self.allowed.iter().copied().collect::<Vec<_>>()
+            } else {
+                (0..population)
+                    .filter(|candidate| !self.forbidden.contains(candidate))
+                    .collect::<Vec<_>>()
+            };
+            entries.sort_unstable();
+            entries.dedup();
+            entries
+        }
+    }
+
+    pub struct RuleBasedMapGenerator {
+        spec: TilesetSpec,
+        compiled_tiles: Vec<CompiledTile>,
+        global_stats: GlobalStats,
+        tileset_hash: u64,
+        retry_budget: usize,
+    }
+
+    impl RuleBasedMapGenerator {
+        pub fn new(spec: TilesetSpec) -> Result<Self, MapGenerationError> {
+            let tileset_hash = compute_tileset_hash(&spec);
+            let (compiled_tiles, global_stats) = compile_tileset(&spec)?;
+            Ok(Self {
+                spec,
+                compiled_tiles,
+                global_stats,
+                tileset_hash,
+                retry_budget: DEFAULT_RETRY_BUDGET,
+            })
+        }
+
+        pub fn with_retry_budget(mut self, retries: usize) -> Self {
+            self.retry_budget = retries;
+            self
+        }
+
+        pub fn spec(&self) -> &TilesetSpec {
+            &self.spec
+        }
+
+        pub fn generate(
+            &self,
+            width: u32,
+            height: u32,
+            cell_size: u32,
+            seed: u64,
+        ) -> Result<MapArtifact, MapGenerationError> {
+            if width == 0 || height == 0 {
+                return Err(MapGenerationError::InvalidDimensions);
+            }
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let runner = RunOwnAll::new(
+                Size::new(width, height),
+                self.global_stats.clone(),
+                &mut rng,
+            );
+            let budget = self.retry_budget;
+            let mut retry = retry::NumTimes(budget);
+            let wave: Wave = match retry.retry(runner, &mut rng) {
+                Ok(wave) => wave,
+                Err(_) => {
+                    return Err(MapGenerationError::Contradiction {
+                        attempts: budget + 1,
+                    });
+                }
+            };
+
+            let attempts_spent = budget - retry.0;
+            let success_attempt = attempts_spent + 1;
+
+            let tile_capacity = (width as usize) * (height as usize);
+            let mut tiles = Vec::with_capacity(tile_capacity);
+            let mut fertility = Vec::with_capacity(tile_capacity);
+            let mut temperature = Vec::with_capacity(tile_capacity);
+
+            for (coord, cell) in wave.grid().enumerate() {
+                let pattern_id =
+                    cell.chosen_pattern_id()
+                        .map_err(|_| MapGenerationError::Contradiction {
+                            attempts: success_attempt,
+                        })?;
+                let idx = pattern_id as usize;
+                let tile = self.compiled_tiles.get(idx).ok_or_else(|| {
+                    MapGenerationError::Contradiction {
+                        attempts: success_attempt,
+                    }
+                })?;
+                let accent_noise = coordinate_noise(seed, coord);
+                let accent = (tile.accent + accent_noise * 0.35).clamp(0.0, 1.0);
+                tiles.push(TerrainTile {
+                    kind: tile.terrain_kind,
+                    elevation: tile.elevation,
+                    moisture: tile.moisture,
+                    accent,
+                    fertility_bias: tile.fertility_bias,
+                    temperature_bias: tile.temperature_bias,
+                    palette_index: tile.palette_index,
+                });
+                fertility.push(tile.fertility_bias);
+                temperature.push(tile.temperature_bias);
+            }
+
+            let terrain = TerrainLayer::from_tiles(width, height, cell_size, tiles)
+                .map_err(|_| MapGenerationError::InvalidDimensions)?;
+            let fertility_field = ScalarField::new(width, height, fertility);
+            let temperature_field = ScalarField::new(width, height, temperature);
+            let metadata = MapArtifactMetadata {
+                generator: MapGeneratorKind::RuleBased,
+                tileset_id: self.spec.id.clone(),
+                tileset_hash: self.tileset_hash,
+                seed,
+                width,
+                height,
+                attempt_count: budget + 1,
+                succeeded_on: success_attempt,
+                generated_at_epoch_ms: current_epoch_ms(),
+            };
+
+            Ok(MapArtifact {
+                terrain,
+                fertility: Some(fertility_field),
+                temperature: Some(temperature_field),
+                metadata,
+            })
+        }
+    }
+
+    fn compile_tileset(
+        spec: &TilesetSpec,
+    ) -> Result<(Vec<CompiledTile>, GlobalStats), MapGenerationError> {
+        if spec.tiles.is_empty() {
+            return Err(MapGenerationError::EmptyTileset);
+        }
+
+        let mut index_by_id = HashMap::new();
+        for (idx, tile) in spec.tiles.iter().enumerate() {
+            if index_by_id.insert(tile.id.clone(), idx).is_some() {
+                return Err(MapGenerationError::DuplicateTileId(tile.id.clone()));
+            }
+        }
+
+        let compiled_tiles = spec
+            .tiles
+            .iter()
+            .map(|tile| compile_tile(tile))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut rules = Vec::with_capacity(compiled_tiles.len());
+        for _ in &compiled_tiles {
+            rules.push(CardinalDirectionTable::default());
+        }
+
+        for adjacency in &spec.adjacency {
+            let Some(&a_idx) = index_by_id.get(&adjacency.tile_a) else {
+                return Err(MapGenerationError::UnknownTile(adjacency.tile_a.clone()));
+            };
+            let Some(&b_idx) = index_by_id.get(&adjacency.tile_b) else {
+                return Err(MapGenerationError::UnknownTile(adjacency.tile_b.clone()));
+            };
+            let dir_a = parse_direction(&adjacency.side_a)
+                .ok_or_else(|| MapGenerationError::InvalidDirection(adjacency.side_a.clone()))?;
+            let dir_b = parse_direction(&adjacency.side_b)
+                .ok_or_else(|| MapGenerationError::InvalidDirection(adjacency.side_b.clone()))?;
+
+            update_direction_rule(&mut rules[a_idx][dir_a], b_idx, adjacency.allowed);
+            update_direction_rule(&mut rules[b_idx][dir_b], a_idx, adjacency.allowed);
+        }
+
+        let pattern_descriptions = compiled_tiles
+            .iter()
+            .enumerate()
+            .map(|(idx, tile)| {
+                let mut neighbors = CardinalDirectionTable::default();
+                for direction in CardinalDirections {
+                    let resolved = rules[idx][direction].resolve(compiled_tiles.len());
+                    if resolved.is_empty() {
+                        return Err(MapGenerationError::EmptyAdjacency {
+                            tile: tile.id.clone(),
+                            direction,
+                        });
+                    }
+                    neighbors[direction] = resolved.iter().map(|&value| value as u32).collect();
+                }
+                Ok(PatternDescription::new(Some(tile.weight), neighbors))
+            })
+            .collect::<Result<Vec<_>, MapGenerationError>>()?;
+
+        let global_stats = GlobalStats::new(PatternTable::from_vec(pattern_descriptions));
+        Ok((compiled_tiles, global_stats))
+    }
+
+    fn compile_tile(tile: &TileSpec) -> Result<CompiledTile, MapGenerationError> {
+        let elevation = tile
+            .elevation
+            .unwrap_or_else(|| default_elevation_for_kind(tile.terrain_kind));
+        let moisture = tile
+            .moisture
+            .unwrap_or_else(|| default_moisture_for_kind(tile.terrain_kind));
+        let fertility_bias = tile
+            .fertility_bias
+            .unwrap_or_else(|| default_tile_fertility_bias(tile.terrain_kind, elevation, moisture));
+        let temperature_bias = tile.temperature_bias.unwrap_or(0.5);
+        let accent = tile.accent.unwrap_or(0.5);
+        let palette_index = tile
+            .palette_index
+            .unwrap_or_else(|| default_tile_palette_index(tile.terrain_kind));
+
+        Ok(CompiledTile {
+            id: tile.id.clone(),
+            _label: tile.label.clone(),
+            terrain_kind: tile.terrain_kind,
+            weight: tile.weight()?,
+            fertility_bias: fertility_bias.clamp(0.0, 1.0),
+            temperature_bias: temperature_bias.clamp(0.0, 1.0),
+            elevation: elevation.clamp(0.0, 1.0),
+            moisture: moisture.clamp(0.0, 1.0),
+            accent: accent.clamp(0.0, 1.0),
+            palette_index,
+        })
+    }
+
+    fn update_direction_rule(rule: &mut DirectionRule, neighbor: usize, allowed: bool) {
+        if allowed {
+            rule.allow(neighbor);
+        } else {
+            rule.forbid(neighbor);
+        }
+    }
+
+    fn parse_direction(raw: &str) -> Option<CardinalDirection> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "n" | "north" | "up" => Some(CardinalDirection::North),
+            "s" | "south" | "down" => Some(CardinalDirection::South),
+            "e" | "east" | "right" => Some(CardinalDirection::East),
+            "w" | "west" | "left" => Some(CardinalDirection::West),
+            _ => None,
+        }
+    }
+
+    fn default_elevation_for_kind(kind: TerrainKind) -> f32 {
+        match kind {
+            TerrainKind::DeepWater => 0.1,
+            TerrainKind::ShallowWater => 0.23,
+            TerrainKind::Sand => 0.34,
+            TerrainKind::Grass => 0.5,
+            TerrainKind::Bloom => 0.58,
+            TerrainKind::Rock => 0.85,
+        }
+    }
+
+    fn default_moisture_for_kind(kind: TerrainKind) -> f32 {
+        match kind {
+            TerrainKind::DeepWater => 0.95,
+            TerrainKind::ShallowWater => 0.85,
+            TerrainKind::Sand => 0.2,
+            TerrainKind::Grass => 0.5,
+            TerrainKind::Bloom => 0.8,
+            TerrainKind::Rock => 0.25,
+        }
+    }
+
+    fn coordinate_noise(seed: u64, coord: Coord) -> f32 {
+        let mut value = seed
+            .wrapping_mul(0x9e3779b185ebca87)
+            .wrapping_add(coord.x as u64 * 0xc2b2ae3d27d4eb4f)
+            .wrapping_add(coord.y as u64 * 0x165667b19e3779f9);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d049bb133111eb);
+        value ^= value >> 31;
+        ((value >> 11) as f64 / (1u64 << 53) as f64) as f32
+    }
+
+    fn compute_tileset_hash(spec: &TilesetSpec) -> u64 {
+        let canonical = serde_json::to_vec(spec).unwrap_or_default();
+        let mut hasher = DefaultHasher::new();
+        hasher.write(&canonical);
+        hasher.finish()
+    }
+
+    fn current_epoch_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_millis())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rule_based_generator_produces_map() {
+            let tileset = TilesetSpec {
+                id: "unit".into(),
+                label: None,
+                description: None,
+                tiles: vec![
+                    TileSpec {
+                        id: "grass".into(),
+                        label: None,
+                        weight: 1,
+                        terrain_kind: TerrainKind::Grass,
+                        fertility_bias: Some(0.7),
+                        temperature_bias: Some(0.5),
+                        elevation: Some(0.48),
+                        moisture: Some(0.6),
+                        accent: Some(0.3),
+                        palette_index: Some(3),
+                    },
+                    TileSpec {
+                        id: "water".into(),
+                        label: None,
+                        weight: 1,
+                        terrain_kind: TerrainKind::DeepWater,
+                        fertility_bias: Some(0.05),
+                        temperature_bias: Some(0.9),
+                        elevation: Some(0.12),
+                        moisture: Some(0.95),
+                        accent: Some(0.4),
+                        palette_index: Some(0),
+                    },
+                ],
+                adjacency: Vec::new(),
+            };
+
+            let generator = RuleBasedMapGenerator::new(tileset).expect("compile tileset");
+            let artifact = generator.generate(8, 8, 16, 42).expect("generate artifact");
+
+            assert_eq!(artifact.terrain().width(), 8);
+            assert_eq!(artifact.terrain().height(), 8);
+            assert_eq!(artifact.metadata().tileset_id, "unit");
+            assert!(artifact.fertility().is_some());
+        }
+    }
+}
+
+pub use map_sandbox::{
+    AdjacencySpec, MapArtifact, MapArtifactMetadata, MapGenerationError, MapGeneratorKind,
+    RuleBasedMapGenerator, ScalarField, TileSpec, TilesetSpec,
+};
+
 #[derive(Debug, Clone, Copy)]
 struct FoodCellProfile {
     capacity: f32,
@@ -2807,6 +3372,7 @@ pub struct WorldState {
     food: FoodGrid,
     food_profiles: Vec<FoodCellProfile>,
     terrain: TerrainLayer,
+    map_metadata: Option<MapArtifactMetadata>,
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
@@ -2843,6 +3409,13 @@ impl fmt::Debug for WorldState {
             .field("closed", &self.closed)
             .field("agent_count", &self.agents.len())
             .field("food_profiles", &self.food_profiles.len())
+            .field(
+                "map_metadata",
+                &self
+                    .map_metadata
+                    .as_ref()
+                    .map(|meta| meta.tileset_id.as_str()),
+            )
             .finish()
     }
 }
@@ -2875,6 +3448,7 @@ impl WorldState {
         Ok(Self {
             food,
             terrain,
+            map_metadata: None,
             config,
             tick: Tick::zero(),
             epoch: 0,
@@ -5697,6 +6271,44 @@ impl WorldState {
     #[must_use]
     pub fn terrain_mut(&mut self) -> &mut TerrainLayer {
         &mut self.terrain
+    }
+
+    /// Replace the current terrain and food fields using a pre-generated map artifact.
+    pub fn apply_map_artifact(&mut self, artifact: &MapArtifact) -> Result<(), WorldStateError> {
+        let terrain = artifact.terrain();
+        if terrain.width() != self.food.width() || terrain.height() != self.food.height() {
+            return Err(WorldStateError::InvalidConfig(
+                "map artifact dimensions must match existing food grid",
+            ));
+        }
+        if terrain.cell_size() != self.config.food_cell_size {
+            return Err(WorldStateError::InvalidConfig(
+                "map artifact cell size must match configuration",
+            ));
+        }
+
+        self.terrain = terrain.clone();
+        self.food_profiles = FoodCellProfile::compute(&self.config, &self.terrain);
+
+        if let Some(field) = artifact.fertility() {
+            if field.width() != self.food.width() || field.height() != self.food.height() {
+                return Err(WorldStateError::InvalidConfig(
+                    "fertility artifact dimensions must match existing food grid",
+                ));
+            }
+            let max_food = self.config.food_max;
+            for (cell, value) in self.food.cells_mut().iter_mut().zip(field.values().iter()) {
+                *cell = value.clamp(0.0, 1.0) * max_food;
+            }
+        }
+
+        self.map_metadata = Some(artifact.metadata().clone());
+        Ok(())
+    }
+
+    /// Metadata describing the last applied procedural map, when available.
+    pub fn map_metadata(&self) -> Option<&MapArtifactMetadata> {
+        self.map_metadata.as_ref()
     }
 
     /// Immutable access to the brain registry.
