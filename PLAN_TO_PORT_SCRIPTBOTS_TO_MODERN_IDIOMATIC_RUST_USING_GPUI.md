@@ -215,7 +215,7 @@
 - **Feature Toggles & UX Integration (Non-rendering)**
   - [Completed - GPT-5 Codex 2025-10-23: Added layered scenario configs (`--config` / `SCRIPTBOTS_CONFIG`) merging TOML/RON files ahead of env overrides] Surfacing runtime toggles: CLI/ENV for enabling brains, selecting indices, adjusting mechanics.
   - [Completed - GPT-5 Codex 2025-10-23: Added `--print-config`, `--write-config`, `--config-format`, and `--config-only` flags so scenarios can be audited or exported without launching the sim] Provide config inspection tooling (print/write/dry-run) so layered scenarios are easy to audit.
-  - [ ] Selection and debug hooks: expose APIs to query agent state, highlight subsets (without GPUI coupling).
+  - [Currently In Progress - 2025-10-23 Codex] Selection and debug hooks: expose APIs to query agent state, highlight subsets (without GPUI coupling).
   - [ ] Audio hooks: structure event bus for future `kira` integration (without touching render crate yet).
   - [ ] Accessibility/logging: structured tracing spans, machine-readable summaries for external dashboards.
 

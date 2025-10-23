@@ -6,7 +6,7 @@ use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
-use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use slotmap::{SecondaryMap, SlotMap, new_key_type, Key, KeyData};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -362,6 +362,28 @@ pub enum SelectionState {
     None,
     Hovered,
     Selected,
+}
+
+/// Coarse dietary classification used for debug surfacing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DietClass {
+    #[default]
+    Herbivore,
+    Omnivore,
+    Carnivore,
+}
+
+impl DietClass {
+    #[must_use]
+    pub fn from_tendency(tendency: f32) -> Self {
+        if tendency <= 0.33 {
+            Self::Herbivore
+        } else if tendency >= 0.66 {
+            Self::Carnivore
+        } else {
+            Self::Omnivore
+        }
+    }
 }
 
 /// Per-tick combat markers used by UI, analytics, and audio layers.
