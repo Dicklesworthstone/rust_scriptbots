@@ -313,6 +313,16 @@ struct ErrorResponse {
     message: String,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+struct PresetList {
+    presets: Vec<&'static str>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct PresetApplyRequest {
+    name: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ConfigPatchRequest {
     #[schema(value_type = Object, nullable = false)]
@@ -341,7 +351,7 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_knobs, get_config, patch_config, apply_updates),
+    paths(get_knobs, get_config, patch_config, apply_updates, get_latest_tick_summary, stream_ticks_sse, get_config_audit, list_presets, apply_preset),
     components(
         schemas(
             KnobEntry,
@@ -350,6 +360,8 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
             ConfigPatchRequest,
             KnobApplyRequest,
             ConfigAuditEntryView,
+            PresetList,
+            PresetApplyRequest,
             ErrorResponse
         )
     ),
@@ -536,6 +548,60 @@ async fn get_config_audit(
     Ok(Json(entries))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/presets",
+    tag = "control",
+    responses((status = 200, body = PresetList))
+)]
+async fn list_presets() -> Result<Json<PresetList>, AppError> {
+    Ok(Json(PresetList {
+        presets: preset_names(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/presets/apply",
+    tag = "control",
+    request_body = PresetApplyRequest,
+    responses((status = 200, body = ConfigSnapshot), (status = 400, body = ErrorResponse))
+)]
+async fn apply_preset(
+    State(state): State<ApiState>,
+    Json(payload): Json<PresetApplyRequest>,
+) -> Result<Json<ConfigSnapshot>, AppError> {
+    let Some(patch) = preset_patch(&payload.name) else {
+        return Err(AppError::bad_request(format!("unknown preset: {}", payload.name)));
+    };
+    let snapshot = state.handle.apply_patch(patch)?;
+    Ok(Json(snapshot))
+}
+
+fn preset_names() -> Vec<&'static str> {
+    vec!["arctic", "boom_bust", "closed_world"]
+}
+
+fn preset_patch(name: &str) -> Option<Value> {
+    match name {
+        "arctic" => Some(json!({
+            "temperature_gradient_exponent": 1.6,
+            "food_max": 0.35,
+            "food_growth_rate": 0.03
+        })),
+        "boom_bust" => Some(json!({
+            "food_growth_rate": 0.12,
+            "food_decay_rate": 0.01,
+            "population_spawn_interval": 60
+        })),
+        "closed_world" => Some(json!({
+            "population_minimum": 0,
+            "population_spawn_interval": 0
+        })),
+        _ => None,
+    }
+}
+
 async fn run_rest_server(
     handle: ControlHandle,
     config: &ControlServerConfig,
@@ -553,6 +619,9 @@ async fn run_rest_server(
         // Tick summaries (JSON one-shot and SSE stream)
         .route("/api/ticks/latest", get(get_latest_tick_summary))
         .route("/api/ticks/stream", get(stream_ticks_sse))
+        // Presets and audit
+        .route("/api/presets", get(list_presets))
+        .route("/api/presets/apply", post(apply_preset))
         .route("/api/config/audit", get(get_config_audit))
         .with_state(state);
 

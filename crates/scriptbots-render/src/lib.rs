@@ -679,7 +679,6 @@ impl SimulationView {
                     ))),
             )
     }
-
     fn render_summary(&self, snapshot: &HudSnapshot) -> Div {
         let mut cards: Vec<Div> = Vec::new();
 
@@ -1468,7 +1467,6 @@ impl SimulationView {
             cx.notify();
         }
     }
-
     fn select_all_agents(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
         let mut first_selected: Option<AgentId> = None;
@@ -2262,7 +2260,6 @@ impl SimulationView {
         }
         cx.notify();
     }
-
     fn toggle_brush_state(&mut self, cx: &mut Context<Self>) {
         if let Ok(mut inspector) = self.inspector.lock() {
             let new_state = !inspector.brush_enabled;
@@ -2994,7 +2991,6 @@ impl SimulationView {
                     ),
             )
     }
-
     fn render_persistence_controls(
         &self,
         inspector: &InspectorSnapshot,
@@ -3479,7 +3475,6 @@ impl SimulationView {
                     .child(format!("Shortcut {}", format_keystroke(&overlay_binding))),
             )
     }
-
     fn render_simulation_controls(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         let controls = snapshot.controls;
 
@@ -3634,6 +3629,23 @@ impl SimulationView {
                 .child(format!("Pause ({})", format_keystroke(&pause_binding)))
                 .on_mouse_down(MouseButton::Left, pause_listener),
             controls.paused,
+        );
+
+        // Baseline toggle (idea #2) — show simple on/off; wire to analytics state
+        let baseline_active = self.analytics.baseline_active();
+        let baseline_listener = cx.listener(|this, _event: &MouseDownEvent, _, _cx| {
+            this.analytics.toggle_baseline();
+        });
+        let baseline_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(if baseline_active { "Baseline: On" } else { "Baseline: Off" })
+                .on_mouse_down(MouseButton::Left, baseline_listener),
+            baseline_active,
         );
 
         let slower_button = div()
@@ -3902,6 +3914,7 @@ impl SimulationView {
                     .gap_2()
                     .children(vec![closed_off_button, closed_on_button]),
             )
+            .child(baseline_button)
     }
 
     fn render_inspector_playback_controls(&self, cx: &mut Context<Self>) -> Div {
@@ -4270,7 +4283,6 @@ impl SimulationView {
             )))
             .child(self.render_mutation_controls(detail, cx))
     }
-
     fn render_mutation_controls(
         &self,
         detail: &AgentInspectorDetails,
@@ -4847,7 +4859,6 @@ impl SimulationView {
 
         card
     }
-
     fn render_settings_panel(&self, cx: &mut Context<Self>) -> Div {
         // Modern, world-class settings panel with beautiful design
         let backdrop = div()
@@ -5217,7 +5228,6 @@ impl SimulationView {
 
         category_div
     }
-
     fn render_category_parameters(&self, category: ConfigCategory, cx: &mut Context<Self>) -> Div {
         // Read current config from world
         let config = if let Ok(world) = self.world.lock() {
@@ -5944,7 +5954,6 @@ struct BrainShareEntry {
     count: usize,
     avg_energy: f64,
 }
-
 fn parse_analytics(
     tick: u64,
     agent_count: usize,
@@ -6731,7 +6740,6 @@ enum ColorPaletteMode {
     Tritanopia,
     HighContrast,
 }
-
 impl ColorPaletteMode {
     const ALL: [ColorPaletteMode; 5] = [
         ColorPaletteMode::Natural,
@@ -7531,7 +7539,6 @@ struct TerrainTileVisual {
 struct PostProcessStack {
     passes: Vec<PostProcessPass>,
 }
-
 #[derive(Clone, Copy)]
 enum PostProcessPass {
     Vignette {
@@ -8257,7 +8264,6 @@ impl CameraState {
         Some((world_x, world_y))
     }
 }
-
 fn paint_terrain_layer(
     terrain: &TerrainFrame,
     offset_x: f32,
@@ -8870,7 +8876,6 @@ fn paint_debug_overlays(
         }
     }
 }
-
 fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     let frame = &state.frame;
     let camera = &state.camera;

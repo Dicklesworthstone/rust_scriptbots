@@ -91,6 +91,13 @@ enum Command {
         #[arg(long, value_name = "ROWS")]
         last: Option<usize>,
     },
+    /// List available scenario presets.
+    Presets,
+    /// Apply a preset by name via REST.
+    ApplyPreset {
+        /// Preset name to apply (see `presets`).
+        name: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -131,6 +138,8 @@ async fn main() -> Result<()> {
                     .await?
                 }
                 Command::Export { .. } => unreachable!("handled in outer match"),
+                Command::Presets => presets_list(&client, &cli.base_url).await?,
+                Command::ApplyPreset { name } => presets_apply(&client, &cli.base_url, &name).await?,
             }
         }
     }
@@ -660,6 +669,32 @@ where
             .unwrap_or_else(|_| "<unavailable>".to_string());
         bail!("control API request failed ({status}): {body}");
     }
+}
+
+async fn presets_list(client: &Client, base_url: &str) -> Result<()> {
+    #[derive(Deserialize)]
+    struct PresetList { presets: Vec<String> }
+    let url = join_url(base_url, "/api/presets");
+    let list: PresetList = client.get(url).send().await?.json().await?;
+    if list.presets.is_empty() {
+        println!("No presets available");
+    } else {
+        println!("Available presets:");
+        for name in list.presets {
+            println!("  - {}", name);
+        }
+    }
+    Ok(())
+}
+
+async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()> {
+    #[derive(Serialize)]
+    struct Apply { name: String }
+    let url = join_url(base_url, "/api/presets/apply");
+    let body = Apply { name: name.to_string() };
+    let snapshot: ConfigSnapshot = client.post(url).json(&body).send().await?.json().await?;
+    println!("Applied preset '{}' at tick {}", name, snapshot.tick);
+    Ok(())
 }
 
 fn join_url(base: &str, path: &str) -> String {

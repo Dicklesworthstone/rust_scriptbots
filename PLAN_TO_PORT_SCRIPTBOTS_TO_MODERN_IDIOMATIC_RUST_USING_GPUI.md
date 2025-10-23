@@ -293,15 +293,17 @@ These scoped additions improve usability, insight, and experiment velocity witho
 ### 1) Config presets + quick toggle
 - Purpose: instant scenario swapping without editing files; great for demos and teaching.
 - MVP: ship a small set of curated layered configs (e.g., `arctic.toml`, `boom_bust.toml`, `closed_world.toml`) and a preset switcher.
-- Surfaces: CLI `--preset <name>`; GPUI dropdown in HUD; TUI picker; REST `POST /api/presets/apply { name }`.
+- Surfaces: CLI `scriptbots-control presets` / `scriptbots-control apply-preset <name>`; GPUI dropdown in HUD; TUI picker; REST `GET /api/presets`, `POST /api/presets/apply { name }`.
 - Data/Perf: uses existing layered-config loader; no extra state; deterministic.
 - Testing: verify merged config equals golden snapshots; run same seed before/after swap.
 - Complexity: S.
 
+[Currently In Progress - 2025-10-23] REST endpoints added: `GET /api/presets` (lists names) and `POST /api/presets/apply` (applies JSON patch for preset); OpenAPI updated.
+
 ### 2) Metrics baseline compare (Δ vs. baseline) [Currently In Progress - 2025-10-23]
 - Purpose: quick A/B within a run (population, births/deaths, avg energy).
 - MVP: "Set Baseline" button stores current summary; HUD/TUI shows Δ and %Δ.
-- Surfaces: HUD button + toggle; TUI key `b` to set/reset (implemented in Terminal HUD); CLI `control_cli baseline set/reset`.
+- Surfaces: HUD button + toggle (GPUI baseline button added in Simulation Controls); TUI key `b` to set/reset (implemented in Terminal HUD); CLI `control_cli baseline set/reset`.
 - Data/Perf: store one struct in memory; optional DuckDB event for audit.
 - Testing: unit-test delta math; snapshot HUD/TUI lines.
 - Complexity: S.
