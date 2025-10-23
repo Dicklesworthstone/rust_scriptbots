@@ -409,6 +409,16 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
   - `apply_patch` → accepts `{ patch: { ... } }`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
 
+## Configuration files & scenarios
+- Configuration is deserialized into `ScriptBotsConfig` (TOML/RON planned). Scenario layering will allow composing base + biome + experiment. Until file loading lands, use REST/CLI to tweak knobs at runtime and persist your chosen values externally.
+
+## Deterministic replay (planned)
+- Event-log schema will capture per-tick snapshots and critical RNG draws/brain outputs to enable headless replay and branch/diff workflows.
+- CLI tooling will compare Rust runs vs the C++ baseline and surface divergences with DuckDB-backed reports.
+
+## Security & operations
+- REST and MCP servers bind to loopback by default. If you expose them externally, front with TLS and configure CORS appropriately. The WASM path requires COOP/COEP headers only when enabling multithreading; single-thread builds avoid this.
+
 ### Configuration knobs (examples)
 All configuration can be inspected and updated at runtime via REST/CLI/MCP. Common knobs:
 - World: `world_width`, `world_height`, `closed`
