@@ -241,6 +241,21 @@ impl ControlRuntime {
     }
 }
 
+#[cfg(test)]
+impl ControlRuntime {
+    /// Create a no-op runtime for tests without starting background threads.
+    pub fn dummy() -> (Self, CommandDrain, CommandSubmit) {
+        let (command_tx, command_rx) = create_command_bus(4);
+        let command_drain = make_command_drain(command_rx);
+        let command_submit = make_command_submit(command_tx);
+        let runtime = Self {
+            shutdown: Arc::new(Notify::new()),
+            thread: None,
+        };
+        (runtime, command_drain, command_submit)
+    }
+}
+
 impl Drop for ControlRuntime {
     fn drop(&mut self) {
         self.shutdown.notify_waiters();

@@ -557,6 +557,58 @@ Implementation notes [2025-10-23]:
 
 ### References (curated)
 - Wave Function Collapse, original repo — tileset and sample models (MIT).
+
+### Hydrology & Dynamic Water Systems (Rainstorms + Floodable Basins) — Proposed Blueprint
+- **Motivation**: Elevate sandbox maps beyond static biomes by layering deterministic hydrology that can react to scripted rainstorms. Agents must negotiate seasonal floods, learn to detour, or evolve swimming. The system needs to dovetail cleanly with WFC generation so basins, rivers, and floodplains emerge coherently and remain reproducible.
+
+- **Tileset Schema Extensions**
+  - Add optional hydrology fields to `TileSpec`: `permeability`, `runoff_bias`, `basin_rank`, `channel_priority`, `swim_cost`. Defaults keep legacy tilesets valid.
+  - Permit adjacency rules tagged with hydrology intents (e.g., `requires_inflow`, `cannot_border_deep_basin_without_channel`). Compilation maps these to per-pattern metadata stored alongside `CompiledTile` so runtime cost lookups stay O(1).
+
+- **Hydrologic Graph Construction (Post-WFC)**
+  - Derive a lattice graph from `TerrainLayer`: each cell stores elevation and permeability. Run a priority-flood or modified D8 flow solver to compute:
+    - `flow_direction` (best downhill neighbor respecting WFC-imposed channels).
+    - `flow_accumulation` (catchment area proxy) and `basin_outlet` per cell.
+    - `spill_threshold` (height at which basin overflows into downstream cell) using partial union-find of depressions.
+  - Persist results in a new `HydrologyField` struct stored inside `MapArtifact` so deterministic replays can reconstruct the graph without recomputation.
+
+- **Rainstorm Events & Water Depth Field**
+  - Initialize `water_depth` scalar field to zero; attach to `WorldState` alongside fertility/temperature.
+  - Weather controller API:
+    - `start_rain(seed, intensity, duration, focus_region?)`
+    - `tick_rain(dt)`: increments `water_depth` = rainfall * accumulation factor, subtracts evaporation, and routes overflow using `flow_direction` + `spill_threshold`.
+    - `stop_rain()` gracefully winds down precipitation while runoff continues until all basins stabilize.
+  - Expose commands via control CLI/REST/MCP: e.g., `wfc.weather.rainburst --seed 88 --intensity 0.7 --duration 600 --focus basin:delta`.
+
+- **Terrain / Agent Interactions**
+  - Define three water regimes per tile: `Dry`, `Shallow` (foraging hindered), `Deep` (requires swimming). Thresholds combine base elevation, water depth, and tile permeability.
+  - Update `TerrainTile` at runtime with dynamic `water_state`, `movement_penalty`, `swim_required` flags.
+  - Extend locomotion: If `topography_enabled`, add `water_depth` penalty. Introduce optional `Swimming` trait on agents; non-swimmers reroute using A* pathing informed by `movement_penalty`.
+  - Fertility feedback: flooded grass converts to `Wetlands` tile variant (higher nutrient density but slower regrowth post-drought), while prolonged drought reverts wetlands to plains.
+
+- **Integration with WFC Pipeline**
+  - During `RuleBasedMapGenerator::generate`, enforce hydrology-aware adjacency: channels must connect basins; plains near coastlines must offer spillways.
+  - Provide deterministic “seed rain” preview: run a shallow rain simulation (few ticks) inside generation, capturing expected max water depth. Feed results into tile selection weights (e.g., discourage high-density settlements in perennial floodplains unless tileset explicitly opts in).
+  - Allow tilesets to tag “aquifer” tiles; WFC ensures they appear beneath rivers to justify perennial flow.
+
+- **Renderer / UX Hooks**
+  - GPUI: animate water surfaces with shader palettes driven by `water_depth`. Add hydrology inspector showing basin outlines, flow vectors, rainfall timeline graphs.
+  - Terminal renderer: extend glyph palette with dynamic water emojis or colorized ASCII shading (e.g., `~`, `≈` for shallow/deep), plus sidebar sparkline tracking flood extent.
+  - Provide “rain storyboard” overlay: timeline scrubber shows predicted inundation when planning rainfall experiments.
+
+- **Persistence & Replay**
+  - Extend `MapArtifactMetadata` with `hydrology_digest` (hash of hydrology field + rainfall seeds) and store rain events in the persistence log for deterministic replays.
+  - Add DuckDB tables `hydrology_basins`, `rain_events`, `flood_snapshots` for analytics.
+
+- **Testing & Validation**
+  - Unit tests for hydrology solver (e.g., synthetic bowl map with known outlet) verifying overflow order.
+  - Property tests ensuring water never becomes negative, total volume conserved during routing (minus evaporation).
+  - Golden scenes: fixed tileset + scripted storm produces identical `water_depth` snapshots on native + wasm.
+
+- **Future Enhancements**
+  - Noise-driven microstreams feeding major rivers for visual richness.
+  - Coupling with agent evolution: track swimming trait prevalence vs. flood frequency.
+  - Multiplayer experiments: expose hydrology knobs via MCP so external agents can orchestrate storms during evolutionary runs.
 - Articles & guides on WFC pattern extraction and constraint propagation.
 - Rust crates: `wfc` (crates.io), `image`, `noise`.
 ## Terminal Rendering Mode (Emoji TUI) [Currently In Progress - Terminal Text Renderer]

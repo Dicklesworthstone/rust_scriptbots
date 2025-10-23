@@ -1722,7 +1722,6 @@ impl Palette {
 mod tests {
     use super::*;
     use scriptbots_core::{AgentData, ScriptBotsConfig};
-    use tempfile::tempdir;
 
     #[test]
     fn snapshot_reflects_world_state() {
@@ -1745,19 +1744,10 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("test.db");
         let storage = Arc::new(std::sync::Mutex::new(
-            scriptbots_storage::Storage::open(db_path.to_string_lossy().as_ref()).expect("storage"),
+            scriptbots_storage::Storage::open(":memory:").expect("storage"),
         ));
-        let mut cfg = crate::servers::ControlServerConfig::default();
-        cfg.rest_enabled = false;
-        cfg.mcp_transport = crate::servers::McpTransportConfig::Disabled;
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::launch(
-            Arc::clone(&world),
-            cfg,
-        )
-        .expect("launch");
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
             world: Arc::clone(&world),
@@ -1768,12 +1758,10 @@ mod tests {
         };
 
         let mut app = TerminalApp::new(&renderer, ctx);
-        // Simulate spike hits via snapshot mutation
         app.snapshot.spike_hits = 3;
         app.paused = false;
         app.evaluate_auto_pause();
         assert!(app.paused, "should auto-pause on spike hits");
-        runtime.shutdown().ok();
     }
 
     #[test]
@@ -1783,19 +1771,10 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("test.db");
         let storage = Arc::new(std::sync::Mutex::new(
-            scriptbots_storage::Storage::open(db_path.to_string_lossy().as_ref()).expect("storage"),
+            scriptbots_storage::Storage::open(":memory:").expect("storage"),
         ));
-        let mut cfg = crate::servers::ControlServerConfig::default();
-        cfg.rest_enabled = false;
-        cfg.mcp_transport = crate::servers::McpTransportConfig::Disabled;
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::launch(
-            Arc::clone(&world),
-            cfg,
-        )
-        .expect("launch");
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
             world: Arc::clone(&world),
@@ -1809,7 +1788,6 @@ mod tests {
         app.paused = false;
         app.evaluate_auto_pause();
         assert!(app.paused, "should auto-pause when max age exceeds threshold");
-        runtime.shutdown().ok();
     }
 
     #[test]
@@ -1817,25 +1795,15 @@ mod tests {
         let mut config = ScriptBotsConfig::default();
         config.control.auto_pause_population_below = Some(5);
         let mut world = WorldState::new(config).expect("world");
-        // Ensure small population
         for _ in 0..3 {
             world.spawn_agent(AgentData::default());
         }
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("test.db");
         let storage = Arc::new(std::sync::Mutex::new(
-            scriptbots_storage::Storage::open(db_path.to_string_lossy().as_ref()).expect("storage"),
+            scriptbots_storage::Storage::open(":memory:").expect("storage"),
         ));
-        let mut cfg = crate::servers::ControlServerConfig::default();
-        cfg.rest_enabled = false;
-        cfg.mcp_transport = crate::servers::McpTransportConfig::Disabled;
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::launch(
-            Arc::clone(&world),
-            cfg,
-        )
-        .expect("launch");
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
             world: Arc::clone(&world),
@@ -1845,11 +1813,9 @@ mod tests {
             command_submit: submit,
         };
         let mut app = TerminalApp::new(&renderer, ctx);
-        // Snapshot already captured population via new(); force a refresh
         app.refresh_snapshot();
         app.paused = false;
         app.evaluate_auto_pause();
         assert!(app.paused, "should auto-pause when population below threshold");
-        runtime.shutdown().ok();
     }
 }
