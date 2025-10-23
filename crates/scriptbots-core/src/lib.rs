@@ -159,6 +159,7 @@ fn angle_difference(a: f32, b: f32) -> f32 {
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
     UpdateConfig(ScriptBotsConfig),
+    UpdateSelection(SelectionUpdate),
 }
 
 /// Apply a control command to the world state.
@@ -168,6 +169,10 @@ pub fn apply_control_command(
 ) -> Result<(), WorldStateError> {
     match command {
         ControlCommand::UpdateConfig(config) => world.apply_config_update(config),
+        ControlCommand::UpdateSelection(update) => {
+            world.apply_selection_update(update);
+            Ok(())
+        }
     }
 }
 
@@ -384,6 +389,87 @@ impl DietClass {
             Self::Omnivore
         }
     }
+}
+
+/// Strategies for applying selection updates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SelectionMode {
+    Replace,
+    Add,
+    Clear,
+}
+
+/// External selection update request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionUpdate {
+    pub mode: SelectionMode,
+    #[serde(default)]
+    pub agent_ids: Vec<u64>,
+    #[serde(default = "SelectionUpdate::default_state")]
+    pub state: SelectionState,
+}
+
+impl SelectionUpdate {
+    const fn default_state() -> SelectionState {
+        SelectionState::Selected
+    }
+}
+
+/// Resulting counts from applying a selection update.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct SelectionResult {
+    pub applied: usize,
+    pub cleared: usize,
+    pub remaining_selected: usize,
+}
+
+/// Sort options for agent debug listings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentDebugSort {
+    EnergyDesc,
+    AgeDesc,
+}
+
+impl Default for AgentDebugSort {
+    fn default() -> Self {
+        Self::EnergyDesc
+    }
+}
+
+/// Query parameters for a debug view of agents.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentDebugQuery {
+    #[serde(default)]
+    pub ids: Option<Vec<u64>>,
+    #[serde(default)]
+    pub diet: Option<DietClass>,
+    #[serde(default)]
+    pub selection: Option<SelectionState>,
+    #[serde(default)]
+    pub brain_kind: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub sort: AgentDebugSort,
+}
+
+/// Debug projection of an agent suitable for external tooling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDebugInfo {
+    pub agent_id: u64,
+    pub selection: SelectionState,
+    pub position: Position,
+    pub energy: f32,
+    pub health: f32,
+    pub age: u32,
+    pub generation: u32,
+    pub herbivore_tendency: f32,
+    pub diet: DietClass,
+    pub brain_kind: Option<String>,
+    pub brain_key: Option<u64>,
+    pub mutation_primary: f32,
+    pub mutation_secondary: f32,
+    pub indicator: IndicatorState,
 }
 
 /// Per-tick combat markers used by UI, analytics, and audio layers.
@@ -7008,6 +7094,186 @@ impl WorldState {
         let data = self.agents.snapshot(id)?;
         let runtime = self.runtime.get(id)?.clone();
         Some(AgentState { id, data, runtime })
+    }
+
+    /// Produce a filtered, sorted listing of agents for debug consumers.
+    pub fn agent_debug_view(&self, query: AgentDebugQuery) -> Vec<AgentDebugInfo> {
+        use std::collections::HashSet;
+
+        let AgentDebugQuery {
+            ids,
+            diet,
+            selection,
+            brain_kind,
+            limit,
+            sort,
+        } = query;
+
+        let id_filter: Option<HashSet<AgentId>> = ids.map(|list| {
+            list.into_iter()
+                .map(Self::decode_agent_id)
+                .collect::<HashSet<_>>()
+        });
+
+        let brain_filter = brain_kind.as_ref().map(|value| value.to_lowercase());
+
+        let mut entries: Vec<AgentDebugInfo> = Vec::new();
+        for handle in self.agents.iter_handles() {
+            if let Some(filter) = &id_filter {
+                if !filter.contains(&handle) {
+                    continue;
+                }
+            }
+
+            let Some(snapshot) = self.snapshot_agent(handle) else {
+                continue;
+            };
+            let runtime = snapshot.runtime;
+
+            if let Some(expected) = selection {
+                if runtime.selection != expected {
+                    continue;
+                }
+            }
+
+            let diet_class = DietClass::from_tendency(runtime.herbivore_tendency);
+            if let Some(expected_diet) = diet {
+                if diet_class != expected_diet {
+                    continue;
+                }
+            }
+
+            if let Some(filter) = &brain_filter {
+                let actual = runtime
+                    .brain
+                    .kind()
+                    .map(|kind| kind.to_lowercase())
+                    .unwrap_or_default();
+                if !actual.contains(filter) {
+                    continue;
+                }
+            }
+
+            entries.push(AgentDebugInfo {
+                agent_id: Self::encode_agent_id(handle),
+                selection: runtime.selection,
+                position: snapshot.data.position,
+                energy: runtime.energy,
+                health: snapshot.data.health,
+                age: snapshot.data.age,
+                generation: snapshot.data.generation.0,
+                herbivore_tendency: runtime.herbivore_tendency,
+                diet: diet_class,
+                brain_kind: runtime.brain.kind().map(str::to_string),
+                brain_key: runtime.brain.registry_key(),
+                mutation_primary: runtime.mutation_rates.primary,
+                mutation_secondary: runtime.mutation_rates.secondary,
+                indicator: runtime.indicator,
+            });
+        }
+
+        match sort {
+            AgentDebugSort::EnergyDesc => entries.sort_by(|a, b| {
+                b.energy
+                    .partial_cmp(&a.energy)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            AgentDebugSort::AgeDesc => entries.sort_by(|a, b| b.age.cmp(&a.age)),
+        }
+
+        if let Some(limit) = limit {
+            if entries.len() > limit {
+                entries.truncate(limit);
+            }
+        }
+
+        entries
+    }
+
+    /// Apply a selection update to highlight agents.
+    pub fn apply_selection_update(&mut self, update: SelectionUpdate) -> SelectionResult {
+        use std::collections::HashSet;
+
+        let mut cleared = 0usize;
+        let mut applied = 0usize;
+
+        let SelectionUpdate {
+            mode,
+            agent_ids,
+            state,
+        } = update;
+
+        let targets: HashSet<AgentId> = agent_ids
+            .into_iter()
+            .map(Self::decode_agent_id)
+            .filter(|id| self.agents.contains(*id))
+            .collect();
+
+        match mode {
+            SelectionMode::Replace => {
+                for runtime in self.runtime.values_mut() {
+                    if !matches!(runtime.selection, SelectionState::None) {
+                        runtime.selection = SelectionState::None;
+                        cleared += 1;
+                    }
+                }
+                for id in &targets {
+                    if let Some(runtime) = self.runtime.get_mut(*id) {
+                        runtime.selection = state;
+                        applied += 1;
+                    }
+                }
+            }
+            SelectionMode::Add => {
+                for id in &targets {
+                    if let Some(runtime) = self.runtime.get_mut(*id) {
+                        if runtime.selection != state {
+                            runtime.selection = state;
+                            applied += 1;
+                        }
+                    }
+                }
+            }
+            SelectionMode::Clear => {
+                if targets.is_empty() {
+                    for runtime in self.runtime.values_mut() {
+                        if !matches!(runtime.selection, SelectionState::None) {
+                            runtime.selection = SelectionState::None;
+                            cleared += 1;
+                        }
+                    }
+                } else {
+                    for id in &targets {
+                        if let Some(runtime) = self.runtime.get_mut(*id) {
+                            if !matches!(runtime.selection, SelectionState::None) {
+                                runtime.selection = SelectionState::None;
+                                cleared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let remaining_selected = self
+            .runtime
+            .values()
+            .filter(|runtime| matches!(runtime.selection, SelectionState::Selected))
+            .count();
+
+        SelectionResult {
+            applied,
+            cleared,
+            remaining_selected,
+        }
+    }
+
+    fn encode_agent_id(id: AgentId) -> u64 {
+        id.data().as_ffi()
+    }
+
+    fn decode_agent_id(raw: u64) -> AgentId {
+        AgentId::from(KeyData::from_ffi(raw))
     }
 }
 

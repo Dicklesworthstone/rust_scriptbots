@@ -38,9 +38,11 @@ use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };
 use crate::control::{
-    AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClass, EventEntry, EventKind,
-    HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard,
+    AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry,
+    EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
+    SelectionStateDto,
 };
+use scriptbots_core::{AgentDebugQuery, AgentDebugSort, SelectionUpdate};
 // keep image out of servers unless needed
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;

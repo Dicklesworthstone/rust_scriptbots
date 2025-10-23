@@ -6,7 +6,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use scriptbots_core::{
-    ControlCommand, HydrologyFlowDirection, HydrologyState, ScriptBotsConfig, Tick, WorldState,
+    AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ControlCommand, DietClass,
+    HydrologyFlowDirection, HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState,
+    SelectionUpdate, Tick, WorldState,
 };
 
 use crate::SharedWorld;
@@ -215,6 +217,17 @@ impl ControlHandle {
         }
     }
 
+    /// Retrieve a filtered debug listing of agents.
+    pub fn debug_agents(&self, query: AgentDebugQuery) -> Result<Vec<AgentDebugInfo>, ControlError> {
+        let world = self.lock_world()?;
+        Ok(world.agent_debug_view(query))
+    }
+
+    /// Enqueue a selection update command.
+    pub fn update_selection(&self, update: SelectionUpdate) -> Result<(), ControlError> {
+        self.enqueue(ControlCommand::UpdateSelection(update))
+    }
+
     /// Retrieve a snapshot of the current hydrology state, if available.
     pub fn hydrology_snapshot(&self) -> Result<Option<HydrologySnapshot>, ControlError> {
         let world = self.lock_world()?;
@@ -285,7 +298,8 @@ impl ControlHandle {
         for (idx, id) in handles.iter().enumerate() {
             let runtime = runtimes.get(*id);
             let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
-            let diet = DietClass::from_tendency(tendency);
+            let diet_core = DietClass::from_tendency(tendency);
+            let diet = DietClassDto::from(diet_core);
             let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
             let health = columns.health()[idx];
             let age = columns.ages()[idx];
@@ -300,7 +314,7 @@ impl ControlHandle {
                 diet,
             };
 
-            if matches!(diet, DietClass::Carnivore) {
+            if matches!(diet_core, DietClass::Carnivore) {
                 carnivores.push(entry.clone());
             }
             oldest.push(entry);
@@ -538,20 +552,80 @@ impl EventEntry {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum DietClass {
+pub enum DietClassDto {
     Herbivore,
     Omnivore,
     Carnivore,
 }
 
-impl DietClass {
-    fn from_tendency(t: f32) -> Self {
-        if t <= 0.33 {
-            Self::Herbivore
-        } else if t >= 0.66 {
-            Self::Carnivore
-        } else {
-            Self::Omnivore
+impl From<DietClass> for DietClassDto {
+    fn from(value: DietClass) -> Self {
+        match value {
+            DietClass::Herbivore => Self::Herbivore,
+            DietClass::Omnivore => Self::Omnivore,
+            DietClass::Carnivore => Self::Carnivore,
+        }
+    }
+}
+
+impl From<DietClassDto> for DietClass {
+    fn from(value: DietClassDto) -> Self {
+        match value {
+            DietClassDto::Herbivore => DietClass::Herbivore,
+            DietClassDto::Omnivore => DietClass::Omnivore,
+            DietClassDto::Carnivore => DietClass::Carnivore,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionStateDto {
+    None,
+    Hovered,
+    Selected,
+}
+
+impl Default for SelectionStateDto {
+    fn default() -> Self {
+        Self::Selected
+    }
+}
+
+impl From<SelectionState> for SelectionStateDto {
+    fn from(value: SelectionState) -> Self {
+        match value {
+            SelectionState::None => Self::None,
+            SelectionState::Hovered => Self::Hovered,
+            SelectionState::Selected => Self::Selected,
+        }
+    }
+}
+
+impl From<SelectionStateDto> for SelectionState {
+    fn from(value: SelectionStateDto) -> Self {
+        match value {
+            SelectionStateDto::None => SelectionState::None,
+            SelectionStateDto::Hovered => SelectionState::Hovered,
+            SelectionStateDto::Selected => SelectionState::Selected,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionModeDto {
+    Replace,
+    Add,
+    Clear,
+}
+
+impl From<SelectionModeDto> for SelectionMode {
+    fn from(value: SelectionModeDto) -> Self {
+        match value {
+            SelectionModeDto::Replace => SelectionMode::Replace,
+            SelectionModeDto::Add => SelectionMode::Add,
+            SelectionModeDto::Clear => SelectionMode::Clear,
         }
     }
 }
@@ -563,7 +637,7 @@ pub struct AgentScoreEntry {
     pub health: f32,
     pub age: u32,
     pub generation: u32,
-    pub diet: DietClass,
+    pub diet: DietClassDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
