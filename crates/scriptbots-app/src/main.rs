@@ -106,7 +106,7 @@ fn run_det_child(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
     Ok(())
 }
 
-fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
+fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     let exe = std::env::current_exe().context("failed to get current exe path")?;
     // Child 1: single-thread (force RAYON_NUM_THREADS=1)
     let mut child1 = Command::new(&exe);

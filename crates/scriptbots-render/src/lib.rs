@@ -30,8 +30,8 @@ use kira::{
     sound::static_sound::{StaticSoundData, StaticSoundSettings},
 };
 
-use tracing::{error, info, warn};
 use image::{ImageBuffer, Rgba as ImgRgba};
+use tracing::{error, info, warn};
 
 fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
     let mut delta = target - origin;
@@ -5880,89 +5880,97 @@ impl SimulationView {
     }
 }
 
-impl SimulationView {
-    /// Render a simple PNG snapshot of the current world without a live window.
-    /// This is a coarse, deterministic rasterization intended for REST exports.
-    pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
-        let mut img: ImageBuffer<ImgRgba<u8>, Vec<u8>> = ImageBuffer::new(width, height);
+/// Render a simple PNG snapshot of the current world without a live window.
+/// This is a coarse, deterministic rasterization intended for REST exports.
+pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
+    let mut img: ImageBuffer<ImgRgba<u8>, Vec<u8>> = ImageBuffer::new(width, height);
 
-        // Background from terrain + food
-        for y in 0..height {
-            for x in 0..width {
-                let u = (x as f32 + 0.5) / width as f32;
-                let v = (y as f32 + 0.5) / height as f32;
-                let tx = (u * world.terrain().width() as f32).clamp(0.0, (world.terrain().width() - 1) as f32) as u32;
-                let ty = (v * world.terrain().height() as f32).clamp(0.0, (world.terrain().height() - 1) as f32) as u32;
-                let tile = world
-                    .terrain()
-                    .tile(tx, ty)
-                    .copied()
-                    .unwrap_or(TerrainTile {
-                        kind: TerrainKind::Grass,
-                        elevation: 0.5,
-                        moisture: 0.5,
-                        accent: 0.0,
-                        fertility_bias: 0.0,
-                        temperature_bias: 0.5,
-                        palette_index: 0,
-                    });
-                let food = world.food().get(tx, ty).unwrap_or(0.0);
-                let base = match tile.kind {
-                    TerrainKind::DeepWater => (40u8, 80u8, 200u8),
-                    TerrainKind::ShallowWater => (60, 120, 220),
-                    TerrainKind::Sand => (210, 200, 160),
-                    TerrainKind::Grass => (60, 160, 60),
-                    TerrainKind::Bloom => (200, 120, 200),
-                    TerrainKind::Rock => (100, 100, 110),
-                };
-                let food_shade = (food.clamp(0.0, 1.0) * 90.0) as u8;
-                let r = base.0.saturating_add(food_shade);
-                let g = base.1.saturating_add(food_shade / 2);
-                let b = base.2;
-                img.put_pixel(x, y, ImgRgba([r, g, b, 255]));
-            }
-        }
-
-        // Agents overlay as small discs
-        let cols = world.agents().columns();
-        for (idx, handle) in world.agents().iter_handles().enumerate() {
-            let pos = cols.positions()[idx];
-            let fx = (pos.x.clamp(0.0, 1.0) * (width as f32 - 1.0)) as i32;
-            let fy = (pos.y.clamp(0.0, 1.0) * (height as f32 - 1.0)) as i32;
-            let energy = world.runtime().get(handle).map(|rt| rt.energy).unwrap_or(0.5);
-            let radius = (2.0 + 3.0 * energy.clamp(0.0, 1.0)) as i32;
-            let tendency = world
-                .runtime()
-                .get(handle)
-                .map(|rt| rt.herbivore_tendency)
-                .unwrap_or(0.5);
-            let color = if tendency <= 0.33 {
-                (120, 200, 120)
-            } else if tendency >= 0.66 {
-                (220, 80, 80)
-            } else {
-                (200, 180, 90)
+    // Background from terrain + food
+    for y in 0..height {
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / width as f32;
+            let v = (y as f32 + 0.5) / height as f32;
+            let tx = (u * world.terrain().width() as f32)
+                .clamp(0.0, (world.terrain().width() - 1) as f32) as u32;
+            let ty = (v * world.terrain().height() as f32)
+                .clamp(0.0, (world.terrain().height() - 1) as f32) as u32;
+            let tile = world
+                .terrain()
+                .tile(tx, ty)
+                .copied()
+                .unwrap_or(TerrainTile {
+                    kind: TerrainKind::Grass,
+                    elevation: 0.5,
+                    moisture: 0.5,
+                    accent: 0.0,
+                    fertility_bias: 0.0,
+                    temperature_bias: 0.5,
+                    palette_index: 0,
+                });
+            let food = world.food().get(tx, ty).unwrap_or(0.0);
+            let base = match tile.kind {
+                TerrainKind::DeepWater => (40u8, 80u8, 200u8),
+                TerrainKind::ShallowWater => (60, 120, 220),
+                TerrainKind::Sand => (210, 200, 160),
+                TerrainKind::Grass => (60, 160, 60),
+                TerrainKind::Bloom => (200, 120, 200),
+                TerrainKind::Rock => (100, 100, 110),
             };
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
-                    if dx * dx + dy * dy <= radius * radius {
-                        let px = fx + dx;
-                        let py = fy + dy;
-                        if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
-                            img.put_pixel(px as u32, py as u32, ImgRgba([color.0, color.1, color.2, 255]));
-                        }
+            let food_shade = (food.clamp(0.0, 1.0) * 90.0) as u8;
+            let r = base.0.saturating_add(food_shade);
+            let g = base.1.saturating_add(food_shade / 2);
+            let b = base.2;
+            img.put_pixel(x, y, ImgRgba([r, g, b, 255]));
+        }
+    }
+
+    // Agents overlay as small discs
+    let cols = world.agents().columns();
+    for (idx, handle) in world.agents().iter_handles().enumerate() {
+        let pos = cols.positions()[idx];
+        let fx = (pos.x.clamp(0.0, 1.0) * (width as f32 - 1.0)) as i32;
+        let fy = (pos.y.clamp(0.0, 1.0) * (height as f32 - 1.0)) as i32;
+        let energy = world
+            .runtime()
+            .get(handle)
+            .map(|rt| rt.energy)
+            .unwrap_or(0.5);
+        let radius = (2.0 + 3.0 * energy.clamp(0.0, 1.0)) as i32;
+        let tendency = world
+            .runtime()
+            .get(handle)
+            .map(|rt| rt.herbivore_tendency)
+            .unwrap_or(0.5);
+        let color = if tendency <= 0.33 {
+            (120, 200, 120)
+        } else if tendency >= 0.66 {
+            (220, 80, 80)
+        } else {
+            (200, 180, 90)
+        };
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy <= radius * radius {
+                    let px = fx + dx;
+                    let py = fy + dy;
+                    if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
+                        img.put_pixel(
+                            px as u32,
+                            py as u32,
+                            ImgRgba([color.0, color.1, color.2, 255]),
+                        );
                     }
                 }
             }
         }
-
-        let mut bytes = Vec::new();
-        {
-            let mut cursor = std::io::Cursor::new(&mut bytes);
-            let _ = img.write_to(&mut cursor, image::ImageFormat::Png);
-        }
-        bytes
     }
+
+    let mut bytes = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut bytes);
+        let _ = img.write_to(&mut cursor, image::ImageFormat::Png);
+    }
+    bytes
 }
 
 impl Render for SimulationView {

@@ -41,7 +41,7 @@ use crate::control::{
     AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClass, EventEntry, EventKind,
     HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard,
 };
-use image::{ImageBuffer, Rgba};
+// keep image out of servers unless needed
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
 

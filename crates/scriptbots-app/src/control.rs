@@ -12,9 +12,8 @@ use scriptbots_core::{
 use crate::SharedWorld;
 use crate::command::CommandSender;
 use scriptbots_core::ConfigAuditEntry;
-use slotmap::Key;
-use scriptbots_render::run_demo; // import crate to ensure linkage
-use scriptbots_render::SimulationView; // access helper for PNG snapshot
+use scriptbots_render::render_png_offscreen;
+use slotmap::Key; // offscreen PNG renderer
 
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -182,7 +181,7 @@ impl ControlHandle {
     /// Produce a PNG snapshot of the world without a live window.
     pub fn snapshot_png(&self, width: u32, height: u32) -> Result<Vec<u8>, ControlError> {
         let world = self.lock_world()?;
-        let bytes = SimulationView::render_png_offscreen(&world, width, height);
+        let bytes = render_png_offscreen(&world, width, height);
         Ok(bytes)
     }
 
