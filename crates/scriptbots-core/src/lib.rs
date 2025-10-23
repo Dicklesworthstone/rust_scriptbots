@@ -745,7 +745,7 @@ pub struct TickEvents {
 }
 
 /// Summary emitted to persistence hooks each tick.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TickSummary {
     pub tick: Tick,
     pub agent_count: usize,
@@ -754,7 +754,9 @@ pub struct TickSummary {
     pub total_energy: f32,
     pub average_energy: f32,
     pub average_health: f32,
+    #[serde(default)]
     pub max_age: u32,
+    #[serde(default)]
     pub spike_hits: u32,
 }
 

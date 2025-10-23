@@ -779,7 +779,42 @@ impl<'a> TerminalApp<'a> {
         };
         self.ingest_events(&new_snapshot);
         self.snapshot = new_snapshot;
-        self.evaluate_auto_pause();
+
+        // Auto-pause evaluation (inline to avoid method resolution issues)
+        if !self.paused {
+            let control = &self.snapshot.control;
+            let mut reason: Option<String> = None;
+
+            if control.auto_pause_on_spike_hit && self.snapshot.spike_hits > 0 {
+                reason = Some(format!(
+                    "Auto-pause: spike hits detected ({})",
+                    self.snapshot.spike_hits
+                ));
+            } else if let Some(age_limit) = control.auto_pause_age_above {
+                if self.snapshot.max_age >= age_limit {
+                    reason = Some(format!(
+                        "Auto-pause: max age {} ≥ {}",
+                        self.snapshot.max_age, age_limit
+                    ));
+                }
+            } else if let Some(limit) = control.auto_pause_population_below {
+                if self.snapshot.agent_count as u32 <= limit {
+                    reason = Some(format!(
+                        "Auto-pause: population {} ≤ {}",
+                        self.snapshot.agent_count, limit
+                    ));
+                }
+            }
+
+            if let Some(reason) = reason {
+                if self.last_autopause_tick != Some(self.snapshot.tick) {
+                    self.push_event(self.snapshot.tick, EventKind::Info, &reason);
+                    self.last_autopause_tick = Some(self.snapshot.tick);
+                }
+                self.paused = true;
+                self.speed_multiplier = 0.0;
+            }
+        }
     }
 
     fn ingest_events(&mut self, new_snapshot: &Snapshot) {

@@ -1475,6 +1475,8 @@ mod tests {
                 total_energy: energy,
                 average_energy: energy,
                 average_health: 1.0,
+                max_age: 0,
+                spike_hits: 0,
             },
             epoch: 3,
             closed: false,
