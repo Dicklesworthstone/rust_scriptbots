@@ -547,7 +547,7 @@ fn count_event_kinds(events: &[PersistedReplayEvent]) -> HashMap<&'static str, u
 }
 
 fn report_divergence(left_label: &str, right_label: &str, divergence: Divergence) -> Result<()> {
-    let marker = "✖".red().bold().to_string();
+    let marker = format!("{}", "✖".red().bold());
     match divergence.kind {
         DivergenceKind::TickMismatch => {
             if let (Some(exp), Some(act)) = (&divergence.expected, &divergence.actual) {
@@ -645,14 +645,14 @@ fn print_event_counts(
             let baseline_value = baseline.get(key).copied().unwrap_or(0);
             let delta = value as i64 - baseline_value as i64;
             let delta_fmt = format!("Δ {delta:+}");
-            let delta_str = if delta == 0 {
-                delta_fmt.as_str().yellow().to_string()
+            let delta_colored = if delta == 0 {
+                delta_fmt.clone().yellow()
             } else if delta > 0 {
-                delta_fmt.as_str().green().to_string()
+                delta_fmt.clone().green()
             } else {
-                delta_fmt.as_str().red().to_string()
+                delta_fmt.clone().red()
             };
-            println!("    {:<14} {:>8} ({delta_str})", key, value);
+            println!("    {:<14} {:>8} ({delta_colored})", key, value);
         } else {
             println!("    {:<14} {:>8}", key, value);
         }
