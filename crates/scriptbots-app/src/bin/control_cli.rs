@@ -764,9 +764,10 @@ async fn hydrology_command(client: &Client, base_url: &str) -> Result<()> {
         return Ok(());
     }
 
+    let status = response.status();
     let response = response
         .error_for_status()
-        .with_context(|| format!("request to {url} failed with status {}", response.status()))?;
+        .with_context(|| format!("request to {url} failed with status {status}"))?;
 
     let snapshot: HydrologySnapshot = response
         .json()

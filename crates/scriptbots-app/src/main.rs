@@ -990,6 +990,7 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
 mod tests {
     use super::*;
     use scriptbots_storage::{Storage, StoragePipeline};
+    use serial_test::serial;
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -1003,6 +1004,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn layered_configs_apply_in_order() {
         let dir = tempdir().expect("tempdir");
         let base_path = dir.path().join("base.toml");
@@ -1056,6 +1058,7 @@ activation = "Sigmoid"
     }
 
     #[test]
+    #[serial]
     fn headless_replay_matches_storage() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("replay.duckdb");
@@ -1093,6 +1096,7 @@ activation = "Sigmoid"
     }
 
     #[test]
+    #[serial]
     fn write_config_honors_format_and_exit_flag() {
         let dir = tempdir().expect("tempdir");
         let output = dir.path().join("effective.toml");
@@ -1129,6 +1133,7 @@ activation = "Sigmoid"
     }
 
     #[test]
+    #[serial]
     fn emit_config_continue_when_not_config_only() {
         let dir = tempdir().expect("tempdir");
         let output = dir.path().join("effective.ron");

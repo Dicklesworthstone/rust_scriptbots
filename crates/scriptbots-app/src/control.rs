@@ -13,6 +13,8 @@ use crate::SharedWorld;
 use crate::command::CommandSender;
 use scriptbots_core::ConfigAuditEntry;
 use slotmap::Key;
+use scriptbots_render::run_demo; // import crate to ensure linkage
+use scriptbots_render::SimulationView; // access helper for PNG snapshot
 
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -36,7 +38,7 @@ impl ConfigSnapshot {
 }
 
 /// Snapshot describing the current hydrology state.
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HydrologySnapshot {
     pub width: u32,
     pub height: u32,
@@ -175,6 +177,13 @@ impl ControlHandle {
             shared_world,
             commands,
         }
+    }
+
+    /// Produce a PNG snapshot of the world without a live window.
+    pub fn snapshot_png(&self, width: u32, height: u32) -> Result<Vec<u8>, ControlError> {
+        let world = self.lock_world()?;
+        let bytes = SimulationView::render_png_offscreen(&world, width, height);
+        Ok(bytes)
     }
 
     fn lock_world(&self) -> Result<MutexGuard<'_, WorldState>, ControlError> {

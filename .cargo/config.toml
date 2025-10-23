@@ -11,6 +11,7 @@ CXX_x86_64_pc_windows_gnullvm = "/data/projects/rust_scriptbots/toolchains/llvm-
 AR_x86_64_pc_windows_gnullvm = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/llvm-ar"
 CXXFLAGS_x86_64_pc_windows_gnullvm = "-isystem /data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/x86_64-w64-mingw32/include/c++/v1"
 GPUI_FXC_PATH = "/data/projects/rust_scriptbots/toolchains/windows/bin/fxc-wrapper"
+RUST_TEST_THREADS = "1"
 
 [target.x86_64-pc-windows-gnullvm]
 linker = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang"

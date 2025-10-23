@@ -580,16 +580,11 @@ async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, App
     tag = "control",
     responses((status = 200, description = "PNG screenshot", content_type = "image/png"))
 )]
-async fn screenshot_png() -> Result<Response, AppError> {
-    // Placeholder PNG (1x1 transparent) to unblock CLI plumbing without coupling to GPUI internals.
-    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_fn(1, 1, |_x, _y| Rgba([0, 0, 0, 0]));
-    let mut bytes: Vec<u8> = Vec::new();
-    {
-        let mut cursor = std::io::Cursor::new(&mut bytes);
-        img.write_to(&mut cursor, image::ImageFormat::Png)
-            .map_err(|e| AppError::internal(format!("encode png: {e}")))?;
-    }
+async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppError> {
+    let bytes = state
+        .handle
+        .snapshot_png(1024, 576)
+        .map_err::<AppError, _>(|e| e.into())?;
     Ok((StatusCode::OK, axum::body::Bytes::from(bytes)).into_response())
 }
 

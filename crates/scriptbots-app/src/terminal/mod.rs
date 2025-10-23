@@ -1282,7 +1282,6 @@ enum EventKind {
     Death,
     Population,
     Info,
-    Error,
 }
 
 impl Snapshot {
@@ -1692,7 +1691,6 @@ impl Palette {
             EventKind::Death => Color::Red,
             EventKind::Population => Color::Yellow,
             EventKind::Info => Color::Cyan,
-            EventKind::Error => Color::Red,
         };
         Style::default().fg(color)
     }

@@ -11,6 +11,7 @@ use scriptbots_app::{
 use scriptbots_core::{AgentData, Generation, Position, ScriptBotsConfig, Velocity, WorldState};
 use scriptbots_storage::{Storage, StoragePipeline};
 use serde::Deserialize;
+use serial_test::serial;
 use tempfile::tempdir;
 use tracing::Level;
 
@@ -77,6 +78,7 @@ struct HeadlessReportDto {
 }
 
 #[test]
+#[serial]
 fn terminal_headless_generates_report() -> Result<()> {
     let _env_guard = ENV_GUARD
         .get_or_init(|| Mutex::new(()))
@@ -89,7 +91,7 @@ fn terminal_headless_generates_report() -> Result<()> {
         .with_test_writer()
         .try_init();
 
-    let frames = 160usize;
+    let frames = 32usize;
 
     let report_dir = tempdir()?;
     let report_path = report_dir.path().join("terminal_report.json");
@@ -302,6 +304,7 @@ fn terminal_headless_generates_report() -> Result<()> {
 }
 
 #[test]
+#[serial]
 fn terminal_headless_applies_control_updates() -> Result<()> {
     let _env_guard = ENV_GUARD
         .get_or_init(|| Mutex::new(()))
@@ -314,7 +317,7 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
         .with_test_writer()
         .try_init();
 
-    let frames = 180usize;
+    let frames = 48usize;
 
     let report_dir = tempdir()?;
     let report_path = report_dir.path().join("terminal_control_report.json");

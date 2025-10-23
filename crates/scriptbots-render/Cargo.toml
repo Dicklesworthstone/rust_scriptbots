@@ -12,6 +12,7 @@ scriptbots-brain = { path = "../scriptbots-brain" }
 scriptbots-storage = { path = "../scriptbots-storage" }
 kira = { workspace = true, optional = true }
 rand = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 audio = ["kira"]
