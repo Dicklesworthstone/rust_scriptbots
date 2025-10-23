@@ -6624,6 +6624,7 @@ impl WorldState {
         self.last_max_age = age_max;
         self.persistence.on_tick(&batch);
         if self.cadence.should_sample_history(next_tick) {
+            eprintln!("pushing history for tick {}", next_tick.0);
             if self.history.len() >= self.config.history_capacity {
                 self.history.pop_front();
             }
