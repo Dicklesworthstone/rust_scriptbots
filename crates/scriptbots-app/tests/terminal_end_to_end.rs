@@ -421,14 +421,14 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
         ControlRuntime::launch(Arc::clone(&shared_world), control_config)?;
 
     let mut updated_config = config.clone();
-    updated_config.food_growth_rate = 0.24;
-    updated_config.food_decay_rate = 0.0004;
-    updated_config.food_respawn_amount = 0.5;
-    updated_config.metabolism_drain = 0.004;
-    updated_config.reproduction_cooldown = 8;
-    updated_config.reproduction_rate_herbivore = 220.0;
-    updated_config.reproduction_rate_carnivore = 220.0;
-    updated_config.reproduction_energy_cost = 0.08;
+    updated_config.food_growth_rate = 0.32;
+    updated_config.food_decay_rate = 0.0003;
+    updated_config.food_respawn_amount = 0.65;
+    updated_config.metabolism_drain = 0.0032;
+    updated_config.reproduction_cooldown = 6;
+    updated_config.reproduction_rate_herbivore = 320.0;
+    updated_config.reproduction_rate_carnivore = 320.0;
+    updated_config.reproduction_energy_cost = 0.06;
     updated_config.chart_flush_interval = 90;
     let submit_ok = command_submit(ControlCommand::UpdateConfig(Box::new(
         updated_config.clone(),

@@ -7093,8 +7093,6 @@ impl WorldState {
 
     /// Produce a filtered, sorted listing of agents for debug consumers.
     pub fn agent_debug_view(&self, query: AgentDebugQuery) -> Vec<AgentDebugInfo> {
-        use std::collections::HashSet;
-
         let AgentDebugQuery {
             ids,
             diet,
@@ -7187,8 +7185,6 @@ impl WorldState {
 
     /// Apply a selection update to highlight agents.
     pub fn apply_selection_update(&mut self, update: SelectionUpdate) -> SelectionResult {
-        use std::collections::HashSet;
-
         let mut cleared = 0usize;
         let mut applied = 0usize;
 
@@ -8093,6 +8089,129 @@ mod tests {
         let ticks_b = reproduction_tick_sequence(base.clone(), 24);
         assert_eq!(ticks_a, ticks_b);
         assert!(!ticks_a.is_empty());
+    }
+
+    #[test]
+    fn selection_updates_replace_add_and_clear() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let id_a = world.spawn_agent(sample_agent(0));
+        let id_b = world.spawn_agent(sample_agent(1));
+
+        let raw_a = id_a.data().as_ffi();
+        let raw_b = id_b.data().as_ffi();
+
+        let result = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: vec![raw_a],
+            state: SelectionState::Selected,
+        });
+        assert_eq!(result.applied, 1);
+        assert!(matches!(
+            world.agent_runtime(id_a).unwrap().selection,
+            SelectionState::Selected
+        ));
+        assert!(matches!(
+            world.agent_runtime(id_b).unwrap().selection,
+            SelectionState::None
+        ));
+
+        let result = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Add,
+            agent_ids: vec![raw_b],
+            state: SelectionState::Hovered,
+        });
+        assert_eq!(result.applied, 1);
+        assert!(matches!(
+            world.agent_runtime(id_b).unwrap().selection,
+            SelectionState::Hovered
+        ));
+
+        let result = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::Selected,
+        });
+        assert!(result.cleared >= 2);
+        assert!(matches!(
+            world.agent_runtime(id_a).unwrap().selection,
+            SelectionState::None
+        ));
+        assert!(matches!(
+            world.agent_runtime(id_b).unwrap().selection,
+            SelectionState::None
+        ));
+
+        // Clearing specific ids
+        world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Add,
+            agent_ids: vec![raw_a, raw_b],
+            state: SelectionState::Selected,
+        });
+        let result = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: vec![raw_a],
+            state: SelectionState::Selected,
+        });
+        assert!(result.cleared >= 1);
+        assert!(matches!(
+            world.agent_runtime(id_a).unwrap().selection,
+            SelectionState::None
+        ));
+        assert!(matches!(
+            world.agent_runtime(id_b).unwrap().selection,
+            SelectionState::Selected
+        ));
+
+        // Ensure raw conversion round-trips to live id
+        let round_trip = AgentId::from(KeyData::from_ffi(raw_b));
+        assert!(world.agents().contains(round_trip));
+        assert_eq!(round_trip.data().as_ffi(), raw_b);
+    }
+
+    #[test]
+    fn agent_debug_view_filters_by_selection_and_diet() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let id_a = world.spawn_agent(sample_agent(0));
+        let id_b = world.spawn_agent(sample_agent(1));
+
+        world.agent_runtime_mut(id_a).unwrap().herbivore_tendency = 0.8;
+        world.agent_runtime_mut(id_b).unwrap().herbivore_tendency = 0.1;
+        world.agent_runtime_mut(id_b).unwrap().energy = 5.0;
+
+        world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: vec![id_a.data().as_ffi()],
+            state: SelectionState::Selected,
+        });
+
+        let selected = world.agent_debug_view(AgentDebugQuery {
+            selection: Some(SelectionState::Selected),
+            ..AgentDebugQuery::default()
+        });
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].agent_id, id_a.data().as_ffi());
+
+        let carnivores = world.agent_debug_view(AgentDebugQuery {
+            diet: Some(DietClass::Carnivore),
+            sort: AgentDebugSort::EnergyDesc,
+            ..AgentDebugQuery::default()
+        });
+        assert_eq!(carnivores.len(), 1);
+        assert_eq!(carnivores[0].agent_id, id_a.data().as_ffi());
+
+        let specific = world.agent_debug_view(AgentDebugQuery {
+            ids: Some(vec![id_b.data().as_ffi()]),
+            limit: Some(1),
+            ..AgentDebugQuery::default()
+        });
+        assert_eq!(specific.len(), 1);
+        assert_eq!(specific[0].agent_id, id_b.data().as_ffi());
+
+        let nonexistent = world.agent_debug_view(AgentDebugQuery {
+            ids: Some(vec![u64::MAX]),
+            ..AgentDebugQuery::default()
+        });
+        assert!(nonexistent.is_empty());
     }
 
     #[test]

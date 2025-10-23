@@ -685,6 +685,7 @@ fn knob_kind(value: &Value) -> KnobKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slotmap::{Key, KeyData};
     use std::sync::{Arc, Mutex};
 
     fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
@@ -749,5 +750,54 @@ mod tests {
             }
             other => panic!("expected InvalidPatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn debug_agents_lists_selection() {
+        let (handle, receiver) = handle();
+        let raw_id = {
+            let mut world = handle.lock_world().expect("world lock");
+            let id = world.spawn_agent(scriptbots_core::AgentData::default());
+            world.apply_selection_update(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![id.data().as_ffi()],
+                state: SelectionState::Selected,
+            });
+            crate::command::drain_pending_commands(&receiver, &mut world);
+            id.data().as_ffi()
+        };
+
+        let entries = handle
+            .debug_agents(AgentDebugQuery {
+                selection: Some(SelectionState::Selected),
+                ids: Some(vec![raw_id]),
+                ..AgentDebugQuery::default()
+            })
+            .expect("debug agents");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent_id, raw_id);
+    }
+
+    #[test]
+    fn update_selection_enqueues_and_applies() {
+        let (handle, receiver) = handle();
+        let raw_id = {
+            let mut world = handle.lock_world().expect("world lock");
+            let id = world.spawn_agent(scriptbots_core::AgentData::default());
+            id.data().as_ffi()
+        };
+        handle
+            .update_selection(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![raw_id],
+                state: SelectionState::Selected,
+            })
+            .expect("enqueue selection command");
+
+        let mut world = handle.lock_world().expect("world lock");
+        crate::command::drain_pending_commands(&receiver, &mut world);
+        let agent_id = scriptbots_core::AgentId::from(KeyData::from_ffi(raw_id));
+        let runtime = world.agent_runtime(agent_id).expect("runtime");
+        assert!(matches!(runtime.selection, SelectionState::Selected));
     }
 }
