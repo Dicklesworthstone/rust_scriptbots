@@ -10,8 +10,9 @@ use scriptbots_core::{
     PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope,
     WorldPersistence,
 };
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
-use slotmap::Key;
+use slotmap::{Key, KeyData};
 use std::{
     sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
@@ -75,11 +76,7 @@ pub enum StorageError {
     #[error("storage worker error: {0}")]
     Worker(String),
     #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
-    ReplayParse {
-        tick: i64,
-        seq: i64,
-        reason: String,
-    },
+    ReplayParse { tick: i64, seq: i64, reason: String },
 }
 
 /// Summary row written to the `ticks` table.
@@ -1000,10 +997,7 @@ impl StoragePipeline {
                             }
                             Err(poisoned) => {
                                 let tick = batch.summary.tick.0;
-                                eprintln!(
-                                    "storage mutex poisoned while persisting tick {}",
-                                    tick
-                                );
+                                eprintln!("storage mutex poisoned while persisting tick {}", tick);
                                 let mut storage = poisoned.into_inner();
                                 if let Err(err) = storage.persist(&batch) {
                                     eprintln!(
@@ -1222,7 +1216,10 @@ fn decode_agent_id(raw: Option<i64>, tick: i64, seq: i64) -> Result<Option<Agent
             seq,
             reason: format!("negative agent id {value}"),
         }),
-        Some(value) => Ok(Some(AgentId::from_ffi(value as u64))),
+        Some(value) => {
+            let key = KeyData::from_ffi(value as u64);
+            Ok(Some(AgentId::from(key)))
+        }
         None => Ok(None),
     }
 }
@@ -1235,7 +1232,7 @@ fn agent_id_from_u64(value: u64, tick: i64, seq: i64) -> Result<AgentId, Storage
             reason: format!("agent id {value} exceeds supported range"),
         });
     }
-    Ok(AgentId::from_ffi(value))
+    Ok(AgentId::from(KeyData::from_ffi(value)))
 }
 
 fn parse_payload<T>(row: &ReplayEventRow) -> Result<T, StorageError>
@@ -1366,7 +1363,7 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
                 tick: row.tick,
                 seq: row.seq,
                 reason: format!("unknown event type '{other}'"),
-            })
+            });
         }
     };
 

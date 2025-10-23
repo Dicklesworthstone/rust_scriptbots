@@ -350,7 +350,7 @@ fn food_growth_moves_toward_capacity() {
 
     let mut world = WorldState::new(config).expect("world");
     let before = world.food().cells().to_vec();
-   world.step();
+    world.step();
 
     let width = world.food().width() as usize;
     let height = world.food().height() as usize;
@@ -393,7 +393,6 @@ fn food_diffusion_spreads_across_neighbors() {
     world.step();
 
     let width = world.food().width() as usize;
-    let height = world.food().height() as usize;
     let cells = world.food().cells();
     let center_expected = expected_food_value(&world, &before, 0, 0);
     assert!(

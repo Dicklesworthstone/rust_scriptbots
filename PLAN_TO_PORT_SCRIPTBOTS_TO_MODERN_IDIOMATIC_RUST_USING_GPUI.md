@@ -332,6 +332,7 @@
 - *Feature parity expectations*: document intentionally omitted GPUI features (e.g., advanced camera) and ensure Control Server APIs remain the extension point for deep inspection.
 
 ### Execution TODOs [Currently In Progress]
+- [Currently In Progress - 2025-10-23] Terminal renderer v2 visual overhaul (denser map glyphs, biome layers, agent inspectors, sparkline telemetry, narrative event log, configurable palettes).
 - [Completed - 2025-10-22] Dependency alignment: restored `thiserror`, added terminal dependencies (`supports-color`, ratatui already present), and confirmed no redundant `utoipa-axum` entries remain.
 - [Completed - 2025-10-22] CLI mode integration: `resolve_renderer` now detects headless environments, honors override env vars, and logs terminal fallback activation.
 - [Completed - 2025-10-22] Terminal renderer scaffolding: new `terminal` module implements the shared `Renderer` trait with the crossterm/ratatui event loop.

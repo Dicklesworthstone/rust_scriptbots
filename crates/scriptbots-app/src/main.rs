@@ -1,17 +1,22 @@
-use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::{ArgAction, Parser, ValueEnum};
+use owo_colors::OwoColorize;
 use scriptbots_app::{
     ControlRuntime, ControlServerConfig, SharedStorage, SharedWorld,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
 use scriptbots_brain::MlpBrain;
-use scriptbots_core::{AgentData, NeuroflowActivationKind, ScriptBotsConfig, WorldState};
+use scriptbots_core::{
+    AgentData, NeuroflowActivationKind, ReplayEventKind, ScriptBotsConfig, TickSummary, WorldState,
+};
 use scriptbots_render::run_demo;
-use scriptbots_storage::StoragePipeline;
+use scriptbots_storage::{PersistedReplayEvent, ReplayEventCount, Storage, StoragePipeline};
+use serde_json::{self, Value as JsonValue};
 use std::{
+    collections::HashMap,
     env, fmt, fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info, warn};
@@ -19,7 +24,12 @@ use tracing::{debug, info, warn};
 fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
-    let (world, storage) = bootstrap_world()?;
+    if cli.replay_db.is_some() {
+        run_replay_cli(&cli)?;
+        return Ok(());
+    }
+
+    let (world, storage) = bootstrap_world(&cli)?;
     let control_config = ControlServerConfig::from_env();
     let (control_runtime, command_drain, command_submit) =
         ControlRuntime::launch(world.clone(), control_config)?;
@@ -49,13 +59,8 @@ fn init_tracing() {
         .try_init();
 }
 
-fn bootstrap_world() -> Result<(SharedWorld, SharedStorage)> {
-    let mut config = ScriptBotsConfig {
-        persistence_interval: 60,
-        history_capacity: 600,
-        ..ScriptBotsConfig::default()
-    };
-    apply_env_overrides(&mut config);
+fn bootstrap_world(cli: &AppCli) -> Result<(SharedWorld, SharedStorage)> {
+    let config = compose_config(cli)?;
 
     let storage_path =
         env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
@@ -93,6 +98,17 @@ fn bootstrap_world() -> Result<(SharedWorld, SharedStorage)> {
     Ok((Arc::new(Mutex::new(world)), storage))
 }
 
+fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
+    let mut config = ScriptBotsConfig {
+        persistence_interval: 60,
+        history_capacity: 600,
+        ..ScriptBotsConfig::default()
+    };
+    config = apply_config_layers(config, &cli.config_layers)?;
+    apply_env_overrides(&mut config);
+    Ok(config)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "scriptbots-app",
@@ -108,6 +124,77 @@ struct AppCli {
         default_value_t = RendererMode::Auto
     )]
     mode: RendererMode,
+    /// Layered configuration files (TOML or RON) applied in order.
+    #[arg(
+        long = "config",
+        value_name = "FILE",
+        action = ArgAction::Append,
+        env = "SCRIPTBOTS_CONFIG",
+        value_delimiter = ';'
+    )]
+    config_layers: Vec<PathBuf>,
+    /// Path to a DuckDB run to verify via headless deterministic replay.
+    #[arg(long = "replay-db", value_name = "FILE", env = "SCRIPTBOTS_REPLAY_DB")]
+    replay_db: Option<PathBuf>,
+    /// Optional comparison database for divergence analysis.
+    #[arg(long = "compare-db", value_name = "FILE", requires = "replay_db")]
+    compare_db: Option<PathBuf>,
+    /// Limit the number of ticks simulated during replay verification.
+    #[arg(long = "tick-limit", value_name = "TICKS", requires = "replay_db")]
+    tick_limit: Option<u64>,
+}
+
+fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<ScriptBotsConfig> {
+    if layers.is_empty() {
+        return Ok(base);
+    }
+
+    let mut merged = serde_json::to_value(&base).expect("serialize base config");
+    for path in layers {
+        let layer_value = load_config_layer(path)?;
+        info!(
+            layer = %path.display(),
+            "Applying configuration layer"
+        );
+        merge_layer(&mut merged, layer_value);
+    }
+
+    serde_json::from_value(merged)
+        .map_err(|err| anyhow::anyhow!("failed to deserialize merged configuration: {err}"))
+}
+
+fn load_config_layer(path: &Path) -> Result<JsonValue> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read configuration layer {}", path.display()))?;
+
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ron") => ron::from_str(&contents)
+            .with_context(|| format!("failed to parse RON config layer {}", path.display())),
+        _ => toml::from_str(&contents)
+            .with_context(|| format!("failed to parse TOML config layer {}", path.display())),
+    }
+}
+
+fn merge_layer(base: &mut JsonValue, layer: JsonValue) {
+    match (base, layer) {
+        (JsonValue::Object(base_map), JsonValue::Object(layer_map)) => {
+            for (key, value) in layer_map {
+                if let Some(existing) = base_map.get_mut(&key) {
+                    merge_layer(existing, value);
+                } else {
+                    base_map.insert(key, value);
+                }
+            }
+        }
+        (target, value) => {
+            *target = value;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -196,6 +283,393 @@ fn should_use_terminal_mode() -> bool {
     }
 
     false
+}
+
+fn run_replay_cli(cli: &AppCli) -> Result<()> {
+    let db_path = cli
+        .replay_db
+        .as_ref()
+        .expect("replay_db required to enter replay mode");
+    let db_display = db_path.display().to_string();
+
+    let mut storage = Storage::open(&db_display).with_context(|| {
+        format!("failed to open replay database {db_display}")
+    })?;
+    let recorded_max_tick = storage.max_tick()?.unwrap_or(0);
+    let persisted_events = storage.load_replay_events()?;
+    let recorded_counts = storage.replay_event_counts()?;
+    drop(storage);
+
+    let events_max_tick = persisted_events.iter().map(|e| e.tick).max().unwrap_or(0);
+    let tick_limit = cli
+        .tick_limit
+        .unwrap_or(recorded_max_tick.max(events_max_tick));
+
+    let config = compose_config(cli)?;
+    if config.rng_seed.is_none() {
+        warn!("config_rng_seed" = false, "Replay config has no rng_seed; deterministic verification may fail");
+    }
+
+    let replay_run = run_headless_simulation(&config, tick_limit)?;
+    let simulated_tick_count = replay_run.summaries.len() as u64;
+    debug!(
+        simulated_ticks = simulated_tick_count,
+        simulated_events = replay_run.events.len(),
+        "Headless replay complete"
+    );
+    if simulated_tick_count != tick_limit {
+        warn!(
+            requested_ticks = tick_limit,
+            simulated_ticks = simulated_tick_count,
+            "Simulated tick count differs from requested limit"
+        );
+    }
+    let diff = diff_event_stream(&persisted_events, &replay_run.events);
+
+    let recorded_map = recorded_counts
+        .into_iter()
+        .map(|entry| (entry.event_type, entry.count))
+        .collect::<HashMap<_, _>>();
+    let simulated_counts = count_event_kinds(&replay_run.events)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<HashMap<_, _>>();
+
+    println!(
+        "{} Replaying {} ticks ({} recorded events) against {}",
+        "▶".bright_blue().bold(),
+        tick_limit,
+        persisted_events.len(),
+        db_display.cyan()
+    );
+    print_event_counts("recorded", &recorded_map, None);
+    print_event_counts("simulated", &simulated_counts, Some(&recorded_map));
+
+    if let Some(divergence) = diff {
+        report_divergence("recorded", "simulated", divergence)?;
+    } else {
+        println!(
+            "{} Replay matched {} events across {} ticks",
+            "✔".green().bold(),
+            replay_run.events.len().green(),
+            simulated_tick_count.green()
+        );
+    }
+
+    if let Some(compare_path) = cli.compare_db.as_ref() {
+        let compare_display = compare_path.display().to_string();
+        let mut other = Storage::open(&compare_display).with_context(|| {
+            format!("failed to open comparison database {compare_display}")
+        })?;
+        let other_events = other.load_replay_events()?;
+        let other_counts = other.replay_event_counts()?;
+        drop(other);
+
+        println!(
+            "{} Comparing {} against {}",
+            "▶".bright_blue().bold(),
+            db_display.cyan(),
+            compare_display.cyan()
+        );
+        let compare_diff = diff_event_stream(&persisted_events, &other_events);
+        let other_map = other_counts
+            .into_iter()
+            .map(|entry| (entry.event_type, entry.count))
+            .collect::<HashMap<_, _>>();
+        print_event_counts("baseline", &recorded_map, None);
+        print_event_counts("candidate", &other_map, Some(&recorded_map));
+
+        if let Some(divergence) = compare_diff {
+            report_divergence("baseline", "candidate", divergence)?;
+        } else {
+            println!(
+                "{} Event streams are identical ({} events)",
+                "✔".green().bold(),
+                other_events.len().green()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+struct ReplayCollector {
+    ticks: Arc<Mutex<Vec<ReplayTickRecord>>>,
+}
+
+impl ReplayCollector {
+    fn new() -> (Self, Arc<Mutex<Vec<ReplayTickRecord>>>) {
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        (Self { ticks: Arc::clone(&ticks) }, ticks)
+    }
+}
+
+impl WorldPersistence for ReplayCollector {
+    fn on_tick(&mut self, payload: &scriptbots_core::PersistenceBatch) {
+        if let Ok(mut guard) = self.ticks.lock() {
+            guard.push(ReplayTickRecord {
+                tick: payload.summary.tick.0,
+                events: payload.replay_events.clone(),
+                summary: payload.summary.clone(),
+            });
+        }
+    }
+}
+
+struct ReplayTickRecord {
+    tick: u64,
+    events: Vec<scriptbots_core::ReplayEvent>,
+    summary: TickSummary,
+}
+
+struct ReplayRun {
+    events: Vec<PersistedReplayEvent>,
+    summaries: Vec<TickSummary>,
+}
+
+fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result<ReplayRun> {
+    let (collector, handle) = ReplayCollector::new();
+    let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
+    let brain_keys = install_brains(&mut world);
+    seed_agents(&mut world, &brain_keys);
+
+    for _ in 0..tick_limit {
+        world.step();
+    }
+
+    drop(world);
+
+    let records = Arc::try_unwrap(handle)
+        .map_err(|_| anyhow::anyhow!("replay collector still in use"))?
+        .into_inner()
+        .map_err(|err| anyhow::anyhow!("replay collector poisoned: {err}"))?;
+
+    let mut events = Vec::new();
+    let mut summaries = Vec::with_capacity(records.len());
+    for record in records {
+        summaries.push(record.summary);
+        for (seq, event) in record.events.into_iter().enumerate() {
+            events.push(PersistedReplayEvent {
+                tick: record.tick,
+                seq: seq as u64,
+                event,
+            });
+        }
+    }
+
+    Ok(ReplayRun { events, summaries })
+}
+
+#[derive(Debug)]
+struct Divergence {
+    kind: DivergenceKind,
+    expected: Option<PersistedReplayEvent>,
+    actual: Option<PersistedReplayEvent>,
+}
+
+#[derive(Debug)]
+enum DivergenceKind {
+    TickMismatch,
+    SequenceMismatch,
+    EventMismatch,
+    MissingActual,
+    ExtraActual,
+}
+
+fn diff_event_stream(
+    expected: &[PersistedReplayEvent],
+    actual: &[PersistedReplayEvent],
+) -> Option<Divergence> {
+    let mut idx = 0;
+    loop {
+        match (expected.get(idx), actual.get(idx)) {
+            (Some(left), Some(right)) => {
+                if left.tick != right.tick {
+                    return Some(Divergence {
+                        kind: DivergenceKind::TickMismatch,
+                        expected: Some(left.clone()),
+                        actual: Some(right.clone()),
+                    });
+                }
+                if left.seq != right.seq {
+                    return Some(Divergence {
+                        kind: DivergenceKind::SequenceMismatch,
+                        expected: Some(left.clone()),
+                        actual: Some(right.clone()),
+                    });
+                }
+                if left.event != right.event {
+                    return Some(Divergence {
+                        kind: DivergenceKind::EventMismatch,
+                        expected: Some(left.clone()),
+                        actual: Some(right.clone()),
+                    });
+                }
+            }
+            (Some(left), None) => {
+                return Some(Divergence {
+                    kind: DivergenceKind::MissingActual,
+                    expected: Some(left.clone()),
+                    actual: None,
+                });
+            }
+            (None, Some(right)) => {
+                return Some(Divergence {
+                    kind: DivergenceKind::ExtraActual,
+                    expected: None,
+                    actual: Some(right.clone()),
+                });
+            }
+            (None, None) => return None,
+        }
+        idx += 1;
+    }
+}
+
+fn count_event_kinds(events: &[PersistedReplayEvent]) -> HashMap<&'static str, u64> {
+    let mut counts = HashMap::new();
+    for entry in events {
+        let key = match entry.event.kind {
+            ReplayEventKind::BrainOutputs { .. } => "brain_outputs",
+            ReplayEventKind::Action { .. } => "action",
+            ReplayEventKind::RngSample { .. } => "rng_sample",
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn report_divergence(left_label: &str, right_label: &str, divergence: Divergence) -> Result<()> {
+    let marker = "✖".red().bold();
+    match divergence.kind {
+        DivergenceKind::TickMismatch => {
+            if let (Some(exp), Some(act)) = (&divergence.expected, &divergence.actual) {
+                println!(
+                    "{marker} Tick mismatch: {left_label} tick {} vs {right_label} tick {}",
+                    exp.tick.red(),
+                    act.tick.red()
+                );
+            }
+        }
+        DivergenceKind::SequenceMismatch => {
+            if let (Some(exp), Some(act)) = (&divergence.expected, &divergence.actual) {
+                println!(
+                    "{marker} Sequence mismatch at tick {}: {left_label} seq {} vs {right_label} seq {}",
+                    exp.tick.red(),
+                    exp.seq.red(),
+                    act.seq.red()
+                );
+            }
+        }
+        DivergenceKind::EventMismatch => {
+            if let (Some(exp), Some(act)) = (&divergence.expected, &divergence.actual) {
+                println!(
+                    "{marker} Event mismatch at tick {} seq {}",
+                    exp.tick.red(),
+                    exp.seq.red()
+                );
+                println!(
+                    "    expected: {}",
+                    format_replay_event(&exp.event).yellow()
+                );
+                println!(
+                    "    actual:   {}",
+                    format_replay_event(&act.event).yellow()
+                );
+            }
+        }
+        DivergenceKind::MissingActual => {
+            if let Some(exp) = divergence.expected {
+                println!(
+                    "{marker} {right_label} stream ended before event tick {} seq {}",
+                    exp.tick.red(),
+                    exp.seq.red()
+                );
+            }
+        }
+        DivergenceKind::ExtraActual => {
+            if let Some(act) = divergence.actual {
+                println!(
+                    "{marker} {right_label} has extra event at tick {} seq {}",
+                    act.tick.red(),
+                    act.seq.red()
+                );
+            }
+        }
+    }
+
+    bail!("replay divergence detected")
+}
+
+fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
+    match &event.kind {
+        ReplayEventKind::BrainOutputs { outputs } => format!(
+            "BrainOutputs(agent={:?}, len={})",
+            event.agent_id,
+            outputs.len()
+        ),
+        ReplayEventKind::Action {
+            left_wheel,
+            right_wheel,
+            boost,
+            spike_target,
+            sound_level,
+            give_intent,
+        } => format!(
+            "Action(agent={:?}, lw={:.3}, rw={:.3}, boost={}, spike={:?}, sound={:.3}, give={:.3})",
+            event.agent_id,
+            left_wheel,
+            right_wheel,
+            boost,
+            spike_target,
+            sound_level,
+            give_intent
+        ),
+        ReplayEventKind::RngSample {
+            scope,
+            range_min,
+            range_max,
+            value,
+        } => format!(
+            "RngSample(scope={:?}, min={:.3}, max={:.3}, value={:.3})",
+            scope, range_min, range_max, value
+        ),
+    }
+}
+
+fn print_event_counts(
+    label: &str,
+    counts: &HashMap<String, u64>,
+    reference: Option<&HashMap<String, u64>>,
+) {
+    let keys = ["brain_outputs", "action", "rng_sample"];
+    println!("  {}", label.cyan().bold());
+    for key in keys {
+        let value = counts.get(key).copied().unwrap_or(0);
+        if let Some(baseline) = reference {
+            let baseline_value = baseline.get(key).copied().unwrap_or(0);
+            let delta = value as i64 - baseline_value as i64;
+            let delta_str = if delta == 0 {
+                format!("Δ {delta:+}").yellow()
+            } else if delta > 0 {
+                format!("Δ {delta:+}").green()
+            } else {
+                format!("Δ {delta:+}").red()
+            };
+            println!(
+                "    {:<14} {:>8} ({})",
+                key,
+                value,
+                delta_str
+            );
+        } else {
+            println!(
+                "    {:<14} {:>8}",
+                key,
+                value
+            );
+        }
+    }
 }
 
 fn install_brains(world: &mut WorldState) -> Vec<u64> {

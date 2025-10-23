@@ -2813,8 +2813,7 @@ impl WorldState {
 
                 if growth > 0.0 && self.config.food_max > 0.0 {
                     let normalized = value / self.config.food_max;
-                    let growth_delta =
-                        growth * profile.growth_multiplier * (1.0 - normalized);
+                    let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
                     value += growth_delta * self.config.food_max;
                 }
 
