@@ -7214,6 +7214,8 @@ mod tests {
         };
 
         let mut world = WorldState::new(config).expect("world");
+        assert_eq!(world.config().chart_flush_interval, 3);
+        assert_eq!(world.config().history_capacity, 8);
         let id = world.spawn_agent(sample_agent(0));
         {
             let runtime = world.agent_runtime_mut(id).expect("runtime");
@@ -7300,9 +7302,12 @@ mod tests {
         let mut flushed = Vec::new();
         for _ in 0..6 {
             let events = world.step();
+            dbg!(events.charts_flushed);
             if events.charts_flushed {
                 flushed.push(events.tick.0);
             }
+            let hist_len = world.history().count();
+            dbg!(events.tick.0, hist_len);
         }
 
         assert_eq!(flushed, vec![3, 6]);
