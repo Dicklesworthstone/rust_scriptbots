@@ -430,7 +430,9 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
     updated_config.reproduction_rate_carnivore = 220.0;
     updated_config.reproduction_energy_cost = 0.08;
     updated_config.chart_flush_interval = 90;
-    let submit_ok = command_submit(ControlCommand::UpdateConfig(updated_config.clone()));
+    let submit_ok = command_submit(ControlCommand::UpdateConfig(Box::new(
+        updated_config.clone(),
+    )));
     assert!(submit_ok, "control queue rejected config update");
 
     let renderer = TerminalRenderer::default();

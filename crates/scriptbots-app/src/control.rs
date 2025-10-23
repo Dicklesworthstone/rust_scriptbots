@@ -6,9 +6,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ControlCommand, DietClass,
-    HydrologyFlowDirection, HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState,
-    SelectionUpdate, Tick, WorldState,
+    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
+    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, Tick,
+    WorldState,
 };
 
 use crate::SharedWorld;
@@ -218,7 +218,10 @@ impl ControlHandle {
     }
 
     /// Retrieve a filtered debug listing of agents.
-    pub fn debug_agents(&self, query: AgentDebugQuery) -> Result<Vec<AgentDebugInfo>, ControlError> {
+    pub fn debug_agents(
+        &self,
+        query: AgentDebugQuery,
+    ) -> Result<Vec<AgentDebugInfo>, ControlError> {
         let world = self.lock_world()?;
         Ok(world.agent_debug_view(query))
     }
@@ -368,7 +371,7 @@ impl ControlHandle {
         }
         let snapshot = ConfigSnapshot::from_config(new_config.clone(), current_tick)?;
         drop(world);
-        self.enqueue(ControlCommand::UpdateConfig(new_config))?;
+        self.enqueue(ControlCommand::UpdateConfig(Box::new(new_config)))?;
         Ok(snapshot)
     }
 
@@ -578,18 +581,13 @@ impl From<DietClassDto> for DietClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionStateDto {
     None,
     Hovered,
+    #[default]
     Selected,
-}
-
-impl Default for SelectionStateDto {
-    fn default() -> Self {
-        Self::Selected
-    }
 }
 
 impl From<SelectionState> for SelectionStateDto {

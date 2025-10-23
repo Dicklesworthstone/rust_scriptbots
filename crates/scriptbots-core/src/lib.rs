@@ -6,7 +6,7 @@ use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
-use slotmap::{SecondaryMap, SlotMap, new_key_type, Key, KeyData};
+use slotmap::{Key, KeyData, SecondaryMap, SlotMap, new_key_type};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -158,7 +158,7 @@ fn angle_difference(a: f32, b: f32) -> f32 {
 /// Commands that can be applied to the world from external control surfaces.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
-    UpdateConfig(ScriptBotsConfig),
+    UpdateConfig(Box<ScriptBotsConfig>),
     UpdateSelection(SelectionUpdate),
 }
 
@@ -168,7 +168,7 @@ pub fn apply_control_command(
     command: ControlCommand,
 ) -> Result<(), WorldStateError> {
     match command {
-        ControlCommand::UpdateConfig(config) => world.apply_config_update(config),
+        ControlCommand::UpdateConfig(config) => world.apply_config_update(*config),
         ControlCommand::UpdateSelection(update) => {
             world.apply_selection_update(update);
             Ok(())
@@ -424,16 +424,11 @@ pub struct SelectionResult {
 }
 
 /// Sort options for agent debug listings.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum AgentDebugSort {
+    #[default]
     EnergyDesc,
     AgeDesc,
-}
-
-impl Default for AgentDebugSort {
-    fn default() -> Self {
-        Self::EnergyDesc
-    }
 }
 
 /// Query parameters for a debug view of agents.
@@ -7119,10 +7114,10 @@ impl WorldState {
 
         let mut entries: Vec<AgentDebugInfo> = Vec::new();
         for handle in self.agents.iter_handles() {
-            if let Some(filter) = &id_filter {
-                if !filter.contains(&handle) {
-                    continue;
-                }
+            if let Some(filter) = &id_filter
+                && !filter.contains(&handle)
+            {
+                continue;
             }
 
             let Some(snapshot) = self.snapshot_agent(handle) else {
@@ -7130,17 +7125,17 @@ impl WorldState {
             };
             let runtime = snapshot.runtime;
 
-            if let Some(expected) = selection {
-                if runtime.selection != expected {
-                    continue;
-                }
+            if let Some(expected) = selection
+                && runtime.selection != expected
+            {
+                continue;
             }
 
             let diet_class = DietClass::from_tendency(runtime.herbivore_tendency);
-            if let Some(expected_diet) = diet {
-                if diet_class != expected_diet {
-                    continue;
-                }
+            if let Some(expected_diet) = diet
+                && diet_class != expected_diet
+            {
+                continue;
             }
 
             if let Some(filter) = &brain_filter {
@@ -7181,10 +7176,10 @@ impl WorldState {
             AgentDebugSort::AgeDesc => entries.sort_by(|a, b| b.age.cmp(&a.age)),
         }
 
-        if let Some(limit) = limit {
-            if entries.len() > limit {
-                entries.truncate(limit);
-            }
+        if let Some(limit) = limit
+            && entries.len() > limit
+        {
+            entries.truncate(limit);
         }
 
         entries
@@ -7226,11 +7221,11 @@ impl WorldState {
             }
             SelectionMode::Add => {
                 for id in &targets {
-                    if let Some(runtime) = self.runtime.get_mut(*id) {
-                        if runtime.selection != state {
-                            runtime.selection = state;
-                            applied += 1;
-                        }
+                    if let Some(runtime) = self.runtime.get_mut(*id)
+                        && runtime.selection != state
+                    {
+                        runtime.selection = state;
+                        applied += 1;
                     }
                 }
             }
@@ -7244,11 +7239,11 @@ impl WorldState {
                     }
                 } else {
                     for id in &targets {
-                        if let Some(runtime) = self.runtime.get_mut(*id) {
-                            if !matches!(runtime.selection, SelectionState::None) {
-                                runtime.selection = SelectionState::None;
-                                cleared += 1;
-                            }
+                        if let Some(runtime) = self.runtime.get_mut(*id)
+                            && !matches!(runtime.selection, SelectionState::None)
+                        {
+                            runtime.selection = SelectionState::None;
+                            cleared += 1;
                         }
                     }
                 }

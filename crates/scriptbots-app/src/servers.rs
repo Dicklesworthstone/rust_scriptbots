@@ -42,7 +42,7 @@ use crate::control::{
     EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
     SelectionStateDto,
 };
-use scriptbots_core::{AgentDebugQuery, AgentDebugSort, SelectionUpdate};
+use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 // keep image out of servers unless needed
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
@@ -172,6 +172,25 @@ fn parse_mcp_socket_addr(value: &str) -> Option<SocketAddr> {
         .unwrap_or(trimmed);
     let host_port = normalized.split('/').next().unwrap_or(normalized);
     host_port.parse::<SocketAddr>().ok()
+}
+
+fn parse_id_list(raw: &str) -> Result<Vec<u64>, AppError> {
+    let mut ids = Vec::new();
+    for part in raw.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.parse::<u64>() {
+            Ok(value) => ids.push(value),
+            Err(_) => {
+                return Err(AppError::bad_request(format!(
+                    "unable to parse agent id '{token}'"
+                )));
+            }
+        }
+    }
+    Ok(ids)
 }
 
 /// Supported transports for the MCP server.
@@ -345,6 +364,107 @@ struct PresetApplyRequest {
     name: String,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+struct AgentDebugResponse {
+    agents: Vec<AgentDebugEntryDto>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct AgentDebugEntryDto {
+    agent_id: u64,
+    selection: SelectionStateDto,
+    position: PositionDto,
+    energy: f32,
+    health: f32,
+    age: u32,
+    generation: u32,
+    herbivore_tendency: f32,
+    diet: DietClassDto,
+    brain_kind: Option<String>,
+    brain_key: Option<u64>,
+    mutation_primary: f32,
+    mutation_secondary: f32,
+    indicator_intensity: f32,
+    indicator_color: [f32; 3],
+}
+
+impl From<AgentDebugInfo> for AgentDebugEntryDto {
+    fn from(info: AgentDebugInfo) -> Self {
+        Self {
+            agent_id: info.agent_id,
+            selection: info.selection.into(),
+            position: PositionDto::from(info.position),
+            energy: info.energy,
+            health: info.health,
+            age: info.age,
+            generation: info.generation,
+            herbivore_tendency: info.herbivore_tendency,
+            diet: DietClassDto::from(info.diet),
+            brain_kind: info.brain_kind,
+            brain_key: info.brain_key,
+            mutation_primary: info.mutation_primary,
+            mutation_secondary: info.mutation_secondary,
+            indicator_intensity: info.indicator.intensity,
+            indicator_color: info.indicator.color,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+struct PositionDto {
+    x: f32,
+    y: f32,
+}
+
+impl From<Position> for PositionDto {
+    fn from(value: Position) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema, Default)]
+struct AgentDebugQueryParams {
+    #[serde(default)]
+    ids: Option<String>,
+    #[serde(default)]
+    diet: Option<DietClassDto>,
+    #[serde(default)]
+    selection: Option<SelectionStateDto>,
+    #[serde(default)]
+    brain: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct SelectionUpdateRequestBody {
+    mode: SelectionModeDto,
+    #[serde(default)]
+    agent_ids: Vec<u64>,
+    #[serde(default)]
+    state: Option<SelectionStateDto>,
+}
+
+impl From<SelectionUpdateRequestBody> for SelectionUpdate {
+    fn from(value: SelectionUpdateRequestBody) -> Self {
+        SelectionUpdate {
+            mode: value.mode.into(),
+            agent_ids: value.agent_ids,
+            state: value.state.unwrap_or_default().into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct SelectionAcknowledge {
+    queued: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ConfigPatchRequest {
     #[schema(value_type = Object, nullable = false)]
@@ -383,9 +503,11 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
         stream_ticks_sse,
         get_events_tail,
         get_scoreboard,
+        get_agents_debug,
         get_config_audit,
         list_presets,
-        apply_preset
+        apply_preset,
+        post_selection
     ),
     components(
         schemas(
@@ -400,10 +522,17 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
             ErrorResponse,
             EventEntry,
             EventKind,
-            DietClass,
+            DietClassDto,
+            SelectionStateDto,
+            SelectionModeDto,
             AgentScoreEntry,
             Scoreboard,
-            HydrologySnapshot
+            HydrologySnapshot,
+            AgentDebugResponse,
+            AgentDebugEntryDto,
+            PositionDto,
+            SelectionUpdateRequestBody,
+            SelectionAcknowledge
         )
     ),
     info(title = "ScriptBots Control API", version = "0.0.0"),
@@ -662,6 +791,76 @@ async fn get_scoreboard(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/agents/debug",
+    tag = "control",
+    params(
+        ("ids" = String, Query, description = "Comma-separated list of agent ids to include"),
+        ("diet" = DietClassDto, Query, description = "Filter by dietary class"),
+        ("selection" = SelectionStateDto, Query, description = "Filter by selection state"),
+        ("brain" = String, Query, description = "Substring match against brain kind"),
+        ("limit" = usize, Query, description = "Maximum number of agents to return"),
+        ("sort" = String, Query, description = "Sort order: 'energy' (default) or 'age'")
+    ),
+    responses((status = 200, body = AgentDebugResponse), (status = 400, body = ErrorResponse))
+)]
+async fn get_agents_debug(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<AgentDebugQueryParams>,
+) -> Result<Json<AgentDebugResponse>, AppError> {
+    let mut query = AgentDebugQuery::default();
+
+    if let Some(raw_ids) = params.ids.as_deref() {
+        let ids = parse_id_list(raw_ids)?;
+        if !ids.is_empty() {
+            query.ids = Some(ids);
+        }
+    }
+    query.diet = params.diet.map(|dto| dto.into());
+    query.selection = params.selection.map(|dto| dto.into());
+    query.brain_kind = params.brain.clone();
+    query.limit = params.limit;
+    if let Some(sort) = params.sort.as_deref() {
+        query.sort = match sort.to_ascii_lowercase().as_str() {
+            "energy" | "" => AgentDebugSort::EnergyDesc,
+            "age" => AgentDebugSort::AgeDesc,
+            other => {
+                return Err(AppError::bad_request(format!(
+                    "unknown sort mode '{other}'; expected 'energy' or 'age'"
+                )));
+            }
+        };
+    }
+
+    let agents = state
+        .handle
+        .debug_agents(query)?
+        .into_iter()
+        .map(AgentDebugEntryDto::from)
+        .collect();
+    Ok(Json(AgentDebugResponse { agents }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/selection",
+    tag = "control",
+    request_body = SelectionUpdateRequestBody,
+    responses((status = 202, body = SelectionAcknowledge), (status = 400, body = ErrorResponse))
+)]
+async fn post_selection(
+    State(state): State<ApiState>,
+    Json(body): Json<SelectionUpdateRequestBody>,
+) -> Result<(StatusCode, Json<SelectionAcknowledge>), AppError> {
+    let update: SelectionUpdate = body.into();
+    state.handle.update_selection(update)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SelectionAcknowledge { queued: true }),
+    ))
+}
+
+#[utoipa::path(
     patch,
     path = "/api/config",
     tag = "control",
@@ -775,6 +974,8 @@ async fn run_rest_server(
         // Event tail and scoreboard
         .route("/api/events/tail", get(get_events_tail))
         .route("/api/scoreboard", get(get_scoreboard))
+        .route("/api/agents/debug", get(get_agents_debug))
+        .route("/api/selection", post(post_selection))
         // Presets and audit
         .route("/api/presets", get(list_presets))
         .route("/api/presets/apply", post(apply_preset))
