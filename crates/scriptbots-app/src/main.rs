@@ -12,7 +12,7 @@ use scriptbots_core::{
     AgentData, NeuroflowActivationKind, ReplayEventKind, ScriptBotsConfig, TickSummary,
     WorldPersistence, WorldState,
 };
-use scriptbots_render::run_demo;
+use scriptbots_render::{render_png_offscreen, run_demo};
 use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
 use std::process::Command;
@@ -55,7 +55,45 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Configure low-power / thread budget before world creation so the Rayon pool is capped.
+    if let Some(threads) = cli.threads {
+        unsafe {
+            std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
+        }
+    } else if cli.low_power {
+        // Conservative default: 2 worker threads unless explicitly overridden by --threads
+        unsafe {
+            std::env::set_var("SCRIPTBOTS_MAX_THREADS", "2");
+        }
+    }
+
     let (world, storage) = bootstrap_world(config)?;
+
+    // Optional: dump a PNG snapshot and exit (no UI launched).
+    if let Some(path) = cli.dump_png.as_ref() {
+        let (w, h) = cli
+            .png_size
+            .as_deref()
+            .and_then(parse_png_size)
+            .unwrap_or((1280, 720));
+
+        let bytes = {
+            let guard = world.lock().expect("world mutex poisoned");
+            render_png_offscreen(&guard, w, h)
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, &bytes)?;
+        println!(
+            "{} Wrote snapshot {} ({}x{})",
+            "✔".green().bold(),
+            path.display(),
+            w,
+            h
+        );
+        return Ok(());
+    }
     let control_config = ControlServerConfig::from_env();
     let (control_runtime, command_drain, command_submit) =
         ControlRuntime::launch(world.clone(), control_config)?;
@@ -348,6 +386,18 @@ struct AppCli {
     /// Run determinism self-check comparing 1-thread vs N-threads for the given number of ticks.
     #[arg(long = "det-check", value_name = "TICKS")]
     det_check: Option<u64>,
+    /// Cap simulation worker threads (overrides low-power default).
+    #[arg(long = "threads", value_name = "N")]
+    threads: Option<usize>,
+    /// Prefer lower CPU usage (equivalent to --threads 2 unless --threads is provided).
+    #[arg(long = "low-power", action = ArgAction::SetTrue)]
+    low_power: bool,
+    /// Write an offscreen PNG snapshot and exit (no UI).
+    #[arg(long = "dump-png", value_name = "FILE")]
+    dump_png: Option<PathBuf>,
+    /// Snapshot size for --dump-png, formatted as WIDTHxHEIGHT (e.g., 1280x720).
+    #[arg(long = "png-size", value_name = "WxH")]
+    png_size: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -965,6 +1015,17 @@ fn parse_activation(raw: &str) -> Option<NeuroflowActivationKind> {
         "relu" => Some(NeuroflowActivationKind::Relu),
         _ => None,
     }
+}
+
+fn parse_png_size(raw: &str) -> Option<(u32, u32)> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let mut parts = lower.split('x');
+    let w = parts.next()?.trim().parse::<u32>().ok()?;
+    let h = parts.next()?.trim().parse::<u32>().ok()?;
+    if parts.next().is_some() || w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
 }
 
 fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {

@@ -42,9 +42,7 @@ use crate::control::{
     EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
     SelectionStateDto,
 };
-use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate,
-};
+use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 // keep image out of servers unless needed
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;

@@ -134,6 +134,8 @@ fn terminal_headless_generates_report() -> Result<()> {
         temperature_discomfort_rate: 0.0015,
         food_intake_rate: 0.008,
         food_waste_rate: 0.0005,
+        reproduction_attempt_interval: 1,
+        reproduction_attempt_chance: 1.0,
         ..ScriptBotsConfig::default()
     };
     config.food_sharing_rate = 0.15;
@@ -317,7 +319,7 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
         .with_test_writer()
         .try_init();
 
-    let frames = 48usize;
+    let frames = 96usize;
 
     let report_dir = tempdir()?;
     let report_path = report_dir.path().join("terminal_control_report.json");
@@ -364,6 +366,8 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
         food_intake_rate: 0.009,
         food_waste_rate: 0.0006,
         chart_flush_interval: 240,
+        reproduction_attempt_interval: 1,
+        reproduction_attempt_chance: 1.0,
         ..ScriptBotsConfig::default()
     };
     config.analytics_stride.behavior_metrics = 24;
@@ -421,15 +425,18 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
         ControlRuntime::launch(Arc::clone(&shared_world), control_config)?;
 
     let mut updated_config = config.clone();
-    updated_config.food_growth_rate = 0.32;
-    updated_config.food_decay_rate = 0.0003;
-    updated_config.food_respawn_amount = 0.65;
-    updated_config.metabolism_drain = 0.0032;
-    updated_config.reproduction_cooldown = 6;
-    updated_config.reproduction_rate_herbivore = 320.0;
-    updated_config.reproduction_rate_carnivore = 320.0;
-    updated_config.reproduction_energy_cost = 0.06;
+    updated_config.food_growth_rate = 0.36;
+    updated_config.food_decay_rate = 0.00025;
+    updated_config.food_respawn_amount = 0.72;
+    updated_config.metabolism_drain = 0.0025;
+    updated_config.reproduction_cooldown = 5;
+    updated_config.reproduction_rate_herbivore = 420.0;
+    updated_config.reproduction_rate_carnivore = 420.0;
+    updated_config.reproduction_energy_cost = 0.045;
+    updated_config.reproduction_child_energy = 1.2;
     updated_config.chart_flush_interval = 90;
+    updated_config.reproduction_attempt_interval = 1;
+    updated_config.reproduction_attempt_chance = 1.0;
     let submit_ok = command_submit(ControlCommand::UpdateConfig(Box::new(
         updated_config.clone(),
     )));
