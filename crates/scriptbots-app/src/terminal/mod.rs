@@ -237,6 +237,17 @@ impl<'a> TerminalApp<'a> {
         self.last_tick = now;
 
         let mut steps = 0usize;
+        // Auto-pause check based on config threshold
+        if !self.paused {
+            if let Ok(world) = self.world.lock() {
+                if let Some(limit) = world.config().control.auto_pause_population_below {
+                    if world.agent_count() as u32 <= limit {
+                        self.paused = true;
+                    }
+                }
+            }
+        }
+
         let effective_speed = if self.paused {
             0.0
         } else {

@@ -305,7 +305,7 @@ These scoped additions improve usability, insight, and experiment velocity witho
 - Testing: unit-test delta math; snapshot HUD/TUI lines.
 - Complexity: S.
 
-### 3) Auto‑pause on conditions
+### 3) Auto‑pause on conditions [Currently In Progress - 2025-10-23]
 - Purpose: stop at interesting moments automatically.
 - MVP: triggers: population < X, first spike kill, age > Y.
 - Surfaces: HUD panel with checkboxes/thresholds; TUI toggles; REST patch `control.auto_pause.*` keys.
@@ -369,7 +369,7 @@ These scoped additions improve usability, insight, and experiment velocity witho
 - Testing: fixture worlds pass; inject a known race → diff surfaces red.
 - Complexity: M.
 
-### 11) NDJSON tick tail endpoint
+### 11) NDJSON tick tail endpoint [Currently In Progress - 2025-10-23]
 - Purpose: easy streaming to dashboards/scripts without websockets.
 - MVP: `GET /api/stream/ticks?fields=tick,agents,births,deaths` returns NDJSON.
 - Surfaces: REST only; docs example with `curl`.

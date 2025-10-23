@@ -195,6 +195,19 @@ impl SimulationView {
         let last = self.last_sim_instant.unwrap_or(now);
         self.last_sim_instant = Some(now);
 
+        // Auto-pause: honor control config threshold without mutating world state directly.
+        if !self.controls.paused {
+            if let Ok(world) = self.world.lock() {
+                let threshold = world.config().control.auto_pause_population_below;
+                if let Some(limit) = threshold {
+                    if world.agent_count() as u32 <= limit {
+                        self.controls.paused = true;
+                        info!(limit, count = world.agent_count(), "Auto-paused due to population threshold");
+                    }
+                }
+            }
+        }
+
         if self.controls.paused || self.controls.speed_multiplier <= 0.0 {
             self.sim_accumulator = 0.0;
             return;

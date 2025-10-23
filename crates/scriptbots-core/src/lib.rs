@@ -1648,6 +1648,21 @@ pub enum WorldStateError {
     InvalidConfig(&'static str),
 }
 
+/// Control-related runtime behavior toggles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlSettings {
+    /// Auto-pause the simulation when population is at or below this threshold. None disables.
+    pub auto_pause_population_below: Option<u32>,
+}
+
+impl Default for ControlSettings {
+    fn default() -> Self {
+        Self {
+            auto_pause_population_below: None,
+        }
+    }
+}
+
 /// Static configuration for a ScriptBots world.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptBotsConfig {
@@ -1825,6 +1840,8 @@ pub struct ScriptBotsConfig {
     pub analytics_stride: AnalyticsStride,
     /// NeuroFlow runtime configuration.
     pub neuroflow: NeuroflowSettings,
+    /// Control-related runtime behavior toggles.
+    pub control: ControlSettings,
 }
 
 impl Default for ScriptBotsConfig {
@@ -1917,6 +1934,7 @@ impl Default for ScriptBotsConfig {
             persistence_interval: 0,
             analytics_stride: AnalyticsStride::default(),
             neuroflow: NeuroflowSettings::default(),
+            control: ControlSettings::default(),
         }
     }
 }

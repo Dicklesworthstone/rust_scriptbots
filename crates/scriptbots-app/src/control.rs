@@ -116,6 +116,24 @@ impl ControlHandle {
         ConfigSnapshot::from_world(world.config(), world.tick())
     }
 
+    /// Retrieve the latest tick summary from the running world.
+    pub fn latest_summary(&self) -> Result<scriptbots_core::TickSummary, ControlError> {
+        let world = self.lock_world()?;
+        if let Some(latest) = world.history().last() {
+            Ok(latest.clone())
+        } else {
+            Ok(scriptbots_core::TickSummary {
+                tick: world.tick(),
+                agent_count: world.agent_count(),
+                births: 0,
+                deaths: 0,
+                total_energy: 0.0,
+                average_energy: 0.0,
+                average_health: 0.0,
+            })
+        }
+    }
+
     /// Flatten the configuration into individual knob descriptors for discovery.
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
         let world = self.lock_world()?;

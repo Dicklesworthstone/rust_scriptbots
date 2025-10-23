@@ -13,6 +13,13 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    body::Body,
+};
+use axum::response::sse::{Event, Sse};
+use futures_util::stream::{Stream, StreamExt};
+use std::convert::Infallible;
+use std::time::Duration;
+use tokio_stream::wrappers::IntervalStream;
     routing::{get, post},
 };
 use mcp_protocol_sdk::{
@@ -414,6 +421,45 @@ async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot
     Ok(Json(snapshot))
 }
 
+/// Return the latest tick summary as JSON.
+#[utoipa::path(
+    get,
+    path = "/api/ticks/latest",
+    tag = "control",
+    responses((status = 200, description = "Latest tick summary"))
+)]
+async fn get_latest_tick_summary(
+    State(state): State<ApiState>,
+) -> Result<Json<scriptbots_core::TickSummaryDto>, AppError> {
+    let summary = state.handle.latest_summary()?;
+    Ok(Json(summary.into()))
+}
+
+/// Stream latest tick summaries as Server-Sent Events (SSE).
+#[utoipa::path(
+    get,
+    path = "/api/ticks/stream",
+    tag = "control",
+    responses((status = 200, description = "SSE stream of tick summaries"))
+)]
+async fn stream_ticks_sse(State(state): State<ApiState>) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let handle = state.handle.clone();
+    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
+        let handle = handle.clone();
+        async move {
+            let event = match handle.latest_summary() {
+                Ok(summary) => {
+                    let json = serde_json::to_string(&scriptbots_core::TickSummaryDto::from(summary)).unwrap_or_else(|_| "{}".to_string());
+                    Event::default().data(json)
+                }
+                Err(_) => Event::default().data("{}"),
+            };
+            Ok::<Event, Infallible>(event)
+        }
+    });
+    Ok(Sse::new(stream))
+}
+
 #[utoipa::path(
     patch,
     path = "/api/config",
@@ -467,6 +513,9 @@ async fn run_rest_server(
         .route("/api/knobs", get(get_knobs))
         .route("/api/config", get(get_config).patch(patch_config))
         .route("/api/knobs/apply", post(apply_updates))
+        // Tick summaries (JSON one-shot and SSE stream)
+        .route("/api/ticks/latest", get(get_latest_tick_summary))
+        .route("/api/ticks/stream", get(stream_ticks_sse))
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(swagger_path_static)
