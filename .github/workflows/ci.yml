@@ -72,6 +72,11 @@ jobs:
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
+      - name: Scriptbots-app unit tests (terminal HUD)
+        run: cargo test -p scriptbots-app --lib -- --nocapture
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
   wasm:
     name: Wasm (ubuntu)
     runs-on: ubuntu-24.04

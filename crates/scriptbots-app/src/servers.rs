@@ -528,6 +528,44 @@ async fn stream_ticks_sse(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/events/tail",
+    tag = "control",
+    params(("limit" = usize, Query, description = "Max events to return", example = 32)),
+    responses((status = 200, body = [EventEntry]))
+)]
+async fn get_events_tail(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<EventEntry>>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(32);
+    let events = state.handle.events_tail(limit)?;
+    Ok(Json(events))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/scoreboard",
+    tag = "control",
+    params(("limit" = usize, Query, description = "Max entries per list", example = 10)),
+    responses((status = 200, body = Scoreboard))
+)]
+async fn get_scoreboard(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Scoreboard>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(10);
+    let board = state.handle.compute_scoreboard(limit)?;
+    Ok(Json(board))
+}
+
+#[utoipa::path(
     patch,
     path = "/api/config",
     tag = "control",
@@ -633,6 +671,9 @@ async fn run_rest_server(
         // Tick summaries (JSON one-shot and SSE stream)
         .route("/api/ticks/latest", get(get_latest_tick_summary))
         .route("/api/ticks/stream", get(stream_ticks_sse))
+        // Event tail and scoreboard
+        .route("/api/events/tail", get(get_events_tail))
+        .route("/api/scoreboard", get(get_scoreboard))
         // Presets and audit
         .route("/api/presets", get(list_presets))
         .route("/api/presets/apply", post(apply_preset))

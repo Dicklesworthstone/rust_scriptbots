@@ -3679,6 +3679,73 @@ pub use map_sandbox::{
     ScalarField, TileSpec, TilesetSpec,
 };
 
+/// Runtime hydrology state tracked by the world.
+#[derive(Debug, Clone)]
+pub struct HydrologyState {
+    tiles: HydrologyTileLayer,
+    field: HydrologyField,
+    water_depth: Vec<f32>,
+}
+
+impl HydrologyState {
+    pub fn new(tiles: HydrologyTileLayer, field: HydrologyField) -> Self {
+        let len = (tiles.width() as usize) * (tiles.height() as usize);
+        let mut water_depth = Vec::with_capacity(len);
+        water_depth.extend_from_slice(field.initial_water_depth());
+        Self {
+            tiles,
+            field,
+            water_depth,
+        }
+    }
+
+    pub fn tiles(&self) -> &HydrologyTileLayer {
+        &self.tiles
+    }
+
+    pub fn field(&self) -> &HydrologyField {
+        &self.field
+    }
+
+    pub fn width(&self) -> u32 {
+        self.tiles.width()
+    }
+
+    pub fn height(&self) -> u32 {
+        self.tiles.height()
+    }
+
+    pub fn cell_count(&self) -> usize {
+        self.water_depth.len()
+    }
+
+    pub fn water_depth(&self) -> &[f32] {
+        &self.water_depth
+    }
+
+    pub fn water_depth_mut(&mut self) -> &mut [f32] {
+        &mut self.water_depth
+    }
+
+    pub fn total_water_depth(&self) -> f32 {
+        self.water_depth.iter().sum()
+    }
+
+    pub fn flooded_cell_counts(&self, shallow_threshold: f32, deep_threshold: f32) -> (usize, usize) {
+        let mut shallow = 0usize;
+        let mut deep = 0usize;
+        for depth in &self.water_depth {
+            if *depth >= shallow_threshold {
+                shallow += 1;
+            }
+            if *depth >= deep_threshold {
+                deep += 1;
+            }
+        }
+        (shallow, deep)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FoodCellProfile {
     capacity: f32,
@@ -3786,6 +3853,7 @@ pub struct WorldState {
     food_profiles: Vec<FoodCellProfile>,
     terrain: TerrainLayer,
     map_metadata: Option<MapArtifactMetadata>,
+    hydrology: Option<HydrologyState>,
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
@@ -3829,6 +3897,13 @@ impl fmt::Debug for WorldState {
                     .as_ref()
                     .map(|meta| meta.tileset_id.as_str()),
             )
+            .field(
+                "hydrology",
+                &self
+                    .hydrology
+                    .as_ref()
+                    .map(|state| state.tiles().width()),
+            )
             .finish()
     }
 }
@@ -3862,6 +3937,7 @@ impl WorldState {
             food,
             terrain,
             map_metadata: None,
+            hydrology: None,
             config,
             tick: Tick::zero(),
             epoch: 0,
@@ -6242,6 +6318,36 @@ impl WorldState {
                 metrics.push(MetricSample::from_f32("food.max", max));
             }
 
+            if let Some(hydrology) = self.hydrology.as_ref() {
+                let total_water = hydrology.total_water_depth();
+                let flooded = hydrology.flooded_cell_counts(0.05, 0.2);
+                let cell_count = hydrology.cell_count().max(1) as f64;
+                metrics.push(MetricSample::new(
+                    "hydrology.water.total_depth",
+                    f64::from(total_water),
+                ));
+                metrics.push(MetricSample::new(
+                    "hydrology.water.mean_depth",
+                    f64::from(total_water) / cell_count,
+                ));
+                metrics.push(MetricSample::new(
+                    "hydrology.water.flooded.shallow.count",
+                    flooded.0 as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "hydrology.water.flooded.deep.count",
+                    flooded.1 as f64,
+                ));
+                metrics.push(MetricSample::new(
+                    "hydrology.water.flooded.shallow.ratio",
+                    flooded.0 as f64 / cell_count,
+                ));
+                metrics.push(MetricSample::new(
+                    "hydrology.water.flooded.deep.ratio",
+                    flooded.1 as f64 / cell_count,
+                ));
+            }
+
             for (label, (count, energy_sum)) in brain_map {
                 let key = sanitize_metric_key(&label);
                 metrics.push(MetricSample::new(
@@ -6715,6 +6821,13 @@ impl WorldState {
             }
         }
 
+        self.hydrology = match (artifact.hydrology_tiles(), artifact.hydrology_field()) {
+            (Some(tiles), Some(field)) => {
+                Some(HydrologyState::new(tiles.clone(), field.clone()))
+            }
+            _ => None,
+        };
+
         self.map_metadata = Some(artifact.metadata().clone());
         Ok(())
     }
@@ -6722,6 +6835,16 @@ impl WorldState {
     /// Metadata describing the last applied procedural map, when available.
     pub fn map_metadata(&self) -> Option<&MapArtifactMetadata> {
         self.map_metadata.as_ref()
+    }
+
+    /// Immutable access to hydrology state when available.
+    pub fn hydrology(&self) -> Option<&HydrologyState> {
+        self.hydrology.as_ref()
+    }
+
+    /// Mutable access to hydrology state when available.
+    pub fn hydrology_mut(&mut self) -> Option<&mut HydrologyState> {
+        self.hydrology.as_mut()
     }
 
     /// Immutable access to the brain registry.

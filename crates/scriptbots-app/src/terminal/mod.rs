@@ -305,17 +305,17 @@ impl<'a> TerminalApp<'a> {
             .constraints([
                 Constraint::Length(7),
                 Constraint::Length(5),
-                Constraint::Length(
-                    (LEADERBOARD_LIMIT as u16 + 3).min(body[1].height.saturating_sub(15)),
-                ),
-                Constraint::Min(5),
+                Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                Constraint::Min(3),
             ])
             .split(body[1]);
 
         self.draw_stats(frame, sidebar[0], &snapshot);
         self.draw_trends(frame, sidebar[1], &snapshot);
         self.draw_leaderboard(frame, sidebar[2], &snapshot);
-        self.draw_events(frame, sidebar[3], &snapshot);
+        self.draw_oldest(frame, sidebar[3], &snapshot);
+        self.draw_events(frame, sidebar[4], &snapshot);
 
         if self.help_visible {
             self.draw_help(frame);
@@ -635,7 +635,40 @@ impl<'a> TerminalApp<'a> {
             .collect();
 
         let block = Block::default()
-            .title(self.palette.title("Top Survivors"))
+            .title(self.palette.title("Top Predators"))
+            .borders(Borders::ALL);
+        frame.render_widget(List::new(items).block(block), area);
+    }
+
+    fn draw_oldest(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let items: Vec<ListItem> = snapshot
+            .oldest
+            .iter()
+            .map(|entry| {
+                let mut spans = Vec::new();
+                spans.push(Span::styled(
+                    format!("#{:<4}", entry.label),
+                    self.palette.header_style(),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    match entry.diet {
+                        DietClass::Herbivore => "H ",
+                        DietClass::Omnivore => "O ",
+                        DietClass::Carnivore => "C ",
+                    },
+                    self.palette.diet_style(entry.diet),
+                ));
+                spans.push(Span::raw(format!(
+                    "age {:>3} ⚡{:>5.2} ❤{:>5.2} gen {:>2}",
+                    entry.age, entry.energy, entry.health, entry.generation
+                )));
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let block = Block::default()
+            .title(self.palette.title("Oldest Agents"))
             .borders(Borders::ALL);
         frame.render_widget(List::new(items).block(block), area);
     }
@@ -934,6 +967,7 @@ struct Snapshot {
     diet_split: DietSplit,
     agents: Vec<AgentViz>,
     leaderboard: Vec<LeaderboardEntry>,
+    oldest: Vec<LeaderboardEntry>,
     food: FoodView,
     control: ControlSettings,
     spike_hits: u32,
@@ -1313,8 +1347,10 @@ impl Snapshot {
             energy_max = 0.0;
         }
 
+        // Top Predators: carnivores by energy (health tie-break)
         let mut leaderboard: Vec<LeaderboardEntry> = agents
             .iter()
+            .filter(|a| matches!(a.diet, DietClass::Carnivore))
             .map(|agent| LeaderboardEntry {
                 label: agent.id,
                 diet: agent.diet,
@@ -1332,6 +1368,21 @@ impl Snapshot {
                 .then_with(|| b.health.partial_cmp(&a.health).unwrap_or(Ordering::Equal))
         });
         leaderboard.truncate(LEADERBOARD_LIMIT);
+
+        // Oldest Agents: across all diets by age
+        let mut oldest: Vec<LeaderboardEntry> = agents
+            .iter()
+            .map(|agent| LeaderboardEntry {
+                label: agent.id,
+                diet: agent.diet,
+                energy: agent.energy,
+                health: agent.health,
+                age: agent.age,
+                generation: agent.generation,
+            })
+            .collect();
+        oldest.sort_by(|a, b| b.age.cmp(&a.age));
+        oldest.truncate(LEADERBOARD_LIMIT);
 
         let food_grid = world.food();
         let food_cells = food_grid.cells().to_vec();
@@ -1363,6 +1414,7 @@ impl Snapshot {
             diet_split,
             agents,
             leaderboard,
+            oldest,
             food: FoodView {
                 width: food_grid.width(),
                 height: food_grid.height(),

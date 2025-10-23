@@ -445,12 +445,35 @@ order by bucket;
 ### REST Control API (with Swagger UI)
 - Default address: `http://127.0.0.1:8088` (override `SCRIPTBOTS_CONTROL_REST_ADDR`)
 - Swagger UI path: `/docs` (override `SCRIPTBOTS_CONTROL_SWAGGER_PATH`)
+- OpenAPI JSON: `/api-docs/openapi.json`
 - Enable/disable: `SCRIPTBOTS_CONTROL_REST_ENABLED=true|false`
 - Endpoints:
   - `GET /api/knobs` → list flattened config knobs
   - `GET /api/config` → fetch entire config snapshot
   - `PATCH /api/config` → apply JSON object patch `{ ... }`
   - `POST /api/knobs/apply` → apply list of `{ path, value }` updates
+
+REST quickstart:
+```bash
+# 1) Start the app
+cargo run -p scriptbots-app
+
+# 2) Open Swagger UI in a browser
+#    http://127.0.0.1:8088/docs
+
+# 3) List knobs
+curl -s http://127.0.0.1:8088/api/knobs | jq '.[0:10]'
+
+# 4) Patch configuration (enable NeuroFlow, set layers, activation)
+curl -s -X PATCH http://127.0.0.1:8088/api/config \
+  -H 'content-type: application/json' \
+  -d '{"patch":{"neuroflow":{"enabled":true,"hidden_layers":[64,32,16],"activation":"relu"}}}' | jq .
+
+# 5) Apply typed updates
+curl -s -X POST http://127.0.0.1:8088/api/knobs/apply \
+  -H 'content-type: application/json' \
+  -d '{"updates":[{"path":"food_max","value":0.6}]}' | jq .
+```
 
 Example PATCH body:
 ```json
@@ -483,6 +506,11 @@ cargo run -p scriptbots-app --bin control_cli -- export metrics --db scriptbots.
   - `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`
   - `apply_patch` → accepts `{ patch: { ... } }`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
+
+MCP quickstart:
+- Start the app; verify MCP binds on `127.0.0.1:8090` (override via `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR`).
+- Connect an MCP HTTP client to the endpoint; available tools: `list_knobs`, `get_config`, `apply_updates`, `apply_patch`.
+- Each tool returns structured JSON; use your MCP-compatible agent to orchestrate parameter sweeps and log findings to DuckDB.
 
 ## Configuration files & scenarios
 - **Current state**: all configuration changes flow through the control surfaces (REST, MCP HTTP, CLI). Values persist only for the lifetime of the session unless you export them yourself.
@@ -523,6 +551,10 @@ All configuration can be inspected and updated at runtime via REST/CLI/MCP. Comm
 - NeuroFlow: `neuroflow.{enabled,hidden_layers,activation}`
 
 Use `GET /api/knobs` to discover the full flattened list with current values.
+
+Runtime constraints:
+- Changing `world_width`/`world_height` at runtime is rejected; restart with new dimensions.
+- Some composite changes may be coerced (e.g., number/string parsing) but type mismatches are rejected with a clear error.
 
 ### Control bus architecture
 - The app owns a bounded MPMC `CommandBus`; external surfaces (REST, MCP, CLI) enqueue `ControlCommand`s.

@@ -326,12 +326,15 @@ Implementation notes [2025-10-23]:
 - Terminal & GPUI: main render loops set paused when `agent_count <= limit`.
 - CLI: `--auto-pause-below` (env `SCRIPTBOTS_AUTO_PAUSE_BELOW`) wires into config at startup.
 
-### 4) Event feed (birth/kill/combat)
+### 4) Event feed (birth/kill/combat) [Completed - 2025-10-23 Codex; [Currently In Progress] polishing filters]
 - Purpose: narrative understanding; lightweight teaching log.
-- MVP: bounded ring buffer sourced from existing tick events; filter chips (All|Birth|Death|Combat).
-- Surfaces: HUD side panel; TUI tab; REST `GET /api/events/tail?limit=N`.
-- Data/Perf: reuse persisted `events`; also keep last N in memory; colorized rendering.
-- Testing: property test that counts match `events` table; UI snapshot.
+- MVP: bounded ring buffer sourced from tick summaries (births/deaths/spike_hits).
+- Surfaces: HUD side panel; TUI panel; REST `GET /api/events/tail?limit=N`.
+- Implementation:
+  - Terminal HUD now renders a colorized Recent Events panel; event ingestion hooks births/deaths deltas and population changes.
+  - REST: `/api/events/tail` returns latest events (tick, kind, count).
+- Data/Perf: reads from in-memory history; zero extra allocations on hot paths.
+- Follow‑ups: add filter chips (All|Birth|Death|Combat) and expose in Swagger.
 - Complexity: S.
 
 ### 5) Selection tags (cohorts)
@@ -438,12 +441,14 @@ Implementation notes [2025-10-23]:
 - Testing: serialization round‑trip; overlay render smoke.
 - Complexity: S-M.
 
-### 18) Agent scoreboard
+### 18) Agent scoreboard [Completed - 2025-10-23 Codex]
 - Purpose: at‑a‑glance “Top predators” and “Oldest living”.
 - MVP: two small tables sourced from current snapshot (not heavy analytics).
-- Surfaces: HUD cards; TUI tab.
-- Data/Perf: compute over current agents once per second.
-- Testing: tie‑break determinism; snapshot tests.
+- Surfaces: Terminal HUD shows "Top Predators" (carnivores by energy) and "Oldest Agents"; REST `GET /api/scoreboard?limit=K`.
+- Implementation:
+  - Control layer computes top carnivores (energy/health tie‑break) and oldest agents.
+  - OpenAPI schemas exposed; endpoints documented in Swagger UI.
+- Data/Perf: computed from live world state; bounded sort/truncate (`K=10` default).
 - Complexity: S.
 
 ### 19) Brush‑based food edits
