@@ -10,6 +10,7 @@ use scriptbots_core::{ControlCommand, ScriptBotsConfig, Tick, WorldState};
 use crate::SharedWorld;
 use crate::command::CommandSender;
 use scriptbots_core::ConfigAuditEntry;
+use slotmap::Key;
 
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -151,6 +152,96 @@ impl ControlHandle {
     pub fn audit(&self) -> Result<Vec<ConfigAuditEntry>, ControlError> {
         let world = self.lock_world()?;
         Ok(world.config_audit().to_vec())
+    }
+
+    /// Build a tail of recent narrative events from the world's tick history.
+    /// Events include births, deaths, and combat spike hits.
+    pub fn events_tail(&self, limit: usize) -> Result<Vec<EventEntry>, ControlError> {
+        let world = self.lock_world()?;
+        let mut events = Vec::new();
+        for summary in world.history().rev() {
+            if summary.births > 0 {
+                events.push(EventEntry::new(
+                    summary.tick.0,
+                    EventKind::Birth,
+                    summary.births,
+                ));
+            }
+            if summary.deaths > 0 {
+                events.push(EventEntry::new(
+                    summary.tick.0,
+                    EventKind::Death,
+                    summary.deaths,
+                ));
+            }
+            if summary.spike_hits > 0 {
+                events.push(EventEntry::new(
+                    summary.tick.0,
+                    EventKind::Combat,
+                    summary.spike_hits as usize,
+                ));
+            }
+            if events.len() >= limit {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    /// Compute scoreboard snapshots: top predators (carnivores) by energy and oldest living agents.
+    pub fn compute_scoreboard(&self, limit: usize) -> Result<Scoreboard, ControlError> {
+        let world = self.lock_world()?;
+
+        let handles: Vec<scriptbots_core::AgentId> = world.agents().iter_handles().collect();
+        let columns = world.agents().columns();
+        let runtimes = world.runtime();
+
+        let mut carnivores = Vec::new();
+        let mut oldest = Vec::new();
+
+        for (idx, id) in handles.iter().enumerate() {
+            let runtime = runtimes.get(*id);
+            let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
+            let diet = DietClass::from_tendency(tendency);
+            let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
+            let health = columns.health()[idx];
+            let age = columns.ages()[idx];
+            let generation = columns.generations()[idx].0;
+
+            let entry = AgentScoreEntry {
+                agent_id: id.data().as_ffi(),
+                energy,
+                health,
+                age,
+                generation,
+                diet,
+            };
+
+            if matches!(diet, DietClass::Carnivore) {
+                carnivores.push(entry.clone());
+            }
+            oldest.push(entry);
+        }
+
+        carnivores.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.health
+                        .partial_cmp(&a.health)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        oldest.sort_by(|a, b| b.age.cmp(&a.age));
+
+        carnivores.truncate(limit);
+        oldest.truncate(limit);
+
+        Ok(Scoreboard {
+            top_predators: carnivores,
+            oldest,
+        })
     }
 
     /// Apply a structured JSON patch object onto the configuration.
@@ -339,6 +430,63 @@ fn merge_value(
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    Birth,
+    Death,
+    Combat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct EventEntry {
+    pub tick: u64,
+    pub kind: EventKind,
+    pub count: usize,
+}
+
+impl EventEntry {
+    pub fn new(tick: u64, kind: EventKind, count: usize) -> Self {
+        Self { tick, kind, count }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DietClass {
+    Herbivore,
+    Omnivore,
+    Carnivore,
+}
+
+impl DietClass {
+    fn from_tendency(t: f32) -> Self {
+        if t <= 0.33 {
+            Self::Herbivore
+        } else if t >= 0.66 {
+            Self::Carnivore
+        } else {
+            Self::Omnivore
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AgentScoreEntry {
+    pub agent_id: u64,
+    pub energy: f32,
+    pub health: f32,
+    pub age: u32,
+    pub generation: u32,
+    pub diet: DietClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Scoreboard {
+    pub top_predators: Vec<AgentScoreEntry>,
+    pub oldest: Vec<AgentScoreEntry>,
 }
 
 fn flatten_value(prefix: &str, value: &Value, entries: &mut Vec<KnobEntry>) {

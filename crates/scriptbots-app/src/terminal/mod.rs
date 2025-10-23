@@ -839,6 +839,14 @@ impl<'a> TerminalApp<'a> {
         });
     }
 
+    /// Evaluate auto-pause triggers from the current snapshot and update
+    /// paused/speed state. Emits at most one Auto-pause event per tick.
+    ///
+    /// Covered by tests:
+    /// - auto_pause_on_spike_hits
+    /// - auto_pause_on_max_age
+    /// - auto_pause_on_population_threshold
+    /// - auto_pause_single_event_per_tick
     fn evaluate_auto_pause(&mut self) {
         if self.paused {
             return;
@@ -1823,5 +1831,41 @@ mod tests {
             app.paused,
             "should auto-pause when population below threshold"
         );
+    }
+
+    #[test]
+    fn auto_pause_single_event_per_tick() {
+        let mut config = ScriptBotsConfig::default();
+        config.control.auto_pause_on_spike_hit = true;
+        let world = WorldState::new(config).expect("world");
+
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let storage = Arc::new(std::sync::Mutex::new(
+            scriptbots_storage::Storage::open(":memory:").expect("storage"),
+        ));
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            storage: Arc::clone(&storage),
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+
+        let initial_events = app.event_log.len();
+        app.snapshot.spike_hits = 1;
+        app.paused = false;
+        app.evaluate_auto_pause();
+        let after_first = app.event_log.len();
+        // Re-evaluate within the same tick; should not add a duplicate event
+        app.evaluate_auto_pause();
+        let after_second = app.event_log.len();
+
+        assert_eq!(after_first, initial_events + 1);
+        assert_eq!(after_second, after_first);
+        assert!(app.paused);
+        assert_eq!(app.last_autopause_tick, Some(app.snapshot.tick));
     }
 }

@@ -2902,12 +2902,100 @@ mod map_sandbox {
         }
     }
 
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum HydrologyFlowDirection {
+        None,
+        North,
+        South,
+        East,
+        West,
+    }
+
+    impl HydrologyFlowDirection {
+        fn from_cardinal(direction: Option<CardinalDirection>) -> Self {
+            match direction {
+                Some(CardinalDirection::North) => Self::North,
+                Some(CardinalDirection::South) => Self::South,
+                Some(CardinalDirection::East) => Self::East,
+                Some(CardinalDirection::West) => Self::West,
+                None => Self::None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct HydrologyField {
+        width: u32,
+        height: u32,
+        flow_directions: Vec<HydrologyFlowDirection>,
+        accumulation: Vec<f32>,
+        spill_elevation: Vec<f32>,
+        basin_ids: Vec<u32>,
+        initial_water_depth: Vec<f32>,
+    }
+
+    impl HydrologyField {
+        pub fn new(
+            width: u32,
+            height: u32,
+            flow_directions: Vec<HydrologyFlowDirection>,
+            accumulation: Vec<f32>,
+            spill_elevation: Vec<f32>,
+            basin_ids: Vec<u32>,
+            initial_water_depth: Vec<f32>,
+        ) -> Self {
+            debug_assert_eq!(flow_directions.len(), (width as usize) * (height as usize));
+            debug_assert_eq!(accumulation.len(), flow_directions.len());
+            debug_assert_eq!(spill_elevation.len(), flow_directions.len());
+            debug_assert_eq!(basin_ids.len(), flow_directions.len());
+            debug_assert_eq!(initial_water_depth.len(), flow_directions.len());
+            Self {
+                width,
+                height,
+                flow_directions,
+                accumulation,
+                spill_elevation,
+                basin_ids,
+                initial_water_depth,
+            }
+        }
+
+        pub fn width(&self) -> u32 {
+            self.width
+        }
+
+        pub fn height(&self) -> u32 {
+            self.height
+        }
+
+        pub fn flow_directions(&self) -> &[HydrologyFlowDirection] {
+            &self.flow_directions
+        }
+
+        pub fn accumulation(&self) -> &[f32] {
+            &self.accumulation
+        }
+
+        pub fn spill_elevation(&self) -> &[f32] {
+            &self.spill_elevation
+        }
+
+        pub fn basin_ids(&self) -> &[u32] {
+            &self.basin_ids
+        }
+
+        pub fn initial_water_depth(&self) -> &[f32] {
+            &self.initial_water_depth
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MapArtifact {
         terrain: TerrainLayer,
         fertility: Option<ScalarField>,
         temperature: Option<ScalarField>,
         hydrology_tiles: Option<HydrologyTileLayer>,
+        hydrology_field: Option<HydrologyField>,
         metadata: MapArtifactMetadata,
     }
 
@@ -2926,6 +3014,10 @@ mod map_sandbox {
 
         pub fn hydrology_tiles(&self) -> Option<&HydrologyTileLayer> {
             self.hydrology_tiles.as_ref()
+        }
+
+        pub fn hydrology_field(&self) -> Option<&HydrologyField> {
+            self.hydrology_field.as_ref()
         }
 
         pub fn metadata(&self) -> &MapArtifactMetadata {
@@ -3097,6 +3189,8 @@ mod map_sandbox {
             let fertility_field = ScalarField::new(width, height, fertility);
             let temperature_field = ScalarField::new(width, height, temperature);
             let hydrology_layer = HydrologyTileLayer::new(width, height, hydrology_tiles);
+            let hydrology_field =
+                compute_hydrology_field(width, height, &terrain, &hydrology_layer);
             let metadata = MapArtifactMetadata {
                 generator: MapGeneratorKind::RuleBased,
                 tileset_id: self.spec.id.clone(),
@@ -3114,6 +3208,7 @@ mod map_sandbox {
                 fertility: Some(fertility_field),
                 temperature: Some(temperature_field),
                 hydrology_tiles: Some(hydrology_layer),
+                hydrology_field: Some(hydrology_field),
                 metadata,
             })
         }
@@ -3348,6 +3443,166 @@ mod map_sandbox {
         hasher.finish()
     }
 
+    fn compute_hydrology_field(
+        width: u32,
+        height: u32,
+        terrain: &TerrainLayer,
+        hydrology: &HydrologyTileLayer,
+    ) -> HydrologyField {
+        let len = (width as usize) * (height as usize);
+        let terrain_tiles = terrain.tiles();
+        let hydrology_tiles = hydrology.tiles();
+        let mut flow_directions = vec![HydrologyFlowDirection::None; len];
+        let mut flow_targets: Vec<Option<usize>> = vec![None; len];
+        let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); len];
+        let mut spill_elevation = vec![0.0f32; len];
+        let mut effective_elevation = vec![0.0f32; len];
+
+        let width_i32 = width as i32;
+        let height_i32 = height as i32;
+
+        let neighbors = [
+            (CardinalDirection::North, (0, -1)),
+            (CardinalDirection::South, (0, 1)),
+            (CardinalDirection::East, (1, 0)),
+            (CardinalDirection::West, (-1, 0)),
+        ];
+
+        for y in 0..height_i32 {
+            for x in 0..width_i32 {
+                let idx = (y as usize) * (width as usize) + (x as usize);
+                let tile = &terrain_tiles[idx];
+                let hyd = &hydrology_tiles[idx];
+                let permeability_penalty = (1.0 - hyd.permeability) * 0.04;
+                let runoff_bonus = hyd.runoff_bias.max(0.0) * 0.03;
+                let channel_bonus = (1.0 - hyd.channel_priority) * 0.02;
+                effective_elevation[idx] =
+                    tile.elevation + permeability_penalty + channel_bonus + runoff_bonus;
+
+                let mut best_direction = HydrologyFlowDirection::None;
+                let mut best_score = effective_elevation[idx] - 1e-6;
+                let mut best_target = None;
+                let mut min_neighbor_elevation = tile.elevation;
+
+                for (direction, (dx, dy)) in neighbors.iter() {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || nx >= width_i32 || ny < 0 || ny >= height_i32 {
+                        continue;
+                    }
+                    let nidx = (ny as usize) * (width as usize) + (nx as usize);
+                    let neighbor_tile = &terrain_tiles[nidx];
+                    let neighbor_hyd = &hydrology_tiles[nidx];
+                    let slope_bonus = (tile.elevation - neighbor_tile.elevation).max(0.0) * 0.5;
+                    let channel_synergy =
+                        (hyd.channel_priority + neighbor_hyd.channel_priority) * 0.03;
+                    let neighbor_permeability_penalty = (1.0 - neighbor_hyd.permeability) * 0.02;
+                    let neighbor_score = effective_elevation[nidx] - slope_bonus - channel_synergy
+                        + neighbor_permeability_penalty;
+
+                    if neighbor_score < best_score {
+                        best_score = neighbor_score;
+                        best_direction = HydrologyFlowDirection::from_cardinal(Some(*direction));
+                        best_target = Some(nidx);
+                    }
+
+                    if neighbor_tile.elevation < min_neighbor_elevation {
+                        min_neighbor_elevation = neighbor_tile.elevation;
+                    }
+                }
+
+                flow_directions[idx] = best_direction;
+                flow_targets[idx] = best_target;
+                if let Some(target) = best_target {
+                    incoming[target].push(idx);
+                }
+
+                spill_elevation[idx] = min_neighbor_elevation;
+            }
+        }
+
+        let mut accumulation = vec![0.0f32; len];
+        let mut visited = vec![false; len];
+        for idx in 0..len {
+            accumulate_flow(idx, &incoming, &mut accumulation, &mut visited);
+        }
+
+        let mut basin_ids = vec![u32::MAX; len];
+        let mut next_basin_id: u32 = 0;
+        for idx in 0..len {
+            if basin_ids[idx] != u32::MAX {
+                continue;
+            }
+            let mut trail = Vec::new();
+            let mut current = idx;
+            let basin_id = loop {
+                if basin_ids[current] != u32::MAX {
+                    break basin_ids[current];
+                }
+                if let Some(pos) = trail.iter().position(|&value| value == current) {
+                    let basin = next_basin_id;
+                    next_basin_id += 1;
+                    for node in &trail[pos..] {
+                        basin_ids[*node] = basin;
+                    }
+                    break basin;
+                }
+                trail.push(current);
+                match flow_targets[current] {
+                    Some(next) if next != current => {
+                        current = next;
+                    }
+                    _ => {
+                        let basin = next_basin_id;
+                        next_basin_id += 1;
+                        basin_ids[current] = basin;
+                        break basin;
+                    }
+                }
+            };
+            for node in trail {
+                basin_ids[node] = basin_id;
+            }
+        }
+
+        let mut initial_water_depth = Vec::with_capacity(len);
+        for idx in 0..len {
+            let hyd = &hydrology_tiles[idx];
+            let base_depth = hyd.basin_rank * 0.25 + hyd.runoff_bias.max(0.0) * 0.05;
+            let permeability_discount = hyd.permeability * 0.1;
+            let depth = (base_depth - permeability_discount).clamp(0.0, 0.6);
+            initial_water_depth.push(depth);
+        }
+
+        HydrologyField::new(
+            width,
+            height,
+            flow_directions,
+            accumulation,
+            spill_elevation,
+            basin_ids,
+            initial_water_depth,
+        )
+    }
+
+    fn accumulate_flow(
+        idx: usize,
+        incoming: &[Vec<usize>],
+        accumulation: &mut [f32],
+        visited: &mut [bool],
+    ) -> f32 {
+        if visited[idx] {
+            return accumulation[idx];
+        }
+        let mut total = 1.0f32;
+        for &child in &incoming[idx] {
+            total += accumulate_flow(child, incoming, accumulation, visited);
+        }
+        visited[idx] = true;
+        accumulation[idx] = total;
+        total
+    }
+
     fn current_epoch_ms() -> u128 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3405,14 +3660,23 @@ mod map_sandbox {
             assert_eq!(hydrology.width(), 8);
             assert_eq!(hydrology.height(), 8);
             assert!(hydrology.tiles().iter().any(|tile| tile.permeability > 0.0));
+            let hydrology_field = artifact.hydrology_field().expect("hydrology field present");
+            assert_eq!(hydrology_field.width(), 8);
+            assert_eq!(hydrology_field.height(), 8);
+            assert!(
+                hydrology_field
+                    .accumulation()
+                    .iter()
+                    .all(|value| *value >= 1.0)
+            );
         }
     }
 }
 
 pub use map_sandbox::{
-    AdjacencySpec, HydrologyTile, HydrologyTileLayer, MapArtifact, MapArtifactMetadata,
-    MapGenerationError, MapGeneratorKind, RuleBasedMapGenerator, ScalarField, TileSpec,
-    TilesetSpec,
+    AdjacencySpec, HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer,
+    MapArtifact, MapArtifactMetadata, MapGenerationError, MapGeneratorKind, RuleBasedMapGenerator,
+    ScalarField, TileSpec, TilesetSpec,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -6322,7 +6586,7 @@ impl WorldState {
     }
 
     /// Iterate over retained tick summaries.
-    pub fn history(&self) -> impl Iterator<Item = &TickSummary> {
+    pub fn history(&self) -> impl DoubleEndedIterator<Item = &TickSummary> {
         self.history.iter()
     }
 

@@ -37,7 +37,10 @@ use crate::SharedWorld;
 use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };
-use crate::control::{ConfigSnapshot, ControlError, ControlHandle, KnobEntry, KnobUpdate};
+use crate::control::{
+    AgentScoreEntry, ConfigSnapshot, ControlError, ControlHandle, DietClass, EventEntry, EventKind,
+    KnobEntry, KnobUpdate, Scoreboard,
+};
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
 
@@ -367,7 +370,19 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_knobs, get_config, patch_config, apply_updates, get_latest_tick_summary, stream_ticks_sse, get_config_audit, list_presets, apply_preset),
+    paths(
+        get_knobs,
+        get_config,
+        patch_config,
+        apply_updates,
+        get_latest_tick_summary,
+        stream_ticks_sse,
+        get_events_tail,
+        get_scoreboard,
+        get_config_audit,
+        list_presets,
+        apply_preset
+    ),
     components(
         schemas(
             KnobEntry,
@@ -378,7 +393,12 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
             ConfigAuditEntryView,
             PresetList,
             PresetApplyRequest,
-            ErrorResponse
+            ErrorResponse,
+            EventEntry,
+            EventKind,
+            DietClass,
+            AgentScoreEntry,
+            Scoreboard
         )
     ),
     info(title = "ScriptBots Control API", version = "0.0.0"),
