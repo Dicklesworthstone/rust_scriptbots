@@ -25,6 +25,8 @@
   - `crates/scriptbots-brain-neuro`: Optional crate that wraps NeuroFlow feed-forward networks for more advanced brains, kept isolated behind a Cargo feature for lean builds.citeturn2search1
   - `crates/scriptbots-render`: GPUI views, canvas drawing, input handling, overlays.
   - `crates/scriptbots-app`: Binary crate wiring simulation loop, GPUI application, CLI/config loading.
+  - [Completed - GPT-5 Codex 2025-10-23] `crates/scriptbots-index`: Spatial indexing utilities (`UniformGridIndex`) powering neighbor queries in sensing/combat.
+  - [Completed - GPT-5 Codex 2025-10-23] `crates/scriptbots-web`: Wasm wrapper exposing a browser API (`Simulation`, `SimulationSnapshot`) with wasm-bindgen tests in CI.
   - Optional future crate `scriptbots-replay`: tooling for replay/serialization.
 - Shared utilities crate (e.g., `scriptbots-util`) for RNG wrappers, fixed-point helpers, instrumentation.
 - Use Cargo features to toggle experimental brains (`assembly`), AI modules, or headless mode.
@@ -89,7 +91,7 @@
   - Keep sensor aggregation and brain inference behind pluggable traits so alternative implementations (SIMD-optimized, GPU-backed) can be introduced without touching higher-level logic. Prototype GPU execution by batching inference into wgpu compute shaders or other accelerators once profiling justifies the investment.
 
 ## Rendering with GPUI
-- Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Completed - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
+ - Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Completed - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
 - State ownership:
   - `SimulationEntity`: `Entity<SimulationModel>` holds shared simulation state (agents, food grid snapshot, metrics). Updates triggered via background tasks that mutate entity and call `cx.notify()`.
   - UI-specific entity for camera (zoom, pan) mirroring original GLView controls.
@@ -100,10 +102,12 @@
 - Input Handling:
   - Map keyboard shortcuts (`gpui::prelude::*`) to actions (pause, toggle render, spawn agents) using GPUI action system.
   - Mouse interactions: listen for `MouseDownEvent`, translate world coordinates using camera entity, select nearest agent, show inspector drawer.
-- Platform Notes:
+ - Platform Notes:
   - GPUI documentation highlights macOS and Linux as current targets; prioritize those platforms and monitor upstream progress for additional backends.citeturn0search0
-- Tooling:
+  - [Completed - GPT-5 Codex 2025-10-23] Terminal renderer auto‑fallback covers headless environments and is exercised in CI.
+ - Tooling:
   - Use `create-gpui-app` CLI to scaffold initial GPUI project structure, then integrate workspace crates manually.citeturn0search1
+  - [Completed - GPT-5 Codex 2025-10-23] Terminal rendering mode implemented in `scriptbots-app::terminal` with palette‑aware emoji/ASCII mini‑map, stats HUD, event feed, and keyboard controls.
 - Ecosystem:
   - Track community crates like `gpui-component` for prebuilt widgets and styling patterns.citeturn0search8
 
@@ -116,6 +120,7 @@
   - Provide interpolation for camera smoothing if we add variable render rate.
 - Storage Sync:
   - On snapshot publication, enqueue summary records (population counts, resource totals) for DuckDB ingestion, and optionally archive raw agent rows every configurable cadence for replay/debug. Employ DuckDB's Arrow integration for efficient bulk writes when analytics pipelines demand columnar exports. [Completed - GPT-5 Codex 2025-10-21]citeturn1search0turn1search5
+  - [Completed - GPT-5 Codex 2025-10-23] Replay event logging persisted each tick (RNG scopes, brain outputs, actions) with CLI to verify and diff recorded vs. simulated streams.
 
 ## Visual Polish & Audio Enhancements
 - Rich terrain & backgrounds: integrate a tilemap or overlay renderer such as `wgpu-tilemap` to stream large ground textures efficiently, enabling biomes, paths, and heatmaps without dropping frame rate.citeturn0search0
@@ -124,6 +129,7 @@
 - Particle and lighting effects: reference the `ShadowEngine2D` example for wgpu-driven particles, bloom, and lighting passes, adapting similar shaders to draw energy trails, spike impacts, or weather overlays.citeturn0reddit15
 - Post-processing shaders: batch agent render buffers through compute builders like `cuneus` to add color grading, vignette, or heat shimmer effects without rewriting the entire pipeline.citeturn0reddit18
 - Game-quality audio: adopt the `kira` crate for layered ambient loops, positional effects, and event-driven sound design, using its mixer and timing system to sync audio cues with agent behaviors; expose toggles for audio channels in the GPUI inspector.citeturn2search1turn2search2
+  - [Completed - GPT-5 Codex 2025-10-23] Feature‑gated audio cues integrated in GPUI renderer (birth/death/spike and UI toggles); ships disabled by default and can be enabled via features.
 - Accessibility polish: add colorblind-safe palettes and toggleable outline shaders so the simulation remains readable with visual enhancements. [Completed - GPT-5 Codex 2025-10-22: added HUD inspector overlay toggle (Shift) plus agent outlines and existing palette modes to improve readability.]
 - Procedural sandbox terrain: add an interactive map builder leveraging Wave Function Collapse to synthesize believable topography/biomes with configurable resource strata, oxygen levels, and hazard tuning.
 
@@ -147,6 +153,8 @@
   - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]citeturn1search0
   - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]citeturn1search0turn1search5
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build. [Completed - GPT-5 Codex 2025-10-22]
+ - [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI: generate baseline/candidate DuckDB runs in headless terminal mode and diff event streams via CLI (`--replay-db`, `--compare-db`).
+ - [Completed - GPT-5 Codex 2025-10-23] Wasm CI job builds `scriptbots-web` via `wasm-pack` and runs headless Chrome tests (Playwright-provisioned Chromium).
 
 ## Advanced Brain Architecture Strategy
 - Trait hierarchy: extend the `Brain` interface with marker traits (`EvolvableBrain`, `TrainableBrain`, `BatchBrain`) so the world loop can branch on capabilities (e.g., some brains may not support online learning).
@@ -160,8 +168,8 @@
   - Register brain constructors through a `BrainRegistry` so additional engines (ONNXRuntime, Torch via tch-rs, GPU kernels) can be added behind feature flags without core refactors.
 - [Completed - GPT-5 Codex 2025-10-22] Expose runtime control surfaces for selecting brain families and tuning evolution knobs (mutation rates, speciation thresholds, environmental parameters) without rebuilds.
   - Introduced `ControlHandle`/`KnobEntry` scaffolding shared by REST, CLI, and MCP front-ends for atomic JSON patching of `ScriptBotsConfig` and live snapshots.
-  - Shipped an axum-based REST API (`/api/knobs`, `/api/config`, `/api/knobs/apply`) with generated OpenAPI docs and embedded Swagger UI for operator discovery.
-  - Added a stdio MCP server (`list_knobs`, `get_config`, `apply_updates`, `apply_patch`) so external LLM tooling can orchestrate simulations safely.
+  - [Completed - GPT-5 Codex 2025-10-23] Shipped an axum-based REST API (`/api/knobs`, `/api/config`, `/api/knobs/apply`) with generated OpenAPI docs and embedded Swagger UI for operator discovery.
+  - [Completed - GPT-5 Codex 2025-10-23] Added an HTTP MCP server (tools: `list_knobs`, `get_config`, `apply_updates`, `apply_patch`) so external LLM tooling can orchestrate simulations safely; stdio/SSE transports deprecated in favor of HTTP-only.
   - Delivered the `scriptbots-control` CLI (clap + reqwest + ratatui) offering scripted updates (`set`, `patch`) and a live dashboard (`watch`) that highlights config deltas while the GPUI shell runs.
 - [Completed - GPT-5 Codex 2025-10-22] Migrated configuration writes onto a crossfire-backed command bus drained inside the simulation loop and exposed an HTTP MCP server (default `127.0.0.1:8090`) so control surfaces enqueue consistent `ControlCommand`s rather than mutating `WorldState` directly.
 - Diagnostics:

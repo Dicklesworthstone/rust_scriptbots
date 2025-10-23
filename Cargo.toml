@@ -65,8 +65,9 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
+incremental = true
 strip = true
 panic = "abort"
 
