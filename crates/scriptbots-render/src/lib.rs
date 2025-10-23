@@ -3631,23 +3631,6 @@ impl SimulationView {
             controls.paused,
         );
 
-        // Baseline toggle (idea #2) — show simple on/off; wire to analytics state
-        let baseline_active = self.analytics.baseline_active();
-        let baseline_listener = cx.listener(|this, _event: &MouseDownEvent, _, _cx| {
-            this.analytics.toggle_baseline();
-        });
-        let baseline_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child(if baseline_active { "Baseline: On" } else { "Baseline: Off" })
-                .on_mouse_down(MouseButton::Left, baseline_listener),
-            baseline_active,
-        );
-
         let slower_button = div()
             .rounded_md()
             .border_1()
@@ -3914,7 +3897,6 @@ impl SimulationView {
                     .gap_2()
                     .children(vec![closed_off_button, closed_on_button]),
             )
-            .child(baseline_button)
     }
 
     fn render_inspector_playback_controls(&self, cx: &mut Context<Self>) -> Div {

@@ -884,11 +884,7 @@ activation = "Tanh"
         let overlay_path = dir.path().join("overlay.ron");
         fs::write(
             &overlay_path,
-            r#"{
-                "history_capacity": 1024,
-                "neuroflow": { "hidden_layers": [8, 4], "activation": "Sigmoid" },
-                "world_width": 2048
-            }"#,
+            r#"(history_capacity: 1024, neuroflow: (hidden_layers: [8, 4], activation: "Sigmoid"), world_width: 2048)"#,
         )
         .expect("write overlay layer");
 
