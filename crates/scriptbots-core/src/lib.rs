@@ -3893,10 +3893,18 @@ impl TickCadence {
     }
 
     fn should_sample_history(&self, tick: Tick) -> bool {
+        eprintln!(
+            "should_sample_history tick={} interval={}",
+            tick.0, self.chart_interval
+        );
         self.chart_interval == 0 || tick.0.is_multiple_of(self.chart_interval as u64)
     }
 
     fn should_emit_chart_event(&self, tick: Tick) -> bool {
+        eprintln!(
+            "should_emit_chart_event tick={} interval={}",
+            tick.0, self.chart_interval
+        );
         self.chart_interval > 0 && tick.0.is_multiple_of(self.chart_interval as u64)
     }
 
