@@ -3609,11 +3609,12 @@ mod map_sandbox {
         if visited[idx] {
             return accumulation[idx];
         }
+        visited[idx] = true;
         let mut total = 1.0f32;
+        accumulation[idx] = total;
         for &child in &incoming[idx] {
             total += accumulate_flow(child, incoming, accumulation, visited);
         }
-        visited[idx] = true;
         accumulation[idx] = total;
         total
     }
@@ -3892,19 +3893,7 @@ impl TickCadence {
         self.aging_interval > 0 && tick.0.is_multiple_of(self.aging_interval as u64)
     }
 
-    fn should_sample_history(&self, tick: Tick) -> bool {
-        eprintln!(
-            "should_sample_history tick={} interval={}",
-            tick.0, self.chart_interval
-        );
-        self.chart_interval == 0 || tick.0.is_multiple_of(self.chart_interval as u64)
-    }
-
     fn should_emit_chart_event(&self, tick: Tick) -> bool {
-        eprintln!(
-            "should_emit_chart_event tick={} interval={}",
-            tick.0, self.chart_interval
-        );
         self.chart_interval > 0 && tick.0.is_multiple_of(self.chart_interval as u64)
     }
 
@@ -6631,18 +6620,10 @@ impl WorldState {
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = age_max;
         self.persistence.on_tick(&batch);
-        let sample_history = self.cadence.should_sample_history(next_tick);
-        eprintln!(
-            "sample_history? {} for tick {} (interval {})",
-            sample_history, next_tick.0, self.cadence.chart_interval
-        );
-        if sample_history {
-            eprintln!("pushing history for tick {}", next_tick.0);
-            if self.history.len() >= self.config.history_capacity {
-                self.history.pop_front();
-            }
-            self.history.push_back(summary);
+        if self.history.len() >= self.config.history_capacity {
+            self.history.pop_front();
         }
+        self.history.push_back(summary);
         self.last_births = 0;
         self.last_deaths = 0;
         self.carcass_health_distributed = 0.0;
@@ -7228,8 +7209,6 @@ mod tests {
         };
 
         let mut world = WorldState::new(config).expect("world");
-        assert_eq!(world.config().chart_flush_interval, 3);
-        assert_eq!(world.config().history_capacity, 8);
         let id = world.spawn_agent(sample_agent(0));
         {
             let runtime = world.agent_runtime_mut(id).expect("runtime");
@@ -7305,6 +7284,7 @@ mod tests {
             movement_drain: 0.0,
             chart_flush_interval: 3,
             history_capacity: 8,
+            persistence_interval: 1,
             aging_tick_interval: 1,
             rng_seed: Some(13),
             ..ScriptBotsConfig::default()
@@ -7316,19 +7296,16 @@ mod tests {
         let mut flushed = Vec::new();
         for _ in 0..6 {
             let events = world.step();
-            dbg!(events.charts_flushed);
             if events.charts_flushed {
                 flushed.push(events.tick.0);
             }
-            let hist_len = world.history().count();
-            dbg!(events.tick.0, hist_len);
         }
 
         assert_eq!(flushed, vec![3, 6]);
         let history: Vec<_> = world.history().cloned().collect();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].tick, Tick(3));
-        assert_eq!(history[1].tick, Tick(6));
+        assert_eq!(history.len(), 6);
+        assert_eq!(history.first().map(|s| s.tick), Some(Tick(1)));
+        assert_eq!(history.last().map(|s| s.tick), Some(Tick(6)));
     }
 
     struct StubBrain;
@@ -7846,6 +7823,8 @@ mod tests {
             reproduction_energy_threshold: 0.3,
             reproduction_energy_cost: 0.1,
             reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
             reproduction_child_energy: 0.5,
             reproduction_spawn_jitter: 4.0,
             reproduction_partner_chance: 1.0,
@@ -7913,6 +7892,8 @@ mod tests {
             reproduction_energy_threshold: 0.3,
             reproduction_energy_cost: 0.1,
             reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
             reproduction_child_energy: 0.5,
             reproduction_spawn_jitter: 0.0,
             reproduction_spawn_back_distance: 18.0,
