@@ -663,6 +663,33 @@ async fn run_mcp_server(
             let server_arc = http_server.server().await;
             register_tool(
                 server_arc.clone(),
+                "list_presets",
+                "List available scenario presets",
+                json!({"type": "object", "additionalProperties": false}),
+                ControlToolKind::ListPresets,
+                handle.clone(),
+            )
+            .await
+            .map_err(|err| anyhow!("failed to register list_presets tool: {err}"))?;
+
+            register_tool(
+                server_arc.clone(),
+                "apply_preset",
+                "Apply a named scenario preset",
+                json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+                ControlToolKind::ApplyPreset,
+                handle.clone(),
+            )
+            .await
+            .map_err(|err| anyhow!("failed to register apply_preset tool: {err}"))?;
+
+            register_tool(
+                server_arc.clone(),
                 "list_knobs",
                 "List all exposed configuration knobs",
                 json!({"type": "object", "additionalProperties": false}),
@@ -774,6 +801,8 @@ struct ControlTool {
 
 #[derive(Clone, Copy)]
 enum ControlToolKind {
+    ListPresets,
+    ApplyPreset,
     ListKnobs,
     GetConfig,
     ApplyUpdates,
@@ -784,6 +813,20 @@ enum ControlToolKind {
 impl ToolHandler for ControlTool {
     async fn call(&self, arguments: HashMap<String, Value>) -> McpResult<ToolResult> {
         match self.kind {
+            ControlToolKind::ListPresets => {
+                let presets = preset_names();
+                Ok(make_tool_result(presets)?)
+            }
+            ControlToolKind::ApplyPreset => {
+                let name_value = arguments
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| McpError::Validation("missing 'name' field".into()))?;
+                let patch = preset_patch(name_value)
+                    .ok_or_else(|| McpError::Validation(format!("unknown preset: {}", name_value)))?;
+                let snapshot = self.handle.apply_patch(patch).map_err(map_control_error)?;
+                Ok(make_tool_result(snapshot)?)
+            }
             ControlToolKind::ListKnobs => {
                 let knobs = self.handle.list_knobs().map_err(map_control_error)?;
                 Ok(make_tool_result(knobs)?)

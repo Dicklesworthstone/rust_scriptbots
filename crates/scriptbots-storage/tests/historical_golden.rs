@@ -63,6 +63,8 @@ fn make_batch(
             total_energy,
             average_energy,
             average_health: 0.75,
+            max_age: 0,
+            spike_hits: 0,
         },
         epoch: 0,
         closed: false,

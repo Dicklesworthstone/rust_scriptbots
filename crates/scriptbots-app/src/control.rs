@@ -131,6 +131,8 @@ impl ControlHandle {
                 total_energy: 0.0,
                 average_energy: 0.0,
                 average_health: 0.0,
+                max_age: 0,
+                spike_hits: 0,
             })
         }
     }

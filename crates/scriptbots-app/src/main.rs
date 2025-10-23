@@ -116,6 +116,12 @@ fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
     if let Some(limit) = cli.auto_pause_below {
         config.control.auto_pause_population_below = Some(limit);
     }
+    if let Some(age) = cli.auto_pause_age_above {
+        config.control.auto_pause_age_above = Some(age);
+    }
+    if cli.auto_pause_on_spike {
+        config.control.auto_pause_on_spike_hit = true;
+    }
     Ok(config)
 }
 
@@ -197,6 +203,20 @@ struct AppCli {
         env = "SCRIPTBOTS_AUTO_PAUSE_BELOW"
     )]
     auto_pause_below: Option<u32>,
+    /// Auto-pause when any agent's age meets or exceeds this value.
+    #[arg(
+        long = "auto-pause-age-above",
+        value_name = "AGE",
+        env = "SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE"
+    )]
+    auto_pause_age_above: Option<u32>,
+    /// Auto-pause after a spike hit is recorded.
+    #[arg(
+        long = "auto-pause-on-spike",
+        action = ArgAction::SetTrue,
+        env = "SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE"
+    )]
+    auto_pause_on_spike: bool,
     /// Print the composed configuration in the selected format.
     #[arg(long = "print-config", action = ArgAction::SetTrue)]
     print_config: bool,
@@ -881,10 +901,17 @@ activation = "Tanh"
         )
         .expect("write base layer");
 
-        let overlay_path = dir.path().join("overlay.ron");
+        let overlay_path = dir.path().join("overlay.toml");
         fs::write(
             &overlay_path,
-            r#"(history_capacity: 1024, neuroflow: (hidden_layers: [8, 4], activation: "Sigmoid"), world_width: 2048)"#,
+            r#"
+history_capacity = 1024
+world_width = 2048
+
+[neuroflow]
+hidden_layers = [8, 4]
+activation = "Sigmoid"
+"#,
         )
         .expect("write overlay layer");
 

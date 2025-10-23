@@ -299,6 +299,8 @@ These scoped additions improve usability, insight, and experiment velocity witho
 - Complexity: S.
 
 [Currently In Progress - 2025-10-23] REST endpoints added: `GET /api/presets` (lists names) and `POST /api/presets/apply` (applies JSON patch for preset); OpenAPI updated.
+Follow‑up [Currently In Progress - 2025-10-23]: GPUI preset picker upgraded to a compact micro‑menu with keyboard focus/hover and a confirmation toast on apply.
+Keyboard/UX details: the preset micro‑menu mirrors button styling, supports focus rings, hover color shifts, and click feedback; a toast appears under the header with the applied preset name and fades out automatically.
 
 ### 2) Metrics baseline compare (Δ vs. baseline) [Currently In Progress - 2025-10-23]
 - Purpose: quick A/B within a run (population, births/deaths, avg energy).
@@ -308,16 +310,19 @@ These scoped additions improve usability, insight, and experiment velocity witho
 - Testing: unit-test delta math; snapshot HUD/TUI lines.
 - Complexity: S.
 
-### 3) Auto‑pause on conditions [Currently In Progress - 2025-10-23]
+### 3) Auto‑pause on conditions [Completed - 2025-10-23 Codex]
 - Purpose: stop at interesting moments automatically.
-- MVP: triggers: population < X (implemented), first spike kill, age > Y.
-- Surfaces: HUD panel with checkboxes/thresholds; TUI toggles; REST patch `control.auto_pause.*` keys; CLI `--auto-pause-below <COUNT>`.
-- Data/Perf: O(1) checks in tick summary; deterministic.
+- MVP: triggers: population < X, first spike kill, age > Y.
+- Surfaces: HUD panel with checkboxes/thresholds; TUI toggles; REST patch `control.auto_pause.*` keys; CLI `--auto-pause-below <COUNT>`, `--auto-pause-age-above <AGE>`, `--auto-pause-on-spike`.
+- Data/Perf: O(1) checks driven by cached per-tick stats; deterministic.
 - Testing: seeded scenarios that cross thresholds → assert paused.
 - Complexity: S.
 
-Implementation progress [2025-10-23]:
-- Config: added `control.auto_pause_population_below: Option<u32>` in `ScriptBotsConfig`.
+Implementation notes [2025-10-23]:
+- Config: `ControlSettings` now exposes `auto_pause_age_above` and `auto_pause_on_spike_hit` alongside the existing population threshold.
+- CLI: new flags/env vars configure population, age, and spike-hit pausing; reflected in emitted config.
+- Terminal & headless: snapshot evaluation auto-pauses and logs the trigger reason, halting the loop and zeroing speed.
+- GPUI renderer: simulation pump honours the same three triggers, pausing and logging via tracing.
 - Terminal & GPUI: main render loops set paused when `agent_count <= limit`.
 - CLI: `--auto-pause-below` (env `SCRIPTBOTS_AUTO_PAUSE_BELOW`) wires into config at startup.
 

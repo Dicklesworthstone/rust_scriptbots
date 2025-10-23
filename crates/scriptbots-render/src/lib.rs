@@ -195,16 +195,32 @@ impl SimulationView {
         let last = self.last_sim_instant.unwrap_or(now);
         self.last_sim_instant = Some(now);
 
-        // Auto-pause: honor control config threshold without mutating world state directly.
-        if !self.controls.paused && let Ok(world) = self.world.lock() {
-            let threshold = world.config().control.auto_pause_population_below;
-            if let Some(limit) = threshold && world.agent_count() as u32 <= limit {
-                self.controls.paused = true;
-                info!(
-                    limit,
-                    count = world.agent_count(),
-                    "Auto-paused due to population threshold"
-                );
+        // Auto-pause: honor control config thresholds without mutating world state directly.
+        if !self.controls.paused {
+            if let Ok(world) = self.world.lock() {
+                let control = world.config().control.clone();
+                let agent_count = world.agent_count();
+                let max_age = world.last_max_age();
+                let spike_hits = world.last_spike_hits();
+                drop(world);
+
+                let mut reason: Option<String> = None;
+                if control.auto_pause_on_spike_hit && spike_hits > 0 {
+                    reason = Some(format!("spike hits detected ({})", spike_hits));
+                } else if let Some(age_limit) = control.auto_pause_age_above {
+                    if max_age >= age_limit {
+                        reason = Some(format!("max age {} ≥ {}", max_age, age_limit));
+                    }
+                } else if let Some(limit) = control.auto_pause_population_below {
+                    if agent_count as u32 <= limit {
+                        reason = Some(format!("population {} ≤ {}", agent_count, limit));
+                    }
+                }
+
+                if let Some(reason) = reason {
+                    self.controls.paused = true;
+                    info!(reason = %reason, "Auto-paused due to control settings");
+                }
             }
         }
 
@@ -258,6 +274,25 @@ impl SimulationView {
         } else {
             warn!("failed to acquire world lock for config update");
         }
+    }
+
+    fn apply_preset(&mut self, preset: PresetKind, _cx: &mut Context<Self>) {
+        self.submit_config_update(|config| match preset {
+            PresetKind::Arctic => {
+                config.temperature_gradient_exponent = 1.6;
+                config.food_max = 0.35;
+                config.food_growth_rate = 0.03;
+            }
+            PresetKind::BoomBust => {
+                config.food_growth_rate = 0.12;
+                config.food_decay_rate = 0.01;
+                config.population_spawn_interval = 60;
+            }
+            PresetKind::ClosedWorld => {
+                config.population_minimum = 0;
+                config.population_spawn_interval = 0;
+            }
+        });
     }
 
     fn canvas_to_world(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
@@ -2932,6 +2967,8 @@ impl SimulationView {
             }
         };
 
+        
+
         div()
             .flex()
             .flex_col()
@@ -3897,6 +3934,33 @@ impl SimulationView {
                     .gap_2()
                     .children(vec![closed_off_button, closed_on_button]),
             )
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Presets"))
+            .child({
+                let apply = |label: &'static str, preset: PresetKind| {
+                    let listener = cx.listener(move |this, _e: &MouseDownEvent, _, cx| {
+                        this.apply_preset(preset, cx);
+                    });
+                    div()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(0x1e293b))
+                        .bg(rgb(0x111b2b))
+                        .text_color(rgb(0xcbd5f5))
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .child(label)
+                        .on_mouse_down(MouseButton::Left, listener)
+                };
+                div()
+                    .flex()
+                    .gap_2()
+                    .children(vec![
+                        apply("Arctic", PresetKind::Arctic),
+                        apply("Boom–Bust", PresetKind::BoomBust),
+                        apply("Closed World", PresetKind::ClosedWorld),
+                    ])
+            })
     }
 
     fn render_inspector_playback_controls(&self, cx: &mut Context<Self>) -> Div {
@@ -6265,6 +6329,23 @@ impl Default for DebugOverlayState {
             enabled: false,
             show_velocity: true,
             show_sense_radius: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresetKind {
+    Arctic,
+    BoomBust,
+    ClosedWorld,
+}
+
+impl PresetKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Arctic => "arctic",
+            Self::BoomBust => "boom_bust",
+            Self::ClosedWorld => "closed_world",
         }
     }
 }

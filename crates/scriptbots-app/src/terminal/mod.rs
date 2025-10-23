@@ -23,7 +23,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
 };
-use scriptbots_core::{AgentId, TerrainKind, TerrainLayer, TickSummary, WorldState};
+use scriptbots_core::{AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState};
 use serde::Serialize;
 use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
@@ -194,6 +194,7 @@ struct TerminalApp<'a> {
     last_event_tick: u64,
     snapshot: Snapshot,
     baseline: Option<Baseline>,
+    last_autopause_tick: Option<u64>,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -227,6 +228,7 @@ impl<'a> TerminalApp<'a> {
             last_event_tick: 0,
             snapshot: Snapshot::default(),
             baseline: None,
+            last_autopause_tick: None,
         };
         app.refresh_snapshot();
         app
@@ -237,14 +239,6 @@ impl<'a> TerminalApp<'a> {
         self.last_tick = now;
 
         let mut steps = 0usize;
-        // Auto-pause check based on config threshold
-        if !self.paused
-            && let Ok(world) = self.world.lock()
-            && let Some(limit) = world.config().control.auto_pause_population_below
-            && world.agent_count() as u32 <= limit
-        {
-            self.paused = true;
-        }
 
         let effective_speed = if self.paused {
             0.0
@@ -785,6 +779,7 @@ impl<'a> TerminalApp<'a> {
         };
         self.ingest_events(&new_snapshot);
         self.snapshot = new_snapshot;
+        self.evaluate_auto_pause();
     }
 
     fn ingest_events(&mut self, new_snapshot: &Snapshot) {
@@ -841,6 +836,45 @@ impl<'a> TerminalApp<'a> {
             message: message.into(),
         });
     }
+
+    fn evaluate_auto_pause(&mut self) {
+        if self.paused {
+            return;
+        }
+
+        let control = &self.snapshot.control;
+        let mut reason: Option<String> = None;
+
+        if control.auto_pause_on_spike_hit && self.snapshot.spike_hits > 0 {
+            reason = Some(format!(
+                "Auto-pause: spike hits detected ({})",
+                self.snapshot.spike_hits
+            ));
+        } else if let Some(age_limit) = control.auto_pause_age_above {
+            if self.snapshot.max_age >= age_limit {
+                reason = Some(format!(
+                    "Auto-pause: max age {} ≥ {}",
+                    self.snapshot.max_age, age_limit
+                ));
+            }
+        } else if let Some(limit) = control.auto_pause_population_below {
+            if self.snapshot.agent_count as u32 <= limit {
+                reason = Some(format!(
+                    "Auto-pause: population {} ≤ {}",
+                    self.snapshot.agent_count, limit
+                ));
+            }
+        }
+
+        if let Some(reason) = reason {
+            if self.last_autopause_tick != Some(self.snapshot.tick) {
+                self.push_event(self.snapshot.tick, EventKind::Info, &reason);
+                self.last_autopause_tick = Some(self.snapshot.tick);
+            }
+            self.paused = true;
+            self.speed_multiplier = 0.0;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -891,6 +925,8 @@ struct Snapshot {
     agents: Vec<AgentViz>,
     leaderboard: Vec<LeaderboardEntry>,
     food: FoodView,
+    control: ControlSettings,
+    spike_hits: u32,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1165,6 +1201,8 @@ impl Snapshot {
             total_energy: 0.0,
             average_energy: 0.0,
             average_health: 0.0,
+            max_age: 0,
+            spike_hits: 0,
         });
 
         let history = summaries
@@ -1322,6 +1360,8 @@ impl Snapshot {
                 max: food_max,
                 mean: food_mean,
             },
+            control: config.control.clone(),
+            spike_hits: summary.spike_hits,
         }
     }
 }

@@ -754,6 +754,8 @@ pub struct TickSummary {
     pub total_energy: f32,
     pub average_energy: f32,
     pub average_health: f32,
+    pub max_age: u32,
+    pub spike_hits: u32,
 }
 
 /// Serializable representation of [`TickSummary`] for API surfaces.
@@ -766,6 +768,8 @@ pub struct TickSummaryDto {
     pub total_energy: f32,
     pub average_energy: f32,
     pub average_health: f32,
+    pub max_age: u32,
+    pub spike_hits: u32,
 }
 
 impl From<TickSummary> for TickSummaryDto {
@@ -778,6 +782,8 @@ impl From<TickSummary> for TickSummaryDto {
             total_energy: summary.total_energy,
             average_energy: summary.average_energy,
             average_health: summary.average_health,
+            max_age: summary.max_age,
+            spike_hits: summary.spike_hits,
         }
     }
 }
@@ -792,6 +798,8 @@ impl From<TickSummaryDto> for TickSummary {
             total_energy: dto.total_energy,
             average_energy: dto.average_energy,
             average_health: dto.average_health,
+            max_age: dto.max_age,
+            spike_hits: dto.spike_hits,
         }
     }
 }
@@ -1745,6 +1753,10 @@ pub enum WorldStateError {
 pub struct ControlSettings {
     /// Auto-pause the simulation when population is at or below this threshold. None disables.
     pub auto_pause_population_below: Option<u32>,
+    /// Auto-pause when any agent reaches at least this age. None disables.
+    pub auto_pause_age_above: Option<u32>,
+    /// Auto-pause after a spike hit is recorded.
+    pub auto_pause_on_spike_hit: bool,
 }
 
 /// Configuration change audit entry captured in-process.
@@ -2674,6 +2686,8 @@ pub struct WorldState {
     persistence: Box<dyn WorldPersistence>,
     last_births: usize,
     last_deaths: usize,
+    last_spike_hits: u32,
+    last_max_age: u32,
     history: VecDeque<TickSummary>,
     #[allow(dead_code)]
     carcass_health_distributed: f32,
@@ -2745,6 +2759,8 @@ impl WorldState {
             persistence,
             last_births: 0,
             last_deaths: 0,
+            last_spike_hits: 0,
+            last_max_age: 0,
             history: VecDeque::with_capacity(history_capacity),
             carcass_health_distributed: 0.0,
             carcass_reproduction_bonus: 0.0,
@@ -4850,18 +4866,17 @@ impl WorldState {
 
         for (idx, agent_id) in handles.iter().enumerate() {
             total_health += healths.get(idx).copied().unwrap_or(0.0);
+            if let Some(age) = ages.get(idx).copied() {
+                age_sum += age as f64;
+                if age > age_max {
+                    age_max = age;
+                }
+            }
+            if boosts.get(idx).copied().unwrap_or(false) {
+                boost_count += 1;
+            }
             if let Some(runtime) = self.runtime.get(*agent_id) {
                 total_energy += runtime.energy;
-
-                if let Some(age) = ages.get(idx).copied() {
-                    age_sum += age as f64;
-                    if age > age_max {
-                        age_max = age;
-                    }
-                }
-                if boosts.get(idx).copied().unwrap_or(false) {
-                    boost_count += 1;
-                }
 
                 reproduction_counter_stats.update(f64::from(runtime.reproduction_counter));
                 temperature_pref_stats.update(f64::from(runtime.temperature_preference));
@@ -4953,6 +4968,8 @@ impl WorldState {
             total_energy,
             average_energy,
             average_health,
+            max_age: age_max,
+            spike_hits: self.combat_spike_hits,
         };
         let mut metrics = vec![
             MetricSample::from_f32("total_energy", summary.total_energy),
@@ -5287,6 +5304,8 @@ impl WorldState {
             deaths,
             replay_events: std::mem::take(&mut self.replay_events),
         };
+        self.last_spike_hits = self.combat_spike_hits;
+        self.last_max_age = age_max;
         self.persistence.on_tick(&batch);
         if self.history.len() >= self.config.history_capacity {
             self.history.pop_front();
@@ -5484,6 +5503,16 @@ impl WorldState {
     #[must_use]
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    /// Spike hits recorded during the most recent tick.
+    pub fn last_spike_hits(&self) -> u32 {
+        self.last_spike_hits
+    }
+
+    /// Maximum agent age observed during the most recent tick.
+    pub fn last_max_age(&self) -> u32 {
+        self.last_max_age
     }
 
     /// Spawn a new agent, returning its handle.
