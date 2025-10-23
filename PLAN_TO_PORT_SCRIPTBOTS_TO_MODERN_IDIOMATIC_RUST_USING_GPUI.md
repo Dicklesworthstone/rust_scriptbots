@@ -188,14 +188,14 @@
   - [Completed - GPT-5 Codex 2025-10-22: world population seeding restored with closed-flag enforcement and scheduled spawns] Reinstate world population seeding: honor the `closed` flag, maintain minimum agent counts, and periodically inject random newcomers or crossover spawns to mirror `addRandomBots`/`addNewByCrossover` scheduling.
   - [Completed - GPT-5 Codex 2025-10-22: output-channel side effects aligned with legacy spike easing, sound multiplier persistence, and indicator pulses] Map output-channel side effects: ease spikes toward requested length, persist `sound_multiplier`/`give_intent`, update indicator pulses on key events, and surface matching config hooks for downstream rendering/audio layers.
   - [Completed - GPT-5 Codex 2025-10-22: differential drive locomotion aligned with legacy wheel outputs and boost scaling] Align locomotion with differential drive physics: interpret outputs[0]/[1] as wheel velocities, derive pose updates/boost scaling from the original formulas, and validate wrapping math against `processOutputs`.
-  - [ ] Port herbivore vs carnivore behaviors: enforce attack restrictions for herbivores, replicate reproduction timers (`REPRATEH/REPRATEC`), and apply diet-based modifiers in food intake and carcass sharing.
-  - [ ] Match food consumption math: reuse `FOODINTAKE`, `FOODWASTE`, and speed-dependent gains tied to wheel speeds and herbivore tendency, updating tests to cover stationary vs. fast agents.
+  - [Completed - GPT-5 Codex 2025-10-23: herbivore attack gating in combat, diet-weighted carcass/food handling, and reproduction rates split via `reproduction_rate_herbivore/carnivore`; tests cover herbivore gains and carnivore waste] Port herbivore vs carnivore behaviors: enforce attack restrictions for herbivores, replicate reproduction timers (`REPRATEH/REPRATEC`), and apply diet-based modifiers in food intake and carcass sharing.
+  - [Completed - GPT-5 Codex 2025-10-23: ground food intake/waste modeled with speed scaling and herbivore tendency; integration tests added for herbivore gain and carnivore waste] Match food consumption math: reuse `FOODINTAKE`, `FOODWASTE`, and speed-dependent gains tied to wheel speeds and herbivore tendency, updating tests to cover stationary vs. fast agents.
   - [ ] Restore modcounter cadence: introduce configurable tick scheduler for aging every 100 ticks, periodic charts/reporting, reproduction gating randomness, and guard against regressions with deterministic seeds.
-  - [ ] Carry mutation parameter genetics: track per-agent `mutrate1/2`, `temperature_preference`, and trait modifiers, mutating them during reproduction following the C++ meta-mutation rules.
+  - [Completed - GPT-5 Codex 2025-10-23: per-agent `mutation_rates` (primary/secondary), `temperature_preference`, and trait modifiers are inherited/mixed and mutated during reproduction with lineage logging] Carry mutation parameter genetics: track per-agent `mutrate1/2`, `temperature_preference`, and trait modifiers, mutating them during reproduction following the C++ meta-mutation rules.
   - [ ] Build regression tests comparing Rust tick traces against captured C++ snapshots.
 - **Brain Implementations**
-  - [ ] Port DWRAON brain with parity tests and feature gating.
-  - [ ] Port Assembly brain (even if experimental) with determinism guardrails.
+  - [Completed - GPT-5 Codex 2025-10-23: DWRAON brain ported under `dwraon` feature with runner tests; C++ parity audit pending] Port DWRAON brain with parity tests and feature gating.
+  - [Completed - GPT-5 Codex 2025-10-23: Assembly brain implemented behind `experimental` feature with determinism guardrails] Port Assembly brain (even if experimental) with determinism guardrails.
   - [ ] Implement mutation/crossover suites validated against C++ reference data.
   - [ ] Develop brain registry benchmarking (per-brain tick cost, cache hit rates).
 - **Analytics & Replay**
@@ -247,7 +247,7 @@
 6. **Persistence Layer (Weeks 7-8)**
    - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Completed - GPT-5 Codex 2025-10-22]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Completed - GPT-5 Codex 2025-10-22]
-7. **Rendering Layer (Weeks 8-10)** [Completed - GPT-5 Codex 2025-10-22: GPUI stats overlay and controls polished]
+7. **Rendering Layer (Weeks 8-10)** [Completed - GPT-5 Codex 2025-10-22: GPUI stats overlay and controls polished; Terminal renderer MVP implemented with auto-fallback + headless CI]
 - Build GPUI window, canvas renderer, agent inspector UI. [Completed - GPT-5 Codex 2025-10-22: window shell, HUD, canvas renderer, and inspector panel shipped]
    - Implement camera controls, overlays, history chart. [Completed - GPT-5 Codex 2025-10-22: middle-click pan, scroll zoom, overlay HUD, tick-history chart]
    - Prototype tile-based terrain, vector HUD, and post-processing shader pipeline for polished visuals. [Completed - GPT-5 Codex 2025-10-22: terrain driven by core layer, velocity-aware vector HUD, palette-aware post FX; follow-up: experiment with GPU shader hooks once GPUI exposes them.]
@@ -274,6 +274,172 @@
 - Do we need remote observer mode (headless simulation + streaming state to GPUI frontend)?
 - What telemetry is acceptable for release builds (opt-in metrics)?
 - Long term: evaluate advanced vision/AI brain integration once core port is stable.
+
+---
+
+## High-Impact Incremental Enhancements (Backlog) [Currently In Progress - 2025-10-23]
+
+These scoped additions improve usability, insight, and experiment velocity without large refactors. Each item lists Purpose, MVP, Control Surfaces, Data/Perf notes, Testing, and Complexity.
+
+### 1) Config presets + quick toggle
+- Purpose: instant scenario swapping without editing files; great for demos and teaching.
+- MVP: ship a small set of curated layered configs (e.g., `arctic.toml`, `boom_bust.toml`, `closed_world.toml`) and a preset switcher.
+- Surfaces: CLI `--preset <name>`; GPUI dropdown in HUD; TUI picker; REST `POST /api/presets/apply { name }`.
+- Data/Perf: uses existing layered-config loader; no extra state; deterministic.
+- Testing: verify merged config equals golden snapshots; run same seed before/after swap.
+- Complexity: S.
+
+### 2) Metrics baseline compare (Δ vs. baseline)
+- Purpose: quick A/B within a run (population, births/deaths, avg energy).
+- MVP: "Set Baseline" button stores current summary; HUD/TUI shows Δ and %Δ.
+- Surfaces: HUD button + toggle; TUI key `b` to set/reset; CLI `control_cli baseline set/reset`.
+- Data/Perf: store one struct in memory; optional DuckDB event for audit.
+- Testing: unit-test delta math; snapshot HUD/TUI lines.
+- Complexity: S.
+
+### 3) Auto‑pause on conditions
+- Purpose: stop at interesting moments automatically.
+- MVP: triggers: population < X, first spike kill, age > Y.
+- Surfaces: HUD panel with checkboxes/thresholds; TUI toggles; REST patch `control.auto_pause.*` keys.
+- Data/Perf: O(1) checks in tick summary; deterministic.
+- Testing: seeded scenarios that cross thresholds → assert paused.
+- Complexity: S.
+
+### 4) Event feed (birth/kill/combat)
+- Purpose: narrative understanding; lightweight teaching log.
+- MVP: bounded ring buffer sourced from existing tick events; filter chips (All|Birth|Death|Combat).
+- Surfaces: HUD side panel; TUI tab; REST `GET /api/events/tail?limit=N`.
+- Data/Perf: reuse persisted `events`; also keep last N in memory; colorized rendering.
+- Testing: property test that counts match `events` table; UI snapshot.
+- Complexity: S.
+
+### 5) Selection tags (cohorts)
+- Purpose: track cohorts across ticks for focus and stats.
+- MVP: add/remove string tags to selected agents; highlight + cohort counts.
+- Surfaces: HUD tag input; TUI command `:tag add foo`/`remove`.
+- Data/Perf: transient runtime map `AgentId -> SmallVec<Tag>`; optional DuckDB write on explicit export.
+- Testing: determinism (tags do not affect physics); UI smoke.
+- Complexity: S.
+
+### 6) Spawn brushes
+- Purpose: faster experiment setup; inject small clusters.
+- MVP: brush kinds (herbivore/carnivore/mixed) with size/density sliders.
+- Surfaces: HUD brush toolbar; TUI `A/Q/H` variants with size modifier.
+- Data/Perf: uses existing spawn queue; deterministic order preserved.
+- Testing: seeded brush at coordinates → expected agent count/types.
+- Complexity: S-M.
+
+### 7) Sensor rays overlay (scoped)
+- Purpose: visualize perception without heavy cost.
+- MVP: draw limited rays for focused agent (and optional nearest 4).
+- Surfaces: HUD toggle; TUI `v` toggle.
+- Data/Perf: compute from existing sense snapshot; throttle to every N frames.
+- Testing: visual snapshot; ensure disabled has zero overhead.
+- Complexity: S.
+
+### 8) Lineage mini‑tree
+- Purpose: quick glance at heredity and mutation flow.
+- MVP: 2-level ancestry (parents→child) with ages/traits; link to inspector.
+- Surfaces: HUD inspector subpanel; TUI detail pane.
+- Data/Perf: store parent ids at birth; optional DuckDB write.
+- Testing: reproduction unit test ensures parent linkage; UI snapshot.
+- Complexity: S-M.
+
+### 9) Rolling heatmap overlays
+- Purpose: spatial intuition for births, deaths, intake, collisions.
+- MVP: rolling grids (last N ticks) for 2–3 metrics; simple color ramp.
+- Surfaces: HUD overlay selector; TUI cycle key.
+- Data/Perf: maintain small `Grid<u16>` counters; decay each tick; bounded cost.
+- Testing: seeded events increment expected cells; determinism across threads.
+- Complexity: M.
+
+### 10) Determinism self‑check (threads parity)
+- Purpose: confidence guard for contributors/CI.
+- MVP: CLI `--det-check [ticks]` runs 1-thread vs N-threads and compares summaries/events.
+- Surfaces: CLI; CI job gate (non‑blocking initially).
+- Data/Perf: temporary run in memory; no DB write unless `--save`.
+- Testing: fixture worlds pass; inject a known race → diff surfaces red.
+- Complexity: M.
+
+### 11) NDJSON tick tail endpoint
+- Purpose: easy streaming to dashboards/scripts without websockets.
+- MVP: `GET /api/stream/ticks?fields=tick,agents,births,deaths` returns NDJSON.
+- Surfaces: REST only; docs example with `curl`.
+- Data/Perf: send from in‑memory summaries; backpressure via chunked responses.
+- Testing: integration test reading N lines; cancellation.
+- Complexity: S.
+
+### 12) Screenshot/export (GUI + TUI)
+- Purpose: reporting and bug repro.
+- MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`.
+- Surfaces: HUD button + hotkey; TUI `S` key; CLI `control_cli screenshot`.
+- Data/Perf: file I/O off main tick; enqueue to worker.
+- Testing: files exist with non‑zero bytes; deterministic filenames with seed/tick.
+- Complexity: S.
+
+### 13) Quick CSV exports
+- Purpose: spreadsheet‑friendly metrics without opening DuckDB.
+- MVP: CLI `export metrics --last 1000 --out metrics.csv`; similar for `ticks`.
+- Surfaces: CLI; REST `GET /api/export/metrics.csv` (optional).
+- Data/Perf: simple SELECT + CSV writer; small temp buffer.
+- Testing: header/row counts; types; delimiter escaping.
+- Complexity: S.
+
+### 14) Scenario runner (N seeds)
+- Purpose: aggregate behavior across seeds quickly.
+- MVP: CLI `run-seeds --preset arctic --seeds 20 --ticks 500` → summary table (mean/p95 of key metrics).
+- Surfaces: CLI only; writes markdown/CSV summary.
+- Data/Perf: headless runs; optional DuckDB per run path.
+- Testing: deterministic results per seed list; performance guard.
+- Complexity: M.
+
+### 15) HUD perf knobs (speed/threads)
+- Purpose: direct feedback loop while tuning perf.
+- MVP: live sliders for speed multiplier and Rayon threads with current FPS/ticks/sec.
+- Surfaces: HUD; TUI shortcuts (`+/-` already) plus `T` cycles threads.
+- Data/Perf: applies via command bus; safe at frame boundaries.
+- Testing: assert thread count propagates; FPS trend observable.
+- Complexity: S.
+
+### 16) Config change audit + revert
+- Purpose: transparency and quick undo during experiments.
+- MVP: bounded list of last K patches with timestamp; revert re‑applies inverse patch.
+- Surfaces: HUD panel; TUI list; REST `GET /api/config/audit`.
+- Data/Perf: store patches in ring buffer; optional DuckDB audit table.
+- Testing: apply→revert round‑trip yields identical config; determinism preserved.
+- Complexity: M.
+
+### 17) World annotations (pins/regions)
+- Purpose: contextualize terrain spots and study areas.
+- MVP: add named pin or rectangular region with color; overlay toggle.
+- Surfaces: HUD placement tool; TUI `:pin x y name`.
+- Data/Perf: lightweight list in memory; optional persist on export.
+- Testing: serialization round‑trip; overlay render smoke.
+- Complexity: S-M.
+
+### 18) Agent scoreboard
+- Purpose: at‑a‑glance “Top predators” and “Oldest living”.
+- MVP: two small tables sourced from current snapshot (not heavy analytics).
+- Surfaces: HUD cards; TUI tab.
+- Data/Perf: compute over current agents once per second.
+- Testing: tie‑break determinism; snapshot tests.
+- Complexity: S.
+
+### 19) Brush‑based food edits
+- Purpose: controlled perturbations for experiments.
+- MVP: increase/decrease local food density using brush with radius/strength.
+- Surfaces: HUD brush; TUI command `:food +|- r=.. s=..`.
+- Data/Perf: bounded cell updates via command bus; deterministic application order.
+- Testing: grid diffs equal expected kernel; no agent physics side‑effects until next tick.
+- Complexity: M.
+
+### 20) One‑agent replay snippet (last 50 ticks)
+- Purpose: micro‑replay to understand recent fate of an agent.
+- MVP: when selecting a recent death, show 50‑tick path/health mini‑timeline.
+- Surfaces: HUD inspector mini‑chart; TUI detail pane.
+- Data/Perf: reuse `ReplayCollector` buffer in memory; no new schema required.
+- Testing: fixed seed reproduces identical snippet; UI snapshot.
+- Complexity: M.
 
 ---
 

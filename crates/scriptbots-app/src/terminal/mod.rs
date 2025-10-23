@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::VecDeque,
+    f32::consts::{PI, TAU},
     fs::{self, File},
     io::{self, Stdout},
     path::{Path, PathBuf},
@@ -370,19 +371,32 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_stats(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let diet = snapshot.diet_split;
+        let total = diet.total().max(1);
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
             Span::styled("Population ", self.palette.header_style()),
             Span::raw(format!("{:>5}", snapshot.agent_count)),
             Span::raw("   "),
             Span::styled("H:", self.palette.diet_style(DietClass::Herbivore)),
-            Span::raw(format!("{:>3}", diet.herbivores)),
+            Span::raw(format!(
+                "{:>3} ({:>2}%)",
+                diet.herbivores,
+                diet.herbivores * 100 / total
+            )),
             Span::raw("  "),
             Span::styled("O:", self.palette.diet_style(DietClass::Omnivore)),
-            Span::raw(format!("{:>3}", diet.omnivores)),
+            Span::raw(format!(
+                "{:>3} ({:>2}%)",
+                diet.omnivores,
+                diet.omnivores * 100 / total
+            )),
             Span::raw("  "),
             Span::styled("C:", self.palette.diet_style(DietClass::Carnivore)),
-            Span::raw(format!("{:>3}", diet.carnivores)),
+            Span::raw(format!(
+                "{:>3} ({:>2}%)",
+                diet.carnivores,
+                diet.carnivores * 100 / total
+            )),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Energy ", self.palette.header_style()),
@@ -467,11 +481,29 @@ impl<'a> TerminalApp<'a> {
             frame.render_widget(spark, trend_layout[1]);
         }
 
-        let trend_text = Paragraph::new(vec![Line::from(vec![
-            Span::styled("Last Tick ", self.palette.header_style()),
-            Span::raw(format!("Δ+{:>2} Δ-{:>2}", snapshot.births, snapshot.deaths)),
-        ])])
-        .block(Block::default());
+        let mut trend_lines = Vec::new();
+        if let Some(recent) = snapshot.history.first() {
+            trend_lines.push(Line::from(vec![
+                Span::styled("Last Tick ", self.palette.header_style()),
+                Span::raw(format!(
+                    "t{:>6} Δ+{:>2} Δ-{:>2} ⚡{:>5.2}",
+                    recent.tick, recent.births, recent.deaths, recent.avg_energy
+                )),
+            ]));
+        }
+        if let (Some(latest), Some(oldest)) = (snapshot.history.first(), snapshot.history.last()) {
+            trend_lines.push(Line::from(vec![
+                Span::styled("Window ", self.palette.header_style()),
+                Span::raw(format!(
+                    "t{:>6}→t{:>6} pop {:>4}→{:>4}",
+                    oldest.tick, latest.tick, oldest.population, latest.population
+                )),
+            ]));
+        }
+        if trend_lines.is_empty() {
+            trend_lines.push(Line::from(vec![Span::raw("Waiting for samples...")]));
+        }
+        let trend_text = Paragraph::new(trend_lines).block(Block::default());
         frame.render_widget(trend_text, trend_layout[2]);
     }
 
@@ -515,7 +547,14 @@ impl<'a> TerminalApp<'a> {
                 .clamp(0.0, (height - 1) as f32) as usize;
             let idx = y * width + x;
             let cell = &mut occupancy[idx];
-            cell.add(agent.diet, agent.boosted, agent.energy);
+            cell.add(
+                agent.diet,
+                agent.boosted,
+                agent.energy,
+                agent.heading,
+                agent.spike_length,
+                agent.tendency,
+            );
             let base = grid[idx].style;
             let (glyph, style) = self.palette.agent_symbol(cell, base);
             grid[idx].ch = glyph;
@@ -636,20 +675,44 @@ impl<'a> TerminalApp<'a> {
                 if self.speed_multiplier > 0.0 {
                     self.paused = false;
                 }
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    format!("Speed x{:.1}", self.speed_multiplier),
+                );
             }
             (KeyCode::Char('-') | KeyCode::Char('_'), _) => {
                 self.speed_multiplier = (self.speed_multiplier - 0.5).max(0.0);
                 if self.speed_multiplier <= 0.0 {
                     self.paused = true;
                 }
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.paused {
+                        "Simulation paused".to_string()
+                    } else {
+                        format!("Speed x{:.1}", self.speed_multiplier)
+                    },
+                );
             }
             (KeyCode::Char('s'), _) => {
                 self.step_once();
                 self.paused = true;
                 self.speed_multiplier = 0.0;
+                self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
             }
             (KeyCode::Char('?') | KeyCode::Char('h'), _) => {
                 self.help_visible = !self.help_visible;
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.help_visible {
+                        "Help overlay opened"
+                    } else {
+                        "Help overlay closed"
+                    },
+                );
             }
             _ => {}
         }
@@ -899,6 +962,10 @@ struct CellOccupancy {
     boosted: bool,
     top_energy: f32,
     top_class: DietClass,
+    heading_accum: f32,
+    heading_count: u16,
+    spike_peak: f32,
+    tendency_accum: f32,
 }
 
 impl Default for CellOccupancy {
@@ -910,12 +977,24 @@ impl Default for CellOccupancy {
             boosted: false,
             top_energy: 0.0,
             top_class: DietClass::Omnivore,
+            heading_accum: 0.0,
+            heading_count: 0,
+            spike_peak: 0.0,
+            tendency_accum: 0.0,
         }
     }
 }
 
 impl CellOccupancy {
-    fn add(&mut self, class: DietClass, boosted: bool, energy: f32) {
+    fn add(
+        &mut self,
+        class: DietClass,
+        boosted: bool,
+        energy: f32,
+        heading: f32,
+        spike: f32,
+        tendency: f32,
+    ) {
         match class {
             DietClass::Herbivore => self.herbivores = self.herbivores.saturating_add(1),
             DietClass::Omnivore => self.omnivores = self.omnivores.saturating_add(1),
@@ -928,6 +1007,12 @@ impl CellOccupancy {
             self.top_energy = energy;
             self.top_class = class;
         }
+        self.heading_accum += heading;
+        self.heading_count = self.heading_count.saturating_add(1);
+        if spike > self.spike_peak {
+            self.spike_peak = spike;
+        }
+        self.tendency_accum += tendency;
     }
 
     fn total(&self) -> u16 {
@@ -945,6 +1030,22 @@ impl CellOccupancy {
             best = (self.carnivores, DietClass::Carnivore);
         }
         if best.0 == 0 { self.top_class } else { best.1 }
+    }
+
+    fn mean_heading(&self) -> Option<f32> {
+        if self.heading_count == 0 {
+            None
+        } else {
+            Some(self.heading_accum / self.heading_count as f32)
+        }
+    }
+
+    fn mean_tendency(&self) -> Option<f32> {
+        if self.heading_count == 0 {
+            None
+        } else {
+            Some(self.tendency_accum / self.heading_count as f32)
+        }
     }
 }
 
@@ -1010,10 +1111,10 @@ impl Snapshot {
 
         for (idx, id) in handles.iter().enumerate() {
             let position = columns.positions()[idx];
+            let heading = columns.headings()[idx];
             let health = columns.health()[idx];
             let age = columns.ages()[idx];
             let generation = columns.generations()[idx].0;
-            let spike_length = columns.spike_lengths()[idx];
             let runtime = runtimes.get(*id);
 
             let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
@@ -1022,6 +1123,7 @@ impl Snapshot {
                 .unwrap_or(DietClass::Omnivore);
             let boosted = columns.boosts()[idx];
             let hybrid = runtime.map(|rt| rt.hybrid).unwrap_or(false);
+            let spike_length = columns.spike_lengths()[idx];
             let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
 
             diet_split.increment(diet);
@@ -1048,7 +1150,7 @@ impl Snapshot {
             agents.push(AgentViz {
                 id: id.data().as_ffi(),
                 position: (normalized_x, normalized_y),
-                heading: columns.headings()[idx],
+                heading,
                 diet,
                 energy,
                 health,
@@ -1434,17 +1536,23 @@ impl Palette {
         } else {
             occupancy.dominant()
         };
-        let mut glyph = match class {
-            DietClass::Herbivore => 'h',
-            DietClass::Omnivore => 'o',
-            DietClass::Carnivore => 'c',
+        let mut glyph = match total {
+            0 => ' ',
+            1 => occupancy
+                .mean_heading()
+                .map(Self::heading_char)
+                .unwrap_or_else(|| match class {
+                    DietClass::Herbivore => 'h',
+                    DietClass::Omnivore => 'o',
+                    DietClass::Carnivore => 'c',
+                }),
+            2..=3 => match class {
+                DietClass::Herbivore => 'H',
+                DietClass::Omnivore => 'O',
+                DietClass::Carnivore => 'C',
+            },
+            _ => '@',
         };
-
-        if total > 3 {
-            glyph = '@';
-        } else if total > 1 {
-            glyph = glyph.to_ascii_uppercase();
-        }
 
         let mut style = base.fg(self.diet_color(class));
         if occupancy.boosted || total > 1 {
@@ -1453,7 +1561,33 @@ impl Palette {
         if total > 3 {
             style = style.add_modifier(Modifier::REVERSED);
         }
+        if occupancy.spike_peak > 0.6 {
+            glyph = '!';
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        if let Some(tendency) = occupancy.mean_tendency() {
+            if tendency < 0.25 {
+                style = style.fg(Color::Green);
+            } else if tendency > 0.75 {
+                style = style.fg(Color::Red);
+            }
+        }
         (glyph, style)
+    }
+
+    fn heading_char(heading: f32) -> char {
+        let normalized = heading.rem_euclid(TAU);
+        let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
+        match sector {
+            0 => '→',
+            1 => '↗',
+            2 => '↑',
+            3 => '↖',
+            4 => '←',
+            5 => '↙',
+            6 => '↓',
+            _ => '↘',
+        }
     }
 }
 
