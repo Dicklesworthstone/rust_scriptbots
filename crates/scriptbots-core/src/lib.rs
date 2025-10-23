@@ -6631,7 +6631,12 @@ impl WorldState {
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = age_max;
         self.persistence.on_tick(&batch);
-        if self.cadence.should_sample_history(next_tick) {
+        let sample_history = self.cadence.should_sample_history(next_tick);
+        eprintln!(
+            "sample_history? {} for tick {} (interval {})",
+            sample_history, next_tick.0, self.cadence.chart_interval
+        );
+        if sample_history {
             eprintln!("pushing history for tick {}", next_tick.0);
             if self.history.len() >= self.config.history_capacity {
                 self.history.pop_front();
