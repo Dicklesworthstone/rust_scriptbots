@@ -27,10 +27,10 @@ fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
     let config = compose_config(&cli)?;
-    if let Some(outcome) = maybe_emit_config(&cli, &config)? {
-        if matches!(outcome, ConfigEmitOutcome::Exit) {
-            return Ok(());
-        }
+    if let Some(outcome) = maybe_emit_config(&cli, &config)?
+        && matches!(outcome, ConfigEmitOutcome::Exit)
+    {
+        return Ok(());
     }
 
     if cli.replay_db.is_some() {
@@ -884,7 +884,11 @@ activation = "Tanh"
         let overlay_path = dir.path().join("overlay.ron");
         fs::write(
             &overlay_path,
-            r#"{ history_capacity: 1024, neuroflow: { hidden_layers: [8, 4], activation: "Sigmoid" }, world_width: 2048 }"#,
+            r#"{
+                "history_capacity": 1024,
+                "neuroflow": { "hidden_layers": [8, 4], "activation": "Sigmoid" },
+                "world_width": 2048
+            }"#,
         )
         .expect("write overlay layer");
 

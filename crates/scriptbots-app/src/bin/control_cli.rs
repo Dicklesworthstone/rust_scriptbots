@@ -13,7 +13,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use csv::Writer;
-use duckdb::Connection;
+use duckdb::{Connection, params};
 use owo_colors::OwoColorize;
 use ratatui::{
     Frame, Terminal,
@@ -144,10 +144,10 @@ fn export_command(
     out: PathBuf,
     last: Option<usize>,
 ) -> Result<()> {
-    if let Some(limit) = last {
-        if limit == 0 {
-            bail!("--last must be greater than zero when provided");
-        }
+    if let Some(limit) = last
+        && limit == 0
+    {
+        bail!("--last must be greater than zero when provided");
     }
 
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -199,7 +199,7 @@ fn export_metrics(
         )?
     };
     let mut rows = if let Some(limit) = last {
-        stmt.query([limit as i64])?
+        stmt.query(params![limit as i64])?
     } else {
         stmt.query([])?
     };
@@ -243,7 +243,7 @@ fn export_ticks(
         )?
     };
     let mut rows = if let Some(limit) = last {
-        stmt.query([limit as i64])?
+        stmt.query(params![limit as i64])?
     } else {
         stmt.query([])?
     };

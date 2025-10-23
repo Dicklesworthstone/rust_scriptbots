@@ -107,6 +107,8 @@ fn configure_parallelism() {
             limit = 1;
         }
 
+        // SAFETY: `limit` is a finite positive integer converted to string; the standard library
+        // marks `set_var` as unsafe on nightly, but providing well-formed Unicode strings is safe.
         unsafe {
             std::env::set_var("RAYON_NUM_THREADS", limit.to_string());
         }
@@ -120,7 +122,7 @@ fn configure_parallelism() {
 #[cfg(feature = "parallel")]
 fn default_thread_budget(cpu_count: usize) -> usize {
     match cpu_count {
-        0 | 1 | 2 => 1,
+        0..=2 => 1,
         3 | 4 => 2,
         _ => 4,
     }
@@ -1739,18 +1741,17 @@ pub enum WorldStateError {
 }
 
 /// Control-related runtime behavior toggles.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ControlSettings {
     /// Auto-pause the simulation when population is at or below this threshold. None disables.
     pub auto_pause_population_below: Option<u32>,
 }
 
-impl Default for ControlSettings {
-    fn default() -> Self {
-        Self {
-            auto_pause_population_below: None,
-        }
-    }
+/// Configuration change audit entry captured in-process.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigAuditEntry {
+    pub tick: u64,
+    pub patch: serde_json::Value,
 }
 
 /// Static configuration for a ScriptBots world.
@@ -2680,6 +2681,7 @@ pub struct WorldState {
     carcass_reproduction_bonus: f32,
     combat_spike_attempts: u32,
     combat_spike_hits: u32,
+    config_audit: Vec<ConfigAuditEntry>,
 }
 
 impl fmt::Debug for WorldState {
@@ -2748,6 +2750,7 @@ impl WorldState {
             carcass_reproduction_bonus: 0.0,
             combat_spike_attempts: 0,
             combat_spike_hits: 0,
+            config_audit: Vec::with_capacity(32),
         })
     }
 
@@ -5391,6 +5394,17 @@ impl WorldState {
             new_config.world_height as f32,
         );
 
+        // Record audit entry
+        let tick = self.tick.0;
+        if let Ok(value) = serde_json::to_value(&new_config) {
+            self.config_audit
+                .push(ConfigAuditEntry { tick, patch: value });
+            if self.config_audit.len() > 64 {
+                let drop_count = self.config_audit.len() - 64;
+                self.config_audit.drain(0..drop_count);
+            }
+        }
+
         self.config = new_config;
         self.food_profiles = food_profiles;
         self.index = new_index;
@@ -5418,6 +5432,10 @@ impl WorldState {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    pub fn config_audit(&self) -> &[ConfigAuditEntry] {
+        &self.config_audit
     }
 
     /// Toggle the closed-environment flag.

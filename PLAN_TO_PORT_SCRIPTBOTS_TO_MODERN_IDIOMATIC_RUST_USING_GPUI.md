@@ -298,10 +298,10 @@ These scoped additions improve usability, insight, and experiment velocity witho
 - Testing: verify merged config equals golden snapshots; run same seed before/after swap.
 - Complexity: S.
 
-### 2) Metrics baseline compare (Δ vs. baseline)
+### 2) Metrics baseline compare (Δ vs. baseline) [Currently In Progress - 2025-10-23]
 - Purpose: quick A/B within a run (population, births/deaths, avg energy).
 - MVP: "Set Baseline" button stores current summary; HUD/TUI shows Δ and %Δ.
-- Surfaces: HUD button + toggle; TUI key `b` to set/reset; CLI `control_cli baseline set/reset`.
+- Surfaces: HUD button + toggle; TUI key `b` to set/reset (implemented in Terminal HUD); CLI `control_cli baseline set/reset`.
 - Data/Perf: store one struct in memory; optional DuckDB event for audit.
 - Testing: unit-test delta math; snapshot HUD/TUI lines.
 - Complexity: S.
@@ -415,10 +415,10 @@ Implementation progress [2025-10-23]:
 - Testing: assert thread count propagates; FPS trend observable.
 - Complexity: S.
 
-### 16) Config change audit + revert
+### 16) Config change audit + revert [Currently In Progress - 2025-10-23]
 - Purpose: transparency and quick undo during experiments.
 - MVP: bounded list of last K patches with timestamp; revert re‑applies inverse patch.
-- Surfaces: HUD panel; TUI list; REST `GET /api/config/audit`.
+- Surfaces: HUD panel; TUI list; REST `GET /api/config/audit` (implemented: returns recent in-process config patches with tick).
 - Data/Perf: store patches in ring buffer; optional DuckDB audit table.
 - Testing: apply→revert round‑trip yields identical config; determinism preserved.
 - Complexity: M.

@@ -37,6 +37,7 @@ use crate::command::{
     CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
 };
 use crate::control::{ConfigSnapshot, ControlError, ControlHandle, KnobEntry, KnobUpdate};
+use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
 
 const DEFAULT_MCP_HTTP_ADDR: &str = "127.0.0.1:8090";
@@ -323,6 +324,21 @@ pub struct KnobApplyRequest {
     pub updates: Vec<KnobUpdate>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+struct ConfigAuditEntryView {
+    tick: u64,
+    patch: Value,
+}
+
+impl From<ConfigAuditEntry> for ConfigAuditEntryView {
+    fn from(entry: ConfigAuditEntry) -> Self {
+        Self {
+            tick: entry.tick,
+            patch: entry.patch,
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(get_knobs, get_config, patch_config, apply_updates),
@@ -333,6 +349,7 @@ pub struct KnobApplyRequest {
             ConfigSnapshot,
             ConfigPatchRequest,
             KnobApplyRequest,
+            ConfigAuditEntryView,
             ErrorResponse
         )
     ),
@@ -501,6 +518,24 @@ async fn apply_updates(
     Ok(Json(snapshot))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/config/audit",
+    tag = "control",
+    responses((status = 200, body = [ConfigAuditEntryView]))
+)]
+async fn get_config_audit(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<ConfigAuditEntryView>>, AppError> {
+    let entries = state
+        .handle
+        .audit()?
+        .into_iter()
+        .map(ConfigAuditEntryView::from)
+        .collect();
+    Ok(Json(entries))
+}
+
 async fn run_rest_server(
     handle: ControlHandle,
     config: &ControlServerConfig,
@@ -518,6 +553,7 @@ async fn run_rest_server(
         // Tick summaries (JSON one-shot and SSE stream)
         .route("/api/ticks/latest", get(get_latest_tick_summary))
         .route("/api/ticks/stream", get(stream_ticks_sse))
+        .route("/api/config/audit", get(get_config_audit))
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(swagger_path_static)

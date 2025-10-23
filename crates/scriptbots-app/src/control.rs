@@ -9,6 +9,7 @@ use scriptbots_core::{ControlCommand, ScriptBotsConfig, Tick, WorldState};
 
 use crate::SharedWorld;
 use crate::command::CommandSender;
+use scriptbots_core::ConfigAuditEntry;
 
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -142,6 +143,12 @@ impl ControlHandle {
             serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
         flatten_value("", &config_value, &mut entries);
         Ok(entries)
+    }
+
+    /// Retrieve the configuration audit log accumulated since startup.
+    pub fn audit(&self) -> Result<Vec<ConfigAuditEntry>, ControlError> {
+        let world = self.lock_world()?;
+        Ok(world.config_audit().to_vec())
     }
 
     /// Apply a structured JSON patch object onto the configuration.

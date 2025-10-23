@@ -193,6 +193,7 @@ struct TerminalApp<'a> {
     event_log: VecDeque<EventEntry>,
     last_event_tick: u64,
     snapshot: Snapshot,
+    baseline: Option<Baseline>,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -225,6 +226,7 @@ impl<'a> TerminalApp<'a> {
             event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
             last_event_tick: 0,
             snapshot: Snapshot::default(),
+            baseline: None,
         };
         app.refresh_snapshot();
         app
@@ -236,14 +238,12 @@ impl<'a> TerminalApp<'a> {
 
         let mut steps = 0usize;
         // Auto-pause check based on config threshold
-        if !self.paused {
-            if let Ok(world) = self.world.lock() {
-                if let Some(limit) = world.config().control.auto_pause_population_below {
-                    if world.agent_count() as u32 <= limit {
-                        self.paused = true;
-                    }
-                }
-            }
+        if !self.paused
+            && let Ok(world) = self.world.lock()
+            && let Some(limit) = world.config().control.auto_pause_population_below
+            && world.agent_count() as u32 <= limit
+        {
+            self.paused = true;
         }
 
         let effective_speed = if self.paused {
@@ -327,17 +327,44 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
-        let status = format!(
-            "Tick {:>6}  Epoch {:>3}  Agents {:>5}  Δ+{:>3}/Δ-{:>3}  Avg⚡ {:>5.2}  Avg❤ {:>5.2}  Food {:>5.2}",
-            snapshot.tick,
-            snapshot.epoch,
-            snapshot.agent_count,
-            snapshot.births,
-            snapshot.deaths,
-            snapshot.avg_energy,
-            snapshot.avg_health,
-            snapshot.food.mean,
-        );
+        let (agents_delta, energy_delta, health_delta) = if let Some(base) = &self.baseline {
+            (
+                diff_i(snapshot.agent_count as i64 - base.agent_count as i64),
+                diff_f(snapshot.avg_energy - base.avg_energy),
+                diff_f(snapshot.avg_health - base.avg_health),
+            )
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+
+        let status = if self.baseline.is_some() {
+            format!(
+                "Tick {:>6}  Epoch {:>3}  Agents {:>5} {}  Δ+{:>3}/Δ-{:>3}  Avg⚡ {:>5.2} {}  Avg❤ {:>5.2} {}  Food {:>5.2}",
+                snapshot.tick,
+                snapshot.epoch,
+                snapshot.agent_count,
+                agents_delta,
+                snapshot.births,
+                snapshot.deaths,
+                snapshot.avg_energy,
+                energy_delta,
+                snapshot.avg_health,
+                health_delta,
+                snapshot.food.mean,
+            )
+        } else {
+            format!(
+                "Tick {:>6}  Epoch {:>3}  Agents {:>5}  Δ+{:>3}/Δ-{:>3}  Avg⚡ {:>5.2}  Avg❤ {:>5.2}  Food {:>5.2}",
+                snapshot.tick,
+                snapshot.epoch,
+                snapshot.agent_count,
+                snapshot.births,
+                snapshot.deaths,
+                snapshot.avg_energy,
+                snapshot.avg_health,
+                snapshot.food.mean,
+            )
+        };
 
         let paused_flag = if self.paused {
             Span::styled(" PAUSED ", self.palette.paused_style())
@@ -651,6 +678,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" space  Toggle pause"),
             Line::raw(" + / - Adjust speed"),
             Line::raw(" s      Single step"),
+            Line::raw(" b      Toggle metrics baseline (set/clear)"),
             Line::raw(" ?      Toggle this help"),
         ];
 
@@ -710,6 +738,23 @@ impl<'a> TerminalApp<'a> {
                 self.paused = true;
                 self.speed_multiplier = 0.0;
                 self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
+            }
+            (KeyCode::Char('b'), _) => {
+                if self.baseline.is_some() {
+                    self.baseline = None;
+                    self.push_event(self.snapshot.tick, EventKind::Info, "Baseline cleared");
+                } else {
+                    self.baseline = Some(Baseline {
+                        agent_count: self.snapshot.agent_count,
+                        avg_energy: self.snapshot.avg_energy,
+                        avg_health: self.snapshot.avg_health,
+                    });
+                    self.push_event(
+                        self.snapshot.tick,
+                        EventKind::Info,
+                        "Baseline set to current metrics",
+                    );
+                }
             }
             (KeyCode::Char('?') | KeyCode::Char('h'), _) => {
                 self.help_visible = !self.help_visible;
@@ -795,6 +840,33 @@ impl<'a> TerminalApp<'a> {
             kind,
             message: message.into(),
         });
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Baseline {
+    agent_count: usize,
+    avg_energy: f32,
+    avg_health: f32,
+}
+
+fn diff_i(value: i64) -> String {
+    if value > 0 {
+        format!("(+{value})")
+    } else if value < 0 {
+        format!("({value})")
+    } else {
+        String::from("(+0)")
+    }
+}
+
+fn diff_f(value: f32) -> String {
+    if value > 0.0 {
+        format!("(+{:.2})", value)
+    } else if value < 0.0 {
+        format!("({:.2})", value)
+    } else {
+        String::from("(+0.00)")
     }
 }
 
@@ -971,7 +1043,8 @@ struct CellOccupancy {
     boosted: bool,
     top_energy: f32,
     top_class: DietClass,
-    heading_accum: f32,
+    heading_sin: f32,
+    heading_cos: f32,
     heading_count: u16,
     spike_peak: f32,
     tendency_accum: f32,
@@ -986,7 +1059,8 @@ impl Default for CellOccupancy {
             boosted: false,
             top_energy: 0.0,
             top_class: DietClass::Omnivore,
-            heading_accum: 0.0,
+            heading_sin: 0.0,
+            heading_cos: 0.0,
             heading_count: 0,
             spike_peak: 0.0,
             tendency_accum: 0.0,
@@ -1016,7 +1090,9 @@ impl CellOccupancy {
             self.top_energy = energy;
             self.top_class = class;
         }
-        self.heading_accum += heading;
+        let (s, c) = heading.sin_cos();
+        self.heading_sin += s;
+        self.heading_cos += c;
         self.heading_count = self.heading_count.saturating_add(1);
         if spike > self.spike_peak {
             self.spike_peak = spike;
@@ -1045,7 +1121,7 @@ impl CellOccupancy {
         if self.heading_count == 0 {
             None
         } else {
-            Some(self.heading_accum / self.heading_count as f32)
+            Some(self.heading_sin.atan2(self.heading_cos))
         }
     }
 
