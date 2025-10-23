@@ -558,7 +558,7 @@ Implementation notes [2025-10-23]:
 ### References (curated)
 - Wave Function Collapse, original repo — tileset and sample models (MIT).
 
-### Hydrology & Dynamic Water Systems (Rainstorms + Floodable Basins) — Proposed Blueprint
+### Hydrology & Dynamic Water Systems (Rainstorms + Floodable Basins) — Proposed Blueprint [Currently In Progress - GPT-5 Codex 2025-10-23]
 - **Motivation**: Elevate sandbox maps beyond static biomes by layering deterministic hydrology that can react to scripted rainstorms. Agents must negotiate seasonal floods, learn to detour, or evolve swimming. The system needs to dovetail cleanly with WFC generation so basins, rivers, and floodplains emerge coherently and remain reproducible.
 
 - **Tileset Schema Extensions**

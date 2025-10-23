@@ -1787,7 +1787,10 @@ mod tests {
         app.snapshot.max_age = 12;
         app.paused = false;
         app.evaluate_auto_pause();
-        assert!(app.paused, "should auto-pause when max age exceeds threshold");
+        assert!(
+            app.paused,
+            "should auto-pause when max age exceeds threshold"
+        );
     }
 
     #[test]
@@ -1816,6 +1819,9 @@ mod tests {
         app.refresh_snapshot();
         app.paused = false;
         app.evaluate_auto_pause();
-        assert!(app.paused, "should auto-pause when population below threshold");
+        assert!(
+            app.paused,
+            "should auto-pause when population below threshold"
+        );
     }
 }

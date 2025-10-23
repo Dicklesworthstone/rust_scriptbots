@@ -2703,19 +2703,19 @@ pub struct TerrainTile {
 
 mod map_sandbox {
     use super::{
-        default_tile_fertility_bias, default_tile_palette_index, TerrainKind, TerrainLayer,
-        TerrainTile,
+        TerrainKind, TerrainLayer, TerrainTile, default_tile_fertility_bias,
+        default_tile_palette_index,
     };
     use direction::{CardinalDirection, CardinalDirectionTable, CardinalDirections};
-    use rand08::{Rng, SeedableRng, rngs::StdRng};
+    use rand08::{SeedableRng, rngs::StdRng};
     use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
     use std::hash::{DefaultHasher, Hasher};
     use std::num::NonZeroU32;
     use std::time::{SystemTime, UNIX_EPOCH};
     use wfc::{
-        retry::{self, RetryOwnAll},
         Coord, GlobalStats, PatternDescription, PatternTable, RunOwnAll, Size, Wave,
+        retry::{self, RetryOwnAll},
     };
 
     const DEFAULT_RETRY_BUDGET: usize = 32;
@@ -2776,6 +2776,16 @@ mod map_sandbox {
         pub accent: Option<f32>,
         #[serde(default)]
         pub palette_index: Option<u16>,
+        #[serde(default)]
+        pub permeability: Option<f32>,
+        #[serde(default)]
+        pub runoff_bias: Option<f32>,
+        #[serde(default)]
+        pub basin_rank: Option<f32>,
+        #[serde(default)]
+        pub channel_priority: Option<f32>,
+        #[serde(default)]
+        pub swim_cost: Option<f32>,
     }
 
     impl TileSpec {
@@ -2854,10 +2864,50 @@ mod map_sandbox {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct HydrologyTile {
+        pub permeability: f32,
+        pub runoff_bias: f32,
+        pub basin_rank: f32,
+        pub channel_priority: f32,
+        pub swim_cost: f32,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct HydrologyTileLayer {
+        width: u32,
+        height: u32,
+        tiles: Vec<HydrologyTile>,
+    }
+
+    impl HydrologyTileLayer {
+        pub fn new(width: u32, height: u32, tiles: Vec<HydrologyTile>) -> Self {
+            debug_assert_eq!(tiles.len(), (width as usize) * (height as usize));
+            Self {
+                width,
+                height,
+                tiles,
+            }
+        }
+
+        pub fn width(&self) -> u32 {
+            self.width
+        }
+
+        pub fn height(&self) -> u32 {
+            self.height
+        }
+
+        pub fn tiles(&self) -> &[HydrologyTile] {
+            &self.tiles
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MapArtifact {
         terrain: TerrainLayer,
         fertility: Option<ScalarField>,
         temperature: Option<ScalarField>,
+        hydrology_tiles: Option<HydrologyTileLayer>,
         metadata: MapArtifactMetadata,
     }
 
@@ -2872,6 +2922,10 @@ mod map_sandbox {
 
         pub fn temperature(&self) -> Option<&ScalarField> {
             self.temperature.as_ref()
+        }
+
+        pub fn hydrology_tiles(&self) -> Option<&HydrologyTileLayer> {
+            self.hydrology_tiles.as_ref()
         }
 
         pub fn metadata(&self) -> &MapArtifactMetadata {
@@ -2891,6 +2945,11 @@ mod map_sandbox {
         moisture: f32,
         accent: f32,
         palette_index: u16,
+        permeability: f32,
+        runoff_bias: f32,
+        basin_rank: f32,
+        channel_priority: f32,
+        swim_cost: f32,
     }
 
     #[derive(Default, Clone)]
@@ -2997,6 +3056,7 @@ mod map_sandbox {
             let mut tiles = Vec::with_capacity(tile_capacity);
             let mut fertility = Vec::with_capacity(tile_capacity);
             let mut temperature = Vec::with_capacity(tile_capacity);
+            let mut hydrology_tiles = Vec::with_capacity(tile_capacity);
 
             for (coord, cell) in wave.grid().enumerate() {
                 let pattern_id =
@@ -3023,12 +3083,20 @@ mod map_sandbox {
                 });
                 fertility.push(tile.fertility_bias);
                 temperature.push(tile.temperature_bias);
+                hydrology_tiles.push(HydrologyTile {
+                    permeability: tile.permeability,
+                    runoff_bias: tile.runoff_bias,
+                    basin_rank: tile.basin_rank,
+                    channel_priority: tile.channel_priority,
+                    swim_cost: tile.swim_cost,
+                });
             }
 
             let terrain = TerrainLayer::from_tiles(width, height, cell_size, tiles)
                 .map_err(|_| MapGenerationError::InvalidDimensions)?;
             let fertility_field = ScalarField::new(width, height, fertility);
             let temperature_field = ScalarField::new(width, height, temperature);
+            let hydrology_layer = HydrologyTileLayer::new(width, height, hydrology_tiles);
             let metadata = MapArtifactMetadata {
                 generator: MapGeneratorKind::RuleBased,
                 tileset_id: self.spec.id.clone(),
@@ -3045,6 +3113,7 @@ mod map_sandbox {
                 terrain,
                 fertility: Some(fertility_field),
                 temperature: Some(temperature_field),
+                hydrology_tiles: Some(hydrology_layer),
                 metadata,
             })
         }
@@ -3129,6 +3198,21 @@ mod map_sandbox {
         let palette_index = tile
             .palette_index
             .unwrap_or_else(|| default_tile_palette_index(tile.terrain_kind));
+        let permeability = tile
+            .permeability
+            .unwrap_or_else(|| default_permeability_for_kind(tile.terrain_kind));
+        let runoff_bias = tile
+            .runoff_bias
+            .unwrap_or_else(|| default_runoff_bias_for_kind(tile.terrain_kind));
+        let basin_rank = tile
+            .basin_rank
+            .unwrap_or_else(|| default_basin_rank_for_kind(tile.terrain_kind));
+        let channel_priority = tile
+            .channel_priority
+            .unwrap_or_else(|| default_channel_priority_for_kind(tile.terrain_kind));
+        let swim_cost = tile
+            .swim_cost
+            .unwrap_or_else(|| default_swim_cost_for_kind(tile.terrain_kind));
 
         Ok(CompiledTile {
             id: tile.id.clone(),
@@ -3141,6 +3225,11 @@ mod map_sandbox {
             moisture: moisture.clamp(0.0, 1.0),
             accent: accent.clamp(0.0, 1.0),
             palette_index,
+            permeability: permeability.clamp(0.0, 1.0),
+            runoff_bias: runoff_bias.clamp(-1.0, 1.0),
+            basin_rank: basin_rank.clamp(0.0, 1.0),
+            channel_priority: channel_priority.clamp(0.0, 1.0),
+            swim_cost: swim_cost.max(0.0),
         })
     }
 
@@ -3181,6 +3270,61 @@ mod map_sandbox {
             TerrainKind::Grass => 0.5,
             TerrainKind::Bloom => 0.8,
             TerrainKind::Rock => 0.25,
+        }
+    }
+
+    fn default_permeability_for_kind(kind: TerrainKind) -> f32 {
+        match kind {
+            TerrainKind::DeepWater => 0.05,
+            TerrainKind::ShallowWater => 0.15,
+            TerrainKind::Sand => 0.8,
+            TerrainKind::Grass => 0.6,
+            TerrainKind::Bloom => 0.5,
+            TerrainKind::Rock => 0.1,
+        }
+    }
+
+    fn default_runoff_bias_for_kind(kind: TerrainKind) -> f32 {
+        match kind {
+            TerrainKind::DeepWater => 0.9,
+            TerrainKind::ShallowWater => 0.6,
+            TerrainKind::Sand => -0.2,
+            TerrainKind::Grass => 0.1,
+            TerrainKind::Bloom => -0.1,
+            TerrainKind::Rock => 0.5,
+        }
+    }
+
+    fn default_basin_rank_for_kind(kind: TerrainKind) -> f32 {
+        match kind {
+            TerrainKind::DeepWater => 1.0,
+            TerrainKind::ShallowWater => 0.8,
+            TerrainKind::Sand => 0.35,
+            TerrainKind::Grass => 0.4,
+            TerrainKind::Bloom => 0.55,
+            TerrainKind::Rock => 0.2,
+        }
+    }
+
+    fn default_channel_priority_for_kind(kind: TerrainKind) -> f32 {
+        match kind {
+            TerrainKind::DeepWater => 0.2,
+            TerrainKind::ShallowWater => 0.6,
+            TerrainKind::Sand => 0.4,
+            TerrainKind::Grass => 0.5,
+            TerrainKind::Bloom => 0.35,
+            TerrainKind::Rock => 0.7,
+        }
+    }
+
+    fn default_swim_cost_for_kind(kind: TerrainKind) -> f32 {
+        match kind {
+            TerrainKind::DeepWater => 0.0,
+            TerrainKind::ShallowWater => 0.3,
+            TerrainKind::Sand => 2.0,
+            TerrainKind::Grass => 1.5,
+            TerrainKind::Bloom => 1.2,
+            TerrainKind::Rock => 2.5,
         }
     }
 
@@ -3257,13 +3401,18 @@ mod map_sandbox {
             assert_eq!(artifact.terrain().height(), 8);
             assert_eq!(artifact.metadata().tileset_id, "unit");
             assert!(artifact.fertility().is_some());
+            let hydrology = artifact.hydrology_tiles().expect("hydrology tiles present");
+            assert_eq!(hydrology.width(), 8);
+            assert_eq!(hydrology.height(), 8);
+            assert!(hydrology.tiles().iter().any(|tile| tile.permeability > 0.0));
         }
     }
 }
 
 pub use map_sandbox::{
-    AdjacencySpec, MapArtifact, MapArtifactMetadata, MapGenerationError, MapGeneratorKind,
-    RuleBasedMapGenerator, ScalarField, TileSpec, TilesetSpec,
+    AdjacencySpec, HydrologyTile, HydrologyTileLayer, MapArtifact, MapArtifactMetadata,
+    MapGenerationError, MapGeneratorKind, RuleBasedMapGenerator, ScalarField, TileSpec,
+    TilesetSpec,
 };
 
 #[derive(Debug, Clone, Copy)]
