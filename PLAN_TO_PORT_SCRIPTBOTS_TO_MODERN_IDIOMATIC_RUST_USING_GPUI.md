@@ -201,6 +201,7 @@
 - **Analytics & Replay**
 - [Completed - GPT-5 Codex 2025-10-23: Storage exposes `load_replay_events`/`max_tick`/`replay_event_counts`; `scriptbots-app` ships headless replay CLI (`--replay-db`, `--compare-db`, `--tick-limit`) with colored divergence diagnostics] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
   - [Completed - GPT-5 Codex 2025-10-23: Deterministic replay runner records per-tick events via `ReplayCollector` and verifies against DuckDB logs.]
+  - [Currently In Progress - GPT-5 Codex 2025-10-23: Wire deterministic replay CLI into CI pipelines for baseline vs. candidate runs]
   - [ ] Add DuckDB parity queries (population charts, kill ratios, energy histograms) vs. C++ scripts.
   - [ ] Provide CLI tooling to diff runs (Rust vs. C++ baseline) and highlight divergences.
 - **Feature Toggles & UX Integration (Non-rendering)**
@@ -274,6 +275,103 @@
 - What telemetry is acceptable for release builds (opt-in metrics)?
 - Long term: evaluate advanced vision/AI brain integration once core port is stable.
 
+---
+
+## Sandbox Map Creator (Wave Function Collapse) — Comprehensive Roadmap
+
+### Purpose & Outcomes
+- Provide an interactive, deterministic sandbox for generating and editing world maps using Wave Function Collapse (WFC) and complementary procedural techniques.
+- Output coherent terrain/biome tiles and a fertility/food seed map that plugs directly into `scriptbots-core` (terrain, food grid, population seeding).
+- Expose REST/MCP/CLI knobs for automated sweeps; ship example tilesets and recipes for visually appealing results.
+
+### Scope (MVP → Advanced)
+1) MVP (rule-based WFC)
+   - Tileset-driven WFC (adjacency matrices, rotations/reflections, weights), CPU implementation.
+   - Deterministic generation (seeded RNG), resolution presets (e.g., 64×64, 128×128, 256×256).
+   - Export to core layers: `TerrainLayer` (enum per tile) and `fertility: Grid<f32>` (0..1); optional temperature mask.
+   - GPUI editor: generate/regen with seed, visualize collisions/contradictions, paint override brush, save/load tileset and map.
+2) Advanced
+   - Sample-based WFC (pattern extraction from example images/tilesheets), pattern size k=2..3 with rotations.
+   - Mixed model: pre-pass WFC for macro-structure, noise-based post for micro-variation (Perlin/Simplex/fBm ridges, rivers).
+   - Constraints: rivers/roads/lakes pinned with soft/hard constraints; keep-outs for spawn sites; guaranteed traversability corridors.
+   - Tiling-at-scale: chunked generation (e.g., 512×512) with seamless borders; streaming view in GPUI.
+   - Optional compute path: batch entropy/propagation on worker threads; evaluate GPU compute later.
+
+### Data Model & Formats
+- Tileset spec (TOML/RON):
+  - `tile { id, label, weight, terrain_kind, fertility_bias, temperature_bias, palette_index }`
+  - `adjacency { tile_a, side, tile_b, side, allowed }` (4-way + optional diagonals)
+  - `symmetry { rotate=true|false, reflect=true|false }`
+- Map artifact:
+  - `terrain: Grid<TerrainKind>` — one tile per cell.
+  - `fertility: Grid<f32>` — derived via per-tile bias + smoothing kernels.
+  - `temperature: Grid<f32>` (optional) — gradient + per-tile offsets.
+- Version & provenance metadata: seed, generator version, model (rule|sample), pattern size, constraints.
+
+### Library Survey (Rust, 2025)
+- WFC implementations (CPU):
+  - `wfc` (crates.io) — general-purpose WFC in Rust; good starting point for rule-based model.
+  - Alternative lightweight WFC ports exist; select one with permissive license (MIT/Apache) and active maintenance.
+- General utilities:
+  - `image` for reading tilesheets/examples in sample-based mode; `png`/`qoi` support.
+  - Noise: `noise` crate (Perlin/Simplex) to blend fertility/temperature or carve rivers.
+  - Parallelism: Rayon for propagation hot loops (feature-gated; keep single-threaded for wasm).
+- Rendering:
+  - GPUI canvas already available; draw tile quads with a palette; optional mini-map thumbnails.
+
+### Determinism & Performance
+- Deterministic orderings for: cell selection (lowest entropy with stable tie-breaks), tile choice (seeded RNG), propagation queue.
+- Seeds: `seed = master_seed ⊕ world_id ⊕ tileset_hash`; record in artifact metadata.
+- Performance targets (CPU): 128×128 in < 75 ms (rule-based) on CI baseline; 256×256 in < 300 ms; pattern-extraction in sample mode amortized and cached.
+- Memory: limit states per cell by precomputing allowed sets from adjacency; reuse buffers; avoid per-iteration allocs.
+
+### Integration with Core Layers
+- TerrainKind mapping: tileset enumerates `TerrainKind` (e.g., Water, Sand, Grass, Rock, Snow).
+- Fertility derivation: per-tile `fertility_bias` blended with Gaussian kernel; optional erosion/diffusion post.
+- Food seeding: initialize `food` grid based on fertility (e.g., `food = fertility * food_max * biome_factor`).
+- Spawn rules: mark legal spawn tiles; bias herbivore/carnivore spawn toward biomes; prevent water spawns.
+- Temperature: combine world gradient with per-tile bias for discomfort modeling.
+
+### UI/UX (GPUI Editor)
+- Panels: Tileset (list, weights, symmetry), Constraints (pin, forbid, keep-out), Generation (seed, size, retries), Post (fertility smoothing, river carve), Export.
+- Tools: Brush (paint tile/constraint), Picker, Flood fill; Undo stack (N steps), regen with same seed.
+- Overlays: show contradictions in red; toggles for fertility/temperature heatmaps; mini-map preview; palette themes.
+
+### Control Surfaces (REST/MCP/CLI)
+- REST endpoints (proposed):
+  - `POST /api/wfc/generate` { model: "rule"|"sample", seed, size, tileset_id, constraints? } → map artifact id
+  - `GET /api/wfc/artifacts/:id` → metadata + preview
+  - `POST /api/wfc/apply/:id` → replace world terrain/fertility/temperature; re-seed food/spawns deterministically
+  - `POST /api/wfc/tilesets` (CRUD) → upload/download tilesets (TOML/ZIP with PNGs)
+- MCP tools mirror: `wfc_generate`, `wfc_apply`, `wfc_list_tilesets`, enabling LLM-driven experimentation.
+- CLI: `scriptbots-control wfc generate --tileset arctic --size 128 --seed 42`.
+
+### Wasm Viability
+- Rule-based WFC compiles to wasm fine (single-thread); sample-based pattern extraction uses `image` and is CPU-bound but acceptable for moderate sizes.
+- Hosting: no special headers required for single-thread; if we parallelize in wasm later, COOP/COEP and `wasm-bindgen-rayon` apply.
+
+### Testing & QA
+- Property tests: adjacency closure (no orphan rules), symmetry correctness, reversibility of rotations/reflections.
+- Determinism: fixed seed produces identical terrain/fertility outputs across platforms and thread counts.
+- Regression suite: golden artifacts (terrain/fertility PNGs) for canonical tilesets; checksum in CI.
+- Failure handling: contradiction detection and repair strategies (backtracking cap, retries, constraints hints) with clear UX.
+
+### Deliverables & Milestones
+- M1 (Rule-based MVP): tileset spec + CPU WFC + REST `generate/apply` + basic GPUI editor.
+- M2 (Sample-based mode): pattern extraction from example tilesheets; caching; preview thumbnails.
+- M3 (Constraints & rivers): pin/forbid/keep-out + noise/ridge-based river carving + fertility derivation.
+- M4 (UX polish & artifacts): undo/redo, export/import tilesets and maps, screenshot/export previews.
+- M5 (Automation): CLI + MCP tools; demo notebooks or scripts that sweep seeds/tilesets and log population outcomes.
+
+### Risks & Mitigations
+- Contradictions in WFC: provide constraint hints, backtracking with cap, and guided regeneration (`low-entropy patch` mode) instead of full resets.
+- Tileset authoring difficulty: ship curated example tilesets (islands, archipelago, arctic, desert steppe) with clear adjacency diagrams.
+- Performance at larger sizes: chunked WFC with seam constraints; cache per-chunk entropy; optional Rayon for native builds (feature-gated).
+
+### References (curated)
+- Wave Function Collapse, original repo — tileset and sample models (MIT).
+- Articles & guides on WFC pattern extraction and constraint propagation.
+- Rust crates: `wfc` (crates.io), `image`, `noise`.
 ## Terminal Rendering Mode (Emoji TUI) [Currently In Progress - Terminal Text Renderer]
 
 ### Goal

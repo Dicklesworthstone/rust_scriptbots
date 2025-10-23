@@ -24,7 +24,7 @@ use ratatui::{
 };
 #[cfg(test)]
 use scriptbots_core::AgentData;
-use scriptbots_core::{AgentColumns, AgentId, TerrainKind, TerrainLayer, TickSummary, WorldState};
+use scriptbots_core::{AgentId, TerrainKind, TerrainLayer, TickSummary, WorldState};
 use serde::Serialize;
 use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
@@ -299,7 +299,9 @@ impl<'a> TerminalApp<'a> {
             .constraints([
                 Constraint::Length(7),
                 Constraint::Length(5),
-                Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(body[1].height.saturating_sub(15))),
+                Constraint::Length(
+                    (LEADERBOARD_LIMIT as u16 + 3).min(body[1].height.saturating_sub(15)),
+                ),
                 Constraint::Min(5),
             ])
             .split(body[1]);
@@ -353,9 +355,7 @@ impl<'a> TerminalApp<'a> {
         line.spans.push(Span::styled(
             format!(
                 "Boosted {:>3}  Hybrids {:>3}  Avg Age {:>5.1}",
-                snapshot.boosted_count,
-                snapshot.hybrid_count,
-                snapshot.avg_age
+                snapshot.boosted_count, snapshot.hybrid_count, snapshot.avg_age
             ),
             self.palette.accent_style(),
         ));
@@ -434,7 +434,11 @@ impl<'a> TerminalApp<'a> {
 
         let trend_layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
             .split(inner);
 
         let pop_data: Vec<u64> = snapshot
@@ -463,15 +467,10 @@ impl<'a> TerminalApp<'a> {
             frame.render_widget(spark, trend_layout[1]);
         }
 
-        let trend_text = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("Last Tick ", self.palette.header_style()),
-                Span::raw(format!(
-                    "Δ+{:>2} Δ-{:>2}",
-                    snapshot.births, snapshot.deaths
-                )),
-            ]),
-        ])
+        let trend_text = Paragraph::new(vec![Line::from(vec![
+            Span::styled("Last Tick ", self.palette.header_style()),
+            Span::raw(format!("Δ+{:>2} Δ-{:>2}", snapshot.births, snapshot.deaths)),
+        ])])
         .block(Block::default());
         frame.render_widget(trend_text, trend_layout[2]);
     }
@@ -663,11 +662,12 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn refresh_snapshot(&mut self) {
-        if let Ok(world) = self.world.lock() {
-            let new_snapshot = Snapshot::from_world(&world);
-            self.ingest_events(&new_snapshot);
-            self.snapshot = new_snapshot;
-        }
+        let new_snapshot = match self.world.lock() {
+            Ok(world) => Snapshot::from_world(&world),
+            Err(_) => return,
+        };
+        self.ingest_events(&new_snapshot);
+        self.snapshot = new_snapshot;
     }
 
     fn ingest_events(&mut self, new_snapshot: &Snapshot) {
@@ -695,8 +695,7 @@ impl<'a> TerminalApp<'a> {
         }
 
         if new_snapshot.tick > self.snapshot.tick {
-            let delta =
-                new_snapshot.agent_count as i64 - self.snapshot.agent_count as i64;
+            let delta = new_snapshot.agent_count as i64 - self.snapshot.agent_count as i64;
             if delta > 0 {
                 self.push_event(
                     new_snapshot.tick,
@@ -799,7 +798,7 @@ impl DietClass {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct AgentViz {
     id: u64,
     position: (f32, f32),
@@ -814,7 +813,7 @@ struct AgentViz {
     tendency: f32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct LeaderboardEntry {
     label: u64,
     diet: DietClass,
@@ -892,6 +891,7 @@ impl Default for CellGlyph {
     }
 }
 
+#[derive(Clone, Copy)]
 struct CellOccupancy {
     herbivores: u16,
     omnivores: u16,
@@ -944,11 +944,7 @@ impl CellOccupancy {
         if self.carnivores > best.0 {
             best = (self.carnivores, DietClass::Carnivore);
         }
-        if best.0 == 0 {
-            self.top_class
-        } else {
-            best.1
-        }
+        if best.0 == 0 { self.top_class } else { best.1 }
     }
 }
 
@@ -1024,7 +1020,7 @@ impl Snapshot {
             let diet = runtime
                 .map(|rt| DietClass::from_tendency(rt.herbivore_tendency))
                 .unwrap_or(DietClass::Omnivore);
-            let boosted = runtime.map(|rt| rt.boosted).unwrap_or(false);
+            let boosted = columns.boosts()[idx];
             let hybrid = runtime.map(|rt| rt.hybrid).unwrap_or(false);
             let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
 
@@ -1042,8 +1038,12 @@ impl Snapshot {
             age_acc += f64::from(age);
             max_age = max_age.max(age);
 
-            let normalized_x = (position.x / world_width).rem_euclid(1.0).clamp(0.0, 0.9999);
-            let normalized_y = (position.y / world_height).rem_euclid(1.0).clamp(0.0, 0.9999);
+            let normalized_x = (position.x / world_width)
+                .rem_euclid(1.0)
+                .clamp(0.0, 0.9999);
+            let normalized_y = (position.y / world_height)
+                .rem_euclid(1.0)
+                .clamp(0.0, 0.9999);
 
             agents.push(AgentViz {
                 id: id.data().as_ffi(),
@@ -1364,14 +1364,56 @@ impl Palette {
     }
 
     fn terrain_symbol(&self, kind: TerrainKind, food_level: f32) -> (char, Style) {
-        let rich_color = self.level.map_or(false, |level| level.has_16m || level.has_256);
+        let rich_color = self
+            .level
+            .map_or(false, |level| level.has_16m || level.has_256);
         let (glyph, fg, bg) = match kind {
             TerrainKind::DeepWater => ('≈', Color::Cyan, Color::Blue),
-            TerrainKind::ShallowWater => ('~', Color::Cyan, Color::DarkBlue),
-            TerrainKind::Sand => ('·', Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
-            TerrainKind::Grass => ('"', Color::LightGreen, if rich_color { Color::Rgb(30, 90, 30) } else { Color::Green }),
-            TerrainKind::Bloom => ('*', Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
-            TerrainKind::Rock => ('^', Color::Gray, if rich_color { Color::Rgb(70, 70, 70) } else { Color::DarkGray }),
+            TerrainKind::ShallowWater => (
+                '~',
+                Color::Cyan,
+                if rich_color {
+                    Color::Rgb(0, 80, 160)
+                } else {
+                    Color::Blue
+                },
+            ),
+            TerrainKind::Sand => (
+                '·',
+                Color::Yellow,
+                if rich_color {
+                    Color::Rgb(160, 120, 50)
+                } else {
+                    Color::Yellow
+                },
+            ),
+            TerrainKind::Grass => (
+                '"',
+                Color::LightGreen,
+                if rich_color {
+                    Color::Rgb(30, 90, 30)
+                } else {
+                    Color::Green
+                },
+            ),
+            TerrainKind::Bloom => (
+                '*',
+                Color::Magenta,
+                if rich_color {
+                    Color::Rgb(100, 30, 100)
+                } else {
+                    Color::Magenta
+                },
+            ),
+            TerrainKind::Rock => (
+                '^',
+                Color::Gray,
+                if rich_color {
+                    Color::Rgb(70, 70, 70)
+                } else {
+                    Color::DarkGray
+                },
+            ),
         };
         let mut style = Style::default().fg(fg);
         if self.has_color() {

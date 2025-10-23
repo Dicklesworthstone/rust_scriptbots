@@ -111,3 +111,58 @@ jobs:
         env:
           CHROMIUM: ${{ steps.chromium.outputs.path }}
         run: wasm-pack test crates/scriptbots-web --headless --chrome
+
+  replay:
+    name: Replay Determinism (ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: replay-linux
+
+      - name: Build scriptbots-app (release)
+        run: cargo build --release -p scriptbots-app
+
+      - name: Generate baseline replay database
+        env:
+          SCRIPTBOTS_MODE: terminal
+          SCRIPTBOTS_TERMINAL_HEADLESS: "1"
+          SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES: "16"
+          SCRIPTBOTS_STORAGE_PATH: ${{ github.workspace }}/ci-baseline.duckdb
+        run: |
+          rm -f "$SCRIPTBOTS_STORAGE_PATH"
+          cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
+
+      - name: Generate candidate replay database
+        env:
+          SCRIPTBOTS_MODE: terminal
+          SCRIPTBOTS_TERMINAL_HEADLESS: "1"
+          SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES: "16"
+          SCRIPTBOTS_STORAGE_PATH: ${{ github.workspace }}/ci-candidate.duckdb
+        run: |
+          rm -f "$SCRIPTBOTS_STORAGE_PATH"
+          cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
+
+      - name: Verify baseline replay determinism
+        run: |
+          cargo run --release -p scriptbots-app --bin scriptbots-app -- \
+            --config ci/configs/replay_ci.toml \
+            --replay-db ci-baseline.duckdb \
+            --tick-limit 128
+
+      - name: Compare baseline and candidate event streams
+        run: |
+          cargo run --release -p scriptbots-app --bin scriptbots-app -- \
+            --config ci/configs/replay_ci.toml \
+            --replay-db ci-baseline.duckdb \
+            --compare-db ci-candidate.duckdb \
+            --tick-limit 128

@@ -1,0 +1,9 @@
+# Minimal deterministic config for CI replay smoke tests
+rng_seed = 424242
+world_width = 480
+world_height = 480
+food_cell_size = 60
+persistence_interval = 1
+history_capacity = 64
+population_spawn_interval = 10
+population_spawn_count = 1
