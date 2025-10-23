@@ -67,6 +67,14 @@ fn main() -> Result<()> {
         }
     }
 
+    // Renderer debug toggles
+    if cli.debug_watermark {
+        unsafe { std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1"); }
+    }
+    if cli.renderer_safe {
+        unsafe { std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1"); }
+    }
+
     let (world, storage) = bootstrap_world(config)?;
 
     // Optional: dump a PNG snapshot and exit (no UI launched).
@@ -386,6 +394,12 @@ struct AppCli {
     /// Run determinism self-check comparing 1-thread vs N-threads for the given number of ticks.
     #[arg(long = "det-check", value_name = "TICKS")]
     det_check: Option<u64>,
+    /// Overlay a tiny debug watermark in the render canvas (diagnostics).
+    #[arg(long = "debug-watermark", action = ArgAction::SetTrue)]
+    debug_watermark: bool,
+    /// Force a conservative canvas paint path (diagnostics on Windows black canvas).
+    #[arg(long = "renderer-safe", action = ArgAction::SetTrue)]
+    renderer_safe: bool,
     /// Cap simulation worker threads (overrides low-power default).
     #[arg(long = "threads", value_name = "N")]
     threads: Option<usize>,

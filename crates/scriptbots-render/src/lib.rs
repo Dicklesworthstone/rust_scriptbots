@@ -18,7 +18,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, VecDeque},
     f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -42,6 +42,28 @@ fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
         delta += extent;
     }
     delta
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let s = value.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+static RENDER_WATERMARK: OnceLock<bool> = OnceLock::new();
+static RENDER_SAFE: OnceLock<bool> = OnceLock::new();
+
+fn watermark_enabled() -> bool {
+    *RENDER_WATERMARK
+        .get_or_init(|| env_flag("SCRIPTBOTS_RENDER_WATERMARK"))
+}
+
+fn safe_mode_enabled() -> bool {
+    *RENDER_SAFE.get_or_init(|| env_flag("SCRIPTBOTS_RENDER_SAFE"))
 }
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
@@ -9058,18 +9080,26 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let day_phase = frame.tick as f32 * 0.00025;
     let daylight = day_phase.sin() * 0.5 + 0.5;
 
-    let sky_base = lerp_rgba(
-        rgba_from_hex(0x050b16, 1.0),
-        rgba_from_hex(0x173f6a, 1.0),
-        daylight,
-    );
-    window.paint_quad(fill(
-        bounds,
-        Background::from(apply_palette(sky_base, frame.palette)),
-    ));
+    if safe_mode_enabled() {
+        // Conservative background fill (bypass gradient blending that could expose format issues)
+        window.paint_quad(fill(
+            bounds,
+            Background::from(rgba_from_hex(0x0b1120, 1.0)),
+        ));
+    } else {
+        let sky_base = lerp_rgba(
+            rgba_from_hex(0x050b16, 1.0),
+            rgba_from_hex(0x173f6a, 1.0),
+            daylight,
+        );
+        window.paint_quad(fill(
+            bounds,
+            Background::from(apply_palette(sky_base, frame.palette)),
+        ));
+    }
 
     let horizon_height = height_px * 0.35;
-    if horizon_height > 1.0 {
+    if !safe_mode_enabled() && horizon_height > 1.0 {
         let horizon_bounds = Bounds::new(
             point(
                 px(f32::from(origin.x)),
@@ -9277,14 +9307,24 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         paint_debug_overlays(frame, focus_agent, debug, offset_x, offset_y, scale, window);
     }
 
-    apply_post_processing(
-        &frame.post_stack,
-        frame.palette,
-        bounds,
-        window,
-        daylight,
-        scale,
-    );
+    if !safe_mode_enabled() {
+        apply_post_processing(
+            &frame.post_stack,
+            frame.palette,
+            bounds,
+            window,
+            daylight,
+            scale,
+        );
+    }
+
+    if watermark_enabled() {
+        let mark_bounds = Bounds::new(
+            point(px(f32::from(bounds.origin.x) + 6.0), px(f32::from(bounds.origin.y) + 6.0)),
+            size(px(6.0), px(6.0)),
+        );
+        window.paint_quad(fill(mark_bounds, Background::from(rgba_from_hex(0xff00aa, 1.0))));
+    }
 }
 
 fn food_color(intensity: f32) -> Rgba {
