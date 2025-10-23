@@ -707,6 +707,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" space  Toggle pause"),
             Line::raw(" + / - Adjust speed"),
             Line::raw(" s      Single step"),
+            Line::raw(" S      Save ASCII screenshot"),
             Line::raw(" b      Toggle metrics baseline (set/clear)"),
             Line::raw(" ?      Toggle this help"),
         ];
@@ -768,6 +769,13 @@ impl<'a> TerminalApp<'a> {
                 self.speed_multiplier = 0.0;
                 self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
             }
+            (KeyCode::Char('S'), _) => {
+                if let Err(err) = self.save_ascii_snapshot() {
+                    self.push_event(self.snapshot.tick, EventKind::Error, format!("Screenshot failed: {err}"));
+                } else {
+                    self.push_event(self.snapshot.tick, EventKind::Info, "Saved ASCII screenshot");
+                }
+            }
             (KeyCode::Char('b'), _) => {
                 if self.baseline.is_some() {
                     self.baseline = None;
@@ -801,6 +809,38 @@ impl<'a> TerminalApp<'a> {
         }
 
         Ok(false)
+    }
+
+    fn save_ascii_snapshot(&self) -> Result<()> {
+        use std::io::Write;
+        let dir = std::path::Path::new("screenshots");
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let path = dir.join(format!("frame_{}.txt", self.snapshot.tick));
+        let mut file = std::fs::File::create(path)?;
+
+        let width = 64usize.min(self.snapshot.world_size.0 as usize).max(16);
+        let height = 32usize.min(self.snapshot.world_size.1 as usize).max(8);
+        for y in 0..height {
+            for x in 0..width {
+                let u = (x as f32 + 0.5) / width as f32;
+                let v = (y as f32 + 0.5) / height as f32;
+                let terrain = self.terrain.sample(u, v);
+                let food = self.snapshot.food.sample(u, v);
+                let ch = match terrain.kind {
+                    TerrainKind::Water => '~',
+                    TerrainKind::Sand => '.',
+                    TerrainKind::Grass => ',',
+                    TerrainKind::Rock => '^',
+                    TerrainKind::Snow => '*',
+                };
+                let glyph = if food > 0.66 { '#' } else if food > 0.33 { '+' } else { ch };
+                write!(file, "{}", glyph)?;
+            }
+            write!(file, "\n")?;
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> &Snapshot {

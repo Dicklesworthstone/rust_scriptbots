@@ -15,6 +15,7 @@ use scriptbots_core::{
 use scriptbots_render::run_demo;
 use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
+use std::process::Command;
 use std::{
     collections::HashMap,
     env, fmt, fs,
@@ -26,6 +27,17 @@ use tracing::{debug, info, warn};
 fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
+
+    // Determinism check child mode: run headless and emit JSON, then exit.
+    if let Ok(flag) = env::var("SCRIPTBOTS_DET_RUN")
+        && matches!(parse_bool(&flag), Some(true))
+    {
+        let ticks_env = env::var("SCRIPTBOTS_DET_TICKS").ok();
+        let tick_limit = ticks_env.and_then(|s| s.parse::<u64>().ok()).unwrap_or(500);
+        let config = compose_config(&cli)?;
+        run_det_child(&config, tick_limit)?;
+        return Ok(());
+    }
     let config = compose_config(&cli)?;
     if let Some(outcome) = maybe_emit_config(&cli, &config)?
         && matches!(outcome, ConfigEmitOutcome::Exit)
@@ -35,6 +47,11 @@ fn main() -> Result<()> {
 
     if cli.replay_db.is_some() {
         run_replay_cli(&cli, &config)?;
+        return Ok(());
+    }
+
+    if let Some(ticks) = cli.det_check {
+        run_det_check(&cli, ticks)?;
         return Ok(());
     }
 
@@ -66,6 +83,105 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+}
+
+fn run_det_child(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
+    let run = run_headless_simulation(config, tick_limit)?;
+    #[derive(serde::Serialize)]
+    struct DetOut {
+        events: usize,
+        ticks: usize,
+        last_tick: u64,
+        summaries: Vec<TickSummary>,
+    }
+    let last_tick = run.summaries.last().map(|s| s.tick.0).unwrap_or(0);
+    let out = DetOut {
+        events: run.events.len(),
+        ticks: run.summaries.len(),
+        last_tick,
+        summaries: run.summaries,
+    };
+    let json = serde_json::to_string(&out)?;
+    println!("{}", json);
+    Ok(())
+}
+
+fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to get current exe path")?;
+    // Child 1: single-thread (force RAYON_NUM_THREADS=1)
+    let mut child1 = Command::new(&exe);
+    child1.arg("--config-only"); // avoid launching UI
+    child1.env("SCRIPTBOTS_DET_RUN", "1");
+    child1.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
+    child1.env("RAYON_NUM_THREADS", "1");
+    if let Some(seed) = std::env::var("SCRIPTBOTS_DET_SEED").ok() {
+        child1.env("SCRIPTBOTS_RNG_SEED", seed);
+    }
+    let out1 = child1.output().context("failed to run det child 1")?;
+    if !out1.status.success() {
+        bail!("det child 1 failed: status {:?}", out1.status);
+    }
+    // Child N: default thread budget
+    let mut childn = Command::new(&exe);
+    childn.arg("--config-only");
+    childn.env("SCRIPTBOTS_DET_RUN", "1");
+    childn.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
+    let outn = childn.output().context("failed to run det child N")?;
+    if !outn.status.success() {
+        bail!("det child N failed: status {:?}", outn.status);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DetOutIn {
+        events: usize,
+        ticks: usize,
+        last_tick: u64,
+        summaries: Vec<TickSummary>,
+    }
+    let left: DetOutIn =
+        serde_json::from_slice(&out1.stdout).context("failed to parse child 1 JSON output")?;
+    let right: DetOutIn =
+        serde_json::from_slice(&outn.stdout).context("failed to parse child N JSON output")?;
+
+    if left.ticks != right.ticks || left.last_tick != right.last_tick {
+        bail!(
+            "tick count/last tick mismatch: 1t {:?} vs Nt {:?}",
+            left.ticks,
+            right.ticks
+        );
+    }
+    for (idx, (a, b)) in left
+        .summaries
+        .iter()
+        .zip(right.summaries.iter())
+        .enumerate()
+    {
+        if a != b {
+            println!(
+                "{} divergence at idx {} tick {}",
+                "✖".red().bold(),
+                idx,
+                a.tick.0
+            );
+            println!(
+                "    1t: agents={} births={} deaths={} avgE={:.4}",
+                a.agent_count, a.births, a.deaths, a.average_energy
+            );
+            println!(
+                "    Nt: agents={} births={} deaths={} avgE={:.4}",
+                b.agent_count, b.births, b.deaths, b.average_energy
+            );
+            bail!("determinism self-check failed");
+        }
+    }
+    println!(
+        "{} Determinism self-check passed for {} ticks (events: 1t={}, Nt={})",
+        "✔".green().bold(),
+        ticks,
+        left.events,
+        right.events
+    );
+    Ok(())
 }
 
 fn bootstrap_world(config: ScriptBotsConfig) -> Result<(SharedWorld, SharedStorage)> {
@@ -229,6 +345,9 @@ struct AppCli {
     /// Exit immediately after emitting configuration output.
     #[arg(long = "config-only", action = ArgAction::SetTrue)]
     config_only: bool,
+    /// Run determinism self-check comparing 1-thread vs N-threads for the given number of ticks.
+    #[arg(long = "det-check", value_name = "TICKS")]
+    det_check: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]

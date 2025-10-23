@@ -709,6 +709,73 @@ async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()
     Ok(())
 }
 
+async fn hydrology_command(client: &Client, base_url: &str) -> Result<()> {
+    let url = join_url(base_url, "/api/hydrology");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to GET hydrology snapshot from {url}"))?;
+
+    if response.status() == StatusCode::NOT_FOUND {
+        println!(
+            "{} hydrology state is not yet available.",
+            "info".yellow().bold()
+        );
+        return Ok(());
+    }
+
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("request to {url} failed with status {}", response.status()))?;
+
+    let snapshot: HydrologySnapshot = response
+        .json()
+        .await
+        .context("failed to decode hydrology snapshot")?;
+
+    let total_cells = (snapshot.width as f64) * (snapshot.height as f64);
+    let shallow_ratio = if total_cells > 0.0 {
+        snapshot.flooded_shallow_count as f64 / total_cells
+    } else {
+        0.0
+    };
+    let deep_ratio = if total_cells > 0.0 {
+        snapshot.flooded_deep_count as f64 / total_cells
+    } else {
+        0.0
+    };
+
+    println!(
+        "{} hydrology grid {}×{}",
+        "Hydrology".green().bold(),
+        snapshot.width,
+        snapshot.height
+    );
+    println!(
+        "  total depth: {:.4} | mean depth: {:.4}",
+        snapshot.total_water_depth, snapshot.mean_water_depth
+    );
+    println!(
+        "  flooded: shallow {} ({:.1}%, ≥{:.2}), deep {} ({:.1}%, ≥{:.2})",
+        snapshot.flooded_shallow_count,
+        shallow_ratio * 100.0,
+        snapshot.shallow_threshold,
+        snapshot.flooded_deep_count,
+        deep_ratio * 100.0,
+        snapshot.deep_threshold
+    );
+    println!(
+        "  arrays: water_depth {}, flow_dirs {}, basins {}, accumulation {}",
+        snapshot.water_depth.len(),
+        snapshot.flow_directions.len(),
+        snapshot.basin_ids.len(),
+        snapshot.accumulation.len()
+    );
+
+    Ok(())
+}
+
 fn join_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     if path.starts_with('/') {

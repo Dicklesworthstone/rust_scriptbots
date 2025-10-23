@@ -377,7 +377,7 @@ Implementation notes [2025-10-23]:
 - Testing: seeded events increment expected cells; determinism across threads.
 - Complexity: M.
 
-### 10) Determinism self‑check (threads parity)
+### 10) Determinism self‑check (threads parity) [Currently In Progress - 2025-10-23]
 - Purpose: confidence guard for contributors/CI.
 - MVP: CLI `--det-check [ticks]` runs 1-thread vs N-threads and compares summaries/events.
 - Surfaces: CLI; CI job gate (non‑blocking initially).
@@ -393,9 +393,9 @@ Implementation notes [2025-10-23]:
 - Testing: integration test reading N events; cancellation.
 - Complexity: S.
 
-### 12) Screenshot/export (GUI + TUI)
+### 12) Screenshot/export (GUI + TUI) [Currently In Progress - 2025-10-23]
 - Purpose: reporting and bug repro.
-- MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`.
+- MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`. [Started: Terminal HUD adds 'S' to save ASCII snapshot under `screenshots/frame_<tick>.txt`; help overlay updated.]
 - Surfaces: HUD button + hotkey; TUI `S` key; CLI `control_cli screenshot`.
 - Data/Perf: file I/O off main tick; enqueue to worker.
 - Testing: files exist with non‑zero bytes; deterministic filenames with seed/tick.

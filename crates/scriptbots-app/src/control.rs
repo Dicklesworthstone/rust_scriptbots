@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use scriptbots_core::{ControlCommand, HydrologyFlowDirection, HydrologyState, ScriptBotsConfig, Tick, WorldState};
+use scriptbots_core::{
+    ControlCommand, HydrologyFlowDirection, HydrologyState, ScriptBotsConfig, Tick, WorldState,
+};
 
 use crate::SharedWorld;
 use crate::command::CommandSender;
@@ -70,14 +72,16 @@ impl HydrologySnapshot {
             .field()
             .flow_directions()
             .iter()
-            .map(|direction| match direction {
-                HydrologyFlowDirection::North => "N",
-                HydrologyFlowDirection::South => "S",
-                HydrologyFlowDirection::East => "E",
-                HydrologyFlowDirection::West => "W",
-                HydrologyFlowDirection::None => "-",
-            }
-            .to_string())
+            .map(|direction| {
+                match direction {
+                    HydrologyFlowDirection::North => "N",
+                    HydrologyFlowDirection::South => "S",
+                    HydrologyFlowDirection::East => "E",
+                    HydrologyFlowDirection::West => "W",
+                    HydrologyFlowDirection::None => "-",
+                }
+                .to_string()
+            })
             .collect();
 
         Self {

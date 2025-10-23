@@ -3632,6 +3632,11 @@ mod map_sandbox {
                         moisture: Some(0.6),
                         accent: Some(0.3),
                         palette_index: Some(3),
+                        permeability: Some(0.35),
+                        runoff_bias: Some(0.2),
+                        basin_rank: Some(0.55),
+                        channel_priority: Some(0.4),
+                        swim_cost: Some(1.2),
                     },
                     TileSpec {
                         id: "water".into(),
@@ -3644,6 +3649,11 @@ mod map_sandbox {
                         moisture: Some(0.95),
                         accent: Some(0.4),
                         palette_index: Some(0),
+                        permeability: Some(0.9),
+                        runoff_bias: Some(0.8),
+                        basin_rank: Some(0.1),
+                        channel_priority: Some(0.9),
+                        swim_cost: Some(0.2),
                     },
                 ],
                 adjacency: Vec::new(),
@@ -3731,7 +3741,11 @@ impl HydrologyState {
         self.water_depth.iter().sum()
     }
 
-    pub fn flooded_cell_counts(&self, shallow_threshold: f32, deep_threshold: f32) -> (usize, usize) {
+    pub fn flooded_cell_counts(
+        &self,
+        shallow_threshold: f32,
+        deep_threshold: f32,
+    ) -> (usize, usize) {
         let mut shallow = 0usize;
         let mut deep = 0usize;
         for depth in &self.water_depth {
@@ -3899,10 +3913,7 @@ impl fmt::Debug for WorldState {
             )
             .field(
                 "hydrology",
-                &self
-                    .hydrology
-                    .as_ref()
-                    .map(|state| state.tiles().width()),
+                &self.hydrology.as_ref().map(|state| state.tiles().width()),
             )
             .finish()
     }
@@ -6822,9 +6833,7 @@ impl WorldState {
         }
 
         self.hydrology = match (artifact.hydrology_tiles(), artifact.hydrology_field()) {
-            (Some(tiles), Some(field)) => {
-                Some(HydrologyState::new(tiles.clone(), field.clone()))
-            }
+            (Some(tiles), Some(field)) => Some(HydrologyState::new(tiles.clone(), field.clone())),
             _ => None,
         };
 
