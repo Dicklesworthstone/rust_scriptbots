@@ -3870,6 +3870,46 @@ fn terrain_kind_fertility_bonus(kind: TerrainKind) -> f32 {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TickCadence {
+    aging_interval: u32,
+    chart_interval: u32,
+    reproduction_interval: u32,
+    reproduction_chance: f32,
+}
+
+impl TickCadence {
+    fn from_config(config: &ScriptBotsConfig) -> Self {
+        Self {
+            aging_interval: config.aging_tick_interval.max(1),
+            chart_interval: config.chart_flush_interval,
+            reproduction_interval: config.reproduction_attempt_interval,
+            reproduction_chance: config.reproduction_attempt_chance.clamp(0.0, 1.0),
+        }
+    }
+
+    fn should_age(&self, tick: Tick) -> bool {
+        self.aging_interval > 0 && tick.0.is_multiple_of(self.aging_interval as u64)
+    }
+
+    fn should_sample_history(&self, tick: Tick) -> bool {
+        self.chart_interval == 0 || tick.0.is_multiple_of(self.chart_interval as u64)
+    }
+
+    fn should_emit_chart_event(&self, tick: Tick) -> bool {
+        self.chart_interval > 0 && tick.0.is_multiple_of(self.chart_interval as u64)
+    }
+
+    fn reproduction_window(&self, tick: Tick) -> bool {
+        self.reproduction_interval == 0
+            || tick.0.is_multiple_of(self.reproduction_interval as u64)
+    }
+
+    fn reproduction_chance(&self) -> f32 {
+        self.reproduction_chance
+    }
+}
+
 /// Aggregate world state shared by the simulation and rendering layers.
 pub struct WorldState {
     config: ScriptBotsConfig,
@@ -3886,6 +3926,7 @@ pub struct WorldState {
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
+    cadence: TickCadence,
     food_scratch: Vec<f32>,
     pending_deaths: Vec<AgentId>,
     #[allow(dead_code)]
@@ -3959,6 +4000,7 @@ impl WorldState {
             config.world_height as f32,
         );
         let history_capacity = config.history_capacity;
+        let cadence = TickCadence::from_config(&config);
         Ok(Self {
             food,
             terrain,
@@ -3973,6 +4015,7 @@ impl WorldState {
             runtime: AgentMap::new(),
             index,
             brain_registry: BrainRegistry::new(),
+            cadence,
             food_profiles,
             food_scratch: vec![0.0; (food_w as usize) * (food_h as usize)],
             pending_deaths: Vec::new(),
@@ -5490,6 +5533,8 @@ impl WorldState {
             .iter()
             .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
             .collect();
+        let reproduction_window = self.cadence.reproduction_window(self.tick.next());
+        let reproduction_chance = self.cadence.reproduction_chance();
 
         for (idx, agent_id) in handles.iter().enumerate() {
             let mut parent_runtime_snapshot = None;
@@ -5510,6 +5555,25 @@ impl WorldState {
                 if runtime.energy < self.config.reproduction_energy_cost {
                     continue;
                 }
+            }
+
+            if !reproduction_window {
+                continue;
+            }
+            if reproduction_chance <= 0.0 {
+                continue;
+            }
+            if reproduction_chance < 1.0
+                && self.rng.random_range(0.0..1.0) >= reproduction_chance
+            {
+                continue;
+            }
+
+            {
+                let runtime = match self.runtime.get_mut(*agent_id) {
+                    Some(rt) => rt,
+                    None => continue,
+                };
                 runtime.energy -= self.config.reproduction_energy_cost;
                 runtime.reproduction_counter = 0.0;
                 parent_runtime_snapshot = Some(runtime.clone());
@@ -6562,10 +6626,12 @@ impl WorldState {
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = age_max;
         self.persistence.on_tick(&batch);
-        if self.history.len() >= self.config.history_capacity {
-            self.history.pop_front();
+        if self.cadence.should_sample_history(next_tick) {
+            if self.history.len() >= self.config.history_capacity {
+                self.history.pop_front();
+            }
+            self.history.push_back(summary);
         }
-        self.history.push_back(summary);
         self.last_births = 0;
         self.last_deaths = 0;
         self.carcass_health_distributed = 0.0;
@@ -6579,7 +6645,9 @@ impl WorldState {
         let next_tick = self.tick.next();
         let previous_epoch = self.epoch;
 
-        self.stage_aging();
+        if self.cadence.should_age(next_tick) {
+            self.stage_aging();
+        }
         let food_respawned = self.stage_food_dynamics(next_tick);
         self.stage_sense();
         self.stage_brains();
@@ -6595,10 +6663,7 @@ impl WorldState {
 
         let mut events = TickEvents {
             tick: next_tick,
-            charts_flushed: self.config.chart_flush_interval > 0
-                && next_tick
-                    .0
-                    .is_multiple_of(self.config.chart_flush_interval as u64),
+            charts_flushed: self.cadence.should_emit_chart_event(next_tick),
             epoch_rolled: false,
             food_respawned,
         };
@@ -6682,6 +6747,7 @@ impl WorldState {
         self.config = new_config;
         self.food_profiles = food_profiles;
         self.index = new_index;
+        self.cadence = TickCadence::from_config(&self.config);
         Ok(())
     }
 
@@ -7130,6 +7196,7 @@ mod tests {
             food_respawn_amount: 0.4,
             food_max: 0.5,
             chart_flush_interval: 2,
+            aging_tick_interval: 1,
             food_intake_rate: 0.0,
             metabolism_drain: 0.0,
             movement_drain: 0.0,
@@ -7500,6 +7567,8 @@ mod tests {
             spike_energy_cost: 0.0,
             persistence_interval: 1,
             history_capacity: 4,
+            chart_flush_interval: 1,
+            aging_tick_interval: 1,
             rng_seed: Some(123),
             ..ScriptBotsConfig::default()
         };
@@ -7543,6 +7612,8 @@ mod tests {
             reproduction_energy_threshold: 0.4,
             reproduction_energy_cost: 0.1,
             reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
             reproduction_child_energy: 0.6,
             reproduction_spawn_jitter: 0.0,
             reproduction_color_jitter: 0.0,
