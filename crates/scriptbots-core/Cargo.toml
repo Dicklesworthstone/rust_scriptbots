@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["parallel"]
+default = ["parallel", "simd_wide"]
 parallel = ["dep:rayon"]
-simd = []
+simd_wide = ["dep:wide"]
 
 [dependencies]
 serde = { workspace = true }
@@ -22,3 +22,4 @@ rayon = { workspace = true, optional = true }
 getrandom = { workspace = true }
 num_cpus = { workspace = true }
 serde_json = { workspace = true }
+wide = { version = "0.7", default-features = false, optional = true }

@@ -12,3 +12,5 @@ crates/scriptbots-web/web/pkg/
 vendor/
 *.backup
 scriptbots.db.wal
+scriptbots*.db
+scriptbots*.db.wal

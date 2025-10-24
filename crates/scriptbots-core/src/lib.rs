@@ -13,6 +13,8 @@ use std::fmt;
 #[cfg(feature = "parallel")]
 use std::sync::OnceLock;
 use thiserror::Error;
+#[cfg(feature = "simd_wide")]
+use wide::{f32x4, CmpLt};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainActivations {
     pub layers: Vec<ActivationLayer>,
@@ -4574,18 +4576,69 @@ impl WorldState {
                         return;
                     }
 
-                    for eye in 0..NUM_EYES {
-                        let view_dir = wrap_signed_angle(heading + eyes_dir[eye]);
-                        let diff = angle_difference(view_dir, ang);
-                        let fov = eyes_fov[eye].max(0.01);
-                        if diff < fov {
-                            let fov_factor = ((fov - diff) / fov).max(0.0);
-                            let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
-                            density[eye] += intensity;
-                            let color = colors[other_idx];
-                            eye_r[eye] += intensity * color[0];
-                            eye_g[eye] += intensity * color[1];
-                            eye_b[eye] += intensity * color[2];
+                    #[cfg(feature = "simd_wide")]
+                    {
+                        // SIMD vectorize per-eye computation (4 lanes)
+                        let base = [
+                            wrap_signed_angle(heading + eyes_dir[0]),
+                            wrap_signed_angle(heading + eyes_dir[1]),
+                            wrap_signed_angle(heading + eyes_dir[2]),
+                            wrap_signed_angle(heading + eyes_dir[3]),
+                        ];
+                        let fov = [
+                            eyes_fov[0].max(0.01),
+                            eyes_fov[1].max(0.01),
+                            eyes_fov[2].max(0.01),
+                            eyes_fov[3].max(0.01),
+                        ];
+                        let diff = [
+                            angle_difference(base[0], ang),
+                            angle_difference(base[1], ang),
+                            angle_difference(base[2], ang),
+                            angle_difference(base[3], ang),
+                        ];
+                        let diff_v = f32x4::new(diff);
+                        let fov_v = f32x4::new(fov);
+                        let mask = diff_v.cmp_lt(fov_v);
+                        let mut fov_factor = (fov_v - diff_v) / fov_v;
+                        fov_factor = fov_factor.max(f32x4::splat(0.0));
+                        let scalar = traits.eye * dist_factor * (dist / radius);
+                        let intensity_v = fov_factor * f32x4::splat(scalar);
+
+                        let color = colors[other_idx];
+                        let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
+                        let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
+                        let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
+                        let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
+                        let add_v = mask.blend(intensity_v, f32x4::splat(0.0));
+                        dens = dens + add_v;
+                        r = r + add_v * f32x4::splat(color[0]);
+                        g = g + add_v * f32x4::splat(color[1]);
+                        b = b + add_v * f32x4::splat(color[2]);
+                        let out_d = dens.to_array();
+                        let out_r = r.to_array();
+                        let out_g = g.to_array();
+                        let out_b = b.to_array();
+                        density[0] = out_d[0]; density[1] = out_d[1]; density[2] = out_d[2]; density[3] = out_d[3];
+                        eye_r[0] = out_r[0]; eye_r[1] = out_r[1]; eye_r[2] = out_r[2]; eye_r[3] = out_r[3];
+                        eye_g[0] = out_g[0]; eye_g[1] = out_g[1]; eye_g[2] = out_g[2]; eye_g[3] = out_g[3];
+                        eye_b[0] = out_b[0]; eye_b[1] = out_b[1]; eye_b[2] = out_b[2]; eye_b[3] = out_b[3];
+                    }
+                    #[cfg(not(feature = "simd_wide"))]
+                    {
+                        for eye in 0..NUM_EYES {
+                            let view_dir = wrap_signed_angle(heading + eyes_dir[eye]);
+                            let diff = angle_difference(view_dir, ang);
+                            let fov = eyes_fov[eye].max(0.01);
+                            if diff < fov {
+                                let fov_factor = ((fov - diff) / fov).max(0.0);
+                                let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
+                                density[eye] += intensity;
+                                let color = colors[other_idx];
+                                eye_r[eye] += intensity * color[0];
+                                eye_g[eye] += intensity * color[1];
+                                eye_b[eye] += intensity * color[2];
+                            }
                         }
                     }
 
