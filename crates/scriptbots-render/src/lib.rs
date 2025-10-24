@@ -109,11 +109,12 @@ pub fn run_demo(
         let view_title = title_for_view.clone();
         let drain_for_hud = Arc::clone(&drain_for_view);
         let submit_for_hud = Arc::clone(&submit_for_view);
+        let storage_for_hud = storage_for_view.clone();
         if let Err(err) = app.open_window(hud_options, move |_window, cx| {
             cx.new(|_| {
                 SimulationView::new(
                     Arc::clone(&world_handle),
-                    storage_for_view.clone(),
+                    storage_for_hud.clone(),
                     view_title.clone(),
                     Arc::clone(&drain_for_hud),
                     Arc::clone(&submit_for_hud),
