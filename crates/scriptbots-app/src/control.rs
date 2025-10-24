@@ -14,6 +14,7 @@ use scriptbots_core::{
 use crate::SharedWorld;
 use crate::command::CommandSender;
 use scriptbots_core::ConfigAuditEntry;
+#[cfg(feature = "gui")]
 use scriptbots_render::render_png_offscreen;
 use slotmap::Key; // offscreen PNG renderer
 
@@ -182,9 +183,16 @@ impl ControlHandle {
 
     /// Produce a PNG snapshot of the world without a live window.
     pub fn snapshot_png(&self, width: u32, height: u32) -> Result<Vec<u8>, ControlError> {
-        let world = self.lock_world()?;
-        let bytes = render_png_offscreen(&world, width, height);
-        Ok(bytes)
+        #[cfg(feature = "gui")]
+        {
+            let world = self.lock_world()?;
+            let bytes = render_png_offscreen(&world, width, height);
+            Ok(bytes)
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            Err(ControlError::InvalidPatch("PNG snapshot requires gui feature".into()))
+        }
     }
 
     fn lock_world(&self) -> Result<MutexGuard<'_, WorldState>, ControlError> {

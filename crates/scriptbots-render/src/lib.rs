@@ -305,7 +305,9 @@ impl SimulationView {
 
         // Clamp accumulator to avoid long-frame backlogs
         let max_accumulator = step_interval * MAX_SIM_STEPS_PER_FRAME as f32;
-        self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
+        // Hard clamp to 0.5s to prevent spike-induced lag
+        let hard_cap = 0.5f32;
+        self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(hard_cap);
 
         let mut steps = (self.sim_accumulator / step_interval).floor() as usize;
         if steps == 0 {
@@ -9212,7 +9214,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         window,
     );
     let cell_world = frame.food_cell_size as f32;
-    let cell_px = (cell_world * scale).max(1.0);
+    let _cell_px = (cell_world * scale).max(1.0);
     let max_food = frame.food_max.max(f32::EPSILON);
 
     if controls.draw_food {

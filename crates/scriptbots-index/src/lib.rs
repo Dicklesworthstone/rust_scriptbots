@@ -56,6 +56,12 @@ enum Buckets {
     Sparse(HashMap<(i32, i32), Vec<usize>>),
 }
 
+impl Default for Buckets {
+    fn default() -> Self {
+        Buckets::Sparse(HashMap::new())
+    }
+}
+
 impl UniformGridIndex {
     /// Create a new uniform grid with the provided cell size and world dimensions.
     #[must_use]
