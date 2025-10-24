@@ -114,6 +114,14 @@ fn main() -> Result<()> {
     // Apply OS-level priority niceness where supported.
     apply_process_niceness(cli.low_power)?;
 
+    // Prefer high-performance adapter on Windows for wgpu
+    #[cfg(windows)]
+    unsafe {
+        if std::env::var("WGPU_POWER_PREFERENCE").is_err() {
+            std::env::set_var("WGPU_POWER_PREFERENCE", "high_performance");
+        }
+    }
+
     // Renderer debug toggles
     if cli.debug_watermark {
         unsafe { std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1"); }

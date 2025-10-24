@@ -8012,15 +8012,19 @@ impl HistoryChartData {
         if entries.len() < 2 {
             return None;
         }
+        // Decimate samples to a fixed budget to avoid heavy polylines
+        const MAX_SAMPLES: usize = 120;
+        let stride = ((entries.len() + MAX_SAMPLES - 1) / MAX_SAMPLES).max(1);
+        let decimated: Vec<&HudHistoryEntry> = entries.iter().step_by(stride).collect();
 
-        let max_agents = entries.iter().map(|e| e.agent_count).max().unwrap_or(1);
-        let max_births = entries.iter().map(|e| e.births).max().unwrap_or(0);
-        let max_deaths = entries.iter().map(|e| e.deaths).max().unwrap_or(0);
+        let max_agents = decimated.iter().map(|e| e.agent_count).max().unwrap_or(1);
+        let max_births = decimated.iter().map(|e| e.births).max().unwrap_or(0);
+        let max_deaths = decimated.iter().map(|e| e.deaths).max().unwrap_or(0);
         let scale_agents = max_agents.max(1) as f32;
         let scale_births = max_births.max(1) as f32;
         let scale_deaths = max_deaths.max(1) as f32;
 
-        let samples = entries.len();
+        let samples = decimated.len();
         let step = if samples > 1 {
             width / (samples as f32 - 1.0)
         } else {
@@ -8041,24 +8045,9 @@ impl HistoryChartData {
                 .collect()
         };
 
-        let agents = to_points(
-            entries
-                .iter()
-                .map(|e| e.agent_count as f32 / scale_agents)
-                .collect(),
-        );
-        let births = to_points(
-            entries
-                .iter()
-                .map(|e| e.births as f32 / scale_births)
-                .collect(),
-        );
-        let deaths = to_points(
-            entries
-                .iter()
-                .map(|e| e.deaths as f32 / scale_deaths)
-                .collect(),
-        );
+        let agents = to_points(decimated.iter().map(|e| e.agent_count as f32 / scale_agents).collect());
+        let births = to_points(decimated.iter().map(|e| e.births as f32 / scale_births).collect());
+        let deaths = to_points(decimated.iter().map(|e| e.deaths as f32 / scale_deaths).collect());
 
         Some(Self {
             width,
@@ -8861,11 +8850,6 @@ fn apply_post_processing(
     let bounds_size = bounds.size;
     let width_px = f32::from(bounds_size.width).max(1.0);
     let height_px = f32::from(bounds_size.height).max(1.0);
-    // Window-space view bounds
-    let view_left = f32::from(origin.x);
-    let view_top = f32::from(origin.y);
-    let view_right = view_left + width_px;
-    let view_bottom = view_top + height_px;
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
@@ -9033,7 +9017,6 @@ fn hashed_noise(seed: u64, row: u64, col: u64) -> f32 {
     value ^= value >> 32;
     (value as f64 / u64::MAX as f64) as f32
 }
-
 fn paint_debug_overlays(
     frame: &RenderFrame,
     focus_agent: Option<AgentId>,
@@ -9180,6 +9163,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     let width_px = f32::from(bounds_size.width).max(1.0);
     let height_px = f32::from(bounds_size.height).max(1.0);
+    let origin_x = f32::from(origin.x);
+    let origin_y = f32::from(origin.y);
 
     let base_scale = (width_px / world_w).min(height_px / world_h).max(0.000_1);
     let scale = base_scale * camera_guard.zoom;
@@ -9187,11 +9172,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let render_h = world_h * scale;
     let pad_x = (width_px - render_w) * 0.5;
     let pad_y = (height_px - render_h) * 0.5;
-    let offset_x = f32::from(origin.x) + pad_x + camera_guard.offset_px.0;
-    let offset_y = f32::from(origin.y) + pad_y + camera_guard.offset_px.1;
+    let offset_x = origin_x + pad_x + camera_guard.offset_px.0;
+    let offset_y = origin_y + pad_y + camera_guard.offset_px.1;
 
     camera_guard.record_render_metrics(
-        (f32::from(origin.x), f32::from(origin.y)),
+        (origin_x, origin_y),
         (width_px, height_px),
         frame.world_size,
         base_scale,
@@ -9202,6 +9187,12 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         camera_guard.center_on(target);
     }
     drop(camera_guard);
+
+    // View bounds in window space used for culling
+    let view_left = origin_x;
+    let view_top = origin_y;
+    let view_right = view_left + width_px;
+    let view_bottom = view_top + height_px;
 
     let day_phase = frame.tick as f32 * 0.00025;
     let phase_sin = day_phase.sin();
@@ -9229,8 +9220,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     if !safe_mode_enabled() && horizon_height > 1.0 {
         let horizon_bounds = Bounds::new(
             point(
-                px(f32::from(origin.x)),
-                px(f32::from(origin.y) + height_px - horizon_height),
+                px(origin_x),
+                px(origin_y + height_px - horizon_height),
             ),
             size(px(width_px), px(horizon_height)),
         );
@@ -9242,7 +9233,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let aurora_strength = (1.0 - daylight).clamp(0.0, 1.0);
     if aurora_strength > 0.05 {
         let aurora_bounds = Bounds::new(
-            point(px(f32::from(origin.x)), px(f32::from(origin.y))),
+            point(px(origin_x), px(origin_y)),
             size(px(width_px), px(height_px * 0.25)),
         );
         let aurora_base = rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength);
@@ -9264,7 +9255,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let cell_world = frame.food_cell_size as f32;
     let _cell_px = (cell_world * scale).max(1.0);
     let max_food = frame.food_max.max(f32::EPSILON);
-    let inv_max_food = if max_food > 0.0 { 1.0 / max_food } else { 0.0 };
+    let inv_max_food: f32 = if max_food > 0.0 { 1.0_f32 / max_food } else { 0.0_f32 };
 
     if controls.draw_food {
         // Compute visible cell range to cull off-screen food cells
@@ -9603,7 +9594,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     if watermark_enabled() {
         let mark_bounds = Bounds::new(
-            point(px(f32::from(bounds.origin.x) + 6.0), px(f32::from(bounds.origin.y) + 6.0)),
+            point(px(origin_x + 6.0), px(origin_y + 6.0)),
             size(px(6.0), px(6.0)),
         );
         window.paint_quad(fill(mark_bounds, Background::from(rgba_from_hex(0xff00aa, 1.0))));
