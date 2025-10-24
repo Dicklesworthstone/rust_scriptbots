@@ -9726,6 +9726,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     );
     // If the current render rectangle lies completely outside the canvas, recentre.
     // This can happen after extreme panning combined with zoom, resulting in a blank view.
+    // Re-evaluate render rect after possible camera adjustments
     let (mut render_left, mut render_top, mut render_right, mut render_bottom) = (offset_x, offset_y, offset_x + render_w, offset_y + render_h);
     let fully_offscreen =
         render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
@@ -9743,8 +9744,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         let offset_y2 = origin_y + pad_y2 + camera_guard.offset_px.1;
         // Overwrite locals for subsequent drawing
         // SAFETY: shadow immutable locals with new bindings
-        let (render_w, render_h, offset_x, offset_y) = (render_w2, render_h2, offset_x2, offset_y2);
-        let _ = (render_w, render_h, offset_x, offset_y);
+        // Update outer-scope variables for subsequent computations
+        render_w = render_w2;
+        render_h = render_h2;
+        offset_x = offset_x2;
+        offset_y = offset_y2;
     }
     if controls.follow_mode != FollowMode::Off
         && let Some(target) = follow_target
