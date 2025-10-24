@@ -676,6 +676,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" + / - Adjust speed"),
             Line::raw(" s      Single step"),
             Line::raw(" S      Save ASCII screenshot"),
+            Line::raw(" e      Toggle emoji mode"),
             Line::raw(" b      Toggle metrics baseline (set/clear)"),
             Line::raw(" ?      Toggle this help"),
         ];
@@ -755,6 +756,14 @@ impl<'a> TerminalApp<'a> {
                         "Saved ASCII screenshot",
                     );
                 }
+            }
+            (KeyCode::Char('e') | KeyCode::Char('E'), _) => {
+                self.palette.toggle_emoji();
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.palette.is_emoji() { "Emoji mode ON" } else { "Emoji mode OFF" },
+                );
             }
             (KeyCode::Char('b'), _) => {
                 if self.baseline.is_some() {
@@ -1587,12 +1596,16 @@ fn report_file_path_from_env() -> Option<PathBuf> {
 
 struct Palette {
     level: Option<ColorLevel>,
+    emoji: bool,
 }
 
 impl Palette {
     fn detect() -> Self {
+        let emoji_env = std::env::var("SCRIPTBOTS_TERMINAL_EMOJI").unwrap_or_default();
+        let emoji = matches!(emoji_env.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
         Self {
             level: on_cached(Stream::Stdout),
+            emoji,
         }
     }
 
@@ -1661,6 +1674,10 @@ impl Palette {
         self.level.is_some()
     }
 
+    fn is_emoji(&self) -> bool { self.emoji }
+
+    fn toggle_emoji(&mut self) { self.emoji = !self.emoji; }
+
     fn diet_color(&self, diet: DietClass) -> Color {
         match diet {
             DietClass::Herbivore => Color::Green,
@@ -1673,53 +1690,64 @@ impl Palette {
         let rich_color = self
             .level
             .is_some_and(|level| level.has_16m || level.has_256);
-        let (glyph, fg, bg) = match kind {
-            TerrainKind::DeepWater => ('≈', Color::Cyan, Color::Blue),
-            TerrainKind::ShallowWater => (
-                '~',
-                Color::Cyan,
-                if rich_color {
-                    Color::Rgb(0, 80, 160)
-                } else {
-                    Color::Blue
-                },
-            ),
-            TerrainKind::Sand => (
-                '·',
-                Color::Yellow,
-                if rich_color {
-                    Color::Rgb(160, 120, 50)
-                } else {
-                    Color::Yellow
-                },
-            ),
-            TerrainKind::Grass => (
-                '"',
-                Color::LightGreen,
-                if rich_color {
-                    Color::Rgb(30, 90, 30)
-                } else {
-                    Color::Green
-                },
-            ),
-            TerrainKind::Bloom => (
-                '*',
-                Color::Magenta,
-                if rich_color {
-                    Color::Rgb(100, 30, 100)
-                } else {
-                    Color::Magenta
-                },
-            ),
-            TerrainKind::Rock => (
-                '^',
-                Color::Gray,
-                if rich_color {
-                    Color::Rgb(70, 70, 70)
-                } else {
-                    Color::DarkGray
-                },
-            ),
+        let (glyph, fg, bg) = if self.emoji {
+            match kind {
+                TerrainKind::DeepWater => ('🌊', Color::Cyan, Color::Blue),
+                TerrainKind::ShallowWater => ('💧', Color::Cyan, if rich_color { Color::Rgb(0, 80, 160) } else { Color::Blue }),
+                TerrainKind::Sand => ('🟨', Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
+                TerrainKind::Grass => ('🌿', Color::LightGreen, if rich_color { Color::Rgb(30, 90, 30) } else { Color::Green }),
+                TerrainKind::Bloom => ('🌸', Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
+                TerrainKind::Rock => ('🪨', Color::Gray, if rich_color { Color::Rgb(70, 70, 70) } else { Color::DarkGray }),
+            }
+        } else {
+            match kind {
+                TerrainKind::DeepWater => ('≈', Color::Cyan, Color::Blue),
+                TerrainKind::ShallowWater => (
+                    '~',
+                    Color::Cyan,
+                    if rich_color {
+                        Color::Rgb(0, 80, 160)
+                    } else {
+                        Color::Blue
+                    },
+                ),
+                TerrainKind::Sand => (
+                    '·',
+                    Color::Yellow,
+                    if rich_color {
+                        Color::Rgb(160, 120, 50)
+                    } else {
+                        Color::Yellow
+                    },
+                ),
+                TerrainKind::Grass => (
+                    '"',
+                    Color::LightGreen,
+                    if rich_color {
+                        Color::Rgb(30, 90, 30)
+                    } else {
+                        Color::Green
+                    },
+                ),
+                TerrainKind::Bloom => (
+                    '*',
+                    Color::Magenta,
+                    if rich_color {
+                        Color::Rgb(100, 30, 100)
+                    } else {
+                        Color::Magenta
+                    },
+                ),
+                TerrainKind::Rock => (
+                    '^',
+                    Color::Gray,
+                    if rich_color {
+                        Color::Rgb(70, 70, 70)
+                    } else {
+                        Color::DarkGray
+                    },
+                ),
+            }
         };
         let mut style = Style::default().fg(fg);
         if self.has_color() {
@@ -1740,22 +1768,42 @@ impl Palette {
         } else {
             occupancy.dominant()
         };
-        let mut glyph = match total {
-            0 => ' ',
-            1 => occupancy
-                .mean_heading()
-                .map(Self::heading_char)
-                .unwrap_or_else(|| match class {
-                    DietClass::Herbivore => 'h',
-                    DietClass::Omnivore => 'o',
-                    DietClass::Carnivore => 'c',
-                }),
-            2..=3 => match class {
-                DietClass::Herbivore => 'H',
-                DietClass::Omnivore => 'O',
-                DietClass::Carnivore => 'C',
-            },
-            _ => '@',
+        let mut glyph = if self.emoji {
+            match total {
+                0 => ' ',
+                1 => occupancy
+                    .mean_heading()
+                    .map(Self::heading_char)
+                    .unwrap_or_else(|| match class {
+                        DietClass::Herbivore => '🐭',
+                        DietClass::Omnivore => '🦝',
+                        DietClass::Carnivore => '🦊',
+                    }),
+                2..=3 => match class {
+                    DietClass::Herbivore => '🐰',
+                    DietClass::Omnivore => '🐻',
+                    DietClass::Carnivore => '🐺',
+                },
+                _ => '👥',
+            }
+        } else {
+            match total {
+                0 => ' ',
+                1 => occupancy
+                    .mean_heading()
+                    .map(Self::heading_char)
+                    .unwrap_or_else(|| match class {
+                        DietClass::Herbivore => 'h',
+                        DietClass::Omnivore => 'o',
+                        DietClass::Carnivore => 'c',
+                    }),
+                2..=3 => match class {
+                    DietClass::Herbivore => 'H',
+                    DietClass::Omnivore => 'O',
+                    DietClass::Carnivore => 'C',
+                },
+                _ => '@',
+            }
         };
 
         let mut style = base.fg(self.diet_color(class));

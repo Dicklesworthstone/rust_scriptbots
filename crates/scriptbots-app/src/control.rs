@@ -20,7 +20,7 @@ use scriptbots_core::ConfigAuditEntry;
 #[cfg(feature = "gui")]
 use scriptbots_render::render_png_offscreen;
 use slotmap::Key; // offscreen PNG renderer
-use smallvec::SmallVec;
+// use smallvec::SmallVec; // not needed here
 
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
