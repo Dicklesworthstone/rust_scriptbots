@@ -26,7 +26,7 @@ use ratatui::{
 };
 use scriptbots_core::{
     AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
-    BrainActivations, ActivationLayer,
+    BrainActivations,
 };
 use scriptbots_storage::MetricReading;
 use serde::Serialize;
@@ -805,6 +805,13 @@ impl<'a> TerminalApp<'a> {
                 Span::styled("Gen ", self.palette.header_style()),
                 Span::raw(format!("μ {:>4.1}  max {:>3.0}", ana.generation_mean, ana.generation_max)),
             ]));
+            if area.width > 60 {
+                lines.push(Line::from(vec![
+                    Span::styled("Temp ", self.palette.header_style()),
+                    Span::raw(format!("pref μ {:>4.2} σ {:>4.2}  discomfort σ {:>4.2}",
+                        ana.temperature_preference_mean, ana.temperature_preference_stddev, ana.temperature_discomfort_stddev)),
+                ]));
+            }
             lines.push(Line::from(vec![
                 Span::styled("Mutation ", self.palette.header_style()),
                 Span::raw(format!("pri μ {:>4.2}  sec μ {:>4.2}", ana.mutation_primary_mean, ana.mutation_secondary_mean)),
