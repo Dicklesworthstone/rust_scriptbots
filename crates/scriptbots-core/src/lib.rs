@@ -4590,6 +4590,211 @@ impl WorldState {
             let eyes_fov = &self.work_eye_fov_clamped[idx];
 
             index.visit_neighbor_buckets(idx, radius, &mut |indices| {
+                #[cfg(feature = "simd_wide")]
+                {
+                    // SIMD-batch smell/sound/hearing; eyes/blood remain per-lane for correctness
+                    for chunk in indices.chunks_exact(4) {
+                        let ids = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                        let dx_arr = [
+                            toroidal_delta(positions[ids[0]].x, position.x, world_width),
+                            toroidal_delta(positions[ids[1]].x, position.x, world_width),
+                            toroidal_delta(positions[ids[2]].x, position.x, world_width),
+                            toroidal_delta(positions[ids[3]].x, position.x, world_width),
+                        ];
+                        let dy_arr = [
+                            toroidal_delta(positions[ids[0]].y, position.y, world_height),
+                            toroidal_delta(positions[ids[1]].y, position.y, world_height),
+                            toroidal_delta(positions[ids[2]].y, position.y, world_height),
+                            toroidal_delta(positions[ids[3]].y, position.y, world_height),
+                        ];
+                        let dx_v = f32x4::new(dx_arr);
+                        let dy_v = f32x4::new(dy_arr);
+                        let dist_sq_v = dx_v * dx_v + dy_v * dy_v;
+                        let dist_v = dist_sq_v.sqrt();
+                        let mut df_v = (f32x4::splat(radius) - dist_v) / f32x4::splat(radius);
+                        df_v = df_v.max(f32x4::splat(0.0));
+                        // Zero out invalid lanes (self, <= eps, > radius^2)
+                        let dsq = dist_sq_v.to_array();
+                        let mut df = df_v.to_array();
+                        for lane in 0..4 {
+                            let oid = ids[lane];
+                            if oid == idx || dsq[lane] <= f32::EPSILON || dsq[lane] > radius_sq {
+                                df[lane] = 0.0;
+                            }
+                        }
+                        let df_v = f32x4::new(df);
+                        // Smell accumulation
+                        smell += df.iter().copied().sum::<f32>();
+                        // Sound accumulation
+                        let sp = f32x4::new([
+                            self.work_speed_norm[ids[0]],
+                            self.work_speed_norm[ids[1]],
+                            self.work_speed_norm[ids[2]],
+                            self.work_speed_norm[ids[3]],
+                        ]);
+                        sound += (df_v * sp).to_array().iter().copied().sum::<f32>();
+                        // Hearing accumulation
+                        let em = f32x4::new([
+                            sound_emitters[ids[0]],
+                            sound_emitters[ids[1]],
+                            sound_emitters[ids[2]],
+                            sound_emitters[ids[3]],
+                        ]);
+                        hearing += (df_v * em).to_array().iter().copied().sum::<f32>();
+
+                        // Eyes and blood per-lane for these four
+                        let dist_arr = dist_v.to_array();
+                        for lane in 0..4 {
+                            let other_idx = ids[lane];
+                            if df[lane] <= 0.0 { continue; }
+                            let dx = dx_arr[lane];
+                            let dy = dy_arr[lane];
+                            let dist = dist_arr[lane];
+                            let ang = angle_to(dx, dy);
+                            let dist_factor = (radius - dist) / radius;
+                            #[cfg(feature = "simd_wide")]
+                            {
+                                let base = [
+                                    eyes_dir[0],
+                                    eyes_dir[1],
+                                    eyes_dir[2],
+                                    eyes_dir[3],
+                                ];
+                                let fov = [eyes_fov[0], eyes_fov[1], eyes_fov[2], eyes_fov[3]];
+                                let diff = [
+                                    angle_difference(base[0], ang),
+                                    angle_difference(base[1], ang),
+                                    angle_difference(base[2], ang),
+                                    angle_difference(base[3], ang),
+                                ];
+                                let diff_v = f32x4::new(diff);
+                                let fov_v = f32x4::new(fov);
+                                let mut fov_factor = (fov_v - diff_v) / fov_v;
+                                fov_factor = fov_factor.max(f32x4::splat(0.0));
+                                let scalar = traits.eye * dist_factor * (dist / radius);
+                                let intensity_v = fov_factor * f32x4::splat(scalar);
+                                let color = colors[other_idx];
+                                let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
+                                let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
+                                let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
+                                let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
+                                dens = dens + intensity_v;
+                                r = r + intensity_v * f32x4::splat(color[0]);
+                                g = g + intensity_v * f32x4::splat(color[1]);
+                                b = b + intensity_v * f32x4::splat(color[2]);
+                                let out_d = dens.to_array();
+                                let out_r = r.to_array();
+                                let out_g = g.to_array();
+                                let out_b = b.to_array();
+                                density[0] = out_d[0]; density[1] = out_d[1]; density[2] = out_d[2]; density[3] = out_d[3];
+                                eye_r[0] = out_r[0]; eye_r[1] = out_r[1]; eye_r[2] = out_r[2]; eye_r[3] = out_r[3];
+                                eye_g[0] = out_g[0]; eye_g[1] = out_g[1]; eye_g[2] = out_g[2]; eye_g[3] = out_g[3];
+                                eye_b[0] = out_b[0]; eye_b[1] = out_b[1]; eye_b[2] = out_b[2]; eye_b[3] = out_b[3];
+                            }
+                            #[cfg(not(feature = "simd_wide"))]
+                            {
+                                for eye in 0..NUM_EYES {
+                                    let diff = angle_difference(eyes_dir[eye], ang);
+                                    let fov = eyes_fov[eye];
+                                    if diff < fov {
+                                        let fov_factor = ((fov - diff) / fov).max(0.0);
+                                        let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
+                                        density[eye] += intensity;
+                                        let color = colors[other_idx];
+                                        eye_r[eye] += intensity * color[0];
+                                        eye_g[eye] += intensity * color[1];
+                                        eye_b[eye] += intensity * color[2];
+                                    }
+                                }
+                            }
+                            let forward_diff = angle_difference(heading, ang);
+                            if forward_diff < BLOOD_HALF_FOV {
+                                let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
+                                let health = healths[other_idx];
+                                let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
+                                blood += bleed * dist_factor * wound;
+                            }
+                        }
+                    }
+                    // Remainder (less than 4)
+                    for &other_idx in indices.chunks_exact(4).remainder() {
+                        if other_idx == idx {
+                            continue;
+                        }
+                        let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
+                        let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
+                        let dist_sq_val = dx.mul_add(dx, dy * dy);
+                        if dist_sq_val <= f32::EPSILON || dist_sq_val > radius_sq {
+                            continue;
+                        }
+                        let dist = dist_sq_val.sqrt();
+                        let ang = angle_to(dx, dy);
+                        let dist_factor = (radius - dist) / radius;
+                        if dist_factor <= 0.0 { continue; }
+                        smell += dist_factor;
+                        sound += dist_factor * self.work_speed_norm[other_idx];
+                        hearing += dist_factor * sound_emitters[other_idx];
+                        #[cfg(feature = "simd_wide")]
+                        {
+                            let base = [eyes_dir[0], eyes_dir[1], eyes_dir[2], eyes_dir[3]];
+                            let fov = [eyes_fov[0], eyes_fov[1], eyes_fov[2], eyes_fov[3]];
+                            let diff = [
+                                angle_difference(base[0], ang),
+                                angle_difference(base[1], ang),
+                                angle_difference(base[2], ang),
+                                angle_difference(base[3], ang),
+                            ];
+                            let diff_v = f32x4::new(diff);
+                            let fov_v = f32x4::new(fov);
+                            let mut fov_factor = (fov_v - diff_v) / fov_v;
+                            fov_factor = fov_factor.max(f32x4::splat(0.0));
+                            let scalar = traits.eye * dist_factor * (dist / radius);
+                            let intensity_v = fov_factor * f32x4::splat(scalar);
+                            let color = colors[other_idx];
+                            let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
+                            let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
+                            let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
+                            let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
+                            dens = dens + intensity_v;
+                            r = r + intensity_v * f32x4::splat(color[0]);
+                            g = g + intensity_v * f32x4::splat(color[1]);
+                            b = b + intensity_v * f32x4::splat(color[2]);
+                            let out_d = dens.to_array();
+                            let out_r = r.to_array();
+                            let out_g = g.to_array();
+                            let out_b = b.to_array();
+                            density[0] = out_d[0]; density[1] = out_d[1]; density[2] = out_d[2]; density[3] = out_d[3];
+                            eye_r[0] = out_r[0]; eye_r[1] = out_r[1]; eye_r[2] = out_r[2]; eye_r[3] = out_r[3];
+                            eye_g[0] = out_g[0]; eye_g[1] = out_g[1]; eye_g[2] = out_g[2]; eye_g[3] = out_g[3];
+                            eye_b[0] = out_b[0]; eye_b[1] = out_b[1]; eye_b[2] = out_b[2]; eye_b[3] = out_b[3];
+                        }
+                        #[cfg(not(feature = "simd_wide"))]
+                        {
+                            for eye in 0..NUM_EYES {
+                                let diff = angle_difference(eyes_dir[eye], ang);
+                                let fov = eyes_fov[eye];
+                                if diff < fov {
+                                    let fov_factor = ((fov - diff) / fov).max(0.0);
+                                    let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
+                                    density[eye] += intensity;
+                                    let color = colors[other_idx];
+                                    eye_r[eye] += intensity * color[0];
+                                    eye_g[eye] += intensity * color[1];
+                                    eye_b[eye] += intensity * color[2];
+                                }
+                            }
+                        }
+                        let forward_diff = angle_difference(heading, ang);
+                        if forward_diff < BLOOD_HALF_FOV {
+                            let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
+                            let health = healths[other_idx];
+                            let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
+                            blood += bleed * dist_factor * wound;
+                        }
+                    }
+                    return;
+                }
+                #[cfg(not(feature = "simd_wide"))]
                 for &other_idx in indices {
                     if other_idx == idx {
                         continue;

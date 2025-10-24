@@ -43,7 +43,6 @@ pub struct WorldRenderer {
 }
 
 pub struct RenderFrame {
-    pub color: wgpu::Texture,
     pub extent: (u32, u32),
 }
 
@@ -112,11 +111,11 @@ impl WorldRenderer {
         self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot);
         self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot);
         self.queue.submit(Some(encoder.finish()));
-        RenderFrame { color: self.color.clone(), extent: self.size }
+        RenderFrame { extent: self.size }
     }
 
-    pub fn copy_to_readback(&mut self, frame: &RenderFrame) -> Result<(), String> {
-        self.readback.copy(&self.device, &self.queue, frame)
+    pub fn copy_to_readback(&mut self, _frame: &RenderFrame) -> Result<(), String> {
+        self.readback.copy(&self.device, &self.queue, &self.color)
     }
 
     pub fn mapped_rgba(&mut self) -> Option<ReadbackView<'_>> { self.readback.mapped() }
@@ -179,13 +178,13 @@ impl ReadbackRing {
         Ok(Self { slots, curr: 0, bytes_per_row, extent })
     }
 
-    pub fn copy(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &RenderFrame) -> Result<(), String> {
+    pub fn copy(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, color: &wgpu::Texture) -> Result<(), String> {
         let slot = &mut self.slots[self.curr];
         slot.ready = false;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.readback.copy") });
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
-                texture: &frame.color,
+                texture: color,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
