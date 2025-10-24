@@ -1382,7 +1382,30 @@ impl SimulationView {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
                     let extend = event.modifiers.shift;
+                    // Snapshot focus state BEFORE mutating selection
+                    let had_focus_before = if !extend {
+                        this.inspector
+                            .lock()
+                            .map(|s| s.focused_agent.is_some())
+                            .unwrap_or(false)
+                    } else { false };
+
                     let mut changed = this.update_selection_from_point(event.position, extend);
+
+                    // Auto-follow behavior: when a single-click focuses an agent (no Shift),
+                    // enable Follow selected; clicking empty space turns follow off.
+                    if !extend {
+                        let has_focus_after = this
+                            .inspector
+                            .lock()
+                            .map(|s| s.focused_agent.is_some())
+                            .unwrap_or(false);
+                        if has_focus_after {
+                            this.set_follow_mode(FollowMode::Selected, cx);
+                        } else if had_focus_before && !has_focus_after {
+                            this.set_follow_mode(FollowMode::Off, cx);
+                        }
+                    }
                     if this.set_shift_inspect(event.modifiers.shift) {
                         changed = true;
                     }

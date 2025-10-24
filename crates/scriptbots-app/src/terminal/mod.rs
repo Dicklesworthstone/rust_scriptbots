@@ -212,6 +212,7 @@ struct TerminalApp<'a> {
     // Brain view controls
     focused_agent_cursor: usize,
     activation_layer_index: usize,
+    activation_row_offset: usize,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -253,6 +254,7 @@ impl<'a> TerminalApp<'a> {
             expanded_user_override: false,
             focused_agent_cursor: 0,
             activation_layer_index: 0,
+            activation_row_offset: 0,
         };
         app.refresh_snapshot();
         app
@@ -824,20 +826,44 @@ impl<'a> TerminalApp<'a> {
             lines.push(Line::from(vec![Span::raw("Analytics warming up… (run a few ticks) ")]));
         }
 
-        // Compact brain activation row if available (pull from snapshot when we expose it)
-        if let Some(first_layer) = self.snapshot.brain_activations_layer() {
-            let cols = first_layer.width.max(1);
-            let take = cols.min(32);
-            let mut row = String::new();
-            for i in 0..take {
-                let v = first_layer.values.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let ch = if v > 0.8 { '█' } else if v > 0.6 { '▆' } else if v > 0.4 { '▅' } else if v > 0.2 { '▃' } else if v > 0.1 { '▂' } else { '▁' };
-                row.push(ch);
+        // Compact brain activation row if available (pull selected layer)
+        if let Some(layer) = self.snapshot.brain_activations_layer_indexed(self.activation_layer_index) {
+            if layer.width > 0 && layer.height > 0 {
+                let cols = layer.width;
+                let start_row = self.activation_row_offset.min(layer.height.saturating_sub(1));
+                let rows_to_show = 3.min(layer.height - start_row);
+                for r in 0..rows_to_show {
+                    let row_index = start_row + r;
+                    let start = row_index * cols;
+                    let end = start + cols;
+                    let slice = &layer.values[start..end.min(layer.values.len())];
+                    if self.palette.is_emoji() && area.width > 40 {
+                        let take = cols.min(16);
+                        let mut row = String::new();
+                        for v in slice.iter().take(take) {
+                            let v = (*v).clamp(0.0, 1.0);
+                            let ch = if v > 0.85 { '🔥' } else if v > 0.6 { '🌶' } else if v > 0.35 { '✨' } else if v > 0.15 { '·' } else { ' ' };
+                            row.push(ch);
+                        }
+                        lines.push(Line::from(vec![
+                            if r == 0 { Span::styled("Brain ", self.palette.header_style()) } else { Span::raw("      ") },
+                            Span::raw(row),
+                        ]));
+                    } else {
+                        let take = cols.min(32);
+                        let mut row = String::new();
+                        for v in slice.iter().take(take) {
+                            let v = (*v).clamp(0.0, 1.0);
+                            let ch = if v > 0.8 { '█' } else if v > 0.6 { '▆' } else if v > 0.4 { '▅' } else if v > 0.2 { '▃' } else if v > 0.1 { '▂' } else { '▁' };
+                            row.push(ch);
+                        }
+                        lines.push(Line::from(vec![
+                            if r == 0 { Span::styled("Brain ", self.palette.header_style()) } else { Span::raw("      ") },
+                            Span::raw(row),
+                        ]));
+                    }
+                }
             }
-            lines.push(Line::from(vec![
-                Span::styled("Brain ", self.palette.header_style()),
-                Span::raw(row),
-            ]));
         }
 
         let paragraph = Paragraph::new(Text::from(lines)).block(
@@ -929,6 +955,9 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" n        Toggle narrow symbols (emoji-compatible alignment)"),
             Line::raw(" b        Toggle metrics baseline (set/clear)"),
             Line::raw(" x        Toggle expanded panels (auto-on on wide terminals)"),
+            Line::raw(" [ / ]    Cycle brain layers (console view)"),
+            Line::raw(" ↑ / ↓    Page brain heatmap rows (console view)"),
+            Line::raw(" ← / →    Change focused agent (console view)"),
             Line::raw(" ? / h    Toggle this help  (? is Shift+/ on most keyboards)"),
             Line::raw(""),
             Line::from(vec![Span::styled(
@@ -1091,6 +1120,26 @@ impl<'a> TerminalApp<'a> {
                     },
                 );
             }
+            (KeyCode::Char('['), _) => {
+                if self.activation_layer_index > 0 { self.activation_layer_index -= 1; }
+            }
+            (KeyCode::Char(']'), _) => {
+                self.activation_layer_index = self.activation_layer_index.saturating_add(1);
+            }
+            (KeyCode::Up, _) => {
+                self.activation_row_offset = self.activation_row_offset.saturating_sub(1);
+            }
+            (KeyCode::Down, _) => {
+                self.activation_row_offset = self.activation_row_offset.saturating_add(1);
+            }
+            (KeyCode::Left, _) => {
+                self.focused_agent_cursor = self.focused_agent_cursor.saturating_sub(1);
+                self.refresh_snapshot();
+            }
+            (KeyCode::Right, _) => {
+                self.focused_agent_cursor = self.focused_agent_cursor.saturating_add(1);
+                self.refresh_snapshot();
+            }
             _ => {}
         }
 
@@ -1140,7 +1189,19 @@ impl<'a> TerminalApp<'a> {
 
     fn refresh_snapshot(&mut self) {
         let new_snapshot = match self.world.lock() {
-            Ok(world) => Snapshot::from_world(&world),
+            Ok(world) => {
+                let mut snap = Snapshot::from_world(&world);
+                // Select focused agent activations if available
+                if snap.agent_count > 0 {
+                    let idx = self.focused_agent_cursor % snap.agent_count;
+                    if let Some(agent_id) = world.agents().iter_handles().nth(idx) {
+                        if let Some(rt) = world.runtime().get(agent_id) {
+                            snap.brain_activations = rt.brain_activations.as_ref().map(BrainLayerView::from_activations);
+                        }
+                    }
+                }
+                snap
+            }
             Err(_) => return,
         };
         self.ingest_events(&new_snapshot);
@@ -1878,11 +1939,7 @@ impl Snapshot {
             },
             control: config.control.clone(),
             spike_hits: summary.spike_hits,
-            brain_activations: world
-                .runtime()
-                .get(handles.first().copied().unwrap_or(AgentId::null()))
-                .and_then(|rt| rt.brain_activations.as_ref())
-                .map(|act| BrainLayerView::from_activations(act)),
+            brain_activations: None,
         }
     }
 
@@ -2561,6 +2618,7 @@ mod tests {
     }
 }
 
+#[derive(Clone, Debug)]
 struct BrainLayerView {
     width: usize,
     height: usize,

@@ -516,7 +516,7 @@ An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode 
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
 - Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
-Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save ASCII screenshot), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Mortality panel, Brains leaderboard, recent events log, and an emoji world mini-map. The layout is responsive and auto-expands panels on wider terminals; press `x` to toggle.
+Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save ASCII screenshot), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Mortality panel, Brains leaderboard, recent events log, and an emoji world mini-map. The layout is responsive and auto-expands panels on wider terminals; press `x` to toggle. Screenshots saved via `S` are written under `screenshots/frame_<tick>.txt`.
 
 ## Storage & analytics
 - DuckDB schema (`ticks`, `metrics`, `events`, `agents`) with buffered writes and maintenance (`optimize`, `VACUUM`).
