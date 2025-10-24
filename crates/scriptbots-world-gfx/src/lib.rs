@@ -2,6 +2,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Public snapshot format the renderer expects. Keep minimal; the app will adapt
@@ -38,6 +39,7 @@ pub struct WorldRenderer {
     readback: ReadbackRing,
     terrain: TerrainPipeline,
     agents: AgentPipeline,
+    view: ViewUniforms,
 }
 
 pub struct RenderFrame {
@@ -55,8 +57,9 @@ impl WorldRenderer {
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let (color, color_view) = create_color(&device, format, size);
         let readback = ReadbackRing::new(&device, size, format)?;
-        let terrain = TerrainPipeline::new(&device, format);
-        let agents = AgentPipeline::new(&device, format);
+        let view = ViewUniforms::new(&device, &queue, size);
+        let terrain = TerrainPipeline::new(&device, format, &view);
+        let agents = AgentPipeline::new(&device, format, &view);
 
         Ok(Self {
             device,
@@ -68,6 +71,7 @@ impl WorldRenderer {
             readback,
             terrain,
             agents,
+            view,
         })
     }
 
@@ -80,6 +84,7 @@ impl WorldRenderer {
         self.color_view = view;
         self.size = new_size;
         self.readback = ReadbackRing::new(&self.device, new_size, self.format)?;
+        self.view.update(&self.queue, new_size);
         Ok(())
     }
 
@@ -87,6 +92,8 @@ impl WorldRenderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.render") });
+        // Ensure view uniforms match current viewport
+        self.view.update(&self.queue, self.size);
         // Background clear
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -94,7 +101,7 @@ impl WorldRenderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.color_view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.06, b: 0.12, a: 1.0 }), store: true },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.06, b: 0.12, a: 1.0 }), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
@@ -102,8 +109,8 @@ impl WorldRenderer {
             });
         }
         // Terrain + agents
-        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, snapshot);
-        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, snapshot);
+        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot);
+        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot);
         self.queue.submit(Some(encoder.finish()));
         RenderFrame { color: self.color.clone(), extent: self.size }
     }
@@ -145,10 +152,16 @@ pub struct ReadbackSlot {
 }
 
 pub struct ReadbackView<'a> {
-    pub bytes: &'a [u8],
+    pub guard: wgpu::BufferView<'a>,
     pub bytes_per_row: u32,
     pub width: u32,
     pub height: u32,
+}
+
+impl<'a> ReadbackView<'a> {
+    pub fn bytes(&self) -> &[u8] {
+        &self.guard
+    }
 }
 
 impl ReadbackRing {
@@ -204,8 +217,8 @@ impl ReadbackRing {
         let slot = &mut self.slots[prev];
         if !slot.ready { return None; }
         let slice = slot.buf.slice(..);
-        let data = slice.get_mapped_range();
-        Some(ReadbackView { bytes: &data, bytes_per_row: self.bytes_per_row, width: self.extent.0, height: self.extent.1 })
+        let guard = slice.get_mapped_range();
+        Some(ReadbackView { guard, bytes_per_row: self.bytes_per_row, width: self.extent.0, height: self.extent.1 })
     }
 }
 
@@ -282,7 +295,7 @@ struct TileInstance {
 }
 
 impl TerrainPipeline {
-    fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat, view: &ViewUniforms) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("terrain.sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -327,12 +340,12 @@ impl TerrainPipeline {
             label: Some("terrain.wgsl"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(TERRAIN_WGSL)),
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("terrain.layout"), bind_group_layouts: &[&bg_layout], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("terrain.layout"), bind_group_layouts: &[&bg_layout, &view.layout], push_constant_ranges: &[] });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4] }] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4] }] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, strip_index_format: None, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
@@ -343,7 +356,7 @@ impl TerrainPipeline {
         Self { pipeline, sampler, atlas, atlas_view, bg_layout, bg, tile_vbuf, tile_count: 0 }
     }
 
-    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, snapshot: &WorldSnapshot) {
+    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot) {
         // Build tile instances for visible terrain (simple full mesh for now). In a follow‑up commit, add culling.
         let (tw, th) = snapshot.terrain.dims;
         let cell = snapshot.terrain.cell_size as f32;
@@ -360,13 +373,14 @@ impl TerrainPipeline {
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("terrain.pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: true } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bg, &[]);
+        pass.set_bind_group(1, &view_uniforms.bg, &[]);
         pass.set_vertex_buffer(0, self.tile_vbuf.slice(..));
         pass.draw(0..4, 0..staging.len() as u32);
     }
@@ -384,15 +398,17 @@ struct VsOut {
   @location(0) uv: vec2<f32>,
 };
 
+struct View { viewport: vec2<f32>, _pad: vec2<f32> };
+@group(1) @binding(0) var<uniform> view: View;
+
 @vertex
 fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
   var o: VsOut;
   var quad = array<vec2<f32>, 4>(vec2<f32>(0.0,0.0), vec2<f32>(1.0,0.0), vec2<f32>(0.0,1.0), vec2<f32>(1.0,1.0));
   let p = quad[vid];
   let xy = inst.pos + p * inst.size;
-  // Viewport-space (pixel) to NDC conversion (assumes a postprocess that maps pixel to NDC; simplify for now with framebuffer-sized world)
-  // For now assume origin at top-left and framebuffer matched to world pixels; GPUI will scale.
-  o.pos = vec4<f32>(xy, 0.0, 1.0);
+  let ndc = vec2<f32>(xy.x / view.viewport.x * 2.0 - 1.0, 1.0 - (xy.y / view.viewport.y * 2.0));
+  o.pos = vec4<f32>(ndc, 0.0, 1.0);
   o.uv = mix(inst.uv.xy, inst.uv.zw, p);
   return o;
 }
@@ -423,14 +439,14 @@ struct AgentInstanceGpu {
 }
 
 impl AgentPipeline {
-    fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat, view: &ViewUniforms) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("agents.wgsl"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(AGENTS_WGSL)) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("agents.layout"), bind_group_layouts: &[], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("agents.layout"), bind_group_layouts: &[&view.layout], push_constant_ranges: &[] });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("agents.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4] }] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4] }] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
@@ -440,7 +456,7 @@ impl AgentPipeline {
         Self { pipeline, vbuf }
     }
 
-    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, snapshot: &WorldSnapshot) {
+    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot) {
         let mut staging: Vec<AgentInstanceGpu> = Vec::with_capacity(snapshot.agents.len());
         for a in snapshot.agents {
             staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color });
@@ -450,12 +466,13 @@ impl AgentPipeline {
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("agents.pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: true } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &view_uniforms.bg, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.draw(0..4, 0..staging.len() as u32);
     }

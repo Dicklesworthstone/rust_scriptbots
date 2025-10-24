@@ -647,6 +647,7 @@ Implementation notes [2025-10-23]:
 
 ### [Currently In Progress] Execution Log
 - 2025-10-24: Created new crate `scriptbots-world-gfx` (workspace member) with initial `WorldRenderer` skeleton, RGBA8 sRGB color target, and triple‑buffered readback ring API (non‑blocking poll). This establishes the offscreen render + readback contract for GPUI composition. Next: wire minimal terrain/agent pipelines and the GPUI compositor stub.
+- 2025-10-24: Implemented two instanced pipelines (terrain + agents). Terrain uses a texture‑atlas, linear sampling, and alpha blending; agents render as SDF circles with rim highlights for premium visuals. Added viewport uniform (bind groups) and correct NDC mapping, plus per‑frame updates and resize propagation. Next: biome-aware atlas UVs, water shimmer/slope accents, CPU frustum culling, and GPUI compositor upload path.
 
 ### Maintenance & Risk Notes
 - No GPUI fork. Unmodified upstream stays in `Cargo.toml`.
