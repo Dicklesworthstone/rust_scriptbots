@@ -5,17 +5,39 @@ use scriptbots_core::ScriptBotsConfig;
 
 fn bench_world_steps(c: &mut Criterion) {
     let mut group = c.benchmark_group("world_step");
-    // Increase iteration time for more stable results and allow fewer samples
-    group.sample_size(30);
-    group.warm_up_time(Duration::from_secs(2));
-    group.measurement_time(Duration::from_secs(10));
+    // Increase iteration time for more stable results and allow env overrides
+    let samples: usize = std::env::var("SB_BENCH_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(30);
+    let warm: u64 = std::env::var("SB_BENCH_WARMUP_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(2);
+    let measure: u64 = std::env::var("SB_BENCH_MEASURE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+    group.sample_size(samples);
+    group.warm_up_time(Duration::from_secs(warm));
+    group.measurement_time(Duration::from_secs(measure));
     // Steps per bench iteration (can override via SB_BENCH_STEPS)
     let steps: usize = std::env::var("SB_BENCH_STEPS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(64);
-    for &agents in &[2000_usize, 5000, 10000] {
+    let agents_list: Vec<usize> = std::env::var("SB_BENCH_AGENTS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![2000_usize, 5000, 10000]);
+    for &agents in &agents_list {
         group.bench_function(format!("steps{}_agents{}_ticks", steps, agents), |b| {
             b.iter_batched(
                 || {

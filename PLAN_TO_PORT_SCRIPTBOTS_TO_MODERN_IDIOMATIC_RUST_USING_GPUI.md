@@ -474,6 +474,104 @@ Implementation notes [2025-10-23]:
 
 ---
 
+## World Renderer Evolution — Offscreen wgpu Readback Composited in GPUI (Chosen Path)
+
+### Rationale
+- The GPUI canvas path is excellent for HUD/UI, vector shapes, and small custom drawings, but our world view requires high-throughput 2D rendering of thousands of agents and tiles every frame with post‑FX. A dedicated GPU pipeline using wgpu gives us instancing, batching, and predictable performance.
+- We deliberately avoid forking GPUI. Instead, we render the world into an offscreen wgpu texture and composite it inside GPUI using a per‑frame updated image. This works with unmodified upstream GPUI on all platforms we target.
+- The bandwidth cost of GPU→CPU→GPU at 1080p/1440p, 60–120 Hz, is well within modern hardware headroom. We will engineer the pipeline to minimize latency and CPU cost via triple‑buffered staging and persistent allocations.
+
+### Goals
+- Smooth 60–120 FPS world rendering at 1080p/1440p with 10k+ agents under typical settings.
+- Deterministic visuals (no racey CPU/GPU feedback loops). GPUI retains input, overlays, inspector panels, and charts.
+- Clean, testable crate boundaries: world renderer is a small, well‑documented wgpu crate with no GPUI dependency; GPUI owns composition only.
+
+### Architecture Overview
+1) New crate: `crates/scriptbots-world-gfx`
+   - Public API (stable):
+     - `WorldRenderer::new(device, queue, size, options) -> Self`
+     - `WorldRenderer::resize(&mut self, new_size)`
+     - `WorldRenderer::render(&mut self, snapshot: &WorldSnapshot) -> RenderFrame`
+     - `RenderFrame { color: wgpu::Texture, extent: (u32, u32) }`
+     - `WorldRenderer::readback_rgba8(&mut self, &RenderFrame) -> &[u8]` (triple‑buffered; returns pointer to a persistently mapped staging region valid until next rotation)
+   - Internals:
+     - Terrain pipeline: instanced quads using a tileset atlas; per‑cell variation (moisture/elevation) via SSBO or texture; one draw per layer.
+     - Agents pipeline: instanced quads with per‑instance buffer (position, size, color, spike, flags); one draw per species/material.
+     - Selection rings/highlights: either a second instanced pipeline or SDF in the main shader.
+     - Culling: CPU frustum culling on agent instances; optional compute‑binning path later.
+     - Post‑FX: color grade/vignette/bloom implemented in a lightweight full‑screen pass.
+
+2) Readback/Upload Strategy (polished, low‑latency)
+   - Render target: RGBA8UnormSrgb.
+   - CopyTextureToBuffer into a row‑padded staging buffer (wgpu requires 256‑byte alignment for `bytes_per_row`). We compute stride = align(width * 4, 256).
+   - Triple‑buffered staging:
+     - Allocate 3 persistent `wgpu::Buffer`s in MAP_READ | COPY_DST usage; rotate each frame.
+     - Issue copy → `buffer.slice(..).map_async(Read)` without awaiting; poll via a lightweight fence API and read only when `IsReady`. The previous frame’s buffer is typically ready by the time we need to upload to GPUI, avoiding stalls.
+   - GPUI image persistence:
+     - Maintain persistent GPUI image objects/buffers sized to the current viewport; reuse them every frame (no reallocations).
+     - CPU‑side memcpy from mapped staging into GPUI’s image backing memory; then invalidate/mark dirty for GPUI to present.
+   - Ring‑buffer the uploads: when a frame’s staging map isn’t ready, skip re‑upload and reuse the last image (prevents blocking the UI thread).
+
+3) Color/format discipline
+   - Always RGBA8 sRGB for the render target and GPUI image. No per‑pixel swizzles or conversions. No tonemapping on CPU.
+
+4) Resize & scale
+   - Renderer tracks `world_view_size` separately from the window; when GPUI’s layout changes, call `resize` to recreate the color target and the three staging buffers with correctly aligned rows.
+   - Snapshots include world size; camera maps world→view consistently; culling uses updated frustum.
+
+5) Integration in `scriptbots-render`
+   - Add a small compositor struct:
+     - Owns `WorldRenderer` and a triple of `StagingSlot { mapped_ptr, bytes_per_row, fence }` plus a persistent `GpuImage` wrapper for GPUI.
+     - Each UI frame:
+       1. Acquire latest `WorldSnapshot` (read‑only snapshot already exists).
+       2. Call `render(snapshot)` to produce a wgpu texture.
+       3. Enqueue `copy_to_staging` into the current ring slot; request map; poll the previous slot; if ready, memcpy into GPUI image.
+       4. Present the GPUI image inside the existing world viewport node.
+   - No changes to input handling, inspector, or HUD—only the world drawing path changes.
+
+6) Performance techniques
+   - Instanced draws with tightly packed per‑instance buffers; avoid per‑agent draw calls.
+   - Persistent bind groups/pipelines; update only dynamic buffers.
+   - Avoid transient allocations each frame (reserve vecs; reuse `Vec::clear`).
+   - CPU frustum culling reduces instance count when zoomed in.
+   - Optional compute pass for large worlds to bin agents into screen tiles for more aggressive culling (backlog).
+
+7) Scheduling & latency
+   - UI thread never blocks on GPU readback. We always upload last‑ready frame.
+   - Typical added latency: ~1 frame at 60–120 FPS. Acceptable for the simulation; HUD remains interactive.
+
+8) 4K/High‑refresh guidance
+   - 4K@60 (~33.2 MB/frame) is fine on PCIe 4.0 and Apple Silicon unified memory. 4K@120 approaches ~8 GB/s round‑trip; still feasible on high‑end systems but we’ll expose a toggle to halve the world buffer rate or resolution when needed.
+   - If we outgrow readback at ultra‑high refresh rates, we can add a zero‑copy external‑texture path later (requires GPUI API support).
+
+### Deliverables
+- New crate `scriptbots-world-gfx` with:
+  - Instanced terrain/agents pipelines and post‑FX.
+  - Triple‑buffered readback manager.
+  - Safe, documented API and unit tests for alignment/stride math.
+- `scriptbots-render` integration behind a feature flag (`world_wgpu`).
+- Fallback path: keep the current GPUI canvas renderer behind a toggle for regression comparison.
+
+### Testing & Benchmarks
+- Determinism: snapshots driven by seeded `WorldSnapshot` → capture images and hash; compare across platforms.
+- Throughput microbench: measure `render+readback` time at 1080p/1440p with 1k/5k/10k agents.
+- Resize thrash: random resize patterns; assert no realloc leaks; staging ring rotates cleanly.
+- CI: headless `wgpu` test that renders synthetic scenes, validates map readiness cadence, and bounds alignment math.
+
+### Implementation Steps
+1) Create `scriptbots-world-gfx` crate; add `wgpu`, `wgpu-types`, `bytemuck`, `glam`, `glyphon` (optional for labels), feature‑gate compute binning.
+2) Build pipelines (terrain, agents, post‑FX); validate with a synthetic snapshot generator.
+3) Implement readback ring (3 slots): allocate persistent MAP_READ buffers with aligned `bytes_per_row`.
+4) Integrate in `scriptbots-render`: add compositor node that owns the renderer and GPUI image; replace world canvas draw with image presentation.
+5) Bench/optimize; document knobs: render size, max FPS, culling on/off.
+6) Keep canvas renderer as a fallback toggle (`--renderer=canvas|wgpu`).
+
+### Maintenance & Risk Notes
+- No GPUI fork. Unmodified upstream stays in `Cargo.toml`.
+- The renderer crate is self‑contained; future upgrades (e.g., zero‑copy textures) won’t impact core/hud code.
+- Platform backends come from wgpu; we test Metal (macOS) and Vulkan (Linux/Windows) in CI where available.
+
+
 ## Sandbox Map Creator (Wave Function Collapse) — Comprehensive Roadmap [Currently In Progress - GPT-5 Codex 2025-10-23]
 
 ### Purpose & Outcomes

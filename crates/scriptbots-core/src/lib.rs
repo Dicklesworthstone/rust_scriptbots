@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::OnceLock;
 use thiserror::Error;
 #[cfg(feature = "simd_wide")]
-use wide::{f32x4, CmpLt};
+use wide::f32x4;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainActivations {
     pub layers: Vec<ActivationLayer>,
@@ -4608,7 +4608,6 @@ impl WorldState {
                         ];
                         let diff_v = f32x4::new(diff);
                         let fov_v = f32x4::new(fov);
-                        let mask = diff_v.cmp_lt(fov_v);
                         let mut fov_factor = (fov_v - diff_v) / fov_v;
                         fov_factor = fov_factor.max(f32x4::splat(0.0));
                         let scalar = traits.eye * dist_factor * (dist / radius);
@@ -4619,11 +4618,10 @@ impl WorldState {
                         let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
                         let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
                         let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                        let add_v = mask.blend(intensity_v, f32x4::splat(0.0));
-                        dens = dens + add_v;
-                        r = r + add_v * f32x4::splat(color[0]);
-                        g = g + add_v * f32x4::splat(color[1]);
-                        b = b + add_v * f32x4::splat(color[2]);
+                        dens = dens + intensity_v;
+                        r = r + intensity_v * f32x4::splat(color[0]);
+                        g = g + intensity_v * f32x4::splat(color[1]);
+                        b = b + intensity_v * f32x4::splat(color[2]);
                         let out_d = dens.to_array();
                         let out_r = r.to_array();
                         let out_g = g.to_array();

@@ -1,0 +1,22 @@
+[package]
+name = "scriptbots-world-gfx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "High-performance wgpu-based world renderer for ScriptBots with offscreen readback for GPUI composition."
+
+[lib]
+name = "scriptbots_world_gfx"
+path = "src/lib.rs"
+
+[dependencies]
+wgpu = { version = "0.20" }
+bytemuck = { version = "1.16", features = ["derive"] }
+glam = { version = "0.27", default-features = false, features = ["std"] }
+tracing = { version = "0.1" }
+
+[features]
+default = []
+compute_binning = []
+
+
