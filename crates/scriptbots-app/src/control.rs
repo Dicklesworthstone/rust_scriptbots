@@ -1,4 +1,5 @@
 use std::sync::{MutexGuard, PoisonError};
+use std::cmp::Reverse;
 
 use crossfire::TrySendError;
 use serde::{Deserialize, Serialize};
@@ -84,7 +85,7 @@ impl HydrologySnapshot {
                     HydrologyFlowDirection::West => "W",
                     HydrologyFlowDirection::None => "-",
                 }
-                .to_string()
+                .to_owned()
             })
             .collect();
 
@@ -185,6 +186,10 @@ impl ControlHandle {
     pub fn snapshot_png(&self, width: u32, height: u32) -> Result<Vec<u8>, ControlError> {
         #[cfg(feature = "gui")]
         {
+            const MAX_PIXELS: u64 = 64 * 1024 * 1024; // 64M px guardrail
+            if (width as u64) * (height as u64) > MAX_PIXELS {
+                return Err(ControlError::InvalidPatch("requested image too large".into()));
+            }
             let world = self.lock_world()?;
             let bytes = render_png_offscreen(&world, width, height);
             Ok(bytes)
@@ -235,6 +240,7 @@ impl ControlHandle {
     }
 
     /// Enqueue a selection update command.
+    #[must_use]
     pub fn update_selection(&self, update: SelectionUpdate) -> Result<(), ControlError> {
         self.enqueue(ControlCommand::UpdateSelection(update))
     }
@@ -248,10 +254,11 @@ impl ControlHandle {
     /// Flatten the configuration into individual knob descriptors for discovery.
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
         let world = self.lock_world()?;
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(256);
         let config_value =
             serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
-        flatten_value("", &config_value, &mut entries);
+        let mut prefix = String::new();
+        flatten_value(&mut prefix, &config_value, &mut entries);
         Ok(entries)
     }
 
@@ -265,7 +272,10 @@ impl ControlHandle {
     /// Events include births, deaths, and combat spike hits.
     pub fn events_tail(&self, limit: usize) -> Result<Vec<EventEntry>, ControlError> {
         let world = self.lock_world()?;
-        let mut events = Vec::new();
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::with_capacity(limit);
         for summary in world.history().rev() {
             if summary.births > 0 {
                 events.push(EventEntry::new(
@@ -273,6 +283,7 @@ impl ControlHandle {
                     EventKind::Birth,
                     summary.births,
                 ));
+                if events.len() >= limit { break; }
             }
             if summary.deaths > 0 {
                 events.push(EventEntry::new(
@@ -280,6 +291,7 @@ impl ControlHandle {
                     EventKind::Death,
                     summary.deaths,
                 ));
+                if events.len() >= limit { break; }
             }
             if summary.spike_hits > 0 {
                 events.push(EventEntry::new(
@@ -287,9 +299,7 @@ impl ControlHandle {
                     EventKind::Combat,
                     summary.spike_hits as usize,
                 ));
-            }
-            if events.len() >= limit {
-                break;
+                if events.len() >= limit { break; }
             }
         }
         Ok(events)
@@ -303,8 +313,8 @@ impl ControlHandle {
         let columns = world.agents().columns();
         let runtimes = world.runtime();
 
-        let mut carnivores = Vec::new();
-        let mut oldest = Vec::new();
+        let mut carnivores = Vec::with_capacity(handles.len() / 2 + 1);
+        let mut oldest = Vec::with_capacity(handles.len());
 
         for (idx, id) in handles.iter().enumerate() {
             let runtime = runtimes.get(*id);
@@ -331,20 +341,21 @@ impl ControlHandle {
             oldest.push(entry);
         }
 
-        carnivores.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    b.health
-                        .partial_cmp(&a.health)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        });
-        oldest.sort_by(|a, b| b.age.cmp(&a.age));
+        drop(world); // release lock before sorting
 
-        carnivores.truncate(limit);
-        oldest.truncate(limit);
+        if limit == 0 {
+            return Ok(Scoreboard { top_predators: Vec::new(), oldest: Vec::new() });
+        }
+
+        partial_top_k(&mut carnivores, limit, cmp_score);
+        if oldest.len() > limit {
+            let nth = limit - 1;
+            oldest.select_nth_unstable_by_key(nth, |e| Reverse(e.age));
+            oldest.truncate(limit);
+            oldest.sort_unstable_by_key(|e| Reverse(e.age));
+        } else {
+            oldest.sort_unstable_by_key(|e| Reverse(e.age));
+        }
 
         Ok(Scoreboard {
             top_predators: carnivores,
@@ -353,6 +364,7 @@ impl ControlHandle {
     }
 
     /// Apply a structured JSON patch object onto the configuration.
+    #[must_use]
     pub fn apply_patch(&self, patch: Value) -> Result<ConfigSnapshot, ControlError> {
         if !patch.is_object() {
             return Err(ControlError::InvalidPatch(
@@ -364,9 +376,12 @@ impl ControlHandle {
         let current_tick = world.tick();
         let mut config_value =
             serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
-        merge_value(&mut config_value, &patch, &mut Vec::new())?;
-        let new_config: ScriptBotsConfig =
-            serde_json::from_value(config_value).map_err(ControlError::serialization)?;
+        let mut path = Vec::<&str>::new();
+        merge_value(&mut config_value, &patch, &mut path)?;
+        let json_str = serde_json::to_string(&config_value).map_err(ControlError::serialization)?;
+        let mut de = serde_json::Deserializer::from_str(&json_str);
+        let new_config: ScriptBotsConfig = serde_path_to_error::deserialize::<_, ScriptBotsConfig>(&mut de)
+            .map_err(|e: serde_path_to_error::Error<serde_json::Error>| ControlError::InvalidPatch(format!("{} at {}", e, e.path())))?;
         let (food_w, food_h) = new_config
             .food_dimensions()
             .map_err(|err| ControlError::InvalidPatch(err.to_string()))?;
@@ -384,6 +399,7 @@ impl ControlHandle {
     }
 
     /// Apply a list of knob updates by path.
+    #[must_use]
     pub fn apply_updates(&self, updates: &[KnobUpdate]) -> Result<ConfigSnapshot, ControlError> {
         let mut patch_map = Map::new();
         for update in updates {
@@ -402,46 +418,77 @@ impl ControlHandle {
 }
 
 fn insert_path(map: &mut Map<String, Value>, path: &str, value: Value) -> Result<(), ControlError> {
-    let mut segments = path.split('.').filter(|segment| !segment.is_empty());
-    let Some(first) = segments.next() else {
+    let mut segs = path.split('.').filter(|s| !s.is_empty());
+    let Some(mut seg) = segs.next() else {
         return Err(ControlError::InvalidPatch("empty knob path".into()));
     };
+    let mut cur = map;
 
-    let mut current = map;
-    let mut segment = first.to_string();
+    for next in segs {
+        // Scope the first mutable borrow so we can safely mutate the map again below
+        let found_obj: Option<*mut Map<String, Value>> = if let Some(val) = cur.get_mut(seg) {
+            let obj: &mut Map<String, Value> = val.as_object_mut().ok_or_else(|| {
+                ControlError::InvalidPatch(format!(
+                    "intermediate segment '{seg}' is not an object"
+                ))
+            })?;
+            Some(obj as *mut _)
+        } else {
+            None
+        };
 
-    for next in segments {
-        let entry = current
-            .entry(segment.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-        current = entry.as_object_mut().ok_or_else(|| {
-            ControlError::InvalidPatch(format!("intermediate segment '{segment}' is not an object"))
-        })?;
-        segment = next.to_string();
+        if let Some(ptr) = found_obj {
+            // SAFETY: pointer derived from &mut within this iteration and not used elsewhere
+            cur = unsafe { &mut *ptr };
+        } else {
+            let entry = cur.entry(seg.to_owned()).or_insert_with(|| Value::Object(Map::new()));
+            cur = entry.as_object_mut().ok_or_else(|| {
+                ControlError::InvalidPatch(format!(
+                    "intermediate segment '{seg}' is not an object"
+                ))
+            })?;
+        }
+        seg = next;
     }
-
-    current.insert(segment, value);
+    cur.insert(seg.to_owned(), value);
     Ok(())
 }
 
-fn merge_value(
+fn path_display(path: &[&str]) -> String {
+    path.join(".")
+}
+
+fn set_f64(target: &mut Value, v: f64, path: &[&str]) -> Result<(), ControlError> {
+    if !v.is_finite() {
+        return Err(ControlError::InvalidPatch(format!(
+            "non-finite float at {}",
+            path_display(path)
+        )));
+    }
+    *target = Value::Number(
+        serde_json::Number::from_f64(v).expect("checked finite above"),
+    );
+    Ok(())
+}
+
+fn merge_value<'a>(
     target: &mut Value,
-    patch: &Value,
-    path: &mut Vec<String>,
+    patch: &'a Value,
+    path: &mut Vec<&'a str>,
 ) -> Result<(), ControlError> {
     match target {
         Value::Object(target_map) => {
             let Value::Object(patch_map) = patch else {
                 return Err(ControlError::InvalidPatch(format!(
                     "type mismatch at {}",
-                    path.join("."),
+                    path_display(path),
                 )));
             };
 
             for (key, patch_value) in patch_map {
-                path.push(key.clone());
+                path.push(key);
                 let Some(target_value) = target_map.get_mut(key) else {
-                    return Err(ControlError::UnknownPath(path.join(".")));
+                    return Err(ControlError::UnknownPath(path_display(path)));
                 };
                 merge_value(target_value, patch_value, path)?;
                 path.pop();
@@ -455,37 +502,32 @@ fn merge_value(
             } else {
                 Err(ControlError::InvalidPatch(format!(
                     "type mismatch at {}",
-                    path.join("."),
+                    path_display(path),
                 )))
             }
         }
         Value::Number(_) => match patch {
-            Value::Number(_) => {
-                *target = patch.clone();
+            Value::Number(n) => {
+                *target = Value::Number(n.clone());
                 Ok(())
             }
-            Value::String(_) => {
-                let Some(text) = patch.as_str() else {
-                    return Err(ControlError::InvalidPatch(path.join(".")));
-                };
+            Value::String(s) => {
+                let s = s.trim();
                 if target.as_i64().is_some() {
-                    let parsed: i64 = text
-                        .trim()
+                    let v: i64 = s
                         .parse()
-                        .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
-                    *target = Value::from(parsed);
+                        .map_err(|_| ControlError::InvalidPatch(path_display(path)))?;
+                    *target = Value::from(v);
                 } else if target.as_u64().is_some() {
-                    let parsed: u64 = text
-                        .trim()
+                    let v: u64 = s
                         .parse()
-                        .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
-                    *target = Value::from(parsed);
+                        .map_err(|_| ControlError::InvalidPatch(path_display(path)))?;
+                    *target = Value::from(v);
                 } else {
-                    let parsed: f64 = text
-                        .trim()
+                    let v: f64 = s
                         .parse()
-                        .map_err(|_| ControlError::InvalidPatch(path.join(".")))?;
-                    *target = Value::from(parsed);
+                        .map_err(|_| ControlError::InvalidPatch(path_display(path)))?;
+                    set_f64(target, v, path)?;
                 }
                 Ok(())
             }
@@ -495,7 +537,7 @@ fn merge_value(
             }
             _ => Err(ControlError::InvalidPatch(format!(
                 "type mismatch at {}",
-                path.join("."),
+                path_display(path),
             ))),
         },
         Value::String(_) => match patch {
@@ -505,7 +547,7 @@ fn merge_value(
             }
             _ => Err(ControlError::InvalidPatch(format!(
                 "type mismatch at {}",
-                path.join("."),
+                path_display(path),
             ))),
         },
         Value::Bool(_) => match patch {
@@ -515,13 +557,13 @@ fn merge_value(
             }
             Value::String(_) => {
                 let parsed = match patch.as_str().map(|s| s.trim().to_ascii_lowercase()) {
-                    Some(s) if matches!(s.as_str(), "true" | "1" | "yes" | "on") => true,
-                    Some(s) if matches!(s.as_str(), "false" | "0" | "no" | "off") => false,
+                    Some(s) if matches!(s.as_str(), "true" | "1" | "yes" | "on" | "t" | "y") => true,
+                    Some(s) if matches!(s.as_str(), "false" | "0" | "no" | "off" | "f" | "n") => false,
                     _ => {
                         return Err(ControlError::InvalidPatch(format!(
                             "cannot coerce '{:?}' to bool for {}",
                             patch,
-                            path.join("."),
+                            path_display(path),
                         )));
                     }
                 };
@@ -530,7 +572,7 @@ fn merge_value(
             }
             _ => Err(ControlError::InvalidPatch(format!(
                 "type mismatch at {}",
-                path.join("."),
+                path_display(path),
             ))),
         },
         Value::Null => {
@@ -636,6 +678,16 @@ impl From<SelectionModeDto> for SelectionMode {
     }
 }
 
+impl From<SelectionMode> for SelectionModeDto {
+    fn from(value: SelectionMode) -> Self {
+        match value {
+            SelectionMode::Replace => SelectionModeDto::Replace,
+            SelectionMode::Add => SelectionModeDto::Add,
+            SelectionMode::Clear => SelectionModeDto::Clear,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentScoreEntry {
     pub agent_id: u64,
@@ -652,20 +704,37 @@ pub struct Scoreboard {
     pub oldest: Vec<AgentScoreEntry>,
 }
 
-fn flatten_value(prefix: &str, value: &Value, entries: &mut Vec<KnobEntry>) {
+fn cmp_score(a: &AgentScoreEntry, b: &AgentScoreEntry) -> std::cmp::Ordering {
+    b.energy
+        .total_cmp(&a.energy)
+        .then_with(|| b.health.total_cmp(&a.health))
+        .then_with(|| b.age.cmp(&a.age))
+}
+
+fn partial_top_k<T, F: Fn(&T, &T) -> std::cmp::Ordering>(v: &mut Vec<T>, k: usize, cmp: F) {
+    if v.len() <= k {
+        v.sort_by(cmp);
+        return;
+    }
+    let nth = k.saturating_sub(1);
+    v.select_nth_unstable_by(nth, &cmp);
+    v.truncate(k);
+    v.sort_by(cmp);
+}
+
+fn flatten_value(prefix: &mut String, value: &Value, entries: &mut Vec<KnobEntry>) {
     match value {
         Value::Object(map) => {
-            for (key, child) in map {
-                let new_prefix = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                flatten_value(&new_prefix, child, entries);
+            let base = prefix.len();
+            for (k, v) in map {
+                if base != 0 { prefix.push('.'); }
+                prefix.push_str(k);
+                flatten_value(prefix, v, entries);
+                prefix.truncate(base);
             }
         }
         _ => entries.push(KnobEntry {
-            path: prefix.to_string(),
+            path: prefix.clone(),
             kind: knob_kind(value),
             value: value.clone(),
             description: None,

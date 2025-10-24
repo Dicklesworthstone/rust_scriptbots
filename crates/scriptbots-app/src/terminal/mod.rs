@@ -18,10 +18,11 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Widget},
 };
 use scriptbots_core::{
     AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
@@ -119,21 +120,22 @@ fn run_event_loop(
 
         if now.duration_since(app.last_draw) >= app.draw_interval {
             terminal.draw(|frame| app.draw(frame))?;
-            app.last_draw = now;
+            app.last_draw = Instant::now();
         }
 
-        let timeout = renderer
-            .draw_interval
-            .saturating_sub(now.duration_since(app.last_event_check));
-        let event_ready = event::poll(timeout).unwrap_or(false);
-        if event_ready
-            && let Event::Key(key) = event::read()?
-            && app.handle_key(key)?
-        {
-            break;
-        }
-        if event_ready {
-            app.last_event_check = Instant::now();
+        let next_draw_due = app.last_draw + app.draw_interval;
+        let next_sim_due = app.last_tick + app.tick_interval;
+        let now = Instant::now();
+        let sleep_for = next_draw_due
+            .saturating_duration_since(now)
+            .min(next_sim_due.saturating_duration_since(now));
+
+        if event::poll(sleep_for)? {
+            if let Event::Key(key) = event::read()? {
+                if app.handle_key(key)? {
+                    break;
+                }
+            }
         }
     }
 
@@ -189,7 +191,6 @@ struct TerminalApp<'a> {
     sim_accumulator: f32,
     last_tick: Instant,
     last_draw: Instant,
-    last_event_check: Instant,
     palette: Palette,
     terrain: TerrainView,
     event_log: VecDeque<EventEntry>,
@@ -223,7 +224,6 @@ impl<'a> TerminalApp<'a> {
             sim_accumulator: 0.0,
             last_tick: Instant::now(),
             last_draw: Instant::now(),
-            last_event_check: Instant::now(),
             palette,
             terrain,
             event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
@@ -283,22 +283,21 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
-        self.refresh_snapshot();
-        let snapshot = self.snapshot.clone();
+        let snapshot = &self.snapshot;
 
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(0)])
             .split(frame.area());
 
-        self.draw_header(frame, outer[0], &snapshot);
+        self.draw_header(frame, outer[0], snapshot);
 
         let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
             .split(outer[1]);
 
-        self.draw_map(frame, body[0], &snapshot);
+        self.draw_map(frame, body[0], snapshot);
 
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
@@ -311,11 +310,11 @@ impl<'a> TerminalApp<'a> {
             ])
             .split(body[1]);
 
-        self.draw_stats(frame, sidebar[0], &snapshot);
-        self.draw_trends(frame, sidebar[1], &snapshot);
-        self.draw_leaderboard(frame, sidebar[2], &snapshot);
-        self.draw_oldest(frame, sidebar[3], &snapshot);
-        self.draw_events(frame, sidebar[4], &snapshot);
+        self.draw_stats(frame, sidebar[0], snapshot);
+        self.draw_trends(frame, sidebar[1], snapshot);
+        self.draw_leaderboard(frame, sidebar[2], snapshot);
+        self.draw_oldest(frame, sidebar[3], snapshot);
+        self.draw_events(frame, sidebar[4], snapshot);
 
         if self.help_visible {
             self.draw_help(frame);
@@ -550,61 +549,14 @@ impl<'a> TerminalApp<'a> {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 2 || inner.height < 2 {
-            return;
-        }
-
-        let width = inner.width as usize;
-        let height = inner.height as usize;
-        let mut grid = vec![CellGlyph::default(); width * height];
-        let mut occupancy = vec![CellOccupancy::default(); width * height];
-
-        for y in 0..height {
-            for x in 0..width {
-                let u = (x as f32 + 0.5) / width as f32;
-                let v = (y as f32 + 0.5) / height as f32;
-                let terrain = self.terrain.sample(u, v);
-                let food_level = snapshot.food.sample(u, v);
-                let (glyph, style) = self.palette.terrain_symbol(terrain, food_level);
-                grid[y * width + x] = CellGlyph { ch: glyph, style };
-            }
-        }
-
-        for agent in &snapshot.agents {
-            let x = (agent.position.0 * width as f32)
-                .floor()
-                .clamp(0.0, (width - 1) as f32) as usize;
-            let y = (agent.position.1 * height as f32)
-                .floor()
-                .clamp(0.0, (height - 1) as f32) as usize;
-            let idx = y * width + x;
-            let cell = &mut occupancy[idx];
-            cell.add(
-                agent.diet,
-                agent.boosted,
-                agent.energy,
-                agent.heading,
-                agent.spike_length,
-                agent.tendency,
-            );
-            let base = grid[idx].style;
-            let (glyph, style) = self.palette.agent_symbol(cell, base);
-            grid[idx].ch = glyph;
-            grid[idx].style = style;
-        }
-
-        let mut lines = Vec::with_capacity(height);
-        for y in 0..height {
-            let mut spans = Vec::with_capacity(width);
-            for x in 0..width {
-                let cell = &grid[y * width + x];
-                spans.push(Span::styled(cell.ch.to_string(), cell.style));
-            }
-            lines.push(Line::from(spans));
-        }
-
-        let paragraph = Paragraph::new(Text::from(lines));
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(
+            MapWidget {
+                snapshot,
+                terrain: &self.terrain,
+                palette: &self.palette,
+            },
+            inner,
+        );
     }
 
     fn draw_leaderboard(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
@@ -716,7 +668,11 @@ impl<'a> TerminalApp<'a> {
             Block::default()
                 .title(self.palette.title("Help"))
                 .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Black).fg(Color::White)),
+                .style(if self.palette.has_color() {
+                    Style::default().bg(Color::Black).fg(Color::White)
+                } else {
+                    Style::default()
+                }),
         );
         frame.render_widget(paragraph, area);
     }
@@ -822,9 +778,7 @@ impl<'a> TerminalApp<'a> {
     fn save_ascii_snapshot(&self) -> Result<()> {
         use std::io::Write;
         let dir = std::path::Path::new("screenshots");
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir)?;
-        }
+        std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("frame_{}.txt", self.snapshot.tick));
         let mut file = std::fs::File::create(path)?;
 
@@ -1156,20 +1110,7 @@ impl TerrainView {
     }
 }
 
-#[derive(Clone, Debug)]
-struct CellGlyph {
-    ch: char,
-    style: Style,
-}
-
-impl Default for CellGlyph {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            style: Style::default(),
-        }
-    }
-}
+// Removed grid-based glyph buffering in favor of a buffer-writing widget.
 
 #[derive(Clone, Copy)]
 struct CellOccupancy {
@@ -1292,8 +1233,7 @@ impl Snapshot {
         let world_width = config.world_width.max(1) as f32;
         let world_height = config.world_height.max(1) as f32;
 
-        let summaries: Vec<TickSummary> = world.history().cloned().collect();
-        let summary = summaries.last().cloned().unwrap_or_else(|| TickSummary {
+        let summary = world.history().rev().next().cloned().unwrap_or_else(|| TickSummary {
             tick: world.tick(),
             agent_count,
             births: 0,
@@ -1304,9 +1244,8 @@ impl Snapshot {
             max_age: 0,
             spike_hits: 0,
         });
-
-        let history = summaries
-            .iter()
+        let history: Vec<HistoryEntry> = world
+            .history()
             .rev()
             .take(32)
             .map(|entry| HistoryEntry {
@@ -1830,6 +1769,69 @@ impl Palette {
             5 => '↙',
             6 => '↓',
             _ => '↘',
+        }
+    }
+}
+
+struct MapWidget<'a> {
+    snapshot: &'a Snapshot,
+    terrain: &'a TerrainView,
+    palette: &'a Palette,
+}
+
+impl<'a> Widget for MapWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
+
+        let width = area.width as usize;
+        let height = area.height as usize;
+
+        // Terrain base layer written directly into the buffer
+        for y in 0..height {
+            for x in 0..width {
+                let u = (x as f32 + 0.5) / width as f32;
+                let v = (y as f32 + 0.5) / height as f32;
+                let terrain = self.terrain.sample(u, v);
+                let food = self.snapshot.food.sample(u, v);
+                let (glyph, style) = self.palette.terrain_symbol(terrain, food);
+                let cell = &mut buf[(area.x + x as u16, area.y + y as u16)];
+                cell.set_char(glyph);
+                cell.set_style(style);
+            }
+        }
+
+        // Occupancy overlay
+        let mut occupancy = vec![CellOccupancy::default(); width * height];
+        let w = width as f32;
+        let h = height as f32;
+        for agent in &self.snapshot.agents {
+            let x = (agent.position.0 * w).floor().clamp(0.0, w - 1.0) as usize;
+            let y = (agent.position.1 * h).floor().clamp(0.0, h - 1.0) as usize;
+            let idx = y * width + x;
+            occupancy[idx].add(
+                agent.diet,
+                agent.boosted,
+                agent.energy,
+                agent.heading,
+                agent.spike_length,
+                agent.tendency,
+            );
+        }
+
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * width + x;
+                if occupancy[idx].total() == 0 {
+                    continue;
+                }
+                let base_style = buf[(area.x + x as u16, area.y + y as u16)].style();
+                let (glyph, style) = self.palette.agent_symbol(&occupancy[idx], base_style);
+                let cell = &mut buf[(area.x + x as u16, area.y + y as u16)];
+                cell.set_char(glyph);
+                cell.set_style(style);
+            }
         }
     }
 }

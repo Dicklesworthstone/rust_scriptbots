@@ -75,6 +75,34 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Auto-tune: run a quick sweep for the chosen storage mode, apply best settings, then continue.
+    let mut thresholds = thresholds;
+    if let Some(ticks) = cli.auto_tune {
+        if let Some(best) = pick_best_for_storage(&config, ticks, cli.storage, cli.threads, cli.low_power)? {
+            // Apply threads if not explicitly set
+            if cli.threads.is_none() {
+                unsafe { std::env::set_var("SCRIPTBOTS_MAX_THREADS", best.threads.to_string()); }
+            }
+            // Apply thresholds if not provided via CLI
+            if cli.storage_thresholds.is_none() {
+                thresholds = ThresholdsOverride {
+                    tick: Some(best.tick),
+                    agent: Some(best.agent),
+                    event: Some(best.event),
+                    metric: Some(best.metric),
+                };
+            }
+            println!(
+                "{} Auto-tune selected: threads={} storage={} thresholds={},{},{},{} ({:.0} tps)",
+                "✔".green().bold(),
+                best.threads,
+                match cli.storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
+                best.tick, best.agent, best.event, best.metric,
+                best.tps
+            );
+        }
+    }
+
     // Configure low-power / thread budget before world creation so the Rayon pool is capped.
     if let Some(threads) = cli.threads {
         unsafe { std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string()); }
@@ -546,6 +574,9 @@ struct AppCli {
     /// Automated profiling sweep: runs multiple configurations for N ticks and summarizes.
     #[arg(long = "profile-sweep", value_name = "TICKS")]
     profile_sweep: Option<u64>,
+    /// Auto-tune: quick sweep to pick threads/thresholds for current storage, then continue.
+    #[arg(long = "auto-tune", value_name = "TICKS")]
+    auto_tune: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -1051,6 +1082,62 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
         println!("{} No successful sweep results", "✖".red().bold());
     }
     Ok(())
+}
+
+struct BestPick {
+    threads: usize,
+    tick: usize,
+    agent: usize,
+    event: usize,
+    metric: usize,
+    tps: f64,
+}
+
+fn pick_best_for_storage(
+    _config: &ScriptBotsConfig,
+    ticks: u64,
+    storage: StorageMode,
+    pinned_threads: Option<usize>,
+    low_power: bool,
+) -> Result<Option<BestPick>> {
+    let exe = std::env::current_exe().context("failed to get current exe path")?;
+
+    let thread_candidates: Vec<usize> = if let Some(t) = pinned_threads { vec![t] } else { vec![1, 2, 4, 8] };
+    let threshold_candidates: Vec<&str> = vec![
+        "64,2048,512,512",
+        "128,4096,1024,1024",
+        "256,4096,2048,1024",
+    ];
+    let mut best: Option<BestPick> = None;
+
+    for threads in thread_candidates {
+        for thresholds in &threshold_candidates {
+            let mut cmd = Command::new(&exe);
+            cmd.env("SCRIPTBOTS_DET_RUN", "0");
+            cmd.arg("--profile-storage-steps").arg(ticks.to_string());
+            cmd.arg("--storage").arg(match storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" });
+            cmd.arg("--storage-thresholds").arg(thresholds);
+            cmd.arg("--threads").arg(threads.to_string());
+            if low_power { cmd.arg("--low-power"); }
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            let out = cmd.output()?;
+            if !out.status.success() { continue; }
+            if let Some(tps) = parse_tps_from_stdout(&out.stdout) {
+                let parts: Vec<_> = thresholds.split(',').collect();
+                if parts.len() == 4 {
+                    if let (Ok(tk), Ok(ag), Ok(ev), Ok(me)) = (parts[0].parse(), parts[1].parse(), parts[2].parse(), parts[3].parse()) {
+                        let candidate = BestPick { threads, tick: tk, agent: ag, event: ev, metric: me, tps };
+                        match &best {
+                            Some(b) if b.tps >= candidate.tps => {}
+                            _ => { best = Some(candidate); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(best)
 }
 
 #[derive(Debug)]
