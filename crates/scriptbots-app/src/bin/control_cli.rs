@@ -188,6 +188,9 @@ fn export_command(
 
     let connection = Connection::open(&database)
         .with_context(|| format!("failed to open DuckDB database {}", database.display()))?;
+    // Align CLI exports with runtime settings
+    let _ = connection.execute(&format!("SET threads = {}", num_cpus::get()), []);
+    let _ = connection.execute("SET enable_progress_bar = false", []);
     let file = std::fs::File::create(&out)
         .with_context(|| format!("failed to create export file {}", out.display()))?;
     let mut writer = Writer::from_writer(file);

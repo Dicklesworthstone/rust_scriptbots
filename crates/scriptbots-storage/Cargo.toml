@@ -11,3 +11,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
 slotmap = { workspace = true }
+crossbeam-channel = "0.5"
+num_cpus = { workspace = true }

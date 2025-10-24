@@ -266,6 +266,7 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     child1.env("SCRIPTBOTS_DET_RUN", "1");
     child1.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
     child1.env("RAYON_NUM_THREADS", "1");
+    child1.env("RUST_LOG", "error");
     if let Ok(seed) = std::env::var("SCRIPTBOTS_DET_SEED") {
         child1.env("SCRIPTBOTS_RNG_SEED", seed);
     }
@@ -278,6 +279,7 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     childn.arg("--config-only");
     childn.env("SCRIPTBOTS_DET_RUN", "1");
     childn.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
+    childn.env("RUST_LOG", "error");
     childn.stdout(Stdio::piped());
     childn.stderr(Stdio::null());
     let handlen = childn.spawn().context("failed to spawn det child N")?;
@@ -876,14 +878,18 @@ struct ReplayCollector {
 }
 
 impl ReplayCollector {
-    fn new() -> (Self, Arc<Mutex<Vec<ReplayTickRecord>>>) {
-        let ticks = Arc::new(Mutex::new(Vec::new()));
+    fn with_capacity(capacity: usize) -> (Self, Arc<Mutex<Vec<ReplayTickRecord>>>) {
+        let ticks = Arc::new(Mutex::new(Vec::with_capacity(capacity)));
         (
             Self {
                 ticks: Arc::clone(&ticks),
             },
             ticks,
         )
+    }
+
+    fn new() -> (Self, Arc<Mutex<Vec<ReplayTickRecord>>>) {
+        Self::with_capacity(0)
     }
 }
 
@@ -911,7 +917,7 @@ struct ReplayRun {
 }
 
 fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result<ReplayRun> {
-    let (collector, handle) = ReplayCollector::new();
+    let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
     let brain_keys = install_brains(&mut world);
     seed_agents(&mut world, &brain_keys);
@@ -944,7 +950,7 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
 }
 
 fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
-    let (collector, _handle) = ReplayCollector::new();
+    let (collector, _handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
     let brain_keys = install_brains(&mut world);
     seed_agents(&mut world, &brain_keys);
@@ -1055,6 +1061,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
             for thresholds in threshold_list {
                 let mut cmd = Command::new(&exe);
                 cmd.env("SCRIPTBOTS_DET_RUN", "0");
+                cmd.env("RUST_LOG", "error");
                 cmd.arg("--profile-storage-steps").arg(ticks.to_string());
                 cmd.arg("--storage").arg(match storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" });
                 cmd.arg("--storage-thresholds").arg(thresholds);
@@ -1136,6 +1143,7 @@ fn pick_best_for_storage(
         for thresholds in &threshold_candidates {
             let mut cmd = Command::new(&exe);
             cmd.env("SCRIPTBOTS_DET_RUN", "0");
+            cmd.env("RUST_LOG", "error");
             cmd.arg("--profile-storage-steps").arg(ticks.to_string());
             cmd.arg("--storage").arg(match storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" });
             cmd.arg("--storage-thresholds").arg(thresholds);

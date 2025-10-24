@@ -1619,6 +1619,17 @@ struct Palette {
 }
 
 impl Palette {
+    fn heading_char_ascii(heading: f32) -> char {
+        let normalized = heading.rem_euclid(TAU);
+        let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
+        match sector { 0 => '>', 1 => '/', 2 => '^', 3 => '\\', 4 => '<', 5 => '/', 6 => 'v', _ => '\\' }
+    }
+
+    fn heading_char_pretty(heading: f32) -> char {
+        let normalized = heading.rem_euclid(TAU);
+        let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
+        match sector { 0 => '→', 1 => '↗', 2 => '↑', 3 => '↖', 4 => '←', 5 => '↙', 6 => '↓', _ => '↘' }
+    }
     fn detect() -> Self {
         let level = on_cached(Stream::Stdout);
         let emoji = {
@@ -1833,14 +1844,25 @@ impl Palette {
         let mut glyph = if self.emoji {
             match total {
                 0 => ' ',
-                1 => occupancy
+                1 => {
+                    let heading_fn = if self.is_emoji_narrow() {
+                        |ang: f32| -> char {
+                            let normalized = ang.rem_euclid(TAU);
+                            let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
+                            match sector { 0 => '>', 1 => '/', 2 => '^', 3 => '\\', 4 => '<', 5 => '/', 6 => 'v', _ => '\\' }
+                        }
+                    } else {
+                        move |ang: f32| -> char { Self::heading_char_pretty(ang) }
+                    };
+                    occupancy
                     .mean_heading()
-                    .map(Self::heading_char)
+                    .map(heading_fn)
                     .unwrap_or_else(|| match class {
                         DietClass::Herbivore => if self.is_emoji_narrow() { 'h' } else { '🐇' },
                         DietClass::Omnivore => if self.is_emoji_narrow() { 'o' } else { '🦝' },
                         DietClass::Carnivore => if self.is_emoji_narrow() { 'c' } else { '🦊' },
-                    }),
+                    })
+                },
                 2..=3 => match class {
                     DietClass::Herbivore => if self.is_emoji_narrow() { 'H' } else { '🐑' },
                     DietClass::Omnivore => if self.is_emoji_narrow() { 'O' } else { '🐻' },
@@ -1853,7 +1875,7 @@ impl Palette {
                 0 => ' ',
                 1 => occupancy
                     .mean_heading()
-                    .map(Self::heading_char)
+                    .map(Self::heading_char_pretty)
                     .unwrap_or_else(|| match class {
                         DietClass::Herbivore => 'h',
                         DietClass::Omnivore => 'o',
@@ -1892,34 +1914,7 @@ impl Palette {
         (glyph, style)
     }
 
-    fn heading_char(heading: f32) -> char {
-        let normalized = heading.rem_euclid(TAU);
-        let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
-        // Use narrow, width-1 ASCII arrows when emoji_narrow is enabled; otherwise use pretty arrows
-        if self.emoji && self.emoji_narrow {
-            match sector {
-                0 => '>',
-                1 => '/',
-                2 => '^',
-                3 => '\\',
-                4 => '<',
-                5 => '/',
-                6 => 'v',
-                _ => '\\',
-            }
-        } else {
-            match sector {
-                0 => '→',
-                1 => '↗',
-                2 => '↑',
-                3 => '↖',
-                4 => '←',
-                5 => '↙',
-                6 => '↓',
-                _ => '↘',
-            }
-        }
-    }
+    fn heading_char(&self, heading: f32) -> char { if self.is_emoji_narrow() { Self::heading_char_ascii(heading) } else { Self::heading_char_pretty(heading) } }
 }
 
 struct MapWidget<'a> {

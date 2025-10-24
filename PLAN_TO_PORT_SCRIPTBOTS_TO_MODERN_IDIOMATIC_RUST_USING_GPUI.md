@@ -463,7 +463,7 @@ Implementation notes [2025-10-23]:
 - Purpose: micro-replay to understand recent fate of an agent.
 - MVP: when selecting a recent death, show 50-tick path/health mini-timeline.
 - Surfaces: HUD inspector mini-chart; TUI detail pane.
-- Data/Perf: reuse `ReplayCollector` buffer in memory; no new schema required.
+- Data/Perf: reuse `ReplayCollector` buffer in memory; no new schema required. [Currently In Progress]
 - Testing: fixed seed reproduces identical snippet; UI snapshot.
 - Complexity: M.
 

@@ -14,9 +14,10 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
 use slotmap::{Key, KeyData};
 use std::{
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{Arc, Mutex, OnceLock},
     thread,
 };
+use crossbeam_channel as xchan;
 use thiserror::Error;
 
 const DEFAULT_TICK_BUFFER: usize = 32;
@@ -272,9 +273,10 @@ impl Storage {
     /// Open or create a DuckDB database at the provided path with default buffering thresholds.
     pub fn open(path: &str) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
-        // Performance-friendly defaults that don't compromise persistence
-        let _ = conn.execute("PRAGMA threads = (SELECT CASE WHEN current_setting('threads') IS NULL THEN 0 ELSE current_setting('threads') END);", []);
-        let _ = conn.execute("PRAGMA progress_bar = false;", []);
+        // Configure DuckDB execution settings
+        let threads = num_cpus::get() as i64;
+        let _ = conn.execute(&format!("SET threads = {threads}"), []);
+        let _ = conn.execute("SET enable_progress_bar = false", []);
         let mut storage = Self {
             conn,
             buffer: StorageBuffer::default(),
@@ -300,7 +302,9 @@ impl Storage {
         metric: usize,
     ) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
-        let _ = conn.execute("PRAGMA progress_bar = false;", []);
+        let threads = num_cpus::get() as i64;
+        let _ = conn.execute(&format!("SET threads = {threads}"), []);
+        let _ = conn.execute("SET enable_progress_bar = false", []);
         let mut storage = Self {
             conn,
             buffer: StorageBuffer::default(),
@@ -951,7 +955,7 @@ enum StorageCommand {
 }
 
 pub struct StoragePipeline {
-    tx: mpsc::Sender<StorageCommand>,
+    tx: xchan::Sender<StorageCommand>,
     storage: Arc<Mutex<Storage>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -982,7 +986,7 @@ impl StoragePipeline {
 
     fn from_storage(storage: Storage) -> Result<Self, StorageError> {
         let shared = Arc::new(Mutex::new(storage));
-        let (tx, rx) = mpsc::channel::<StorageCommand>();
+        let (tx, rx) = xchan::unbounded::<StorageCommand>();
         let worker_storage = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("scriptbots-storage-worker".into())
@@ -1052,11 +1056,7 @@ impl StoragePipeline {
 
 impl WorldPersistence for StoragePipeline {
     fn on_tick(&mut self, payload: &PersistenceBatch) {
-        if self
-            .tx
-            .send(StorageCommand::Persist(Box::new(payload.clone())))
-            .is_err()
-        {
+        if self.tx.send(StorageCommand::Persist(Box::new(payload.clone()))).is_err() {
             eprintln!(
                 "storage worker channel closed; tick {} dropped",
                 payload.summary.tick.0
