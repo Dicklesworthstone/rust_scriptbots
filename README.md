@@ -159,6 +159,13 @@ RUST_LOG=info cargo run -p scriptbots-app
   - `SCRIPTBOTS_FORCE_GUI=1` → keep GPUI even if no display variables are set (may still fail if the OS truly lacks a GUI).
 - CI/headless smoke runs can bypass raw TTY requirements by setting `SCRIPTBOTS_TERMINAL_HEADLESS=1`, which drives the renderer against an in-memory buffer for a few frames.
 
+- Emoji mode (terminal renderer):
+  - Defaults ON when a modern UTF‑8 terminal is detected; press `e` to toggle at runtime.
+  - Force enable via env: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on`.
+  - Heuristic: enabled if `TERM` is not `dumb/linux/vt100`, locale contains `utf-8|utf8`, and `CI` is unset.
+  - Emoji mappings: terrain `🌊/💧/🏜/🌿/🌺/🪨` (lush swaps: `🐟`, `🌴`, `🌾`, barren `🥀`); agents single `🐇/🦝/🦊`, small groups `🐑/🐻/🐺`, large cluster `👥`, boosted `🚀`, spike peak `⚔` (underline). Heading arrows remain for single agents when available.
+  - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
+
 ### Build for Web (experimental)
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -346,6 +353,13 @@ An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode 
   - `SCRIPTBOTS_FORCE_TERMINAL=1` → force terminal even when a display server is present.
   - `SCRIPTBOTS_FORCE_GUI=1` → keep GPUI even if no display variables are set (may still fail if the OS truly lacks a GUI).
 - CI/headless smoke runs can bypass raw TTY requirements by setting `SCRIPTBOTS_TERMINAL_HEADLESS=1`, which drives the renderer against an in-memory buffer for a few frames.
+
+- Emoji mode (terminal renderer):
+  - Defaults ON when a modern UTF‑8 terminal is detected; press `e` to toggle at runtime.
+  - Force enable via env: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on`.
+  - Heuristic: enabled if `TERM` is not `dumb/linux/vt100`, locale contains `utf-8|utf8`, and `CI` is unset.
+  - Emoji mappings: terrain `🌊/💧/🏜/🌿/🌺/🪨` (lush swaps: `🐟`, `🌴`, `🌾`, barren `🥀`); agents single `🐇/🦝/🦊`, small groups `🐑/🐻/🐺`, large cluster `👥`, boosted `🚀`, spike peak `⚔` (underline). Heading arrows remain for single agents when available.
+  - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
 
 Keybinds: space (pause), +/- (speed), s (single-step), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy and an emoji world mini-map that adapts to color support.
 
@@ -624,3 +638,9 @@ Licensed under `MIT OR Apache-2.0` (see workspace manifest).
 4. Storage: extend analytics, add replay hooks and regression tests.
 5. Rendering: HUD/overlays/inspector polish; performance diagnostics.
 6. Packaging/CI: release builds, binaries; wasm sibling crate scaffolding (non-invasive).
+
+### Mixed brain families (default)
+- The app now registers multiple brain families by default (MLP, DWRAON, Assembly experimental, NeuroFlow) and seeds mixed populations automatically. Random spawns are bound to a sampled brain family.
+- NeuroFlow is enabled in the default config; edit at runtime via REST/CLI or env (e.g., SCRIPTBOTS_NEUROFLOW_*).
+- Sexual reproduction only occurs within the same brain kind (species barrier). Cross-kind parents fall back to random spawns. This allows fair A/B comparisons between families.
+- To force a single brain for new agents, bind a chosen `brain_key` to agents via `WorldState::bind_agent_brain` or modify the seeding function to always pick that key.

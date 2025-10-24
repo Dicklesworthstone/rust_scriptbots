@@ -436,38 +436,25 @@ impl ControlHandle {
 }
 
 fn insert_path(map: &mut Map<String, Value>, path: &str, value: Value) -> Result<(), ControlError> {
-    let mut segs = path.split('.').filter(|s| !s.is_empty());
-    let Some(mut seg) = segs.next() else {
+    let mut segments = path.split('.').filter(|s| !s.is_empty());
+    let Some(mut seg) = segments.next() else {
         return Err(ControlError::InvalidPatch("empty knob path".into()));
     };
     let mut cur = map;
 
-    for next in segs {
-        // Scope the first mutable borrow so we can safely mutate the map again below
-        let found_obj: Option<*mut Map<String, Value>> = if let Some(val) = cur.get_mut(seg) {
-            let obj: &mut Map<String, Value> = val.as_object_mut().ok_or_else(|| {
-                ControlError::InvalidPatch(format!(
-                    "intermediate segment '{seg}' is not an object"
-                ))
-            })?;
-            Some(obj as *mut _)
-        } else {
-            None
-        };
-
-        if let Some(ptr) = found_obj {
-            // SAFETY: pointer derived from &mut within this iteration and not used elsewhere
-            cur = unsafe { &mut *ptr };
-        } else {
-            let entry = cur.entry(seg.to_owned()).or_insert_with(|| Value::Object(Map::new()));
-            cur = entry.as_object_mut().ok_or_else(|| {
-                ControlError::InvalidPatch(format!(
-                    "intermediate segment '{seg}' is not an object"
-                ))
-            })?;
-        }
+    for next in segments {
+        // Always use Entry API to avoid double-borrow; require objects for intermediate segments
+        let entry = cur
+            .entry(seg.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        cur = entry.as_object_mut().ok_or_else(|| {
+            ControlError::InvalidPatch(format!(
+                "intermediate segment '{seg}' is not an object"
+            ))
+        })?;
         seg = next;
     }
+
     cur.insert(seg.to_owned(), value);
     Ok(())
 }

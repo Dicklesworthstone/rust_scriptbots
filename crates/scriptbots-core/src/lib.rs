@@ -663,6 +663,18 @@ impl BrainRegistry {
     pub fn contains(&self, key: u64) -> bool {
         self.entries.contains_key(&key)
     }
+
+    /// Pick a random registered brain key, if any.
+    pub fn random_key(&self, rng: &mut dyn RngCore) -> Option<u64> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        // Select from a sorted key list for stable ordering across hashseed/platforms
+        let mut keys: Vec<u64> = self.entries.keys().copied().collect();
+        keys.sort_unstable();
+        let idx = rng.random_range(0..keys.len());
+        keys.get(idx).copied()
+    }
 }
 
 /// Runtime data associated with an agent beyond the dense SoA columns.
@@ -2224,7 +2236,7 @@ impl Default for ScriptBotsConfig {
             history_capacity: 256,
             persistence_interval: 0,
             analytics_stride: AnalyticsStride::default(),
-            neuroflow: NeuroflowSettings::default(),
+            neuroflow: NeuroflowSettings { enabled: true, ..NeuroflowSettings::default() },
             control: ControlSettings::default(),
         }
     }
@@ -5037,6 +5049,25 @@ impl WorldState {
         };
         let partner_runtime = self.runtime.get(partner_id).cloned();
 
+        // Species barrier: require matching brain kinds for sexual reproduction
+        if let Some(ref partner_rt) = partner_runtime {
+            let pk1 = parent_runtime.brain.registry_key();
+            let pk2 = partner_rt.brain.registry_key();
+            let kind_match = match (pk1, pk2) {
+                (Some(k1), Some(k2)) => {
+                    let a = self.brain_registry.kind(k1);
+                    let b = self.brain_registry.kind(k2);
+                    a.is_some() && a == b
+                }
+                _ => false,
+            };
+            if !kind_match {
+                return false; // fall back to random spawn in caller
+            }
+        } else {
+            return false;
+        }
+
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
         let child_data = self.build_child_data(
@@ -5059,6 +5090,10 @@ impl WorldState {
         let child_id = self.spawn_agent(child_data);
         if let Some(runtime) = self.runtime.get_mut(child_id) {
             *runtime = child_runtime;
+            // Inherit parent brain binding (same kind already enforced)
+            if let Some(key) = parent_runtime.brain.registry_key() {
+                let _ = self.bind_agent_brain(child_id, key);
+            }
             true
         } else {
             false
@@ -5128,7 +5163,10 @@ impl WorldState {
             0,
             Generation::default(),
         );
-        let _ = self.spawn_agent(data);
+        let id = self.spawn_agent(data);
+        if let Some(key) = self.brain_registry.random_key(&mut self.rng) {
+            let _ = self.bind_agent_brain(id, key);
+        }
     }
     fn pulse_indicator(&mut self, id: AgentId, intensity: f32, color: [f32; 3]) {
         if let Some(runtime) = self.runtime.get_mut(id) {

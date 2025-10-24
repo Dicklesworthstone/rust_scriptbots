@@ -1705,13 +1705,13 @@ impl Palette {
         let rich_color = self
             .level
             .is_some_and(|level| level.has_16m || level.has_256);
-        let (glyph, fg, bg) = if self.emoji {
+        let (mut glyph, fg, bg) = if self.emoji {
             match kind {
                 TerrainKind::DeepWater => ('🌊', Color::Cyan, Color::Blue),
                 TerrainKind::ShallowWater => ('💧', Color::Cyan, if rich_color { Color::Rgb(0, 80, 160) } else { Color::Blue }),
-                TerrainKind::Sand => ('🟨', Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
+                TerrainKind::Sand => ('🏜', Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
                 TerrainKind::Grass => ('🌿', Color::LightGreen, if rich_color { Color::Rgb(30, 90, 30) } else { Color::Green }),
-                TerrainKind::Bloom => ('🌸', Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
+                TerrainKind::Bloom => ('🌺', Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
                 TerrainKind::Rock => ('🪨', Color::Gray, if rich_color { Color::Rgb(70, 70, 70) } else { Color::DarkGray }),
             }
         } else {
@@ -1764,6 +1764,23 @@ impl Palette {
                 ),
             }
         };
+        // Food-driven flourish: swap glyph for lush/barren variants when in emoji mode
+        if self.emoji {
+            if food_level > 0.66 {
+                glyph = match kind {
+                    TerrainKind::DeepWater | TerrainKind::ShallowWater => '🐟',
+                    TerrainKind::Sand => '🌴',
+                    TerrainKind::Grass | TerrainKind::Bloom => '🌾',
+                    TerrainKind::Rock => glyph,
+                };
+            } else if food_level < 0.2 {
+                glyph = match kind {
+                    TerrainKind::Grass | TerrainKind::Bloom => '🥀',
+                    _ => glyph,
+                };
+            }
+        }
+
         let mut style = Style::default().fg(fg);
         if self.has_color() {
             style = style.bg(bg);
@@ -1790,12 +1807,12 @@ impl Palette {
                     .mean_heading()
                     .map(Self::heading_char)
                     .unwrap_or_else(|| match class {
-                        DietClass::Herbivore => '🐭',
+                        DietClass::Herbivore => '🐇',
                         DietClass::Omnivore => '🦝',
                         DietClass::Carnivore => '🦊',
                     }),
                 2..=3 => match class {
-                    DietClass::Herbivore => '🐰',
+                    DietClass::Herbivore => '🐑',
                     DietClass::Omnivore => '🐻',
                     DietClass::Carnivore => '🐺',
                 },
@@ -1828,8 +1845,11 @@ impl Palette {
         if total > 3 {
             style = style.add_modifier(Modifier::REVERSED);
         }
+        if occupancy.boosted {
+            glyph = if self.emoji { '🚀' } else { glyph };
+        }
         if occupancy.spike_peak > 0.6 {
-            glyph = '!';
+            glyph = if self.emoji { '⚔' } else { '!' };
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         if let Some(tendency) = occupancy.mean_tendency() {

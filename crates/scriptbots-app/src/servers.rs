@@ -610,7 +610,8 @@ impl IntoResponse for AppError {
     responses((status = 200, body = [KnobEntry]))
 )]
 async fn get_knobs(State(state): State<ApiState>) -> Result<Json<Vec<KnobEntry>>, AppError> {
-    let knobs = state.handle.list_knobs()?;
+    let mut knobs = state.handle.list_knobs()?;
+    knobs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Json(knobs))
 }
 
@@ -908,12 +909,13 @@ async fn apply_updates(
 async fn get_config_audit(
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<ConfigAuditEntryView>>, AppError> {
-    let entries = state
+    let mut entries: Vec<ConfigAuditEntryView> = state
         .handle
         .audit()?
         .into_iter()
         .map(ConfigAuditEntryView::from)
         .collect();
+    entries.sort_by(|a, b| a.tick.cmp(&b.tick));
     Ok(Json(entries))
 }
 

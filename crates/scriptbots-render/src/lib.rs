@@ -6262,7 +6262,7 @@ fn parse_analytics(
     }
 
     let mut brain_shares: Vec<BrainShareEntry> = brain_map.into_values().collect();
-    brain_shares.sort_by(|a, b| b.count.cmp(&a.count));
+    brain_shares.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
 
     let deaths_combat_carnivore = as_count("mortality.combat_carnivore.count");
     let deaths_combat_herbivore = as_count("mortality.combat_herbivore.count");

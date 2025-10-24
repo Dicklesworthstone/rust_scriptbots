@@ -808,6 +808,12 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
         .map(|(key, value)| (key.to_string(), value))
         .collect::<HashMap<_, _>>();
 
+    // Deterministic key ordering for printed output
+    let mut recorded_sorted: Vec<_> = recorded_map.iter().collect();
+    recorded_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut simulated_sorted: Vec<_> = simulated_counts.iter().collect();
+    simulated_sorted.sort_by(|a, b| a.0.cmp(b.0));
+
     println!(
         "{} Replaying {} ticks ({} recorded events) against {}",
         "▶".bright_blue().bold(),

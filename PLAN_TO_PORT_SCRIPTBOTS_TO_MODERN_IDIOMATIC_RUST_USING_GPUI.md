@@ -1,10 +1,10 @@
 # Plan to Port ScriptBots to Modern Idiomatic Rust with GPUI
 
 ## Vision and Success Criteria
-- Deliver a faithful, deterministic port of ScriptBots’ agent-based ecosystem in Rust, preserving simulation behaviors (sensing, decision-making, reproduction, food dynamics, carnivore/herbivore specialization) while removing undefined behavior and manual memory management found in the original GLUT/C++ codebase (`World.cpp`, `Agent.cpp`).
+- Deliver a faithful, deterministic port of ScriptBots' agent-based ecosystem in Rust, preserving simulation behaviors (sensing, decision-making, reproduction, food dynamics, carnivore/herbivore specialization) while removing undefined behavior and manual memory management found in the original GLUT/C++ codebase (`World.cpp`, `Agent.cpp`).
 - Embrace Rust idioms: error handling via `Result`, trait-based abstraction for brains, `Arc`/`RwLock` only where unavoidable, and zero `unsafe` in the first release.
 - Exploit data-parallelism with Rayon to scale agent updates on modern multi-core CPUs.
-- Replace legacy GLUT rendering with a GPU-accelerated GPUI front-end, using declarative views plus imperative canvas drawing to render thousands of agents at 60+ FPS on macOS and Linux, the platforms GPUI currently targets.citeturn0search0
+- Replace legacy GLUT rendering with a GPU-accelerated GPUI front-end, using declarative views plus imperative canvas drawing to render thousands of agents at 60+ FPS on macOS and Linux, the platforms GPUI currently targets.
 - Ship cross-platform binaries (macOS + Linux) with reproducible builds via Cargo, and include automated tests/benchmarks validating simulation invariants.
 - Provide high-fidelity telemetry: pause/resume, deterministic replay, and offline analytics pipelines backed by DuckDB snapshots.
 - Support hot-swapping of agent brain implementations—from simple heuristics to differentiable neural networks—without recompiling the simulation.
@@ -21,8 +21,8 @@
 - `Cargo.toml` (workspace) with members:
   - `crates/scriptbots-core`: Pure simulation logic, no UI or platform dependencies.
   - `crates/scriptbots-brain`: Houses `Brain` trait + concrete implementations (`mlp`, `dwraon`, `assembly`). Depends on `scriptbots-core`.
-  - `crates/scriptbots-storage`: Abstraction over DuckDB for persistence, journaling, and analytics exports built atop the `duckdb` crate.citeturn1search0
-  - `crates/scriptbots-brain-neuro`: Optional crate that wraps NeuroFlow feed-forward networks for more advanced brains, kept isolated behind a Cargo feature for lean builds.citeturn2search1
+  - `crates/scriptbots-storage`: Abstraction over DuckDB for persistence, journaling, and analytics exports built atop the `duckdb` crate.
+  - `crates/scriptbots-brain-neuro`: Optional crate that wraps NeuroFlow feed-forward networks for more advanced brains, kept isolated behind a Cargo feature for lean builds.
   - `crates/scriptbots-render`: GPUI views, canvas drawing, input handling, overlays.
   - `crates/scriptbots-app`: Binary crate wiring simulation loop, GPUI application, CLI/config loading.
   - [Completed - GPT-5 Codex 2025-10-23] `crates/scriptbots-index`: Spatial indexing utilities (`UniformGridIndex`) powering neighbor queries in sensing/combat.
@@ -59,7 +59,7 @@
 7. **Food Intake & Sharing** [Completed: cell intake + sharing baseline]: Process using `par_iter_mut` with atomic adds or gather stage followed by sequential commit to avoid floating-point race conditions (determinism).
 8. **Combat and Death** [Completed: spike collisions & removal queue]: Evaluate spike collisions using spatial index, queue health changes, then apply.
 9. **Reproduction & Spawning** [Completed: queued spawn orders + child mutations]: Collect reproduction events into `Vec<SpawnOrder>`, apply sequentially to maintain deterministic ordering, leveraging `rand_distr` for gaussian mutations.
-10. **Persistence Hooks** [Completed: tick summary + pluggable sink]: Stream agent snapshots, food deltas, and event logs into DuckDB tables using batched transactions (e.g., every N ticks or when buffers exceed threshold). Leverage Arrow/Parquet features for zero-copy exports when advanced analytics are enabled.citeturn1search0turn1search5
+10. **Persistence Hooks** [Completed: tick summary + pluggable sink]: Stream agent snapshots, food deltas, and event logs into DuckDB tables using batched transactions (e.g., every N ticks or when buffers exceed threshold). Leverage Arrow/Parquet features for zero-copy exports when advanced analytics are enabled.
 11. **Cleanup** [Completed - GPT-5 Codex 2025-10-22: deterministic death queue drains, stable arena retention, runtime cleanup + tests]: Remove dead agents using `Vec::retain` (single-threaded) or stable partition maintaining deterministic ordering; recycle IDs as needed.
 
 ## Brain System
@@ -86,12 +86,12 @@
 - Metrics:
   - Expose `SimulationMetrics` (FPS, agent count, reproduction rate) updated atomically, consumed by UI overlays.
 - DuckDB integration threading:
-  - Maintain a dedicated async task that receives structured log batches over an MPSC channel, writes them via a pooled DuckDB `Connection`, and periodically checkpoints/optimizes storage. Use `duckdb`'s bundled feature in development to avoid external dependencies, and adopt `Connection::open_with_flags` variants for file-backed persistence in production.citeturn1search0
+  - Maintain a dedicated async task that receives structured log batches over an MPSC channel, writes them via a pooled DuckDB `Connection`, and periodically checkpoints/optimizes storage. Use `duckdb`'s bundled feature in development to avoid external dependencies, and adopt `Connection::open_with_flags` variants for file-backed persistence in production.
 - Accelerator hooks:
   - Keep sensor aggregation and brain inference behind pluggable traits so alternative implementations (SIMD-optimized, GPU-backed) can be introduced without touching higher-level logic. Prototype GPU execution by batching inference into wgpu compute shaders or other accelerators once profiling justifies the investment.
 
 ## Rendering with GPUI
- - Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.citeturn0search0 [Completed - GPT-5 Codex 2025-10-21: window shell + metrics HUD scaffolding]
+ - Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.
 - State ownership:
   - `SimulationEntity`: `Entity<SimulationModel>` holds shared simulation state (agents, food grid snapshot, metrics). Updates triggered via background tasks that mutate entity and call `cx.notify()`.
   - UI-specific entity for camera (zoom, pan) mirroring original GLView controls.
@@ -103,33 +103,33 @@
   - Map keyboard shortcuts (`gpui::prelude::*`) to actions (pause, toggle render, spawn agents) using GPUI action system.
   - Mouse interactions: listen for `MouseDownEvent`, translate world coordinates using camera entity, select nearest agent, show inspector drawer.
  - Platform Notes:
-  - GPUI documentation highlights macOS and Linux as current targets; prioritize those platforms and monitor upstream progress for additional backends.citeturn0search0
-  - [Completed - GPT-5 Codex 2025-10-23] Terminal renderer auto‑fallback covers headless environments and is exercised in CI.
+  - GPUI documentation highlights macOS and Linux as current targets; prioritize those platforms and monitor upstream progress for additional backends.
+  - [Completed - GPT-5 Codex 2025-10-23] Terminal renderer auto-fallback covers headless environments and is exercised in CI.
  - Tooling:
-  - Use `create-gpui-app` CLI to scaffold initial GPUI project structure, then integrate workspace crates manually.citeturn0search1
-  - [Completed - GPT-5 Codex 2025-10-23] Terminal rendering mode implemented in `scriptbots-app::terminal` with palette‑aware emoji/ASCII mini‑map, stats HUD, event feed, and keyboard controls.
+  - Use `create-gpui-app` CLI to scaffold initial GPUI project structure, then integrate workspace crates manually.
+  - [Completed - GPT-5 Codex 2025-10-23] Terminal rendering mode implemented in `scriptbots-app::terminal` with palette-aware emoji/ASCII mini-map, stats HUD, event feed, and keyboard controls.
 - Ecosystem:
-  - Track community crates like `gpui-component` for prebuilt widgets and styling patterns.citeturn0search8
+  - Track community crates like `gpui-component` for prebuilt widgets and styling patterns.
 
 ## Simulation Loop and UI Synchronization
 - Dedicated simulation thread:
-  - Leverage GPUI’s async executor to run the simulation tick loop off the main thread while keeping the UI responsive (target ~16 ms timestep).citeturn0search0
+  - Leverage GPUI's async executor to run the simulation tick loop off the main thread while keeping the UI responsive (target ~16 ms timestep).
   - Use `async` channel (`tokio::sync::watch` or `flume`) to push immutable snapshots to UI layer.
 - Snapshot Strategy:
   - Maintain double buffer (`SimulationSnapshot` with `Arc<[AgentRenderData]>` + `Arc<[FoodCell]>`). UI clones `Arc`s cheaply, ensuring zero-copy render pipeline.
   - Provide interpolation for camera smoothing if we add variable render rate.
 - Storage Sync:
-  - On snapshot publication, enqueue summary records (population counts, resource totals) for DuckDB ingestion, and optionally archive raw agent rows every configurable cadence for replay/debug. Employ DuckDB's Arrow integration for efficient bulk writes when analytics pipelines demand columnar exports. [Completed - GPT-5 Codex 2025-10-21]citeturn1search0turn1search5
+  - On snapshot publication, enqueue summary records (population counts, resource totals) for DuckDB ingestion, and optionally archive raw agent rows every configurable cadence for replay/debug. Employ DuckDB's Arrow integration for efficient bulk writes when analytics pipelines demand columnar exports. [Completed - GPT-5 Codex 2025-10-21]
   - [Completed - GPT-5 Codex 2025-10-23] Replay event logging persisted each tick (RNG scopes, brain outputs, actions) with CLI to verify and diff recorded vs. simulated streams.
 
 ## Visual Polish & Audio Enhancements
-- Rich terrain & backgrounds: integrate a tilemap or overlay renderer such as `wgpu-tilemap` to stream large ground textures efficiently, enabling biomes, paths, and heatmaps without dropping frame rate.citeturn0search0
+- Rich terrain & backgrounds: integrate a tilemap or overlay renderer such as `wgpu-tilemap` to stream large ground textures efficiently, enabling biomes, paths, and heatmaps without dropping frame rate.
 - [Completed - GPT-5 Codex 2025-10-22: Terrain elevation now drives downhill momentum/energy costs, with HUD-integrated shading reflecting slopes.]
-- Stylized UI elements: use Vello inside GPUI canvases for high-quality vector icons, rounded panels, and animated HUD elements, giving the interface a modern “game” look while staying GPU-accelerated. [Completed - GPT-5 Codex 2025-10-22: added animated header badge, gradient-styled metric cards, and overlay summaries rendered via GPUI/Vello canvases for consistent theming.]citeturn0search4
-- Particle and lighting effects: reference the `ShadowEngine2D` example for wgpu-driven particles, bloom, and lighting passes, adapting similar shaders to draw energy trails, spike impacts, or weather overlays.citeturn0reddit15
-- Post-processing shaders: batch agent render buffers through compute builders like `cuneus` to add color grading, vignette, or heat shimmer effects without rewriting the entire pipeline.citeturn0reddit18
-- Game-quality audio: adopt the `kira` crate for layered ambient loops, positional effects, and event-driven sound design, using its mixer and timing system to sync audio cues with agent behaviors; expose toggles for audio channels in the GPUI inspector.citeturn2search1turn2search2
-  - [Completed - GPT-5 Codex 2025-10-23] Feature‑gated audio cues integrated in GPUI renderer (birth/death/spike and UI toggles); ships disabled by default and can be enabled via features.
+- Stylized UI elements: use Vello inside GPUI canvases for high-quality vector icons, rounded panels, and animated HUD elements, giving the interface a modern "game" look while staying GPU-accelerated. [Completed - GPT-5 Codex 2025-10-22: added animated header badge, gradient-styled metric cards, and overlay summaries rendered via GPUI/Vello canvases for consistent theming.]
+- Particle and lighting effects: reference the `ShadowEngine2D` example for wgpu-driven particles, bloom, and lighting passes, adapting similar shaders to draw energy trails, spike impacts, or weather overlays.
+- Post-processing shaders: batch agent render buffers through compute builders like `cuneus` to add color grading, vignette, or heat shimmer effects without rewriting the entire pipeline.
+- Game-quality audio: adopt the `kira` crate for layered ambient loops, positional effects, and event-driven sound design, using its mixer and timing system to sync audio cues with agent behaviors; expose toggles for audio channels in the GPUI inspector.
+  - [Completed - GPT-5 Codex 2025-10-23] Feature-gated audio cues integrated in GPUI renderer (birth/death/spike and UI toggles); ships disabled by default and can be enabled via features.
 - Accessibility polish: add colorblind-safe palettes and toggleable outline shaders so the simulation remains readable with visual enhancements. [Completed - GPT-5 Codex 2025-10-22: added HUD inspector overlay toggle (Shift) plus agent outlines and existing palette modes to improve readability.]
 - Procedural sandbox terrain: add an interactive map builder leveraging Wave Function Collapse to synthesize believable topography/biomes with configurable resource strata, oxygen levels, and hazard tuning.
 
@@ -148,10 +148,10 @@
 - Property tests (QuickCheck/Proptest) verifying invariants (health clamped [0, 2], reproduction resets counter).
 - Determinism tests running simulation for fixed ticks with seeded RNG and asserting stable snapshots. [Completed - GPT-5 Codex 2025-10-21]
 - Bench harness (`criterion`) measuring ticks/sec at various agent counts.
-- GPUI view tests using `#[gpui::test]` macro to ensure layout compiles and actions dispatch.citeturn0search0
+- GPUI view tests using `#[gpui::test]` macro to ensure layout compiles and actions dispatch.
 - Storage tests:
-  - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]citeturn1search0
-  - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]citeturn1search0turn1search5
+  - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]
+  - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build. [Completed - GPT-5 Codex 2025-10-22]
  - [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI: generate baseline/candidate DuckDB runs in headless terminal mode and diff event streams via CLI (`--replay-db`, `--compare-db`).
  - [Completed - GPT-5 Codex 2025-10-23] Wasm CI job builds `scriptbots-web` via `wasm-pack` and runs headless Chrome tests (Playwright-provisioned Chromium).
@@ -159,7 +159,7 @@
 ## Advanced Brain Architecture Strategy
 - Trait hierarchy: extend the `Brain` interface with marker traits (`EvolvableBrain`, `TrainableBrain`, `BatchBrain`) so the world loop can branch on capabilities (e.g., some brains may not support online learning).
 - NeuroFlow integration:
-  - Implement `NeuroflowBrain` around `neuroflow::FeedForward`, leveraging builder helpers for declarative layer construction and `io::to_file`/`from_file` for serialization.citeturn2search1turn2search2
+  - Implement `NeuroflowBrain` around `neuroflow::FeedForward`, leveraging builder helpers for declarative layer construction and `io::to_file`/`from_file` for serialization.
   - Support asynchronous fine-tuning by accumulating recent experience tuples and training in background tasks, swapping weights atomically on completion.
 - Genome-centric evolution:
   - `BrainGenome` persists topology, activation mix, optimizer hyperparameters, and provenance metadata (parent IDs, mutation notes). Sexual reproduction performs uniform crossover on layer specs and blends hyperparameters; asexual reproduction perturbs and, occasionally, inserts/removes layers.
@@ -250,7 +250,7 @@
 5. **Brain Ports (Weeks 5-7)**
    - MLP (baseline) complete with mutate/crossover. [Completed - GPT-5 Codex 2025-10-21]
    - DWRAON feature gate; assembly brain behind `--features experimental`. [Completed - GPT-5 Codex 2025-10-21]
-   - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds. [Completed - GPT-5 Codex 2025-10-22]citeturn2search1turn2search2
+   - Implement NeuroFlow-backed brain module and wire through the brain registry for opt-in builds. [Completed - GPT-5 Codex 2025-10-22]
    - Seed NeuroFlow weights using the world RNG for deterministic runs. [Completed - GPT-5 Codex 2025-10-21]
    - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Completed - GPT-5 Codex 2025-10-21]
 6. **Persistence Layer (Weeks 7-8)**
@@ -270,13 +270,13 @@
    - Release pipeline (`cargo dist` or `cargo bundle`), signed macOS binaries. [Completed - GPT-5 Codex 2025-10-22: `cargo dist` workflow now emits platform archives with optional macOS signing and README docs cover the release process; follow-up: add notarization once certificates are in place.]
 
 ## Risks and Mitigations
-- **GPU backend availability**: GPUI is still evolving; focus initial support on macOS/Linux per official guidance, while monitoring upstream platform work.citeturn0search0
+- **GPU backend availability**: GPUI is still evolving; focus initial support on macOS/Linux per official guidance, while monitoring upstream platform work.
 - **Determinism under parallelism**: Floating-point reductions can diverge; solve via deterministic orderings and staged accumulations.
 - **Performance regressions**: Large agent counts may stress GPUI canvas; prototype rendering with 10k agents early, profile using Tracy/`wgpu-profiler`.
 - **Brain extensibility**: Trait object overhead; consider `enum BrainImpl` with static dispatch once stable.
-- **DuckDB durability/throughput**: Excessive per-tick writes could bottleneck; mitigate with batched transactions, asynchronous writers, and optional toggles for high-frequency logging. Evaluate Parquet exports for heavy analytics workloads.citeturn1search0turn1search5
-- **NeuroFlow maturity**: Crate targets CPU feed-forward networks; keep abstractions loose so alternative engines can slot in if requirements outgrow NeuroFlow.citeturn2search1
-- **Team familiarity with GPUI**: Documentation is evolving; allocate ramp-up time exploring official docs, tutorials, and community component libraries such as `gpui-component`.citeturn0search8
+- **DuckDB durability/throughput**: Excessive per-tick writes could bottleneck; mitigate with batched transactions, asynchronous writers, and optional toggles for high-frequency logging. Evaluate Parquet exports for heavy analytics workloads.
+- **NeuroFlow maturity**: Crate targets CPU feed-forward networks; keep abstractions loose so alternative engines can slot in if requirements outgrow NeuroFlow.
+- **Team familiarity with GPUI**: Documentation is evolving; allocate ramp-up time exploring official docs, tutorials, and community component libraries such as `gpui-component`.
 
 ## Open Questions
 - Should we adopt serde-based save/load for simulation snapshots at launch?
@@ -299,8 +299,8 @@ These scoped additions improve usability, insight, and experiment velocity witho
 - Complexity: S.
 
 [Currently In Progress - 2025-10-23] REST endpoints added: `GET /api/presets` (lists names) and `POST /api/presets/apply` (applies JSON patch for preset); OpenAPI updated.
-Follow‑up [Currently In Progress - 2025-10-23]: GPUI preset picker upgraded to a compact micro‑menu with keyboard focus/hover and a confirmation toast on apply.
-Keyboard/UX details: the preset micro‑menu mirrors button styling, supports focus rings, hover color shifts, and click feedback; a toast appears under the header with the applied preset name and fades out automatically.
+Follow-up [Currently In Progress - 2025-10-23]: GPUI preset picker upgraded to a compact micro-menu with keyboard focus/hover and a confirmation toast on apply.
+Keyboard/UX details: the preset micro-menu mirrors button styling, supports focus rings, hover color shifts, and click feedback; a toast appears under the header with the applied preset name and fades out automatically.
 
 ### 2) Metrics baseline compare (Δ vs. baseline) [Currently In Progress - 2025-10-23]
 - Purpose: quick A/B within a run (population, births/deaths, avg energy).
@@ -310,7 +310,7 @@ Keyboard/UX details: the preset micro‑menu mirrors button styling, supports fo
 - Testing: unit-test delta math; snapshot HUD/TUI lines.
 - Complexity: S.
 
-### 3) Auto‑pause on conditions [Completed - 2025-10-23 Codex]
+### 3) Auto-pause on conditions [Completed - 2025-10-23 Codex]
 - Purpose: stop at interesting moments automatically.
 - MVP: triggers: population < X, first spike kill, age > Y.
 - Surfaces: HUD panel with checkboxes/thresholds; TUI toggles; REST patch `control.auto_pause.*` keys; CLI `--auto-pause-below <COUNT>`, `--auto-pause-age-above <AGE>`, `--auto-pause-on-spike`.
@@ -334,7 +334,7 @@ Implementation notes [2025-10-23]:
   - Terminal HUD now renders a colorized Recent Events panel; event ingestion hooks births/deaths deltas and population changes.
   - REST: `/api/events/tail` returns latest events (tick, kind, count).
 - Data/Perf: reads from in-memory history; zero extra allocations on hot paths.
-- Follow‑ups: add filter chips (All|Birth|Death|Combat) and expose in Swagger.
+- Follow-ups: add filter chips (All|Birth|Death|Combat) and expose in Swagger.
 - Complexity: S.
 
 ### 5) Selection tags (cohorts)
@@ -361,7 +361,7 @@ Implementation notes [2025-10-23]:
 - Testing: visual snapshot; ensure disabled has zero overhead.
 - Complexity: S.
 
-### 8) Lineage mini‑tree
+### 8) Lineage mini-tree
 - Purpose: quick glance at heredity and mutation flow.
 - MVP: 2-level ancestry (parents→child) with ages/traits; link to inspector.
 - Surfaces: HUD inspector subpanel; TUI detail pane.
@@ -377,10 +377,10 @@ Implementation notes [2025-10-23]:
 - Testing: seeded events increment expected cells; determinism across threads.
 - Complexity: M.
 
-### 10) Determinism self‑check (threads parity) [Currently In Progress - 2025-10-23]
+### 10) Determinism self-check (threads parity) [Currently In Progress - 2025-10-23]
 - Purpose: confidence guard for contributors/CI.
 - MVP: CLI `--det-check [ticks]` runs 1-thread vs N-threads and compares summaries/events.
-- Surfaces: CLI; CI job gate (non‑blocking initially).
+- Surfaces: CLI; CI job gate (non-blocking initially).
 - Data/Perf: temporary run in memory; no DB write unless `--save`.
 - Testing: fixture worlds pass; inject a known race → diff surfaces red.
 - Complexity: M.
@@ -389,7 +389,7 @@ Implementation notes [2025-10-23]:
 - Purpose: easy streaming to dashboards/scripts without websockets.
 - MVP: `GET /api/ticks/latest` (JSON), `GET /api/ticks/stream` (SSE; emits JSON objects periodically).
 - Surfaces: REST only; docs example with `curl`.
-- Data/Perf: send from in‑memory summaries; backpressure via chunked responses.
+- Data/Perf: send from in-memory summaries; backpressure via chunked responses.
 - Testing: integration test reading N events; cancellation.
 - Complexity: S.
 
@@ -398,11 +398,11 @@ Implementation notes [2025-10-23]:
 - MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`. [Started: Terminal HUD adds 'S' to save ASCII snapshot under `screenshots/frame_<tick>.txt`; help overlay updated. CLI `scriptbots-control screenshot --out FILE [--png]` added. REST: `GET /api/screenshot/ascii|png`. PNG currently returns a minimal placeholder image until GPUI hook is wired.]
 - Surfaces: HUD button + hotkey; TUI `S` key; CLI `control_cli screenshot`.
 - Data/Perf: file I/O off main tick; enqueue to worker.
-- Testing: files exist with non‑zero bytes; deterministic filenames with seed/tick.
+- Testing: files exist with non-zero bytes; deterministic filenames with seed/tick.
 - Complexity: S.
 
 ### 13) Quick CSV exports [Completed - 2025-10-23 Codex: added `scriptbots-control export` for ticks/metrics CSV dumps]
-- Purpose: spreadsheet‑friendly metrics without opening DuckDB.
+- Purpose: spreadsheet-friendly metrics without opening DuckDB.
 - MVP: CLI `export metrics --last 1000 --out metrics.csv`; similar for `ticks`.
 - Surfaces: CLI; REST `GET /api/export/metrics.csv` (optional).
 - Data/Perf: simple SELECT + CSV writer; small temp buffer.
@@ -427,10 +427,10 @@ Implementation notes [2025-10-23]:
 
 ### 16) Config change audit + revert [Currently In Progress - 2025-10-23]
 - Purpose: transparency and quick undo during experiments.
-- MVP: bounded list of last K patches with timestamp; revert re‑applies inverse patch.
+- MVP: bounded list of last K patches with timestamp; revert re-applies inverse patch.
 - Surfaces: HUD panel; TUI list; REST `GET /api/config/audit` (implemented: returns recent in-process config patches with tick).
 - Data/Perf: store patches in ring buffer; optional DuckDB audit table.
-- Testing: apply→revert round‑trip yields identical config; determinism preserved.
+- Testing: apply→revert round-trip yields identical config; determinism preserved.
 - Complexity: M.
 
 ### 17) World annotations (pins/regions)
@@ -438,31 +438,31 @@ Implementation notes [2025-10-23]:
 - MVP: add named pin or rectangular region with color; overlay toggle.
 - Surfaces: HUD placement tool; TUI `:pin x y name`.
 - Data/Perf: lightweight list in memory; optional persist on export.
-- Testing: serialization round‑trip; overlay render smoke.
+- Testing: serialization round-trip; overlay render smoke.
 - Complexity: S-M.
 
 ### 18) Agent scoreboard [Completed - 2025-10-23 Codex]
-- Purpose: at‑a‑glance “Top predators” and “Oldest living”.
+- Purpose: at-a-glance "Top predators" and "Oldest living".
 - MVP: two small tables sourced from current snapshot (not heavy analytics).
 - Surfaces: Terminal HUD shows "Top Predators" (carnivores by energy) and "Oldest Agents"; REST `GET /api/scoreboard?limit=K`.
 - Implementation:
-  - Control layer computes top carnivores (energy/health tie‑break) and oldest agents.
+  - Control layer computes top carnivores (energy/health tie-break) and oldest agents.
   - OpenAPI schemas exposed; endpoints documented in Swagger UI.
 - Data/Perf: computed from live world state; bounded sort/truncate (`K=10` default).
 - Complexity: S.
 
-### 19) Brush‑based food edits
+### 19) Brush-based food edits
 - Purpose: controlled perturbations for experiments.
 - MVP: increase/decrease local food density using brush with radius/strength.
 - Surfaces: HUD brush; TUI command `:food +|- r=.. s=..`.
 - Data/Perf: bounded cell updates via command bus; deterministic application order.
-- Testing: grid diffs equal expected kernel; no agent physics side‑effects until next tick.
+- Testing: grid diffs equal expected kernel; no agent physics side-effects until next tick.
 - Complexity: M.
 
-### 20) One‑agent replay snippet (last 50 ticks)
-- Purpose: micro‑replay to understand recent fate of an agent.
-- MVP: when selecting a recent death, show 50‑tick path/health mini‑timeline.
-- Surfaces: HUD inspector mini‑chart; TUI detail pane.
+### 20) One-agent replay snippet (last 50 ticks)
+- Purpose: micro-replay to understand recent fate of an agent.
+- MVP: when selecting a recent death, show 50-tick path/health mini-timeline.
+- Surfaces: HUD inspector mini-chart; TUI detail pane.
 - Data/Perf: reuse `ReplayCollector` buffer in memory; no new schema required.
 - Testing: fixed seed reproduces identical snippet; UI snapshot.
 - Complexity: M.
@@ -593,13 +593,13 @@ Implementation notes [2025-10-23]:
 
 - **Integration with WFC Pipeline**
   - During `RuleBasedMapGenerator::generate`, enforce hydrology-aware adjacency: channels must connect basins; plains near coastlines must offer spillways.
-  - Provide deterministic “seed rain” preview: run a shallow rain simulation (few ticks) inside generation, capturing expected max water depth. Feed results into tile selection weights (e.g., discourage high-density settlements in perennial floodplains unless tileset explicitly opts in).
-  - Allow tilesets to tag “aquifer” tiles; WFC ensures they appear beneath rivers to justify perennial flow.
+  - Provide deterministic "seed rain" preview: run a shallow rain simulation (few ticks) inside generation, capturing expected max water depth. Feed results into tile selection weights (e.g., discourage high-density settlements in perennial floodplains unless tileset explicitly opts in).
+  - Allow tilesets to tag "aquifer" tiles; WFC ensures they appear beneath rivers to justify perennial flow.
 
 - **Renderer / UX Hooks**
   - GPUI: animate water surfaces with shader palettes driven by `water_depth`. Add hydrology inspector showing basin outlines, flow vectors, rainfall timeline graphs.
   - Terminal renderer: extend glyph palette with dynamic water emojis or colorized ASCII shading (e.g., `~`, `≈` for shallow/deep), plus sidebar sparkline tracking flood extent.
-  - Provide “rain storyboard” overlay: timeline scrubber shows predicted inundation when planning rainfall experiments.
+  - Provide "rain storyboard" overlay: timeline scrubber shows predicted inundation when planning rainfall experiments.
 
 - **Persistence & Replay**
   - Extend `MapArtifactMetadata` with `hydrology_digest` (hash of hydrology field + rainfall seeds) and store rain events in the persistence log for deterministic replays.
@@ -702,7 +702,7 @@ Implementation notes [2025-10-23]:
 ### Compatibility & fallbacks
 - Capability matrix (macOS Terminal, iTerm2, Windows Terminal, Linux SSH):
   - Emoji availability varies; always provide ASCII/block fallbacks.
-  - Truecolor vs 256 colors: detect and downgrade palettes; never assume 24‑bit.
+  - Truecolor vs 256 colors: detect and downgrade palettes; never assume 24-bit.
   - Inline image protocols (kitty/iTerm2/SIXEL) are opt-in only and not required for MVP.
 
 ### Testing & QA (expanded)
@@ -748,3 +748,37 @@ Implementation notes [2025-10-23]:
 - [Completed - 2025-10-22] Input handling parity: pause/resume, speed scaling, single-step, help overlay, and quit shortcuts are wired into the control runtime.
 - [Completed - 2025-10-22] Automated testing: headless smoke test runs the `scriptbots-app` binary in terminal mode (`SCRIPTBOTS_TERMINAL_HEADLESS=1`) to guard against regressions.
 - [Completed - 2025-10-22] Documentation updates: README now covers terminal mode flags, fallback behavior, and headless usage tips.
+
+#### [Completed - 2025-10-24] Emoji mode v1.1 (default-on + curated glyphs)
+- Purpose: make the terminal renderer visually appealing by default while remaining robust on headless/limited terminals.
+- Behavior:
+  - Emoji mode defaults to ON when stdout is a modern terminal and the locale is UTF‑8; auto-disabled on obviously minimal terminals or CI.
+  - Hotkey: `e` toggles emoji mode at runtime and logs an event ("Emoji mode ON/OFF").
+  - Env override: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on` forces ON regardless of detection.
+- Detection heuristic:
+  - `TERM` not in {"", "dumb", "linux", "vt100"}
+  - locale from `LC_ALL`/`LC_CTYPE`/`LANG` contains `utf-8` or `utf8`
+  - `CI` unset
+- Emoji mappings:
+  - Terrain: DeepWater=🌊, ShallowWater=💧 (lush → 🐟), Sand=🏜 (lush → 🌴), Grass=🌿 / Bloom=🌺 (lush → 🌾, barren → 🥀), Rock=🪨.
+  - Agents: single Herbivore=🐇, Omnivore=🦝, Carnivore=🦊; small groups 🐑/🐻/🐺; large cluster 👥; boosted 🚀; spike peak ⚔ with underline; heading arrows preserved when available.
+- Files: `crates/scriptbots-app/src/terminal/mod.rs` (`Palette::detect/terrain_symbol/agent_symbol`, key handler, help overlay).
+- Risks & mitigations: width variance across terminals (press `e` to revert); README documents installing emoji-capable fonts if glyphs appear as tofu.
+
+### [Completed - 2025-10-24] Brain families default-on and mixed-species evolution
+- Enabled all brain families by default: MLP (baseline), DWRAON, Assembly (experimental), NeuroFlow (optional crate), and register them at app startup. Mixed populations are now the default.
+- Random new spawns receive a brain binding sampled from the BrainRegistry.
+- Sexual reproduction enforces a species barrier: crossover only occurs when both parents share the same brain kind; otherwise, the spawn falls back to random seeding. This makes differing brain kinds act as distinct species while fairly competing in the same environment.
+- NeuroFlow is enabled in default `ScriptBotsConfig` and still configurable at runtime (layers/activation).
+- Control/CLI/REST remain unchanged; analytics/inspector now implicitly reflect multiple brain kinds (brain_kind, brain_key already surfaced).
+
+Implementation notes:
+- `BrainRegistry::random_key(&mut rng) -> Option<u64>` added for unbiased brain sampling.
+- `WorldState::spawn_random_agent` binds a sampled brain key to the newly spawned agent.
+- `WorldState::spawn_crossover_agent` now checks parent brain kinds via registry keys; when mismatched, it returns `false` so the scheduled spawner falls back to a random newcomer.
+- Default config toggles `neuroflow.enabled = true`.
+- App features default to including optional brain crates so binaries ship with all families available by default.
+
+Benchmarks/Determinism:
+- The selection of brain family for random spawns is driven by the world RNG, so runs remain seed-stable.
+- Crossover gating (species barrier) removes undefined mixing across brain kinds and reduces variance in hybrid viability analysis.

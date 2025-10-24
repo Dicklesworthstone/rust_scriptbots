@@ -46,7 +46,7 @@ windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Syste
 mimalloc = { version = "0.1", optional = true }
 
 [features]
-default = []
+default = ["ml", "neuro"]
 gui = ["dep:scriptbots-render"]
 ml = ["scriptbots-brain-ml"]
 neuro = ["scriptbots-brain-neuro"]
