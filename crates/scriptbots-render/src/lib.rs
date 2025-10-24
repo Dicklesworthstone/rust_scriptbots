@@ -135,6 +135,7 @@ pub fn run_demo(
         }
 
         let world_for_canvas = Arc::clone(&world_for_view);
+        let storage_for_canvas = storage_for_view.clone();
         let drain_for_canvas = Arc::clone(&drain_for_view);
         let submit_for_canvas = Arc::clone(&submit_for_view);
         if let Err(err) = app.open_window(sim_options, move |_window, cx| {
@@ -142,7 +143,7 @@ pub fn run_demo(
                 // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
                 let mut view = SimulationView::new(
                     Arc::clone(&world_for_canvas),
-                    storage_for_view.clone(),
+                    storage_for_canvas.clone(),
                     "World".into(),
                     Arc::clone(&drain_for_canvas),
                     Arc::clone(&submit_for_canvas),
@@ -706,7 +707,7 @@ impl SimulationView {
         }
     }
 
-    fn render_header(&self, snapshot: &HudSnapshot) -> Div {
+    fn render_header(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         let status_text = if snapshot.is_closed {
             "Closed Ecosystem"
         } else {
@@ -4315,7 +4316,6 @@ impl SimulationView {
             )
             .children(bindings_rows)
     }
-
     fn render_inspector_detail(
         &self,
         detail: &AgentInspectorDetails,
@@ -6056,7 +6056,7 @@ impl Render for SimulationView {
                 .bg(rgb(0x0f172a))
                 .text_color(rgb(0xf8fafc))
                 .p_2()
-                .child(self.render_canvas(snapshot, cx))
+                .child(self.render_canvas(&snapshot, cx))
         } else {
             div()
             .size_full()
@@ -6067,7 +6067,7 @@ impl Render for SimulationView {
             .text_color(rgb(0xf8fafc))
             .p_6()
             .gap_4()
-            .child(self.render_header(&snapshot))
+                .child(self.render_header(&snapshot, cx))
             .child(self.render_summary(&snapshot))
             .child(self.render_analytics_panel(&snapshot))
             .child(
@@ -6117,7 +6117,6 @@ struct HudSnapshot {
     controls: ControlsSnapshot,
     perf: PerfSnapshot,
 }
-
 #[derive(Clone)]
 struct HudAnalytics {
     tick: u64,
@@ -6882,7 +6881,6 @@ impl SelectionEventKind {
         }
     }
 }
-
 impl InspectorSnapshot {
     fn from_world(world: &WorldState, inspector: &InspectorState) -> Self {
         let mut snapshot = InspectorSnapshot {
@@ -7582,7 +7580,6 @@ struct PlaybackState {
     mode: PlaybackMode,
     pointer: usize,
 }
-
 impl PlaybackState {
     fn new(max_frames: usize) -> Self {
         Self {
@@ -8340,7 +8337,6 @@ impl Default for CameraState {
         }
     }
 }
-
 impl CameraState {
     const MIN_ZOOM: f32 = 0.4;
     const MAX_ZOOM: f32 = 2.5;
