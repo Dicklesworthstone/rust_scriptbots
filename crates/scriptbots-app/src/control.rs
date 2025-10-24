@@ -196,6 +196,8 @@ impl ControlHandle {
         }
         #[cfg(not(feature = "gui"))]
         {
+            // Reference params to avoid unused warnings in non-GUI builds
+            let _ = (width, height);
             Err(ControlError::InvalidPatch("PNG snapshot requires gui feature".into()))
         }
     }

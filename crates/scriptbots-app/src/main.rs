@@ -160,6 +160,8 @@ fn main() -> Result<()> {
         }
         #[cfg(not(feature = "gui"))]
         {
+            // Avoid unused-variable warning when GUI is not enabled
+            let _ = path;
             bail!("--dump-png requires GUI feature; recompile with --features gui");
         }
     }
@@ -710,6 +712,8 @@ impl Renderer for GuiRenderer {
         }
         #[cfg(not(feature = "gui"))]
         {
+            // Avoid unused-parameter warning when GUI is not enabled
+            let _ = ctx;
             bail!("GUI feature not enabled; recompile with --features gui or use --mode terminal");
         }
         
@@ -1429,6 +1433,7 @@ fn parse_activation(raw: &str) -> Option<NeuroflowActivationKind> {
     }
 }
 
+#[cfg(feature = "gui")]
 fn parse_png_size(raw: &str) -> Option<(u32, u32)> {
     let lower = raw.trim().to_ascii_lowercase();
     let mut parts = lower.split('x');

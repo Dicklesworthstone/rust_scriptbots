@@ -9021,35 +9021,37 @@ fn paint_debug_overlays(
         return;
     }
 
+    let wants_sense = debug.show_sense_radius && frame.sense_radius > 0.0;
+    let wants_velocity = debug.show_velocity;
+    let mut sense_path = if wants_sense { Some(PathBuilder::stroke(px(1.4))) } else { None };
+    let mut vel_shaft_path = if wants_velocity { Some(PathBuilder::stroke(px(1.6))) } else { None };
+    let mut vel_head_path = if wants_velocity { Some(PathBuilder::stroke(px(1.2))) } else { None };
+    let mut crosshair_path = if focus_agent.is_some() { Some(PathBuilder::stroke(px(1.6))) } else { None };
+
+    let view_left = f32::from(bounds.origin.x);
+    let view_top = f32::from(bounds.origin.y);
+    let view_right = view_left + f32::from(bounds.size.width);
+    let view_bottom = view_top + f32::from(bounds.size.height);
+
     for agent in &frame.agents {
         let px_x = offset_x + agent.position.x * scale;
         let px_y = offset_y + agent.position.y * scale;
 
-        // Cull debug overlays off-screen
-        let view_left = f32::from(bounds.origin.x);
-        let view_top = f32::from(bounds.origin.y);
-        let view_right = view_left + f32::from(bounds.size.width);
-        let view_bottom = view_top + f32::from(bounds.size.height);
+        // Cull debug overlays off-screen (with a small margin)
         if px_x < view_left - 64.0 || px_x > view_right + 64.0 || px_y < view_top - 64.0 || px_y > view_bottom + 64.0 {
             continue;
         }
 
-        if debug.show_sense_radius
-            && frame.sense_radius > 0.0
-            && matches!(
-                agent.selection,
-                SelectionState::Selected | SelectionState::Hovered
-            )
+        if wants_sense
+            && matches!(agent.selection, SelectionState::Selected | SelectionState::Hovered)
         {
-            let radius_px = (frame.sense_radius * scale).max(4.0);
-            let mut circle = PathBuilder::stroke(px(1.4));
-            append_arc_polyline(&mut circle, px_x, px_y, radius_px, 0.0, 360.0);
-            if let Ok(path) = circle.build() {
-                window.paint_path(path, rgba_from_hex(0x38bdf8, 0.35));
+            if let Some(builder) = sense_path.as_mut() {
+                let radius_px = (frame.sense_radius * scale).max(4.0);
+                append_arc_polyline(builder, px_x, px_y, radius_px, 0.0, 360.0);
             }
         }
 
-        if debug.show_velocity {
+        if wants_velocity {
             let vx = agent.velocity.vx;
             let vy = agent.velocity.vy;
             let speed = (vx * vx + vy * vy).sqrt();
@@ -9064,18 +9066,15 @@ fn paint_debug_overlays(
                 let tip_x = px_x + norm_x * arrow_length;
                 let tip_y = px_y + norm_y * arrow_length;
 
-                let mut shaft = PathBuilder::stroke(px(1.6));
-                shaft.move_to(point(px(px_x), px(px_y)));
-                shaft.line_to(point(px(tip_x), px(tip_y)));
-                if let Ok(path) = shaft.build() {
-                    window.paint_path(path, rgba_from_hex(0x22d3ee, 0.85));
+                if let Some(builder) = vel_shaft_path.as_mut() {
+                    builder.move_to(point(px(px_x), px(px_y)));
+                    builder.line_to(point(px(tip_x), px(tip_y)));
                 }
 
                 let head_size = (arrow_length * 0.18).clamp(4.0, 14.0);
                 let angle = vy.atan2(vx);
                 let left_angle = angle + PI - 0.5;
                 let right_angle = angle + PI + 0.5;
-
                 let left_point = point(
                     px(tip_x + head_size * left_angle.cos()),
                     px(tip_y + head_size * left_angle.sin()),
@@ -9084,28 +9083,44 @@ fn paint_debug_overlays(
                     px(tip_x + head_size * right_angle.cos()),
                     px(tip_y + head_size * right_angle.sin()),
                 );
-
-                let mut head = PathBuilder::stroke(px(1.2));
-                head.move_to(point(px(tip_x), px(tip_y)));
-                head.line_to(left_point);
-                head.move_to(point(px(tip_x), px(tip_y)));
-                head.line_to(right_point);
-                if let Ok(path) = head.build() {
-                    window.paint_path(path, rgba_from_hex(0xe0f2fe, 0.78));
+                if let Some(builder) = vel_head_path.as_mut() {
+                    builder.move_to(point(px(tip_x), px(tip_y)));
+                    builder.line_to(left_point);
+                    builder.move_to(point(px(tip_x), px(tip_y)));
+                    builder.line_to(right_point);
                 }
             }
         }
 
         if Some(agent.agent_id) == focus_agent {
-            let cross = (frame.agent_base_radius * scale).max(6.0);
-            let mut crosshair = PathBuilder::stroke(px(1.6));
-            crosshair.move_to(point(px(px_x - cross), px(px_y)));
-            crosshair.line_to(point(px(px_x + cross), px(px_y)));
-            crosshair.move_to(point(px(px_x), px(px_y - cross)));
-            crosshair.line_to(point(px(px_x), px(px_y + cross)));
-            if let Ok(path) = crosshair.build() {
-                window.paint_path(path, rgba_from_hex(0xfacc15, 0.9));
+            if let Some(builder) = crosshair_path.as_mut() {
+                let cross = (frame.agent_base_radius * scale).max(6.0);
+                builder.move_to(point(px(px_x - cross), px(px_y)));
+                builder.line_to(point(px(px_x + cross), px(px_y)));
+                builder.move_to(point(px(px_x), px(px_y - cross)));
+                builder.line_to(point(px(px_x), px(px_y + cross)));
             }
+        }
+    }
+
+    if let Some(builder) = sense_path {
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, rgba_from_hex(0x38bdf8, 0.35));
+        }
+    }
+    if let Some(builder) = vel_shaft_path {
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, rgba_from_hex(0x22d3ee, 0.85));
+        }
+    }
+    if let Some(builder) = vel_head_path {
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, rgba_from_hex(0xe0f2fe, 0.78));
+        }
+    }
+    if let Some(builder) = crosshair_path {
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, rgba_from_hex(0xfacc15, 0.9));
         }
     }
 }
@@ -9236,25 +9251,85 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         y_min = y_min.clamp(0, food_h as isize - 1);
         y_max = y_max.clamp(0, food_h as isize - 1);
 
-        for y in y_min as usize..=y_max as usize {
-            for x in x_min as usize..=x_max as usize {
-                let idx = y * food_w + x;
-                let value = frame.food_cells.get(idx).copied().unwrap_or_default();
-                if value <= 0.001 {
-                    continue;
+        if very_low_fps {
+            // Quantized batching: approximate per-cell shading by grouping into bins, reducing draw calls
+            const FOOD_BINS: usize = 24;
+            for y in y_min as usize..=y_max as usize {
+                let mut builders: [Option<PathBuilder>; FOOD_BINS] = [
+                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                ];
+                let mut colors: [Option<Rgba>; FOOD_BINS] = [None; FOOD_BINS];
+                for x in x_min as usize..=x_max as usize {
+                    let idx = y * food_w + x;
+                    let value = frame.food_cells.get(idx).copied().unwrap_or_default();
+                    if value <= 0.001 {
+                        continue;
+                    }
+                    let intensity = (value / max_food).clamp(0.0, 1.0);
+                    let mut color = food_color(intensity);
+                    let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
+                    let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
+                    color = scale_rgb(color, shade);
+                    color = apply_palette(color, frame.palette);
+
+                    // Quantize based on luminance to group similar colors
+                    let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+                    let mut bin = ((luma * (FOOD_BINS as f32)) as isize).clamp(0, (FOOD_BINS as isize) - 1) as usize;
+                    // Avoid bin 0 swallowing very dark but present cells when alpha is tiny
+                    if bin == 0 && luma > 0.0 { bin = 1; }
+
+                    let px_x = offset_x + (x as f32 * cell_world * scale);
+                    let px_y = offset_y + (y as f32 * cell_world * scale);
+                    if let Some(builder) = builders[bin].as_mut() {
+                        // Append rectangle path for this cell
+                        let x0 = px(px_x);
+                        let y0 = px(px_y);
+                        let x1 = px(px_x + cell_px);
+                        let y1 = px(px_y + cell_px);
+                        builder.move_to(point(x0, y0));
+                        builder.line_to(point(x1, y0));
+                        builder.line_to(point(x1, y1));
+                        builder.line_to(point(x0, y1));
+                        builder.close();
+                    }
+                    if colors[bin].is_none() {
+                        colors[bin] = Some(color);
+                    }
                 }
-                let intensity = (value / max_food).clamp(0.0, 1.0);
-                let mut color = food_color(intensity);
-                let shade_wave =
-                    ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
-                let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
-                color = scale_rgb(color, shade);
-                color = apply_palette(color, frame.palette);
-                let px_x = offset_x + (x as f32 * cell_world * scale);
-                let px_y = offset_y + (y as f32 * cell_world * scale);
-                let cell_bounds =
-                    Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
-                window.paint_quad(fill(cell_bounds, Background::from(color)));
+                for b in 0..FOOD_BINS {
+                    if let (Some(builder), Some(col)) = (builders[b].take(), colors[b]) {
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, col);
+                        }
+                    }
+                }
+            }
+        } else {
+            for y in y_min as usize..=y_max as usize {
+                for x in x_min as usize..=x_max as usize {
+                    let idx = y * food_w + x;
+                    let value = frame.food_cells.get(idx).copied().unwrap_or_default();
+                    if value <= 0.001 {
+                        continue;
+                    }
+                    let intensity = (value / max_food).clamp(0.0, 1.0);
+                    let mut color = food_color(intensity);
+                    let shade_wave =
+                        ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
+                    let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
+                    color = scale_rgb(color, shade);
+                    color = apply_palette(color, frame.palette);
+                    let px_x = offset_x + (x as f32 * cell_world * scale);
+                    let px_y = offset_y + (y as f32 * cell_world * scale);
+                    let cell_bounds =
+                        Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
+                    window.paint_quad(fill(cell_bounds, Background::from(color)));
+                }
             }
         }
     }
@@ -9326,14 +9401,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 }
             }
 
-            if controls.agent_outline && !very_low_fps {
-                let outline_radius = (size_px * 0.55).max(3.0);
-                let mut outline = PathBuilder::stroke(px(1.8));
-                append_arc_polyline(&mut outline, px_x, px_y, outline_radius, 0.0, 360.0);
-                if let Ok(path) = outline.build() {
-                    window.paint_path(path, rgba_from_hex(0xffffff, 0.35));
-                }
-            }
+            // Defer agent outlines to a single batched pass below
 
             if agent.indicator.intensity > 0.05 && !low_fps {
                 let effect = agent.indicator.intensity.clamp(0.0, 1.0);
@@ -9412,6 +9480,32 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             bounds,
             window,
         );
+
+        // Batched agent outlines pass
+        if controls.agent_outline && !very_low_fps {
+            let mut outline_builder = PathBuilder::stroke(px(1.8));
+            let view_left = f32::from(origin.x);
+            let view_top = f32::from(origin.y);
+            let view_right = view_left + width_px;
+            let view_bottom = view_top + height_px;
+
+            for agent in &frame.agents {
+                let px_x = offset_x + agent.position.x * scale;
+                let px_y = offset_y + agent.position.y * scale;
+                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
+                let size_px = (dynamic_radius * scale).max(2.0);
+                let half = size_px * 0.5;
+                if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
+                    continue;
+                }
+
+                let outline_radius = (size_px * 0.55).max(3.0);
+                append_arc_polyline(&mut outline_builder, px_x, px_y, outline_radius, 0.0, 360.0);
+            }
+            if let Ok(path) = outline_builder.build() {
+                window.paint_path(path, rgba_from_hex(0xffffff, 0.35));
+            }
+        }
     }
 
     if !safe_mode_enabled() {
