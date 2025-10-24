@@ -397,6 +397,13 @@ impl<'a> TerminalApp<'a> {
             self.palette.accent_style(),
         ));
 
+        // Add a compact, persistent help hint
+        line.spans.push(Span::raw("  "));
+        line.spans.push(Span::styled(
+            "Help: ?/h",
+            self.palette.accent_style(),
+        ));
+
         let paragraph = Paragraph::new(line).block(
             Block::default()
                 .title(self.palette.title("ScriptBots Terminal HUD"))
@@ -661,31 +668,43 @@ impl<'a> TerminalApp<'a> {
     fn draw_help(&self, frame: &mut Frame<'_>) {
         let size = frame.area();
         let help_width = (size.width as f32 * 0.6).round() as u16;
-        let help_height = 10;
-        let help_x = size.x + (size.width - help_width) / 2;
-        let help_y = size.y + (size.height - help_height) / 2;
-        let area = Rect::new(help_x, help_y, help_width, help_height);
 
-        let help_lines = vec![
+        let mut help_lines = vec![
             Line::from(vec![Span::styled(
                 "Controls",
                 self.palette.header_style().add_modifier(Modifier::BOLD),
             )]),
-            Line::raw(" q      Quit"),
-            Line::raw(" space  Toggle pause"),
-            Line::raw(" + / - Adjust speed"),
-            Line::raw(" s      Single step"),
-            Line::raw(" S      Save ASCII screenshot"),
-            Line::raw(" e      Toggle emoji mode"),
-            Line::raw(" n      Toggle narrow symbols (emoji-compatible alignment)"),
-            Line::raw("        Legend: water 🌊/💧, sand 🏜, grass 🌿, bloom 🌺, rock 🪨"),
-            Line::raw(" b      Toggle metrics baseline (set/clear)"),
-            Line::raw(" ?      Toggle this help"),
+            Line::raw(" q        Quit"),
+            Line::raw(" space    Toggle pause"),
+            Line::raw(" + / -    Adjust speed"),
+            Line::raw(" s        Single step"),
+            Line::raw(" S        Save ASCII screenshot"),
+            Line::raw(" e        Toggle emoji mode"),
+            Line::raw(" n        Toggle narrow symbols (emoji-compatible alignment)"),
+            Line::raw(" b        Toggle metrics baseline (set/clear)"),
+            Line::raw(" ? / h    Toggle this help  (? is Shift+/ on most keyboards)"),
+            Line::raw(""),
+            Line::from(vec![Span::styled(
+                "Legend",
+                self.palette.header_style().add_modifier(Modifier::BOLD),
+            )]),
+            Line::raw(" Terrain: 🌊 deep water, 💧 shallow, 🏜 sand, 🌿 grass, 🌺 bloom, 🪨 rock"),
+            Line::raw("          lush/barren variants may appear: 🐟, 🌴, 🌾, 🥀"),
+            Line::raw(" Agents:  single 🐇 herb, 🦝 omni, 🦊 carn; small groups 🐑/🐻/🐺; large 👥"),
+            Line::raw("          boosted 🚀; spike peak ⚔ (underlined)"),
+            Line::raw(" Narrow:  width-1 symbols: ≈ ~ · \" * ^; agents h/H, o/O, c/C; groups @"),
         ];
+
+        // Compute a suitable height based on content and available space
+        let desired_height = (help_lines.len() as u16).saturating_add(2);
+        let help_height = desired_height.min(size.height.saturating_sub(2).max(8));
+        let help_x = size.x + (size.width - help_width) / 2;
+        let help_y = size.y + (size.height - help_height) / 2;
+        let area = Rect::new(help_x, help_y, help_width, help_height);
 
         let paragraph = Paragraph::new(help_lines).block(
             Block::default()
-                .title(self.palette.title("Help"))
+                .title(self.palette.title("Help — controls & legend"))
                 .borders(Borders::ALL)
                 .style(if self.palette.has_color() {
                     Style::default().bg(Color::Black).fg(Color::White)
