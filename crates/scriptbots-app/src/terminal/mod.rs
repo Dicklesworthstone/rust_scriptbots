@@ -1845,18 +1845,9 @@ impl Palette {
             match total {
                 0 => ' ',
                 1 => {
-                    let heading_fn = if self.is_emoji_narrow() {
-                        |ang: f32| -> char {
-                            let normalized = ang.rem_euclid(TAU);
-                            let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
-                            match sector { 0 => '>', 1 => '/', 2 => '^', 3 => '\\', 4 => '<', 5 => '/', 6 => 'v', _ => '\\' }
-                        }
-                    } else {
-                        move |ang: f32| -> char { Self::heading_char_pretty(ang) }
-                    };
                     occupancy
                     .mean_heading()
-                    .map(heading_fn)
+                    .map(|ang| self.heading_char(ang))
                     .unwrap_or_else(|| match class {
                         DietClass::Herbivore => if self.is_emoji_narrow() { 'h' } else { '🐇' },
                         DietClass::Omnivore => if self.is_emoji_narrow() { 'o' } else { '🦝' },
@@ -1875,7 +1866,7 @@ impl Palette {
                 0 => ' ',
                 1 => occupancy
                     .mean_heading()
-                    .map(Self::heading_char_pretty)
+                    .map(|ang| self.heading_char(ang))
                     .unwrap_or_else(|| match class {
                         DietClass::Herbivore => 'h',
                         DietClass::Omnivore => 'o',

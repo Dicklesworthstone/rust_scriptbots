@@ -950,7 +950,7 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
 }
 
 fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
-    let (collector, _handle) = ReplayCollector::with_capacity(tick_limit as usize);
+    let (collector, _handle) = ReplayCollector::new();
     let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
     let brain_keys = install_brains(&mut world);
     seed_agents(&mut world, &brain_keys);
