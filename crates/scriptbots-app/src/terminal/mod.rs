@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     f32::consts::{PI, TAU},
     fs::{self, File},
     io::{self, Stdout},
@@ -27,6 +27,7 @@ use ratatui::{
 use scriptbots_core::{
     AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
 };
+use scriptbots_storage::MetricReading;
 use serde::Serialize;
 use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
@@ -44,6 +45,7 @@ const DEFAULT_HEADLESS_FRAMES: usize = 12;
 const MAX_HEADLESS_FRAMES: usize = 360;
 const EVENT_LOG_CAPACITY: usize = 16;
 const LEADERBOARD_LIMIT: usize = 6;
+const BRAINBOARD_LIMIT: usize = 4;
 
 pub struct TerminalRenderer {
     tick_interval: Duration,
@@ -179,7 +181,7 @@ impl TerminalRenderer {
 
 struct TerminalApp<'a> {
     world: SharedWorld,
-    _storage: SharedStorage,
+    storage: SharedStorage,
     _control: &'a ControlRuntime,
     command_drain: CommandDrain,
     _command_submit: CommandSubmit,
@@ -200,6 +202,9 @@ struct TerminalApp<'a> {
     last_autopause_tick: Option<u64>,
     map_scratch: Vec<CellOccupancy>,
     map_stamp: u32,
+    analytics: Option<TerminalAnalytics>,
+    analytics_tick: Option<u64>,
+    expanded: bool,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -214,7 +219,7 @@ impl<'a> TerminalApp<'a> {
         };
         let mut app = Self {
             world: Arc::clone(&ctx.world),
-            _storage: Arc::clone(&ctx.storage),
+            storage: Arc::clone(&ctx.storage),
             _control: ctx.control_runtime,
             command_drain: Arc::clone(&ctx.command_drain),
             _command_submit: Arc::clone(&ctx.command_submit),
@@ -235,6 +240,9 @@ impl<'a> TerminalApp<'a> {
             last_autopause_tick: None,
             map_scratch: Vec::new(),
             map_stamp: 1,
+            analytics: None,
+            analytics_tick: None,
+            expanded: false,
         };
         app.refresh_snapshot();
         app
@@ -311,6 +319,8 @@ impl<'a> TerminalApp<'a> {
                 Constraint::Length(5),
                 Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
                 Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                Constraint::Length(7),
+                Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
                 Constraint::Min(3),
             ])
             .split(body[1]);
@@ -319,10 +329,32 @@ impl<'a> TerminalApp<'a> {
         self.draw_trends(frame, sidebar[1], &self.snapshot);
         self.draw_leaderboard(frame, sidebar[2], &self.snapshot);
         self.draw_oldest(frame, sidebar[3], &self.snapshot);
-        self.draw_events(frame, sidebar[4], &self.snapshot);
+        // Refresh analytics opportunistically before drawing insights/brains
+        self.maybe_refresh_analytics();
+        self.draw_insights(frame, sidebar[4], &self.snapshot);
+        self.draw_brains(frame, sidebar[5], &self.snapshot);
+        self.draw_events(frame, sidebar[6], &self.snapshot);
 
         if self.help_visible {
             self.draw_help(frame);
+        }
+    }
+
+    fn maybe_refresh_analytics(&mut self) {
+        let tick = self.snapshot.tick;
+        if self.analytics_tick == Some(tick) {
+            return;
+        }
+        match self.storage.try_lock() {
+            Ok(mut guard) => {
+                if let Ok(readings) = guard.latest_metrics(256) {
+                    if let Some(ana) = parse_terminal_analytics(tick, self.snapshot.agent_count, &readings) {
+                        self.analytics = Some(ana);
+                        self.analytics_tick = Some(tick);
+                    }
+                }
+            }
+            Err(_) => {}
         }
     }
 
@@ -665,6 +697,77 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(List::new(events).block(block), area);
     }
 
+    fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(ana) = &self.analytics {
+            lines.push(Line::from(vec![
+                Span::styled("Age ", self.palette.header_style()),
+                Span::raw(format!("μ {:>4.1}  max {:>3}", ana.age_mean, ana.age_max)),
+                Span::raw("  "),
+                Span::styled("Boost ", self.palette.accent_style()),
+                Span::raw(format!("{:>3} ({:>4.1}%)", ana.boost_count, ana.boost_ratio * 100.0)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Food ", self.palette.header_style()),
+                Span::raw(format!("μ {:>4.2}  σ {:>4.2}", ana.food_mean, ana.food_stddev)),
+                Span::raw("  "),
+                Span::styled("Gen ", self.palette.header_style()),
+                Span::raw(format!("μ {:>4.1}  max {:>3.0}", ana.generation_mean, ana.generation_max)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Mutation ", self.palette.header_style()),
+                Span::raw(format!("pri μ {:>4.2}  sec μ {:>4.2}", ana.mutation_primary_mean, ana.mutation_secondary_mean)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Behavior H ", self.palette.header_style()),
+                Span::raw(format!("sens {:>4.2}  out {:>4.2}", ana.behavior_sensor_entropy, ana.behavior_output_entropy)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Deaths ", self.palette.header_style()),
+                Span::raw(format!("total {:>4}", ana.deaths_total)),
+                Span::raw("  "),
+                Span::styled("Births ", self.palette.header_style()),
+                Span::raw(format!("{:>4}  hybrid {:>3} ({:>4.1}%)", ana.births_total, ana.births_hybrid, ana.births_hybrid_ratio * 100.0)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![Span::raw("Analytics warming up… (run a few ticks) ")]));
+        }
+
+        let paragraph = Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .title(self.palette.title("Insights"))
+                .borders(Borders::ALL),
+        );
+        frame.render_widget(paragraph, area);
+    }
+
+    fn draw_brains(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        let mut items: Vec<ListItem> = Vec::new();
+        if let Some(ana) = &self.analytics {
+            let total_agents = snapshot.agent_count.max(1) as f64;
+            let mut rows = 0usize;
+            for entry in ana.brain_shares.iter().take(BRAINBOARD_LIMIT) {
+                let share = (entry.count as f64 / total_agents * 100.0).clamp(0.0, 100.0);
+                let spans = vec![
+                    Span::styled(format!("{:<10}", entry.label), self.palette.header_style()),
+                    Span::raw("  "),
+                    Span::raw(format!("{:>4} {:>5.1}%  ⚡{:>4.2}", entry.count, share, entry.avg_energy)),
+                ];
+                items.push(ListItem::new(Line::from(spans)));
+                rows += 1;
+            }
+            if rows == 0 {
+                items.push(ListItem::new(Span::raw("No brain metrics yet")));
+            }
+        } else {
+            items.push(ListItem::new(Span::raw("Metrics not yet available")));
+        }
+        let block = Block::default()
+            .title(self.palette.title("Brains"))
+            .borders(Borders::ALL);
+        frame.render_widget(List::new(items).block(block), area);
+    }
+
     fn draw_help(&self, frame: &mut Frame<'_>) {
         let size = frame.area();
         let help_width = (size.width as f32 * 0.6).round() as u16;
@@ -997,6 +1100,97 @@ struct Baseline {
     agent_count: usize,
     avg_energy: f32,
     avg_health: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalAnalytics {
+    age_mean: f64,
+    age_max: f64,
+    boost_count: usize,
+    boost_ratio: f64,
+    food_mean: f64,
+    food_stddev: f64,
+    generation_mean: f64,
+    generation_max: f64,
+    mutation_primary_mean: f64,
+    mutation_secondary_mean: f64,
+    behavior_sensor_entropy: f64,
+    behavior_output_entropy: f64,
+    deaths_total: usize,
+    births_total: usize,
+    births_hybrid: usize,
+    births_hybrid_ratio: f64,
+    brain_shares: Vec<BrainShareEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct BrainShareEntry {
+    label: String,
+    count: usize,
+    avg_energy: f64,
+}
+
+fn parse_terminal_analytics(
+    _tick: u64,
+    agent_count: usize,
+    readings: &[MetricReading],
+) -> Option<TerminalAnalytics> {
+    if readings.is_empty() {
+        return None;
+    }
+    let mut metrics: HashMap<String, f64> = HashMap::with_capacity(readings.len());
+    for r in readings {
+        metrics.insert(r.name.clone(), r.value);
+    }
+    let value = |k: &str| metrics.get(k).copied();
+    let as_count = |k: &str| value(k).unwrap_or(0.0).max(0.0).round() as usize;
+
+    let boost_count = as_count("behavior.boost.count");
+    let boost_ratio = value("behavior.boost.ratio").unwrap_or_else(|| {
+        if agent_count > 0 { boost_count as f64 / agent_count as f64 } else { 0.0 }
+    });
+
+    // Brain shares aggregation
+    let mut brain_map: HashMap<String, BrainShareEntry> = HashMap::new();
+    for (name, &v) in &metrics {
+        if let Some(rest) = name.strip_prefix("brain.population.") {
+            if let Some(label) = rest.strip_suffix(".count") {
+                let entry = brain_map.entry(label.to_string()).or_insert(BrainShareEntry {
+                    label: label.to_string(), count: 0, avg_energy: 0.0
+                });
+                entry.count = v.max(0.0).round() as usize;
+                continue;
+            }
+            if let Some(label) = rest.strip_suffix(".avg_energy") {
+                let entry = brain_map.entry(label.to_string()).or_insert(BrainShareEntry {
+                    label: label.to_string(), count: 0, avg_energy: 0.0
+                });
+                entry.avg_energy = v;
+            }
+        }
+    }
+    let mut brain_shares: Vec<BrainShareEntry> = brain_map.into_values().collect();
+    brain_shares.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+
+    Some(TerminalAnalytics {
+        age_mean: value("population.age.mean").unwrap_or(0.0),
+        age_max: value("population.age.max").unwrap_or(0.0),
+        boost_count,
+        boost_ratio,
+        food_mean: value("food.mean").unwrap_or(0.0),
+        food_stddev: value("food.stddev").unwrap_or(0.0),
+        generation_mean: value("population.generation.mean").unwrap_or(0.0),
+        generation_max: value("population.generation.max").unwrap_or(0.0),
+        mutation_primary_mean: value("mutation.primary.mean").unwrap_or(0.0),
+        mutation_secondary_mean: value("mutation.secondary.mean").unwrap_or(0.0),
+        behavior_sensor_entropy: value("behavior.sensor.entropy").unwrap_or(0.0),
+        behavior_output_entropy: value("behavior.output.entropy").unwrap_or(0.0),
+        deaths_total: as_count("mortality.total.count"),
+        births_total: as_count("births.total.count"),
+        births_hybrid: as_count("births.hybrid.count"),
+        births_hybrid_ratio: value("births.hybrid.ratio").unwrap_or(0.0),
+        brain_shares,
+    })
 }
 
 fn diff_i(value: i64) -> String {
