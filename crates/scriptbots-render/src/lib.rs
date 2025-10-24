@@ -9684,8 +9684,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     let base_scale = (width_px / world_w).min(height_px / world_h).max(0.000_1);
     let scale = base_scale * camera_guard.zoom;
-    let mut render_w = world_w * scale;
-    let mut render_h = world_h * scale;
+    let render_w = world_w * scale;
+    let render_h = world_h * scale;
     let pad_x = (width_px - render_w) * 0.5;
     let pad_y = (height_px - render_h) * 0.5;
 
@@ -9711,10 +9711,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         // Recompute offsets with updated camera state
         offset_x = origin_x + pad_x + camera_guard.offset_px.0;
         offset_y = origin_y + pad_y + camera_guard.offset_px.1;
-        render_left = offset_x;
-        render_top = offset_y;
-        render_right = offset_x + render_w;
-        render_bottom = offset_y + render_h;
+        // Values will be recomputed below after any follow-target recentering
     }
 
     camera_guard.record_render_metrics(
@@ -9735,6 +9732,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     // Follow target may change camera offset; recompute offsets if it did
     offset_x = origin_x + pad_x + camera_guard.offset_px.0;
     offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+    // Finalize render rect from the latest camera offsets
     render_left = offset_x;
     render_top = offset_y;
     render_right = offset_x + render_w;
