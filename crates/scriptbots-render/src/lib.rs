@@ -8506,12 +8506,20 @@ fn paint_terrain_layer(
     if stride > 1 {
         // Coarse block path: fill aggregated blocks using the top-left sample
         let block_px = (cell_px * stride as f32).max(1.0);
+        // Compute view bounds to cull blocks
+        let view_left = f32::from(window.origin().x);
+        let view_top = f32::from(window.origin().y);
+        let view_right = view_left + f32::from(window.size().width);
+        let view_bottom = view_top + f32::from(window.size().height);
         for y in (0..height).step_by(stride) {
             for x in (0..width).step_by(stride) {
                 let idx = y * width + x;
                 let Some(tile) = terrain.tiles.get(idx).copied() else { continue };
                 let px_x = offset_x + (x as f32 * cell_world * scale);
                 let px_y = offset_y + (y as f32 * cell_world * scale);
+                if px_x > view_right || px_y > view_bottom || px_x + block_px < view_left || px_y + block_px < view_top {
+                    continue;
+                }
                 let surface = terrain_surface_color(tile, daylight, palette);
                 let bounds = Bounds::new(point(px(px_x), px(px_y)), size(px(block_px), px(block_px)));
                 window.paint_quad(fill(bounds, Background::from(surface)));
@@ -8520,6 +8528,11 @@ fn paint_terrain_layer(
         return;
     }
 
+    // Fine path: per-cell render with culling and reused px conversions
+    let view_left = f32::from(window.origin().x);
+    let view_top = f32::from(window.origin().y);
+    let view_right = view_left + f32::from(window.size().width);
+    let view_bottom = view_top + f32::from(window.size().height);
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
@@ -8529,10 +8542,14 @@ fn paint_terrain_layer(
 
             let px_x = offset_x + (x as f32 * cell_world * scale);
             let px_y = offset_y + (y as f32 * cell_world * scale);
+            if px_x > view_right || px_y > view_bottom || px_x + cell_px < view_left || px_y + cell_px < view_top {
+                continue;
+            }
 
             let surface = terrain_surface_color(tile, daylight, palette);
-            let cell_bounds =
-                Bounds::new(point(px(px_x), px(px_y)), size(px(cell_px), px(cell_px)));
+            let px_xu = px(px_x);
+            let px_yu = px(px_y);
+            let cell_bounds = Bounds::new(point(px_xu, px_yu), size(px(cell_px), px(cell_px)));
             window.paint_quad(fill(cell_bounds, Background::from(surface)));
 
             if tile.slope > 0.12 {
