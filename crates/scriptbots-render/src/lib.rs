@@ -8835,6 +8835,11 @@ fn apply_post_processing(
     let bounds_size = bounds.size;
     let width_px = f32::from(bounds_size.width).max(1.0);
     let height_px = f32::from(bounds_size.height).max(1.0);
+    // Window-space view bounds
+    let view_left = f32::from(origin.x);
+    let view_top = f32::from(origin.y);
+    let view_right = view_left + width_px;
+    let view_bottom = view_top + height_px;
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
@@ -9023,10 +9028,16 @@ fn paint_debug_overlays(
 
     let wants_sense = debug.show_sense_radius && frame.sense_radius > 0.0;
     let wants_velocity = debug.show_velocity;
-    let mut sense_path = if wants_sense { Some(PathBuilder::stroke(px(1.4))) } else { None };
-    let mut vel_shaft_path = if wants_velocity { Some(PathBuilder::stroke(px(1.6))) } else { None };
-    let mut vel_head_path = if wants_velocity { Some(PathBuilder::stroke(px(1.2))) } else { None };
+    // Lazily create paths only if they are actually used (reduces per-frame allocations)
+    let mut sense_path: Option<PathBuilder> = None;
+    let mut vel_shaft_path: Option<PathBuilder> = None;
+    let mut vel_head_path: Option<PathBuilder> = None;
     let mut crosshair_path = if focus_agent.is_some() { Some(PathBuilder::stroke(px(1.6))) } else { None };
+
+    // If nothing is requested, return early
+    if !wants_sense && !wants_velocity && crosshair_path.is_none() {
+        return;
+    }
 
     let view_left = f32::from(bounds.origin.x);
     let view_top = f32::from(bounds.origin.y);
@@ -9045,10 +9056,10 @@ fn paint_debug_overlays(
         if wants_sense
             && matches!(agent.selection, SelectionState::Selected | SelectionState::Hovered)
         {
-            if let Some(builder) = sense_path.as_mut() {
-                let radius_px = (frame.sense_radius * scale).max(4.0);
-                append_arc_polyline(builder, px_x, px_y, radius_px, 0.0, 360.0);
-            }
+            if sense_path.is_none() { sense_path = Some(PathBuilder::stroke(px(1.4))); }
+            let builder = sense_path.as_mut().expect("sense_path just created");
+            let radius_px = (frame.sense_radius * scale).max(4.0);
+            append_arc_polyline(builder, px_x, px_y, radius_px, 0.0, 360.0);
         }
 
         if wants_velocity {
@@ -9066,29 +9077,31 @@ fn paint_debug_overlays(
                 let tip_x = px_x + norm_x * arrow_length;
                 let tip_y = px_y + norm_y * arrow_length;
 
-                if let Some(builder) = vel_shaft_path.as_mut() {
-                    builder.move_to(point(px(px_x), px(px_y)));
-                    builder.line_to(point(px(tip_x), px(tip_y)));
-                }
+                if vel_shaft_path.is_none() { vel_shaft_path = Some(PathBuilder::stroke(px(1.6))); }
+                let builder = vel_shaft_path.as_mut().expect("vel_shaft_path just created");
+                builder.move_to(point(px(px_x), px(px_y)));
+                builder.line_to(point(px(tip_x), px(tip_y)));
 
+                // Arrow head using fixed-angle rotation (avoid per-agent atan2/cos/sin)
+                // angle = 0.5 rad; cos ~= 0.87758256, sin ~= 0.47942555
                 let head_size = (arrow_length * 0.18).clamp(4.0, 14.0);
-                let angle = vy.atan2(vx);
-                let left_angle = angle + PI - 0.5;
-                let right_angle = angle + PI + 0.5;
-                let left_point = point(
-                    px(tip_x + head_size * left_angle.cos()),
-                    px(tip_y + head_size * left_angle.sin()),
-                );
-                let right_point = point(
-                    px(tip_x + head_size * right_angle.cos()),
-                    px(tip_y + head_size * right_angle.sin()),
-                );
-                if let Some(builder) = vel_head_path.as_mut() {
-                    builder.move_to(point(px(tip_x), px(tip_y)));
-                    builder.line_to(left_point);
-                    builder.move_to(point(px(tip_x), px(tip_y)));
-                    builder.line_to(right_point);
-                }
+                let back = head_size * 0.877_582_56_f32;
+                let side = head_size * 0.479_425_55_f32;
+                // Perpendicular to direction
+                let perp_x = -norm_y;
+                let perp_y = norm_x;
+                // Left and right points relative to tip
+                let left_x = tip_x - back * norm_x + side * perp_x;
+                let left_y = tip_y - back * norm_y + side * perp_y;
+                let right_x = tip_x - back * norm_x - side * perp_x;
+                let right_y = tip_y - back * norm_y - side * perp_y;
+
+                if vel_head_path.is_none() { vel_head_path = Some(PathBuilder::stroke(px(1.2))); }
+                let builder = vel_head_path.as_mut().expect("vel_head_path just created");
+                builder.move_to(point(px(tip_x), px(tip_y)));
+                builder.line_to(point(px(left_x), px(left_y)));
+                builder.move_to(point(px(tip_x), px(tip_y)));
+                builder.line_to(point(px(right_x), px(right_y)));
             }
         }
 
@@ -9136,6 +9149,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     let low_fps = state.perf.fps > 0.0 && state.perf.fps < 30.0;
     let very_low_fps = state.perf.fps > 0.0 && state.perf.fps < 24.0;
+    let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);
 
     let mut camera_guard = camera.lock().expect("camera lock poisoned");
 
@@ -9168,7 +9182,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     drop(camera_guard);
 
     let day_phase = frame.tick as f32 * 0.00025;
-    let daylight = day_phase.sin() * 0.5 + 0.5;
+    let phase_sin = day_phase.sin();
+    let daylight = phase_sin * 0.5 + 0.5;
 
     if safe_mode_enabled() {
         // Conservative background fill (bypass gradient blending that could expose format issues)
@@ -9184,7 +9199,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         );
         window.paint_quad(fill(
             bounds,
-            Background::from(apply_palette(sky_base, frame.palette)),
+            Background::from(if palette_is_natural { sky_base } else { apply_palette(sky_base, frame.palette) }),
         ));
     }
 
@@ -9197,10 +9212,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             ),
             size(px(width_px), px(horizon_height)),
         );
-        let horizon_color = apply_palette(
-            rgba_from_hex(0xffa94d, (0.12 + 0.25 * daylight).clamp(0.0, 0.3)),
-            frame.palette,
-        );
+        let horizon_base = rgba_from_hex(0xffa94d, (0.12 + 0.25 * daylight).clamp(0.0, 0.3));
+        let horizon_color = if palette_is_natural { horizon_base } else { apply_palette(horizon_base, frame.palette) };
         window.paint_quad(fill(horizon_bounds, Background::from(horizon_color)));
     }
 
@@ -9210,10 +9223,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             point(px(f32::from(origin.x)), px(f32::from(origin.y))),
             size(px(width_px), px(height_px * 0.25)),
         );
-        let aurora_color = apply_palette(
-            rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength),
-            frame.palette,
-        );
+        let aurora_base = rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength);
+        let aurora_color = if palette_is_natural { aurora_base } else { apply_palette(aurora_base, frame.palette) };
         window.paint_quad(fill(aurora_bounds, Background::from(aurora_color)));
     }
 
@@ -9237,11 +9248,6 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         let cell_world = frame.food_cell_size as f32;
         let cell_px = (cell_world * scale).max(1.0);
         let inv_cell_px = if cell_px > f32::EPSILON { 1.0 / cell_px } else { 0.0 };
-        let view_left = f32::from(origin.x);
-        let view_top = f32::from(origin.y);
-        let view_right = view_left + width_px;
-        let view_bottom = view_top + height_px;
-
         let mut x_min = ((view_left - offset_x) * inv_cell_px).floor() as isize;
         let mut x_max = ((view_right - offset_x) * inv_cell_px).ceil() as isize;
         let mut y_min = ((view_top - offset_y) * inv_cell_px).floor() as isize;
@@ -9275,7 +9281,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
                     let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
                     color = scale_rgb(color, shade);
-                    color = apply_palette(color, frame.palette);
+                    if !palette_is_natural { color = apply_palette(color, frame.palette); }
 
                     // Quantize based on luminance to group similar colors
                     let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
@@ -9323,7 +9329,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
                     let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
                     color = scale_rgb(color, shade);
-                    color = apply_palette(color, frame.palette);
+                    if !palette_is_natural { color = apply_palette(color, frame.palette); }
                     let px_x = offset_x + (x as f32 * cell_world * scale);
                     let px_y = offset_y + (y as f32 * cell_world * scale);
                     let cell_bounds =
@@ -9335,137 +9341,193 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     }
 
     if controls.draw_agents {
-        let view_left = f32::from(origin.x);
-        let view_top = f32::from(origin.y);
-        let view_right = view_left + width_px;
-        let view_bottom = view_top + height_px;
+        if very_low_fps {
+            // Quantized batching for agent body quads to reduce draw calls under heavy load
+            const AGENT_BINS: usize = 24;
+            let mut builders: [Option<PathBuilder>; AGENT_BINS] = [
+                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+            ];
+            let mut colors: [Option<Rgba>; AGENT_BINS] = [None; AGENT_BINS];
 
-        for agent in &frame.agents {
-            let px_x = offset_x + agent.position.x * scale;
-            let px_y = offset_y + agent.position.y * scale;
-            let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
-            let size_px = (dynamic_radius * scale).max(2.0);
-            let half = size_px * 0.5;
+            for agent in &frame.agents {
+                let px_x = offset_x + agent.position.x * scale;
+                let px_y = offset_y + agent.position.y * scale;
+                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
+                let size_px = (dynamic_radius * scale).max(2.0);
+                let half = size_px * 0.5;
 
-            // Cull off-screen agents
-            if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
-                continue;
-            }
-            // Inline highlights without allocating
-            if !very_low_fps {
-                match agent.selection {
-                    SelectionState::Selected => {
-                        let factor = 1.8;
-                        let highlight = apply_palette(
-                            Rgba { r: 0.20, g: 0.65, b: 0.96, a: 0.35 },
-                            frame.palette,
-                        );
-                        let highlight_size = size_px * factor;
-                        let highlight_half = highlight_size * 0.5;
-                        let highlight_bounds = Bounds::new(
-                            point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                            size(px(highlight_size), px(highlight_size)),
-                        );
-                        window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
-                    }
-                    SelectionState::Hovered => {
-                        let factor = 1.4;
-                        let highlight = apply_palette(
-                            Rgba { r: 0.92, g: 0.58, b: 0.20, a: 0.30 },
-                            frame.palette,
-                        );
-                        let highlight_size = size_px * factor;
-                        let highlight_half = highlight_size * 0.5;
-                        let highlight_bounds = Bounds::new(
-                            point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                            size(px(highlight_size), px(highlight_size)),
-                        );
-                        window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
-                    }
-                    SelectionState::None => {}
+                // Cull off-screen agents
+                if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
+                    continue;
                 }
 
-                if focus_agent == Some(agent.agent_id) {
-                    let factor = 2.05;
-                    let highlight = apply_palette(
-                        Rgba { r: 0.45, g: 0.88, b: 0.97, a: 0.32 },
+                // Body color (approximate binning by luminance)
+                let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
+                let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
+            let mut color = agent_color(agent, agent_shade);
+            if !palette_is_natural { color = apply_palette(color, frame.palette); }
+                let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+                let mut bin = ((luma * (AGENT_BINS as f32)) as isize).clamp(0, (AGENT_BINS as isize) - 1) as usize;
+                if bin == 0 && luma > 0.0 { bin = 1; }
+
+                // Append rectangle for agent body
+                if let Some(builder) = builders[bin].as_mut() {
+                    let x0 = px(px_x - half);
+                    let y0 = px(px_y - half);
+                    let x1 = px(px_x + half);
+                    let y1 = px(px_y + half);
+                    builder.move_to(point(x0, y0));
+                    builder.line_to(point(x1, y0));
+                    builder.line_to(point(x1, y1));
+                    builder.line_to(point(x0, y1));
+                    builder.close();
+                }
+                if colors[bin].is_none() {
+                    colors[bin] = Some(color);
+                }
+
+                // Defer outlines (batched later). Skip highlights/effects under very low FPS.
+            }
+            for b in 0..AGENT_BINS {
+                if let (Some(builder), Some(col)) = (builders[b].take(), colors[b]) {
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, col);
+                    }
+                }
+            }
+        } else {
+            for agent in &frame.agents {
+                let px_x = offset_x + agent.position.x * scale;
+                let px_y = offset_y + agent.position.y * scale;
+                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
+                let size_px = (dynamic_radius * scale).max(2.0);
+                let half = size_px * 0.5;
+
+                // Cull off-screen agents
+                if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
+                    continue;
+                }
+                // Inline highlights without allocating
+                if !very_low_fps {
+                    match agent.selection {
+                        SelectionState::Selected => {
+                            let factor = 1.8;
+                            let highlight = apply_palette(
+                                Rgba { r: 0.20, g: 0.65, b: 0.96, a: 0.35 },
+                                frame.palette,
+                            );
+                            let highlight_size = size_px * factor;
+                            let highlight_half = highlight_size * 0.5;
+                            let highlight_bounds = Bounds::new(
+                                point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                                size(px(highlight_size), px(highlight_size)),
+                            );
+                            window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                        }
+                        SelectionState::Hovered => {
+                            let factor = 1.4;
+                            let highlight = apply_palette(
+                                Rgba { r: 0.92, g: 0.58, b: 0.20, a: 0.30 },
+                                frame.palette,
+                            );
+                            let highlight_size = size_px * factor;
+                            let highlight_half = highlight_size * 0.5;
+                            let highlight_bounds = Bounds::new(
+                                point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                                size(px(highlight_size), px(highlight_size)),
+                            );
+                            window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                        }
+                        SelectionState::None => {}
+                    }
+
+                    if focus_agent == Some(agent.agent_id) {
+                        let factor = 2.05;
+                        let highlight = apply_palette(
+                            Rgba { r: 0.45, g: 0.88, b: 0.97, a: 0.32 },
+                            frame.palette,
+                        );
+                        let highlight_size = size_px * factor;
+                        let highlight_half = highlight_size * 0.5;
+                        let highlight_bounds = Bounds::new(
+                            point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                            size(px(highlight_size), px(highlight_size)),
+                        );
+                        window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                    }
+                }
+
+                // Defer agent outlines to a single batched pass below
+
+                if agent.indicator.intensity > 0.05 && !low_fps {
+                    let effect = agent.indicator.intensity.clamp(0.0, 1.0);
+                    let indicator_size = size_px * (1.2 + effect * 1.4);
+                    let indicator_half = indicator_size * 0.5;
+                    let indicator_bounds = Bounds::new(
+                        point(px(px_x - indicator_half), px(px_y - indicator_half)),
+                        size(px(indicator_size), px(indicator_size)),
+                    );
+                    let indicator_color = apply_palette(
+                        rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect),
                         frame.palette,
                     );
-                    let highlight_size = size_px * factor;
-                    let highlight_half = highlight_size * 0.5;
-                    let highlight_bounds = Bounds::new(
-                        point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                        size(px(highlight_size), px(highlight_size)),
-                    );
-                    window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                    window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
                 }
+
+                if agent.reproduction_intent > 0.2 && !low_fps {
+                    let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
+                    let pulse_size = size_px * (1.8 + pulse * 1.6);
+                    let pulse_half = pulse_size * 0.5;
+                    let pulse_bounds = Bounds::new(
+                        point(px(px_x - pulse_half), px(px_y - pulse_half)),
+                        size(px(pulse_size), px(pulse_size)),
+                    );
+                    let pulse_color = apply_palette(
+                        Rgba {
+                            r: 0.88,
+                            g: 0.36,
+                            b: 0.86,
+                            a: 0.18 + 0.28 * pulse,
+                        },
+                        frame.palette,
+                    );
+                    window.paint_quad(fill(pulse_bounds, Background::from(pulse_color)));
+                }
+
+                if agent.spiked {
+                    let spike_size = size_px * 2.2;
+                    let spike_half = spike_size * 0.5;
+                    let spike_bounds = Bounds::new(
+                        point(px(px_x - spike_half), px(px_y - spike_half)),
+                        size(px(spike_size), px(spike_size)),
+                    );
+                    let spike_color = apply_palette(
+                        Rgba {
+                            r: 0.95,
+                            g: 0.25,
+                            b: 0.35,
+                            a: 0.28,
+                        },
+                        frame.palette,
+                    );
+                    window.paint_quad(fill(spike_bounds, Background::from(spike_color)));
+                }
+
+                let agent_bounds = Bounds::new(
+                    point(px(px_x - half), px(px_y - half)),
+                    size(px(size_px), px(size_px)),
+                );
+                let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
+                let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
+                let mut color = agent_color(agent, agent_shade);
+                if !palette_is_natural { color = apply_palette(color, frame.palette); }
+                window.paint_quad(fill(agent_bounds, Background::from(color)));
             }
-
-            // Defer agent outlines to a single batched pass below
-
-            if agent.indicator.intensity > 0.05 && !low_fps {
-                let effect = agent.indicator.intensity.clamp(0.0, 1.0);
-                let indicator_size = size_px * (1.2 + effect * 1.4);
-                let indicator_half = indicator_size * 0.5;
-                let indicator_bounds = Bounds::new(
-                    point(px(px_x - indicator_half), px(px_y - indicator_half)),
-                    size(px(indicator_size), px(indicator_size)),
-                );
-                let indicator_color = apply_palette(
-                    rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect),
-                    frame.palette,
-                );
-                window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
-            }
-
-            if agent.reproduction_intent > 0.2 && !low_fps {
-                let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
-                let pulse_size = size_px * (1.8 + pulse * 1.6);
-                let pulse_half = pulse_size * 0.5;
-                let pulse_bounds = Bounds::new(
-                    point(px(px_x - pulse_half), px(px_y - pulse_half)),
-                    size(px(pulse_size), px(pulse_size)),
-                );
-                let pulse_color = apply_palette(
-                    Rgba {
-                        r: 0.88,
-                        g: 0.36,
-                        b: 0.86,
-                        a: 0.18 + 0.28 * pulse,
-                    },
-                    frame.palette,
-                );
-                window.paint_quad(fill(pulse_bounds, Background::from(pulse_color)));
-            }
-
-            if agent.spiked {
-                let spike_size = size_px * 2.2;
-                let spike_half = spike_size * 0.5;
-                let spike_bounds = Bounds::new(
-                    point(px(px_x - spike_half), px(px_y - spike_half)),
-                    size(px(spike_size), px(spike_size)),
-                );
-                let spike_color = apply_palette(
-                    Rgba {
-                        r: 0.95,
-                        g: 0.25,
-                        b: 0.35,
-                        a: 0.28,
-                    },
-                    frame.palette,
-                );
-                window.paint_quad(fill(spike_bounds, Background::from(spike_color)));
-            }
-
-            let agent_bounds = Bounds::new(
-                point(px(px_x - half), px(px_y - half)),
-                size(px(size_px), px(size_px)),
-            );
-            let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
-            let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-            let mut color = agent_color(agent, agent_shade);
-            color = apply_palette(color, frame.palette);
-            window.paint_quad(fill(agent_bounds, Background::from(color)));
         }
     }
 

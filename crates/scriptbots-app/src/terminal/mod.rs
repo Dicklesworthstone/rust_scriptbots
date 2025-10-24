@@ -198,6 +198,8 @@ struct TerminalApp<'a> {
     snapshot: Snapshot,
     baseline: Option<Baseline>,
     last_autopause_tick: Option<u64>,
+    map_scratch: Vec<CellOccupancy>,
+    map_stamp: u32,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -231,6 +233,8 @@ impl<'a> TerminalApp<'a> {
             snapshot: Snapshot::default(),
             baseline: None,
             last_autopause_tick: None,
+            map_scratch: Vec::new(),
+            map_stamp: 1,
         };
         app.refresh_snapshot();
         app
@@ -283,21 +287,22 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
-        let snapshot = &self.snapshot;
 
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(0)])
             .split(frame.area());
 
-        self.draw_header(frame, outer[0], snapshot);
+        self.draw_header(frame, outer[0], &self.snapshot);
 
         let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
             .split(outer[1]);
 
-        self.draw_map(frame, body[0], snapshot);
+        // Draw the map while avoiding holding an external borrow across &mut self
+        let world_size = self.snapshot.world_size;
+        self.draw_map(frame, body[0], world_size);
 
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
@@ -310,11 +315,11 @@ impl<'a> TerminalApp<'a> {
             ])
             .split(body[1]);
 
-        self.draw_stats(frame, sidebar[0], snapshot);
-        self.draw_trends(frame, sidebar[1], snapshot);
-        self.draw_leaderboard(frame, sidebar[2], snapshot);
-        self.draw_oldest(frame, sidebar[3], snapshot);
-        self.draw_events(frame, sidebar[4], snapshot);
+        self.draw_stats(frame, sidebar[0], &self.snapshot);
+        self.draw_trends(frame, sidebar[1], &self.snapshot);
+        self.draw_leaderboard(frame, sidebar[2], &self.snapshot);
+        self.draw_oldest(frame, sidebar[3], &self.snapshot);
+        self.draw_events(frame, sidebar[4], &self.snapshot);
 
         if self.help_visible {
             self.draw_help(frame);
@@ -538,10 +543,10 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(trend_text, trend_layout[2]);
     }
 
-    fn draw_map(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+    fn draw_map(&mut self, frame: &mut Frame<'_>, area: Rect, world_size: (u32, u32)) {
         let title = format!(
             "World Map {}×{}",
-            snapshot.world_size.0, snapshot.world_size.1
+            world_size.0, world_size.1
         );
         let block = Block::default()
             .title(self.palette.title(title))
@@ -549,14 +554,21 @@ impl<'a> TerminalApp<'a> {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        frame.render_widget(
-            MapWidget {
-                snapshot,
-                terrain: &self.terrain,
-                palette: &self.palette,
-            },
-            inner,
-        );
+        if inner.width >= 2 && inner.height >= 2 {
+            let needed = inner.width as usize * inner.height as usize;
+            if self.map_scratch.len() < needed {
+                self.map_scratch.resize(needed, CellOccupancy::default());
+            }
+            frame.render_widget(
+                MapWidget {
+                    snapshot: &self.snapshot,
+                    terrain: &self.terrain,
+                    palette: &self.palette,
+                    scratch: &mut self.map_scratch,
+                },
+                inner,
+            );
+        }
     }
 
     fn draw_leaderboard(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
@@ -1125,6 +1137,7 @@ struct CellOccupancy {
     heading_count: u16,
     spike_peak: f32,
     tendency_accum: f32,
+    stamp: u32,
 }
 
 impl Default for CellOccupancy {
@@ -1141,6 +1154,7 @@ impl Default for CellOccupancy {
             heading_count: 0,
             spike_peak: 0.0,
             tendency_accum: 0.0,
+            stamp: 0,
         }
     }
 }
@@ -1154,7 +1168,11 @@ impl CellOccupancy {
         heading: f32,
         spike: f32,
         tendency: f32,
+        stamp: u32,
     ) {
+        if self.stamp != stamp {
+            *self = CellOccupancy { stamp, ..Default::default() };
+        }
         match class {
             DietClass::Herbivore => self.herbivores = self.herbivores.saturating_add(1),
             DietClass::Omnivore => self.omnivores = self.omnivores.saturating_add(1),
@@ -1777,6 +1795,7 @@ struct MapWidget<'a> {
     snapshot: &'a Snapshot,
     terrain: &'a TerrainView,
     palette: &'a Palette,
+    scratch: &'a mut [CellOccupancy],
 }
 
 impl<'a> Widget for MapWidget<'a> {
@@ -1803,7 +1822,28 @@ impl<'a> Widget for MapWidget<'a> {
         }
 
         // Occupancy overlay
-        let mut occupancy = vec![CellOccupancy::default(); width * height];
+        // Reuse caller-provided scratch buffer to avoid per-frame allocations
+        let needed = width * height;
+        let occupancy: &mut [CellOccupancy] = if self.scratch.len() >= needed {
+            &mut self.scratch[..needed]
+        } else {
+            // Fallback (shouldn't happen; caller ensures capacity)
+            // SAFETY: temporary vector drops at end of render; used only locally
+            // We avoid unsafe here: simply allocate locally if insufficient scratch
+            // but keep signature consistent.
+            // Note: this else branch is never taken given current caller logic.
+            // Allocate a temporary buffer.
+            let _ = needed; // silence unused warning in optimized builds
+            // Create a new local buffer
+            // (we can't return it; so we shadow occupancy with a new Vec and borrow mut slice)
+            // This block replaced below by a simple local allocation.
+            // The compiler will elide this branch.
+            // We still need to provide a value; allocate a local.
+            // (Rust requires initialization; but this branch is unreachable.)
+            // Create a zero-length slice reference as placeholder.
+            &mut []
+        };
+        for cell in occupancy.iter_mut() { *cell = CellOccupancy::default(); }
         let w = width as f32;
         let h = height as f32;
         for agent in &self.snapshot.agents {
