@@ -9,9 +9,10 @@ use gpui::{
 use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::{
-    AgentColumns, AgentData, AgentId, AgentRuntime, ControlCommand, Generation, INPUT_SIZE,
-    IndicatorState, MutationRates, OUTPUT_SIZE, Position, ScriptBotsConfig, SelectionState,
+    AgentColumns, AgentData, AgentId, AgentRuntime, ControlCommand, Generation,
+    IndicatorState, MutationRates, Position, ScriptBotsConfig, SelectionState,
     TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
+    BrainActivations, ActivationLayer,
 };
 use scriptbots_storage::{MetricReading, Storage};
 use std::{
@@ -4333,14 +4334,14 @@ impl SimulationView {
         // Brain bars (sensors/outputs)
         let sensor_bars = render_brain_bars(&detail.sensors, true);
         let output_bars = render_brain_bars(&detail.outputs, false);
-        let sensors_preview: Vec<String> = detail
+        let _sensors_preview: Vec<String> = detail
             .sensors
             .iter()
             .take(6)
             .enumerate()
             .map(|(idx, value)| format!("s{idx}:{value:.2}"))
             .collect();
-        let outputs_preview: Vec<String> = detail
+        let _outputs_preview: Vec<String> = detail
             .outputs
             .iter()
             .take(4)
