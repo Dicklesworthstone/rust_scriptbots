@@ -22,11 +22,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Widget},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Widget, Clear},
 };
 use scriptbots_core::{
     AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
-    BrainActivations,
+    BrainActivations, ActivationLayer,
 };
 use scriptbots_storage::MetricReading;
 use serde::Serialize;
@@ -180,6 +180,13 @@ impl TerminalRenderer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FocusLockMode {
+    Manual,
+    TopPredator,
+    Oldest,
+}
+
 struct TerminalApp<'a> {
     world: SharedWorld,
     storage: SharedStorage,
@@ -213,6 +220,7 @@ struct TerminalApp<'a> {
     focused_agent_cursor: usize,
     activation_layer_index: usize,
     activation_row_offset: usize,
+    focus_lock: FocusLockMode,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -255,6 +263,7 @@ impl<'a> TerminalApp<'a> {
             focused_agent_cursor: 0,
             activation_layer_index: 0,
             activation_row_offset: 0,
+            focus_lock: FocusLockMode::Manual,
         };
         app.refresh_snapshot();
         app
@@ -307,6 +316,8 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        // Ensure we start from a clean buffer every frame to avoid ghosting artifacts
+        frame.render_widget(Clear, frame.area());
 
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -826,6 +837,17 @@ impl<'a> TerminalApp<'a> {
             lines.push(Line::from(vec![Span::raw("Analytics warming up… (run a few ticks) ")]));
         }
 
+        // Legend for brain paging
+        if self.snapshot.agent_count > 0 {
+            let ai = self.focused_agent_cursor % self.snapshot.agent_count;
+            let total_layers = self.snapshot.brain_layers.len();
+            let li = if total_layers == 0 { 0 } else { self.activation_layer_index.min(total_layers - 1) };
+            lines.push(Line::from(vec![
+                Span::styled("Focus ", self.palette.header_style()),
+                Span::raw(format!("agent #{:>3}  layer {:>2}/{}  row {:>3}", ai, li, total_layers, self.activation_row_offset)),
+            ]));
+        }
+
         // Compact brain activation row if available (pull selected layer)
         if let Some(layer) = self.snapshot.brain_activations_layer_indexed(self.activation_layer_index) {
             if layer.width > 0 && layer.height > 0 {
@@ -1124,7 +1146,10 @@ impl<'a> TerminalApp<'a> {
                 if self.activation_layer_index > 0 { self.activation_layer_index -= 1; }
             }
             (KeyCode::Char(']'), _) => {
-                self.activation_layer_index = self.activation_layer_index.saturating_add(1);
+                if !self.snapshot.brain_layers.is_empty() {
+                    let max = self.snapshot.brain_layers.len() - 1;
+                    if self.activation_layer_index < max { self.activation_layer_index += 1; }
+                }
             }
             (KeyCode::Up, _) => {
                 self.activation_row_offset = self.activation_row_offset.saturating_sub(1);
@@ -1191,12 +1216,14 @@ impl<'a> TerminalApp<'a> {
         let new_snapshot = match self.world.lock() {
             Ok(world) => {
                 let mut snap = Snapshot::from_world(&world);
-                // Select focused agent activations if available
+                // Select focused agent activations if available and populate all layers
                 if snap.agent_count > 0 {
                     let idx = self.focused_agent_cursor % snap.agent_count;
                     if let Some(agent_id) = world.agents().iter_handles().nth(idx) {
                         if let Some(rt) = world.runtime().get(agent_id) {
-                            snap.brain_activations = rt.brain_activations.as_ref().map(BrainLayerView::from_activations);
+                            if let Some(act) = rt.brain_activations.as_ref() {
+                                snap.brain_layers = convert_layers(act);
+                            }
                         }
                     }
                 }
@@ -1493,8 +1520,7 @@ struct Snapshot {
     food: FoodView,
     control: ControlSettings,
     spike_hits: u32,
-    #[allow(dead_code)]
-    brain_activations: Option<BrainLayerView>,
+    brain_layers: Vec<BrainLayerView>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1939,16 +1965,15 @@ impl Snapshot {
             },
             control: config.control.clone(),
             spike_hits: summary.spike_hits,
-            brain_activations: None,
+            brain_layers: Vec::new(),
         }
     }
 
     fn brain_activations_layer(&self) -> Option<&BrainLayerView> {
-        self.brain_activations.as_ref()
+        self.brain_layers.first()
     }
-    fn brain_activations_layer_indexed(&self, _idx: usize) -> Option<&BrainLayerView> {
-        // For now we only expose the first layer in terminal view; index ignored.
-        self.brain_activations.as_ref()
+    fn brain_activations_layer_indexed(&self, idx: usize) -> Option<&BrainLayerView> {
+        self.brain_layers.get(idx)
     }
 }
 
@@ -2632,4 +2657,11 @@ impl BrainLayerView {
         }
         Self { width: 0, height: 0, values: Vec::new() }
     }
+    fn vec_from_activations(act: &BrainActivations) -> Vec<BrainLayerView> {
+        act.layers.iter().map(|l| BrainLayerView { width: l.width, height: l.height, values: l.values.clone() }).collect()
+    }
+}
+
+fn convert_layers(act: &BrainActivations) -> Vec<BrainLayerView> {
+    BrainLayerView::vec_from_activations(act)
 }

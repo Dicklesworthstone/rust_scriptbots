@@ -232,16 +232,9 @@ impl Brain for NeuroflowBrain {
     fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send + Sync) {
         self
     }
-}
 
-impl BrainRunner for scriptbots_brain::BrainRunnerAdapter<NeuroflowBrain> {
-    fn kind(&self) -> &'static str { self.brain.kind().as_str() }
-    fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] { self.brain.tick(inputs) }
     fn snapshot_activations(&self) -> Option<BrainActivations> {
-        // Extract layer outputs (y) from the network by serializing the seed back out.
-        // This is a pragmatic approach since NeuroFlow does not expose public getters for y.
-        // Note: serde reflection of internal state relies on current NeuroFlow structure.
-        let value = serde_json::to_value(&self.brain.network).ok()?;
+        let value = serde_json::to_value(&self.network).ok()?;
         let layers = value.get("layers")?.as_array()?.to_vec();
         let mut result_layers: Vec<ActivationLayer> = Vec::new();
         for (li, layer_val) in layers.iter().enumerate() {
@@ -259,6 +252,8 @@ impl BrainRunner for scriptbots_brain::BrainRunnerAdapter<NeuroflowBrain> {
         Some(BrainActivations { layers: result_layers, connections: Vec::new() })
     }
 }
+
+// snapshot_activations implemented in the existing Brain impl below
 
 #[cfg(test)]
 mod tests {

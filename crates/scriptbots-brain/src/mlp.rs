@@ -149,6 +149,25 @@ impl MlpBrain {
         let u2 = rng.random::<f32>();
         (-2.0 * u1.ln()).sqrt() * (TWO_PI * u2).cos()
     }
+
+    pub(crate) fn activations(&self) -> BrainActivations {
+        // Map internal node outputs into a single-layer activation map for now.
+        let width = 20usize;
+        let height = 10usize;
+        let mut values = vec![0.0_f32; width * height];
+        for (i, node) in self.state.iter().enumerate().take(values.len()) {
+            values[i] = node.output;
+        }
+        BrainActivations {
+            layers: vec![ActivationLayer {
+                name: "mlp.state".to_string(),
+                width,
+                height,
+                values,
+            }],
+            connections: Vec::new(),
+        }
+    }
 }
 
 impl Brain for MlpBrain {
@@ -269,33 +288,11 @@ impl Brain for MlpBrain {
     fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
         self
     }
+
+    fn snapshot_activations(&self) -> Option<BrainActivations> { Some(self.activations()) }
 }
 
-impl BrainRunner for crate::BrainRunnerAdapter<MlpBrain> {
-    fn kind(&self) -> &'static str {
-        self.brain.kind().as_str()
-    }
-
-    fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
-        self.brain.tick(inputs)
-    }
-
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        // Map internal node outputs into a single-layer activation map for now.
-        let width = 20usize;
-        let height = 10usize;
-        let mut values = vec![0.0_f32; width * height];
-        for (i, node) in self.brain.state.iter().enumerate().take(values.len()) {
-            values[i] = node.output;
-        }
-        Some(BrainActivations { layers: vec![ActivationLayer {
-            name: "mlp.state".to_string(),
-            width,
-            height,
-            values,
-        }], connections: Vec::new() })
-    }
-}
+// Specialized adapter impl removed; generic adapter in lib.rs downcasts to call `activations()`.
 
 #[cfg(test)]
 mod tests {

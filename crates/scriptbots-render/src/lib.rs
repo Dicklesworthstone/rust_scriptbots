@@ -12,7 +12,7 @@ use scriptbots_core::{
     AgentColumns, AgentData, AgentId, AgentRuntime, ControlCommand, Generation,
     IndicatorState, MutationRates, Position, ScriptBotsConfig, SelectionState,
     TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
-    BrainActivations, ActivationLayer,
+    BrainActivations, ActivationLayer, ActivationEdge,
 };
 use scriptbots_storage::{MetricReading, Storage};
 use std::{
@@ -6064,9 +6064,10 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
     if let Some(act) = activations {
         for layer in &act.layers {
             let state = layer.clone();
+            let state_for_canvas = state.clone();
             let canvas_el = canvas(
-                move |_, _, _| state.clone(),
-                move |bounds, state, window, _| paint_activation_grid(bounds, state, window),
+                move |_, _, _| state_for_canvas.clone(),
+                move |bounds, st, window, _| paint_activation_grid(bounds, &st, window),
             )
             .w(px(200.0))
             .h(px(120.0));
@@ -6095,7 +6096,7 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
                     .flex_col()
                     .gap_1()
                     .child(div().text_xs().text_color(rgb(0x94a3b8)).child(state.name.clone()))
-                    .child(div().relative().children(vec![canvas_el.into(), edges_canvas.into()])),
+                    .child(div().relative().child(canvas_el).child(edges_canvas)),
             );
         }
         // Optional: show top-N connections if provided (textual summary)
@@ -6130,9 +6131,9 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
 fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window: &mut Window) {
     window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1223, 0.92))));
     let origin = bounds.origin;
-    let size = bounds.size;
-    let width = f32::from(size.width).max(1.0);
-    let height = f32::from(size.height).max(1.0);
+    let bounds_size = bounds.size;
+    let width = f32::from(bounds_size.width).max(1.0);
+    let height = f32::from(bounds_size.height).max(1.0);
     let cols = layer.width.max(1) as u16;
     let rows = layer.height.max(1) as u16;
     let cell_w = width / cols as f32;
@@ -6142,10 +6143,10 @@ fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window
             let idx = y as usize * layer.width + x as usize;
             let v = layer.values.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             let color = lerp_rgba(rgba_from_hex(0x1e293b, 0.95), rgba_from_hex(0x22d3ee, 0.95), v);
-            let rect = Bounds {
-                origin: Point { x: origin.x + (x as f32 * cell_w) as i32, y: origin.y + (y as f32 * cell_h) as i32 },
-                size: size.with_width((cell_w as i32).max(1)).with_height((cell_h as i32).max(1)),
-            };
+            let rect = Bounds::new(
+                point(px(f32::from(origin.x) + x as f32 * cell_w), px(f32::from(origin.y) + y as f32 * cell_h)),
+                size(px(cell_w.max(1.0)), px(cell_h.max(1.0))),
+            );
             window.paint_quad(fill(rect, Background::from(color)));
         }
     }
@@ -9731,10 +9732,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     );
     // If the current render rectangle lies completely outside the canvas, recentre.
     // This can happen after extreme panning combined with zoom, resulting in a blank view.
-    let render_left = offset_x;
-    let render_top = offset_y;
-    let render_right = offset_x + render_w;
-    let render_bottom = offset_y + render_h;
+    let (mut render_left, mut render_top, mut render_right, mut render_bottom) = (offset_x, offset_y, offset_x + render_w, offset_y + render_h);
     let fully_offscreen =
         render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
     if fully_offscreen {

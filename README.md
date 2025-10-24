@@ -194,6 +194,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
 - Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
+- Headless report (CI-friendly):
+  ```bash
+  SCRIPTBOTS_MODE=terminal \
+  SCRIPTBOTS_TERMINAL_HEADLESS=1 \
+  SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES=24 \
+  SCRIPTBOTS_TERMINAL_HEADLESS_REPORT=terminal_report.json \
+  cargo run -p scriptbots-app -- --storage memory --threads 2
+  ```
+  This renders offscreen for N frames and writes a JSON summary (frames, ticks, births/deaths, energy stats) to `terminal_report.json`.
+
 ## Quick start (platform scripts)
 
 Use the convenience scripts in the repo root to launch ScriptBots with sensible defaults per OS. These scripts set appropriate targets, isolate build artifacts, and pick the right renderer.
@@ -387,6 +397,8 @@ cargo build -p scriptbots-brain-ml --features candle
 - `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.
 - `SCRIPTBOTS_MAX_THREADS` — preferred maximum thread budget; core will cap Rayon to min of CPUs and this value (used unless `RAYON_NUM_THREADS` is already set).
  - `SCRIPTBOTS_TERMINAL_EMOJI` — force emoji mode `1|true|yes|on` or disable with `0|false|off|no`.
+ - `SCRIPTBOTS_RENDER_SAFE` — force conservative rendering path in GUI mode (also enabled by `--renderer-safe` or `--low-power`).
+ - `SCRIPTBOTS_RENDER_WATERMARK` — overlay a tiny diagnostics watermark in the GUI canvas (also enabled by `--debug-watermark`).
 - `SCRIPTBOTS_NEUROFLOW_ENABLED` — `true|false`.
 - `SCRIPTBOTS_NEUROFLOW_HIDDEN` — comma-separated hidden sizes (e.g., `64,32,16`).
 - `SCRIPTBOTS_NEUROFLOW_ACTIVATION` — `tanh|sigmoid|relu`.

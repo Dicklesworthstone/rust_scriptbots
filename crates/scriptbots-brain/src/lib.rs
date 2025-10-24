@@ -1,7 +1,7 @@
 //! Traits and adapters for ScriptBots brain implementations.
 
 use rand::RngCore;
-use scriptbots_core::{AgentId, BrainRunner, BrainActivations, ActivationLayer, INPUT_SIZE, OUTPUT_SIZE, Tick};
+use scriptbots_core::{AgentId, BrainRunner, BrainActivations, INPUT_SIZE, OUTPUT_SIZE, Tick};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
@@ -63,6 +63,12 @@ pub trait Brain: Send + Sync + Any {
 
     /// Mutable downcast support for concrete brain logic.
     fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync);
+
+    /// Optional introspection hook for visualization/debug UIs.
+    /// Default returns `None` for brains that do not expose activations.
+    fn snapshot_activations(&self) -> Option<BrainActivations> {
+        None
+    }
 }
 
 /// Summary emitted after each brain evaluation.
@@ -141,10 +147,7 @@ impl<B: Brain> BrainRunner for BrainRunnerAdapter<B> {
         self.brain.tick(inputs)
     }
 
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        // Default adapter returns None; concrete brain adapters can override by downcasting.
-        None
-    }
+    fn snapshot_activations(&self) -> Option<BrainActivations> { self.brain.snapshot_activations() }
 }
 
 /// Convenience helper to box a brain as a [`BrainRunner`].
