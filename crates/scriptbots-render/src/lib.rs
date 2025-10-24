@@ -95,31 +95,63 @@ pub fn run_demo(
     let storage_for_view = storage.clone();
 
     Application::new().run(move |app: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
-        let mut options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // Window A: HUD
+        let hud_bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
+        let mut hud_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(hud_bounds)),
             ..Default::default()
         };
-
-        if let Some(titlebar) = options.titlebar.as_mut() {
+        if let Some(titlebar) = hud_options.titlebar.as_mut() {
             titlebar.title = Some(title_for_options.clone());
         }
 
         let world_handle = Arc::clone(&world_for_view);
         let view_title = title_for_view.clone();
-
-        if let Err(err) = app.open_window(options, move |_window, cx| {
+        let drain_for_hud = Arc::clone(&drain_for_view);
+        let submit_for_hud = Arc::clone(&submit_for_view);
+        if let Err(err) = app.open_window(hud_options, move |_window, cx| {
             cx.new(|_| {
                 SimulationView::new(
                     Arc::clone(&world_handle),
                     storage_for_view.clone(),
                     view_title.clone(),
-                    Arc::clone(&drain_for_view),
-                    Arc::clone(&submit_for_view),
+                    Arc::clone(&drain_for_hud),
+                    Arc::clone(&submit_for_hud),
                 )
             })
         }) {
-            error!(error = ?err, "failed to open ScriptBots window");
+            error!(error = ?err, "failed to open HUD window");
+            return;
+        }
+
+        // Window B: Dedicated simulation viewport (minimal chrome)
+        let sim_bounds = Bounds::centered(None, size(px(1024.0), px(768.0)), app);
+        let mut sim_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(sim_bounds)),
+            ..Default::default()
+        };
+        if let Some(titlebar) = sim_options.titlebar.as_mut() {
+            titlebar.title = Some("ScriptBots World".into());
+        }
+
+        let world_for_canvas = Arc::clone(&world_for_view);
+        let drain_for_canvas = Arc::clone(&drain_for_view);
+        let submit_for_canvas = Arc::clone(&submit_for_view);
+        if let Err(err) = app.open_window(sim_options, move |_window, cx| {
+            cx.new(|_| {
+                // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
+                let mut view = SimulationView::new(
+                    Arc::clone(&world_for_canvas),
+                    storage_for_view.clone(),
+                    "World".into(),
+                    Arc::clone(&drain_for_canvas),
+                    Arc::clone(&submit_for_canvas),
+                );
+                view.set_minimal_canvas_mode();
+                view
+            })
+        }) {
+            error!(error = ?err, "failed to open simulation window");
             return;
         }
 
@@ -156,6 +188,8 @@ struct SimulationView {
     analytics_tick: Option<u64>,
     #[cfg(feature = "audio")]
     audio: Option<AudioState>,
+    // When true, render a minimal canvas-focused layout (used in the dedicated world window).
+    minimal_canvas_mode: bool,
 }
 
 impl SimulationView {
@@ -204,7 +238,12 @@ impl SimulationView {
                     err
                 })
                 .ok(),
+            minimal_canvas_mode: false,
         }
+    }
+
+    fn set_minimal_canvas_mode(&mut self) {
+        self.minimal_canvas_mode = true;
     }
 
     fn camera_snapshot(&self) -> CameraState {
@@ -731,6 +770,14 @@ impl SimulationView {
                             .bg(status_color)
                             .text_sm()
                             .text_color(rgb(0x0f172a))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x16a34a)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+                                    this.toggle_closed_environment(cx);
+                                }),
+                            )
                             .child(status_text),
                     )
                     .child(div().text_sm().text_color(rgb(0x94a3b8)).child(format!(
@@ -879,9 +926,8 @@ impl SimulationView {
             None,
         ));
 
-        let column_count = cards.len().clamp(1, 4) as u16;
-
-        div().grid().grid_cols(column_count).gap_4().children(cards)
+        // Use a conservative 3-column grid to avoid clipping on smaller window sizes; rows wrap gracefully.
+        div().grid().grid_cols(3).gap_4().children(cards)
     }
 
     fn render_analytics_panel(&self, snapshot: &HudSnapshot) -> Div {
@@ -931,11 +977,7 @@ impl SimulationView {
             ),
         ];
 
-        let trophic_row = div()
-            .grid()
-            .grid_cols(trophic_cards.len() as u16)
-            .gap_4()
-            .children(trophic_cards);
+        let trophic_row = div().grid().grid_cols(3).gap_4().children(trophic_cards);
 
         let meta_bar = div()
             .flex()
@@ -1093,7 +1135,8 @@ impl SimulationView {
                 )
         };
 
-        let insights_row = div().grid().grid_cols(3).gap_4().children(vec![
+        // Reduce to 2 columns to prevent overlap on narrow screens; content flows to multiple rows.
+        let insights_row = div().grid().grid_cols(2).gap_4().children(vec![
             resource_panel,
             mutation_panel,
             behavior_panel,
@@ -6003,7 +6046,19 @@ impl Render for SimulationView {
         let live_snapshot = self.snapshot();
         let snapshot = self.playback.snapshot_for_render(live_snapshot);
 
-        let mut content = div()
+        let mut content = if self.minimal_canvas_mode {
+            // Dedicated window: render only canvas + overlay and skip heavy HUD sections
+            div()
+                .size_full()
+                .relative()
+                .flex()
+                .flex_col()
+                .bg(rgb(0x0f172a))
+                .text_color(rgb(0xf8fafc))
+                .p_2()
+                .child(self.render_canvas(snapshot, cx))
+        } else {
+            div()
             .size_full()
             .relative()
             .flex()
@@ -6025,9 +6080,10 @@ impl Render for SimulationView {
                     .child(self.render_inspector(&snapshot, cx)),
             )
             .child(self.render_footer(&snapshot))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                this.handle_key_down(event, cx);
-            }));
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    this.handle_key_down(event, cx);
+                }))
+        };
 
         let perf_snapshot = self.perf.end_frame();
         self.last_perf = perf_snapshot;

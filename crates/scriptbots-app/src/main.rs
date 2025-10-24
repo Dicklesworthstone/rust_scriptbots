@@ -78,7 +78,7 @@ fn main() -> Result<()> {
         unsafe { std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1"); }
     }
 
-    let (world, storage) = bootstrap_world(config)?;
+    let (world, storage) = bootstrap_world(config, cli.storage)?;
 
     // Optional: dump a PNG snapshot and exit (no UI launched).
     if let Some(path) = cli.dump_png.as_ref() {
@@ -264,7 +264,7 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     Ok(())
 }
 
-fn bootstrap_world(config: ScriptBotsConfig) -> Result<(SharedWorld, SharedStorage)> {
+fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode) -> Result<(SharedWorld, SharedStorage)> {
     let storage_path =
         env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
     if let Some(parent) = Path::new(&storage_path)
@@ -274,9 +274,22 @@ fn bootstrap_world(config: ScriptBotsConfig) -> Result<(SharedWorld, SharedStora
         fs::create_dir_all(parent)?;
     }
 
-    let pipeline = StoragePipeline::new(&storage_path)?;
-    let storage: SharedStorage = pipeline.storage();
-    let mut world = WorldState::with_persistence(config, Box::new(pipeline))?;
+    // Choose persistence strategy
+    let (storage, mut world) = match storage_mode {
+        StorageMode::DuckDb => {
+            let pipeline = StoragePipeline::new(&storage_path)?;
+            let storage: SharedStorage = pipeline.storage();
+            let world = WorldState::with_persistence(config, Box::new(pipeline))?;
+            (storage, world)
+        }
+        StorageMode::Memory => {
+            // In-memory DuckDB for analytics, avoids disk I/O
+            let pipeline = StoragePipeline::with_thresholds(":memory:", 64, 2048, 512, 512)?;
+            let storage: SharedStorage = pipeline.storage();
+            let world = WorldState::with_persistence(config, Box::new(pipeline))?;
+            (storage, world)
+        }
+    };
     let brain_keys = install_brains(&mut world);
 
     seed_agents(&mut world, &brain_keys);
@@ -446,6 +459,15 @@ struct AppCli {
     /// Snapshot size for --dump-png, formatted as WIDTHxHEIGHT (e.g., 1280x720).
     #[arg(long = "png-size", value_name = "WxH")]
     png_size: Option<String>,
+    /// Storage mode: duckdb (default) or memory (disable persistence).
+    #[arg(long = "storage", value_enum, default_value_t = StorageMode::DuckDb)]
+    storage: StorageMode,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum StorageMode {
+    DuckDb,
+    Memory,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
