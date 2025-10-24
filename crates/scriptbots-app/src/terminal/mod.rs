@@ -384,6 +384,14 @@ impl<'a> TerminalApp<'a> {
         }
 
         if self.help_visible {
+            // Draw a full-screen dimmed backdrop, then the help panel on top
+            let size = frame.area();
+            let overlay_style = if self.palette.has_color() {
+                Style::default().bg(Color::Black).add_modifier(Modifier::DIM)
+            } else {
+                Style::default()
+            };
+            frame.render_widget(Block::default().style(overlay_style), size);
             self.draw_help(frame);
         }
     }
@@ -888,6 +896,23 @@ impl<'a> TerminalApp<'a> {
             }
         }
 
+        // Layers list (indices) when space permits
+        if area.width > 48 && !self.snapshot.brain_layers.is_empty() {
+            let mut layer_labels = String::new();
+            for (i, layer) in self.snapshot.brain_layers.iter().enumerate() {
+                if i == self.activation_layer_index { layer_labels.push('>'); } else { layer_labels.push(' '); }
+                if let Some(name) = &layer.name {
+                    layer_labels.push_str(&format!("{}  ", name));
+                } else {
+                    layer_labels.push_str(&format!("L{}  ", i));
+                }
+            }
+            lines.push(Line::from(vec![
+                Span::styled("Layers ", self.palette.header_style()),
+                Span::raw(layer_labels.trim_end().to_string()),
+            ]));
+        }
+
         let paragraph = Paragraph::new(Text::from(lines)).block(
             Block::default()
                 .title(self.palette.title("Insights"))
@@ -980,6 +1005,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" [ / ]    Cycle brain layers (console view)"),
             Line::raw(" ↑ / ↓    Page brain heatmap rows (console view)"),
             Line::raw(" ← / →    Change focused agent (console view)"),
+            Line::raw(" m/t/o    Focus mode: Manual / TopPredator / Oldest"),
             Line::raw(" ? / h    Toggle this help  (? is Shift+/ on most keyboards)"),
             Line::raw(""),
             Line::from(vec![Span::styled(
@@ -1165,6 +1191,21 @@ impl<'a> TerminalApp<'a> {
                 self.focused_agent_cursor = self.focused_agent_cursor.saturating_add(1);
                 self.refresh_snapshot();
             }
+            (KeyCode::Char('t') | KeyCode::Char('T'), _) => {
+                self.focus_lock = FocusLockMode::TopPredator;
+                self.refresh_snapshot();
+                self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Top predators");
+            }
+            (KeyCode::Char('o') | KeyCode::Char('O'), _) => {
+                self.focus_lock = FocusLockMode::Oldest;
+                self.refresh_snapshot();
+                self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Oldest agents");
+            }
+            (KeyCode::Char('m') | KeyCode::Char('M'), _) => {
+                self.focus_lock = FocusLockMode::Manual;
+                self.refresh_snapshot();
+                self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Manual");
+            }
             _ => {}
         }
 
@@ -1216,14 +1257,24 @@ impl<'a> TerminalApp<'a> {
         let new_snapshot = match self.world.lock() {
             Ok(world) => {
                 let mut snap = Snapshot::from_world(&world);
-                // Select focused agent activations if available and populate all layers
-                if snap.agent_count > 0 {
-                    let idx = self.focused_agent_cursor % snap.agent_count;
-                    if let Some(agent_id) = world.agents().iter_handles().nth(idx) {
-                        if let Some(rt) = world.runtime().get(agent_id) {
-                            if let Some(act) = rt.brain_activations.as_ref() {
-                                snap.brain_layers = convert_layers(act);
-                            }
+                // Determine focused agent id
+                let agent_id_opt = match self.focus_lock {
+                    FocusLockMode::Manual => {
+                        if snap.agent_count > 0 {
+                            world.agents().iter_handles().nth(self.focused_agent_cursor % snap.agent_count)
+                        } else { None }
+                    }
+                    FocusLockMode::TopPredator => {
+                        snap.leaderboard.first().and_then(|e| world.agents().iter_handles().find(|h| h.data().as_ffi() == e.label))
+                    }
+                    FocusLockMode::Oldest => {
+                        snap.oldest.first().and_then(|e| world.agents().iter_handles().find(|h| h.data().as_ffi() == e.label))
+                    }
+                };
+                if let Some(agent_id) = agent_id_opt {
+                    if let Some(rt) = world.runtime().get(agent_id) {
+                        if let Some(act) = rt.brain_activations.as_ref() {
+                            snap.brain_layers = convert_layers(act);
                         }
                     }
                 }
@@ -2648,17 +2699,18 @@ struct BrainLayerView {
     width: usize,
     height: usize,
     values: Vec<f32>,
+    name: Option<String>,
 }
 
 impl BrainLayerView {
     fn from_activations(act: &BrainActivations) -> Self {
         if let Some(layer) = act.layers.first() {
-            return Self { width: layer.width, height: layer.height, values: layer.values.clone() };
+            return Self { width: layer.width, height: layer.height, values: layer.values.clone(), name: Some(layer.name.clone()) };
         }
-        Self { width: 0, height: 0, values: Vec::new() }
+        Self { width: 0, height: 0, values: Vec::new(), name: None }
     }
     fn vec_from_activations(act: &BrainActivations) -> Vec<BrainLayerView> {
-        act.layers.iter().map(|l| BrainLayerView { width: l.width, height: l.height, values: l.values.clone() }).collect()
+        act.layers.iter().map(|l| BrainLayerView { width: l.width, height: l.height, values: l.values.clone(), name: Some(l.name.clone()) }).collect()
     }
 }
 

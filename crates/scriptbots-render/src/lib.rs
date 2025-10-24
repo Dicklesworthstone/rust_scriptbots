@@ -1597,7 +1597,6 @@ impl SimulationView {
         }
         self.selection_events.push_back(event);
     }
-
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
         if self.clear_all_selections() {
             self.record_selection_event(SelectionEventKind::Clear);
@@ -6220,7 +6219,6 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!("dominant o{} {:.2}", best_idx, best_val)))
         .child(radar_canvas)
 }
-
 fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &Vec<f32>, outputs: &Vec<f32>, window: &mut Window) {
     let origin = bounds.origin;
     let size = bounds.size;
@@ -7017,7 +7015,6 @@ impl Default for DebugOverlayState {
         }
     }
 }
-
 // PresetKind comes from core now
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -7814,7 +7811,6 @@ fn format_keystroke(keystroke: &Keystroke) -> String {
     parts.push(key);
     parts.join(" + ")
 }
-
 #[derive(Clone)]
 struct AgentListEntry {
     agent_id: AgentId,
@@ -8612,7 +8608,6 @@ fn paint_history_chart(bounds: Bounds<Pixels>, data: &HistoryChartData, window: 
     draw_polyline(&data.births, rgb(0x22c55e));
     draw_polyline(&data.deaths, rgb(0xef4444));
 }
-
 fn append_arc_polyline(
     builder: &mut PathBuilder,
     cx: f32,
@@ -9359,7 +9354,6 @@ fn paint_header_badge(bounds: Bounds<Pixels>, state: HeaderBadgeState, window: &
         window.paint_path(path, pulse_color);
     }
 }
-
 fn apply_post_processing(
     stack: &PostProcessStack,
     palette: ColorPaletteMode,
