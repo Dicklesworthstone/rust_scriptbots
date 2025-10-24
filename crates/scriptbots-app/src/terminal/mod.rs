@@ -829,18 +829,24 @@ impl<'a> TerminalApp<'a> {
                 Span::styled("Deaths total ", self.palette.header_style()),
                 Span::raw(format!("{:>4}", ana.deaths_total)),
             ]));
-            lines.push(Line::from(vec![
-                Span::raw("  Combat C:"),
-                Span::raw(format!("{:>3}", ana.deaths_combat_carnivore)),
-                Span::raw("  Combat H:"),
-                Span::raw(format!("{:>3}", ana.deaths_combat_herbivore)),
-                Span::raw("  Starv:"),
-                Span::raw(format!("{:>3}", ana.deaths_starvation)),
-                Span::raw("  Aging:"),
-                Span::raw(format!("{:>3}", ana.deaths_aging)),
-                Span::raw("  Unknown:"),
-                Span::raw(format!("{:>3}", ana.deaths_unknown)),
-            ]));
+            // Simple horizontal bars to visualize proportions
+            let parts = [
+                ("C", ana.deaths_combat_carnivore as u64, Color::Red),
+                ("H", ana.deaths_combat_herbivore as u64, Color::LightRed),
+                ("S", ana.deaths_starvation as u64, Color::Yellow),
+                ("A", ana.deaths_aging as u64, Color::Gray),
+                ("U", ana.deaths_unknown as u64, Color::DarkGray),
+            ];
+            let total = ana.deaths_total.max(1) as u64;
+            for (label, count, color) in parts {
+                let width = ((count * 20) / total).clamp(0, 20) as usize;
+                let bar = "█".repeat(width);
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {:>2} ", label), self.palette.header_style()),
+                    Span::styled(bar, Style::default().fg(color)),
+                    Span::raw(format!(" {:>3}", count)),
+                ]));
+            }
         } else {
             lines.push(Line::from(vec![Span::raw("Mortality data warming up…")]));
         }
@@ -1228,6 +1234,10 @@ struct TerminalAnalytics {
     traits_hearing_mean: f64,
     traits_eye_mean: f64,
     traits_blood_mean: f64,
+    temperature_preference_mean: f64,
+    temperature_preference_stddev: f64,
+    temperature_discomfort_mean: f64,
+    temperature_discomfort_stddev: f64,
     brain_shares: Vec<BrainShareEntry>,
 }
 
@@ -1312,6 +1322,10 @@ fn parse_terminal_analytics(
         traits_hearing_mean: value("traits.hearing.mean").unwrap_or(0.0),
         traits_eye_mean: value("traits.eye.mean").unwrap_or(0.0),
         traits_blood_mean: value("traits.blood.mean").unwrap_or(0.0),
+        temperature_preference_mean: value("temperature.preference.mean").unwrap_or(0.0),
+        temperature_preference_stddev: value("temperature.preference.stddev").unwrap_or(0.0),
+        temperature_discomfort_mean: value("temperature.discomfort.mean").unwrap_or(0.0),
+        temperature_discomfort_stddev: value("temperature.discomfort.stddev").unwrap_or(0.0),
         brain_shares,
     })
 }

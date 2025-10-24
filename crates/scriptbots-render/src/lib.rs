@@ -4404,6 +4404,7 @@ impl SimulationView {
                     .child("Outputs")
             )
             .child(output_bars)
+            .child(self.render_output_sparklines_for(detail.agent_id))
             .child(render_brain_card(detail))
             .child(self.render_mutation_controls(detail, cx))
     }
@@ -5961,6 +5962,73 @@ impl SimulationView {
     }
 }
 
+fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
+    let mut rows: Vec<Div> = Vec::new();
+    let max_show = if is_sensor { 8 } else { 6 };
+    let max_val = values.iter().copied().fold(0.0_f32, |m, v| m.max(v.abs())).max(1e-3);
+    for (idx, v) in values.iter().copied().take(max_show).enumerate() {
+        let width = (v.abs() / max_val).clamp(0.0, 1.0);
+        let color = if is_sensor { rgb(0x60a5fa) } else { rgb(0xf59e0b) };
+        let bar = div()
+            .w(px(160.0 * width))
+            .h(px(8.0))
+            .bg(color)
+            .rounded_sm();
+        let label = div()
+            .text_xs()
+            .text_color(rgb(0x94a3b8))
+            .w(px(32.0))
+            .child(format!("{}{}", if is_sensor { "s" } else { "o" }, idx));
+        rows.push(
+            div()
+                .flex()
+                .gap_2()
+                .items_center()
+                .child(label)
+                .child(bar)
+                .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!("{v:.2}"))),
+        );
+    }
+    div().flex().flex_col().gap_1().children(rows)
+}
+
+fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
+    // Compact card summarizing brain type and a mini gauge for output dominance
+    let (best_idx, best_val) = detail
+        .outputs
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, v)| (i, v))
+        .unwrap_or((0, 0.0));
+    let gauge = div()
+        .w(px(180.0))
+        .h(px(8.0))
+        .bg(rgb(0x1e293b))
+        .rounded_sm()
+        .child(
+            div()
+                .w(px(180.0 * best_val.clamp(0.0, 1.0)))
+                .h(px(8.0))
+                .bg(rgb(0x34d399))
+                .rounded_sm(),
+        );
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x1e293b))
+        .bg(rgb(0x0f172a))
+        .px_3()
+        .py_2()
+        .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Brain"))
+        .child(div().text_sm().text_color(rgb(0xcbd5f5)).child(detail.brain_descriptor.clone()))
+        .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!("dominant o{} {:.2}", best_idx, best_val)))
+        .child(gauge)
+}
 /// Render a simple PNG snapshot of the current world without a live window.
 /// This is a coarse, deterministic rasterization intended for REST exports.
 pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
@@ -6061,6 +6129,9 @@ impl Render for SimulationView {
         let live_snapshot = self.snapshot();
         let snapshot = self.playback.snapshot_for_render(live_snapshot);
 
+        // Update per-agent brain output history from the current inspector focus
+        self.update_brain_history(&snapshot);
+
         let mut content = if self.minimal_canvas_mode {
             // Dedicated window: render only canvas + overlay and skip heavy HUD sections
             div()
@@ -6116,6 +6187,174 @@ impl Render for SimulationView {
         }
 
         content
+    }
+}
+
+#[derive(Clone)]
+struct OutputSparklineState {
+    // Up to N series; each is a time-ordered vector of samples in [f32]
+    series: Vec<Vec<f32>>,
+}
+
+struct OutputHistory {
+    capacity: usize,
+    series: Vec<VecDeque<f32>>, // per-output history
+}
+
+impl OutputHistory {
+    fn new(outputs_len: usize, capacity: usize) -> Self {
+        let mut series = Vec::with_capacity(outputs_len);
+        for _ in 0..outputs_len {
+            series.push(VecDeque::with_capacity(capacity));
+        }
+        Self { capacity, series }
+    }
+
+    fn push(&mut self, outputs: &[f32]) {
+        if self.series.len() != outputs.len() {
+            // Reinitialize to match new output vector size
+            *self = OutputHistory::new(outputs.len(), self.capacity);
+        }
+        for (i, &v) in outputs.iter().enumerate() {
+            let q = &mut self.series[i];
+            if q.len() == self.capacity { q.pop_front(); }
+            q.push_back(v);
+        }
+    }
+
+    fn as_state(&self, take: usize) -> OutputSparklineState {
+        let mut series: Vec<Vec<f32>> = Vec::new();
+        for q in &self.series {
+            let len = q.len();
+            let start = len.saturating_sub(take);
+            series.push(q.iter().skip(start).copied().collect());
+        }
+        OutputSparklineState { series }
+    }
+}
+
+impl SimulationView {
+    fn update_brain_history(&mut self, snapshot: &HudSnapshot) {
+        if let Some(detail) = snapshot.inspector.focused.as_ref() {
+            let id = detail.agent_id;
+            let entry = self
+                .brain_history
+                .entry(id)
+                .or_insert_with(|| OutputHistory::new(detail.outputs.len(), 64));
+            entry.push(&detail.outputs);
+            // Keep only the focused agent to control memory
+            self.brain_history.retain(|k, _| *k == id);
+        }
+    }
+
+    fn render_output_sparklines_for(&self, agent_id: AgentId) -> Div {
+        if let Some(history) = self.brain_history.get(&agent_id) {
+            // Pick top 3 series by latest absolute value
+            let state_full = history.as_state(64);
+            let mut idx_vals: Vec<(usize, f32)> = state_full
+                .series
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, s.last().copied().unwrap_or(0.0).abs()))
+                .collect();
+            idx_vals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            let top_indices: Vec<usize> = idx_vals.into_iter().take(3).map(|(i, _)| i).collect();
+            let mut series: Vec<Vec<f32>> = Vec::new();
+            for i in top_indices {
+                series.push(state_full.series[i].clone());
+            }
+            let state = OutputSparklineState { series };
+
+            let spark_canvas = canvas(
+                move |_, _, _| state.clone(),
+                move |bounds, state, window, _| paint_output_sparklines(bounds, &state, window),
+            )
+            .w(px(200.0))
+            .h(px(56.0));
+
+            return div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x0f172a))
+                .px_3()
+                .py_2()
+                .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Output history"))
+                .child(spark_canvas);
+        }
+        div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(div().text_xs().text_color(rgb(0x475569)).child("Collecting output history…"))
+    }
+}
+
+fn paint_output_sparklines(bounds: Bounds<Pixels>, state: &OutputSparklineState, window: &mut Window) {
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+
+    // Background
+    window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1223, 0.92))));
+
+    // Compute global min/max
+    let mut min_v = 0.0_f32;
+    let mut max_v = 1.0_f32;
+    if !state.series.is_empty() {
+        min_v = f32::INFINITY;
+        max_v = f32::NEG_INFINITY;
+        for s in &state.series {
+            for &v in s {
+                if v < min_v { min_v = v; }
+                if v > max_v { max_v = v; }
+            }
+        }
+        if (max_v - min_v).abs() < 1e-6 { max_v = min_v + 1.0; }
+    }
+
+    let colors = [
+        rgba_from_hex(0x22d3ee, 0.95), // cyan
+        rgba_from_hex(0xf59e0b, 0.95), // amber
+        rgba_from_hex(0xa78bfa, 0.95), // violet
+    ];
+
+    // Draw zero baseline if in range
+    if min_v < 0.0 && max_v > 0.0 {
+        let y0 = (1.0 - (-min_v / (max_v - min_v))) * height;
+        let mut baseline = PathBuilder::stroke(px(1.0));
+        baseline.move_to(point(px(f32::from(origin.x)), px(f32::from(origin.y) + y0)));
+        baseline.line_to(point(px(f32::from(origin.x) + width), px(f32::from(origin.y) + y0)));
+        if let Ok(path) = baseline.build() {
+            window.paint_path(path, rgba_from_hex(0x1e293b, 0.9));
+        }
+    }
+
+    for (si, series) in state.series.iter().enumerate() {
+        if series.len() < 2 { continue; }
+        let color = colors.get(si).copied().unwrap_or(rgba_from_hex(0x94a3b8, 0.95));
+        let step_x = width / (series.len() as f32 - 1.0);
+        let mut path = PathBuilder::stroke(px(1.8));
+        for (i, &v) in series.iter().enumerate() {
+            let x = f32::from(origin.x) + step_x * i as f32;
+            let norm = (v - min_v) / (max_v - min_v);
+            let y = f32::from(origin.y) + (1.0 - norm) * height;
+            if i == 0 {
+                path.move_to(point(px(x), px(y)));
+            } else {
+                path.line_to(point(px(x), px(y)));
+            }
+        }
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color);
+        }
     }
 }
 

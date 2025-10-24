@@ -387,6 +387,9 @@ cargo build -p scriptbots-brain-ml --features candle
 - `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
 - `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
 
+### Dual-window mode (GUI)
+- On capable desktops, ScriptBots opens two GPUI windows: a canvas window rendering the world and a HUD window with controls, charts, and inspector. If a second window cannot be created (WM limits/remote desktop), the app falls back to a single-window overlay layout automatically.
+
 ## Simulation overview
 Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 1. Aging and scheduled tasks
@@ -441,11 +444,15 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - **Analytics**: attacker/victim flags (carnivore/herbivore), births/deaths, hybrid markers, age/boost tracking, and per-tick summaries feed the HUD and DuckDB.
 
 ## Rendering & UX
-- GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes).
+- GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes). Dual-window layout opens a HUD window and a simulation canvas window; a single-window overlay fallback is used when needed.
 - Camera controls: pan/zoom; keyboard bindings for pause, draw toggle, speed ±.
 - Overlays: selection highlights, diagnostics panel; charts and advanced overlays are staged in the plan.
-- Inspector: per-agent stats and genome/brain views (scoped to plan milestones).
+- Inspector: per-agent stats and genome/brain views (scoped to plan milestones); mutation-rate adjusters (±) for primary/secondary let you tweak an agent’s evolution parameters live.
 - Optional audio via `kira` (feature `audio`).
+
+### GPUI performance & diagnostics
+- Adaptive GPU adapter selection; viewport culling for terrain; chart decimation; batched path rendering to reduce draw calls.
+- Troubleshooting flags: `--renderer-safe` (conservative paint path) and `--debug-watermark` (tiny on-canvas badge) help isolate rendering issues.
 
 ### Accessibility & input
 - **Colorblind-safe palettes** (deuteranopia/protanopia/tritanopia) and a high-contrast mode; UI elements and overlays respect palette transforms.
@@ -488,7 +495,7 @@ An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode 
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
 - Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
-Keybinds: space (pause), +/- (speed), s (single-step), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy and an emoji world mini-map that adapts to color support.
+Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save ASCII screenshot), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Brains leaderboard, and an emoji world mini-map.
 
 ## Storage & analytics
 - DuckDB schema (`ticks`, `metrics`, `events`, `agents`) with buffered writes and maintenance (`optimize`, `VACUUM`).
@@ -571,6 +578,10 @@ order by bucket;
 - Tracy (optional): integrate client in dev builds to visualize frame times and background worker activity.
 - Threading: tune `RAYON_NUM_THREADS` to match physical cores; verify determinism with seeded runs.
 - Rendering: measure HUD/canvas frame times; avoid per-frame allocations; prefer batched path building.
+ - Built-in tools:
+   - `--profile-steps N` and `--profile-storage-steps N` to run headless micro-benchmarks
+   - `--profile-sweep N` and `--auto-tune N` to explore and auto-pick thread/flush settings
+   - `--renderer-safe` for a conservative paint path; `--debug-watermark` overlays a diagnostics badge
 
 ## Tracing & logging
 - Logging uses `tracing` with `RUST_LOG` filters (e.g., `RUST_LOG=info,scriptbots_core=debug`).
@@ -656,6 +667,12 @@ cargo run -p scriptbots-app --bin control_cli -- apply-preset arctic
 cargo run -p scriptbots-app --bin control_cli -- screenshot --out screenshots/frame_0001.txt
 cargo run -p scriptbots-app --bin control_cli -- screenshot --png --out screenshots/frame_0001.png
 cargo run -p scriptbots-app --bin control_cli -- hydrology
+``` 
+
+Interactive dashboard:
+```bash
+# Live TUI dashboard of knobs and their current values; press 'q' to quit, 'r' to refresh
+cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
 ```
 
 ### Scenario layering & deterministic replay CLI
