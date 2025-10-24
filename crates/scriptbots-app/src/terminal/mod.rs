@@ -898,7 +898,6 @@ impl<'a> TerminalApp<'a> {
                     }
                 }
             }
-        }
 
         // Layers list (indices) when space permits
         if area.width > 48 && !self.snapshot.brain_layers.is_empty() {

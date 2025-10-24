@@ -25,6 +25,15 @@ pub trait NeighborhoodIndex {
         radius_sq: f32,
         visitor: &mut dyn FnMut(usize, OrderedFloat<f32>),
     );
+
+    /// Visit candidate neighbor bucket slices around `agent_idx` spanning cells that intersect `radius`.
+    /// This does not perform distance checks; callers should filter by distance as needed.
+    fn visit_neighbor_buckets(
+        &self,
+        agent_idx: usize,
+        radius: f32,
+        visitor: &mut dyn FnMut(&[usize]),
+    );
 }
 
 /// Baseline uniform grid index backing neighbor queries.
@@ -255,6 +264,43 @@ impl NeighborhoodIndex for UniformGridIndex {
                                 if dist_sq <= radius_sq {
                                     visitor(other_idx, OrderedFloat(dist_sq));
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn visit_neighbor_buckets(
+        &self,
+        agent_idx: usize,
+        radius: f32,
+        visitor: &mut dyn FnMut(&[usize]),
+    ) {
+        if agent_idx >= self.positions.len() || radius < 0.0 {
+            return;
+        }
+        let (_ax, _ay) = self.positions[agent_idx];
+        let (cell_x, cell_y) = self.agent_cells[agent_idx];
+        let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
+
+        for dx in -cell_radius..=cell_radius {
+            for dy in -cell_radius..=cell_radius {
+                let nx = Self::wrap(cell_x + dx, self.cells_x);
+                let ny = Self::wrap(cell_y + dy, self.cells_y);
+                match &self.buckets {
+                    Buckets::Dense(b) => {
+                        let lin = self.linear_index(nx, ny);
+                        let indices = &b[lin];
+                        if !indices.is_empty() {
+                            visitor(indices);
+                        }
+                    }
+                    Buckets::Sparse(m) => {
+                        if let Some(indices) = m.get(&(nx, ny)) {
+                            if !indices.is_empty() {
+                                visitor(indices);
                             }
                         }
                     }

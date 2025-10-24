@@ -23,3 +23,10 @@ getrandom = { workspace = true }
 num_cpus = { workspace = true }
 serde_json = { workspace = true }
 wide = { version = "0.7", default-features = false, optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
+[[bench]]
+name = "world_bench"
+harness = false

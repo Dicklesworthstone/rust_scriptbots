@@ -1,5 +1,6 @@
 //! Core types shared across the ScriptBots workspace.
 
+#[allow(unused_imports)]
 use ordered_float::OrderedFloat;
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
@@ -41,12 +42,24 @@ pub struct ActivationEdge {
 static RAYON_LIMIT_GUARD: OnceLock<()> = OnceLock::new();
 
 #[cfg(feature = "parallel")]
+fn par_min_split() -> usize {
+    use std::sync::OnceLock;
+    static PAR_MIN_SPLIT: OnceLock<usize> = OnceLock::new();
+    *PAR_MIN_SPLIT.get_or_init(|| {
+        std::env::var("SCRIPTBOTS_PAR_MIN_SPLIT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
+
+#[cfg(feature = "parallel")]
 macro_rules! collect_handles {
     ($handles:expr, |$idx:ident, $handle:pat_param| $body:expr) => {{
-        const PAR_MIN_SPLIT: usize = 1024;
         ($handles)
             .par_iter()
-            .with_min_len(PAR_MIN_SPLIT)
+            .with_min_len(par_min_split())
             .enumerate()
             .map(|($idx, $handle)| $body)
             .collect::<Vec<_>>()
@@ -4552,33 +4565,29 @@ impl WorldState {
             let eyes_dir = eye_directions[idx];
             let eyes_fov = eye_fov[idx];
 
-            index.neighbors_within(
-                idx,
-                radius_sq,
-                &mut |other_idx, dist_sq: OrderedFloat<f32>| {
+            index.visit_neighbor_buckets(idx, radius, &mut |indices| {
+                for &other_idx in indices {
                     if other_idx == idx {
-                        return;
+                        continue;
                     }
-                    let dist_sq_val = dist_sq.into_inner();
-                    if dist_sq_val <= f32::EPSILON {
-                        return;
-                    }
-                    let dist = dist_sq_val.sqrt();
-                    if dist > radius {
-                        return;
-                    }
-
                     let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
                     let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
+                    let dist_sq_val = dx.mul_add(dx, dy * dy);
+                    if dist_sq_val <= f32::EPSILON {
+                        continue;
+                    }
+                    if dist_sq_val > radius_sq {
+                        continue;
+                    }
+                    let dist = dist_sq_val.sqrt();
                     let ang = angle_to(dx, dy);
                     let dist_factor = (radius - dist) / radius;
                     if dist_factor <= 0.0 {
-                        return;
+                        continue;
                     }
 
                     #[cfg(feature = "simd_wide")]
                     {
-                        // SIMD vectorize per-eye computation (4 lanes)
                         let base = [
                             wrap_signed_angle(heading + eyes_dir[0]),
                             wrap_signed_angle(heading + eyes_dir[1]),
@@ -4656,8 +4665,8 @@ impl WorldState {
                         let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
                         blood += bleed * dist_factor * wound;
                     }
-                },
-            );
+                }
+            });
 
             smell *= traits.smell;
             sound *= traits.sound;
@@ -5511,45 +5520,147 @@ impl WorldState {
 
             let origin = positions[idx];
             let mut hits = Vec::new();
-            index.neighbors_within(
-                idx,
-                reach_sq,
-                &mut |other_idx, _dist_sq: OrderedFloat<f32>| {
-                    if other_idx == idx {
-                        return;
+            index.visit_neighbor_buckets(idx, reach, &mut |indices| {
+                #[cfg(feature = "simd_wide")]
+                {
+                    for chunk in indices.chunks_exact(4) {
+                        let a0 = chunk[0];
+                        let a1 = chunk[1];
+                        let a2 = chunk[2];
+                        let a3 = chunk[3];
+                        let dx_arr = [
+                            Self::wrap_delta(origin.x, positions[a0].x, world_w),
+                            Self::wrap_delta(origin.x, positions[a1].x, world_w),
+                            Self::wrap_delta(origin.x, positions[a2].x, world_w),
+                            Self::wrap_delta(origin.x, positions[a3].x, world_w),
+                        ];
+                        let dy_arr = [
+                            Self::wrap_delta(origin.y, positions[a0].y, world_h),
+                            Self::wrap_delta(origin.y, positions[a1].y, world_h),
+                            Self::wrap_delta(origin.y, positions[a2].y, world_h),
+                            Self::wrap_delta(origin.y, positions[a3].y, world_h),
+                        ];
+                        let dx_v = f32x4::new(dx_arr);
+                        let dy_v = f32x4::new(dy_arr);
+                        let dist_sq_v = dx_v * dx_v + dy_v * dy_v;
+                        let dist_v = dist_sq_v.sqrt();
+                        let dir_x_v = dx_v / dist_v;
+                        let dir_y_v = dy_v / dist_v;
+                        let align_v = dir_x_v * f32x4::splat(facing.0)
+                            + dir_y_v * f32x4::splat(facing.1);
+                        let align = align_v.to_array();
+                        let dist_sq = dist_sq_v.to_array();
+                        // Emit per-lane using identical scalar conditions and order
+                        let ids = [a0, a1, a2, a3];
+                        for lane in 0..4 {
+                            let other_idx = ids[lane];
+                            if other_idx == idx {
+                                continue;
+                            }
+                            let dist_sq_val = dist_sq[lane];
+                            if dist_sq_val <= f32::EPSILON || dist_sq_val > reach_sq {
+                                continue;
+                            }
+                            let alignment = align[lane];
+                            if alignment < alignment_threshold {
+                                continue;
+                            }
+                            let damage = base_damage * alignment.max(0.0);
+                            if damage <= 0.0 {
+                                continue;
+                            }
+                            let target_runtime = &runtime_snapshot[other_idx];
+                            let victim_carnivore =
+                                target_runtime.herbivore_tendency < carnivore_threshold;
+                            if victim_carnivore {
+                                result.hit_carnivore = true;
+                            } else {
+                                result.hit_herbivore = true;
+                            }
+                            hits.push(CombatHit {
+                                target_idx: other_idx,
+                                damage,
+                                attacker_carnivore: is_carnivore,
+                            });
+                        }
                     }
-                    let target_runtime = &runtime_snapshot[other_idx];
-                    let dx = Self::wrap_delta(origin.x, positions[other_idx].x, world_w);
-                    let dy = Self::wrap_delta(origin.y, positions[other_idx].y, world_h);
-                    let dist_sq = dx * dx + dy * dy;
-                    if dist_sq <= f32::EPSILON || dist_sq > reach_sq {
-                        return;
+                    let rem = indices.chunks_exact(4).remainder();
+                    for &other_idx in rem {
+                        if other_idx == idx {
+                            continue;
+                        }
+                        let target_runtime = &runtime_snapshot[other_idx];
+                        let dx = Self::wrap_delta(origin.x, positions[other_idx].x, world_w);
+                        let dy = Self::wrap_delta(origin.y, positions[other_idx].y, world_h);
+                        let dist_sq = dx * dx + dy * dy;
+                        if dist_sq <= f32::EPSILON || dist_sq > reach_sq {
+                            continue;
+                        }
+                        let dist = dist_sq.sqrt();
+                        let dir_x = dx / dist;
+                        let dir_y = dy / dist;
+                        let alignment = dot2(facing.0, facing.1, dir_x, dir_y);
+                        if alignment < alignment_threshold {
+                            continue;
+                        }
+                        let damage = base_damage * alignment.max(0.0);
+                        if damage <= 0.0 {
+                            continue;
+                        }
+                        let victim_carnivore =
+                            target_runtime.herbivore_tendency < carnivore_threshold;
+                        if victim_carnivore {
+                            result.hit_carnivore = true;
+                        } else {
+                            result.hit_herbivore = true;
+                        }
+                        hits.push(CombatHit {
+                            target_idx: other_idx,
+                            damage,
+                            attacker_carnivore: is_carnivore,
+                        });
                     }
-                    let dist = dist_sq.sqrt();
-                    let dir_x = dx / dist;
-                    let dir_y = dy / dist;
-            let alignment = dot2(facing.0, facing.1, dir_x, dir_y);
-                    if alignment < alignment_threshold {
-                        return;
-                    }
+                }
+                #[cfg(not(feature = "simd_wide"))]
+                {
+                    for &other_idx in indices {
+                        if other_idx == idx {
+                            continue;
+                        }
+                        let target_runtime = &runtime_snapshot[other_idx];
+                        let dx = Self::wrap_delta(origin.x, positions[other_idx].x, world_w);
+                        let dy = Self::wrap_delta(origin.y, positions[other_idx].y, world_h);
+                        let dist_sq = dx * dx + dy * dy;
+                        if dist_sq <= f32::EPSILON || dist_sq > reach_sq {
+                            continue;
+                        }
+                        let dist = dist_sq.sqrt();
+                        let dir_x = dx / dist;
+                        let dir_y = dy / dist;
+                        let alignment = dot2(facing.0, facing.1, dir_x, dir_y);
+                        if alignment < alignment_threshold {
+                            continue;
+                        }
 
-                    let damage = base_damage * alignment.max(0.0);
-                    if damage <= 0.0 {
-                        return;
+                        let damage = base_damage * alignment.max(0.0);
+                        if damage <= 0.0 {
+                            continue;
+                        }
+                        let victim_carnivore =
+                            target_runtime.herbivore_tendency < carnivore_threshold;
+                        if victim_carnivore {
+                            result.hit_carnivore = true;
+                        } else {
+                            result.hit_herbivore = true;
+                        }
+                        hits.push(CombatHit {
+                            target_idx: other_idx,
+                            damage,
+                            attacker_carnivore: is_carnivore,
+                        });
                     }
-                    let victim_carnivore = target_runtime.herbivore_tendency < carnivore_threshold;
-                    if victim_carnivore {
-                        result.hit_carnivore = true;
-                    } else {
-                        result.hit_herbivore = true;
-                    }
-                    hits.push(CombatHit {
-                        target_idx: other_idx,
-                        damage,
-                        attacker_carnivore: is_carnivore,
-                    });
-                },
-            );
+                }
+            });
 
             result.total_damage = hits.iter().map(|hit| hit.damage).sum();
             result.hits = hits;
