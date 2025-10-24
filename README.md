@@ -142,6 +142,33 @@ cargo check
 ```bash
 cargo run -p scriptbots-app
 ```
+### Recommended defaults for performance
+
+- Threads: By default, the core auto-budgets worker threads conservatively. Our profiling shows best throughput at 8 threads on a 32-core CPU for this workload. To match that:
+
+```bash
+SCRIPTBOTS_MAX_THREADS=8 cargo run -p scriptbots-app -- --storage memory --storage-thresholds 128,4096,1024,1024
+```
+
+- With servers disabled (avoid port conflicts/background overhead):
+
+```bash
+SCRIPTBOTS_CONTROL_REST_ENABLED=false \
+SCRIPTBOTS_CONTROL_MCP=disabled \
+SCRIPTBOTS_MAX_THREADS=8 \
+cargo run -p scriptbots-app -- --mode terminal --storage memory --storage-thresholds 128,4096,1024,1024
+```
+
+- Profiling helpers (headless):
+
+```bash
+# No storage (isolates world.step performance)
+SCRIPTBOTS_MAX_THREADS=8 cargo run -p scriptbots-app -- --profile-steps 1000
+
+# With storage (memory) and tuned flush thresholds
+SCRIPTBOTS_MAX_THREADS=8 cargo run -p scriptbots-app -- --profile-storage-steps 3000 --storage memory --storage-thresholds 128,4096,1024,1024
+```
+
 
 Set logging verbosity with `RUST_LOG`, for example:
 ```bash

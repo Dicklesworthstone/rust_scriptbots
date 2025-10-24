@@ -124,8 +124,9 @@ fn configure_parallelism() {
 fn default_thread_budget(cpu_count: usize) -> usize {
     match cpu_count {
         0..=2 => 1,
-        3 | 4 => 2,
-        _ => 4,
+        3..=4 => 2,
+        5..=7 => 4,
+        _ => 8,
     }
 }
 
