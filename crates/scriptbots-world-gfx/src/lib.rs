@@ -211,6 +211,55 @@ impl ReadbackRing {
 
 fn align_256(n: u32) -> u32 { ((n + 255) / 256) * 256 }
 
+// ---------------- View uniforms (viewport size) ----------------
+
+struct ViewUniforms {
+    buf: wgpu::Buffer,
+    layout: wgpu::BindGroupLayout,
+    bg: wgpu::BindGroup,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ViewData { viewport: [f32; 2], padding: [f32; 2] }
+
+impl ViewUniforms {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32)) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("view.bg_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<ViewData>() as u64),
+                },
+                count: None,
+            }],
+        });
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view.ubuf"),
+            size: std::mem::size_of::<ViewData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("view.bg"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+        });
+        let this = Self { buf, layout, bg };
+        this.update(queue, size);
+        this
+    }
+
+    fn update(&self, queue: &wgpu::Queue, size: (u32, u32)) {
+        let data = ViewData { viewport: [size.0 as f32, size.1 as f32], padding: [0.0, 0.0] };
+        queue.write_buffer(&self.buf, 0, bytemuck::bytes_of(&data));
+    }
+}
+
 // ---------------- Terrain pipeline (instanced tiles with atlas) ----------------
 
 struct TerrainPipeline {
@@ -420,24 +469,36 @@ struct InInst {
   @location(3) color: vec4<f32>,
 };
 
-struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) color: vec4<f32>,
+  @location(1) local: vec2<f32>,
+  @location(2) radius: f32,
+};
 
 @vertex
 fn vs_main(inst: InInst, @builtin(vertex_index) vid: u32) -> VsOut {
   var o: VsOut;
   var quad = array<vec2<f32>, 4>(vec2<f32>(-0.5,-0.5), vec2<f32>(0.5,-0.5), vec2<f32>(-0.5,0.5), vec2<f32>(0.5,0.5));
-  let local = quad[vid] * inst.size;
-  let world = inst.pos + local;
+  let l = quad[vid];
+  let world = inst.pos + l * inst.size;
   o.pos = vec4<f32>(world, 0.0, 1.0);
   o.color = inst.color;
+  o.local = l;          // range [-0.5, 0.5]
+  o.radius = inst.size; // pixel radius
   return o;
 }
 
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
-  // Soft circular sprite with highlight rim for a polished look
-  let uv = v.pos.xy; // already in pixel space; for a proper look we would pass local coordinates; simplified for now
-  return v.color;
+  // Signed distance circle (soft edge) with thin rim highlight for a premium look
+  let d = length(v.local * 2.0);         // 0 at center, ~1 at edge
+  let edge = smoothstep(1.05, 0.95, 1.0 - d);
+  let rim = smoothstep(1.02, 0.98, d);   // thin rim near edge
+  var base = v.color;
+  base.a = base.a * edge;
+  let rim_col = vec4<f32>(1.0, 1.0, 1.0, 0.25) * rim;
+  return clamp(base + rim_col, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 "#;
 
