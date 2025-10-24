@@ -15,12 +15,13 @@ use scriptbots_core::{
 use scriptbots_render::{render_png_offscreen, run_demo};
 use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::{
     collections::HashMap,
     env, fmt, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use tracing::{debug, info, warn};
 
@@ -55,16 +56,30 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Optional: profiling runs (headless). Execute and exit if specified.
+    let thresholds = thresholds_from_cli(&cli);
+    if cli.profile_steps.is_some() || cli.profile_storage_steps.is_some() {
+        if let Some(ticks) = cli.profile_steps {
+            profile_world_steps(&config, ticks)?;
+        }
+        if let Some(ticks) = cli.profile_storage_steps {
+            profile_world_steps_with_storage(&config, ticks, cli.storage, thresholds)?;
+        }
+        return Ok(());
+    }
+
+    // Automated profiling sweep (child-process based)
+    if let Some(ticks) = cli.profile_sweep {
+        run_profile_sweep(&config, ticks, &cli)?;
+        return Ok(());
+    }
+
     // Configure low-power / thread budget before world creation so the Rayon pool is capped.
     if let Some(threads) = cli.threads {
-        unsafe {
-            std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
-        }
+        unsafe { std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string()); }
     } else if cli.low_power {
         // Conservative default: 2 worker threads unless explicitly overridden by --threads
-        unsafe {
-            std::env::set_var("SCRIPTBOTS_MAX_THREADS", "2");
-        }
+        unsafe { std::env::set_var("SCRIPTBOTS_MAX_THREADS", "2"); }
     }
 
     // Apply OS-level priority niceness where supported.
@@ -74,11 +89,18 @@ fn main() -> Result<()> {
     if cli.debug_watermark {
         unsafe { std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1"); }
     }
-    if cli.renderer_safe {
+    if cli.renderer_safe || cli.low_power {
         unsafe { std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1"); }
     }
+    // Prefer terminal renderer in low-power auto mode unless FORCE_GUI is explicitly set
+    if cli.low_power
+        && matches!(cli.mode, RendererMode::Auto)
+        && !matches!(env::var("SCRIPTBOTS_FORCE_GUI").ok().and_then(|v| parse_bool(&v)), Some(true))
+    {
+        unsafe { std::env::set_var("SCRIPTBOTS_FORCE_TERMINAL", "1"); }
+    }
 
-    let (world, storage) = bootstrap_world(config, cli.storage)?;
+    let (world, storage) = bootstrap_world(config, cli.storage, thresholds)?;
 
     // Optional: dump a PNG snapshot and exit (no UI launched).
     if let Some(path) = cli.dump_png.as_ref() {
@@ -134,7 +156,7 @@ fn apply_process_niceness(low_power: bool) -> Result<()> {
     if low_power {
         unsafe {
             // niceness +10 (lower priority); ignore errors on restricted environments
-            let _ = setpriority(PRIO_PROCESS as i32, 0 as id_t, 10);
+            let _ = setpriority(PRIO_PROCESS as _, 0 as id_t, 10);
         }
     }
     // Best-effort I/O niceness via ionice class 3 (idle) where available.
@@ -146,7 +168,7 @@ fn apply_process_niceness(low_power: bool) -> Result<()> {
 #[cfg(windows)]
 fn apply_process_niceness(low_power: bool) -> Result<()> {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+        GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
     };
     unsafe {
         let handle = GetCurrentProcess();
@@ -197,16 +219,29 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     if let Ok(seed) = std::env::var("SCRIPTBOTS_DET_SEED") {
         child1.env("SCRIPTBOTS_RNG_SEED", seed);
     }
-    let out1 = child1.output().context("failed to run det child 1")?;
-    if !out1.status.success() {
-        bail!("det child 1 failed: status {:?}", out1.status);
-    }
+    child1.stdout(Stdio::piped());
+    child1.stderr(Stdio::piped());
+    let handle1 = child1.spawn().context("failed to spawn det child 1")?;
+
     // Child N: default thread budget
     let mut childn = Command::new(&exe);
     childn.arg("--config-only");
     childn.env("SCRIPTBOTS_DET_RUN", "1");
     childn.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
-    let outn = childn.output().context("failed to run det child N")?;
+    childn.stdout(Stdio::piped());
+    childn.stderr(Stdio::piped());
+    let handlen = childn.spawn().context("failed to spawn det child N")?;
+
+    // Wait for both to complete (they run concurrently)
+    let out1 = handle1
+        .wait_with_output()
+        .context("failed to wait for det child 1")?;
+    let outn = handlen
+        .wait_with_output()
+        .context("failed to wait for det child N")?;
+    if !out1.status.success() {
+        bail!("det child 1 failed: status {:?}", out1.status);
+    }
     if !outn.status.success() {
         bail!("det child N failed: status {:?}", outn.status);
     }
@@ -264,7 +299,27 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     Ok(())
 }
 
-fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode) -> Result<(SharedWorld, SharedStorage)> {
+#[derive(Clone, Copy, Debug, Default)]
+struct ThresholdsOverride {
+    tick: Option<usize>,
+    agent: Option<usize>,
+    event: Option<usize>,
+    metric: Option<usize>,
+}
+
+fn thresholds_from_cli(cli: &AppCli) -> ThresholdsOverride {
+    if let Some(raw) = cli.storage_thresholds.as_ref() {
+        let mut parts = raw.split(',').map(|s| s.trim());
+        let tick = parts.next().and_then(|p| p.parse::<usize>().ok());
+        let agent = parts.next().and_then(|p| p.parse::<usize>().ok());
+        let event = parts.next().and_then(|p| p.parse::<usize>().ok());
+        let metric = parts.next().and_then(|p| p.parse::<usize>().ok());
+        return ThresholdsOverride { tick, agent, event, metric };
+    }
+    ThresholdsOverride::default()
+}
+
+fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode, thresholds: ThresholdsOverride) -> Result<(SharedWorld, SharedStorage)> {
     let storage_path =
         env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
     if let Some(parent) = Path::new(&storage_path)
@@ -277,14 +332,23 @@ fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode) -> Resul
     // Choose persistence strategy
     let (storage, mut world) = match storage_mode {
         StorageMode::DuckDb => {
-            let pipeline = StoragePipeline::new(&storage_path)?;
+            let pipeline = match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
+                (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(&storage_path, t, a, e, m)?,
+                _ => StoragePipeline::new(&storage_path)?,
+            };
             let storage: SharedStorage = pipeline.storage();
             let world = WorldState::with_persistence(config, Box::new(pipeline))?;
             (storage, world)
         }
         StorageMode::Memory => {
             // In-memory DuckDB for analytics, avoids disk I/O
-            let pipeline = StoragePipeline::with_thresholds(":memory:", 64, 2048, 512, 512)?;
+            let pipeline = StoragePipeline::with_thresholds(
+                ":memory:",
+                thresholds.tick.unwrap_or(64),
+                thresholds.agent.unwrap_or(2048),
+                thresholds.event.unwrap_or(512),
+                thresholds.metric.unwrap_or(512),
+            )?;
             let storage: SharedStorage = pipeline.storage();
             let world = WorldState::with_persistence(config, Box::new(pipeline))?;
             (storage, world)
@@ -462,6 +526,18 @@ struct AppCli {
     /// Storage mode: duckdb (default) or memory (disable persistence).
     #[arg(long = "storage", value_enum, default_value_t = StorageMode::DuckDb)]
     storage: StorageMode,
+    /// Profile headless `world.step()` without persistence for N ticks, then exit.
+    #[arg(long = "profile-steps", value_name = "TICKS")]
+    profile_steps: Option<u64>,
+    /// Profile headless `world.step()` with selected storage mode for N ticks, then exit.
+    #[arg(long = "profile-storage-steps", value_name = "TICKS")]
+    profile_storage_steps: Option<u64>,
+    /// Override storage flush thresholds: tick,agent,event,metric (e.g., 64,4096,1024,1024).
+    #[arg(long = "storage-thresholds", value_name = "t,a,e,m")]
+    storage_thresholds: Option<String>,
+    /// Automated profiling sweep: runs multiple configurations for N ticks and summarizes.
+    #[arg(long = "profile-sweep", value_name = "TICKS")]
+    profile_sweep: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -796,6 +872,170 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
     }
 
     Ok(ReplayRun { events, summaries })
+}
+
+fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
+    let (collector, _handle) = ReplayCollector::new();
+    let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
+    let brain_keys = install_brains(&mut world);
+    seed_agents(&mut world, &brain_keys);
+
+    let start = Instant::now();
+    for _ in 0..tick_limit {
+        world.step();
+    }
+    let elapsed = start.elapsed();
+    let secs = elapsed.as_secs_f64().max(1e-9);
+    let tps = tick_limit as f64 / secs;
+    println!(
+        "{} Headless no-storage: {} ticks in {:.3}s ({:.0} tps)",
+        "✔".green().bold(),
+        tick_limit,
+        secs,
+        tps
+    );
+    Ok(())
+}
+
+fn profile_world_steps_with_storage(
+    config: &ScriptBotsConfig,
+    tick_limit: u64,
+    storage_mode: StorageMode,
+    thresholds: ThresholdsOverride,
+) -> Result<()> {
+    let storage_path = env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
+    let pipeline = match storage_mode {
+        StorageMode::DuckDb => match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
+            (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(&storage_path, t, a, e, m)?,
+            _ => StoragePipeline::new(&storage_path)?,
+        },
+        StorageMode::Memory => StoragePipeline::with_thresholds(
+            ":memory:",
+            thresholds.tick.unwrap_or(64),
+            thresholds.agent.unwrap_or(2048),
+            thresholds.event.unwrap_or(512),
+            thresholds.metric.unwrap_or(512),
+        )?,
+    };
+
+    let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline))?;
+    let brain_keys = install_brains(&mut world);
+    seed_agents(&mut world, &brain_keys);
+
+    let start = Instant::now();
+    for _ in 0..tick_limit {
+        world.step();
+    }
+    let elapsed = start.elapsed();
+    let secs = elapsed.as_secs_f64().max(1e-9);
+    let tps = tick_limit as f64 / secs;
+    println!(
+        "{} Headless with-storage({}): {} ticks in {:.3}s ({:.0} tps)",
+        "✔".green().bold(),
+        match storage_mode { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
+        tick_limit,
+        secs,
+        tps
+    );
+    Ok(())
+}
+
+fn parse_tps_from_stdout(stdout: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(stdout).ok()?;
+    // Expect a line ending with "(NNN tps)"; grab the last number before " tps)"
+    for line in s.lines().rev() {
+        if let Some(idx) = line.rfind(" tps)") {
+            let start = line[..idx].rfind('(')? + 1;
+            let num_str = &line[start..idx];
+            if let Ok(val) = num_str.trim().parse::<f64>() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to get current exe path")?;
+
+    // Candidate configurations
+    let thread_candidates: Vec<usize> = if let Some(t) = cli.threads { vec![t] } else { vec![1, 2, 4, 8] };
+    let storage_candidates = [StorageMode::Memory, StorageMode::DuckDb];
+    let threshold_candidates: Vec<&str> = vec![
+        "64,2048,512,512",
+        "128,4096,1024,1024",
+        "256,4096,2048,1024",
+    ];
+
+    #[derive(Clone)]
+    struct ResultRow {
+        threads: usize,
+        storage: StorageMode,
+        thresholds: &'static str,
+        tps: f64,
+    }
+
+    let mut results: Vec<ResultRow> = Vec::new();
+
+    for threads in thread_candidates {
+        for &storage in &storage_candidates {
+            let threshold_list: Vec<&str> = match storage {
+                StorageMode::Memory => threshold_candidates.clone(),
+                StorageMode::DuckDb => threshold_candidates.clone(),
+            };
+            for thresholds in threshold_list {
+                let mut cmd = Command::new(&exe);
+                cmd.arg("--config-only");
+                cmd.env("SCRIPTBOTS_DET_RUN", "0");
+                cmd.arg("--profile-storage-steps").arg(ticks.to_string());
+                cmd.arg("--storage").arg(match storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" });
+                cmd.arg("--storage-thresholds").arg(thresholds);
+                cmd.arg("--threads").arg(threads.to_string());
+                if cli.low_power { cmd.arg("--low-power"); }
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+                let out = cmd.output().with_context(|| format!("sweep run failed (thr={threads}, storage={storage:?}, thres={thresholds})"))?;
+                if !out.status.success() {
+                    continue;
+                }
+                if let Some(tps) = parse_tps_from_stdout(&out.stdout) {
+                    // thresholds is &'static str via const literals
+                    let thresholds_static: &'static str = match thresholds {
+                        "64,2048,512,512" => "64,2048,512,512",
+                        "128,4096,1024,1024" => "128,4096,1024,1024",
+                        _ => "256,4096,2048,1024",
+                    };
+                    results.push(ResultRow { threads, storage, thresholds: thresholds_static, tps });
+                }
+            }
+        }
+    }
+
+    results.sort_by(|a, b| b.tps.partial_cmp(&a.tps).unwrap_or(std::cmp::Ordering::Equal));
+    println!("{} Automated profile sweep ({} ticks):", "▶".bright_blue().bold(), ticks);
+    for row in results.iter().take(8) {
+        println!(
+            "    threads={:<2} storage={:<6} thresholds={:<20} {:>8.0} tps",
+            row.threads,
+            match row.storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
+            row.thresholds,
+            row.tps
+        );
+    }
+
+    if let Some(best) = results.first() {
+        println!(
+            "{} Best: threads={} storage={} thresholds={} ({:.0} tps)",
+            "✔".green().bold(),
+            best.threads,
+            match best.storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
+            best.thresholds,
+            best.tps
+        );
+    } else {
+        println!("{} No successful sweep results", "✖".red().bold());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

@@ -1358,6 +1358,7 @@ impl SimulationView {
             controls: snapshot.controls,
             debug: self.debug,
             follow_target,
+            perf: snapshot.perf,
         };
 
         let canvas_element = canvas(
@@ -7861,6 +7862,7 @@ struct CanvasState {
     controls: ControlsSnapshot,
     debug: DebugOverlayState,
     follow_target: Option<Position>,
+    perf: PerfSnapshot,
 }
 
 impl RenderFrame {
@@ -7884,31 +7886,29 @@ impl RenderFrame {
         let velocities = columns.velocities();
         let ages = columns.ages();
 
-        let agents = arena
-            .iter_handles()
-            .enumerate()
-            .map(|(idx, agent_id)| {
+        let estimated_agents = arena.len();
+        let mut agents = Vec::with_capacity(estimated_agents);
+        for (idx, agent_id) in arena.iter_handles().enumerate() {
                 let runtime_entry = runtime.get(agent_id);
                 let selection = runtime_entry.map(|rt| rt.selection).unwrap_or_default();
                 let indicator = runtime_entry.map(|rt| rt.indicator).unwrap_or_default();
                 let spiked = runtime_entry.map(|rt| rt.spiked).unwrap_or(false);
                 let reproduction_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
 
-                AgentRenderData {
-                    agent_id,
-                    position: positions[idx],
-                    color: colors[idx],
-                    spike_length: spikes[idx],
-                    velocity: velocities[idx],
-                    health: healths[idx],
-                    age: ages[idx],
-                    selection,
-                    indicator,
-                    spiked,
-                    reproduction_intent,
-                }
-            })
-            .collect();
+            agents.push(AgentRenderData {
+                agent_id,
+                position: positions[idx],
+                color: colors[idx],
+                spike_length: spikes[idx],
+                velocity: velocities[idx],
+                health: healths[idx],
+                age: ages[idx],
+                selection,
+                indicator,
+                spiked,
+                reproduction_intent,
+            });
+        }
 
         let food_cells = food.cells().to_vec();
         let terrain = build_terrain_frame(world.terrain());
@@ -8487,6 +8487,10 @@ fn paint_terrain_layer(
     palette: ColorPaletteMode,
     window: &mut Window,
 ) {
+    // In safe mode, skip per-cell terrain rendering entirely to maximize FPS.
+    if safe_mode_enabled() {
+        return;
+    }
     let width = terrain.dimensions.0 as usize;
     let height = terrain.dimensions.1 as usize;
     if width == 0 || height == 0 {
@@ -8821,6 +8825,7 @@ fn apply_post_processing(
     window: &mut Window,
     daylight: f32,
     scale: f32,
+    low_fps: bool,
 ) {
     let origin = bounds.origin;
     let bounds_size = bounds.size;
@@ -8924,7 +8929,7 @@ fn apply_post_processing(
                 }
             }
             PostProcessPass::Scanlines { intensity, spacing } => {
-                if intensity > 0.01 {
+                if intensity > 0.01 && !low_fps {
                     let spacing_px = (spacing / scale).clamp(2.0, 9.0);
                     let alpha = (0.07 * intensity).clamp(0.01, 0.2);
                     let mut y = origin_y;
@@ -8943,7 +8948,7 @@ fn apply_post_processing(
                 }
             }
             PostProcessPass::FilmGrain { strength, seed } => {
-                if strength > 0.01 {
+                if strength > 0.01 && !low_fps {
                     paint_film_grain(bounds, seed, strength, palette, window);
                 }
             }
@@ -9005,6 +9010,7 @@ fn paint_debug_overlays(
     offset_x: f32,
     offset_y: f32,
     scale: f32,
+    bounds: Bounds<Pixels>,
     window: &mut Window,
 ) {
     if !debug.enabled {
@@ -9014,6 +9020,15 @@ fn paint_debug_overlays(
     for agent in &frame.agents {
         let px_x = offset_x + agent.position.x * scale;
         let px_y = offset_y + agent.position.y * scale;
+
+        // Cull debug overlays off-screen
+        let view_left = f32::from(bounds.origin.x);
+        let view_top = f32::from(bounds.origin.y);
+        let view_right = view_left + f32::from(bounds.size.width);
+        let view_bottom = view_top + f32::from(bounds.size.height);
+        if px_x < view_left - 64.0 || px_x > view_right + 64.0 || px_y < view_top - 64.0 || px_y > view_bottom + 64.0 {
+            continue;
+        }
 
         if debug.show_sense_radius
             && frame.sense_radius > 0.0
@@ -9099,6 +9114,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let follow_target = state.follow_target;
     let origin = bounds.origin;
     let bounds_size = bounds.size;
+
+    let low_fps = state.perf.fps > 0.0 && state.perf.fps < 30.0;
+    let very_low_fps = state.perf.fps > 0.0 && state.perf.fps < 24.0;
 
     let mut camera_guard = camera.lock().expect("camera lock poisoned");
 
@@ -9196,8 +9214,26 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let max_food = frame.food_max.max(f32::EPSILON);
 
     if controls.draw_food {
-        for y in 0..food_h {
-            for x in 0..food_w {
+        // Compute visible cell range to cull off-screen food cells
+        let cell_world = frame.food_cell_size as f32;
+        let cell_px = (cell_world * scale).max(1.0);
+        let inv_cell_px = if cell_px > f32::EPSILON { 1.0 / cell_px } else { 0.0 };
+        let view_left = f32::from(origin.x);
+        let view_top = f32::from(origin.y);
+        let view_right = view_left + width_px;
+        let view_bottom = view_top + height_px;
+
+        let mut x_min = ((view_left - offset_x) * inv_cell_px).floor() as isize;
+        let mut x_max = ((view_right - offset_x) * inv_cell_px).ceil() as isize;
+        let mut y_min = ((view_top - offset_y) * inv_cell_px).floor() as isize;
+        let mut y_max = ((view_bottom - offset_y) * inv_cell_px).ceil() as isize;
+        x_min = x_min.clamp(0, food_w as isize - 1);
+        x_max = x_max.clamp(0, food_w as isize - 1);
+        y_min = y_min.clamp(0, food_h as isize - 1);
+        y_max = y_max.clamp(0, food_h as isize - 1);
+
+        for y in y_min as usize..=y_max as usize {
+            for x in x_min as usize..=x_max as usize {
                 let idx = y * food_w + x;
                 let value = frame.food_cells.get(idx).copied().unwrap_or_default();
                 if value <= 0.001 {
@@ -9220,6 +9256,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     }
 
     if controls.draw_agents {
+        let view_left = f32::from(origin.x);
+        let view_top = f32::from(origin.y);
+        let view_right = view_left + width_px;
+        let view_bottom = view_top + height_px;
+
         for agent in &frame.agents {
             let px_x = offset_x + agent.position.x * scale;
             let px_y = offset_y + agent.position.y * scale;
@@ -9227,61 +9268,61 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             let size_px = (dynamic_radius * scale).max(2.0);
             let half = size_px * 0.5;
 
-            let mut highlight_layers: Vec<(f32, Rgba)> = Vec::new();
-            match agent.selection {
-                SelectionState::Selected => highlight_layers.push((
-                    1.8,
-                    apply_palette(
-                        Rgba {
-                            r: 0.20,
-                            g: 0.65,
-                            b: 0.96,
-                            a: 0.35,
-                        },
+            // Cull off-screen agents
+            if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
+                continue;
+            }
+            // Inline highlights without allocating
+            if !very_low_fps {
+                match agent.selection {
+                    SelectionState::Selected => {
+                        let factor = 1.8;
+                        let highlight = apply_palette(
+                            Rgba { r: 0.20, g: 0.65, b: 0.96, a: 0.35 },
+                            frame.palette,
+                        );
+                        let highlight_size = size_px * factor;
+                        let highlight_half = highlight_size * 0.5;
+                        let highlight_bounds = Bounds::new(
+                            point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                            size(px(highlight_size), px(highlight_size)),
+                        );
+                        window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                    }
+                    SelectionState::Hovered => {
+                        let factor = 1.4;
+                        let highlight = apply_palette(
+                            Rgba { r: 0.92, g: 0.58, b: 0.20, a: 0.30 },
+                            frame.palette,
+                        );
+                        let highlight_size = size_px * factor;
+                        let highlight_half = highlight_size * 0.5;
+                        let highlight_bounds = Bounds::new(
+                            point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                            size(px(highlight_size), px(highlight_size)),
+                        );
+                        window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                    }
+                    SelectionState::None => {}
+                }
+
+                if focus_agent == Some(agent.agent_id) {
+                    let factor = 2.05;
+                    let highlight = apply_palette(
+                        Rgba { r: 0.45, g: 0.88, b: 0.97, a: 0.32 },
                         frame.palette,
-                    ),
-                )),
-                SelectionState::Hovered => highlight_layers.push((
-                    1.4,
-                    apply_palette(
-                        Rgba {
-                            r: 0.92,
-                            g: 0.58,
-                            b: 0.20,
-                            a: 0.30,
-                        },
-                        frame.palette,
-                    ),
-                )),
-                SelectionState::None => {}
+                    );
+                    let highlight_size = size_px * factor;
+                    let highlight_half = highlight_size * 0.5;
+                    let highlight_bounds = Bounds::new(
+                        point(px(px_x - highlight_half), px(px_y - highlight_half)),
+                        size(px(highlight_size), px(highlight_size)),
+                    );
+                    window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                }
             }
 
-            if focus_agent == Some(agent.agent_id) {
-                highlight_layers.push((
-                    2.05,
-                    apply_palette(
-                        Rgba {
-                            r: 0.45,
-                            g: 0.88,
-                            b: 0.97,
-                            a: 0.32,
-                        },
-                        frame.palette,
-                    ),
-                ));
-            }
-
-            for (factor, highlight) in highlight_layers {
-                let highlight_size = size_px * factor;
-                let highlight_half = highlight_size * 0.5;
-                let highlight_bounds = Bounds::new(
-                    point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                    size(px(highlight_size), px(highlight_size)),
-                );
-                window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
-            }
-
-            if controls.agent_outline {
+            if controls.agent_outline && !very_low_fps {
                 let outline_radius = (size_px * 0.55).max(3.0);
                 let mut outline = PathBuilder::stroke(px(1.8));
                 append_arc_polyline(&mut outline, px_x, px_y, outline_radius, 0.0, 360.0);
@@ -9290,7 +9331,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 }
             }
 
-            if agent.indicator.intensity > 0.05 {
+            if agent.indicator.intensity > 0.05 && !low_fps {
                 let effect = agent.indicator.intensity.clamp(0.0, 1.0);
                 let indicator_size = size_px * (1.2 + effect * 1.4);
                 let indicator_half = indicator_size * 0.5;
@@ -9305,7 +9346,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
             }
 
-            if agent.reproduction_intent > 0.2 {
+            if agent.reproduction_intent > 0.2 && !low_fps {
                 let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
                 let pulse_size = size_px * (1.8 + pulse * 1.6);
                 let pulse_half = pulse_size * 0.5;
@@ -9368,6 +9409,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             window,
             daylight,
             scale,
+            low_fps,
         );
     }
 
