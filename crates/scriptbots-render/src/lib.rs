@@ -8481,6 +8481,10 @@ fn paint_terrain_layer(
     scale: f32,
     daylight: f32,
     palette: ColorPaletteMode,
+    view_left: f32,
+    view_top: f32,
+    view_right: f32,
+    view_bottom: f32,
     window: &mut Window,
 ) {
     let width = terrain.dimensions.0 as usize;
@@ -8506,11 +8510,6 @@ fn paint_terrain_layer(
     if stride > 1 {
         // Coarse block path: fill aggregated blocks using the top-left sample
         let block_px = (cell_px * stride as f32).max(1.0);
-        // Compute view bounds to cull blocks
-        let view_left = f32::from(window.origin().x);
-        let view_top = f32::from(window.origin().y);
-        let view_right = view_left + f32::from(window.size().width);
-        let view_bottom = view_top + f32::from(window.size().height);
         for y in (0..height).step_by(stride) {
             for x in (0..width).step_by(stride) {
                 let idx = y * width + x;
@@ -8529,10 +8528,6 @@ fn paint_terrain_layer(
     }
 
     // Fine path: per-cell render with culling and reused px conversions
-    let view_left = f32::from(window.origin().x);
-    let view_top = f32::from(window.origin().y);
-    let view_right = view_left + f32::from(window.size().width);
-    let view_bottom = view_top + f32::from(window.size().height);
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
@@ -9267,6 +9262,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         scale,
         daylight,
         frame.palette,
+        view_left,
+        view_top,
+        view_right,
+        view_bottom,
         window,
     );
     let cell_world = frame.food_cell_size as f32;
