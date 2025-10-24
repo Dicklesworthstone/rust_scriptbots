@@ -7016,7 +7016,6 @@ impl Default for DebugOverlayState {
     }
 }
 // PresetKind comes from core now
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum FollowMode {
     #[default]
@@ -9724,32 +9723,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         frame.world_size,
         base_scale,
     );
-    // If the current render rectangle lies completely outside the canvas, recentre.
-    // This can happen after extreme panning combined with zoom, resulting in a blank view.
-    // Re-evaluate render rect after possible camera adjustments
-    let (mut render_left, mut render_top, mut render_right, mut render_bottom) = (offset_x, offset_y, offset_x + render_w, offset_y + render_h);
-    let fully_offscreen =
-        render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
-    if fully_offscreen {
-        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
-        camera_guard.center_on(world_center);
-        // Recompute offsets after recentering for this frame's draw
-        let base_scale2 = (width_px / world_w).min(height_px / world_h).max(0.000_1);
-        let scale2 = base_scale2 * camera_guard.zoom;
-        let render_w2 = world_w * scale2;
-        let render_h2 = world_h * scale2;
-        let pad_x2 = (width_px - render_w2) * 0.5;
-        let pad_y2 = (height_px - render_h2) * 0.5;
-        let offset_x2 = origin_x + pad_x2 + camera_guard.offset_px.0;
-        let offset_y2 = origin_y + pad_y2 + camera_guard.offset_px.1;
-        // Overwrite locals for subsequent drawing
-        // SAFETY: shadow immutable locals with new bindings
-        // Update outer-scope variables for subsequent computations
-        render_w = render_w2;
-        render_h = render_h2;
-        offset_x = offset_x2;
-        offset_y = offset_y2;
-    }
+    // Avoid a duplicate second offscreen-recenter pass that shadowed locals and
+    // discarded recomputed offsets on some platforms (leading to a blank view).
+    // The initial offscreen guard above already recenters when necessary.
+
     if controls.follow_mode != FollowMode::Off
         && let Some(target) = follow_target
     {
