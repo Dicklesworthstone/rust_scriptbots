@@ -370,6 +370,7 @@ cargo build -p scriptbots-brain-ml --features candle
  - `--auto-tune N`: quick sweep to pick threads/thresholds for the chosen storage, then continue.
  - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.
+ - `--storage {duckdb|memory}`: select persistence backend; `memory` uses an in-memory DuckDB for analytics without disk I/O.
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
@@ -388,6 +389,7 @@ cargo build -p scriptbots-brain-ml --features candle
 - `SCRIPTBOTS_CONTROL_REST_ENABLED` — `true|false`.
 - `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
 - `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
+- `SCRIPTBOTS_STORAGE_PATH` — DuckDB file path for persistence (default `scriptbots.db`; set to a unique path per run during experiments).
 
 ### Dual-window mode (GUI)
 - On capable desktops, ScriptBots opens two GPUI windows: a canvas window rendering the world and a HUD window with controls, charts, and inspector. If a second window cannot be created (WM limits/remote desktop), the app falls back to a single-window overlay layout automatically.
@@ -459,6 +461,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes). Dual-window layout opens a HUD window and a simulation canvas window; a single-window overlay fallback is used when needed.
 - Camera controls: pan/zoom; keyboard bindings for pause, draw toggle, speed ±.
 - Overlays: selection highlights, diagnostics panel; charts and advanced overlays are staged in the plan.
+- Functional search: the settings panel includes a live search bar that filters parameters across all categories via a centralized filter, making it fast to find and tweak knobs.
 - Inspector: per-agent stats and genome/brain views (scoped to plan milestones); mutation-rate adjusters (±) for primary/secondary let you tweak an agent’s evolution parameters live.
 - Optional audio via `kira` (feature `audio`).
 
