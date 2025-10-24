@@ -368,6 +368,8 @@ cargo build -p scriptbots-brain-ml --features candle
  - `--storage-thresholds t,a,e,m`: override flush thresholds (tick, agent, event, metric).
  - `--profile-sweep N`: run a sweep of configurations for profiling and print a summary.
  - `--auto-tune N`: quick sweep to pick threads/thresholds for the chosen storage, then continue.
+ - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
+ - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
@@ -505,7 +507,7 @@ An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode 
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
 - Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
-Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save ASCII screenshot), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Brains leaderboard, and an emoji world mini-map.
+Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save ASCII screenshot), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Mortality panel, Brains leaderboard, recent events log, and an emoji world mini-map. The layout is responsive and auto-expands panels on wider terminals; press `x` to toggle.
 
 ## Storage & analytics
 - DuckDB schema (`ticks`, `metrics`, `events`, `agents`) with buffered writes and maintenance (`optimize`, `VACUUM`).

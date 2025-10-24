@@ -526,6 +526,25 @@ impl<'a> TerminalApp<'a> {
             Span::styled("Food ", self.palette.header_style()),
             Span::raw(format!("mean {:>5.2}", snapshot.food.mean)),
         ]));
+        // Per-diet mini bars
+        let max_class = diet.herbivores.max(diet.omnivores).max(diet.carnivores).max(1);
+        let mkbar = |count: usize| -> String {
+            let width = ((count * 20) / max_class).clamp(0, 20) as usize;
+            "█".repeat(width)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Bars  ", self.palette.header_style()),
+            Span::styled("H ", self.palette.diet_style(DietClass::Herbivore)),
+            Span::styled(mkbar(diet.herbivores), self.palette.diet_style(DietClass::Herbivore)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("      O ", self.palette.diet_style(DietClass::Omnivore)),
+            Span::styled(mkbar(diet.omnivores), self.palette.diet_style(DietClass::Omnivore)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("      C ", self.palette.diet_style(DietClass::Carnivore)),
+            Span::styled(mkbar(diet.carnivores), self.palette.diet_style(DietClass::Carnivore)),
+        ]));
 
         let paragraph = Paragraph::new(Text::from(lines)).block(
             Block::default()
@@ -782,6 +801,14 @@ impl<'a> TerminalApp<'a> {
                 Span::styled("Traits μ ", self.palette.header_style()),
                 Span::raw(format!("smell {:.2} sound {:.2} hear {:.2} eye {:.2} blood {:.2}",
                     ana.traits_smell_mean, ana.traits_sound_mean, ana.traits_hearing_mean, ana.traits_eye_mean, ana.traits_blood_mean)),
+            ]));
+            // Temperature comfort
+            let comfort = (1.0 - ana.temperature_discomfort_mean.max(0.0)).clamp(0.0, 1.0);
+            let width = (comfort * 20.0).round() as usize;
+            lines.push(Line::from(vec![
+                Span::styled("Comfort ", self.palette.header_style()),
+                Span::raw(format!("{:>3.0}% ", comfort * 100.0)),
+                Span::styled("█".repeat(width), Style::default().fg(Color::LightGreen)),
             ]));
         } else {
             lines.push(Line::from(vec![Span::raw("Analytics warming up… (run a few ticks) ")]));

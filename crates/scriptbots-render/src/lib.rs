@@ -4405,8 +4405,50 @@ impl SimulationView {
             )
             .child(output_bars)
             .child(self.render_output_sparklines_for(detail.agent_id))
+            .child(self.render_diet_gauges())
             .child(render_brain_card(detail))
             .child(self.render_mutation_controls(detail, cx))
+    }
+
+    fn render_diet_gauges(&self) -> Div {
+        // Use analytics snapshot if available to show diet average energies
+        let mut rows: Vec<Div> = Vec::new();
+        if let Some(analytics) = self.analytics_cache.as_ref() {
+            let h = analytics.herbivore_avg_energy as f32;
+            let o = analytics.hybrid_avg_energy as f32;
+            let c = analytics.carnivore_avg_energy as f32;
+            let maxv = h.max(o).max(c).max(1e-3);
+            let mk = |label: &str, v: f32, color: Rgba| -> Div {
+                let w = (v / maxv).clamp(0.0, 1.0);
+                let track = div().w(px(120.0)).h(px(6.0)).bg(rgb(0x1e293b)).rounded_sm();
+                let fillw = 120.0 * w;
+                let fill = div().w(px(fillw)).h(px(6.0)).bg(color).rounded_sm();
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(label.to_string()))
+                    .child(div().relative().child(track).child(fill))
+                    .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!("{:.2}", v)))
+            };
+            rows.push(mk("H", h, rgba_from_hex(0x22c55e, 0.95)));
+            rows.push(mk("O", o, rgba_from_hex(0xf59e0b, 0.95)));
+            rows.push(mk("C", c, rgba_from_hex(0xef4444, 0.95)));
+        } else {
+            rows.push(div().text_xs().text_color(rgb(0x475569)).child("Diet gauges: analytics pending"));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .px_3()
+            .py_2()
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Diet avg energy"))
+            .children(rows)
     }
     fn render_mutation_controls(
         &self,
@@ -6004,9 +6046,10 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .unwrap_or((0, 0.0));
 
     let outputs = detail.outputs.clone();
+    let sensors = detail.sensors.clone();
     let radar_canvas = canvas(
-        move |_, _, _| outputs.clone(),
-        move |bounds, outputs, window, _| paint_brain_radar(bounds, outputs, window),
+        move |_, _, _| (sensors.clone(), outputs.clone()),
+        move |bounds, state, window, _| paint_brain_radar(bounds, &state.0, &state.1, window),
     )
     .w(px(180.0))
     .h(px(120.0));
@@ -6027,7 +6070,7 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .child(radar_canvas)
 }
 
-fn paint_brain_radar(bounds: Bounds<Pixels>, outputs: &Vec<f32>, window: &mut Window) {
+fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &Vec<f32>, outputs: &Vec<f32>, window: &mut Window) {
     let origin = bounds.origin;
     let size = bounds.size;
     let width = f32::from(size.width).max(1.0);
@@ -6066,11 +6109,29 @@ fn paint_brain_radar(bounds: Bounds<Pixels>, outputs: &Vec<f32>, window: &mut Wi
         if let Ok(path) = spoke.build() { window.paint_path(path, rgba_from_hex(0x1e293b, 0.9)); }
     }
 
-    // Filled polygon of output magnitudes (clamped 0..1)
-    let mut poly = PathBuilder::fill();
+    // Sensor heat ring around the radar (real sensor activations)
+    let n = sensors.len().max(3);
+    let ring_inner = radius * 1.05;
+    let ring_outer = radius * 1.18;
     for i in 0..n {
-        let val = outputs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let val = sensors.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let ang = (i as f32) / (n as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let x1 = cx + ring_inner * ang.cos();
+        let y1 = cy + ring_inner * ang.sin();
+        let x2 = cx + (ring_inner + (ring_outer - ring_inner) * val) * ang.cos();
+        let y2 = cy + (ring_inner + (ring_outer - ring_inner) * val) * ang.sin();
+        let mut seg = PathBuilder::stroke(px(3.0));
+        seg.move_to(point(px(x1), px(y1)));
+        seg.line_to(point(px(x2), px(y2)));
+        if let Ok(path) = seg.build() { window.paint_path(path, rgba_from_hex(0xf97316, 0.85)); }
+    }
+
+    // Filled polygon of output magnitudes (clamped 0..1)
+    let m = outputs.len().max(3);
+    let mut poly = PathBuilder::fill();
+    for i in 0..m {
+        let val = outputs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let ang = (i as f32) / (m as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
         let x = cx + radius * val * ang.cos();
         let y = cy + radius * val * ang.sin();
         if i == 0 { poly.move_to(point(px(x), px(y))); } else { poly.line_to(point(px(x), px(y))); }
