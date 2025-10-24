@@ -380,7 +380,7 @@ Implementation notes [2025-10-23]:
 
 ### 10) Determinism self-check (threads parity) [Currently In Progress - 2025-10-23]
 - Purpose: confidence guard for contributors/CI.
-- MVP: CLI `--det-check [ticks]` runs 1-thread vs N-threads and compares summaries/events.
+- MVP: CLI `--det-check [ticks]` runs 1-thread vs N-threads and compares summaries/events. [Completed - 2025-10-24: implemented in the app binary; CI job executes det runs and compares outputs.]
 - Surfaces: CLI; CI job gate (non-blocking initially).
 - Data/Perf: temporary run in memory; no DB write unless `--save`.
 - Testing: fixture worlds pass; inject a known race → diff surfaces red.

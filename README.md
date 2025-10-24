@@ -194,6 +194,89 @@ RUST_LOG=info cargo run -p scriptbots-app
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
 - Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
+## Quick start (platform scripts)
+
+Use the convenience scripts in the repo root to launch ScriptBots with sensible defaults per OS. These scripts set appropriate targets, isolate build artifacts, and pick the right renderer.
+
+### Linux — terminal mode
+- Script: `run_linux_terminal_mode.sh`
+- Usage:
+  ```bash
+  chmod +x ./run_linux_terminal_mode.sh
+  ./run_linux_terminal_mode.sh
+  ```
+- What it does:
+  - Detects CPU count into `THREADS` (`nproc`/`getconf` fallback; override by exporting `THREADS` beforehand)
+  - Builds with native CPU optimizations (`RUSTFLAGS="-C target-cpu=native"`)
+  - Forces terminal renderer (`SCRIPTBOTS_MODE=terminal`)
+  - Runs release binary with cargo job parallelism `-j $THREADS` and passes `--threads $THREADS` to the app
+- Customize:
+  - Reduce CPU usage: `THREADS=2 ./run_linux_terminal_mode.sh`
+  - Headless CI snapshot: export `SCRIPTBOTS_TERMINAL_HEADLESS=1` to render against an in-memory buffer
+  - Logging: `RUST_LOG=info ./run_linux_terminal_mode.sh`
+
+### macOS — terminal console
+- Script: `run_macos_version_with_console.sh`
+- Usage:
+  ```bash
+  chmod +x ./run_macos_version_with_console.sh
+  ./run_macos_version_with_console.sh
+  ```
+- What it does:
+  - Detects arch (`arm64` vs `x86_64`) and sets `--target` accordingly
+  - Isolates artifacts per-arch via `CARGO_TARGET_DIR=target-macos-$ARCH`
+  - Unsets any stray cross-compile/link flags for a clean native build
+  - Uses all cores for build jobs and launches the app in terminal mode (`--mode terminal`)
+- Customize:
+  - Add app flags by appending to the final `-- ...` section (e.g., `--threads 8`)
+  - Override logging: `RUST_LOG=info ./run_macos_version_with_console.sh`
+
+### macOS — GPU GUI (Metal)
+- Script: `run_macos_version_with_gui.sh`
+- Usage:
+  ```bash
+  chmod +x ./run_macos_version_with_gui.sh
+  ./run_macos_version_with_gui.sh
+  ```
+- What it does:
+  - Same target/artifact isolation as console script
+  - Prefers Metal backend for `wgpu` (`WGPU_BACKEND=metal`)
+  - Builds with `--features gui` and launches GUI mode (`--mode gui`) using `--threads 8`
+- Customize:
+  - Tune threads: edit `--threads 8` or set `SCRIPTBOTS_MAX_THREADS` env
+  - Troubleshoot rendering: you can add `--renderer-safe` to the app args if you see a black canvas
+
+### Windows — terminal console (MSVC)
+- Script: `run_windows_version_with_console.bat`
+- Usage:
+  - Double-click in Explorer, or run from a Developer PowerShell/Command Prompt:
+    ```bat
+    run_windows_version_with_console.bat
+    ```
+- What it does:
+  - Uses MSVC target `x86_64-pc-windows-msvc`
+  - Isolates artifacts under `target-windows-msvc`
+  - Uses all cores for build jobs and launches terminal mode (`--mode terminal`)
+- Prereqs:
+  - Rust MSVC toolchain and Visual Studio Build Tools (Windows 11 SDK) installed
+
+### Windows — GPU GUI (D3D12/Vulkan)
+- Script: `run_windows_version_with_gui.bat`
+- Usage:
+  - Double-click in Explorer, or run from a Developer PowerShell/Command Prompt:
+    ```bat
+    run_windows_version_with_gui.bat
+    ```
+- What it does:
+  - Same MSVC target/artifact isolation as console script
+  - Builds with `--features gui` and launches GUI mode (`--mode gui`) using `--threads 8`
+- Customize:
+  - Adjust threads by editing the `--threads` value; add app flags after `--` as needed (e.g., `--debug-watermark`)
+
+Notes (all platforms):
+- The final `-- ...` segment in each script passes flags to the application binary. You can add flags like `--storage memory`, `--profile-steps 1000`, or `--det-check 200` there.
+- To stream control API docs, ensure REST is enabled (default) and open `http://127.0.0.1:8088/docs` while the app runs.
+
 ### Build for Web (experimental)
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -274,6 +357,17 @@ cargo build -p scriptbots-brain-ml --features candle
   - `auto`: use GPUI when a display is detected; otherwise fall back to terminal.
   - `gui`: force GPUI; may fail on headless systems.
   - `terminal`: force emoji TUI.
+ - `--dump-png <FILE>` (GUI builds): write an offscreen PNG and exit (no UI). Pair with `--png-size WxH`.
+ - `--png-size WxH` (GUI builds): snapshot size for `--dump-png` (e.g., `1280x720`).
+ - `--debug-watermark`: overlay a tiny diagnostics watermark in the render canvas.
+ - `--renderer-safe`: force a conservative paint path (useful for troubleshooting black canvas on some Windows setups).
+ - `--threads N`: cap simulation worker threads (overrides low-power defaults).
+ - `--low-power`: prefer lower CPU usage (equivalent to `--threads 2` unless `--threads` is provided); also biases `auto` toward terminal.
+ - `--profile-steps N`: headless `world.step()` profiling without persistence.
+ - `--profile-storage-steps N`: headless profiling with selected storage mode.
+ - `--storage-thresholds t,a,e,m`: override flush thresholds (tick, agent, event, metric).
+ - `--profile-sweep N`: run a sweep of configurations for profiling and print a summary.
+ - `--auto-tune N`: quick sweep to pick threads/thresholds for the chosen storage, then continue.
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
@@ -283,6 +377,7 @@ cargo build -p scriptbots-brain-ml --features candle
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
 - `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
 - `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.
+- `SCRIPTBOTS_MAX_THREADS` — preferred maximum thread budget; core will cap Rayon to min of CPUs and this value (used unless `RAYON_NUM_THREADS` is already set).
 - `SCRIPTBOTS_NEUROFLOW_ENABLED` — `true|false`.
 - `SCRIPTBOTS_NEUROFLOW_HIDDEN` — comma-separated hidden sizes (e.g., `64,32,16`).
 - `SCRIPTBOTS_NEUROFLOW_ACTIVATION` — `tanh|sigmoid|relu`.

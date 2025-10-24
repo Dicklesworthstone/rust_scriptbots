@@ -192,6 +192,8 @@ struct SimulationView {
     audio: Option<AudioState>,
     // When true, render a minimal canvas-focused layout (used in the dedicated world window).
     minimal_canvas_mode: bool,
+    // Per-agent short history of brain outputs for inspector sparklines
+    brain_history: std::collections::HashMap<AgentId, OutputHistory>,
 }
 
 impl SimulationView {
@@ -241,6 +243,7 @@ impl SimulationView {
                 })
                 .ok(),
             minimal_canvas_mode: false,
+            brain_history: std::collections::HashMap::new(),
         }
     }
 
@@ -4327,6 +4330,9 @@ impl SimulationView {
         detail: &AgentInspectorDetails,
         cx: &mut Context<Self>,
     ) -> Div {
+        // Brain bars (sensors/outputs)
+        let sensor_bars = render_brain_bars(&detail.sensors, true);
+        let output_bars = render_brain_bars(&detail.outputs, false);
         let sensors_preview: Vec<String> = detail
             .sensors
             .iter()
@@ -4384,18 +4390,21 @@ impl SimulationView {
                 detail.trait_modifiers.eye,
                 detail.trait_modifiers.blood
             )))
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                "Sensors ({}/{}) {}",
-                detail.sensors.len(),
-                INPUT_SIZE,
-                sensors_preview.join(", ")
-            )))
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                "Outputs ({}/{}) {}",
-                detail.outputs.len(),
-                OUTPUT_SIZE,
-                outputs_preview.join(", ")
-            )))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Sensors")
+            )
+            .child(sensor_bars)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Outputs")
+            )
+            .child(output_bars)
+            .child(render_brain_card(detail))
             .child(self.render_mutation_controls(detail, cx))
     }
     fn render_mutation_controls(

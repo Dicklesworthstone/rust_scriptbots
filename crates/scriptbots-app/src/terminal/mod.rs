@@ -322,7 +322,7 @@ impl<'a> TerminalApp<'a> {
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
             .constraints(if self.expanded {
-                [
+                vec![
                     Constraint::Length(7),
                     Constraint::Length(7),
                     Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
@@ -333,7 +333,7 @@ impl<'a> TerminalApp<'a> {
                     Constraint::Min(3),
                 ]
             } else {
-                [
+                vec![
                     Constraint::Length(7),
                     Constraint::Length(5),
                     Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
@@ -738,7 +738,7 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(List::new(events).block(block), area);
     }
 
-    fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+    fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(ana) = &self.analytics {
             lines.push(Line::from(vec![
@@ -764,11 +764,24 @@ impl<'a> TerminalApp<'a> {
                 Span::raw(format!("sens {:>4.2}  out {:>4.2}", ana.behavior_sensor_entropy, ana.behavior_output_entropy)),
             ]));
             lines.push(Line::from(vec![
+                Span::styled("Food Δ ", self.palette.header_style()),
+                Span::raw(format!("μ {:>+5.2}  |μ| {:>4.2}", ana.food_delta_mean, ana.food_delta_mean_abs)),
+            ]));
+            lines.push(Line::from(vec![
                 Span::styled("Deaths ", self.palette.header_style()),
                 Span::raw(format!("total {:>4}", ana.deaths_total)),
                 Span::raw("  "),
                 Span::styled("Births ", self.palette.header_style()),
                 Span::raw(format!("{:>4}  hybrid {:>3} ({:>4.1}%)", ana.births_total, ana.births_hybrid, ana.births_hybrid_ratio * 100.0)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Diet E ", self.palette.header_style()),
+                Span::raw(format!("H {:.2} O {:.2} C {:.2}", ana.herbivore_avg_energy, ana.hybrid_avg_energy, ana.carnivore_avg_energy)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Traits μ ", self.palette.header_style()),
+                Span::raw(format!("smell {:.2} sound {:.2} hear {:.2} eye {:.2} blood {:.2}",
+                    ana.traits_smell_mean, ana.traits_sound_mean, ana.traits_hearing_mean, ana.traits_eye_mean, ana.traits_blood_mean)),
             ]));
         } else {
             lines.push(Line::from(vec![Span::raw("Analytics warming up… (run a few ticks) ")]));
@@ -813,10 +826,21 @@ impl<'a> TerminalApp<'a> {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(ana) = &self.analytics {
             lines.push(Line::from(vec![
-                Span::styled("Deaths ", self.palette.header_style()),
-                Span::raw(format!("total {:>4}", ana.deaths_total)),
+                Span::styled("Deaths total ", self.palette.header_style()),
+                Span::raw(format!("{:>4}", ana.deaths_total)),
             ]));
-            // Per-cause breakdown if available in future; placeholder spacing
+            lines.push(Line::from(vec![
+                Span::raw("  Combat C:"),
+                Span::raw(format!("{:>3}", ana.deaths_combat_carnivore)),
+                Span::raw("  Combat H:"),
+                Span::raw(format!("{:>3}", ana.deaths_combat_herbivore)),
+                Span::raw("  Starv:"),
+                Span::raw(format!("{:>3}", ana.deaths_starvation)),
+                Span::raw("  Aging:"),
+                Span::raw(format!("{:>3}", ana.deaths_aging)),
+                Span::raw("  Unknown:"),
+                Span::raw(format!("{:>3}", ana.deaths_unknown)),
+            ]));
         } else {
             lines.push(Line::from(vec![Span::raw("Mortality data warming up…")]));
         }
@@ -832,7 +856,7 @@ impl<'a> TerminalApp<'a> {
         let size = frame.area();
         let help_width = (size.width as f32 * 0.6).round() as u16;
 
-        let mut help_lines = vec![
+        let help_lines = vec![
             Line::from(vec![Span::styled(
                 "Controls",
                 self.palette.header_style().add_modifier(Modifier::BOLD),
@@ -1186,9 +1210,24 @@ struct TerminalAnalytics {
     behavior_sensor_entropy: f64,
     behavior_output_entropy: f64,
     deaths_total: usize,
+    deaths_combat_carnivore: usize,
+    deaths_combat_herbivore: usize,
+    deaths_starvation: usize,
+    deaths_aging: usize,
+    deaths_unknown: usize,
     births_total: usize,
     births_hybrid: usize,
     births_hybrid_ratio: f64,
+    food_delta_mean: f64,
+    food_delta_mean_abs: f64,
+    carnivore_avg_energy: f64,
+    herbivore_avg_energy: f64,
+    hybrid_avg_energy: f64,
+    traits_smell_mean: f64,
+    traits_sound_mean: f64,
+    traits_hearing_mean: f64,
+    traits_eye_mean: f64,
+    traits_blood_mean: f64,
     brain_shares: Vec<BrainShareEntry>,
 }
 
@@ -1252,12 +1291,27 @@ fn parse_terminal_analytics(
         generation_max: value("population.generation.max").unwrap_or(0.0),
         mutation_primary_mean: value("mutation.primary.mean").unwrap_or(0.0),
         mutation_secondary_mean: value("mutation.secondary.mean").unwrap_or(0.0),
-        behavior_sensor_entropy: value("behavior.sensor.entropy").unwrap_or(0.0),
-        behavior_output_entropy: value("behavior.output.entropy").unwrap_or(0.0),
+        behavior_sensor_entropy: value("behavior.sensors.entropy").unwrap_or(0.0),
+        behavior_output_entropy: value("behavior.outputs.entropy").unwrap_or(0.0),
         deaths_total: as_count("mortality.total.count"),
+        deaths_combat_carnivore: as_count("mortality.combat_carnivore.count"),
+        deaths_combat_herbivore: as_count("mortality.combat_herbivore.count"),
+        deaths_starvation: as_count("mortality.starvation.count"),
+        deaths_aging: as_count("mortality.aging.count"),
+        deaths_unknown: as_count("mortality.unknown.count"),
         births_total: as_count("births.total.count"),
         births_hybrid: as_count("births.hybrid.count"),
         births_hybrid_ratio: value("births.hybrid.ratio").unwrap_or(0.0),
+        food_delta_mean: value("food_delta.mean").unwrap_or(0.0),
+        food_delta_mean_abs: value("food_delta.mean_abs").unwrap_or(0.0),
+        carnivore_avg_energy: value("population.carnivore.avg_energy").unwrap_or(0.0),
+        herbivore_avg_energy: value("population.herbivore.avg_energy").unwrap_or(0.0),
+        hybrid_avg_energy: value("population.hybrid.avg_energy").unwrap_or(0.0),
+        traits_smell_mean: value("traits.smell.mean").unwrap_or(0.0),
+        traits_sound_mean: value("traits.sound.mean").unwrap_or(0.0),
+        traits_hearing_mean: value("traits.hearing.mean").unwrap_or(0.0),
+        traits_eye_mean: value("traits.eye.mean").unwrap_or(0.0),
+        traits_blood_mean: value("traits.blood.mean").unwrap_or(0.0),
         brain_shares,
     })
 }
