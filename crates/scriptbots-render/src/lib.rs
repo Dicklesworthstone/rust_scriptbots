@@ -9720,9 +9720,20 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         frame.world_size,
         base_scale,
     );
-    // Avoid a duplicate second offscreen-recenter pass that shadowed locals and
-    // discarded recomputed offsets on some platforms (leading to a blank view).
-    // The initial offscreen guard above already recenters when necessary.
+    // Second-chance offscreen guard: now that render metrics are recorded, a
+    // recenter can compute correct offsets on the very first frame.
+    let fully_offscreen_after_metrics =
+        (offset_x + render_w) < view_left
+            || offset_x > view_right
+            || (offset_y + render_h) < view_top
+            || offset_y > view_bottom;
+    if fully_offscreen_after_metrics {
+        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
+        camera_guard.center_on(world_center);
+        // Recompute offsets with updated camera state (uses freshly recorded metrics)
+        offset_x = origin_x + pad_x + camera_guard.offset_px.0;
+        offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+    }
 
     if controls.follow_mode != FollowMode::Off
         && let Some(target) = follow_target

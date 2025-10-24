@@ -14,7 +14,7 @@ use scriptbots_core::{
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
-use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
+use scriptbots_storage::{PersistedReplayEvent, Storage, StorageError, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
 use std::process::{Command, Stdio};
 use std::{
@@ -384,9 +384,52 @@ fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode, threshol
     // Choose persistence strategy
     let (storage, mut world) = match storage_mode {
         StorageMode::DuckDb => {
-            let pipeline = match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
-                (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(&storage_path, t, a, e, m)?,
-                _ => StoragePipeline::new(&storage_path)?,
+            // Helper to try opening a pipeline with current thresholds
+            let try_open = |path: &str| -> std::result::Result<StoragePipeline, StorageError> {
+                match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
+                    (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(path, t, a, e, m),
+                    _ => StoragePipeline::new(path),
+                }
+            };
+            // First attempt
+            let pipeline = match try_open(&storage_path) {
+                Ok(p) => p,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let lock_error = msg.to_ascii_lowercase().contains("could not set lock")
+                        || msg.to_ascii_lowercase().contains("conflicting lock");
+                    if lock_error {
+                        // Generate a safe fallback path alongside the requested path
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let pid = std::process::id();
+                        let fallback_path = {
+                            let p = std::path::Path::new(&storage_path);
+                            let parent = p.parent();
+                            let (stem, ext) = (
+                                p.file_stem().and_then(|s| s.to_str()).unwrap_or("scriptbots"),
+                                p.extension().and_then(|e| e.to_str()).unwrap_or("duckdb"),
+                            );
+                            let file = format!("{}.run-{}-{}.{}", stem, pid, ts, ext);
+                            if let Some(dir) = parent { dir.join(file) } else { std::path::PathBuf::from(file) }
+                        };
+                        if let Some(parent) = fallback_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        println!(
+                            "{} {} is locked ({}). Falling back to {}",
+                            "⚠".yellow().bold(),
+                            storage_path.cyan(),
+                            msg,
+                            fallback_path.display().to_string().magenta().bold()
+                        );
+                        try_open(&fallback_path.to_string_lossy())?
+                    } else {
+                        return Err(err.into());
+                    }
+                }
             };
             let storage: SharedStorage = pipeline.storage();
             let world = WorldState::with_persistence(config, Box::new(pipeline))?;
@@ -980,10 +1023,52 @@ fn profile_world_steps_with_storage(
 ) -> Result<()> {
     let storage_path = env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
     let pipeline = match storage_mode {
-        StorageMode::DuckDb => match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
-            (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(&storage_path, t, a, e, m)?,
-            _ => StoragePipeline::new(&storage_path)?,
-        },
+        StorageMode::DuckDb => {
+            let try_open = |path: &str| -> std::result::Result<StoragePipeline, StorageError> {
+                match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
+                    (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(path, t, a, e, m),
+                    _ => StoragePipeline::new(path),
+                }
+            };
+            match try_open(&storage_path) {
+                Ok(p) => p,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let lock_error = msg.to_ascii_lowercase().contains("could not set lock")
+                        || msg.to_ascii_lowercase().contains("conflicting lock");
+                    if lock_error {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let pid = std::process::id();
+                        let fallback_path = {
+                            let p = std::path::Path::new(&storage_path);
+                            let parent = p.parent();
+                            let (stem, ext) = (
+                                p.file_stem().and_then(|s| s.to_str()).unwrap_or("scriptbots"),
+                                p.extension().and_then(|e| e.to_str()).unwrap_or("duckdb"),
+                            );
+                            let file = format!("{}.run-{}-{}.{}", stem, pid, ts, ext);
+                            if let Some(dir) = parent { dir.join(file) } else { std::path::PathBuf::from(file) }
+                        };
+                        if let Some(parent) = fallback_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        println!(
+                            "{} {} is locked ({}). Falling back to {}",
+                            "⚠".yellow().bold(),
+                            storage_path.cyan(),
+                            msg,
+                            fallback_path.display().to_string().magenta().bold()
+                        );
+                        try_open(&fallback_path.to_string_lossy())?
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
         StorageMode::Memory => StoragePipeline::with_thresholds(
             ":memory:",
             thresholds.tick.unwrap_or(64),
