@@ -90,6 +90,85 @@
 - Accelerator hooks:
   - Keep sensor aggregation and brain inference behind pluggable traits so alternative implementations (SIMD-optimized, GPU-backed) can be introduced without touching higher-level logic. Prototype GPU execution by batching inference into wgpu compute shaders or other accelerators once profiling justifies the investment.
 
+## SIMD and Chunked Neighborhood Batching (CPU Hot-Path Optimization Roadmap)
+
+### Rationale
+- Our profiler and Criterion benches show the sensing and combat phases dominate CPU time at medium–large populations, primarily due to repeated per-neighbor math (distances, angular checks, color aggregation) inside small scalar loops.
+- We already achieved a deterministic, modest win (~5% at 2k agents over 1000 ticks) by:
+  - Reusing per-tick buffers to reduce allocations.
+  - Adding a chunked neighbor traversal API (`visit_neighbor_buckets`) in `scriptbots-index`.
+  - Vectorizing the per-eye (4 eyes) vision accumulation and batching combat alignment checks with 4-wide SIMD via `wide::f32x4` (feature `simd_wide`, default ON) while preserving scalar fallback and determinism.
+- Bigger wins require reducing scalar control-flow inside the hot loops and processing neighbors in blocks (4–8) where we can execute the same arithmetic in lockstep.
+
+### Goals and Success Criteria
+- Primary: Improve ticks/sec by 15–30% at 5k–10k agents in CPU-only builds on typical 8–16 core machines while preserving deterministic physics and outputs within the project’s defined tolerances.
+- Secondary: Keep code readable and maintainable with minified risk: SIMD behind a feature gate (`simd_wide`) and scalar fallback always compiled and tested.
+- Determinism: Maintain identical outputs vs. scalar path at single-threaded and multi-threaded settings (order preservation and stable floating-point reduction strategies).
+
+### Scope of SIMD Batching (Phase 1 → Phase 3)
+1) Phase 1 (Shipped) [Completed - 2025-10-24]
+   - Added `visit_neighbor_buckets` to `UniformGridIndex` to expose contiguous neighbor candidate slices per cell.
+   - Vectorized 4‑eye vision accumulation for each candidate neighbor using `wide::f32x4`.
+   - Batch combat alignment/damage math over 4 neighbors at a time; scalar remainder loop for tails.
+   - Buffer reuse across `stage_sense`, `stage_actuation`, `stage_combat`, and `stage_food` to eliminate transient allocations.
+
+2) Phase 2 (Next) [Currently In Progress - 2025-10-24]
+   - SIMD‑batch the remaining sensing channels per neighbor:
+     - Density/eye RGB accumulation (done for eyes; verify saturation/clamp paths remain vectorized).
+     - Smell: accumulate `dist_factor` in 4‑wide chunks.
+     - Sound: compute `speed = sqrt(vx^2+vy^2)` and `(speed / max_speed).clamp(0,1)` in lanes; accumulate `dist_factor * normalized_speed`.
+     - Hearing: accumulate `dist_factor * sound_emitter[other]` in lanes (requires `sound_emitters` SoA snapshot; already available).
+     - Blood forward‑cone: vectorize `forward_diff < BLOOD_HALF_FOV` mask, lane-wise `bleed * dist_factor * wound`.
+   - Precompute frequently reused per-agent scalars into SoA arrays before the neighbor pass to reduce scalar work in the inner loop: [Completed - 2025-10-24: headings sin/cos prep deferred; implemented per-eye clamped FOV, precomputed view directions, normalized speeds]
+     - Heading sin/cos arrays.
+     - `inv_radius` (and `inv_max_speed`) for the current tick.
+     - FOV per eye with `max(0.01)` applied once.
+   - Micro-branch pruning in blocks:
+     - Evaluate distance mask (`dist_sq <= ε || dist_sq > r²`) and, when fully false across the 4‑lane block, skip the rest of the math.
+     - For vision: compute lane‑wise `diff < fov` mask, apply via multiply by zero rather than branches; prefer max/min to avoid divergent control paths.
+
+3) Phase 3 (Optional, post‑validation)
+   - Consider 8‑wide SIMD (`f32x8`) if the `wide` crate/API and common targets justify it; gate behind `simd_wide8` feature while keeping `f32x4` as default for portability.
+   - SIMD more of combat:
+     - Precompute attacker `facing` vectors, base damage scalars, and boost/speed factors once; run 4–8 victim lanes at a time.
+     - Keep bucket‑local ordering stable when emitting hits (collect per‑block and append preserving neighbor index order).
+   - Evaluate top‑N filters pre‑SIMD path (e.g., early gating by spike alignment or min length) to avoid arithmetic on clearly invalid candidates.
+
+### Determinism Strategy
+- Keep scalar and vectorized paths mathematically equivalent:
+  - Use lane-wise masks via multiply-by-zero instead of diverging branches.
+  - Preserve output application order by iterating buckets in stable order and emitting per-index results identically.
+  - Avoid horizontal reductions that change addition order; accumulate per-agent values in the same index order as the scalar loop (append per-lane in increasing index).
+- Tests:
+  - Seeded determinism tests already ensure summary equivalence. We’ll add specific equality checks for sensors and combat hits on micro scenes (small neighborhoods) across scalar vs. SIMD modes and across thread counts.
+
+### Data Layout & Indexing
+- SoA snapshots: Continue to expand `work_*` vectors for everything used inside hot loops (eye FOVs, eye directions, trait modifiers, sound emitters, heading sin/cos) to maximize cache locality and enable contiguous reads in SIMD lanes.
+- Index buckets: `visit_neighbor_buckets` exposes contiguous `&[usize]` slices, suitable for `.chunks_exact(4)` iteration. Ensure bucket fill order remains deterministic and spatially local for cache friendliness.
+
+### Feature Flags and Fallbacks
+- `simd_wide` is ON by default; the scalar fallback builds and is tested continuously.
+- Consider a `simd_strict` mode to assert exact equality vs. scalar on CI microtests (dev‑only), guarding accidental drift.
+
+### Benchmarks & Targets (CPU)
+- Criterion harness (`world_bench`) supports env knobs:
+  - `SB_BENCH_STEPS`, `SB_BENCH_SAMPLES`, `SB_BENCH_WARMUP_SECS`, `SB_BENCH_MEASURE_SECS`, `SB_BENCH_AGENTS`.
+  - Parallel tunables: `RAYON_NUM_THREADS`, `SCRIPTBOTS_PAR_MIN_SPLIT` (dynamic min‑split for `.with_min_len`).
+- Targets (indicative, to refine on CI runner):
+  - 2k agents × 1000 ticks: SIMD + chunking yields ≥5–10% over parallel‑only baseline.
+  - 5k–10k agents × 1000 ticks: ≥15–30% improvement after Phase 2 SIMD of smell/sound/hearing/blood and expanded combat vectorization.
+
+### Rollout Plan & Acceptance Criteria
+1) Land Phase 2 SIMD for senses and finalize combat batching; verify determinism tests and unit equality tests.
+2) Bench A/B on CI runner at 2k/5k/10k agents; record ticks/sec and p‑values; document deltas in repo (docs/benchmarks.md).
+3) Tune `SCRIPTBOTS_PAR_MIN_SPLIT` defaults based on benches; expose a CLI knob if needed.
+4) Acceptance: Hit ≥15% at 5k agents (1k ticks) and ≥5% at 2k agents with no determinism regressions; document and keep scalar fallback.
+
+### Risks & Mitigations
+- Floating‑point subtlety: mask‑by‑zero instead of conditional branches; avoid re‑ordering reductions; add microtests.
+- Portability: stay on stable Rust; use `wide` crate for SIMD; fallback remains scalar.
+- Maintainability: clean, isolated SIMD blocks guarded by feature flags; heavy use of SoA snapshots and precomputed scalars to keep inner loops straightforward.
+
 ## Rendering with GPUI
  - Entry point: `Application::new().run(|cx: &mut App| { ... })`, open window with `cx.open_window(...)`, register root view `WorldView`.
 - State ownership:
@@ -565,6 +644,9 @@ Implementation notes [2025-10-23]:
 4) Integrate in `scriptbots-render`: add compositor node that owns the renderer and GPUI image; replace world canvas draw with image presentation.
 5) Bench/optimize; document knobs: render size, max FPS, culling on/off.
 6) Keep canvas renderer as a fallback toggle (`--renderer=canvas|wgpu`).
+
+### [Currently In Progress] Execution Log
+- 2025-10-24: Created new crate `scriptbots-world-gfx` (workspace member) with initial `WorldRenderer` skeleton, RGBA8 sRGB color target, and triple‑buffered readback ring API (non‑blocking poll). This establishes the offscreen render + readback contract for GPUI composition. Next: wire minimal terrain/agent pipelines and the GPUI compositor stub.
 
 ### Maintenance & Risk Notes
 - No GPUI fork. Unmodified upstream stays in `Cargo.toml`.

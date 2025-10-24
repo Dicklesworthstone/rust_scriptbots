@@ -14,6 +14,7 @@ wgpu = { version = "0.20" }
 bytemuck = { version = "1.16", features = ["derive"] }
 glam = { version = "0.27", default-features = false, features = ["std"] }
 tracing = { version = "0.1" }
+futures-intrusive = "0.5"
 
 [features]
 default = []

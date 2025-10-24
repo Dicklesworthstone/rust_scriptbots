@@ -4103,6 +4103,8 @@ pub struct WorldState {
     work_trait_modifiers: Vec<TraitModifiers>,
     work_eye_directions: Vec<[f32; NUM_EYES]>,
     work_eye_fov: Vec<[f32; NUM_EYES]>,
+    work_eye_view_dirs: Vec<[f32; NUM_EYES]>,
+    work_eye_fov_clamped: Vec<[f32; NUM_EYES]>,
     work_clocks: Vec<[f32; 2]>,
     work_temperature_preferences: Vec<f32>,
     work_sound_emitters: Vec<f32>,
@@ -4110,6 +4112,7 @@ pub struct WorldState {
     work_headings: Vec<f32>,
     work_spike_lengths: Vec<f32>,
     work_velocities: Vec<Velocity>,
+    work_speed_norm: Vec<f32>,
     work_runtime_snapshot: Vec<AgentRuntime>,
     work_penalties: Vec<f32>,
     pending_deaths: Vec<AgentId>,
@@ -4207,6 +4210,8 @@ impl WorldState {
             work_trait_modifiers: Vec::new(),
             work_eye_directions: Vec::new(),
             work_eye_fov: Vec::new(),
+            work_eye_view_dirs: Vec::new(),
+            work_eye_fov_clamped: Vec::new(),
             work_clocks: Vec::new(),
             work_temperature_preferences: Vec::new(),
             work_sound_emitters: Vec::new(),
@@ -4214,6 +4219,7 @@ impl WorldState {
             work_headings: Vec::new(),
             work_spike_lengths: Vec::new(),
             work_velocities: Vec::new(),
+            work_speed_norm: Vec::new(),
             work_runtime_snapshot: Vec::new(),
             work_penalties: Vec::new(),
             pending_deaths: Vec::new(),
@@ -4515,14 +4521,27 @@ impl WorldState {
         self.work_trait_modifiers.resize(agent_count, TraitModifiers::default());
         self.work_eye_directions.resize(agent_count, [0.0; NUM_EYES]);
         self.work_eye_fov.resize(agent_count, [1.0; NUM_EYES]);
+        self.work_eye_view_dirs.resize(agent_count, [0.0; NUM_EYES]);
+        self.work_eye_fov_clamped.resize(agent_count, [1.0; NUM_EYES]);
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
         self.work_temperature_preferences.resize(agent_count, 0.5);
         self.work_sound_emitters.resize(agent_count, 0.0);
+        self.work_speed_norm.resize(agent_count, 0.0);
         for (idx, id) in handles.iter().enumerate() {
             if let Some(rt) = runtime.get(*id) {
                 self.work_trait_modifiers[idx] = rt.trait_modifiers;
                 self.work_eye_directions[idx] = rt.eye_direction;
                 self.work_eye_fov[idx] = rt.eye_fov;
+                // Precompute per-eye view directions and clamped FOV once per agent
+                let mut views = [0.0; NUM_EYES];
+                let mut fovc = [1.0; NUM_EYES];
+                let base_heading = headings[idx];
+                for e in 0..NUM_EYES {
+                    views[e] = wrap_signed_angle(base_heading + rt.eye_direction[e]);
+                    fovc[e] = rt.eye_fov[e].max(0.01);
+                }
+                self.work_eye_view_dirs[idx] = views;
+                self.work_eye_fov_clamped[idx] = fovc;
                 self.work_clocks[idx] = rt.clocks;
                 self.work_temperature_preferences[idx] = rt.temperature_preference;
                 self.work_sound_emitters[idx] = rt.sound_multiplier;
@@ -4545,6 +4564,11 @@ impl WorldState {
         let food_cells = self.food.cells();
         let food_max = self.config.food_max;
         let max_speed = (self.config.bot_speed * self.config.boost_multiplier).max(1e-3);
+        // Precompute normalized speed per agent for sound channel
+        for (idx, vel) in velocities.iter().enumerate() {
+            let sp = (vel.vx * vel.vx + vel.vy * vel.vy).sqrt();
+            self.work_speed_norm[idx] = (sp / max_speed).clamp(0.0, 1.0);
+        }
         let tick_value = self.tick.0 as f32;
         let index = &self.index;
 
@@ -4562,8 +4586,8 @@ impl WorldState {
             let position = positions[idx];
             let heading = headings[idx];
             let traits = trait_modifiers[idx];
-            let eyes_dir = eye_directions[idx];
-            let eyes_fov = eye_fov[idx];
+            let eyes_dir = &self.work_eye_view_dirs[idx];
+            let eyes_fov = &self.work_eye_fov_clamped[idx];
 
             index.visit_neighbor_buckets(idx, radius, &mut |indices| {
                 for &other_idx in indices {
@@ -4652,8 +4676,7 @@ impl WorldState {
                     smell += dist_factor;
 
                     let velocity = velocities[other_idx];
-                    let speed = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
-                    sound += dist_factor * (speed / max_speed).clamp(0.0, 1.0);
+                    sound += dist_factor * self.work_speed_norm[other_idx];
                     hearing += dist_factor * sound_emitters[other_idx];
 
                     let forward_diff = angle_difference(heading, ang);

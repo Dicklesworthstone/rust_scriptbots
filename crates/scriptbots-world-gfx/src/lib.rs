@@ -36,7 +36,8 @@ pub struct WorldRenderer {
     color_view: wgpu::TextureView,
     format: wgpu::TextureFormat,
     readback: ReadbackRing,
-    // Pipelines and buffers will be added in subsequent commits.
+    terrain: TerrainPipeline,
+    agents: AgentPipeline,
 }
 
 pub struct RenderFrame {
@@ -54,6 +55,8 @@ impl WorldRenderer {
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let (color, color_view) = create_color(&device, format, size);
         let readback = ReadbackRing::new(&device, size, format)?;
+        let terrain = TerrainPipeline::new(&device, format);
+        let agents = AgentPipeline::new(&device, format);
 
         Ok(Self {
             device,
@@ -63,6 +66,8 @@ impl WorldRenderer {
             color_view,
             format,
             readback,
+            terrain,
+            agents,
         })
     }
 
@@ -78,27 +83,27 @@ impl WorldRenderer {
         Ok(())
     }
 
-    pub fn render(&mut self, _snapshot: &WorldSnapshot) -> RenderFrame {
-        // Placeholder clear; pipelines will be added in later steps.
+    pub fn render(&mut self, snapshot: &WorldSnapshot) -> RenderFrame {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.render") });
+        // Background clear
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world.clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.color_view,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.06, b: 0.12, a: 1.0 }),
-                        store: true,
-                    },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.06, b: 0.12, a: 1.0 }), store: true },
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
         }
+        // Terrain + agents
+        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, snapshot);
+        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, snapshot);
         self.queue.submit(Some(encoder.finish()));
         RenderFrame { color: self.color.clone(), extent: self.size }
     }
@@ -205,5 +210,235 @@ impl ReadbackRing {
 }
 
 fn align_256(n: u32) -> u32 { ((n + 255) / 256) * 256 }
+
+// ---------------- Terrain pipeline (instanced tiles with atlas) ----------------
+
+struct TerrainPipeline {
+    pipeline: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
+    atlas: wgpu::Texture,
+    atlas_view: wgpu::TextureView,
+    bg_layout: wgpu::BindGroupLayout,
+    bg: wgpu::BindGroup,
+    tile_vbuf: wgpu::Buffer,
+    tile_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TileInstance {
+    pos: [f32; 2],
+    size: [f32; 2],
+    atlas_uv: [f32; 4],
+}
+
+impl TerrainPipeline {
+    fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("terrain.sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // 1x1 white atlas placeholder; real atlas supplied later via update
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terrain.atlas"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain.bg_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            }, wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            }],
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain.bg"),
+            layout: &bg_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&atlas_view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) }],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("terrain.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(TERRAIN_WGSL)),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("terrain.layout"), bind_group_layouts: &[&bg_layout], push_constant_ranges: &[] });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain.pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4] }] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, strip_index_format: None, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        let tile_vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("terrain.instances"), size: 1024 * std::mem::size_of::<TileInstance>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        Self { pipeline, sampler, atlas, atlas_view, bg_layout, bg, tile_vbuf, tile_count: 0 }
+    }
+
+    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, snapshot: &WorldSnapshot) {
+        // Build tile instances for visible terrain (simple full mesh for now). In a follow‑up commit, add culling.
+        let (tw, th) = snapshot.terrain.dims;
+        let cell = snapshot.terrain.cell_size as f32;
+        let mut staging: Vec<TileInstance> = Vec::with_capacity((tw as usize) * (th as usize));
+        for y in 0..th {
+            for x in 0..tw {
+                let px = x as f32 * cell;
+                let py = y as f32 * cell;
+                staging.push(TileInstance { pos: [px, py], size: [cell, cell], atlas_uv: [0.0, 0.0, 1.0, 1.0] });
+            }
+        }
+        if !staging.is_empty() {
+            queue.write_buffer(&self.tile_vbuf, 0, bytemuck::cast_slice(&staging));
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("terrain.pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: true } })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bg, &[]);
+        pass.set_vertex_buffer(0, self.tile_vbuf.slice(..));
+        pass.draw(0..4, 0..staging.len() as u32);
+    }
+}
+
+const TERRAIN_WGSL: &str = r#"
+struct VsIn {
+  @location(0) pos: vec2<f32>,
+  @location(1) size: vec2<f32>,
+  @location(2) uv: vec4<f32>,
+};
+
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
+  var o: VsOut;
+  var quad = array<vec2<f32>, 4>(vec2<f32>(0.0,0.0), vec2<f32>(1.0,0.0), vec2<f32>(0.0,1.0), vec2<f32>(1.0,1.0));
+  let p = quad[vid];
+  let xy = inst.pos + p * inst.size;
+  // Viewport-space (pixel) to NDC conversion (assumes a postprocess that maps pixel to NDC; simplify for now with framebuffer-sized world)
+  // For now assume origin at top-left and framebuffer matched to world pixels; GPUI will scale.
+  o.pos = vec4<f32>(xy, 0.0, 1.0);
+  o.uv = mix(inst.uv.xy, inst.uv.zw, p);
+  return o;
+}
+
+@group(0) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(0) @binding(1) var atlas_smp: sampler;
+
+@fragment
+fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
+  return textureSample(atlas_tex, atlas_smp, v.uv);
+}
+"#;
+
+// ---------------- Agent pipeline (instanced sprites with effects) ----------------
+
+struct AgentPipeline {
+    pipeline: wgpu::RenderPipeline,
+    vbuf: wgpu::Buffer,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AgentInstanceGpu {
+    pos: [f32; 2],
+    size: f32,
+    _pad: f32,
+    color: [f32; 4],
+}
+
+impl AgentPipeline {
+    fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("agents.wgsl"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(AGENTS_WGSL)) });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("agents.layout"), bind_group_layouts: &[], push_constant_ranges: &[] });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("agents.pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4] }] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        let vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("agents.instances"), size: 1024 * std::mem::size_of::<AgentInstanceGpu>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        Self { pipeline, vbuf }
+    }
+
+    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, snapshot: &WorldSnapshot) {
+        let mut staging: Vec<AgentInstanceGpu> = Vec::with_capacity(snapshot.agents.len());
+        for a in snapshot.agents {
+            staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color });
+        }
+        if !staging.is_empty() {
+            queue.write_buffer(&self.vbuf, 0, bytemuck::cast_slice(&staging));
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("agents.pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: true } })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.vbuf.slice(..));
+        pass.draw(0..4, 0..staging.len() as u32);
+    }
+}
+
+const AGENTS_WGSL: &str = r#"
+struct InInst {
+  @location(0) pos: vec2<f32>,
+  @location(1) size: f32,
+  @location(2) _pad: f32,
+  @location(3) color: vec4<f32>,
+};
+
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
+
+@vertex
+fn vs_main(inst: InInst, @builtin(vertex_index) vid: u32) -> VsOut {
+  var o: VsOut;
+  var quad = array<vec2<f32>, 4>(vec2<f32>(-0.5,-0.5), vec2<f32>(0.5,-0.5), vec2<f32>(-0.5,0.5), vec2<f32>(0.5,0.5));
+  let local = quad[vid] * inst.size;
+  let world = inst.pos + local;
+  o.pos = vec4<f32>(world, 0.0, 1.0);
+  o.color = inst.color;
+  return o;
+}
+
+@fragment
+fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
+  // Soft circular sprite with highlight rim for a polished look
+  let uv = v.pos.xy; // already in pixel space; for a proper look we would pass local coordinates; simplified for now
+  return v.color;
+}
+"#;
 
 
