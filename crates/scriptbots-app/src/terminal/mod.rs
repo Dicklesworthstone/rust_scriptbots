@@ -677,6 +677,8 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" s      Single step"),
             Line::raw(" S      Save ASCII screenshot"),
             Line::raw(" e      Toggle emoji mode"),
+            Line::raw(" n      Toggle narrow symbols (emoji-compatible alignment)"),
+            Line::raw("        Legend: water 🌊/💧, sand 🏜, grass 🌿, bloom 🌺, rock 🪨"),
             Line::raw(" b      Toggle metrics baseline (set/clear)"),
             Line::raw(" ?      Toggle this help"),
         ];
@@ -763,6 +765,14 @@ impl<'a> TerminalApp<'a> {
                     self.snapshot.tick,
                     EventKind::Info,
                     if self.palette.is_emoji() { "Emoji mode ON" } else { "Emoji mode OFF" },
+                );
+            }
+            (KeyCode::Char('n') | KeyCode::Char('N'), _) => {
+                self.palette.toggle_emoji_narrow();
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.palette.is_emoji_narrow() { "Narrow symbols ON" } else { "Narrow symbols OFF" },
                 );
             }
             (KeyCode::Char('b'), _) => {
@@ -1597,6 +1607,7 @@ fn report_file_path_from_env() -> Option<PathBuf> {
 struct Palette {
     level: Option<ColorLevel>,
     emoji: bool,
+    emoji_narrow: bool,
 }
 
 impl Palette {
@@ -1604,7 +1615,12 @@ impl Palette {
         let level = on_cached(Stream::Stdout);
         let emoji = {
             if let Ok(raw) = std::env::var("SCRIPTBOTS_TERMINAL_EMOJI") {
-                matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                let v = raw.to_ascii_lowercase();
+                if matches!(v.as_str(), "0" | "false" | "off" | "no") {
+                    false
+                } else {
+                    matches!(v.as_str(), "1" | "true" | "yes" | "on")
+                }
             } else {
                 // Auto-detect: prefer ON when stdout is a real terminal, UTF-8 locale, and not a
                 // known minimal TERM. This is heuristic but works well in practice.
@@ -1621,7 +1637,8 @@ impl Palette {
                 looks_modern_term && utf8_locale && !is_ci
             }
         };
-        Self { level, emoji }
+        // Default narrow mode off; users can toggle if their terminal misaligns emojis
+        Self { level, emoji, emoji_narrow: false }
     }
 
     fn header_style(&self) -> Style {
@@ -1693,6 +1710,10 @@ impl Palette {
 
     fn toggle_emoji(&mut self) { self.emoji = !self.emoji; }
 
+    fn is_emoji_narrow(&self) -> bool { self.emoji && self.emoji_narrow }
+
+    fn toggle_emoji_narrow(&mut self) { if self.emoji { self.emoji_narrow = !self.emoji_narrow; } }
+
     fn diet_color(&self, diet: DietClass) -> Color {
         match diet {
             DietClass::Herbivore => Color::Green,
@@ -1707,12 +1728,12 @@ impl Palette {
             .is_some_and(|level| level.has_16m || level.has_256);
         let (mut glyph, fg, bg) = if self.emoji {
             match kind {
-                TerrainKind::DeepWater => ('🌊', Color::Cyan, Color::Blue),
-                TerrainKind::ShallowWater => ('💧', Color::Cyan, if rich_color { Color::Rgb(0, 80, 160) } else { Color::Blue }),
-                TerrainKind::Sand => ('🏜', Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
-                TerrainKind::Grass => ('🌿', Color::LightGreen, if rich_color { Color::Rgb(30, 90, 30) } else { Color::Green }),
-                TerrainKind::Bloom => ('🌺', Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
-                TerrainKind::Rock => ('🪨', Color::Gray, if rich_color { Color::Rgb(70, 70, 70) } else { Color::DarkGray }),
+                TerrainKind::DeepWater => (if self.is_emoji_narrow() { '≈' } else { '🌊' }, Color::Cyan, Color::Blue),
+                TerrainKind::ShallowWater => (if self.is_emoji_narrow() { '~' } else { '💧' }, Color::Cyan, if rich_color { Color::Rgb(0, 80, 160) } else { Color::Blue }),
+                TerrainKind::Sand => (if self.is_emoji_narrow() { '·' } else { '🏜' }, Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
+                TerrainKind::Grass => (if self.is_emoji_narrow() { '"' } else { '🌿' }, Color::LightGreen, if rich_color { Color::Rgb(30, 90, 30) } else { Color::Green }),
+                TerrainKind::Bloom => (if self.is_emoji_narrow() { '*' } else { '🌺' }, Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
+                TerrainKind::Rock => (if self.is_emoji_narrow() { '^' } else { '🪨' }, Color::Gray, if rich_color { Color::Rgb(70, 70, 70) } else { Color::DarkGray }),
             }
         } else {
             match kind {
@@ -1765,7 +1786,7 @@ impl Palette {
             }
         };
         // Food-driven flourish: swap glyph for lush/barren variants when in emoji mode
-        if self.emoji {
+        if self.emoji && !self.is_emoji_narrow() {
             if food_level > 0.66 {
                 glyph = match kind {
                     TerrainKind::DeepWater | TerrainKind::ShallowWater => '🐟',
@@ -1782,7 +1803,8 @@ impl Palette {
         }
 
         let mut style = Style::default().fg(fg);
-        if self.has_color() {
+        // In emoji mode, suppress background to avoid muddy colors behind glyphs
+        if self.has_color() && !self.emoji {
             style = style.bg(bg);
         }
         if food_level > 0.66 {
@@ -1807,16 +1829,16 @@ impl Palette {
                     .mean_heading()
                     .map(Self::heading_char)
                     .unwrap_or_else(|| match class {
-                        DietClass::Herbivore => '🐇',
-                        DietClass::Omnivore => '🦝',
-                        DietClass::Carnivore => '🦊',
+                        DietClass::Herbivore => if self.is_emoji_narrow() { 'h' } else { '🐇' },
+                        DietClass::Omnivore => if self.is_emoji_narrow() { 'o' } else { '🦝' },
+                        DietClass::Carnivore => if self.is_emoji_narrow() { 'c' } else { '🦊' },
                     }),
                 2..=3 => match class {
-                    DietClass::Herbivore => '🐑',
-                    DietClass::Omnivore => '🐻',
-                    DietClass::Carnivore => '🐺',
+                    DietClass::Herbivore => if self.is_emoji_narrow() { 'H' } else { '🐑' },
+                    DietClass::Omnivore => if self.is_emoji_narrow() { 'O' } else { '🐻' },
+                    DietClass::Carnivore => if self.is_emoji_narrow() { 'C' } else { '🐺' },
                 },
-                _ => '👥',
+                _ => if self.is_emoji_narrow() { '@' } else { '👥' },
             }
         } else {
             match total {
@@ -1846,10 +1868,10 @@ impl Palette {
             style = style.add_modifier(Modifier::REVERSED);
         }
         if occupancy.boosted {
-            glyph = if self.emoji { '🚀' } else { glyph };
+            glyph = if self.emoji && !self.is_emoji_narrow() { '🚀' } else { glyph };
         }
         if occupancy.spike_peak > 0.6 {
-            glyph = if self.emoji { '⚔' } else { '!' };
+            glyph = if self.emoji && !self.is_emoji_narrow() { '⚔' } else { '!' };
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         if let Some(tendency) = occupancy.mean_tendency() {

@@ -161,10 +161,11 @@ RUST_LOG=info cargo run -p scriptbots-app
 
 - Emoji mode (terminal renderer):
   - Defaults ON when a modern UTF‑8 terminal is detected; press `e` to toggle at runtime.
-  - Force enable via env: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on`.
+  - Force enable via env: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on`; force disable with `0|false|off|no`.
   - Heuristic: enabled if `TERM` is not `dumb/linux/vt100`, locale contains `utf-8|utf8`, and `CI` is unset.
   - Emoji mappings: terrain `🌊/💧/🏜/🌿/🌺/🪨` (lush swaps: `🐟`, `🌴`, `🌾`, barren `🥀`); agents single `🐇/🦝/🦊`, small groups `🐑/🐻/🐺`, large cluster `👥`, boosted `🚀`, spike peak `⚔` (underline). Heading arrows remain for single agents when available.
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
+- Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
 ### Build for Web (experimental)
 ```bash
@@ -356,10 +357,11 @@ An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode 
 
 - Emoji mode (terminal renderer):
   - Defaults ON when a modern UTF‑8 terminal is detected; press `e` to toggle at runtime.
-  - Force enable via env: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on`.
+  - Force enable via env: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on`; force disable with `0|false|off|no`.
   - Heuristic: enabled if `TERM` is not `dumb/linux/vt100`, locale contains `utf-8|utf8`, and `CI` is unset.
   - Emoji mappings: terrain `🌊/💧/🏜/🌿/🌺/🪨` (lush swaps: `🐟`, `🌴`, `🌾`, barren `🥀`); agents single `🐇/🦝/🦊`, small groups `🐑/🐻/🐺`, large cluster `👥`, boosted `🚀`, spike peak `⚔` (underline). Heading arrows remain for single agents when available.
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
+- Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
 Keybinds: space (pause), +/- (speed), s (single-step), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy and an emoji world mini-map that adapts to color support.
 

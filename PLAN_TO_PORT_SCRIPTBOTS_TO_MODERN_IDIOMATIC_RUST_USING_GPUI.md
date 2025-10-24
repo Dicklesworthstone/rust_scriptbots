@@ -754,7 +754,7 @@ Implementation notes [2025-10-23]:
 - Behavior:
   - Emoji mode defaults to ON when stdout is a modern terminal and the locale is UTF‑8; auto-disabled on obviously minimal terminals or CI.
   - Hotkey: `e` toggles emoji mode at runtime and logs an event ("Emoji mode ON/OFF").
-  - Env override: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on` forces ON regardless of detection.
+  - Env override: `SCRIPTBOTS_TERMINAL_EMOJI=1|true|yes|on` forces ON; `0|false|off|no` forces OFF.
 - Detection heuristic:
   - `TERM` not in {"", "dumb", "linux", "vt100"}
   - locale from `LC_ALL`/`LC_CTYPE`/`LANG` contains `utf-8` or `utf8`
@@ -764,6 +764,7 @@ Implementation notes [2025-10-23]:
   - Agents: single Herbivore=🐇, Omnivore=🦝, Carnivore=🦊; small groups 🐑/🐻/🐺; large cluster 👥; boosted 🚀; spike peak ⚔ with underline; heading arrows preserved when available.
 - Files: `crates/scriptbots-app/src/terminal/mod.rs` (`Palette::detect/terrain_symbol/agent_symbol`, key handler, help overlay).
 - Risks & mitigations: width variance across terminals (press `e` to revert); README documents installing emoji-capable fonts if glyphs appear as tofu.
+- Narrow mode: key `n` toggles a width-1 symbol set (`emoji_narrow`) that substitutes compact glyphs where emojis may misalign; emoji backgrounds are suppressed for visual clarity.
 
 ### [Completed - 2025-10-24] Brain families default-on and mixed-species evolution
 - Enabled all brain families by default: MLP (baseline), DWRAON, Assembly (experimental), NeuroFlow (optional crate), and register them at app startup. Mixed populations are now the default.
