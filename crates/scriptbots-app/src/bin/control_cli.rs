@@ -31,6 +31,10 @@ use scriptbots_app::{
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+#[cfg(feature = "fast-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "scriptbots-control",

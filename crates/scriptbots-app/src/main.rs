@@ -26,6 +26,10 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "fast-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
@@ -266,7 +270,7 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
         child1.env("SCRIPTBOTS_RNG_SEED", seed);
     }
     child1.stdout(Stdio::piped());
-    child1.stderr(Stdio::piped());
+    child1.stderr(Stdio::null());
     let handle1 = child1.spawn().context("failed to spawn det child 1")?;
 
     // Child N: default thread budget
@@ -275,7 +279,7 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     childn.env("SCRIPTBOTS_DET_RUN", "1");
     childn.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
     childn.stdout(Stdio::piped());
-    childn.stderr(Stdio::piped());
+    childn.stderr(Stdio::null());
     let handlen = childn.spawn().context("failed to spawn det child N")?;
 
     // Wait for both to complete (they run concurrently)
@@ -1051,7 +1055,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
                 cmd.arg("--threads").arg(threads.to_string());
                 if cli.low_power { cmd.arg("--low-power"); }
                 cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::piped());
+                cmd.stderr(Stdio::null());
                 let out = cmd.output().with_context(|| format!("sweep run failed (thr={threads}, storage={storage:?}, thres={thresholds})"))?;
                 if !out.status.success() {
                     continue;

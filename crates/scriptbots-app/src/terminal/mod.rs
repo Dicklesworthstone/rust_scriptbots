@@ -1601,12 +1601,27 @@ struct Palette {
 
 impl Palette {
     fn detect() -> Self {
-        let emoji_env = std::env::var("SCRIPTBOTS_TERMINAL_EMOJI").unwrap_or_default();
-        let emoji = matches!(emoji_env.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
-        Self {
-            level: on_cached(Stream::Stdout),
-            emoji,
-        }
+        let level = on_cached(Stream::Stdout);
+        let emoji = {
+            if let Ok(raw) = std::env::var("SCRIPTBOTS_TERMINAL_EMOJI") {
+                matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            } else {
+                // Auto-detect: prefer ON when stdout is a real terminal, UTF-8 locale, and not a
+                // known minimal TERM. This is heuristic but works well in practice.
+                let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+                let looks_modern_term = !matches!(term.as_str(), "" | "dumb" | "linux" | "vt100");
+                let locale = std::env::var("LC_ALL")
+                    .ok()
+                    .or_else(|| std::env::var("LC_CTYPE").ok())
+                    .or_else(|| std::env::var("LANG").ok())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let utf8_locale = locale.contains("utf-8") || locale.contains("utf8");
+                let is_ci = std::env::var("CI").is_ok();
+                looks_modern_term && utf8_locale && !is_ci
+            }
+        };
+        Self { level, emoji }
     }
 
     fn header_style(&self) -> Style {

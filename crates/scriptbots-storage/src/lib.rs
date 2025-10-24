@@ -272,6 +272,9 @@ impl Storage {
     /// Open or create a DuckDB database at the provided path with default buffering thresholds.
     pub fn open(path: &str) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
+        // Performance-friendly defaults that don't compromise persistence
+        let _ = conn.execute("PRAGMA threads = (SELECT CASE WHEN current_setting('threads') IS NULL THEN 0 ELSE current_setting('threads') END);", []);
+        let _ = conn.execute("PRAGMA progress_bar = false;", []);
         let mut storage = Self {
             conn,
             buffer: StorageBuffer::default(),
@@ -297,6 +300,7 @@ impl Storage {
         metric: usize,
     ) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
+        let _ = conn.execute("PRAGMA progress_bar = false;", []);
         let mut storage = Self {
             conn,
             buffer: StorageBuffer::default(),
