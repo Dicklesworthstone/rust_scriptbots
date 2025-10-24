@@ -12,6 +12,7 @@ use scriptbots_core::{
     AgentData, NeuroflowActivationKind, ReplayEventKind, ScriptBotsConfig, TickSummary,
     WorldPersistence, WorldState,
 };
+#[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
 use scriptbots_storage::{PersistedReplayEvent, Storage, StoragePipeline};
 use serde_json::{self, Value as JsonValue};
@@ -104,28 +105,35 @@ fn main() -> Result<()> {
 
     // Optional: dump a PNG snapshot and exit (no UI launched).
     if let Some(path) = cli.dump_png.as_ref() {
-        let (w, h) = cli
-            .png_size
-            .as_deref()
-            .and_then(parse_png_size)
-            .unwrap_or((1280, 720));
+        #[cfg(feature = "gui")]
+        {
+            let (w, h) = cli
+                .png_size
+                .as_deref()
+                .and_then(parse_png_size)
+                .unwrap_or((1280, 720));
 
-        let bytes = {
-            let guard = world.lock().expect("world mutex poisoned");
-            render_png_offscreen(&guard, w, h)
-        };
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
+            let bytes = {
+                let guard = world.lock().expect("world mutex poisoned");
+                render_png_offscreen(&guard, w, h)
+            };
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, &bytes)?;
+            println!(
+                "{} Wrote snapshot {} ({}x{})",
+                "✔".green().bold(),
+                path.display(),
+                w,
+                h
+            );
+            return Ok(());
         }
-        fs::write(path, &bytes)?;
-        println!(
-            "{} Wrote snapshot {} ({}x{})",
-            "✔".green().bold(),
-            path.display(),
-            w,
-            h
-        );
-        return Ok(());
+        #[cfg(not(feature = "gui"))]
+        {
+            bail!("--dump-png requires GUI feature; recompile with --features gui");
+        }
     }
     let control_config = ControlServerConfig::from_env();
     let (control_runtime, command_drain, command_submit) =
@@ -659,13 +667,21 @@ impl Renderer for GuiRenderer {
     }
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
-        run_demo(
-            Arc::clone(&ctx.world),
-            Some(Arc::clone(&ctx.storage)),
-            Arc::clone(&ctx.command_drain),
-            Arc::clone(&ctx.command_submit),
-        );
-        Ok(())
+        #[cfg(feature = "gui")]
+        {
+            run_demo(
+                Arc::clone(&ctx.world),
+                Some(Arc::clone(&ctx.storage)),
+                Arc::clone(&ctx.command_drain),
+                Arc::clone(&ctx.command_submit),
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            bail!("GUI feature not enabled; recompile with --features gui or use --mode terminal");
+        }
+        
     }
 }
 
@@ -985,7 +1001,6 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
             };
             for thresholds in threshold_list {
                 let mut cmd = Command::new(&exe);
-                cmd.arg("--config-only");
                 cmd.env("SCRIPTBOTS_DET_RUN", "0");
                 cmd.arg("--profile-storage-steps").arg(ticks.to_string());
                 cmd.arg("--storage").arg(match storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" });

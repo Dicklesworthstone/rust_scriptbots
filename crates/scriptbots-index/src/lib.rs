@@ -43,11 +43,17 @@ pub struct UniformGridIndex {
     #[serde(skip)]
     cells_y: i32,
     #[serde(skip)]
-    buckets: HashMap<(i32, i32), Vec<usize>>,
+    buckets: Buckets,
     #[serde(skip)]
     agent_cells: Vec<(i32, i32)>,
     #[serde(skip)]
     positions: Vec<(f32, f32)>,
+}
+
+#[derive(Debug, Clone)]
+enum Buckets {
+    Dense(Vec<Vec<usize>>),
+    Sparse(HashMap<(i32, i32), Vec<usize>>),
 }
 
 impl UniformGridIndex {
@@ -76,7 +82,7 @@ impl UniformGridIndex {
             inv_cell_size,
             cells_x,
             cells_y,
-            buckets: HashMap::new(),
+            buckets: Buckets::Sparse(HashMap::new()),
             agent_cells: Vec::new(),
             positions: Vec::new(),
         }
@@ -92,6 +98,12 @@ impl UniformGridIndex {
         let cx = Self::wrap(Self::discretize_cell(x * self.inv_cell_size), self.cells_x);
         let cy = Self::wrap(Self::discretize_cell(y * self.inv_cell_size), self.cells_y);
         (cx, cy)
+    }
+
+    #[inline]
+    fn linear_index(&self, cx: i32, cy: i32) -> usize {
+        // wrap() guarantees 0 <= cx < cells_x and 0 <= cy < cells_y
+        (cy as usize) * (self.cells_x as usize) + (cx as usize)
     }
 
     #[allow(
@@ -143,12 +155,46 @@ impl NeighborhoodIndex for UniformGridIndex {
         self.positions.clear();
         self.positions.extend_from_slice(positions);
         self.agent_cells.resize(positions.len(), (0, 0));
-        self.buckets.clear();
 
-        for (idx, &(x, y)) in positions.iter().enumerate() {
-            let key = self.cell_from_point(x, y);
-            self.agent_cells[idx] = key;
-            self.buckets.entry(key).or_default().push(idx);
+        // Decide dense vs sparse layout based on total cell count.
+        const DENSE_BUCKET_MAX_CELLS: usize = 1_000_000; // guard against excessive memory use
+        let total_cells_u64 = (self.cells_x as i64) as i128 * (self.cells_y as i64) as i128;
+        let total_cells: Option<usize> = if total_cells_u64 >= 0 {
+            usize::try_from(total_cells_u64).ok()
+        } else {
+            None
+        };
+
+        if let Some(cell_count) = total_cells.filter(|&c| c <= DENSE_BUCKET_MAX_CELLS) {
+            // Dense path: two-pass build for precise capacity reservations
+            let mut counts: Vec<usize> = vec![0; cell_count];
+            for (idx, &(x, y)) in positions.iter().enumerate() {
+                let (cx, cy) = self.cell_from_point(x, y);
+                self.agent_cells[idx] = (cx, cy);
+                let lin = self.linear_index(cx, cy);
+                counts[lin] += 1;
+            }
+
+            let mut dense: Vec<Vec<usize>> = counts
+                .into_iter()
+                .map(|c| Vec::with_capacity(c))
+                .collect();
+
+            for (idx, &(cx, cy)) in self.agent_cells.iter().enumerate() {
+                let lin = self.linear_index(cx, cy);
+                dense[lin].push(idx);
+            }
+            self.buckets = Buckets::Dense(dense);
+        } else {
+            // Sparse path: fallback HashMap to avoid huge allocations
+            let mut map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+            map.reserve(positions.len());
+            for (idx, &(x, y)) in positions.iter().enumerate() {
+                let key = self.cell_from_point(x, y);
+                self.agent_cells[idx] = key;
+                map.entry(key).or_default().push(idx);
+            }
+            self.buckets = Buckets::Sparse(map);
         }
         Ok(())
     }
@@ -171,17 +217,37 @@ impl NeighborhoodIndex for UniformGridIndex {
             for dy in -cell_radius..=cell_radius {
                 let nx = Self::wrap(cell_x + dx, self.cells_x);
                 let ny = Self::wrap(cell_y + dy, self.cells_y);
-                if let Some(indices) = self.buckets.get(&(nx, ny)) {
-                    for &other_idx in indices {
-                        if other_idx == agent_idx {
-                            continue;
+                match &self.buckets {
+                    Buckets::Dense(b) => {
+                        let lin = self.linear_index(nx, ny);
+                        let indices = &b[lin];
+                        for &other_idx in indices {
+                            if other_idx == agent_idx {
+                                continue;
+                            }
+                            let (ox, oy) = self.positions[other_idx];
+                            let dx = ox - ax;
+                            let dy = oy - ay;
+                            let dist_sq = dx.mul_add(dx, dy * dy);
+                            if dist_sq <= radius_sq {
+                                visitor(other_idx, OrderedFloat(dist_sq));
+                            }
                         }
-                        let (ox, oy) = self.positions[other_idx];
-                        let dx = ox - ax;
-                        let dy = oy - ay;
-                        let dist_sq = dx.mul_add(dx, dy * dy);
-                        if dist_sq <= radius_sq {
-                            visitor(other_idx, OrderedFloat(dist_sq));
+                    }
+                    Buckets::Sparse(m) => {
+                        if let Some(indices) = m.get(&(nx, ny)) {
+                            for &other_idx in indices {
+                                if other_idx == agent_idx {
+                                    continue;
+                                }
+                                let (ox, oy) = self.positions[other_idx];
+                                let dx = ox - ax;
+                                let dy = oy - ay;
+                                let dist_sq = dx.mul_add(dx, dy * dy);
+                                if dist_sq <= radius_sq {
+                                    visitor(other_idx, OrderedFloat(dist_sq));
+                                }
+                            }
                         }
                     }
                 }

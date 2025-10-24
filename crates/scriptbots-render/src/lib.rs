@@ -303,17 +303,19 @@ impl SimulationView {
             return;
         }
 
+        // Clamp accumulator to avoid long-frame backlogs
         let max_accumulator = step_interval * MAX_SIM_STEPS_PER_FRAME as f32;
-        if self.sim_accumulator > max_accumulator {
-            self.sim_accumulator = max_accumulator;
-        }
+        self.sim_accumulator = self.sim_accumulator.min(max_accumulator);
 
         let mut steps = (self.sim_accumulator / step_interval).floor() as usize;
         if steps == 0 {
             return;
         }
-        if steps > MAX_SIM_STEPS_PER_FRAME {
-            steps = MAX_SIM_STEPS_PER_FRAME;
+        // Adaptive cap: reduce max steps under low FPS to keep UI responsive
+        let avg_ms = self.last_perf.average_ms.max(0.0);
+        let dynamic_cap = if avg_ms > 16.0 { (MAX_SIM_STEPS_PER_FRAME / 2).max(1) } else { MAX_SIM_STEPS_PER_FRAME };
+        if steps > dynamic_cap {
+            steps = dynamic_cap;
         }
 
         self.sim_accumulator -= step_interval * steps as f32;
@@ -9398,7 +9400,16 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     }
 
     if controls.draw_agents {
-        paint_debug_overlays(frame, focus_agent, debug, offset_x, offset_y, scale, window);
+        paint_debug_overlays(
+            frame,
+            focus_agent,
+            debug,
+            offset_x,
+            offset_y,
+            scale,
+            bounds,
+            window,
+        );
     }
 
     if !safe_mode_enabled() {
