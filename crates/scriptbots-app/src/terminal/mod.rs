@@ -303,9 +303,16 @@ impl<'a> TerminalApp<'a> {
 
         self.draw_header(frame, outer[0], &self.snapshot);
 
+        // Auto-expand advanced panels on wide terminals
+        let area = outer[1];
+        let wide = area.width >= 120;
+        if wide {
+            self.expanded = true;
+        }
+
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .constraints(if self.expanded { [Constraint::Percentage(58), Constraint::Percentage(42)] } else { [Constraint::Percentage(62), Constraint::Percentage(38)] })
             .split(outer[1]);
 
         // Draw the map while avoiding holding an external borrow across &mut self
@@ -314,15 +321,28 @@ impl<'a> TerminalApp<'a> {
 
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(7),
-                Constraint::Length(5),
-                Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                Constraint::Length(7),
-                Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
-                Constraint::Min(3),
-            ])
+            .constraints(if self.expanded {
+                [
+                    Constraint::Length(7),
+                    Constraint::Length(7),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length(7),
+                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
+                    Constraint::Length(6),
+                    Constraint::Min(3),
+                ]
+            } else {
+                [
+                    Constraint::Length(7),
+                    Constraint::Length(5),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+                    Constraint::Length(7),
+                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
+                    Constraint::Min(3),
+                ]
+            })
             .split(body[1]);
 
         self.draw_stats(frame, sidebar[0], &self.snapshot);
@@ -333,7 +353,12 @@ impl<'a> TerminalApp<'a> {
         self.maybe_refresh_analytics();
         self.draw_insights(frame, sidebar[4], &self.snapshot);
         self.draw_brains(frame, sidebar[5], &self.snapshot);
-        self.draw_events(frame, sidebar[6], &self.snapshot);
+        if self.expanded {
+            self.draw_mortality(frame, sidebar[6], &self.snapshot);
+            self.draw_events(frame, sidebar[7], &self.snapshot);
+        } else {
+            self.draw_events(frame, sidebar[6], &self.snapshot);
+        }
 
         if self.help_visible {
             self.draw_help(frame);
@@ -512,7 +537,7 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_trends(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let block = Block::default()
-            .title(self.palette.title("Population & Energy Trends"))
+            .title(self.palette.title("Population, Energy, Births/Deaths"))
             .borders(Borders::ALL);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -524,9 +549,11 @@ impl<'a> TerminalApp<'a> {
         let trend_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
+                Constraint::Length(1), // population
+                Constraint::Length(1), // energy
+                Constraint::Length(1), // births
+                Constraint::Length(1), // deaths
+                Constraint::Min(0),    // text
             ])
             .split(inner);
 
@@ -555,6 +582,20 @@ impl<'a> TerminalApp<'a> {
                 .data(&energy_data);
             frame.render_widget(spark, trend_layout[1]);
         }
+        let births_data: Vec<u64> = snapshot.history.iter().rev().map(|e| e.births as u64).collect();
+        let deaths_data: Vec<u64> = snapshot.history.iter().rev().map(|e| e.deaths as u64).collect();
+        if !births_data.is_empty() {
+            let spark = Sparkline::default()
+                .style(Style::default().fg(Color::Green))
+                .data(&births_data);
+            frame.render_widget(spark, trend_layout[2]);
+        }
+        if !deaths_data.is_empty() {
+            let spark = Sparkline::default()
+                .style(Style::default().fg(Color::Red))
+                .data(&deaths_data);
+            frame.render_widget(spark, trend_layout[3]);
+        }
 
         let mut trend_lines = Vec::new();
         if let Some(recent) = snapshot.history.first() {
@@ -579,7 +620,7 @@ impl<'a> TerminalApp<'a> {
             trend_lines.push(Line::from(vec![Span::raw("Waiting for samples...")]));
         }
         let trend_text = Paragraph::new(trend_lines).block(Block::default());
-        frame.render_widget(trend_text, trend_layout[2]);
+        frame.render_widget(trend_text, trend_layout[4]);
     }
 
     fn draw_map(&mut self, frame: &mut Frame<'_>, area: Rect, world_size: (u32, u32)) {
@@ -768,6 +809,25 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(List::new(items).block(block), area);
     }
 
+    fn draw_mortality(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(ana) = &self.analytics {
+            lines.push(Line::from(vec![
+                Span::styled("Deaths ", self.palette.header_style()),
+                Span::raw(format!("total {:>4}", ana.deaths_total)),
+            ]));
+            // Per-cause breakdown if available in future; placeholder spacing
+        } else {
+            lines.push(Line::from(vec![Span::raw("Mortality data warming up…")]));
+        }
+        let paragraph = Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .title(self.palette.title("Mortality"))
+                .borders(Borders::ALL),
+        );
+        frame.render_widget(paragraph, area);
+    }
+
     fn draw_help(&self, frame: &mut Frame<'_>) {
         let size = frame.area();
         let help_width = (size.width as f32 * 0.6).round() as u16;
@@ -785,6 +845,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" e        Toggle emoji mode"),
             Line::raw(" n        Toggle narrow symbols (emoji-compatible alignment)"),
             Line::raw(" b        Toggle metrics baseline (set/clear)"),
+            Line::raw(" x        Toggle expanded panels (auto-on on wide terminals)"),
             Line::raw(" ? / h    Toggle this help  (? is Shift+/ on most keyboards)"),
             Line::raw(""),
             Line::from(vec![Span::styled(
@@ -921,6 +982,14 @@ impl<'a> TerminalApp<'a> {
                         "Baseline set to current metrics",
                     );
                 }
+            }
+            (KeyCode::Char('x') | KeyCode::Char('X'), _) => {
+                self.expanded = !self.expanded;
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.expanded { "Expanded panels ON" } else { "Expanded panels OFF" },
+                );
             }
             (KeyCode::Char('?') | KeyCode::Char('h'), _) => {
                 self.help_visible = !self.help_visible;

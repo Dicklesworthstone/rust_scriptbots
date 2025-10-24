@@ -223,6 +223,7 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
 - **`scriptbots-app` features**:
   - `ml` → enable `scriptbots-brain-ml`
   - `neuro` → enable `scriptbots-brain-neuro`
+  - `fast-alloc` → enable mimalloc as the global allocator for improved multithreaded performance
   - Example: `cargo run -p scriptbots-app --features neuro`
 - **`scriptbots-render`**:
   - `audio` → enable Kira-driven audio in the UI layer
@@ -280,6 +281,8 @@ cargo build -p scriptbots-brain-ml --features candle
 - `SCRIPTBOTS_MODE` — `auto|gui|terminal` (renderer selection).
 - `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — hard override renderer detection (`1|true|yes`).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
+- `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
+- `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.
 - `SCRIPTBOTS_NEUROFLOW_ENABLED` — `true|false`.
 - `SCRIPTBOTS_NEUROFLOW_HIDDEN` — comma-separated hidden sizes (e.g., `64,32,16`).
 - `SCRIPTBOTS_NEUROFLOW_ACTIVATION` — `tanh|sigmoid|relu`.
@@ -495,6 +498,19 @@ order by bucket;
   - `GET /api/config` → fetch entire config snapshot
   - `PATCH /api/config` → apply JSON object patch `{ ... }`
   - `POST /api/knobs/apply` → apply list of `{ path, value }` updates
+  - `GET /api/ticks/latest` → latest tick summary (JSON)
+  - `GET /api/ticks/stream` → server-sent events stream of tick summaries (SSE)
+  - `GET /api/ticks/ndjson` → newline-delimited JSON stream of tick summaries (NDJSON)
+  - `GET /api/screenshot/ascii` → ASCII snapshot of terminal mini-map (text/plain)
+  - `GET /api/screenshot/png` → offscreen PNG snapshot (requires GUI feature)
+  - `GET /api/hydrology` → hydrology snapshot (flow directions, accumulation, basins) if available
+  - `GET /api/events/tail` → recent events (birth/death/combat) ring buffer
+  - `GET /api/scoreboard` → top carnivores and oldest agents at a glance
+  - `GET /api/agents/debug` → lightweight agent debug table (filters: ids, diet, selection, brain)
+  - `POST /api/selection` → queue a selection update (modes: set/add/remove; optional state)
+  - `GET /api/presets` → list scenario presets
+  - `POST /api/presets/apply` → apply preset by name
+  - `GET /api/config/audit` → recent config patches (audit ring buffer)
 
 REST quickstart:
 ```bash
@@ -516,6 +532,13 @@ curl -s -X PATCH http://127.0.0.1:8088/api/config \
 curl -s -X POST http://127.0.0.1:8088/api/knobs/apply \
   -H 'content-type: application/json' \
   -d '{"updates":[{"path":"food_max","value":0.6}]}' | jq .
+
+# 6) Stream ticks as NDJSON (Ctrl+C to stop)
+curl -s http://127.0.0.1:8088/api/ticks/ndjson | head -n 5
+
+# 7) Take an ASCII screenshot (text) and a PNG (requires GUI feature)
+curl -s http://127.0.0.1:8088/api/screenshot/ascii > frame.txt
+curl -s http://127.0.0.1:8088/api/screenshot/png > frame.png
 ```
 
 Example PATCH body:
@@ -532,6 +555,12 @@ cargo run -p scriptbots-app --bin control_cli -- set neuroflow.enabled true
 cargo run -p scriptbots-app --bin control_cli -- patch --json '{"food_max":0.6}'
 cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
 cargo run -p scriptbots-app --bin control_cli -- export metrics --db scriptbots.db --last 1000 --out latest_metrics.csv
+# New commands:
+cargo run -p scriptbots-app --bin control_cli -- presets
+cargo run -p scriptbots-app --bin control_cli -- apply-preset arctic
+cargo run -p scriptbots-app --bin control_cli -- screenshot --out screenshots/frame_0001.txt
+cargo run -p scriptbots-app --bin control_cli -- screenshot --png --out screenshots/frame_0001.png
+cargo run -p scriptbots-app --bin control_cli -- hydrology
 ```
 
 ### Scenario layering & deterministic replay CLI

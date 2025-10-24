@@ -170,6 +170,7 @@
   - Introduced `ControlHandle`/`KnobEntry` scaffolding shared by REST, CLI, and MCP front-ends for atomic JSON patching of `ScriptBotsConfig` and live snapshots.
   - [Completed - GPT-5 Codex 2025-10-23] Shipped an axum-based REST API (`/api/knobs`, `/api/config`, `/api/knobs/apply`) with generated OpenAPI docs and embedded Swagger UI for operator discovery.
   - [Completed - GPT-5 Codex 2025-10-23] Added an HTTP MCP server (tools: `list_knobs`, `get_config`, `apply_updates`, `apply_patch`) so external LLM tooling can orchestrate simulations safely; stdio/SSE transports deprecated in favor of HTTP-only.
+  - [Completed - 2025-10-24] REST surface expanded: tick summaries (`/api/ticks/latest`, `/api/ticks/stream`, `/api/ticks/ndjson`), screenshots (`/api/screenshot/ascii|png`), hydrology (`/api/hydrology`), event tail (`/api/events/tail`), scoreboards (`/api/scoreboard`), agent debug (`/api/agents/debug`), selection updates (`POST /api/selection`), presets (`/api/presets`, `/api/presets/apply`), and config audit (`/api/config/audit`).
   - Delivered the `scriptbots-control` CLI (clap + reqwest + ratatui) offering scripted updates (`set`, `patch`) and a live dashboard (`watch`) that highlights config deltas while the GPUI shell runs.
 - [Completed - GPT-5 Codex 2025-10-22] Migrated configuration writes onto a crossfire-backed command bus drained inside the simulation loop and exposed an HTTP MCP server (default `127.0.0.1:8090`) so control surfaces enqueue consistent `ControlCommand`s rather than mutating `WorldState` directly.
 - Diagnostics:
@@ -387,7 +388,7 @@ Implementation notes [2025-10-23]:
 
 ### 11) NDJSON tick tail endpoint [Currently In Progress - 2025-10-23]
 - Purpose: easy streaming to dashboards/scripts without websockets.
-- MVP: `GET /api/ticks/latest` (JSON), `GET /api/ticks/stream` (SSE; emits JSON objects periodically).
+- MVP: `GET /api/ticks/latest` (JSON), `GET /api/ticks/stream` (SSE; emits JSON objects periodically). [Completed - 2025-10-24: `GET /api/ticks/ndjson` streams newline-delimited JSON]
 - Surfaces: REST only; docs example with `curl`.
 - Data/Perf: send from in-memory summaries; backpressure via chunked responses.
 - Testing: integration test reading N events; cancellation.
@@ -395,7 +396,7 @@ Implementation notes [2025-10-23]:
 
 ### 12) Screenshot/export (GUI + TUI) [Currently In Progress - 2025-10-23]
 - Purpose: reporting and bug repro.
-- MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`. [Started: Terminal HUD adds 'S' to save ASCII snapshot under `screenshots/frame_<tick>.txt`; help overlay updated. CLI `scriptbots-control screenshot --out FILE [--png]` added. REST: `GET /api/screenshot/ascii|png`. PNG currently returns a minimal placeholder image until GPUI hook is wired.]
+- MVP: GPUI PNG capture; TUI saves ASCII frame to `.txt`. [Completed - 2025-10-24: Terminal HUD adds 'S' to save ASCII under `screenshots/frame_<tick>.txt`; CLI `scriptbots-control screenshot --out FILE [--png]`; REST: `GET /api/screenshot/ascii|png`. PNG requires GUI feature; offscreen renderer guards large sizes.]
 - Surfaces: HUD button + hotkey; TUI `S` key; CLI `control_cli screenshot`.
 - Data/Perf: file I/O off main tick; enqueue to worker.
 - Testing: files exist with non-zero bytes; deterministic filenames with seed/tick.
@@ -466,6 +467,10 @@ Implementation notes [2025-10-23]:
 - Data/Perf: reuse `ReplayCollector` buffer in memory; no new schema required. [Currently In Progress]
 - Testing: fixed seed reproduces identical snippet; UI snapshot.
 - Complexity: M.
+
+### 21) Selection APIs (cohorts) [Completed - 2025-10-24]
+- REST: `POST /api/selection` accepts `mode: set|add|remove`, `agent_ids: []`, and optional `state` to update selection cohorts deterministically (applied via command bus inside the tick loop).
+- Debug: `GET /api/agents/debug` provides filtered agent rows (ids/diet/selection/brain) with deterministic sorting (energy/health/age/id tie-breakers) for lightweight queries.
 
 ---
 
@@ -765,6 +770,10 @@ Implementation notes [2025-10-23]:
 - Files: `crates/scriptbots-app/src/terminal/mod.rs` (`Palette::detect/terrain_symbol/agent_symbol`, key handler, help overlay).
 - Risks & mitigations: width variance across terminals (press `e` to revert); README documents installing emoji-capable fonts if glyphs appear as tofu.
 - Narrow mode: key `n` toggles a width-1 symbol set (`emoji_narrow`) that substitutes compact glyphs where emojis may misalign; emoji backgrounds are suppressed for visual clarity.
+
+#### [Completed - 2025-10-24] Headless reporting & CI knobs
+- `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` limits frames during headless terminal runs (default 12; max 360).
+- `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` writes a JSON report (ticks, births/deaths, energy stats) consumed by CI.
 
 ### [Completed - 2025-10-24] Brain families default-on and mixed-species evolution
 - Enabled all brain families by default: MLP (baseline), DWRAON, Assembly (experimental), NeuroFlow (optional crate), and register them at app startup. Mixed populations are now the default.
