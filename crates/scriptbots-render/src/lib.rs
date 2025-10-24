@@ -4405,6 +4405,7 @@ impl SimulationView {
                     .child("Outputs")
             )
             .child(output_bars)
+            .child(render_activation_heatmaps(&detail.brain_activations))
             .child(self.render_output_sparklines_for(detail.agent_id))
             .child(self.render_diet_gauges())
             .child(render_brain_card(detail))
@@ -6035,6 +6036,79 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
     div().flex().flex_col().gap_1().children(rows)
 }
 
+fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
+    let mut rows: Vec<Div> = Vec::new();
+    if let Some(act) = activations {
+        for layer in &act.layers {
+            let state = layer.clone();
+            let canvas_el = canvas(
+                move |_, _, _| state.clone(),
+                move |bounds, state, window, _| paint_activation_grid(bounds, state, window),
+            )
+            .w(px(200.0))
+            .h(px(120.0));
+
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(state.name.clone()))
+                    .child(canvas_el),
+            );
+        }
+        // Optional: show top-N connections if provided (textual summary)
+        if !act.connections.is_empty() {
+            let mut lines: Vec<Div> = Vec::new();
+            for edge in act.connections.iter().take(8) {
+                lines.push(div().text_xs().text_color(rgb(0x64748b)).child(
+                    format!("edge {}→{} w={:.2}", edge.from, edge.to, edge.weight)
+                ));
+            }
+            rows.push(
+                div().flex().flex_col().gap_0().children(lines)
+            );
+        }
+    } else {
+        rows.push(div().text_xs().text_color(rgb(0x475569)).child("Activations: not available"));
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x1e293b))
+        .bg(rgb(0x0f172a))
+        .px_3()
+        .py_2()
+        .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Brain activations"))
+        .children(rows)
+}
+
+fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window: &mut Window) {
+    window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1223, 0.92))));
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+    let cols = layer.width.max(1) as u16;
+    let rows = layer.height.max(1) as u16;
+    let cell_w = width / cols as f32;
+    let cell_h = height / rows as f32;
+    for y in 0..rows {
+        for x in 0..cols {
+            let idx = y as usize * layer.width + x as usize;
+            let v = layer.values.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let color = lerp_rgba(rgba_from_hex(0x1e293b, 0.95), rgba_from_hex(0x22d3ee, 0.95), v);
+            let rect = Bounds {
+                origin: Point { x: origin.x + (x as f32 * cell_w) as i32, y: origin.y + (y as f32 * cell_h) as i32 },
+                size: size.with_width((cell_w as i32).max(1)).with_height((cell_h as i32).max(1)),
+            };
+            window.paint_quad(fill(rect, Background::from(color)));
+        }
+    }
+}
 fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
     // Compact card summarizing brain type and a radial radar chart
     let (best_idx, best_val) = detail
@@ -7720,6 +7794,7 @@ struct AgentInspectorDetails {
     spike_length: f32,
     sensors: Vec<f32>,
     outputs: Vec<f32>,
+    brain_activations: Option<BrainActivations>,
 }
 
 impl AgentInspectorDetails {
@@ -7740,6 +7815,7 @@ impl AgentInspectorDetails {
 
         let sensors = agent_runtime.sensors.to_vec();
         let outputs = agent_runtime.outputs.to_vec();
+        let brain_activations = agent_runtime.brain_activations.clone();
 
         let label = format!("Agent {:?} · Gen {} · Age {}", agent_id, generation.0, age);
 
@@ -7760,6 +7836,7 @@ impl AgentInspectorDetails {
             spike_length,
             sensors,
             outputs,
+            brain_activations,
         })
     }
 }

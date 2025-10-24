@@ -308,6 +308,7 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `neuro` → enable `scriptbots-brain-neuro`
   - `fast-alloc` → enable mimalloc as the global allocator for improved multithreaded performance
   - Example: `cargo run -p scriptbots-app --features neuro`
+  - Note: default features enable `ml`, `neuro`, and `fast-alloc`. To disable defaults, use `--no-default-features` and opt-in explicitly.
 - **`scriptbots-render`**:
   - `audio` → enable Kira-driven audio in the UI layer
 - **`scriptbots-index`** (pluggable spatial indices):
@@ -371,6 +372,10 @@ cargo build -p scriptbots-brain-ml --features candle
  - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.
  - `--storage {duckdb|memory}`: select persistence backend; `memory` uses an in-memory DuckDB for analytics without disk I/O.
+ - Auto-pause (any renderer):
+   - `--auto-pause-below COUNT` (or `SCRIPTBOTS_AUTO_PAUSE_BELOW`) pauses when population ≤ COUNT
+   - `--auto-pause-age-above AGE` (or `SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE`) pauses when any agent’s age ≥ AGE
+   - `--auto-pause-on-spike` (or `SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE=true`) pauses on first spike hit event
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
@@ -432,7 +437,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 
 ### Brains & evolution
 - **Brain trait** with `tick`/`mutate`/`crossover`; implementations include MLP (production), `dwraon` (feature), `assembly` (experimental).
-- **Brain registry**: per-run registry attaches runners by key, enabling hybrid populations and runtime selection.
+- **Brain registry**: per-run registry attaches runners by key, enabling hybrid populations and runtime selection. Random spawns draw from `BrainRegistry::random_key` for mixed-species runs; sexual crossover is gated to same-kind brains (species barrier). Brains can optionally expose activation snapshots for visualization.
 - **Genome & genetics**: genomes capture topology/activations; mutation/crossover create hybrid births with lineage tracking and tests.
 - **NeuroFlow** (optional): deterministic CPU MLP with runtime toggles; seed-stable outputs verified in tests.
 
@@ -632,6 +637,22 @@ order by bucket;
   - `GET /api/presets` → list scenario presets
   - `POST /api/presets/apply` → apply preset by name
   - `GET /api/config/audit` → recent config patches (audit ring buffer)
+
+Examples:
+```bash
+# Filter debug table by selected agents only, limit 20, sort by age
+curl -s 'http://127.0.0.1:8088/api/agents/debug?selection=selected&limit=20&sort=age' | jq .
+
+# Select a cohort (replace selection with ids [1,2,3])
+curl -s -X POST http://127.0.0.1:8088/api/selection \
+  -H 'content-type: application/json' \
+  -d '{"mode":"set","agent_ids":[1,2,3]}'
+
+# Add agents to current selection and mark them highlighted
+curl -s -X POST http://127.0.0.1:8088/api/selection \
+  -H 'content-type: application/json' \
+  -d '{"mode":"add","agent_ids":[4,5],"state":"highlighted"}'
+```
 
 REST quickstart:
 ```bash

@@ -5,7 +5,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
-use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
+use scriptbots_core::{BrainRunner, BrainActivations, ActivationLayer, INPUT_SIZE, OUTPUT_SIZE};
 
 use crate::{Brain, BrainKind, into_runner};
 
@@ -268,6 +268,32 @@ impl Brain for MlpBrain {
 
     fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
         self
+    }
+}
+
+impl BrainRunner for crate::BrainRunnerAdapter<MlpBrain> {
+    fn kind(&self) -> &'static str {
+        self.brain.kind().as_str()
+    }
+
+    fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        self.brain.tick(inputs)
+    }
+
+    fn snapshot_activations(&self) -> Option<BrainActivations> {
+        // Map internal node outputs into a single-layer activation map for now.
+        let width = 20usize;
+        let height = 10usize;
+        let mut values = vec![0.0_f32; width * height];
+        for (i, node) in self.brain.state.iter().enumerate().take(values.len()) {
+            values[i] = node.output;
+        }
+        Some(BrainActivations { layers: vec![ActivationLayer {
+            name: "mlp.state".to_string(),
+            width,
+            height,
+            values,
+        }], connections: Vec::new() })
     }
 }
 

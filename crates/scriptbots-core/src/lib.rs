@@ -13,6 +13,27 @@ use std::fmt;
 #[cfg(feature = "parallel")]
 use std::sync::OnceLock;
 use thiserror::Error;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrainActivations {
+    pub layers: Vec<ActivationLayer>,
+    #[serde(default)]
+    pub connections: Vec<ActivationEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationLayer {
+    pub name: String,
+    pub width: usize,
+    pub height: usize,
+    pub values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationEdge {
+    pub from: usize,
+    pub to: usize,
+    pub weight: f32,
+}
 
 #[cfg(feature = "parallel")]
 static RAYON_LIMIT_GUARD: OnceLock<()> = OnceLock::new();
@@ -587,6 +608,12 @@ impl BrainBinding {
     pub fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> Option<[f32; OUTPUT_SIZE]> {
         self.runner.as_mut().map(|brain| brain.tick(inputs))
     }
+
+    /// Fetch a snapshot of internal brain activations if supported by the runner.
+    #[must_use]
+    pub fn snapshot_activations(&self) -> Option<BrainActivations> {
+        self.runner.as_ref().and_then(|r| r.snapshot_activations())
+    }
 }
 
 /// Thin trait object used to drive brain evaluations without coupling to concrete brain crates.
@@ -596,6 +623,12 @@ pub trait BrainRunner: Send + Sync {
 
     /// Evaluate outputs for the provided sensors.
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE];
+
+    /// Optional snapshot of internal activation state for visualization.
+    /// Defaults to `None` when the runner does not support introspection.
+    fn snapshot_activations(&self) -> Option<BrainActivations> {
+        None
+    }
 }
 
 type BrainSpawner = Box<dyn Fn(&mut dyn RngCore) -> Box<dyn BrainRunner> + Send + Sync + 'static>;
@@ -706,6 +739,8 @@ pub struct AgentRuntime {
     pub lineage: [Option<AgentId>; 2],
     pub mutation_log: Vec<String>,
     pub food_balance_total: f32,
+    #[serde(skip)]
+    pub brain_activations: Option<BrainActivations>,
 }
 
 impl Default for AgentRuntime {
@@ -735,6 +770,7 @@ impl Default for AgentRuntime {
             lineage: [None, None],
             mutation_log: Vec::new(),
             food_balance_total: 0.0,
+            brain_activations: None,
         }
     }
 }
@@ -4542,6 +4578,8 @@ impl WorldState {
                     .tick(&runtime.sensors)
                     .unwrap_or_else(|| Self::default_outputs(&runtime.sensors));
                 runtime.outputs = outputs;
+                // Capture activations if available
+                runtime.brain_activations = runtime.brain.snapshot_activations();
             }
         }
     }

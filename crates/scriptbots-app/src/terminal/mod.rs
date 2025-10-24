@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Widget},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Widget},
 };
 use scriptbots_core::{
     AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
@@ -205,6 +205,9 @@ struct TerminalApp<'a> {
     analytics: Option<TerminalAnalytics>,
     analytics_tick: Option<u64>,
     expanded: bool,
+    // When true, the user has explicitly toggled expanded panels; honor self.expanded
+    // instead of auto-expanding on wide terminals.
+    expanded_user_override: bool,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -243,6 +246,7 @@ impl<'a> TerminalApp<'a> {
             analytics: None,
             analytics_tick: None,
             expanded: false,
+            expanded_user_override: false,
         };
         app.refresh_snapshot();
         app
@@ -303,11 +307,11 @@ impl<'a> TerminalApp<'a> {
 
         self.draw_header(frame, outer[0], &self.snapshot);
 
-        // Auto-expand advanced panels on wide terminals
+        // Auto-expand advanced panels on wide terminals unless the user has overridden
         let area = outer[1];
         let wide = area.width >= 120;
-        if wide {
-            self.expanded = true;
+        if !self.expanded_user_override {
+            self.expanded = wide;
         }
 
         let body = Layout::default()
@@ -923,6 +927,9 @@ impl<'a> TerminalApp<'a> {
         let help_y = size.y + (size.height - help_height) / 2;
         let area = Rect::new(help_x, help_y, help_width, help_height);
 
+        // Ensure the help area fully clears underlying content so background doesn't bleed
+        frame.render_widget(Clear, area);
+
         let paragraph = Paragraph::new(help_lines).block(
             Block::default()
                 .title(self.palette.title("Help — controls & legend"))
@@ -1041,6 +1048,8 @@ impl<'a> TerminalApp<'a> {
                 }
             }
             (KeyCode::Char('x') | KeyCode::Char('X'), _) => {
+                // User explicitly toggled; stop auto behavior and honor user's choice
+                self.expanded_user_override = true;
                 self.expanded = !self.expanded;
                 self.push_event(
                     self.snapshot.tick,

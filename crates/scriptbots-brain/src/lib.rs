@@ -1,7 +1,7 @@
 //! Traits and adapters for ScriptBots brain implementations.
 
 use rand::RngCore;
-use scriptbots_core::{AgentId, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Tick};
+use scriptbots_core::{AgentId, BrainRunner, BrainActivations, ActivationLayer, INPUT_SIZE, OUTPUT_SIZE, Tick};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
@@ -139,6 +139,11 @@ impl<B: Brain> BrainRunner for BrainRunnerAdapter<B> {
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
         self.brain.tick(inputs)
+    }
+
+    fn snapshot_activations(&self) -> Option<BrainActivations> {
+        // Default adapter returns None; concrete brain adapters can override by downcasting.
+        None
     }
 }
 
