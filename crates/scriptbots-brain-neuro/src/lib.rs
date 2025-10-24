@@ -11,7 +11,7 @@ use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use scriptbots_brain::{Brain, BrainKind, into_runner};
-use scriptbots_core::{BrainRunner, NeuroflowActivationKind, NeuroflowSettings, WorldState};
+use scriptbots_core::{BrainRunner, BrainActivations, ActivationLayer, NeuroflowActivationKind, NeuroflowSettings, WorldState};
 use std::sync::Arc;
 
 /// Number of inputs inherited from the simulation sensors.
@@ -231,6 +231,32 @@ impl Brain for NeuroflowBrain {
 
     fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send + Sync) {
         self
+    }
+}
+
+impl BrainRunner for scriptbots_brain::BrainRunnerAdapter<NeuroflowBrain> {
+    fn kind(&self) -> &'static str { self.brain.kind().as_str() }
+    fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] { self.brain.tick(inputs) }
+    fn snapshot_activations(&self) -> Option<BrainActivations> {
+        // Extract layer outputs (y) from the network by serializing the seed back out.
+        // This is a pragmatic approach since NeuroFlow does not expose public getters for y.
+        // Note: serde reflection of internal state relies on current NeuroFlow structure.
+        let value = serde_json::to_value(&self.brain.network).ok()?;
+        let layers = value.get("layers")?.as_array()?.to_vec();
+        let mut result_layers: Vec<ActivationLayer> = Vec::new();
+        for (li, layer_val) in layers.iter().enumerate() {
+            let y = layer_val.get("y").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let values: Vec<f32> = y.into_iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
+            let width = (values.len() as f32).sqrt().ceil() as usize;
+            let height = if width == 0 { 0 } else { (values.len() + width - 1) / width };
+            result_layers.push(ActivationLayer {
+                name: format!("nf.layer.{li}"),
+                width,
+                height,
+                values,
+            });
+        }
+        Some(BrainActivations { layers: result_layers, connections: Vec::new() })
     }
 }
 

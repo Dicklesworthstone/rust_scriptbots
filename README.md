@@ -386,6 +386,7 @@ cargo build -p scriptbots-brain-ml --features candle
 - `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
 - `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.
 - `SCRIPTBOTS_MAX_THREADS` — preferred maximum thread budget; core will cap Rayon to min of CPUs and this value (used unless `RAYON_NUM_THREADS` is already set).
+ - `SCRIPTBOTS_TERMINAL_EMOJI` — force emoji mode `1|true|yes|on` or disable with `0|false|off|no`.
 - `SCRIPTBOTS_NEUROFLOW_ENABLED` — `true|false`.
 - `SCRIPTBOTS_NEUROFLOW_HIDDEN` — comma-separated hidden sizes (e.g., `64,32,16`).
 - `SCRIPTBOTS_NEUROFLOW_ACTIVATION` — `tanh|sigmoid|relu`.
@@ -602,6 +603,7 @@ order by bucket;
    - `--profile-steps N` and `--profile-storage-steps N` to run headless micro-benchmarks
    - `--profile-sweep N` and `--auto-tune N` to explore and auto-pick thread/flush settings
    - `--renderer-safe` for a conservative paint path; `--debug-watermark` overlays a diagnostics badge
+ - Low-power mode: in addition to capping threads (`--low-power`), the app lowers OS process priority (Unix niceness +10; Windows BELOW_NORMAL) to be a better background citizen.
 
 ## Tracing & logging
 - Logging uses `tracing` with `RUST_LOG` filters (e.g., `RUST_LOG=info,scriptbots_core=debug`).
@@ -633,7 +635,7 @@ order by bucket;
   - `GET /api/events/tail` → recent events (birth/death/combat) ring buffer
   - `GET /api/scoreboard` → top carnivores and oldest agents at a glance
   - `GET /api/agents/debug` → lightweight agent debug table (filters: ids, diet, selection, brain)
-  - `POST /api/selection` → queue a selection update (modes: set/add/remove; optional state)
+  - `POST /api/selection` → queue a selection update (modes: set/add/clear; optional state: none|hovered|selected)
   - `GET /api/presets` → list scenario presets
   - `POST /api/presets/apply` → apply preset by name
   - `GET /api/config/audit` → recent config patches (audit ring buffer)
@@ -652,6 +654,22 @@ curl -s -X POST http://127.0.0.1:8088/api/selection \
 curl -s -X POST http://127.0.0.1:8088/api/selection \
   -H 'content-type: application/json' \
   -d '{"mode":"add","agent_ids":[4,5],"state":"highlighted"}'
+```
+
+More examples:
+```bash
+# List and apply a preset via REST
+curl -s http://127.0.0.1:8088/api/presets | jq
+curl -s -X POST http://127.0.0.1:8088/api/presets/apply -H 'content-type: application/json' -d '{"name":"arctic"}' | jq .
+
+# Recent events (tail)
+curl -s 'http://127.0.0.1:8088/api/events/tail?limit=10' | jq .
+
+# Scoreboard (top predators, oldest agents)
+curl -s 'http://127.0.0.1:8088/api/scoreboard?limit=10' | jq .
+
+# SSE tick stream (press Ctrl+C to stop)
+curl -N -H 'Accept: text/event-stream' http://127.0.0.1:8088/api/ticks/stream | sed -n '1,10p'
 ```
 
 REST quickstart:

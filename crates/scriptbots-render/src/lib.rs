@@ -6048,13 +6048,31 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
             .w(px(200.0))
             .h(px(120.0));
 
+            // Optional edges overlay limited to within this layer's index space
+            let edges_in_layer: Vec<ActivationEdge> = activations
+                .as_ref()
+                .map(|a| a.connections.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.from < state.width * state.height && e.to < state.width * state.height)
+                .take(64)
+                .collect();
+
+            let edges_state = (state.width, state.height, edges_in_layer.clone());
+            let edges_canvas = canvas(
+                move |_, _, _| edges_state.clone(),
+                move |bounds, st, window, _| paint_activation_edges(bounds, st, window),
+            )
+            .w(px(200.0))
+            .h(px(120.0));
+
             rows.push(
                 div()
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(div().text_xs().text_color(rgb(0x94a3b8)).child(state.name.clone()))
-                    .child(canvas_el),
+                    .child(div().relative().children(vec![canvas_el.into(), edges_canvas.into()])),
             );
         }
         // Optional: show top-N connections if provided (textual summary)
@@ -6106,6 +6124,40 @@ fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window
                 size: size.with_width((cell_w as i32).max(1)).with_height((cell_h as i32).max(1)),
             };
             window.paint_quad(fill(rect, Background::from(color)));
+        }
+    }
+}
+
+fn paint_activation_edges(
+    bounds: Bounds<Pixels>,
+    state: (usize, usize, Vec<ActivationEdge>),
+    window: &mut Window,
+) {
+    let (cols, rows, edges) = state;
+    if cols == 0 || rows == 0 || edges.is_empty() { return; }
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+    let cell_w = width / cols as f32;
+    let cell_h = height / rows as f32;
+
+    for edge in edges {
+        let from_x = (edge.from % cols) as f32 + 0.5;
+        let from_y = (edge.from / cols) as f32 + 0.5;
+        let to_x = (edge.to % cols) as f32 + 0.5;
+        let to_y = (edge.to / cols) as f32 + 0.5;
+        let x1 = f32::from(origin.x) + from_x * cell_w;
+        let y1 = f32::from(origin.y) + from_y * cell_h;
+        let x2 = f32::from(origin.x) + to_x * cell_w;
+        let y2 = f32::from(origin.y) + to_y * cell_h;
+        let w = edge.weight.abs().clamp(0.1, 1.0);
+        let mut path = PathBuilder::stroke(px(0.5 + 1.5 * w));
+        path.move_to(point(px(x1), px(y1)));
+        path.line_to(point(px(x2), px(y2)));
+        if let Ok(path) = path.build() {
+            let color = if edge.weight >= 0.0 { rgba_from_hex(0x22d3ee, 0.85) } else { rgba_from_hex(0xf471b5, 0.85) };
+            window.paint_path(path, color);
         }
     }
 }
@@ -9619,8 +9671,34 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let render_h = world_h * scale;
     let pad_x = (width_px - render_w) * 0.5;
     let pad_y = (height_px - render_h) * 0.5;
-    let offset_x = origin_x + pad_x + camera_guard.offset_px.0;
-    let offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+
+    // Compute view bounds in window space used for culling and offscreen checks
+    let view_left = origin_x;
+    let view_top = origin_y;
+    let view_right = view_left + width_px;
+    let view_bottom = view_top + height_px;
+
+    // Offscreen guard: if the world render rect lies completely outside the canvas,
+    // recenter on world midpoint to avoid a blank view after extreme panning.
+    let (mut offset_x, mut offset_y) = (origin_x + pad_x + camera_guard.offset_px.0,
+                                        origin_y + pad_y + camera_guard.offset_px.1);
+    let mut render_left = offset_x;
+    let mut render_top = offset_y;
+    let mut render_right = offset_x + render_w;
+    let mut render_bottom = offset_y + render_h;
+    let fully_offscreen =
+        render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
+    if fully_offscreen {
+        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
+        camera_guard.center_on(world_center);
+        // Recompute offsets with updated camera state
+        offset_x = origin_x + pad_x + camera_guard.offset_px.0;
+        offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+        render_left = offset_x;
+        render_top = offset_y;
+        render_right = offset_x + render_w;
+        render_bottom = offset_y + render_h;
+    }
 
     camera_guard.record_render_metrics(
         (origin_x, origin_y),
@@ -9628,18 +9706,45 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         frame.world_size,
         base_scale,
     );
+    // If the current render rectangle lies completely outside the canvas, recentre.
+    // This can happen after extreme panning combined with zoom, resulting in a blank view.
+    let render_left = offset_x;
+    let render_top = offset_y;
+    let render_right = offset_x + render_w;
+    let render_bottom = offset_y + render_h;
+    let fully_offscreen =
+        render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
+    if fully_offscreen {
+        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
+        camera_guard.center_on(world_center);
+        // Recompute offsets after recentering for this frame's draw
+        let base_scale2 = (width_px / world_w).min(height_px / world_h).max(0.000_1);
+        let scale2 = base_scale2 * camera_guard.zoom;
+        let render_w2 = world_w * scale2;
+        let render_h2 = world_h * scale2;
+        let pad_x2 = (width_px - render_w2) * 0.5;
+        let pad_y2 = (height_px - render_h2) * 0.5;
+        let offset_x2 = origin_x + pad_x2 + camera_guard.offset_px.0;
+        let offset_y2 = origin_y + pad_y2 + camera_guard.offset_px.1;
+        // Overwrite locals for subsequent drawing
+        // SAFETY: shadow immutable locals with new bindings
+        let (render_w, render_h, offset_x, offset_y) = (render_w2, render_h2, offset_x2, offset_y2);
+        let _ = (render_w, render_h, offset_x, offset_y);
+    }
     if controls.follow_mode != FollowMode::Off
         && let Some(target) = follow_target
     {
         camera_guard.center_on(target);
     }
-    drop(camera_guard);
+    // Follow target may change camera offset; recompute offsets if it did
+    offset_x = origin_x + pad_x + camera_guard.offset_px.0;
+    offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+    render_left = offset_x;
+    render_top = offset_y;
+    render_right = offset_x + render_w;
+    render_bottom = offset_y + render_h;
 
-    // View bounds in window space used for culling
-    let view_left = origin_x;
-    let view_top = origin_y;
-    let view_right = view_left + width_px;
-    let view_bottom = view_top + height_px;
+    drop(camera_guard);
 
     let day_phase = frame.tick as f32 * 0.00025;
     let phase_sin = day_phase.sin();

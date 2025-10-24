@@ -26,6 +26,7 @@ use ratatui::{
 };
 use scriptbots_core::{
     AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
+    BrainActivations,
 };
 use scriptbots_storage::MetricReading;
 use serde::Serialize;
@@ -208,6 +209,9 @@ struct TerminalApp<'a> {
     // When true, the user has explicitly toggled expanded panels; honor self.expanded
     // instead of auto-expanding on wide terminals.
     expanded_user_override: bool,
+    // Brain view controls
+    focused_agent_cursor: usize,
+    activation_layer_index: usize,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -247,6 +251,8 @@ impl<'a> TerminalApp<'a> {
             analytics_tick: None,
             expanded: false,
             expanded_user_override: false,
+            focused_agent_cursor: 0,
+            activation_layer_index: 0,
         };
         app.refresh_snapshot();
         app
@@ -816,6 +822,22 @@ impl<'a> TerminalApp<'a> {
             ]));
         } else {
             lines.push(Line::from(vec![Span::raw("Analytics warming up… (run a few ticks) ")]));
+        }
+
+        // Compact brain activation row if available (pull from snapshot when we expose it)
+        if let Some(first_layer) = self.snapshot.brain_activations_layer() {
+            let cols = first_layer.width.max(1);
+            let take = cols.min(32);
+            let mut row = String::new();
+            for i in 0..take {
+                let v = first_layer.values.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let ch = if v > 0.8 { '█' } else if v > 0.6 { '▆' } else if v > 0.4 { '▅' } else if v > 0.2 { '▃' } else if v > 0.1 { '▂' } else { '▁' };
+                row.push(ch);
+            }
+            lines.push(Line::from(vec![
+                Span::styled("Brain ", self.palette.header_style()),
+                Span::raw(row),
+            ]));
         }
 
         let paragraph = Paragraph::new(Text::from(lines)).block(
@@ -1410,6 +1432,8 @@ struct Snapshot {
     food: FoodView,
     control: ControlSettings,
     spike_hits: u32,
+    #[allow(dead_code)]
+    brain_activations: Option<BrainLayerView>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1854,7 +1878,20 @@ impl Snapshot {
             },
             control: config.control.clone(),
             spike_hits: summary.spike_hits,
+            brain_activations: world
+                .runtime()
+                .get(handles.first().copied().unwrap_or(AgentId::null()))
+                .and_then(|rt| rt.brain_activations.as_ref())
+                .map(|act| BrainLayerView::from_activations(act)),
         }
+    }
+
+    fn brain_activations_layer(&self) -> Option<&BrainLayerView> {
+        self.brain_activations.as_ref()
+    }
+    fn brain_activations_layer_indexed(&self, _idx: usize) -> Option<&BrainLayerView> {
+        // For now we only expose the first layer in terminal view; index ignored.
+        self.brain_activations.as_ref()
     }
 }
 
@@ -2521,5 +2558,20 @@ mod tests {
         assert_eq!(after_second, after_first);
         assert!(app.paused);
         assert_eq!(app.last_autopause_tick, Some(app.snapshot.tick));
+    }
+}
+
+struct BrainLayerView {
+    width: usize,
+    height: usize,
+    values: Vec<f32>,
+}
+
+impl BrainLayerView {
+    fn from_activations(act: &BrainActivations) -> Self {
+        if let Some(layer) = act.layers.first() {
+            return Self { width: layer.width, height: layer.height, values: layer.values.clone() };
+        }
+        Self { width: 0, height: 0, values: Vec::new() }
     }
 }
