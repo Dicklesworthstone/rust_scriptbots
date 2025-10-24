@@ -133,12 +133,11 @@ fn run_event_loop(
             .saturating_duration_since(now)
             .min(next_sim_due.saturating_duration_since(now));
 
-        if event::poll(sleep_for)? {
-            if let Event::Key(key) = event::read()? {
-                if app.handle_key(key)? {
-                    break;
-                }
-            }
+        if event::poll(sleep_for)?
+            && let Event::Key(key) = event::read()?
+            && app.handle_key(key)?
+        {
+            break;
         }
     }
 
@@ -401,16 +400,13 @@ impl<'a> TerminalApp<'a> {
         if self.analytics_tick == Some(tick) {
             return;
         }
-        match self.storage.try_lock() {
-            Ok(mut guard) => {
-                if let Ok(readings) = guard.latest_metrics(256) {
-                    if let Some(ana) = parse_terminal_analytics(tick, self.snapshot.agent_count, &readings) {
-                        self.analytics = Some(ana);
-                        self.analytics_tick = Some(tick);
-                    }
-                }
+        if let Ok(mut guard) = self.storage.try_lock() {
+            if let Ok(readings) = guard.latest_metrics(256)
+                && let Some(ana) = parse_terminal_analytics(tick, self.snapshot.agent_count, &readings)
+            {
+                self.analytics = Some(ana);
+                self.analytics_tick = Some(tick);
             }
-            Err(_) => {}
         }
     }
 
@@ -560,7 +556,7 @@ impl<'a> TerminalApp<'a> {
         // Per-diet mini bars
         let max_class = diet.herbivores.max(diet.omnivores).max(diet.carnivores).max(1);
         let mkbar = |count: usize| -> String {
-            let width = ((count * 20) / max_class).clamp(0, 20) as usize;
+            let width = ((count * 20) / max_class).clamp(0, 20);
             "█".repeat(width)
         };
         lines.push(Line::from(vec![
@@ -864,8 +860,9 @@ impl<'a> TerminalApp<'a> {
         }
 
         // Compact brain activation row if available (pull selected layer)
-        if let Some(layer) = self.snapshot.brain_activations_layer_indexed(self.activation_layer_index) {
-            if layer.width > 0 && layer.height > 0 {
+        if let Some(layer) = self.snapshot.brain_activations_layer_indexed(self.activation_layer_index)
+            && layer.width > 0 && layer.height > 0
+        {
                 let cols = layer.width;
                 let start_row = self.activation_row_offset.min(layer.height.saturating_sub(1));
                 let rows_to_show = 3.min(layer.height - start_row);
@@ -1278,12 +1275,11 @@ impl<'a> TerminalApp<'a> {
                         snap.oldest.first().and_then(|e| world.agents().iter_handles().find(|h| h.data().as_ffi() == e.label))
                     }
                 };
-                if let Some(agent_id) = agent_id_opt {
-                    if let Some(rt) = world.runtime().get(agent_id) {
-                        if let Some(act) = rt.brain_activations.as_ref() {
-                            snap.brain_layers = convert_layers(act);
-                        }
-                    }
+                if let Some(agent_id) = agent_id_opt
+                    && let Some(rt) = world.runtime().get(agent_id)
+                    && let Some(act) = rt.brain_activations.as_ref()
+                {
+                    snap.brain_layers = convert_layers(act);
                 }
                 snap
             }
@@ -1746,6 +1742,7 @@ impl Default for CellOccupancy {
 }
 
 impl CellOccupancy {
+    #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
         class: DietClass,
@@ -1837,7 +1834,7 @@ impl Snapshot {
         let world_width = config.world_width.max(1) as f32;
         let world_height = config.world_height.max(1) as f32;
 
-        let summary = world.history().rev().next().cloned().unwrap_or_else(|| TickSummary {
+        let summary = world.history().next_back().cloned().unwrap_or_else(|| TickSummary {
             tick: world.tick(),
             agent_count,
             births: 0,

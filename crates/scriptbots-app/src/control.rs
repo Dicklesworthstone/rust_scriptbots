@@ -171,12 +171,14 @@ impl From<PoisonError<MutexGuard<'_, WorldState>>> for ControlError {
     }
 }
 
+type KnobsCache = std::sync::Arc<Mutex<Option<(usize, Vec<KnobEntry>)>>>;
+
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
 #[derive(Clone)]
 pub struct ControlHandle {
     shared_world: SharedWorld,
     commands: CommandSender,
-    knobs_cache: std::sync::Arc<Mutex<Option<(usize, Vec<KnobEntry>)>>>,
+    knobs_cache: KnobsCache,
 }
 
 impl ControlHandle {
@@ -248,7 +250,6 @@ impl ControlHandle {
     }
 
     /// Enqueue a selection update command.
-    #[must_use]
     pub fn update_selection(&self, update: SelectionUpdate) -> Result<(), ControlError> {
         self.enqueue(ControlCommand::UpdateSelection(update))
     }
@@ -262,10 +263,10 @@ impl ControlHandle {
     /// Flatten the configuration into individual knob descriptors for discovery.
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
         let rev = { let world = self.lock_world()?; world.config_audit().len() };
-        if let Some((cached_rev, cached)) = self.knobs_cache.lock().unwrap().as_ref() {
-            if *cached_rev == rev {
-                return Ok(cached.clone());
-            }
+        if let Some((cached_rev, cached)) = self.knobs_cache.lock().unwrap().as_ref()
+            && *cached_rev == rev
+        {
+            return Ok(cached.clone());
         }
         let (rev2, config_value) = {
             let world = self.lock_world()?;
@@ -382,7 +383,6 @@ impl ControlHandle {
     }
 
     /// Apply a structured JSON patch object onto the configuration.
-    #[must_use]
     pub fn apply_patch(&self, patch: Value) -> Result<ConfigSnapshot, ControlError> {
         if !patch.is_object() {
             return Err(ControlError::InvalidPatch(
@@ -417,7 +417,6 @@ impl ControlHandle {
     }
 
     /// Apply a list of knob updates by path.
-    #[must_use]
     pub fn apply_updates(&self, updates: &[KnobUpdate]) -> Result<ConfigSnapshot, ControlError> {
         let mut patch_map = Map::new();
         for update in updates {

@@ -58,9 +58,11 @@ enum Buckets {
 
 impl Default for Buckets {
     fn default() -> Self {
-        Buckets::Sparse(HashMap::new())
+        Self::Sparse(HashMap::new())
     }
 }
+
+const DENSE_BUCKET_MAX_CELLS: usize = 1_000_000; // guard against excessive memory use
 
 impl UniformGridIndex {
     /// Create a new uniform grid with the provided cell size and world dimensions.
@@ -107,7 +109,8 @@ impl UniformGridIndex {
     }
 
     #[inline]
-    fn linear_index(&self, cx: i32, cy: i32) -> usize {
+    #[allow(clippy::cast_sign_loss)]
+    const fn linear_index(&self, cx: i32, cy: i32) -> usize {
         // wrap() guarantees 0 <= cx < cells_x and 0 <= cy < cells_y
         (cy as usize) * (self.cells_x as usize) + (cx as usize)
     }
@@ -163,8 +166,7 @@ impl NeighborhoodIndex for UniformGridIndex {
         self.agent_cells.resize(positions.len(), (0, 0));
 
         // Decide dense vs sparse layout based on total cell count.
-        const DENSE_BUCKET_MAX_CELLS: usize = 1_000_000; // guard against excessive memory use
-        let total_cells_u64 = (self.cells_x as i64) as i128 * (self.cells_y as i64) as i128;
+        let total_cells_u64 = i128::from(i64::from(self.cells_x)) * i128::from(i64::from(self.cells_y));
         let total_cells: Option<usize> = if total_cells_u64 >= 0 {
             usize::try_from(total_cells_u64).ok()
         } else {
@@ -183,7 +185,7 @@ impl NeighborhoodIndex for UniformGridIndex {
 
             let mut dense: Vec<Vec<usize>> = counts
                 .into_iter()
-                .map(|c| Vec::with_capacity(c))
+                .map(Vec::with_capacity)
                 .collect();
 
             for (idx, &(cx, cy)) in self.agent_cells.iter().enumerate() {

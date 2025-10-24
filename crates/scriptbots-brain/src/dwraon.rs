@@ -236,9 +236,7 @@ impl Brain for DwraonBrain {
         if other.kind() != Self::KIND {
             return None;
         }
-        let Some(other) = other.as_any().downcast_ref::<Self>() else {
-            return None;
-        };
+        let other = other.as_any().downcast_ref::<Self>()?;
 
         let mut child = self.clone();
         for (child_params, other_params) in child.nodes.iter_mut().zip(&other.nodes) {

@@ -6192,14 +6192,13 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .copied()
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, v)| (i, v))
         .unwrap_or((0, 0.0));
 
     let outputs = detail.outputs.clone();
     let sensors = detail.sensors.clone();
     let radar_canvas = canvas(
         move |_, _, _| (sensors.clone(), outputs.clone()),
-        move |bounds, state, window, _| paint_brain_radar(bounds, &state.0, &state.1, window),
+        move |bounds, state, window, _| paint_brain_radar(bounds, state.0.as_slice(), state.1.as_slice(), window),
     )
     .w(px(180.0))
     .h(px(120.0));
@@ -6219,7 +6218,7 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!("dominant o{} {:.2}", best_idx, best_val)))
         .child(radar_canvas)
 }
-fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &Vec<f32>, outputs: &Vec<f32>, window: &mut Window) {
+fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &[f32], outputs: &[f32], window: &mut Window) {
     let origin = bounds.origin;
     let size = bounds.size;
     let width = f32::from(size.width).max(1.0);
@@ -6436,7 +6435,7 @@ impl Render for SimulationView {
         self.update_audio(&snapshot);
 
         // Update perf overlay at a modest cadence to reduce churn
-        if perf_snapshot.sample_count % 4 == 0 {
+        if perf_snapshot.sample_count.is_multiple_of(4) {
             content = content.child(self.render_perf_overlay(perf_snapshot));
         }
 
@@ -8520,7 +8519,7 @@ impl HistoryChartData {
         }
         // Decimate samples to a fixed budget to avoid heavy polylines
         const MAX_SAMPLES: usize = 120;
-        let stride = ((entries.len() + MAX_SAMPLES - 1) / MAX_SAMPLES).max(1);
+        let stride = entries.len().div_ceil(MAX_SAMPLES).max(1);
         let decimated: Vec<&HudHistoryEntry> = entries.iter().step_by(stride).collect();
 
         let max_agents = decimated.iter().map(|e| e.agent_count).max().unwrap_or(1);
@@ -8979,6 +8978,7 @@ impl CameraState {
         Some((world_x, world_y))
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn paint_terrain_layer(
     terrain: &TerrainFrame,
     offset_x: f32,
@@ -9533,6 +9533,7 @@ fn hashed_noise(seed: u64, row: u64, col: u64) -> f32 {
     value ^= value >> 32;
     (value as f64 / u64::MAX as f64) as f32
 }
+#[allow(clippy::too_many_arguments)]
 fn paint_debug_overlays(
     frame: &RenderFrame,
     focus_agent: Option<AgentId>,
@@ -9626,36 +9627,36 @@ fn paint_debug_overlays(
             }
         }
 
-        if Some(agent.agent_id) == focus_agent {
-            if let Some(builder) = crosshair_path.as_mut() {
+        if Some(agent.agent_id) == focus_agent
+            && let Some(builder) = crosshair_path.as_mut()
+        {
                 let cross = (frame.agent_base_radius * scale).max(6.0);
                 builder.move_to(point(px(px_x - cross), px(px_y)));
                 builder.line_to(point(px(px_x + cross), px(px_y)));
                 builder.move_to(point(px(px_x), px(px_y - cross)));
                 builder.line_to(point(px(px_x), px(px_y + cross)));
-            }
         }
     }
 
-    if let Some(builder) = sense_path {
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, rgba_from_hex(0x38bdf8, 0.35));
-        }
+    if let Some(builder) = sense_path
+        && let Ok(path) = builder.build()
+    {
+        window.paint_path(path, rgba_from_hex(0x38bdf8, 0.35));
     }
-    if let Some(builder) = vel_shaft_path {
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, rgba_from_hex(0x22d3ee, 0.85));
-        }
+    if let Some(builder) = vel_shaft_path
+        && let Ok(path) = builder.build()
+    {
+        window.paint_path(path, rgba_from_hex(0x22d3ee, 0.85));
     }
-    if let Some(builder) = vel_head_path {
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, rgba_from_hex(0xe0f2fe, 0.78));
-        }
+    if let Some(builder) = vel_head_path
+        && let Ok(path) = builder.build()
+    {
+        window.paint_path(path, rgba_from_hex(0xe0f2fe, 0.78));
     }
-    if let Some(builder) = crosshair_path {
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, rgba_from_hex(0xfacc15, 0.9));
-        }
+    if let Some(builder) = crosshair_path
+        && let Ok(path) = builder.build()
+    {
+        window.paint_path(path, rgba_from_hex(0xfacc15, 0.9));
     }
 }
 fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
@@ -9730,9 +9731,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     if fully_offscreen_after_metrics {
         let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
         camera_guard.center_on(world_center);
-        // Recompute offsets with updated camera state (uses freshly recorded metrics)
-        offset_x = origin_x + pad_x + camera_guard.offset_px.0;
-        offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+        // Offsets will be recomputed after any follow-target recentering below
     }
 
     if controls.follow_mode != FollowMode::Off
@@ -9758,10 +9757,6 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     if still_offscreen {
         offset_x = origin_x + (width_px - render_w) * 0.5;
         offset_y = origin_y + (height_px - render_h) * 0.5;
-        render_left = offset_x;
-        render_top = offset_y;
-        render_right = offset_x + render_w;
-        render_bottom = offset_y + render_h;
     }
 
     drop(camera_guard);
@@ -9898,10 +9893,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     }
                 }
                 for b in 0..FOOD_BINS {
-                    if let (Some(builder), Some(col)) = (builders[b].take(), colors[b]) {
-                        if let Ok(path) = builder.build() {
-                            window.paint_path(path, col);
-                        }
+                    if let (Some(builder), Some(col)) = (builders[b].take(), colors[b])
+                        && let Ok(path) = builder.build()
+                    {
+                        window.paint_path(path, col);
                     }
                 }
             }
@@ -9984,10 +9979,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 // Defer outlines (batched later). Skip highlights/effects under very low FPS.
             }
             for b in 0..AGENT_BINS {
-                if let (Some(builder), Some(col)) = (builders[b].take(), colors[b]) {
-                    if let Ok(path) = builder.build() {
-                        window.paint_path(path, col);
-                    }
+                if let (Some(builder), Some(col)) = (builders[b].take(), colors[b])
+                    && let Ok(path) = builder.build()
+                {
+                    window.paint_path(path, col);
                 }
             }
         } else {

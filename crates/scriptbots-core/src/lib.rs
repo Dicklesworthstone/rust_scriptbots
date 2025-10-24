@@ -178,6 +178,11 @@ fn angle_difference(a: f32, b: f32) -> f32 {
     diff.abs()
 }
 
+#[inline]
+fn dot2(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    ax.mul_add(bx, ay * by)
+}
+
 /// Commands that can be applied to the world from external control surfaces.
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
@@ -4077,6 +4082,21 @@ pub struct WorldState {
     brain_registry: BrainRegistry,
     cadence: TickCadence,
     food_scratch: Vec<f32>,
+    // Reusable per-tick working buffers to avoid allocations
+    work_handles: Vec<AgentId>,
+    work_position_pairs: Vec<(f32, f32)>,
+    work_trait_modifiers: Vec<TraitModifiers>,
+    work_eye_directions: Vec<[f32; NUM_EYES]>,
+    work_eye_fov: Vec<[f32; NUM_EYES]>,
+    work_clocks: Vec<[f32; 2]>,
+    work_temperature_preferences: Vec<f32>,
+    work_sound_emitters: Vec<f32>,
+    work_positions: Vec<Position>,
+    work_headings: Vec<f32>,
+    work_spike_lengths: Vec<f32>,
+    work_velocities: Vec<Velocity>,
+    work_runtime_snapshot: Vec<AgentRuntime>,
+    work_penalties: Vec<f32>,
     pending_deaths: Vec<AgentId>,
     #[allow(dead_code)]
     pending_spawns: Vec<SpawnOrder>,
@@ -4167,6 +4187,20 @@ impl WorldState {
             cadence,
             food_profiles,
             food_scratch: vec![0.0; (food_w as usize) * (food_h as usize)],
+            work_handles: Vec::new(),
+            work_position_pairs: Vec::new(),
+            work_trait_modifiers: Vec::new(),
+            work_eye_directions: Vec::new(),
+            work_eye_fov: Vec::new(),
+            work_clocks: Vec::new(),
+            work_temperature_preferences: Vec::new(),
+            work_sound_emitters: Vec::new(),
+            work_positions: Vec::new(),
+            work_headings: Vec::new(),
+            work_spike_lengths: Vec::new(),
+            work_velocities: Vec::new(),
+            work_runtime_snapshot: Vec::new(),
+            work_penalties: Vec::new(),
             pending_deaths: Vec::new(),
             pending_spawns: Vec::new(),
             pending_birth_records: Vec::new(),
@@ -4321,54 +4355,113 @@ impl WorldState {
         }
 
         let previous = &self.food_scratch;
+        let profiles = &self.food_profiles;
+        let food_max = self.config.food_max;
         let cells_mut = self.food.cells_mut();
 
-        for y in 0..height {
-            let up_row = if y == 0 { height - 1 } else { y - 1 };
-            let down_row = if y + 1 == height { 0 } else { y + 1 };
-            for x in 0..width {
-                let left_col = if x == 0 { width - 1 } else { x - 1 };
-                let right_col = if x + 1 == width { 0 } else { x + 1 };
-                let idx = y * width + x;
-                let previous_value = previous[idx];
-                let mut value = previous_value;
-                let profile = self
-                    .food_profiles
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(FoodCellProfile {
-                        capacity: self.config.food_max,
-                        growth_multiplier: 1.0,
-                        decay_multiplier: 1.0,
-                        fertility: 0.0,
-                        nutrient_density: 0.3,
-                    });
-                if diffusion > 0.0 {
-                    let left = previous[y * width + left_col];
-                    let right = previous[y * width + right_col];
-                    let up = previous[up_row * width + x];
-                    let down = previous[down_row * width + x];
-                    let neighbor_avg = (left + right + up + down) * 0.25;
-                    value += diffusion * (neighbor_avg - previous_value);
-                }
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            cells_mut
+                .par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    let up_row = if y == 0 { height - 1 } else { y - 1 };
+                    let down_row = if y + 1 == height { 0 } else { y + 1 };
+                    for x in 0..width {
+                        let left_col = if x == 0 { width - 1 } else { x - 1 };
+                        let right_col = if x + 1 == width { 0 } else { x + 1 };
+                        let idx = y * width + x;
+                        let previous_value = previous[idx];
+                        let mut value = previous_value;
+                        let profile = profiles
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(FoodCellProfile {
+                                capacity: food_max,
+                                growth_multiplier: 1.0,
+                                decay_multiplier: 1.0,
+                                fertility: 0.0,
+                                nutrient_density: 0.3,
+                            });
+                        if diffusion > 0.0 {
+                            let left = previous[y * width + left_col];
+                            let right = previous[y * width + right_col];
+                            let up = previous[up_row * width + x];
+                            let down = previous[down_row * width + x];
+                            let neighbor_avg = (left + right + up + down) * 0.25;
+                            value += diffusion * (neighbor_avg - previous_value);
+                        }
 
-                if decay > 0.0 {
-                    value -= decay * profile.decay_multiplier * value;
-                }
+                        if decay > 0.0 {
+                            value -= decay * profile.decay_multiplier * value;
+                        }
 
-                if growth > 0.0 && self.config.food_max > 0.0 {
-                    let normalized = value / self.config.food_max;
-                    let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
-                    value += growth_delta * self.config.food_max;
-                }
+                        if growth > 0.0 && food_max > 0.0 {
+                            let normalized = value / food_max;
+                            let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
+                            value += growth_delta * food_max;
+                        }
 
-                let mut capacity = profile.capacity.max(previous_value);
-                let global_cap = self.config.food_max.max(previous_value);
-                if capacity > global_cap {
-                    capacity = global_cap;
+                        let mut capacity = profile.capacity.max(previous_value);
+                        let global_cap = food_max.max(previous_value);
+                        if capacity > global_cap {
+                            capacity = global_cap;
+                        }
+                        capacity = capacity.max(0.0);
+                        row[x] = value.clamp(0.0, capacity);
+                    }
+                });
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            for y in 0..height {
+                let up_row = if y == 0 { height - 1 } else { y - 1 };
+                let down_row = if y + 1 == height { 0 } else { y + 1 };
+                for x in 0..width {
+                    let left_col = if x == 0 { width - 1 } else { x - 1 };
+                    let right_col = if x + 1 == width { 0 } else { x + 1 };
+                    let idx = y * width + x;
+                    let previous_value = previous[idx];
+                    let mut value = previous_value;
+                    let profile = profiles
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(FoodCellProfile {
+                            capacity: food_max,
+                            growth_multiplier: 1.0,
+                            decay_multiplier: 1.0,
+                            fertility: 0.0,
+                            nutrient_density: 0.3,
+                        });
+                    if diffusion > 0.0 {
+                        let left = previous[y * width + left_col];
+                        let right = previous[y * width + right_col];
+                        let up = previous[up_row * width + x];
+                        let down = previous[down_row * width + x];
+                        let neighbor_avg = (left + right + up + down) * 0.25;
+                        value += diffusion * (neighbor_avg - previous_value);
+                    }
+
+                    if decay > 0.0 {
+                        value -= decay * profile.decay_multiplier * value;
+                    }
+
+                    if growth > 0.0 && food_max > 0.0 {
+                        let normalized = value / food_max;
+                        let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
+                        value += growth_delta * food_max;
+                    }
+
+                    let mut capacity = profile.capacity.max(previous_value);
+                    let global_cap = food_max.max(previous_value);
+                    if capacity > global_cap {
+                        capacity = global_cap;
+                    }
+                    capacity = capacity.max(0.0);
+                    cells_mut[idx] = value.clamp(0.0, capacity);
                 }
-                capacity = capacity.max(0.0);
-                cells_mut[idx] = value.clamp(0.0, capacity);
             }
         }
     }
@@ -4386,46 +4479,46 @@ impl WorldState {
         let colors = columns.colors();
         let healths = columns.health();
 
-        let position_pairs: Vec<(f32, f32)> = positions.iter().map(|p| (p.x, p.y)).collect();
-        if self.index.rebuild(&position_pairs).is_err() {
+        // Build and reuse position pairs buffer
+        self.work_position_pairs.clear();
+        self.work_position_pairs.reserve(positions.len());
+        for p in positions.iter() {
+            self.work_position_pairs.push((p.x, p.y));
+        }
+        if self.index.rebuild(&self.work_position_pairs).is_err() {
             return;
         }
 
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        // Build and reuse handles buffer
+        self.work_handles.clear();
+        self.work_handles.reserve(agent_count);
+        self.work_handles.extend(self.agents.iter_handles());
+        let handles = &self.work_handles;
         let runtime = &self.runtime;
 
-        let trait_modifiers: Vec<TraitModifiers> = handles
-            .iter()
-            .map(|id| {
-                runtime
-                    .get(*id)
-                    .map_or(TraitModifiers::default(), |rt| rt.trait_modifiers)
-            })
-            .collect();
-        let eye_directions: Vec<[f32; NUM_EYES]> = handles
-            .iter()
-            .map(|id| {
-                runtime
-                    .get(*id)
-                    .map_or([0.0; NUM_EYES], |rt| rt.eye_direction)
-            })
-            .collect();
-        let eye_fov: Vec<[f32; NUM_EYES]> = handles
-            .iter()
-            .map(|id| runtime.get(*id).map_or([1.0; NUM_EYES], |rt| rt.eye_fov))
-            .collect();
-        let clocks: Vec<[f32; 2]> = handles
-            .iter()
-            .map(|id| runtime.get(*id).map_or([50.0, 50.0], |rt| rt.clocks))
-            .collect();
-        let temperature_preferences: Vec<f32> = handles
-            .iter()
-            .map(|id| runtime.get(*id).map_or(0.5, |rt| rt.temperature_preference))
-            .collect();
-        let sound_emitters: Vec<f32> = handles
-            .iter()
-            .map(|id| runtime.get(*id).map_or(0.0, |rt| rt.sound_multiplier))
-            .collect();
+        // Populate reusable runtime-derived SoA buffers
+        self.work_trait_modifiers.resize(agent_count, TraitModifiers::default());
+        self.work_eye_directions.resize(agent_count, [0.0; NUM_EYES]);
+        self.work_eye_fov.resize(agent_count, [1.0; NUM_EYES]);
+        self.work_clocks.resize(agent_count, [50.0, 50.0]);
+        self.work_temperature_preferences.resize(agent_count, 0.5);
+        self.work_sound_emitters.resize(agent_count, 0.0);
+        for (idx, id) in handles.iter().enumerate() {
+            if let Some(rt) = runtime.get(*id) {
+                self.work_trait_modifiers[idx] = rt.trait_modifiers;
+                self.work_eye_directions[idx] = rt.eye_direction;
+                self.work_eye_fov[idx] = rt.eye_fov;
+                self.work_clocks[idx] = rt.clocks;
+                self.work_temperature_preferences[idx] = rt.temperature_preference;
+                self.work_sound_emitters[idx] = rt.sound_multiplier;
+            }
+        }
+        let trait_modifiers = &self.work_trait_modifiers;
+        let eye_directions = &self.work_eye_directions;
+        let eye_fov = &self.work_eye_fov;
+        let clocks = &self.work_clocks;
+        let temperature_preferences = &self.work_temperature_preferences;
+        let sound_emitters = &self.work_sound_emitters;
 
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
@@ -4623,15 +4716,26 @@ impl WorldState {
         let ramp_rate = self.config.metabolism_ramp_rate;
         let boost_penalty = self.config.metabolism_boost_penalty.max(0.0);
 
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        // Reuse handles buffer
+        self.work_handles.clear();
+        self.work_handles.extend(self.agents.iter_handles());
+        let handles = &self.work_handles;
         if handles.is_empty() {
             return;
         }
 
         let columns = self.agents.columns();
-        let positions_snapshot: Vec<Position> = columns.positions().to_vec();
-        let headings_snapshot: Vec<f32> = columns.headings().to_vec();
-        let spike_lengths_snapshot: Vec<f32> = columns.spike_lengths().to_vec();
+        // Reuse working snapshots
+        let _count = handles.len();
+        self.work_positions.clear();
+        self.work_headings.clear();
+        self.work_spike_lengths.clear();
+        self.work_positions.extend_from_slice(columns.positions());
+        self.work_headings.extend_from_slice(columns.headings());
+        self.work_spike_lengths.extend_from_slice(columns.spike_lengths());
+        let positions_snapshot = &self.work_positions;
+        let headings_snapshot = &self.work_headings;
+        let spike_lengths_snapshot = &self.work_spike_lengths;
 
         let runtime = &self.runtime;
         let terrain = &self.terrain;
@@ -4808,7 +4912,9 @@ impl WorldState {
             return;
         }
 
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        self.work_handles.clear();
+        self.work_handles.extend(self.agents.iter_handles());
+        let handles = &self.work_handles;
         if handles.is_empty() {
             return;
         }
@@ -4819,8 +4925,12 @@ impl WorldState {
             .temperature_discomfort_exponent
             .max(f32::EPSILON);
 
-        let positions_snapshot: Vec<Position> = self.agents.columns().positions().to_vec();
-        let mut penalties = vec![0.0f32; handles.len()];
+        self.work_positions.clear();
+        self.work_positions.extend_from_slice(self.agents.columns().positions());
+        let positions_snapshot = &self.work_positions;
+        self.work_penalties.clear();
+        self.work_penalties.resize(handles.len(), 0.0);
+        let penalties = &mut self.work_penalties;
 
         for (idx, agent_id) in handles.iter().enumerate() {
             let env_temperature = sample_temperature(&self.config, positions_snapshot[idx].x);
@@ -4880,8 +4990,15 @@ impl WorldState {
 
     fn stage_food(&mut self) {
         let cell_size = self.config.food_cell_size as f32;
-        let positions = self.agents.columns().positions().to_vec();
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        // Reuse buffers: positions, handles, sharers
+        self.work_positions.clear();
+        self.work_positions.extend_from_slice(self.agents.columns().positions());
+        let positions = &self.work_positions;
+
+        self.work_handles.clear();
+        self.work_handles.extend(self.agents.iter_handles());
+        let handles = &self.work_handles;
+
         let mut sharers: Vec<usize> = Vec::new();
         let food_width = self.food.width() as usize;
         if food_width == 0 || self.food.height() == 0 {
@@ -4975,6 +5092,8 @@ impl WorldState {
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
 
+        // Defer indicator pulses to avoid borrowing conflicts
+        let mut indicator_pulses: Vec<(AgentId, f32, [f32; 3])> = Vec::new();
         for &giver_idx in &sharers {
             let giver_id = handles[giver_idx];
             for (recipient_idx, recipient_id) in handles.iter().enumerate() {
@@ -5029,9 +5148,12 @@ impl WorldState {
                         (recipient_runtime.energy + actual_transfer).min(2.0);
                     recipient_runtime.food_delta += actual_transfer;
                 }
-                self.pulse_indicator(giver_id, 10.0, [1.0, 1.0, 1.0]);
-                self.pulse_indicator(*recipient_id, 10.0, [1.0, 1.0, 1.0]);
+                indicator_pulses.push((giver_id, 10.0, [1.0, 1.0, 1.0]));
+                indicator_pulses.push((*recipient_id, 10.0, [1.0, 1.0, 1.0]));
             }
+        }
+        for (id, intensity, color) in indicator_pulses {
+            self.pulse_indicator(id, intensity, color);
         }
     }
     fn spawn_crossover_agent(&mut self) -> bool {
@@ -5225,7 +5347,10 @@ impl WorldState {
             runtime.combat = CombatEventFlags::default();
         }
 
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+        // Reuse handles buffer
+        self.work_handles.clear();
+        self.work_handles.extend(self.agents.iter_handles());
+        let handles = &self.work_handles;
         if handles.is_empty() {
             return;
         }
@@ -5240,18 +5365,30 @@ impl WorldState {
 
         let positions = self.agents.columns().positions();
         let headings = self.agents.columns().headings();
-        let velocities: Vec<Velocity> = self.agents.columns().velocities().to_vec();
+        // Reuse velocity buffer
+        self.work_velocities.clear();
+        self.work_velocities.extend_from_slice(self.agents.columns().velocities());
+        let velocities = &self.work_velocities;
         let spike_lengths = self.agents.columns().spike_lengths();
-        let positions_pairs: Vec<(f32, f32)> = positions.iter().map(|p| (p.x, p.y)).collect();
-        let _ = self.index.rebuild(&positions_pairs);
+        // Reuse position_pairs buffer for index rebuild
+        self.work_position_pairs.clear();
+        self.work_position_pairs.reserve(positions.len());
+        for p in positions.iter() {
+            self.work_position_pairs.push((p.x, p.y));
+        }
+        let _ = self.index.rebuild(&self.work_position_pairs);
 
         let spike_damage = self.config.spike_damage;
         let spike_energy_cost = self.config.spike_energy_cost;
         let index = &self.index;
-        let runtime_snapshot: Vec<AgentRuntime> = handles
-            .iter()
-            .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
-            .collect();
+        // Reuse runtime snapshot buffer
+        self.work_runtime_snapshot.clear();
+        self.work_runtime_snapshot.reserve(handles.len());
+        for id in handles.iter() {
+            self.work_runtime_snapshot
+                .push(self.runtime.get(*id).cloned().unwrap_or_default());
+        }
+        let runtime_snapshot = &self.work_runtime_snapshot;
 
         let results: Vec<CombatResult> = collect_handles!(handles, |idx, _handle| {
             let mut result = CombatResult::default();
@@ -5338,7 +5475,7 @@ impl WorldState {
                     let dist = dist_sq.sqrt();
                     let dir_x = dx / dist;
                     let dir_y = dy / dist;
-                    let alignment = facing.0 * dir_x + facing.1 * dir_y;
+            let alignment = dot2(facing.0, facing.1, dir_x, dir_y);
                     if alignment < alignment_threshold {
                         return;
                     }

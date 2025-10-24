@@ -729,7 +729,27 @@ impl fmt::Display for RendererMode {
 
 fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Renderer>)> {
     match mode {
-        RendererMode::Gui => Ok((RendererMode::Gui, Box::new(GuiRenderer))),
+        RendererMode::Gui => {
+            #[cfg(not(feature = "gui"))]
+            {
+                warn!("GUI feature not enabled; falling back to terminal renderer");
+                return Ok((RendererMode::Terminal, Box::new(TerminalRenderer::default())));
+            }
+            #[cfg(feature = "gui")]
+            {
+                if should_use_terminal_mode() {
+                    // Headless environment (no DISPLAY/WAYLAND) or forced terminal mode
+                    println!(
+                        "{} GUI unavailable or disabled. Falling back to terminal. Set {} to force GPUI, or run with {}",
+                        "⚠".yellow().bold(),
+                        "SCRIPTBOTS_FORCE_GUI=1".cyan(),
+                        "--mode terminal".cyan()
+                    );
+                    return Ok((RendererMode::Terminal, Box::new(TerminalRenderer::default())));
+                }
+                Ok((RendererMode::Gui, Box::new(GuiRenderer)))
+            }
+        },
         RendererMode::Terminal => Ok((
             RendererMode::Terminal,
             Box::new(TerminalRenderer::default()),

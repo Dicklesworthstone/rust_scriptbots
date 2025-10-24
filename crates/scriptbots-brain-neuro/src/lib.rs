@@ -241,7 +241,7 @@ impl Brain for NeuroflowBrain {
             let y = layer_val.get("y").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             let values: Vec<f32> = y.into_iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
             let width = (values.len() as f32).sqrt().ceil() as usize;
-            let height = if width == 0 { 0 } else { (values.len() + width - 1) / width };
+            let height = if width == 0 { 0 } else { values.len().div_ceil(width) };
             result_layers.push(ActivationLayer {
                 name: format!("nf.layer.{li}"),
                 width,

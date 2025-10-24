@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["parallel"]
 parallel = ["dep:rayon"]
+simd = []
 
 [dependencies]
 serde = { workspace = true }

@@ -54,11 +54,7 @@ impl AssemblyBrain {
 
     fn clamp_cells(cells: &mut [f32]) {
         for value in cells {
-            if *value > 10.0 {
-                *value = 10.0;
-            } else if *value < -10.0 {
-                *value = -10.0;
-            }
+            *value = (*value).clamp(-10.0, 10.0);
         }
     }
 }
@@ -147,9 +143,7 @@ impl Brain for AssemblyBrain {
             return None;
         }
 
-        let Some(other) = other.as_any().downcast_ref::<Self>() else {
-            return None;
-        };
+        let other = other.as_any().downcast_ref::<Self>()?;
 
         let mut child = self.clone();
         for (value, other_value) in child.cells.iter_mut().zip(&other.cells) {
