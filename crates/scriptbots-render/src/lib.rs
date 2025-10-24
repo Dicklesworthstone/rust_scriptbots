@@ -9685,8 +9685,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     let base_scale = (width_px / world_w).min(height_px / world_h).max(0.000_1);
     let scale = base_scale * camera_guard.zoom;
-    let render_w = world_w * scale;
-    let render_h = world_h * scale;
+    let mut render_w = world_w * scale;
+    let mut render_h = world_h * scale;
     let pad_x = (width_px - render_w) * 0.5;
     let pad_y = (height_px - render_h) * 0.5;
 

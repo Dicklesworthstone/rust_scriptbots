@@ -2027,9 +2027,6 @@ impl Snapshot {
         }
     }
 
-    fn brain_activations_layer(&self) -> Option<&BrainLayerView> {
-        self.brain_layers.first()
-    }
     fn brain_activations_layer_indexed(&self, idx: usize) -> Option<&BrainLayerView> {
         self.brain_layers.get(idx)
     }
@@ -2710,12 +2707,6 @@ struct BrainLayerView {
 }
 
 impl BrainLayerView {
-    fn from_activations(act: &BrainActivations) -> Self {
-        if let Some(layer) = act.layers.first() {
-            return Self { width: layer.width, height: layer.height, values: layer.values.clone(), name: Some(layer.name.clone()) };
-        }
-        Self { width: 0, height: 0, values: Vec::new(), name: None }
-    }
     fn vec_from_activations(act: &BrainActivations) -> Vec<BrainLayerView> {
         act.layers.iter().map(|l| BrainLayerView { width: l.width, height: l.height, values: l.values.clone(), name: Some(l.name.clone()) }).collect()
     }
