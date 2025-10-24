@@ -438,6 +438,16 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - **Temperature**: gradient and per-agent preference drive discomfort drains; exposed in config and analytics.
 - **Closed worlds & seeding**: enforce closed ecosystems; maintain population floors and scheduled spawns.
 
+### Procedural maps (WFC sandbox; in progress)
+- The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
+- Status and usage live in the plan doc; upcoming surfaces include REST/CLI endpoints to generate/apply artifacts. The hydrology system builds atop terrain for dynamic water flows (see below).
+
+### Hydrology snapshot (experimental)
+- Runtime hydrology state models per-cell flow direction, accumulation, basins, and a water depth field. Use `GET /api/hydrology` for a snapshot with:
+  - `width`, `height`, `total_water_depth`, `mean_water_depth`, flooded cell counts with thresholds
+  - Arrays: `water_depth`, `flow_directions` (N/S/E/W/-), `basin_ids`, `accumulation`, `spill_elevation`
+- CLI: `scriptbots-control hydrology` prints a summary (ratios, thresholds, array sizes). Hydrology integrates with terrain and is deterministic per seed.
+
 ### Combat & mortality analytics
 - **Spikes**: damage scales with requested spike length and agent speed; collision resolution is staged for determinism.
 - **Carcass sharing**: meat distribution honors age scaling and diet tendencies; events persisted for analysis.
