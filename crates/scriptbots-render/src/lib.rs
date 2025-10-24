@@ -9749,6 +9749,21 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     render_right = offset_x + render_w;
     render_bottom = offset_y + render_h;
 
+    // Final guard: if the computed render rect is still fully outside the view
+    // (observed on some Windows setups on first frame), draw this frame using a
+    // deterministic centered offset so content is visible. This does not mutate
+    // camera state; subsequent frames will use the camera's offsets.
+    let still_offscreen =
+        render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
+    if still_offscreen {
+        offset_x = origin_x + (width_px - render_w) * 0.5;
+        offset_y = origin_y + (height_px - render_h) * 0.5;
+        render_left = offset_x;
+        render_top = offset_y;
+        render_right = offset_x + render_w;
+        render_bottom = offset_y + render_h;
+    }
+
     drop(camera_guard);
 
     let day_phase = frame.tick as f32 * 0.00025;
