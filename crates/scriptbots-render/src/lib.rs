@@ -9264,6 +9264,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let cell_world = frame.food_cell_size as f32;
     let _cell_px = (cell_world * scale).max(1.0);
     let max_food = frame.food_max.max(f32::EPSILON);
+    let inv_max_food = if max_food > 0.0 { 1.0 / max_food } else { 0.0 };
 
     if controls.draw_food {
         // Compute visible cell range to cull off-screen food cells
@@ -9298,7 +9299,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     if value <= 0.001 {
                         continue;
                     }
-                    let intensity: f32 = (value as f32 / max_food as f32).clamp(0.0, 1.0);
+                    let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
                     let mut color = food_color(intensity);
                     let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
                     let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
@@ -9345,7 +9346,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     if value <= 0.001 {
                         continue;
                     }
-                    let intensity: f32 = (value as f32 / max_food as f32).clamp(0.0, 1.0);
+                    let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
                     let mut color = food_color(intensity);
                     let shade_wave =
                         ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
@@ -9568,10 +9569,6 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         // Batched agent outlines pass
         if controls.agent_outline && !very_low_fps {
             let mut outline_builder = PathBuilder::stroke(px(1.8));
-            let view_left = f32::from(origin.x);
-            let view_top = f32::from(origin.y);
-            let view_right = view_left + width_px;
-            let view_bottom = view_top + height_px;
 
             for agent in &frame.agents {
                 let px_x = offset_x + agent.position.x * scale;
