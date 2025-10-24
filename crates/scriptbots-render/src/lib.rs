@@ -5993,7 +5993,7 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
 }
 
 fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
-    // Compact card summarizing brain type and a mini gauge for output dominance
+    // Compact card summarizing brain type and a radial radar chart
     let (best_idx, best_val) = detail
         .outputs
         .iter()
@@ -6002,22 +6002,19 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, v)| (i, v))
         .unwrap_or((0, 0.0));
-    let gauge = div()
-        .w(px(180.0))
-        .h(px(8.0))
-        .bg(rgb(0x1e293b))
-        .rounded_sm()
-        .child(
-            div()
-                .w(px(180.0 * best_val.clamp(0.0, 1.0)))
-                .h(px(8.0))
-                .bg(rgb(0x34d399))
-                .rounded_sm(),
-        );
+
+    let outputs = detail.outputs.clone();
+    let radar_canvas = canvas(
+        move |_, _, _| outputs.clone(),
+        move |bounds, outputs, window, _| paint_brain_radar(bounds, outputs, window),
+    )
+    .w(px(180.0))
+    .h(px(120.0));
+
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_2()
         .rounded_md()
         .border_1()
         .border_color(rgb(0x1e293b))
@@ -6027,7 +6024,58 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Brain"))
         .child(div().text_sm().text_color(rgb(0xcbd5f5)).child(detail.brain_descriptor.clone()))
         .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!("dominant o{} {:.2}", best_idx, best_val)))
-        .child(gauge)
+        .child(radar_canvas)
+}
+
+fn paint_brain_radar(bounds: Bounds<Pixels>, outputs: &Vec<f32>, window: &mut Window) {
+    let origin = bounds.origin;
+    let size = bounds.size;
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+    window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1223, 0.92))));
+    let cx = f32::from(origin.x) + width * 0.5;
+    let cy = f32::from(origin.y) + height * 0.58;
+    let radius = (width.min(height) * 0.42).max(24.0);
+
+    // Web-like spokes
+    let n = outputs.len().max(3);
+    for ring in [0.3, 0.6, 1.0] {
+        let mut ring_path = PathBuilder::stroke(px(1.0));
+        for i in 0..n {
+            let ang = (i as f32) / (n as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+            let x = cx + radius * ring * ang.cos();
+            let y = cy + radius * ring * ang.sin();
+            if i == 0 { ring_path.move_to(point(px(x), px(y))); } else { ring_path.line_to(point(px(x), px(y))); }
+        }
+        // close polygon
+        let ang0 = -std::f32::consts::FRAC_PI_2;
+        let x0 = cx + radius * ring * ang0.cos();
+        let y0 = cy + radius * ring * ang0.sin();
+        ring_path.line_to(point(px(x0), px(y0)));
+        if let Ok(path) = ring_path.build() { window.paint_path(path, rgba_from_hex(0x1e293b, 0.9)); }
+    }
+
+    // Spokes
+    for i in 0..n {
+        let ang = (i as f32) / (n as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let x = cx + radius * ang.cos();
+        let y = cy + radius * ang.sin();
+        let mut spoke = PathBuilder::stroke(px(1.0));
+        spoke.move_to(point(px(cx), px(cy)));
+        spoke.line_to(point(px(x), px(y)));
+        if let Ok(path) = spoke.build() { window.paint_path(path, rgba_from_hex(0x1e293b, 0.9)); }
+    }
+
+    // Filled polygon of output magnitudes (clamped 0..1)
+    let mut poly = PathBuilder::fill();
+    for i in 0..n {
+        let val = outputs.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let ang = (i as f32) / (n as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        let x = cx + radius * val * ang.cos();
+        let y = cy + radius * val * ang.sin();
+        if i == 0 { poly.move_to(point(px(x), px(y))); } else { poly.line_to(point(px(x), px(y))); }
+    }
+    if let Ok(path) = poly.build() { window.paint_path(path, rgba_from_hex(0x22d3ee, 0.35)); }
 }
 /// Render a simple PNG snapshot of the current world without a live window.
 /// This is a coarse, deterministic rasterization intended for REST exports.
