@@ -768,12 +768,20 @@ impl<'a> TerminalApp<'a> {
                 );
             }
             (KeyCode::Char('n') | KeyCode::Char('N'), _) => {
-                self.palette.toggle_emoji_narrow();
-                self.push_event(
-                    self.snapshot.tick,
-                    EventKind::Info,
-                    if self.palette.is_emoji_narrow() { "Narrow symbols ON" } else { "Narrow symbols OFF" },
-                );
+                if self.palette.is_emoji() {
+                    self.palette.toggle_emoji_narrow();
+                    self.push_event(
+                        self.snapshot.tick,
+                        EventKind::Info,
+                        if self.palette.is_emoji_narrow() { "Narrow symbols ON" } else { "Narrow symbols OFF" },
+                    );
+                } else {
+                    self.push_event(
+                        self.snapshot.tick,
+                        EventKind::Info,
+                        "Enable Emoji mode first (press 'e') to use narrow symbols",
+                    );
+                }
             }
             (KeyCode::Char('b'), _) => {
                 if self.baseline.is_some() {
@@ -1887,15 +1895,29 @@ impl Palette {
     fn heading_char(heading: f32) -> char {
         let normalized = heading.rem_euclid(TAU);
         let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
-        match sector {
-            0 => '→',
-            1 => '↗',
-            2 => '↑',
-            3 => '↖',
-            4 => '←',
-            5 => '↙',
-            6 => '↓',
-            _ => '↘',
+        // Use narrow, width-1 ASCII arrows when emoji_narrow is enabled; otherwise use pretty arrows
+        if self.emoji && self.emoji_narrow {
+            match sector {
+                0 => '>',
+                1 => '/',
+                2 => '^',
+                3 => '\\',
+                4 => '<',
+                5 => '/',
+                6 => 'v',
+                _ => '\\',
+            }
+        } else {
+            match sector {
+                0 => '→',
+                1 => '↗',
+                2 => '↑',
+                3 => '↖',
+                4 => '←',
+                5 => '↙',
+                6 => '↓',
+                _ => '↘',
+            }
         }
     }
 }

@@ -20,8 +20,10 @@ static RAYON_LIMIT_GUARD: OnceLock<()> = OnceLock::new();
 #[cfg(feature = "parallel")]
 macro_rules! collect_handles {
     ($handles:expr, |$idx:ident, $handle:pat_param| $body:expr) => {{
+        const PAR_MIN_SPLIT: usize = 1024;
         ($handles)
             .par_iter()
+            .with_min_len(PAR_MIN_SPLIT)
             .enumerate()
             .map(|($idx, $handle)| $body)
             .collect::<Vec<_>>()
@@ -114,7 +116,6 @@ fn configure_parallelism() {
         }
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(limit)
-            .thread_name(|idx| format!("scriptbots-worker-{idx}"))
             .build_global();
     });
 }
