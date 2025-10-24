@@ -71,10 +71,11 @@ missing_errors_doc = "allow"
 
 [profile.release]
 lto = "thin"
-codegen-units = 16
-incremental = true
+codegen-units = 1
+incremental = false
 strip = true
 panic = "abort"
+opt-level = 3
 
 [profile.dev]
 split-debuginfo = "unpacked"

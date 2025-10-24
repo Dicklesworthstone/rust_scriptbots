@@ -6097,7 +6097,10 @@ impl Render for SimulationView {
         #[cfg(feature = "audio")]
         self.update_audio(&snapshot);
 
-        content = content.child(self.render_perf_overlay(perf_snapshot));
+        // Update perf overlay at a modest cadence to reduce churn
+        if perf_snapshot.sample_count % 4 == 0 {
+            content = content.child(self.render_perf_overlay(perf_snapshot));
+        }
 
         if self.settings_panel.open {
             content = content.child(self.render_settings_panel(cx));
@@ -8491,10 +8494,6 @@ fn paint_terrain_layer(
     palette: ColorPaletteMode,
     window: &mut Window,
 ) {
-    // In safe mode, skip per-cell terrain rendering entirely to maximize FPS.
-    if safe_mode_enabled() {
-        return;
-    }
     let width = terrain.dimensions.0 as usize;
     let height = terrain.dimensions.1 as usize;
     if width == 0 || height == 0 {
@@ -8504,6 +8503,33 @@ fn paint_terrain_layer(
     let cell_world = terrain.cell_size as f32;
     let cell_px = (cell_world * scale).max(1.0);
     let highlight_shift = (daylight * 0.45 + 0.35).clamp(0.2, 0.9);
+
+    // Adaptive tiling: when zoomed out, render coarse blocks to reduce draw calls while
+    // preserving the overall look. When zoomed in, fall back to fine detail per cell.
+    const MAX_TERRAIN_QUADS_DEFAULT: usize = 140_000;
+    const MAX_TERRAIN_QUADS_SAFE: usize = 40_000;
+    let total_cells = width.saturating_mul(height).max(1);
+    let max_quads = if safe_mode_enabled() { MAX_TERRAIN_QUADS_SAFE } else { MAX_TERRAIN_QUADS_DEFAULT };
+    let stride_quads = ((total_cells as f32 / max_quads as f32).sqrt().ceil() as usize).max(1);
+    let stride_pixels = if cell_px < 1.5 { (1.5 / cell_px).ceil() as usize } else { 1 };
+    let stride = stride_quads.max(stride_pixels).clamp(1, 64);
+
+    if stride > 1 {
+        // Coarse block path: fill aggregated blocks using the top-left sample
+        let block_px = (cell_px * stride as f32).max(1.0);
+        for y in (0..height).step_by(stride) {
+            for x in (0..width).step_by(stride) {
+                let idx = y * width + x;
+                let Some(tile) = terrain.tiles.get(idx).copied() else { continue };
+                let px_x = offset_x + (x as f32 * cell_world * scale);
+                let px_y = offset_y + (y as f32 * cell_world * scale);
+                let surface = terrain_surface_color(tile, daylight, palette);
+                let bounds = Bounds::new(point(px(px_x), px(px_y)), size(px(block_px), px(block_px)));
+                window.paint_quad(fill(bounds, Background::from(surface)));
+            }
+        }
+        return;
+    }
 
     for y in 0..height {
         for x in 0..width {
@@ -8887,8 +8913,8 @@ fn apply_post_processing(
             PostProcessPass::Vignette { strength } => {
                 if strength > 0.01 {
                     let alpha = (0.22 + (1.0 - daylight) * 0.14) * strength;
-                    let edge_color =
-                        apply_palette(rgba_from_hex(0x01040c, alpha.clamp(0.05, 0.55)), palette);
+                    let edge_base = rgba_from_hex(0x01040c, alpha.clamp(0.05, 0.55));
+                    let edge_color = if matches!(palette, ColorPaletteMode::Natural) { edge_base } else { apply_palette(edge_base, palette) };
                     let top_bounds = Bounds::new(
                         point(px(origin_x), px(origin_y)),
                         size(px(width_px), px(height_px * 0.18)),
@@ -8901,7 +8927,8 @@ fn apply_post_processing(
                     window.paint_quad(fill(bottom_bounds, Background::from(edge_color)));
 
                     let side_alpha = (alpha * 0.8).clamp(0.04, 0.45);
-                    let side_color = apply_palette(rgba_from_hex(0x020816, side_alpha), palette);
+                    let side_base = rgba_from_hex(0x020816, side_alpha);
+                    let side_color = if matches!(palette, ColorPaletteMode::Natural) { side_base } else { apply_palette(side_base, palette) };
                     let side_width = width_px * 0.08;
                     let left_bounds = Bounds::new(
                         point(px(origin_x), px(origin_y)),
@@ -8926,14 +8953,12 @@ fn apply_post_processing(
                         ),
                         size(px(bloom_width), px(bloom_height)),
                     );
-                    let bloom_color = apply_palette(
-                        lerp_rgba(
-                            rgba_from_hex(0x3b82f6, 0.14 * strength),
-                            rgba_from_hex(0x22c55e, 0.10 * strength),
-                            daylight.clamp(0.0, 1.0),
-                        ),
-                        palette,
+                    let bloom_base = lerp_rgba(
+                        rgba_from_hex(0x3b82f6, 0.14 * strength),
+                        rgba_from_hex(0x22c55e, 0.10 * strength),
+                        daylight.clamp(0.0, 1.0),
                     );
+                    let bloom_color = if matches!(palette, ColorPaletteMode::Natural) { bloom_base } else { apply_palette(bloom_base, palette) };
                     window.paint_quad(fill(bloom_bounds, Background::from(bloom_color)));
                 }
             }
@@ -8945,13 +8970,9 @@ fn apply_post_processing(
                     while y < origin_y + height_px {
                         let scanline_bounds =
                             Bounds::new(point(px(origin_x), px(y)), size(px(width_px), px(1.0)));
-                        window.paint_quad(fill(
-                            scanline_bounds,
-                            Background::from(apply_palette(
-                                rgba_from_hex(0x020816, alpha),
-                                palette,
-                            )),
-                        ));
+                        let scan_base = rgba_from_hex(0x020816, alpha);
+                        let scan_color = if matches!(palette, ColorPaletteMode::Natural) { scan_base } else { apply_palette(scan_base, palette) };
+                        window.paint_quad(fill(scanline_bounds, Background::from(scan_color)));
                         y += spacing_px;
                     }
                 }
@@ -8992,7 +9013,8 @@ fn paint_film_grain(
                 continue;
             }
             let base_hex = if noise > 0.6 { 0xffffff } else { 0x0f172a };
-            let color = apply_palette(rgba_from_hex(base_hex, alpha.clamp(0.01, 0.12)), palette);
+            let base = rgba_from_hex(base_hex, alpha.clamp(0.01, 0.12));
+            let color = if matches!(palette, ColorPaletteMode::Natural) { base } else { apply_palette(base, palette) };
             let x = f32::from(origin.x) + col as f32 * cell_w;
             let y = f32::from(origin.y) + row as f32 * cell_h;
             let cell_bounds = Bounds::new(point(px(x), px(y)), size(px(cell_w), px(cell_h)));
@@ -9276,7 +9298,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     if value <= 0.001 {
                         continue;
                     }
-                    let intensity = (value / max_food).clamp(0.0, 1.0);
+                    let intensity: f32 = (value as f32 / max_food as f32).clamp(0.0, 1.0);
                     let mut color = food_color(intensity);
                     let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
                     let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
@@ -9323,7 +9345,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     if value <= 0.001 {
                         continue;
                     }
-                    let intensity = (value / max_food).clamp(0.0, 1.0);
+                    let intensity: f32 = (value as f32 / max_food as f32).clamp(0.0, 1.0);
                     let mut color = food_color(intensity);
                     let shade_wave =
                         ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;

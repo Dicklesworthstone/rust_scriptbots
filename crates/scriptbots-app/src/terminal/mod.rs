@@ -559,12 +559,16 @@ impl<'a> TerminalApp<'a> {
             if self.map_scratch.len() < needed {
                 self.map_scratch.resize(needed, CellOccupancy::default());
             }
+            // Bump stamp for this frame; keep 0 reserved
+            self.map_stamp = self.map_stamp.wrapping_add(1);
+            if self.map_stamp == 0 { self.map_stamp = 1; }
             frame.render_widget(
                 MapWidget {
                     snapshot: &self.snapshot,
                     terrain: &self.terrain,
                     palette: &self.palette,
                     scratch: &mut self.map_scratch,
+                    stamp: self.map_stamp,
                 },
                 inner,
             );
@@ -1796,6 +1800,7 @@ struct MapWidget<'a> {
     terrain: &'a TerrainView,
     palette: &'a Palette,
     scratch: &'a mut [CellOccupancy],
+    stamp: u32,
 }
 
 impl<'a> Widget for MapWidget<'a> {
@@ -1843,7 +1848,6 @@ impl<'a> Widget for MapWidget<'a> {
             // Create a zero-length slice reference as placeholder.
             &mut []
         };
-        for cell in occupancy.iter_mut() { *cell = CellOccupancy::default(); }
         let w = width as f32;
         let h = height as f32;
         for agent in &self.snapshot.agents {
@@ -1857,13 +1861,14 @@ impl<'a> Widget for MapWidget<'a> {
                 agent.heading,
                 agent.spike_length,
                 agent.tendency,
+                self.stamp,
             );
         }
 
         for y in 0..height {
             for x in 0..width {
                 let idx = y * width + x;
-                if occupancy[idx].total() == 0 {
+                if occupancy[idx].stamp != self.stamp || occupancy[idx].total() == 0 {
                     continue;
                 }
                 let base_style = buf[(area.x + x as u16, area.y + y as u16)].style();

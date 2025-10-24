@@ -1,10 +1,12 @@
-use std::sync::{MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::cmp::Reverse;
+// removed duplicate import
 
 use crossfire::TrySendError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+// removed duplicate import
 
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
@@ -18,6 +20,7 @@ use scriptbots_core::ConfigAuditEntry;
 #[cfg(feature = "gui")]
 use scriptbots_render::render_png_offscreen;
 use slotmap::Key; // offscreen PNG renderer
+use smallvec::SmallVec;
 
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -28,7 +31,8 @@ pub struct ConfigSnapshot {
 
 impl ConfigSnapshot {
     fn from_world(config: &ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
-        Self::from_config(config.clone(), tick)
+        let config_value = serde_json::to_value(config).map_err(ControlError::serialization)?;
+        Ok(Self { tick: tick.0, config: config_value })
     }
 
     fn from_config(config: ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
@@ -172,6 +176,7 @@ impl From<PoisonError<MutexGuard<'_, WorldState>>> for ControlError {
 pub struct ControlHandle {
     shared_world: SharedWorld,
     commands: CommandSender,
+    knobs_cache: std::sync::Arc<Mutex<Option<(usize, Vec<KnobEntry>)>>>,
 }
 
 impl ControlHandle {
@@ -179,6 +184,7 @@ impl ControlHandle {
         Self {
             shared_world,
             commands,
+            knobs_cache: std::sync::Arc::new(Mutex::new(None)),
         }
     }
 
@@ -255,12 +261,22 @@ impl ControlHandle {
 
     /// Flatten the configuration into individual knob descriptors for discovery.
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
-        let world = self.lock_world()?;
+        let rev = { let world = self.lock_world()?; world.config_audit().len() };
+        if let Some((cached_rev, cached)) = self.knobs_cache.lock().unwrap().as_ref() {
+            if *cached_rev == rev {
+                return Ok(cached.clone());
+            }
+        }
+        let (rev2, config_value) = {
+            let world = self.lock_world()?;
+            let rev2 = world.config_audit().len();
+            let value = serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
+            (rev2, value)
+        };
         let mut entries = Vec::with_capacity(256);
-        let config_value =
-            serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
         let mut prefix = String::new();
         flatten_value(&mut prefix, &config_value, &mut entries);
+        *self.knobs_cache.lock().unwrap() = Some((rev2, entries.clone()));
         Ok(entries)
     }
 
@@ -283,7 +299,7 @@ impl ControlHandle {
                 events.push(EventEntry::new(
                     summary.tick.0,
                     EventKind::Birth,
-                    summary.births,
+                    summary.births as u32,
                 ));
                 if events.len() >= limit { break; }
             }
@@ -291,7 +307,7 @@ impl ControlHandle {
                 events.push(EventEntry::new(
                     summary.tick.0,
                     EventKind::Death,
-                    summary.deaths,
+                    summary.deaths as u32,
                 ));
                 if events.len() >= limit { break; }
             }
@@ -299,7 +315,7 @@ impl ControlHandle {
                 events.push(EventEntry::new(
                     summary.tick.0,
                     EventKind::Combat,
-                    summary.spike_hits as usize,
+                    summary.spike_hits as u32,
                 ));
                 if events.len() >= limit { break; }
             }
@@ -376,9 +392,8 @@ impl ControlHandle {
 
         let world = self.lock_world()?;
         let current_tick = world.tick();
-        let mut config_value =
-            serde_json::to_value(world.config().clone()).map_err(ControlError::serialization)?;
-        let mut path = Vec::<&str>::new();
+        let mut config_value = serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
+        let mut path = SmallVec::<[&str; 8]>::new();
         merge_value(&mut config_value, &patch, &mut path)?;
         let json_str = serde_json::to_string(&config_value).map_err(ControlError::serialization)?;
         let mut de = serde_json::Deserializer::from_str(&json_str);
@@ -397,6 +412,7 @@ impl ControlHandle {
         let snapshot = ConfigSnapshot::from_config(new_config.clone(), current_tick)?;
         drop(world);
         self.enqueue(ControlCommand::UpdateConfig(Box::new(new_config)))?;
+        *self.knobs_cache.lock().unwrap() = None;
         Ok(snapshot)
     }
 
@@ -476,7 +492,7 @@ fn set_f64(target: &mut Value, v: f64, path: &[&str]) -> Result<(), ControlError
 fn merge_value<'a>(
     target: &mut Value,
     patch: &'a Value,
-    path: &mut Vec<&'a str>,
+    path: &mut SmallVec<[&'a str; 8]>,
 ) -> Result<(), ControlError> {
     match target {
         Value::Object(target_map) => {
@@ -596,11 +612,11 @@ pub enum EventKind {
 pub struct EventEntry {
     pub tick: u64,
     pub kind: EventKind,
-    pub count: usize,
+    pub count: u32,
 }
 
 impl EventEntry {
-    pub fn new(tick: u64, kind: EventKind, count: usize) -> Self {
+    pub fn new(tick: u64, kind: EventKind, count: u32) -> Self {
         Self { tick, kind, count }
     }
 }
