@@ -155,7 +155,13 @@ fn main() -> Result<()> {
 
             let bytes = {
                 let guard = world.lock().expect("world mutex poisoned");
-                render_png_offscreen(&guard, w, h)
+                // Prefer wgpu compositor path if requested via env; otherwise fallback CPU raster
+                let bytes = if matches!(std::env::var("SB_WGPU_DUMP").ok().as_deref(), Some("1" | "true" | "yes" | "on")) {
+                    scriptbots_render::world_compositor::render_wgpu_png_offscreen(&guard, w, h)
+                } else {
+                    render_png_offscreen(&guard, w, h)
+                };
+                bytes
             };
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 fs::create_dir_all(parent)?;

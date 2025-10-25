@@ -35,9 +35,11 @@ use image::{ImageBuffer, Rgba as ImgRgba};
 use tracing::{error, info, warn};
 
 #[cfg(feature = "world_wgpu")]
-mod world_compositor {
+pub mod world_compositor {
     use super::*;
     use scriptbots_world_gfx::{WorldRenderer, WorldSnapshot as GfxSnapshot, ReadbackView};
+    use scriptbots_core::{WorldState, TerrainKind, SelectionState};
+    
 
     pub struct GpuiImage {
         size: (u32, u32),
@@ -176,6 +178,9 @@ mod world_compositor {
         save_every: u32,
         save_counter: u64,
         save_prefix: String,
+        // Capture the very first frame even when save is disabled, so we can
+        // diagnose blank screens without user setup.
+        force_first_capture: bool,
     }
 
     impl Compositor {
@@ -188,7 +193,8 @@ mod world_compositor {
             let save_dir = std::env::var("SB_WGPU_SAVE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("frames"));
             let save_every = std::env::var("SB_WGPU_SAVE_EVERY").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n > 0).unwrap_or(1);
             let save_prefix = std::env::var("SB_WGPU_SAVE_PREFIX").unwrap_or_else(|_| "frame".to_string());
-            Self { renderer: None, image: None, adapter: None, cam_scale: 1.0, cam_offset: (0.0, 0.0), last_submit: None, min_interval, render_scale, save_enabled, save_dir, save_every, save_counter: 0, save_prefix }
+            let force_first_capture = true; // one-time capture for diagnostics
+            Self { renderer: None, image: None, adapter: None, cam_scale: 1.0, cam_offset: (0.0, 0.0), last_submit: None, min_interval, render_scale, save_enabled, save_dir, save_every, save_counter: 0, save_prefix, force_first_capture }
         }
 
         pub fn set_camera_params(&mut self, scale: f32, offset: (f32, f32)) {
@@ -262,10 +268,12 @@ mod world_compositor {
             let _ = r.copy_to_readback(&_frame);
             if let Some(view) = r.mapped_rgba() {
                 self.save_view_if_requested(&view);
+                // Lazy-initialize image with known dimensions; avoid stale size from previous runs
                 if self.image.is_none() {
                     self.image = Some(GpuiImage::new((view.width, view.height), view.bytes_per_row));
                 }
                 if let Some(img) = self.image.as_mut() {
+                    img.ensure((view.width, view.height), view.bytes_per_row);
                     img.upload_from_readback(&view);
                 }
                 self.last_submit = Some(std::time::Instant::now());
@@ -283,12 +291,15 @@ mod world_compositor {
         }
 
         fn save_view_if_requested(&mut self, view: &ReadbackView) {
-            if !self.save_enabled { return; }
+            if !self.save_enabled && !(self.force_first_capture && self.save_counter == 0) {
+                return;
+            }
             self.save_counter = self.save_counter.saturating_add(1);
             if ((self.save_counter - 1) % (self.save_every as u64)) != 0 { return; }
 
             // Ensure directory exists
-            let _ = std::fs::create_dir_all(&self.save_dir);
+            let target_dir = if self.save_enabled { self.save_dir.clone() } else { std::path::PathBuf::from("frames_live") };
+            let _ = std::fs::create_dir_all(&target_dir);
             // Repack from padded rows into tightly packed RGBA8 buffer
             let width = view.width;
             let height = view.height;
@@ -305,7 +316,7 @@ mod world_compositor {
                 }
             }
             let filename = format!("{}_{:06}.png", self.save_prefix, self.save_counter);
-            let path = self.save_dir.join(filename);
+            let path = target_dir.join(filename);
             let _ = image::save_buffer_with_format(
                 &path,
                 &tight,
@@ -314,7 +325,85 @@ mod world_compositor {
                 image::ColorType::Rgba8,
                 image::ImageFormat::Png,
             );
+            // Only force one capture
+            self.force_first_capture = false;
         }
+    }
+
+    // Headless, one-shot offscreen render to PNG (bytes) using the same snapshot path as the GUI.
+    // This allows verifying the wgpu pipeline without a display server.
+    pub fn render_wgpu_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
+        // Build snapshot from world
+        let frame = crate::RenderFrame::from_world(world, crate::ColorPaletteMode::Natural)
+            .expect("render frame");
+        let world_size = frame.world_size;
+        let dims = frame.terrain.dimensions;
+        let tiles_u32: Vec<u32> = frame
+            .terrain
+            .tiles
+            .iter()
+            .map(|t| match t.kind {
+                TerrainKind::DeepWater => 0,
+                TerrainKind::ShallowWater => 1,
+                TerrainKind::Sand => 2,
+                TerrainKind::Grass => 3,
+                TerrainKind::Bloom => 4,
+                TerrainKind::Rock => 5,
+            })
+            .collect();
+        let elevation: Vec<f32> = frame.terrain.tiles.iter().map(|t| t.elevation).collect();
+        let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = frame
+            .agents
+            .iter()
+            .map(|a| {
+                let sel = match a.selection { SelectionState::Hovered => 1u32, SelectionState::Selected => 2u32, SelectionState::None => 0u32 };
+                let dyn_radius = (frame.agent_base_radius + a.spike_length * 0.25).max(6.0);
+                let glow = (a.indicator.intensity * 0.35).clamp(0.0, 1.0);
+                scriptbots_world_gfx::AgentInstance {
+                    position: [a.position.x, a.position.y],
+                    size: dyn_radius,
+                    color: [a.color[0], a.color[1], a.color[2], 1.0],
+                    selection: sel,
+                    glow,
+                    boost: if a.spiked { 1.0 } else { 0.0 },
+                }
+            })
+            .collect();
+
+        let snapshot = GfxSnapshot {
+            world_size,
+            terrain: scriptbots_world_gfx::TerrainView { dims, cell_size: frame.terrain.cell_size, tiles: &tiles_u32, elevation: Some(&elevation) },
+            agents: &agents_gpu,
+        };
+
+        // Fit camera into the requested viewport
+        let mut comp = Compositor::new();
+        let width_px = width as f32;
+        let height_px = height as f32;
+        let base_scale = (width_px / world_size.0).min(height_px / world_size.1).max(0.0001);
+        let pad_x = (width_px - world_size.0 * base_scale) * 0.5;
+        let pad_y = (height_px - world_size.1 * base_scale) * 0.5;
+        comp.set_camera_params(base_scale, (pad_x, pad_y));
+
+        comp.render_snapshot(&snapshot, (width, height));
+
+        // Extract mapped frame
+        let mut png: Vec<u8> = Vec::new();
+        if let Some(view) = comp.renderer.as_mut().and_then(|r| r.mapped_rgba()) {
+            let stride = view.bytes_per_row as usize;
+            let row_bytes = width as usize * 4;
+            let src = view.bytes();
+            let mut tight = vec![0u8; row_bytes * height as usize];
+            for y in 0..(height as usize) {
+                let s = y * stride;
+                let d = y * row_bytes;
+                tight[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+            }
+            let mut cursor = std::io::Cursor::new(&mut png);
+            let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+            let _ = image::ImageEncoder::write_image(encoder, &tight, width, height, image::ExtendedColorType::Rgba8);
+        }
+        png
     }
 }
 

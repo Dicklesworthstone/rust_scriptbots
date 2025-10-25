@@ -144,8 +144,11 @@ impl WorldRenderer {
             });
         }
         // Terrain + agents
-        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
-        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
+        let vis_tiles = self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
+        let vis_agents = self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
+        if std::env::var("SB_WGPU_LOG_VIS").ok().as_deref() == Some("1") {
+            tracing::info!(tiles = vis_tiles, agents = vis_agents, "wgpu visible instances");
+        }
         // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
         if self.ensure_post() {
             if let Some(p) = self.post.as_mut() {
@@ -320,13 +323,17 @@ impl ReadbackRing {
     }
 
     pub fn mapped(&mut self) -> Option<ReadbackView> {
-        let prev = (self.curr + self.slots.len() - 1) % self.slots.len();
-        let slot = &mut self.slots[prev];
-        if !slot.ready && !slot.mapped.load(Ordering::Relaxed) { return None; }
-        let slice = slot.buf.slice(..);
-        let guard = slice.get_mapped_range();
-        slot.ready = true; // latch until consumer takes a view at least once
-        Some(ReadbackView { guard, bytes_per_row: self.bytes_per_row, width: self.extent.0, height: self.extent.1 })
+        // Prefer the most recently mapped slot (scan last -> older)
+        for i in 0..self.slots.len() {
+            let idx = (self.curr + self.slots.len() - 1 - i) % self.slots.len();
+            let slot = &mut self.slots[idx];
+            if !slot.ready && !slot.mapped.load(Ordering::Relaxed) { continue; }
+            let slice = slot.buf.slice(..);
+            let guard = slice.get_mapped_range();
+            slot.ready = true; // latch until consumer takes a view at least once
+            return Some(ReadbackView { guard, bytes_per_row: self.bytes_per_row, width: self.extent.0, height: self.extent.1 });
+        }
+        None
     }
 }
 
@@ -597,12 +604,13 @@ impl TerrainPipeline {
         self.vbuf_capacity_bytes = cap;
     }
 
-    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32), scale: f32, offset: (f32, f32)) {
+    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32), scale: f32, offset: (f32, f32)) -> u32 {
         // Build tile instances for visible terrain with simple CPU frustum culling.
         let (tw, th) = snapshot.terrain.dims;
         let cell = snapshot.terrain.cell_size as f32;
         let mut staging: Vec<TileInstance> = Vec::with_capacity((tw as usize) * (th as usize));
         let (vp_w, vp_h) = (viewport.0 as f32, viewport.1 as f32);
+        let disable_cull = matches!(std::env::var("SB_WGPU_DISABLE_CULL").ok().map(|s| s.to_ascii_lowercase()), Some(ref v) if v == "1" || v == "true" || v == "yes" || v == "on");
         let elev_opt = snapshot.terrain.elevation;
         let get_elev = |x: i32, y: i32| -> f32 {
             if let Some(elev) = elev_opt {
@@ -621,7 +629,7 @@ impl TerrainPipeline {
                 let min_y_px = py * scale + offset.1;
                 let max_x_px = min_x_px + cell * scale;
                 let max_y_px = min_y_px + cell * scale;
-                if max_x_px < 0.0 || max_y_px < 0.0 || min_x_px > vp_w || min_y_px > vp_h { continue; }
+                if !disable_cull && (max_x_px < 0.0 || max_y_px < 0.0 || min_x_px > vp_w || min_y_px > vp_h) { continue; }
                 let idx = (y as usize) * (tw as usize) + (x as usize);
                 let tile_id = snapshot.terrain.tiles.get(idx).copied().unwrap_or(3);
                 let uv = self.atlas_uv_for(tile_id);
@@ -652,6 +660,7 @@ impl TerrainPipeline {
         pass.set_bind_group(1, &view_uniforms.bg, &[]);
         pass.set_vertex_buffer(0, self.tile_vbuf.slice(..));
         pass.draw(0..4, 0..staging.len() as u32);
+        staging.len() as u32
     }
 }
 
@@ -776,16 +785,17 @@ impl AgentPipeline {
         self.vbuf_capacity_bytes = cap;
     }
 
-    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32), scale: f32, offset: (f32, f32)) {
+    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32), scale: f32, offset: (f32, f32)) -> u32 {
         let mut staging: Vec<AgentInstanceGpu> = Vec::with_capacity(snapshot.agents.len());
         let (vp_w, vp_h) = (viewport.0 as f32, viewport.1 as f32);
+        let disable_cull = matches!(std::env::var("SB_WGPU_DISABLE_CULL").ok().map(|s| s.to_ascii_lowercase()), Some(ref v) if v == "1" || v == "true" || v == "yes" || v == "on");
         for a in snapshot.agents {
             // CPU frustum culling (pixel-space); assumes positions/sizes are pixels in this pass
             let half = a.size * 0.5;
             let cx = a.position[0] * scale + offset.0;
             let cy = a.position[1] * scale + offset.1;
             let radius = half * scale;
-            if cx + radius < 0.0 || cx - radius > vp_w || cy + radius < 0.0 || cy - radius > vp_h {
+            if !disable_cull && (cx + radius < 0.0 || cx - radius > vp_w || cy + radius < 0.0 || cy - radius > vp_h) {
                 continue;
             }
             staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color, selection: a.selection, glow: a.glow, boost: a.boost, _pad2: [0.0] });
@@ -806,6 +816,7 @@ impl AgentPipeline {
         pass.set_bind_group(0, &view_uniforms.bg, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.draw(0..4, 0..staging.len() as u32);
+        staging.len() as u32
     }
 }
 
