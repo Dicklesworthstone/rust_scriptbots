@@ -191,14 +191,14 @@ mod world_compositor {
                 // Create a headless adapter suitable for offscreen rendering
                 let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
                 let future = async {
-                    instance
+                    let res = instance
                         .request_adapter(&wgpu::RequestAdapterOptions {
                             power_preference: wgpu::PowerPreference::HighPerformance,
                             compatible_surface: None,
                             force_fallback_adapter: false,
                         })
-                        .await
-                        .map_err(|_| "wgpu adapter not available".to_string())
+                        .await;
+                    res.map_err(|_| "wgpu adapter not available".to_string())
                 };
                 let adapter = pollster::block_on(future)?;
                 self.adapter = Some(adapter);
@@ -214,6 +214,7 @@ mod world_compositor {
             Ok(())
         }
 
+        #[allow(dead_code)]
         pub fn resize(&mut self, size: (u32, u32)) {
             if let Some(r) = self.renderer.as_mut() {
                 let _ = r.resize(size);

@@ -374,7 +374,7 @@ struct TerrainPipeline {
     bg_layout: wgpu::BindGroupLayout,
     bg: wgpu::BindGroup,
     tile_vbuf: wgpu::Buffer,
-    tile_count: u32,
+    _tile_count: u32,
     grid_cols: u32,
     grid_rows: u32,
     tile_w: u32,
@@ -461,7 +461,7 @@ impl TerrainPipeline {
         let tile_h = 64;
         let atlas_w = grid_cols * tile_w;
         let atlas_h = grid_rows * tile_h;
-        Self { pipeline, sampler, atlas, atlas_view, bg_layout, bg, tile_vbuf, tile_count: 0, grid_cols, grid_rows, tile_w, tile_h, atlas_w, atlas_h, vbuf_capacity_bytes }
+        Self { pipeline, sampler, atlas, atlas_view, bg_layout, bg, tile_vbuf, _tile_count: 0, grid_cols, grid_rows, tile_w, tile_h, atlas_w, atlas_h, vbuf_capacity_bytes }
     }
     fn init_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         // Generate a simple 3x2 atlas (DeepWater, ShallowWater, Sand, Grass, Bloom, Rock)
@@ -586,6 +586,7 @@ impl TerrainPipeline {
             let needed = (staging.len() * std::mem::size_of::<TileInstance>()) as u64;
             self.ensure_vbuf_capacity(device, needed);
             queue.write_buffer(&self.tile_vbuf, 0, bytemuck::cast_slice(&staging));
+            self._tile_count = staging.len() as u32;
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("terrain.pass"),
@@ -842,6 +843,19 @@ struct PostFx {
     bloom_a_view: Option<wgpu::TextureView>,
     bloom_b: Option<wgpu::Texture>,
     bloom_b_view: Option<wgpu::TextureView>,
+
+    // Cached env-driven parameters to avoid per-frame parsing
+    last_env_update: Option<std::time::Instant>,
+    env_exposure: f32,
+    env_vignette: f32,
+    env_tonemap: u32,
+    env_fxaa: u32,
+    env_bloom_on: u32,
+    env_bloom_thresh: f32,
+    env_bloom_intensity: f32,
+    env_fog_enabled: u32,
+    env_fog_density: f32,
+    env_fog_color: [f32; 3],
 }
 
 #[repr(C)]
@@ -958,6 +972,17 @@ impl PostFx {
             bloom_a_view: None,
             bloom_b: None,
             bloom_b_view: None,
+            last_env_update: None,
+            env_exposure: 1.0,
+            env_vignette: 0.08,
+            env_tonemap: 0,
+            env_fxaa: 0,
+            env_bloom_on: 0,
+            env_bloom_thresh: 0.8,
+            env_bloom_intensity: 0.65,
+            env_fog_enabled: 0,
+            env_fog_density: 0.0,
+            env_fog_color: [0.6, 0.7, 0.8],
         }
     }
 
@@ -981,7 +1006,7 @@ impl PostFx {
         ] });
     }
 
-    fn ensure_bloom_targets(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, full: (u32, u32)) {
+    fn ensure_bloom_targets(&mut self, device: &wgpu::Device, _format: wgpu::TextureFormat, full: (u32, u32)) {
         if self.bloom_a.is_some() && self.bloom_b.is_some() { return; }
         let half = (full.0.max(1) / 2).max(1);
         let half_h = (full.1.max(1) / 2).max(1);
@@ -989,7 +1014,8 @@ impl PostFx {
             label: Some(label),
             size: wgpu::Extent3d { width: half, height: half_h, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+            format: wgpu::TextureFormat::Rgba8Unorm, // linear for correct blur/composite
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         });
         let a = make("post.bloom.a");
         let b = make("post.bloom.b");
@@ -1009,32 +1035,50 @@ impl PostFx {
     }
 
     fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, src: &wgpu::TextureView, size: (u32, u32)) {
-        // Env knobs
-        let exposure = std::env::var("SB_WGPU_EXPOSURE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
-        let vignette = std::env::var("SB_WGPU_VIGNETTE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.08);
-        let tonemap = match std::env::var("SB_WGPU_TONEMAP").ok().as_deref() { Some("filmic") => 1u32, Some("reinhard") => 2u32, _ => 0u32 };
-        let fxaa = std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-        let bloom_on = std::env::var("SB_WGPU_BLOOM").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0;
-        let bloom_thresh = std::env::var("SB_WGPU_BLOOM_THRESH").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.8);
-        let bloom_intensity = std::env::var("SB_WGPU_BLOOM_INTENSITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.65);
-        let fog_mode = std::env::var("SB_WGPU_FOG").ok().unwrap_or_else(|| "off".to_string());
-        let fog_enabled = match fog_mode.as_str() { "low" | "med" | "high" => 1u32, _ => 0u32 };
-        let fog_density = match fog_mode.as_str() { "low" => 0.6, "med" => 1.0, "high" => 1.6, _ => 0.0 };
-        let fog_color = std::env::var("SB_WGPU_FOG_COLOR").ok().and_then(|v| {
-            let parts: Vec<_> = v.split(',').collect();
-            if parts.len() == 3 { Some([
-                parts[0].trim().parse::<f32>().unwrap_or(0.6),
-                parts[1].trim().parse::<f32>().unwrap_or(0.7),
-                parts[2].trim().parse::<f32>().unwrap_or(0.8),
-            ]) } else { None }
-        }).unwrap_or([0.6, 0.7, 0.8]);
+        // Refresh env-driven parameters at most every 250ms to avoid per-frame parsing overhead
+        let needs_refresh = self
+            .last_env_update
+            .map(|t| t.elapsed().as_millis() > 250)
+            .unwrap_or(true);
+        if needs_refresh {
+            self.env_exposure = std::env::var("SB_WGPU_EXPOSURE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.env_exposure);
+            self.env_vignette = std::env::var("SB_WGPU_VIGNETTE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.env_vignette);
+            self.env_tonemap = match std::env::var("SB_WGPU_TONEMAP").ok().as_deref() { Some("filmic") => 1u32, Some("reinhard") => 2u32, _ => 0u32 };
+            self.env_fxaa = std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(self.env_fxaa);
+            self.env_bloom_on = std::env::var("SB_WGPU_BLOOM").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(self.env_bloom_on);
+            self.env_bloom_thresh = std::env::var("SB_WGPU_BLOOM_THRESH").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.env_bloom_thresh);
+            self.env_bloom_intensity = std::env::var("SB_WGPU_BLOOM_INTENSITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.env_bloom_intensity);
+            let fog_mode = std::env::var("SB_WGPU_FOG").ok().unwrap_or_else(|| "off".to_string());
+            self.env_fog_enabled = match fog_mode.as_str() { "low" | "med" | "high" => 1u32, _ => 0u32 };
+            self.env_fog_density = match fog_mode.as_str() { "low" => 0.6, "med" => 1.0, "high" => 1.6, _ => self.env_fog_density };
+            if let Some(c) = std::env::var("SB_WGPU_FOG_COLOR").ok().and_then(|v| {
+                let parts: Vec<_> = v.split(',').collect();
+                if parts.len() == 3 { Some([
+                    parts[0].trim().parse::<f32>().unwrap_or(self.env_fog_color[0]),
+                    parts[1].trim().parse::<f32>().unwrap_or(self.env_fog_color[1]),
+                    parts[2].trim().parse::<f32>().unwrap_or(self.env_fog_color[2]),
+                ]) } else { None }
+            }) { self.env_fog_color = c; }
+            self.last_env_update = Some(std::time::Instant::now());
+        }
 
-        let params = PostParams { exposure, vignette, tonemap, fxaa, bloom_thresh, bloom_intensity, fog_density, fog_enabled, fog_color, _pad0: 0.0 };
+        let params = PostParams {
+            exposure: self.env_exposure,
+            vignette: self.env_vignette,
+            tonemap: self.env_tonemap,
+            fxaa: self.env_fxaa,
+            bloom_thresh: self.env_bloom_thresh,
+            bloom_intensity: self.env_bloom_intensity,
+            fog_density: self.env_fog_density,
+            fog_enabled: self.env_fog_enabled,
+            fog_color: self.env_fog_color,
+            _pad0: 0.0,
+        };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Bloom pass chain if enabled
         let mut bloom_view_opt: Option<wgpu::TextureView> = None;
-        if bloom_on {
+        if self.env_bloom_on != 0 {
             self.ensure_bloom_targets(device, self.color_format, size);
             // Create fresh local views to avoid borrowing self across mutable calls
             let a_view_local = self.bloom_a.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default());
@@ -1042,9 +1086,9 @@ impl PostFx {
             // Extract brights from src -> A
             self.bind_bloom_src(device, src);
             {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("bloom.extract"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
                     depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.bloom_extract_pipeline);
@@ -1101,8 +1145,9 @@ impl PostFx {
 }
 
 fn wants_post() -> bool {
-    std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1) != 0
-        || std::env::var("SB_WGPU_TONEMAP").ok().map(|v| !v.is_empty()).unwrap_or(true)
+    // Defaults: off unless explicitly enabled via envs.
+    std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0
+        || std::env::var("SB_WGPU_TONEMAP").map(|v| !v.is_empty()).unwrap_or(false)
         || std::env::var("SB_WGPU_BLOOM").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0
         || matches!(std::env::var("SB_WGPU_FOG").ok().as_deref(), Some("low") | Some("med") | Some("high"))
 }
@@ -1148,7 +1193,7 @@ fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   rgb *= vign;
   // Height-fog (screen-space Y proxy)
   if (params.fog_enabled != 0u) {
-    let h = uv01.y; // bottom-heavy fog
+    let h = 1.0 - uv01.y; // bottom-heavy fog (denser near bottom)
     let fog_f = clamp(1.0 - exp(-params.fog_density * h), 0.0, 1.0);
     rgb = mix(rgb, params.fog_color, fog_f);
   }

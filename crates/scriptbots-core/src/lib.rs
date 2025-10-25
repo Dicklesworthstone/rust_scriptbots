@@ -4669,6 +4669,26 @@ impl WorldState {
         let temperature_preferences = &self.work_temperature_preferences;
         let sound_emitters = &self.work_sound_emitters;
 
+        // Sanity checks (debug-only) to validate buffers are well-formed
+        debug_assert!(eye_directions.len() == handles.len());
+        debug_assert!(eye_fov.len() == handles.len());
+        debug_assert!(clocks.len() == handles.len());
+        debug_assert!(temperature_preferences.len() == handles.len());
+        debug_assert!(sound_emitters.len() == handles.len());
+        debug_assert!({
+            // Ensure FOV and directions contain finite values
+            let mut ok = true;
+            for dir in eye_directions.iter() {
+                for &d in dir.iter() { if !d.is_finite() { ok = false; break; } }
+                if !ok { break; }
+            }
+            for fovs in eye_fov.iter() {
+                for &f in fovs.iter() { if !f.is_finite() { ok = false; break; } }
+                if !ok { break; }
+            }
+            ok
+        });
+
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
         let radius = self.config.sense_radius;
@@ -5125,7 +5145,6 @@ impl WorldState {
         }
         delta
     }
-
     fn stage_actuation(&mut self) {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
@@ -5572,7 +5591,7 @@ impl WorldState {
                 let above_v = (diff_v - band_v).max(f32x4::splat(0.0));
 
                 // Exponent may be non-integer; compute per-lane powf when needed
-                let mut above = above_v.to_array();
+                let above = above_v.to_array();
                 let mut pen = [0.0_f32; 4];
                 for lane in 0..4 {
                     let a = above[lane];
@@ -6639,7 +6658,6 @@ impl WorldState {
         }
         self.last_deaths = removed;
     }
-
     fn stage_reproduction(&mut self) {
         if self.config.reproduction_energy_threshold <= 0.0 {
             return;
@@ -8007,7 +8025,6 @@ impl WorldState {
     pub fn terrain(&self) -> &TerrainLayer {
         &self.terrain
     }
-
     /// Mutable access to the terrain layer.
     #[must_use]
     pub fn terrain_mut(&mut self) -> &mut TerrainLayer {
@@ -8464,7 +8481,7 @@ mod tests {
             rng_seed: Some(42),
             ..ScriptBotsConfig::default()
         };
-        let mut world = WorldState::new(config.clone()).expect("world");
+        let mut world = WorldState::new(config).expect("world");
         assert_eq!(world.agent_count(), 0);
         assert_eq!(world.food().width(), 100);
         assert_eq!(world.food().height(), 100);
@@ -8780,7 +8797,6 @@ mod tests {
         let attacker_runtime = world.agent_runtime(attacker).unwrap();
         assert!(!attacker_runtime.combat.spike_attacker);
     }
-
     #[test]
     fn combat_applies_damage_and_marks_events() {
         let config = ScriptBotsConfig {
@@ -9519,7 +9535,6 @@ mod tests {
             runtime.sensors[20]
         );
     }
-
     #[test]
     fn carcass_distribution_rewards_neighbors() {
         let config = ScriptBotsConfig {
