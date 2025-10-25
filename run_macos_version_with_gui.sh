@@ -20,7 +20,13 @@ unset RUSTC_LINKER || true
 
 # Prefer the Metal backend on macOS for wgpu
 export WGPU_BACKEND=metal
-export SB_WGPU_PRESENT_MODE=full
+# Sane wgpu defaults
+export SB_WGPU_PRESENT_MODE=${SB_WGPU_PRESENT_MODE:-diff}
+export SB_WGPU_RES_SCALE=${SB_WGPU_RES_SCALE:-1.0}
+export SB_WGPU_MAX_FPS=${SB_WGPU_MAX_FPS:-60}
+export SB_WGPU_BLOOM=${SB_WGPU_BLOOM:-1}
+export SB_WGPU_TONEMAP=${SB_WGPU_TONEMAP:-1}
+export SB_WGPU_FOG=${SB_WGPU_FOG:-low}
 
 # Use all CPU cores for faster builds
 JOBS="$( (sysctl -n hw.ncpu 2>/dev/null) || (getconf _NPROCESSORS_ONLN 2>/dev/null) || echo 8 )"
