@@ -824,6 +824,7 @@ struct PostFx {
     sampler: wgpu::Sampler,
     src_layout: wgpu::BindGroupLayout, // src color + sampler + bloom texture
     src_bg: wgpu::BindGroup,
+    params_layout: wgpu::BindGroupLayout,
     params_bg: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     target: wgpu::Texture,
@@ -835,6 +836,7 @@ struct PostFx {
     bloom_blur_pipeline: wgpu::RenderPipeline,
     bloom_src_layout: wgpu::BindGroupLayout, // single texture + sampler
     bloom_src_bg: wgpu::BindGroup,
+    blur_params_layout: wgpu::BindGroupLayout,
     blur_params_bg: wgpu::BindGroup,
     blur_params_buf: wgpu::Buffer,
     bloom_a: Option<wgpu::Texture>,
