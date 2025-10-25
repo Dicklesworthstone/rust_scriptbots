@@ -31,7 +31,7 @@ fi
 # Hint application to choose GUI path even in auto-detect scenarios
 export SCRIPTBOTS_FORCE_GUI="${SCRIPTBOTS_FORCE_GUI:-1}"
 # Sane wgpu defaults
-export SB_WGPU_PRESENT_MODE=${SB_WGPU_PRESENT_MODE:-diff}
+export SB_WGPU_PRESENT_MODE=${SB_WGPU_PRESENT_MODE:-full}
 export SB_WGPU_RES_SCALE=${SB_WGPU_RES_SCALE:-1.0}
 export SB_WGPU_MAX_FPS=${SB_WGPU_MAX_FPS:-60}
 export SB_WGPU_BLOOM=${SB_WGPU_BLOOM:-1}
