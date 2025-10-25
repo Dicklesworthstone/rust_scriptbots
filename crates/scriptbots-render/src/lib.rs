@@ -62,7 +62,7 @@ mod world_compositor {
                 self.prev.resize(cap, 0u8);
             }
         }
-        fn upload_from_readback(&mut self, view: &ReadbackView<'_>) {
+        fn upload_from_readback(&mut self, view: &ReadbackView) {
             self.ensure((view.width, view.height), view.bytes_per_row);
             let new_len = (self.bytes_per_row as usize) * (self.size.1 as usize);
             if self.prev.len() != new_len { self.prev.resize(new_len, 0); }

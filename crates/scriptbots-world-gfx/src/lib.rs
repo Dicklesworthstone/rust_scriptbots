@@ -60,7 +60,7 @@ pub struct RenderFrame {
 impl WorldRenderer {
     pub async fn new(adapter: &wgpu::Adapter, size: (u32, u32)) -> Result<Self, String> {
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .map_err(|e| format!("wgpu device request failed: {e}"))?;
 
@@ -132,6 +132,7 @@ impl WorldRenderer {
                 label: Some("world.clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.color_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.06, b: 0.12, a: 1.0 }), store: wgpu::StoreOp::Store },
                 })],
@@ -164,7 +165,7 @@ impl WorldRenderer {
             .and_then(|_| { #[cfg(feature = "perf_counters")] { self.last_readback_ms = t0.elapsed().as_secs_f32() * 1000.0; } Ok(()) })
     }
 
-    pub fn mapped_rgba(&mut self) -> Option<ReadbackView<'_>> { self.readback.mapped() }
+    pub fn mapped_rgba(&mut self) -> Option<ReadbackView> { self.readback.mapped() }
 
     #[cfg(feature = "perf_counters")]
     pub fn last_timings_ms(&self) -> (f32, f32) { (self.last_render_ms, self.last_readback_ms) }
@@ -209,14 +210,14 @@ pub struct ReadbackSlot {
     mapped: std::sync::Arc<AtomicBool>,
 }
 
-pub struct ReadbackView<'a> {
-    pub guard: wgpu::BufferView<'a>,
+pub struct ReadbackView {
+    pub guard: wgpu::BufferView,
     pub bytes_per_row: u32,
     pub width: u32,
     pub height: u32,
 }
 
-impl<'a> ReadbackView<'a> {
+impl ReadbackView {
     pub fn bytes(&self) -> &[u8] {
         &self.guard
     }
@@ -247,16 +248,8 @@ impl ReadbackRing {
         }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.readback.copy") });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: color,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &slot.buf,
-                layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(std::num::NonZeroU32::new(self.bytes_per_row).unwrap()), rows_per_image: Some(std::num::NonZeroU32::new(self.extent.1).unwrap()) },
-            },
+            color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer: &slot.buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(std::num::NonZeroU32::new(self.bytes_per_row).unwrap().get()), rows_per_image: Some(std::num::NonZeroU32::new(self.extent.1).unwrap().get()) } },
             wgpu::Extent3d { width: self.extent.0, height: self.extent.1, depth_or_array_layers: 1 },
         );
         queue.submit(Some(encoder.finish()));
@@ -268,13 +261,13 @@ impl ReadbackRing {
             if res.is_ok() { mapped_flag.store(true, Ordering::Relaxed); }
         });
         // Non-blocking poll; readiness will be observed next frame via `mapped()`
-        device.poll(wgpu::Maintain::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         // Advance ring pointer
         self.curr = (self.curr + 1) % self.slots.len();
         Ok(())
     }
 
-    pub fn mapped(&mut self) -> Option<ReadbackView<'_>> {
+    pub fn mapped(&mut self) -> Option<ReadbackView> {
         let prev = (self.curr + self.slots.len() - 1) % self.slots.len();
         let slot = &mut self.slots[prev];
         if !slot.ready && !slot.mapped.load(Ordering::Relaxed) { return None; }
@@ -451,12 +444,13 @@ impl TerrainPipeline {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Uint32, 4 => Float32] }] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Uint32, 4 => Float32] }] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, strip_index_format: None, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+            cache: None,
         });
         let vbuf_capacity_bytes = (1024 * std::mem::size_of::<TileInstance>()) as u64;
         let tile_vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("terrain.instances"), size: vbuf_capacity_bytes, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -518,9 +512,9 @@ impl TerrainPipeline {
             }
         }
         queue.write_texture(
-            wgpu::ImageCopyTexture { texture: &self.atlas, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            self.atlas.as_image_copy(),
             &pixels,
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(std::num::NonZeroU32::new(self.atlas_w * 4).unwrap()), rows_per_image: Some(std::num::NonZeroU32::new(self.atlas_h).unwrap()) },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(std::num::NonZeroU32::new(self.atlas_w * 4).unwrap().get()), rows_per_image: Some(std::num::NonZeroU32::new(self.atlas_h).unwrap().get()) },
             wgpu::Extent3d { width: self.atlas_w, height: self.atlas_h, depth_or_array_layers: 1 },
         );
         // refresh bind group to point to the new view
@@ -595,7 +589,7 @@ impl TerrainPipeline {
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("terrain.pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: view_tex, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
@@ -707,12 +701,13 @@ impl AgentPipeline {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("agents.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4, 4 => Uint32, 5 => Float32, 6 => Float32] }] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4, 4 => Uint32, 5 => Float32, 6 => Float32] }] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+            cache: None,
         });
         let vbuf_capacity_bytes = (1024 * std::mem::size_of::<AgentInstanceGpu>()) as u64;
         let vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("agents.instances"), size: vbuf_capacity_bytes, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -748,7 +743,7 @@ impl AgentPipeline {
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("agents.pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: view_tex, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: view_tex, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
@@ -894,9 +889,10 @@ impl PostFx {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("post.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &post_shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &post_shader, entry_point: "fs_post", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &post_shader, entry_point: Some("vs_fullscreen"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &post_shader, entry_point: Some("fs_post"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
+            cache: None,
         });
     let (target, target_view) = create_color(device, format, size);
 
@@ -924,18 +920,20 @@ impl PostFx {
         let bloom_extract_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("bloom.extract.pipeline"),
             layout: Some(&bloom_extract_layout),
-            vertex: wgpu::VertexState { module: &bloom_shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: "fs_extract", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &bloom_shader, entry_point: Some("vs_fullscreen"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: Some("fs_extract"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
+            cache: None,
         });
         // Blur pipeline: bloom_a <-> bloom_b
         let bloom_blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("bloom.blur.layout"), bind_group_layouts: &[&bloom_src_layout, &blur_params_layout], push_constant_ranges: &[] });
         let bloom_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("bloom.blur.pipeline"),
             layout: Some(&bloom_blur_layout),
-            vertex: wgpu::VertexState { module: &bloom_shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: "fs_blur", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &bloom_shader, entry_point: Some("vs_fullscreen"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: Some("fs_blur"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
+            cache: None,
         });
 
         Self {
@@ -1044,9 +1042,9 @@ impl PostFx {
             // Extract brights from src -> A
             self.bind_bloom_src(device, src);
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("bloom.extract"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
                     depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.bloom_extract_pipeline);
@@ -1061,7 +1059,7 @@ impl PostFx {
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("bloom.blur.h"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &b_view_local, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &b_view_local, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
                     depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.bloom_blur_pipeline);
@@ -1076,7 +1074,7 @@ impl PostFx {
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("bloom.blur.v"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
                     depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.bloom_blur_pipeline);
@@ -1092,7 +1090,7 @@ impl PostFx {
         self.rebind(device, src, bloom_view_ref);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("post.pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.target_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.target_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
