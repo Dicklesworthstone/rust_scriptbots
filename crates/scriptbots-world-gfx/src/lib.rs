@@ -182,6 +182,51 @@ impl WorldRenderer {
     }
 }
 
+#[cfg(test)]
+mod capture_smoke_test {
+    use super::*;
+
+    // Not a real unit test; handy local harness to write one frame PNG for diagnosis.
+    // Run: `cargo test -p scriptbots-world-gfx capture_smoke -- --nocapture`
+    #[test]
+    fn capture_smoke() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })).expect("adapter");
+        let size = (640, 360);
+        let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, size)).expect("renderer");
+        let tiles = vec![3u32; (60*34) as usize];
+        let snapshot = WorldSnapshot {
+            world_size: (6000.0, 6000.0),
+            terrain: TerrainView { dims: (60, 34), cell_size: 100, tiles: &tiles, elevation: None },
+            agents: &[],
+        };
+        let frame = renderer.render(&snapshot);
+        renderer.copy_to_readback(&frame).unwrap();
+        if let Some(view) = renderer.mapped_rgba() {
+            let row_bytes = (view.width as usize) * 4;
+            let mut tight = vec![0u8; row_bytes * (view.height as usize)];
+            let src = view.bytes();
+            for y in 0..(view.height as usize) {
+                let s = y * (view.bytes_per_row as usize);
+                let d = y * row_bytes;
+                tight[d..d+row_bytes].copy_from_slice(&src[s..s+row_bytes]);
+            }
+            let _ = image::save_buffer_with_format(
+                "wgpu_capture_smoke.png",
+                &tight,
+                view.width,
+                view.height,
+                image::ColorType::Rgba8,
+                image::ImageFormat::Png,
+            );
+        }
+    }
+}
+
 fn create_color(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
     // Defensive clamp to ensure valid texture extent
     let size = (size.0.max(1), size.1.max(1));
@@ -266,7 +311,7 @@ impl ReadbackRing {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             if res.is_ok() { mapped_flag.store(true, Ordering::Relaxed); }
         });
-        // Non-blocking poll; readiness will be observed next frame via `mapped()`
+        // Ensure progress on mapping; non-blocking is sufficient for our readback ring
         let _ = device.poll(wgpu::PollType::Poll);
         // Advance ring pointer
         self.curr = (self.curr + 1) % self.slots.len();
@@ -654,6 +699,7 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   var base = textureSample(atlas_tex, atlas_smp, v.uv);
+  var rgb = base.rgb;
   // water shimmer for Deep/Shallow water kinds (0,1)
   if (v.kind <= 1u) {
     let time = view.v0.z;
@@ -663,20 +709,20 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
     let ca_s = (sin(v.uv.x * 160.0 + time * 1.7) * sin(v.uv.y * 140.0 + time * 1.5));
     let ca_amp = select(0.01, 0.05, v.kind == 1u);
     let ca = ca_s * ca_amp;
-    base.rgb = clamp(base.rgb + vec3<f32>(shimmer + ca), vec3<f32>(0.0), vec3<f32>(1.0));
+    rgb = clamp(rgb + vec3<f32>(shimmer + ca), vec3<f32>(0.0), vec3<f32>(1.0));
   } else {
     // slope accents (darken proportionally)
     let darken = clamp(1.0 - v.slope * 0.35, 0.0, 1.0);
-    base.rgb *= vec3<f32>(darken);
+    rgb = rgb * vec3<f32>(darken);
   }
   // subtle biome variation for grass/bloom/rock (kinds 3,4,5)
   if (v.kind >= 3u && v.kind <= 5u) {
     // stable hash from world coords -> [-1,1] noise
     let h = fract(sin(dot(v.world, vec2<f32>(12.9898, 78.233))) * 43758.5453);
     let n = (h * 2.0 - 1.0) * 0.06; // +/-6% brightness tweak
-    base.rgb = clamp(base.rgb * (1.0 + n), vec3<f32>(0.0), vec3<f32>(1.0));
+    rgb = clamp(rgb * (1.0 + n), vec3<f32>(0.0), vec3<f32>(1.0));
   }
-  return base;
+  return vec4<f32>(rgb, base.a);
 }
 "#;
 
@@ -813,14 +859,15 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let edge = smoothstep(1.05, 0.95, 1.0 - d);
   let rim = smoothstep(1.02, 0.98, d);   // thin rim near edge
   var base = v.color;
-  base.a = base.a * edge;
+  var rgb = base.rgb;
+  let a = base.a * edge;
   let sel_glow = select(0.0, 0.25, v.selection == 1u) + select(0.0, 0.45, v.selection == 2u);
   let boost_tint = v.boost * 0.35;
   // apply subtle boost tint towards warm color when boosting
-  base.rgb = clamp(base.rgb + vec3<f32>(boost_tint * 0.6, boost_tint * 0.2, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
+  rgb = clamp(rgb + vec3<f32>(boost_tint * 0.6, boost_tint * 0.2, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
   let glow = max(sel_glow, v.glow);
   let rim_col = vec4<f32>(1.0, 1.0, 1.0, glow + v.boost * 0.2) * rim;
-  return clamp(base + rim_col, vec4<f32>(0.0), vec4<f32>(1.0));
+  return clamp(vec4<f32>(rgb, a) + rim_col, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 "#;
 
@@ -941,7 +988,7 @@ impl PostFx {
             label: Some("bloom.extract.pipeline"),
             layout: Some(&bloom_extract_layout),
             vertex: wgpu::VertexState { module: &bloom_shader, entry_point: Some("vs_fullscreen"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: Some("fs_extract"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: Some("fs_extract"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
             cache: None,
         });
@@ -951,7 +998,7 @@ impl PostFx {
             label: Some("bloom.blur.pipeline"),
             layout: Some(&bloom_blur_layout),
             vertex: wgpu::VertexState { module: &bloom_shader, entry_point: Some("vs_fullscreen"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: Some("fs_blur"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: Some("fs_blur"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
             cache: None,
         });

@@ -22,3 +22,7 @@ compute_binning = []
 perf_counters = []
 
 
+[dev-dependencies]
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+

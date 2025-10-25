@@ -170,6 +170,12 @@ mod world_compositor {
         last_submit: Option<std::time::Instant>,
         min_interval: f32, // seconds; 0 = uncapped
         render_scale: f32, // 0<scale<=1; offscreen resolution scale
+        // Optional frame capture
+        save_enabled: bool,
+        save_dir: std::path::PathBuf,
+        save_every: u32,
+        save_counter: u64,
+        save_prefix: String,
     }
 
     impl Compositor {
@@ -177,7 +183,12 @@ mod world_compositor {
             let max_fps = std::env::var("SB_WGPU_MAX_FPS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(60.0);
             let min_interval = if max_fps > 0.0 { (1.0 / max_fps).max(0.001) } else { 0.0 };
             let render_scale = std::env::var("SB_WGPU_RES_SCALE").ok().and_then(|s| s.parse::<f32>().ok()).map(|v| v.clamp(0.25, 1.0)).unwrap_or(1.0);
-            Self { renderer: None, image: None, adapter: None, cam_scale: 1.0, cam_offset: (0.0, 0.0), last_submit: None, min_interval, render_scale }
+            // Frame capture controls (opt-in)
+            let save_enabled = env_flag("SB_WGPU_SAVE_FRAMES");
+            let save_dir = std::env::var("SB_WGPU_SAVE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("frames"));
+            let save_every = std::env::var("SB_WGPU_SAVE_EVERY").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n > 0).unwrap_or(1);
+            let save_prefix = std::env::var("SB_WGPU_SAVE_PREFIX").unwrap_or_else(|_| "frame".to_string());
+            Self { renderer: None, image: None, adapter: None, cam_scale: 1.0, cam_offset: (0.0, 0.0), last_submit: None, min_interval, render_scale, save_enabled, save_dir, save_every, save_counter: 0, save_prefix }
         }
 
         pub fn set_camera_params(&mut self, scale: f32, offset: (f32, f32)) {
@@ -245,6 +256,7 @@ mod world_compositor {
             let _frame = r.render(snapshot);
             let _ = r.copy_to_readback(&_frame);
             if let Some(view) = r.mapped_rgba() {
+                self.save_view_if_requested(&view);
                 if self.image.is_none() {
                     self.image = Some(GpuiImage::new((view.width, view.height), view.bytes_per_row));
                 }
@@ -263,6 +275,40 @@ mod world_compositor {
                     Some("diff") | _ => img.paint_diff(bounds, window),
                 }
             }
+        }
+
+        fn save_view_if_requested(&mut self, view: &ReadbackView) {
+            if !self.save_enabled { return; }
+            self.save_counter = self.save_counter.saturating_add(1);
+            if ((self.save_counter - 1) % (self.save_every as u64)) != 0 { return; }
+
+            // Ensure directory exists
+            let _ = std::fs::create_dir_all(&self.save_dir);
+            // Repack from padded rows into tightly packed RGBA8 buffer
+            let width = view.width;
+            let height = view.height;
+            let stride = view.bytes_per_row as usize;
+            let row_bytes = (width as usize) * 4;
+            let src = view.bytes();
+            let mut tight = vec![0u8; row_bytes * (height as usize)];
+            for y in 0..(height as usize) {
+                let src_off = y * stride;
+                let dst_off = y * row_bytes;
+                let end = src_off + row_bytes;
+                if end <= src.len() {
+                    tight[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..end]);
+                }
+            }
+            let filename = format!("{}_{:06}.png", self.save_prefix, self.save_counter);
+            let path = self.save_dir.join(filename);
+            let _ = image::save_buffer_with_format(
+                &path,
+                &tight,
+                width,
+                height,
+                image::ColorType::Rgba8,
+                image::ImageFormat::Png,
+            );
         }
     }
 }
@@ -301,8 +347,6 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
 
     // Calculate camera scale/offset to map world pixels -> viewport pixels exactly as GPUI would
     // Reuse the same mapping used in paint_frame
-    let origin_x = f32::from(bounds.origin.x);
-    let origin_y = f32::from(bounds.origin.y);
     let width_px = f32::from(bounds.size.width).max(1.0);
     let height_px = f32::from(bounds.size.height).max(1.0);
     let world_w = world_size.0.max(1.0);
@@ -312,7 +356,8 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let pad_x = (width_px - world_w * scale) * 0.5;
     let pad_y = (height_px - world_h * scale) * 0.5;
     let (off_px_x, off_px_y) = state.camera.lock().map(|c| c.offset_px).unwrap_or((0.0, 0.0));
-    let cam_offset = (origin_x + pad_x + off_px_x, origin_y + pad_y + off_px_y);
+    // Offscreen world renderer uses (0,0) origin; include only pad and camera offset
+    let cam_offset = (pad_x + off_px_x, pad_y + off_px_y);
 
     // Build a minimal snapshot from the current RenderFrame
     let terrain_dims = state.frame.terrain.dimensions;
