@@ -30,6 +30,7 @@ fi
 
 # Hint application to choose GUI path even in auto-detect scenarios
 export SCRIPTBOTS_FORCE_GUI="${SCRIPTBOTS_FORCE_GUI:-1}"
+export SB_WGPU_PRESENT_MODE=full
 
 # Optimize for local CPU
 export RUSTFLAGS="-C target-cpu=native"

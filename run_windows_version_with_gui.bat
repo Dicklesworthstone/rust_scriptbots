@@ -13,6 +13,7 @@ set JOBS=%NUMBER_OF_PROCESSORS%
 
 REM Launch ScriptBots with GPU GUI in release mode with tuned threads
 set WGPU_BACKEND=Vulkan
+set SB_WGPU_PRESENT_MODE=full
 cargo run -p scriptbots-app --bin scriptbots-app --release --target x86_64-pc-windows-msvc -j %JOBS% --features gui -- --mode gui --threads 8
 
 endlocal
