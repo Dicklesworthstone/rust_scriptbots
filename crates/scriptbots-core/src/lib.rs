@@ -4389,6 +4389,118 @@ impl WorldState {
                 .for_each(|(y, row)| {
                     let up_row = if y == 0 { height - 1 } else { y - 1 };
                     let down_row = if y + 1 == height { 0 } else { y + 1 };
+                    #[cfg(feature = "simd_wide")]
+                    {
+                        use wide::f32x4;
+                        let mut x = 0usize;
+                        while x + 3 < width {
+                            let xs = [x, x + 1, x + 2, x + 3];
+                            let lefts = [
+                                if xs[0] == 0 { width - 1 } else { xs[0] - 1 },
+                                if xs[1] == 0 { width - 1 } else { xs[1] - 1 },
+                                if xs[2] == 0 { width - 1 } else { xs[2] - 1 },
+                                if xs[3] == 0 { width - 1 } else { xs[3] - 1 },
+                            ];
+                            let rights = [
+                                if xs[0] + 1 == width { 0 } else { xs[0] + 1 },
+                                if xs[1] + 1 == width { 0 } else { xs[1] + 1 },
+                                if xs[2] + 1 == width { 0 } else { xs[2] + 1 },
+                                if xs[3] + 1 == width { 0 } else { xs[3] + 1 },
+                            ];
+                            let idxs = [y * width + xs[0], y * width + xs[1], y * width + xs[2], y * width + xs[3]];
+                            let prev_v = f32x4::new([
+                                previous[idxs[0]],
+                                previous[idxs[1]],
+                                previous[idxs[2]],
+                                previous[idxs[3]],
+                            ]);
+                            let left_v = f32x4::new([
+                                previous[y * width + lefts[0]],
+                                previous[y * width + lefts[1]],
+                                previous[y * width + lefts[2]],
+                                previous[y * width + lefts[3]],
+                            ]);
+                            let right_v = f32x4::new([
+                                previous[y * width + rights[0]],
+                                previous[y * width + rights[1]],
+                                previous[y * width + rights[2]],
+                                previous[y * width + rights[3]],
+                            ]);
+                            let up_v = f32x4::new([
+                                previous[up_row * width + xs[0]],
+                                previous[up_row * width + xs[1]],
+                                previous[up_row * width + xs[2]],
+                                previous[up_row * width + xs[3]],
+                            ]);
+                            let down_v = f32x4::new([
+                                previous[down_row * width + xs[0]],
+                                previous[down_row * width + xs[1]],
+                                previous[down_row * width + xs[2]],
+                                previous[down_row * width + xs[3]],
+                            ]);
+                            let mut val_v = prev_v;
+                            if diffusion > 0.0 {
+                                let neigh = (left_v + right_v + up_v + down_v) * f32x4::splat(0.25);
+                                val_v = val_v + f32x4::splat(diffusion) * (neigh - prev_v);
+                            }
+                            let cap_arr = idxs.map(|i| profiles.get(i).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 }).capacity);
+                            let grow_arr = idxs.map(|i| profiles.get(i).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 }).growth_multiplier);
+                            let decay_arr = idxs.map(|i| profiles.get(i).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 }).decay_multiplier);
+                            let cap_v = f32x4::new(cap_arr);
+                            let grow_v = f32x4::new(grow_arr);
+                            let decay_v = f32x4::new(decay_arr);
+                            if decay > 0.0 {
+                                val_v = val_v - f32x4::splat(decay) * decay_v * val_v;
+                            }
+                            if growth > 0.0 && food_max > 0.0 {
+                                let norm = val_v / f32x4::splat(food_max);
+                                let delta = f32x4::splat(growth) * grow_v * (f32x4::splat(1.0) - norm);
+                                val_v = val_v + delta * f32x4::splat(food_max);
+                            }
+                            // Clamp to capacity and global cap
+                            let prev_cap_v = prev_v; // previous_value for max with capacity floor
+                            let mut cap_eff_v = cap_v.max(prev_cap_v);
+                            let global_cap_v = f32x4::splat(food_max).max(prev_cap_v);
+                            // min(capacity, global_cap)
+                            cap_eff_v = cap_eff_v.min(global_cap_v).max(f32x4::splat(0.0));
+                            let out_v = val_v.max(f32x4::splat(0.0)).min(cap_eff_v);
+                            let out_arr = out_v.to_array();
+                            row[x + 0] = out_arr[0];
+                            row[x + 1] = out_arr[1];
+                            row[x + 2] = out_arr[2];
+                            row[x + 3] = out_arr[3];
+                            x += 4;
+                        }
+                        // Remainder scalar
+                        for x in x..width {
+                            let left_col = if x == 0 { width - 1 } else { x - 1 };
+                            let right_col = if x + 1 == width { 0 } else { x + 1 };
+                            let idx = y * width + x;
+                            let previous_value = previous[idx];
+                            let mut value = previous_value;
+                            let profile = profiles.get(idx).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 });
+                            if diffusion > 0.0 {
+                                let left = previous[y * width + left_col];
+                                let right = previous[y * width + right_col];
+                                let up = previous[up_row * width + x];
+                                let down = previous[down_row * width + x];
+                                let neighbor_avg = (left + right + up + down) * 0.25;
+                                value += diffusion * (neighbor_avg - previous_value);
+                            }
+                            if decay > 0.0 { value -= decay * profile.decay_multiplier * value; }
+                            if growth > 0.0 && food_max > 0.0 {
+                                let normalized = value / food_max;
+                                let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
+                                value += growth_delta * food_max;
+                            }
+                            let mut capacity = profile.capacity.max(previous_value);
+                            let global_cap = food_max.max(previous_value);
+                            if capacity > global_cap { capacity = global_cap; }
+                            capacity = capacity.max(0.0);
+                            row[x] = value.clamp(0.0, capacity);
+                        }
+                    }
+                    #[cfg(not(feature = "simd_wide"))]
                     for x in 0..width {
                         let left_col = if x == 0 { width - 1 } else { x - 1 };
                         let right_col = if x + 1 == width { 0 } else { x + 1 };

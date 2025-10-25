@@ -198,7 +198,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
    - Determinism: Preserve bucket iteration order; push per‑lane hits in increasing index order.
    - Acceptance: Equal hit sets vs. scalar on micro scenes; ≥5% win at 5k/1k ticks in combat‑heavy scenarios.
 
-4) Smell/sound/hearing: full lane mask and dist_factor without scalar fixups [Currently In Progress]
+4) Smell/sound/hearing: full lane mask and dist_factor without scalar fixups [Completed – 2025-10-24]
    - Rationale: Eliminate per‑lane scalar conditionals; derive lane masks from comparisons and apply via multiply‑by‑zero.
    - Approach:
      - Compute `dist_sq`, `dist`, `dist_factor = max(0, (radius - dist)/radius)` in SIMD;
@@ -222,7 +222,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
    - Determinism: Writeback preserves agent index order.
    - Acceptance: ≥2–3% win at 5k/1k ticks; correctness via seeded runs.
 
-7) Food regrowth: decay/growth/diffusion in 4‑wide strides [Planned]
+7) Food regrowth: decay/growth/diffusion in 4‑wide strides [Completed – 2025-10-24]
    - Rationale: Row‑wise loop is embarrassingly parallel; within a row, growth/decay/diffusion arithmetic benefits from 4‑wide SIMD.
    - Approach:
      - For each row, compute neighbor average `(L+R+U+D)*0.25` in 4‑wide packs; apply diffusion/growth/decay and clamp to capacity in SIMD; handle edges with scalar tail.
