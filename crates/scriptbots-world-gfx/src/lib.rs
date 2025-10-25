@@ -46,6 +46,7 @@ pub struct WorldRenderer {
     cam_scale: f32,
     cam_offset: (f32, f32),
     start_time: Instant,
+    post: Option<PostFx>,
     #[cfg(feature = "perf_counters")]
     last_render_ms: f32,
     #[cfg(feature = "perf_counters")]
@@ -85,6 +86,7 @@ impl WorldRenderer {
             cam_scale: 1.0,
             cam_offset: (0.0, 0.0),
             start_time: Instant::now(),
+            post: None,
             #[cfg(feature = "perf_counters")]
             last_render_ms: 0.0,
             #[cfg(feature = "perf_counters")]
@@ -104,6 +106,9 @@ impl WorldRenderer {
         // keep time monotonic across resizes
         let elapsed = self.start_time.elapsed().as_secs_f32();
         self.view.update(&self.queue, new_size, elapsed, self.cam_scale, self.cam_offset);
+        if let Some(post) = self.post.as_mut() {
+            post.resize(&self.device, self.format, new_size);
+        }
         Ok(())
     }
 
@@ -138,6 +143,12 @@ impl WorldRenderer {
         // Terrain + agents
         self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
         self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
+        // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
+        if self.ensure_post() {
+            if let Some(p) = self.post.as_mut() {
+                p.run(&self.device, &self.queue, &mut encoder, &self.color_view, self.size);
+            }
+        }
         self.queue.submit(Some(encoder.finish()));
         #[cfg(feature = "perf_counters")]
         { self.last_render_ms = t0.elapsed().as_secs_f32() * 1000.0; }
@@ -147,7 +158,8 @@ impl WorldRenderer {
     pub fn copy_to_readback(&mut self, _frame: &RenderFrame) -> Result<(), String> {
         #[cfg(feature = "perf_counters")]
         let t0 = Instant::now();
-        self.readback.copy(&self.device, &self.queue, &self.color)
+        let src_tex: &wgpu::Texture = if let Some(post) = self.post.as_ref() { &post.target } else { &self.color };
+        self.readback.copy(&self.device, &self.queue, src_tex)
             .map(|_| ())
             .and_then(|_| { #[cfg(feature = "perf_counters")] { self.last_readback_ms = t0.elapsed().as_secs_f32() * 1000.0; } Ok(()) })
     }
@@ -156,6 +168,15 @@ impl WorldRenderer {
 
     #[cfg(feature = "perf_counters")]
     pub fn last_timings_ms(&self) -> (f32, f32) { (self.last_render_ms, self.last_readback_ms) }
+
+    fn ensure_post(&mut self) -> bool {
+        let enable = wants_post();
+        if !enable { return false; }
+        if self.post.is_none() {
+            self.post = Some(PostFx::new(&self.device, self.format, &self.color_view, self.size));
+        }
+        true
+    }
 }
 
 fn create_color(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
@@ -166,7 +187,7 @@ fn create_color(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, 
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -798,6 +819,134 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let glow = max(sel_glow, v.glow);
   let rim_col = vec4<f32>(1.0, 1.0, 1.0, glow + v.boost * 0.2) * rim;
   return clamp(base + rim_col, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+"#;
+
+struct PostFx {
+    pipeline: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
+    src_layout: wgpu::BindGroupLayout,
+    src_bg: wgpu::BindGroup,
+    params_layout: wgpu::BindGroupLayout,
+    params_bg: wgpu::BindGroup,
+    params_buf: wgpu::Buffer,
+    target: wgpu::Texture,
+    target_view: wgpu::TextureView,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostParams { exposure: f32, vignette: f32, tonemap: u32, fxaa: u32 }
+
+impl PostFx {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, src_view: &wgpu::TextureView, size: (u32, u32)) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("postfx.wgsl"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(POST_WGSL)) });
+        let src_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post.src_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("post.sampler"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("post.src_bg"), layout: &src_layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+        ] });
+        let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post.params_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<PostParams>() as u64) }, count: None }],
+        });
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("post.params_buf"), size: std::mem::size_of::<PostParams>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("post.params_bg"), layout: &params_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() }] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("post.layout"), bind_group_layouts: &[&src_layout, &params_layout], push_constant_ranges: &[] });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("post.pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_post", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
+        });
+        let (target, target_view) = create_color(device, format, size);
+        Self { pipeline, sampler, src_layout, src_bg, params_layout, params_bg, params_buf, target, target_view }
+    }
+
+    fn resize(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) {
+        let (t, v) = create_color(device, format, size);
+        self.target = t;
+        self.target_view = v;
+    }
+
+    fn rebind(&mut self, device: &wgpu::Device, src_view: &wgpu::TextureView) {
+        self.src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("post.src_bg.rebind"), layout: &self.src_layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+        ] });
+    }
+
+    fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, src: &wgpu::TextureView, _size: (u32, u32)) {
+        self.rebind(device, src);
+        // Update params from env each frame
+        let exposure = std::env::var("SB_WGPU_EXPOSURE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+        let vignette = std::env::var("SB_WGPU_VIGNETTE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.08);
+        let tonemap = match std::env::var("SB_WGPU_TONEMAP").ok().as_deref() { Some("filmic") => 1u32, Some("reinhard") => 2u32, _ => 0u32 };
+        let fxaa = std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let params = PostParams { exposure, vignette, tonemap, fxaa };
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("post.pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.target_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.src_bg, &[]);
+        pass.set_bind_group(1, &self.params_bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+fn wants_post() -> bool {
+    std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1) != 0
+        || std::env::var("SB_WGPU_TONEMAP").ok().map(|v| !v.is_empty()).unwrap_or(true)
+}
+
+const POST_WGSL: &str = r#"
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
+  // Fullscreen triangle
+  let x = f32((vid << 1u) & 2u);
+  let y = f32(vid & 2u);
+  return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_smp: sampler;
+struct Params { exposure: f32, vignette: f32, tonemap: u32, fxaa: u32 };
+@group(1) @binding(0) var<uniform> params: Params;
+
+fn aces_tonemap(c: vec3<f32>) -> vec3<f32> {
+  // Fitted ACES curve
+  let a = 2.51; let b = 0.03; let d = 0.59; let e = 0.14;
+  let numerator = c * (a * c + b);
+  let denom = c * ( (a - 1.0) * c + d ) + e;
+  return clamp(numerator / denom, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+@fragment
+fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = pos.xy / vec2<f32>(pos.w);
+  let tex_size = vec2<f32>(textureDimensions(src_tex));
+  let coord = (uv * 0.5 + vec2<f32>(0.5, 0.5)) * tex_size;
+  var col = textureSampleLevel(src_tex, src_smp, coord / tex_size, 0.0);
+  // FXAA stub: none (placeholder for later)
+  // ACES tonemap + mild vignette
+  var rgb = aces_tonemap(col.rgb * params.exposure);
+  let p = (coord / tex_size) * 2.0 - 1.0;
+  let vign = clamp(1.0 - dot(p, p) * params.vignette, 0.85, 1.0);
+  rgb *= vign;
+  return vec4<f32>(rgb, 1.0);
 }
 "#;
 
