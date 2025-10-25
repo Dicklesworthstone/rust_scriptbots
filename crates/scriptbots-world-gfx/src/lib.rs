@@ -136,7 +136,7 @@ impl WorldRenderer {
                     view: &self.color_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.06, b: 0.12, a: 1.0 }), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(if env_flag("SB_WGPU_DEBUG_BRIGHT_BG") { wgpu::Color { r: 0.10, g: 0.10, b: 0.25, a: 1.0 } } else { wgpu::Color { r: 0.03, g: 0.06, b: 0.12, a: 1.0 } }), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
@@ -1328,5 +1328,15 @@ fn fs_blur(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   return vec4<f32>(c, 1.0);
 }
 "#;
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
 
 
