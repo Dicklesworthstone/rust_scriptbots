@@ -251,7 +251,12 @@ mod world_compositor {
             } else { (target_size.0.max(1), target_size.1.max(1)) };
             if self.ensure_renderer(render_size).is_err() { return; }
             let r = self.renderer.as_mut().unwrap();
-            r.set_camera(self.cam_scale, self.cam_offset);
+            // When rendering at a reduced offscreen resolution, scale the camera mapping
+            // so CPU culling and shader NDC math remain consistent with the smaller viewport.
+            let rs = if self.render_scale < 0.9999 { self.render_scale } else { 1.0 };
+            let effective_scale = self.cam_scale * rs;
+            let effective_offset = (self.cam_offset.0 * rs, self.cam_offset.1 * rs);
+            r.set_camera(effective_scale, effective_offset);
             let _ = r.resize(render_size);
             let _frame = r.render(snapshot);
             let _ = r.copy_to_readback(&_frame);
@@ -351,6 +356,83 @@ mod wgpu_capture_test {
             .map(|it| it.filter_map(|e| e.ok()).any(|e| e.path().extension().map(|s| s == "png").unwrap_or(false)))
             .unwrap_or(false);
         assert!(produced, "expected at least one PNG to be written");
+    }
+
+    #[test]
+    fn wgpu_capture_agents() {
+        // Enable compositor saving with a distinct prefix
+        unsafe {
+            std::env::set_var("SB_WGPU_SAVE_FRAMES", "1");
+            std::env::set_var("SB_WGPU_SAVE_DIR", "frames_render_test");
+            std::env::set_var("SB_WGPU_SAVE_EVERY", "1");
+            std::env::set_var("SB_WGPU_SAVE_PREFIX", "agents");
+        }
+
+        // Ensure output directory exists
+        let _ = std::fs::create_dir_all("frames_render_test");
+        let mut comp = Compositor::new();
+        let viewport = (640u32, 360u32);
+
+        // Patterned 60x34 terrain across all six kinds
+        let dims = (60u32, 34u32);
+        let mut tiles: Vec<u32> = Vec::with_capacity((dims.0 * dims.1) as usize);
+        for y in 0..dims.1 {
+            for x in 0..dims.0 {
+                tiles.push(((x + y) % 6) as u32);
+            }
+        }
+
+        // Fit entire world into the viewport (match the GPUI mapping)
+        let world_size = (6000.0f32, 6000.0f32);
+        let base_scale = (viewport.0 as f32 / world_size.0).min(viewport.1 as f32 / world_size.1).max(0.0001);
+        let pad_x = (viewport.0 as f32 - world_size.0 * base_scale) * 0.5;
+        let pad_y = (viewport.1 as f32 - world_size.1 * base_scale) * 0.5;
+        comp.set_camera_params(base_scale, (pad_x, pad_y));
+
+        // Two visible agents near center with distinct colors
+        let agents = vec![
+            AgentInstance {
+                position: [world_size.0 * 0.5, world_size.1 * 0.5],
+                size: 48.0,
+                color: [1.0, 0.25, 0.2, 1.0],
+                selection: 2,
+                glow: 0.4,
+                boost: 0.0,
+            },
+            AgentInstance {
+                position: [world_size.0 * 0.55, world_size.1 * 0.48],
+                size: 36.0,
+                color: [0.2, 0.9, 0.3, 1.0],
+                selection: 1,
+                glow: 0.2,
+                boost: 1.0,
+            },
+        ];
+
+        let snapshot = GfxSnapshot {
+            world_size,
+            terrain: TerrainView { dims, cell_size: 100, tiles: &tiles, elevation: None },
+            agents: &agents,
+        };
+
+        comp.render_snapshot(&snapshot, viewport);
+
+        // Best-effort: ensure at least one agents PNG exists
+        let dir = std::path::Path::new("frames_render_test");
+        assert!(dir.exists(), "frames_render_test dir should exist");
+        let produced = std::fs::read_dir(dir)
+            .ok()
+            .map(|it| it.filter_map(|e| e.ok()).any(|e| {
+                let p = e.path();
+                p.extension().map(|s| s == "png").unwrap_or(false)
+                    && p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("agents_"))
+                        .unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        assert!(produced, "expected at least one agents PNG to be written");
     }
 }
 
