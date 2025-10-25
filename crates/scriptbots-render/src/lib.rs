@@ -189,7 +189,7 @@ mod world_compositor {
         fn ensure_renderer(&mut self, size: (u32, u32)) -> Result<(), String> {
             if self.adapter.is_none() {
                 // Create a headless adapter suitable for offscreen rendering
-                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+                let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
                 let future = async {
                     instance
                         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -198,7 +198,7 @@ mod world_compositor {
                             force_fallback_adapter: false,
                         })
                         .await
-                        .ok_or_else(|| "wgpu adapter not available".to_string())
+                        .map_err(|_| "wgpu adapter not available".to_string())
                 };
                 let adapter = pollster::block_on(future)?;
                 self.adapter = Some(adapter);
