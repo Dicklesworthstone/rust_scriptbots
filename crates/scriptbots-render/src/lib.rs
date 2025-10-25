@@ -266,7 +266,16 @@ pub mod world_compositor {
             let _ = r.resize(render_size);
             let _frame = r.render(snapshot);
             let _ = r.copy_to_readback(&_frame);
-            if let Some(view) = r.mapped_rgba() {
+            // Small bounded spin to ensure first mapped frame is ready; avoids blank-first-paint
+            let mut view_opt = r.mapped_rgba();
+            if view_opt.is_none() {
+                for _ in 0..64 {
+                    std::hint::spin_loop();
+                    view_opt = r.mapped_rgba();
+                    if view_opt.is_some() { break; }
+                }
+            }
+            if let Some(view) = view_opt {
                 self.save_view_if_requested(&view);
                 // Lazy-initialize image with known dimensions; avoid stale size from previous runs
                 if self.image.is_none() {
@@ -277,6 +286,11 @@ pub mod world_compositor {
                     img.upload_from_readback(&view);
                 }
                 self.last_submit = Some(std::time::Instant::now());
+                if env_flag("SB_WGPU_LOG_VIS") {
+                    tracing::info!(width = view.width, height = view.height, stride = view.bytes_per_row, "wgpu readback mapped");
+                }
+            } else if env_flag("SB_WGPU_LOG_VIS") {
+                tracing::info!("wgpu readback not yet mapped");
             }
         }
 
@@ -287,6 +301,12 @@ pub mod world_compositor {
                     Some("full") => img.paint_full(bounds, window),
                     Some("diff") | _ => img.paint_diff(bounds, window),
                 }
+            } else {
+                // Diagnostic fallback: draw a subtle placeholder so we know paint was invoked
+                if env_flag("SB_WGPU_LOG_VIS") {
+                    tracing::info!("wgpu image not available; painting placeholder");
+                }
+                window.paint_quad(fill(bounds, Background::from(rgb(0x091220))));
             }
         }
 
@@ -570,6 +590,18 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let (off_px_x, off_px_y) = state.camera.lock().map(|c| c.offset_px).unwrap_or((0.0, 0.0));
     // Offscreen world renderer uses (0,0) origin; include only pad and camera offset
     let cam_offset = (pad_x + off_px_x, pad_y + off_px_y);
+
+        if env_flag("SB_WGPU_LOG_CAM") {
+            tracing::info!(
+                vw = width_px, vh = height_px,
+                world_w = world_w, world_h = world_h,
+                base_scale = base_scale, scale = scale,
+                pad_x = pad_x, pad_y = pad_y,
+                off_x = off_px_x, off_y = off_px_y,
+                cam_off_x = cam_offset.0, cam_off_y = cam_offset.1,
+                "wgpu camera mapping"
+            );
+        }
 
     // Build a minimal snapshot from the current RenderFrame
     let terrain_dims = state.frame.terrain.dimensions;
@@ -9376,6 +9408,7 @@ struct CameraState {
     last_world_size: (f32, f32),
     last_scale: f32,
     last_base_scale: f32,
+        centered_once: bool,
 }
 
 impl Default for CameraState {
@@ -9390,6 +9423,7 @@ impl Default for CameraState {
             last_world_size: (1.0, 1.0),
             last_scale: 1.0,
             last_base_scale: 1.0,
+            centered_once: false,
         }
     }
 }
@@ -10275,6 +10309,19 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         frame.world_size,
         base_scale,
     );
+    // On the first GUI paint, ensure the map is centered and fully visible.
+    if !camera_guard.centered_once {
+        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
+        camera_guard.center_on(world_center);
+        camera_guard.centered_once = true;
+        // Recompute offsets after forcing center once
+        offset_x = origin_x + pad_x + camera_guard.offset_px.0;
+        offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+        render_left = offset_x;
+        render_top = offset_y;
+        render_right = offset_x + render_w;
+        render_bottom = offset_y + render_h;
+    }
     // Second-chance offscreen guard: now that render metrics are recorded, a
     // recenter can compute correct offsets on the very first frame.
     let fully_offscreen_after_metrics =
