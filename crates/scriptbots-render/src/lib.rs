@@ -313,6 +313,47 @@ mod world_compositor {
     }
 }
 
+#[cfg(all(test, feature = "world_wgpu"))]
+mod wgpu_capture_test {
+    use super::world_compositor::Compositor;
+    use scriptbots_world_gfx::{WorldSnapshot as GfxSnapshot, TerrainView, AgentInstance};
+
+    #[test]
+    fn wgpu_capture_smoke() {
+        // Enable compositor saving
+        unsafe {
+            std::env::set_var("SB_WGPU_SAVE_FRAMES", "1");
+            std::env::set_var("SB_WGPU_SAVE_DIR", "frames_render_test");
+            std::env::set_var("SB_WGPU_SAVE_EVERY", "1");
+            std::env::set_var("SB_WGPU_SAVE_PREFIX", "render");
+        }
+
+        // Ensure output directory exists
+        let _ = std::fs::create_dir_all("frames_render_test");
+        let mut comp = Compositor::new();
+        let viewport = (640u32, 360u32);
+        // Simple 60x34 grass snapshot
+        let dims = (60u32, 34u32);
+        let tiles: Vec<u32> = vec![3u32; (dims.0 * dims.1) as usize];
+        let snapshot = GfxSnapshot {
+            world_size: (6000.0, 6000.0),
+            terrain: TerrainView { dims, cell_size: 100, tiles: &tiles, elevation: None },
+            agents: &[] as &[AgentInstance],
+        };
+        comp.set_camera_params(1.0, (0.0, 0.0));
+        comp.render_snapshot(&snapshot, viewport);
+
+        // Best-effort: ensure at least one file exists
+        let dir = std::path::Path::new("frames_render_test");
+        assert!(dir.exists(), "frames_render_test dir should exist");
+        // Best-effort check for at least one PNG file
+        let produced = std::fs::read_dir(dir).ok()
+            .map(|it| it.filter_map(|e| e.ok()).any(|e| e.path().extension().map(|s| s == "png").unwrap_or(false)))
+            .unwrap_or(false);
+        assert!(produced, "expected at least one PNG to be written");
+    }
+}
+
 #[cfg(feature = "world_wgpu")]
 fn use_wgpu_renderer() -> bool {
     static CHOICE: OnceLock<bool> = OnceLock::new();
