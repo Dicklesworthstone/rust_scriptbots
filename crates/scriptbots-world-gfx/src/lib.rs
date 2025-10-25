@@ -255,7 +255,7 @@ impl ReadbackRing {
             },
             wgpu::ImageCopyBuffer {
                 buffer: &slot.buf,
-                layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(self.bytes_per_row), rows_per_image: Some(self.extent.1) },
+                layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(std::num::NonZeroU32::new(self.bytes_per_row).unwrap()), rows_per_image: Some(std::num::NonZeroU32::new(self.extent.1).unwrap()) },
             },
             wgpu::Extent3d { width: self.extent.0, height: self.extent.1, depth_or_array_layers: 1 },
         );
@@ -520,7 +520,7 @@ impl TerrainPipeline {
         queue.write_texture(
             wgpu::ImageCopyTexture { texture: &self.atlas, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &pixels,
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(self.atlas_w * 4), rows_per_image: Some(self.atlas_h) },
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(std::num::NonZeroU32::new(self.atlas_w * 4).unwrap()), rows_per_image: Some(std::num::NonZeroU32::new(self.atlas_h).unwrap()) },
             wgpu::Extent3d { width: self.atlas_w, height: self.atlas_h, depth_or_array_layers: 1 },
         );
         // refresh bind group to point to the new view
@@ -823,35 +823,66 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 struct PostFx {
+    // Final composite (tonemap + vignette + fog + bloom composite)
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
-    src_layout: wgpu::BindGroupLayout,
+    src_layout: wgpu::BindGroupLayout, // src color + sampler + bloom texture
     src_bg: wgpu::BindGroup,
     params_layout: wgpu::BindGroupLayout,
     params_bg: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     target: wgpu::Texture,
     target_view: wgpu::TextureView,
+    color_format: wgpu::TextureFormat,
+
+    // Bloom: extract brights to half-res, separable blur (ping-pong)
+    bloom_extract_pipeline: wgpu::RenderPipeline,
+    bloom_blur_pipeline: wgpu::RenderPipeline,
+    bloom_src_layout: wgpu::BindGroupLayout, // single texture + sampler
+    bloom_src_bg: wgpu::BindGroup,
+    blur_params_layout: wgpu::BindGroupLayout,
+    blur_params_bg: wgpu::BindGroup,
+    blur_params_buf: wgpu::Buffer,
+    bloom_a: Option<wgpu::Texture>,
+    bloom_a_view: Option<wgpu::TextureView>,
+    bloom_b: Option<wgpu::Texture>,
+    bloom_b_view: Option<wgpu::TextureView>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct PostParams { exposure: f32, vignette: f32, tonemap: u32, fxaa: u32 }
+struct PostParams {
+    exposure: f32,
+    vignette: f32,
+    tonemap: u32,
+    fxaa: u32,
+    bloom_thresh: f32,
+    bloom_intensity: f32,
+    fog_density: f32,
+    fog_enabled: u32,
+    fog_color: [f32; 3],
+    _pad0: f32,
+}
 
 impl PostFx {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat, src_view: &wgpu::TextureView, size: (u32, u32)) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("postfx.wgsl"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(POST_WGSL)) });
+        // Final composite shader
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("postfx.wgsl"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(POST_WGSL)) });
+        // Final pass samples: src color (binding 0), sampler (1), bloom blurred (2)
         let src_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post.src_layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("post.sampler"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        // Placeholder bloom view: use source for now; real bloom bound during run()
         let src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("post.src_bg"), layout: &src_layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(src_view) },
         ] });
         let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post.params_layout"),
@@ -863,42 +894,206 @@ impl PostFx {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("post.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_post", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &post_shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &post_shader, entry_point: "fs_post", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
         });
-        let (target, target_view) = create_color(device, format, size);
-        Self { pipeline, sampler, src_layout, src_bg, params_layout, params_bg, params_buf, target, target_view }
+    let (target, target_view) = create_color(device, format, size);
+
+        // Bloom shaders and layouts
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("bloom.wgsl"), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BLOOM_WGSL)) });
+        let bloom_src_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom.src_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let bloom_src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bloom.src_bg"), layout: &bloom_src_layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+        ] });
+        let blur_params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom.blur_params_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: std::num::NonZeroU64::new(16) }, count: None }],
+        });
+        let blur_params_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("bloom.blur_params_buf"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let blur_params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bloom.blur_params_bg"), layout: &blur_params_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: blur_params_buf.as_entire_binding() }] });
+        // Extract pipeline: src -> bloom_a (half res)
+        let bloom_extract_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("bloom.extract.layout"), bind_group_layouts: &[&bloom_src_layout, &params_layout], push_constant_ranges: &[] });
+        let bloom_extract_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bloom.extract.pipeline"),
+            layout: Some(&bloom_extract_layout),
+            vertex: wgpu::VertexState { module: &bloom_shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: "fs_extract", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
+        });
+        // Blur pipeline: bloom_a <-> bloom_b
+        let bloom_blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("bloom.blur.layout"), bind_group_layouts: &[&bloom_src_layout, &blur_params_layout], push_constant_ranges: &[] });
+        let bloom_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bloom.blur.pipeline"),
+            layout: Some(&bloom_blur_layout),
+            vertex: wgpu::VertexState { module: &bloom_shader, entry_point: "vs_fullscreen", compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &bloom_shader, entry_point: "fs_blur", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
+        });
+
+        Self {
+            pipeline,
+            sampler,
+            src_layout,
+            src_bg,
+            params_layout,
+            params_bg,
+            params_buf,
+            target,
+            target_view,
+            color_format: format,
+            bloom_extract_pipeline,
+            bloom_blur_pipeline,
+            bloom_src_layout,
+            bloom_src_bg,
+            blur_params_layout,
+            blur_params_bg,
+            blur_params_buf,
+            bloom_a: None,
+            bloom_a_view: None,
+            bloom_b: None,
+            bloom_b_view: None,
+        }
     }
 
     fn resize(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) {
         let (t, v) = create_color(device, format, size);
         self.target = t;
         self.target_view = v;
+        self.color_format = format;
+        // Drop bloom targets; will be recreated lazily on next run
+        self.bloom_a = None;
+        self.bloom_a_view = None;
+        self.bloom_b = None;
+        self.bloom_b_view = None;
     }
 
-    fn rebind(&mut self, device: &wgpu::Device, src_view: &wgpu::TextureView) {
+    fn rebind(&mut self, device: &wgpu::Device, src_view: &wgpu::TextureView, bloom_view: &wgpu::TextureView) {
         self.src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("post.src_bg.rebind"), layout: &self.src_layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(bloom_view) },
+        ] });
+    }
+
+    fn ensure_bloom_targets(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, full: (u32, u32)) {
+        if self.bloom_a.is_some() && self.bloom_b.is_some() { return; }
+        let half = (full.0.max(1) / 2).max(1);
+        let half_h = (full.1.max(1) / 2).max(1);
+        let make = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: half, height: half_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        });
+        let a = make("post.bloom.a");
+        let b = make("post.bloom.b");
+        let av = a.create_view(&wgpu::TextureViewDescriptor::default());
+        let bv = b.create_view(&wgpu::TextureViewDescriptor::default());
+        self.bloom_a = Some(a);
+        self.bloom_a_view = Some(av);
+        self.bloom_b = Some(b);
+        self.bloom_b_view = Some(bv);
+    }
+
+    fn bind_bloom_src(&mut self, device: &wgpu::Device, src_view: &wgpu::TextureView) {
+        self.bloom_src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bloom.src_bg.rebind"), layout: &self.bloom_src_layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
         ] });
     }
 
-    fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, src: &wgpu::TextureView, _size: (u32, u32)) {
-        self.rebind(device, src);
-        // Update params from env each frame
+    fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, src: &wgpu::TextureView, size: (u32, u32)) {
+        // Env knobs
         let exposure = std::env::var("SB_WGPU_EXPOSURE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
         let vignette = std::env::var("SB_WGPU_VIGNETTE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.08);
         let tonemap = match std::env::var("SB_WGPU_TONEMAP").ok().as_deref() { Some("filmic") => 1u32, Some("reinhard") => 2u32, _ => 0u32 };
         let fxaa = std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-        let params = PostParams { exposure, vignette, tonemap, fxaa };
+        let bloom_on = std::env::var("SB_WGPU_BLOOM").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0;
+        let bloom_thresh = std::env::var("SB_WGPU_BLOOM_THRESH").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.8);
+        let bloom_intensity = std::env::var("SB_WGPU_BLOOM_INTENSITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.65);
+        let fog_mode = std::env::var("SB_WGPU_FOG").ok().unwrap_or_else(|| "off".to_string());
+        let fog_enabled = match fog_mode.as_str() { "low" | "med" | "high" => 1u32, _ => 0u32 };
+        let fog_density = match fog_mode.as_str() { "low" => 0.6, "med" => 1.0, "high" => 1.6, _ => 0.0 };
+        let fog_color = std::env::var("SB_WGPU_FOG_COLOR").ok().and_then(|v| {
+            let parts: Vec<_> = v.split(',').collect();
+            if parts.len() == 3 { Some([
+                parts[0].trim().parse::<f32>().unwrap_or(0.6),
+                parts[1].trim().parse::<f32>().unwrap_or(0.7),
+                parts[2].trim().parse::<f32>().unwrap_or(0.8),
+            ]) } else { None }
+        }).unwrap_or([0.6, 0.7, 0.8]);
+
+        let params = PostParams { exposure, vignette, tonemap, fxaa, bloom_thresh, bloom_intensity, fog_density, fog_enabled, fog_color, _pad0: 0.0 };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+
+        // Bloom pass chain if enabled
+        let mut bloom_view_opt: Option<wgpu::TextureView> = None;
+        if bloom_on {
+            self.ensure_bloom_targets(device, self.color_format, size);
+            // Create fresh local views to avoid borrowing self across mutable calls
+            let a_view_local = self.bloom_a.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default());
+            let b_view_local = self.bloom_b.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default());
+            // Extract brights from src -> A
+            self.bind_bloom_src(device, src);
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("bloom.extract"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.bloom_extract_pipeline);
+                pass.set_bind_group(0, &self.bloom_src_bg, &[]);
+                pass.set_bind_group(1, &self.params_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            // Blur A -> B (horizontal)
+            let dir_h: [f32; 4] = [1.0 / (size.0.max(1) as f32 * 0.5), 0.0, 0.0, 0.0];
+            queue.write_buffer(&self.blur_params_buf, 0, bytemuck::bytes_of(&dir_h));
+            self.bind_bloom_src(device, &a_view_local);
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("bloom.blur.h"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &b_view_local, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.bloom_blur_pipeline);
+                pass.set_bind_group(0, &self.bloom_src_bg, &[]);
+                pass.set_bind_group(1, &self.blur_params_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            // Blur B -> A (vertical)
+            let dir_v: [f32; 4] = [0.0, 1.0 / (size.1.max(1) as f32 * 0.5), 0.0, 0.0];
+            queue.write_buffer(&self.blur_params_buf, 0, bytemuck::bytes_of(&dir_v));
+            self.bind_bloom_src(device, &b_view_local);
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("bloom.blur.v"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &a_view_local, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.bloom_blur_pipeline);
+                pass.set_bind_group(0, &self.bloom_src_bg, &[]);
+                pass.set_bind_group(1, &self.blur_params_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            bloom_view_opt = Some(a_view_local);
+        }
+
+        // Final composite: bind src + bloom (or src placeholder) and draw
+        let bloom_view_ref = bloom_view_opt.as_ref().unwrap_or(src);
+        self.rebind(device, src, bloom_view_ref);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("post.pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.target_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
-            depth_stencil_attachment: None,
-            occlusion_query_set: None,
-            timestamp_writes: None,
+            depth_stencil_attachment: None, occlusion_query_set: None, timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.src_bg, &[]);
@@ -910,6 +1105,8 @@ impl PostFx {
 fn wants_post() -> bool {
     std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1) != 0
         || std::env::var("SB_WGPU_TONEMAP").ok().map(|v| !v.is_empty()).unwrap_or(true)
+        || std::env::var("SB_WGPU_BLOOM").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0
+        || matches!(std::env::var("SB_WGPU_FOG").ok().as_deref(), Some("low") | Some("med") | Some("high"))
 }
 
 const POST_WGSL: &str = r#"
@@ -923,7 +1120,12 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_smp: sampler;
-struct Params { exposure: f32, vignette: f32, tonemap: u32, fxaa: u32 };
+@group(0) @binding(2) var bloom_tex: texture_2d<f32>;
+struct Params {
+  exposure: f32, vignette: f32, tonemap: u32, fxaa: u32,
+  bloom_thresh: f32, bloom_intensity: f32, fog_density: f32, fog_enabled: u32,
+  fog_color: vec3<f32>, _pad0: f32,
+};
 @group(1) @binding(0) var<uniform> params: Params;
 
 fn aces_tonemap(c: vec3<f32>) -> vec3<f32> {
@@ -936,17 +1138,74 @@ fn aces_tonemap(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-  let uv = pos.xy / vec2<f32>(pos.w);
   let tex_size = vec2<f32>(textureDimensions(src_tex));
-  let coord = (uv * 0.5 + vec2<f32>(0.5, 0.5)) * tex_size;
-  var col = textureSampleLevel(src_tex, src_smp, coord / tex_size, 0.0);
+  // Pixel coords from builtin position -> normalize to [0,1]
+  let uv01 = pos.xy / tex_size;
+  var col = textureSampleLevel(src_tex, src_smp, uv01, 0.0);
   // FXAA stub: none (placeholder for later)
   // ACES tonemap + mild vignette
   var rgb = aces_tonemap(col.rgb * params.exposure);
-  let p = (coord / tex_size) * 2.0 - 1.0;
+  let p = uv01 * 2.0 - 1.0;
   let vign = clamp(1.0 - dot(p, p) * params.vignette, 0.85, 1.0);
   rgb *= vign;
+  // Height-fog (screen-space Y proxy)
+  if (params.fog_enabled != 0u) {
+    let h = uv01.y; // bottom-heavy fog
+    let fog_f = clamp(1.0 - exp(-params.fog_density * h), 0.0, 1.0);
+    rgb = mix(rgb, params.fog_color, fog_f);
+  }
+  // Bloom composite (additive)
+  if (params.bloom_intensity > 0.0) {
+    let b = textureSampleLevel(bloom_tex, src_smp, uv01, 0.0).rgb;
+    rgb = clamp(rgb + b * params.bloom_intensity, vec3<f32>(0.0), vec3<f32>(1.0));
+  }
   return vec4<f32>(rgb, 1.0);
+}
+"#;
+
+// Bloom helpers (extract + separable blur)
+const BLOOM_WGSL: &str = r#"
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
+  let x = f32((vid << 1u) & 2u);
+  let y = f32(vid & 2u);
+  return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_smp: sampler;
+struct Params { exposure: f32, vignette: f32, tonemap: u32, fxaa: u32, bloom_thresh: f32, bloom_intensity: f32, fog_density: f32, fog_enabled: u32, fog_color: vec3<f32>, _pad0: f32 };
+@group(1) @binding(0) var<uniform> params: Params;
+
+@fragment
+fn fs_extract(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let tex_size = vec2<f32>(textureDimensions(src_tex));
+  let uv = pos.xy / tex_size;
+  let c = textureSampleLevel(src_tex, src_smp, uv, 0.0).rgb;
+  let luma = max(c.r, max(c.g, c.b));
+  let m = smoothstep(params.bloom_thresh, params.bloom_thresh + 0.1, luma);
+  return vec4<f32>(c * m, 1.0);
+}
+
+struct BlurParams { dir: vec2<f32>, _pad: vec2<f32> };
+@group(1) @binding(0) var<uniform> blur: BlurParams;
+
+@fragment
+fn fs_blur(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let tex_size = vec2<f32>(textureDimensions(src_tex));
+  let uv = pos.xy / tex_size;
+  // 5-tap gaussian (weights approximate)
+  let w0 = 0.227027;
+  let w1 = 0.316216;
+  let w2 = 0.070270;
+  let off1 = blur.dir * 1.384615;
+  let off2 = blur.dir * 3.230769;
+  var c = textureSampleLevel(src_tex, src_smp, uv, 0.0).rgb * w0;
+  c += textureSampleLevel(src_tex, src_smp, uv + off1, 0.0).rgb * w1;
+  c += textureSampleLevel(src_tex, src_smp, uv - off1, 0.0).rgb * w1;
+  c += textureSampleLevel(src_tex, src_smp, uv + off2, 0.0).rgb * w2;
+  c += textureSampleLevel(src_tex, src_smp, uv - off2, 0.0).rgb * w2;
+  return vec4<f32>(c, 1.0);
 }
 "#;
 

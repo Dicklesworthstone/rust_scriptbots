@@ -189,7 +189,7 @@ mod world_compositor {
         fn ensure_renderer(&mut self, size: (u32, u32)) -> Result<(), String> {
             if self.adapter.is_none() {
                 // Create a headless adapter suitable for offscreen rendering
-                let instance = wgpu::Instance::default();
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
                 let future = async {
                     instance
                         .request_adapter(&wgpu::RequestAdapterOptions {
