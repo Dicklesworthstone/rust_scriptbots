@@ -269,7 +269,7 @@ mod world_compositor {
 
         pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) {
             if let Some(img) = &self.image {
-                let mode = std::env::var("SB_WGPU_PRESENT_MODE").ok().or_else(|| Some("diff".to_string()));
+                let mode = std::env::var("SB_WGPU_PRESENT_MODE").ok().or_else(|| Some("full".to_string()));
                 match mode.as_deref() {
                     Some("full") => img.paint_full(bounds, window),
                     Some("diff") | _ => img.paint_diff(bounds, window),

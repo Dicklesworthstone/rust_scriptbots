@@ -312,7 +312,8 @@ impl ReadbackRing {
             if res.is_ok() { mapped_flag.store(true, Ordering::Relaxed); }
         });
         // Ensure progress on mapping; non-blocking is sufficient for our readback ring
-        let _ = device.poll(wgpu::PollType::Poll);
+        // Non-blocking poll may be insufficient in tests; use indefinite wait
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         // Advance ring pointer
         self.curr = (self.curr + 1) % self.slots.len();
         Ok(())
