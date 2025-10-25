@@ -294,19 +294,21 @@ pub mod world_compositor {
             }
         }
 
-        pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
             if let Some(img) = &self.image {
                 let mode = std::env::var("SB_WGPU_PRESENT_MODE").ok().or_else(|| Some("full".to_string()));
                 match mode.as_deref() {
                     Some("full") => img.paint_full(bounds, window),
                     Some("diff") | _ => img.paint_diff(bounds, window),
                 }
+                true
             } else {
                 // Diagnostic fallback: draw a subtle placeholder so we know paint was invoked
                 if env_flag("SB_WGPU_LOG_VIS") {
                     tracing::info!("wgpu image not available; painting placeholder");
                 }
                 window.paint_quad(fill(bounds, Background::from(rgb(0x091220))));
+                false
             }
         }
 
@@ -561,7 +563,7 @@ fn use_wgpu_renderer() -> bool {
 fn use_wgpu_renderer() -> bool { false }
 
 #[cfg(feature = "world_wgpu")]
-fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
+    fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     use scriptbots_world_gfx::WorldSnapshot as GfxSnapshot;
     use world_compositor::Compositor;
     static COMPOSITOR: OnceLock<std::sync::Mutex<Compositor>> = OnceLock::new();
@@ -653,7 +655,10 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     // Render using current camera mapping
     comp.set_camera_params(scale, cam_offset);
     comp.render_snapshot(&snapshot, viewport);
-    comp.paint_world(bounds, window);
+    if !comp.paint_world(bounds, window) {
+        // If the wgpu image isn't ready, draw the CPU canvas frame this turn to avoid a blank window.
+        paint_frame(state, bounds, window);
+    }
 }
 
 #[cfg(not(feature = "world_wgpu"))]
