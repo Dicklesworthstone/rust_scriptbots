@@ -34,6 +34,27 @@ use kira::{
 use image::{ImageBuffer, Rgba as ImgRgba};
 use tracing::{error, info, warn};
 
+#[cfg(feature = "world_wgpu")]
+mod world_compositor {
+    use super::*;
+    use scriptbots_world_gfx::{WorldSnapshot as GfxSnapshot, WorldRenderer};
+    struct Compositor {
+        renderer: Option<WorldRenderer>,
+        last_bytes_per_row: u32,
+        last_size: (u32, u32),
+        // In a fuller implementation, keep a persistent GPUI image handle here
+    }
+    impl Compositor {
+        fn new() -> Self {
+            Self { renderer: None, last_bytes_per_row: 0, last_size: (0, 0) }
+        }
+        fn render_and_upload(&mut self, snapshot: &GfxSnapshot, size: (u32, u32)) {
+            // Initialization and render are no-ops in this stub; full upload path will map and blit into GPUI image
+            let _ = (snapshot, size);
+        }
+    }
+}
+
 fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
     let mut delta = target - origin;
     let half = extent * 0.5;

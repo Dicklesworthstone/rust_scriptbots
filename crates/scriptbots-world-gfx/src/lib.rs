@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec2, Vec3};
-use std::sync::Arc;
-use tracing::{info, warn};
+use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Public snapshot format the renderer expects. Keep minimal; the app will adapt
 /// its internal world snapshot to this view before passing to the renderer.
@@ -19,6 +18,7 @@ pub struct TerrainView<'a> {
     pub dims: (u32, u32),
     pub cell_size: u32,
     pub tiles: &'a [u32], // index into a tileset palette/atlas (kept simple for MVP)
+    pub elevation: Option<&'a [f32]>, // optional elevation field for slope accents
 }
 
 #[repr(C)]
@@ -40,6 +40,7 @@ pub struct WorldRenderer {
     terrain: TerrainPipeline,
     agents: AgentPipeline,
     view: ViewUniforms,
+    start_time: Instant,
 }
 
 pub struct RenderFrame {
@@ -57,7 +58,8 @@ impl WorldRenderer {
         let (color, color_view) = create_color(&device, format, size);
         let readback = ReadbackRing::new(&device, size, format)?;
         let view = ViewUniforms::new(&device, &queue, size);
-        let terrain = TerrainPipeline::new(&device, format, &view);
+        let mut terrain = TerrainPipeline::new(&device, format, &view);
+        terrain.init_atlas(&device, &queue);
         let agents = AgentPipeline::new(&device, format, &view);
 
         Ok(Self {
@@ -71,6 +73,7 @@ impl WorldRenderer {
             terrain,
             agents,
             view,
+            start_time: Instant::now(),
         })
     }
 
@@ -83,7 +86,9 @@ impl WorldRenderer {
         self.color_view = view;
         self.size = new_size;
         self.readback = ReadbackRing::new(&self.device, new_size, self.format)?;
-        self.view.update(&self.queue, new_size);
+        // keep time monotonic across resizes
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        self.view.update(&self.queue, new_size, elapsed);
         Ok(())
     }
 
@@ -91,8 +96,9 @@ impl WorldRenderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.render") });
-        // Ensure view uniforms match current viewport
-        self.view.update(&self.queue, self.size);
+        // Ensure view uniforms match current viewport and time
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        self.view.update(&self.queue, self.size, elapsed);
         // Background clear
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -108,8 +114,8 @@ impl WorldRenderer {
             });
         }
         // Terrain + agents
-        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot);
-        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot);
+        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size);
+        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size);
         self.queue.submit(Some(encoder.finish()));
         RenderFrame { extent: self.size }
     }
@@ -148,6 +154,7 @@ pub struct ReadbackRing {
 pub struct ReadbackSlot {
     buf: wgpu::Buffer,
     ready: bool,
+    mapped: std::sync::Arc<AtomicBool>,
 }
 
 pub struct ReadbackView<'a> {
@@ -174,13 +181,18 @@ impl ReadbackRing {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let slots = [ReadbackSlot { buf: mk(), ready: false }, ReadbackSlot { buf: mk(), ready: false }, ReadbackSlot { buf: mk(), ready: false }];
+        let mk_slot = || ReadbackSlot { buf: mk(), ready: false, mapped: std::sync::Arc::new(AtomicBool::new(false)) };
+        let slots = [mk_slot(), mk_slot(), mk_slot()];
         Ok(Self { slots, curr: 0, bytes_per_row, extent })
     }
 
     pub fn copy(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, color: &wgpu::Texture) -> Result<(), String> {
         let slot = &mut self.slots[self.curr];
         slot.ready = false;
+        if slot.mapped.load(Ordering::Relaxed) {
+            slot.buf.unmap();
+            slot.mapped.store(false, Ordering::Relaxed);
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.readback.copy") });
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -199,13 +211,12 @@ impl ReadbackRing {
 
         // Map asynchronously; mark ready upon success via polling.
         let slice = slot.buf.slice(..);
-        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        let mapped_flag = std::sync::Arc::clone(&slot.mapped);
         slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = sender.send(res.is_ok());
+            if res.is_ok() { mapped_flag.store(true, Ordering::Relaxed); }
         });
-        // Non-blocking poll; the app can call `mapped` later to retrieve the previous ready slot.
+        // Non-blocking poll; readiness will be observed next frame via `mapped()`
         device.poll(wgpu::Maintain::Poll);
-        if let Some(Ok(true)) = receiver.try_receive() { slot.ready = true; }
         // Advance ring pointer
         self.curr = (self.curr + 1) % self.slots.len();
         Ok(())
@@ -214,9 +225,10 @@ impl ReadbackRing {
     pub fn mapped(&mut self) -> Option<ReadbackView<'_>> {
         let prev = (self.curr + self.slots.len() - 1) % self.slots.len();
         let slot = &mut self.slots[prev];
-        if !slot.ready { return None; }
+        if !slot.ready && !slot.mapped.load(Ordering::Relaxed) { return None; }
         let slice = slot.buf.slice(..);
         let guard = slice.get_mapped_range();
+        slot.ready = true; // latch until consumer takes a view at least once
         Some(ReadbackView { guard, bytes_per_row: self.bytes_per_row, width: self.extent.0, height: self.extent.1 })
     }
 }
@@ -233,7 +245,7 @@ struct ViewUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ViewData { viewport: [f32; 2], padding: [f32; 2] }
+struct ViewData { viewport: [f32; 2], time: f32, _pad: f32 }
 
 impl ViewUniforms {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32)) -> Self {
@@ -241,7 +253,7 @@ impl ViewUniforms {
             label: Some("view.bg_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -262,12 +274,12 @@ impl ViewUniforms {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
         });
         let this = Self { buf, layout, bg };
-        this.update(queue, size);
+        this.update(queue, size, 0.0);
         this
     }
 
-    fn update(&self, queue: &wgpu::Queue, size: (u32, u32)) {
-        let data = ViewData { viewport: [size.0 as f32, size.1 as f32], padding: [0.0, 0.0] };
+    fn update(&self, queue: &wgpu::Queue, size: (u32, u32), time: f32) {
+        let data = ViewData { viewport: [size.0 as f32, size.1 as f32], time, _pad: 0.0 };
         queue.write_buffer(&self.buf, 0, bytemuck::bytes_of(&data));
     }
 }
@@ -283,6 +295,13 @@ struct TerrainPipeline {
     bg: wgpu::BindGroup,
     tile_vbuf: wgpu::Buffer,
     tile_count: u32,
+    grid_cols: u32,
+    grid_rows: u32,
+    tile_w: u32,
+    tile_h: u32,
+    atlas_w: u32,
+    atlas_h: u32,
+    vbuf_capacity_bytes: u64,
 }
 
 #[repr(C)]
@@ -291,6 +310,8 @@ struct TileInstance {
     pos: [f32; 2],
     size: [f32; 2],
     atlas_uv: [f32; 4],
+    kind: u32,
+    slope: f32,
 }
 
 impl TerrainPipeline {
@@ -343,31 +364,131 @@ impl TerrainPipeline {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4] }] },
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Uint32, 4 => Float32] }] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, strip_index_format: None, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
-
-        let tile_vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("terrain.instances"), size: 1024 * std::mem::size_of::<TileInstance>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Self { pipeline, sampler, atlas, atlas_view, bg_layout, bg, tile_vbuf, tile_count: 0 }
+        let vbuf_capacity_bytes = (1024 * std::mem::size_of::<TileInstance>()) as u64;
+        let tile_vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("terrain.instances"), size: vbuf_capacity_bytes, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // default atlas grid config (3x2 tiles of 64px)
+        let grid_cols = 3;
+        let grid_rows = 2;
+        let tile_w = 64;
+        let tile_h = 64;
+        let atlas_w = grid_cols * tile_w;
+        let atlas_h = grid_rows * tile_h;
+        Self { pipeline, sampler, atlas, atlas_view, bg_layout, bg, tile_vbuf, tile_count: 0, grid_cols, grid_rows, tile_w, tile_h, atlas_w, atlas_h, vbuf_capacity_bytes }
+    }
+    fn init_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        // Generate a simple 3x2 atlas (DeepWater, ShallowWater, Sand, Grass, Bloom, Rock)
+        self.atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terrain.atlas.real"),
+            size: wgpu::Extent3d { width: self.atlas_w, height: self.atlas_h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.atlas_view = self.atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        // fill tiles with curated colors
+        let mut pixels = vec![0u8; (self.atlas_w * self.atlas_h * 4) as usize];
+        let colors: [[u8; 4]; 6] = [
+            [18, 98, 189, 255],  // DeepWater
+            [38, 140, 220, 255], // ShallowWater
+            [219, 180, 117, 255],// Sand
+            [90, 140, 64, 255],  // Grass
+            [159, 201, 84, 255], // Bloom
+            [125, 125, 125, 255],// Rock
+        ];
+        for row in 0..self.grid_rows {
+            for col in 0..self.grid_cols {
+                let idx = (row * self.grid_cols + col) as usize;
+                let color = colors.get(idx).copied().unwrap_or([255, 255, 255, 255]);
+                for y in 0..self.tile_h {
+                    for x in 0..self.tile_w {
+                        let px = col * self.tile_w + x;
+                        let py = row * self.tile_h + y;
+                        let offset = ((py * self.atlas_w + px) * 4) as usize;
+                        pixels[offset..offset + 4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+        queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &self.atlas, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &pixels,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(self.atlas_w * 4), rows_per_image: Some(self.atlas_h) },
+            wgpu::Extent3d { width: self.atlas_w, height: self.atlas_h, depth_or_array_layers: 1 },
+        );
+        // refresh bind group to point to the new view
+        self.bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain.bg.rebind"),
+            layout: &self.bg_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.atlas_view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
+        });
     }
 
-    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot) {
-        // Build tile instances for visible terrain (simple full mesh for now). In a follow‑up commit, add culling.
+    fn atlas_uv_for(&self, tile_index: u32) -> [f32; 4] {
+        // Map palette indices 0..5 to our 3x2 grid
+        let idx = (tile_index as usize).min(5);
+        let col = (idx % (self.grid_cols as usize)) as u32;
+        let row = (idx / (self.grid_cols as usize)) as u32;
+        let u0 = (col as f32 * self.tile_w as f32) / self.atlas_w as f32;
+        let v0 = (row as f32 * self.tile_h as f32) / self.atlas_h as f32;
+        let u1 = ((col + 1) as f32 * self.tile_w as f32) / self.atlas_w as f32;
+        let v1 = ((row + 1) as f32 * self.tile_h as f32) / self.atlas_h as f32;
+        [u0, v0, u1, v1]
+    }
+
+    fn ensure_vbuf_capacity(&mut self, device: &wgpu::Device, needed_bytes: u64) {
+        if needed_bytes <= self.vbuf_capacity_bytes { return; }
+        let mut cap = self.vbuf_capacity_bytes.max(1024);
+        while cap < needed_bytes { cap *= 2; }
+        self.tile_vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("terrain.instances.realloc"), size: cap, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        self.vbuf_capacity_bytes = cap;
+    }
+
+    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32)) {
+        // Build tile instances for visible terrain with simple CPU frustum culling.
         let (tw, th) = snapshot.terrain.dims;
         let cell = snapshot.terrain.cell_size as f32;
         let mut staging: Vec<TileInstance> = Vec::with_capacity((tw as usize) * (th as usize));
-        for y in 0..th {
-            for x in 0..tw {
+        let (vp_w, vp_h) = (viewport.0 as f32, viewport.1 as f32);
+        let elev_opt = snapshot.terrain.elevation;
+        let get_elev = |x: i32, y: i32| -> f32 {
+            if let Some(elev) = elev_opt {
+                let xi = x.clamp(0, (tw as i32) - 1) as usize;
+                let yi = y.clamp(0, (th as i32) - 1) as usize;
+                let idx = yi * (tw as usize) + xi;
+                elev.get(idx).copied().unwrap_or(0.5)
+            } else { 0.0 }
+        };
+        for y in 0..th as i32 {
+            for x in 0..tw as i32 {
                 let px = x as f32 * cell;
                 let py = y as f32 * cell;
-                staging.push(TileInstance { pos: [px, py], size: [cell, cell], atlas_uv: [0.0, 0.0, 1.0, 1.0] });
+                // cull offscreen tiles
+                if px >= vp_w || py >= vp_h || px + cell <= 0.0 || py + cell <= 0.0 { continue; }
+                let idx = (y as usize) * (tw as usize) + (x as usize);
+                let tile_id = snapshot.terrain.tiles.get(idx).copied().unwrap_or(3);
+                let uv = self.atlas_uv_for(tile_id);
+                // slope via central differences if elevation present
+                let slope = if elev_opt.is_some() {
+                    let dx = (get_elev(x + 1, y) - get_elev(x - 1, y)) * 0.5;
+                    let dy = (get_elev(x, y + 1) - get_elev(x, y - 1)) * 0.5;
+                    (dx * dx + dy * dy).sqrt().clamp(0.0, 1.0)
+                } else { 0.0 };
+                staging.push(TileInstance { pos: [px, py], size: [cell, cell], atlas_uv: uv, kind: tile_id, slope });
             }
         }
         if !staging.is_empty() {
+            let needed = (staging.len() * std::mem::size_of::<TileInstance>()) as u64;
+            self.ensure_vbuf_capacity(device, needed);
             queue.write_buffer(&self.tile_vbuf, 0, bytemuck::cast_slice(&staging));
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -390,14 +511,18 @@ struct VsIn {
   @location(0) pos: vec2<f32>,
   @location(1) size: vec2<f32>,
   @location(2) uv: vec4<f32>,
+  @location(3) kind: u32,
+  @location(4) slope: f32,
 };
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
+  @location(1) kind: u32,
+  @location(2) slope: f32,
 };
 
-struct View { viewport: vec2<f32>, _pad: vec2<f32> };
+struct View { viewport: vec2<f32>, time: f32, _pad: f32 };
 @group(1) @binding(0) var<uniform> view: View;
 
 @vertex
@@ -409,6 +534,8 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
   let ndc = vec2<f32>(xy.x / view.viewport.x * 2.0 - 1.0, 1.0 - (xy.y / view.viewport.y * 2.0));
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
   o.uv = mix(inst.uv.xy, inst.uv.zw, p);
+  o.kind = inst.kind;
+  o.slope = inst.slope;
   return o;
 }
 
@@ -417,7 +544,18 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
-  return textureSample(atlas_tex, atlas_smp, v.uv);
+  var base = textureSample(atlas_tex, atlas_smp, v.uv);
+  // water shimmer for Deep/Shallow water kinds (0,1)
+  if (v.kind <= 1u) {
+    let wave = sin((v.uv.x * 40.0 + v.uv.y * 28.0) + view.time * 2.2);
+    let shimmer = 0.05 + 0.07 * wave;
+    base.rgb = clamp(base.rgb + vec3<f32>(shimmer), vec3<f32>(0.0), vec3<f32>(1.0));
+  } else {
+    // slope accents (darken proportionally)
+    let darken = clamp(1.0 - v.slope * 0.35, 0.0, 1.0);
+    base.rgb *= vec3<f32>(darken);
+  }
+  return base;
 }
 "#;
 
@@ -426,6 +564,7 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
 struct AgentPipeline {
     pipeline: wgpu::RenderPipeline,
     vbuf: wgpu::Buffer,
+    vbuf_capacity_bytes: u64,
 }
 
 #[repr(C)]
@@ -451,16 +590,33 @@ impl AgentPipeline {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
-        let vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("agents.instances"), size: 1024 * std::mem::size_of::<AgentInstanceGpu>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Self { pipeline, vbuf }
+        let vbuf_capacity_bytes = (1024 * std::mem::size_of::<AgentInstanceGpu>()) as u64;
+        let vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("agents.instances"), size: vbuf_capacity_bytes, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        Self { pipeline, vbuf, vbuf_capacity_bytes }
     }
 
-    fn encode(&self, _device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot) {
+    fn ensure_vbuf_capacity(&mut self, device: &wgpu::Device, needed_bytes: u64) {
+        if needed_bytes <= self.vbuf_capacity_bytes { return; }
+        let mut cap = self.vbuf_capacity_bytes.max(1024);
+        while cap < needed_bytes { cap *= 2; }
+        self.vbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("agents.instances.realloc"), size: cap, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        self.vbuf_capacity_bytes = cap;
+    }
+
+    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32)) {
         let mut staging: Vec<AgentInstanceGpu> = Vec::with_capacity(snapshot.agents.len());
+        let (vp_w, vp_h) = (viewport.0 as f32, viewport.1 as f32);
         for a in snapshot.agents {
+            // CPU frustum culling (pixel-space); assumes positions/sizes are pixels in this pass
+            let half = a.size * 0.5;
+            if a.position[0] + half < 0.0 || a.position[0] - half > vp_w || a.position[1] + half < 0.0 || a.position[1] - half > vp_h {
+                continue;
+            }
             staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color });
         }
         if !staging.is_empty() {
+            let needed = (staging.len() * std::mem::size_of::<AgentInstanceGpu>()) as u64;
+            self.ensure_vbuf_capacity(device, needed);
             queue.write_buffer(&self.vbuf, 0, bytemuck::cast_slice(&staging));
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -492,13 +648,17 @@ struct VsOut {
   @location(2) radius: f32,
 };
 
+struct View { viewport: vec2<f32>, time: f32, _pad: f32 };
+@group(0) @binding(0) var<uniform> view: View;
+
 @vertex
 fn vs_main(inst: InInst, @builtin(vertex_index) vid: u32) -> VsOut {
   var o: VsOut;
   var quad = array<vec2<f32>, 4>(vec2<f32>(-0.5,-0.5), vec2<f32>(0.5,-0.5), vec2<f32>(-0.5,0.5), vec2<f32>(0.5,0.5));
   let l = quad[vid];
   let world = inst.pos + l * inst.size;
-  o.pos = vec4<f32>(world, 0.0, 1.0);
+  let ndc = vec2<f32>(world.x / view.viewport.x * 2.0 - 1.0, 1.0 - (world.y / view.viewport.y * 2.0));
+  o.pos = vec4<f32>(ndc, 0.0, 1.0);
   o.color = inst.color;
   o.local = l;          // range [-0.5, 0.5]
   o.radius = inst.size; // pixel radius

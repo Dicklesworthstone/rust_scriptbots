@@ -13,6 +13,8 @@ scriptbots-storage = { path = "../scriptbots-storage" }
 kira = { workspace = true, optional = true }
 rand = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
+scriptbots-world-gfx = { path = "../scriptbots-world-gfx", optional = true }
 
 [features]
 audio = ["kira"]
+world_wgpu = ["scriptbots-world-gfx"]
