@@ -174,7 +174,7 @@ mod world_compositor {
 
     impl Compositor {
         pub fn new() -> Self {
-            let max_fps = std::env::var("SB_WGPU_MAX_FPS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+            let max_fps = std::env::var("SB_WGPU_MAX_FPS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(60.0);
             let min_interval = if max_fps > 0.0 { (1.0 / max_fps).max(0.001) } else { 0.0 };
             let render_scale = std::env::var("SB_WGPU_RES_SCALE").ok().and_then(|s| s.parse::<f32>().ok()).map(|v| v.clamp(0.25, 1.0)).unwrap_or(1.0);
             Self { renderer: None, image: None, adapter: None, cam_scale: 1.0, cam_offset: (0.0, 0.0), last_submit: None, min_interval, render_scale }
@@ -255,7 +255,7 @@ mod world_compositor {
 
         pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) {
             if let Some(img) = &self.image {
-                let mode = std::env::var("SB_WGPU_PRESENT_MODE").ok();
+                let mode = std::env::var("SB_WGPU_PRESENT_MODE").ok().or_else(|| Some("diff".to_string()));
                 match mode.as_deref() {
                     Some("full") => img.paint_full(bounds, window),
                     Some("diff") | _ => img.paint_diff(bounds, window),

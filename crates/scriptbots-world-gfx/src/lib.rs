@@ -824,7 +824,6 @@ struct PostFx {
     sampler: wgpu::Sampler,
     src_layout: wgpu::BindGroupLayout, // src color + sampler + bloom texture
     src_bg: wgpu::BindGroup,
-    params_layout: wgpu::BindGroupLayout,
     params_bg: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     target: wgpu::Texture,
@@ -836,7 +835,6 @@ struct PostFx {
     bloom_blur_pipeline: wgpu::RenderPipeline,
     bloom_src_layout: wgpu::BindGroupLayout, // single texture + sampler
     bloom_src_bg: wgpu::BindGroup,
-    blur_params_layout: wgpu::BindGroupLayout,
     blur_params_bg: wgpu::BindGroup,
     blur_params_buf: wgpu::Buffer,
     bloom_a: Option<wgpu::Texture>,
@@ -975,13 +973,13 @@ impl PostFx {
             last_env_update: None,
             env_exposure: 1.0,
             env_vignette: 0.08,
-            env_tonemap: 0,
+            env_tonemap: 1, // aces
             env_fxaa: 0,
-            env_bloom_on: 0,
+            env_bloom_on: 1,
             env_bloom_thresh: 0.8,
             env_bloom_intensity: 0.65,
-            env_fog_enabled: 0,
-            env_fog_density: 0.0,
+            env_fog_enabled: 1,
+            env_fog_density: 0.6, // low
             env_fog_color: [0.6, 0.7, 0.8],
         }
     }
@@ -1075,6 +1073,8 @@ impl PostFx {
             _pad0: 0.0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        // Recreate params bind group (demonstrates use of params_layout; allows for dynamic layout changes in future)
+        self.params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("post.params_bg.rebind"), layout: &self.params_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() }] });
 
         // Bloom pass chain if enabled
         let mut bloom_view_opt: Option<wgpu::TextureView> = None;
@@ -1099,6 +1099,7 @@ impl PostFx {
             // Blur A -> B (horizontal)
             let dir_h: [f32; 4] = [1.0 / (size.0.max(1) as f32 * 0.5), 0.0, 0.0, 0.0];
             queue.write_buffer(&self.blur_params_buf, 0, bytemuck::bytes_of(&dir_h));
+            self.blur_params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bloom.blur_params_bg.rebind"), layout: &self.blur_params_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.blur_params_buf.as_entire_binding() }] });
             self.bind_bloom_src(device, &a_view_local);
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1114,6 +1115,7 @@ impl PostFx {
             // Blur B -> A (vertical)
             let dir_v: [f32; 4] = [0.0, 1.0 / (size.1.max(1) as f32 * 0.5), 0.0, 0.0];
             queue.write_buffer(&self.blur_params_buf, 0, bytemuck::bytes_of(&dir_v));
+            self.blur_params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bloom.blur_params_bg.rebind"), layout: &self.blur_params_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.blur_params_buf.as_entire_binding() }] });
             self.bind_bloom_src(device, &b_view_local);
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1145,11 +1147,19 @@ impl PostFx {
 }
 
 fn wants_post() -> bool {
-    // Defaults: off unless explicitly enabled via envs.
-    std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0
-        || std::env::var("SB_WGPU_TONEMAP").map(|v| !v.is_empty()).unwrap_or(false)
-        || std::env::var("SB_WGPU_BLOOM").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0
-        || matches!(std::env::var("SB_WGPU_FOG").ok().as_deref(), Some("low") | Some("med") | Some("high"))
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, bool)>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), true)));
+    let mut guard = cache.lock().unwrap();
+    let (last, val) = &mut *guard;
+    if last.elapsed().as_millis() > 250 {
+        let fxaa = std::env::var("SB_WGPU_FXAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 0;
+        let tonemap = std::env::var("SB_WGPU_TONEMAP").map(|v| !v.is_empty()).unwrap_or(true);
+        let bloom = std::env::var("SB_WGPU_BLOOM").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1) != 0;
+        let fog = matches!(std::env::var("SB_WGPU_FOG").ok().as_deref(), Some("low") | Some("med") | Some("high"));
+        *val = fxaa || tonemap || bloom || fog;
+        *last = std::time::Instant::now();
+    }
+    *val
 }
 
 const POST_WGSL: &str = r#"
