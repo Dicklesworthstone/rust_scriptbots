@@ -1,7 +1,7 @@
 //! Minimal wgpu triangle smoke test (no vertex buffers).
 //! Run: `cargo run -p scriptbots-world-gfx --bin wgpu_triangle`
 
-use winit::{event::Event, event_loop::EventLoop, window::WindowBuilder};
+use winit::{event::Event, event_loop::EventLoop};
 
 #[cfg(target_os = "macos")]
 const BACKEND: wgpu::Backends = wgpu::Backends::METAL;
@@ -12,10 +12,10 @@ fn main() { pollster::block_on(run()); }
 
 async fn run() {
     let event_loop = EventLoop::new().expect("event loop");
-    let window = WindowBuilder::new()
-        .with_title("wgpu triangle smoke test")
-        .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0))
-        .build(&event_loop)
+    let window = event_loop
+        .create_window(winit::window::Window::default_attributes()
+            .with_title("wgpu triangle smoke test")
+            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0)))
         .expect("window");
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: BACKEND, ..Default::default() });
@@ -24,7 +24,7 @@ async fn run() {
         .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false })
         .await
         .expect("adapter");
-    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.expect("device");
+    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.expect("device");
 
     let size = window.inner_size();
     let format = surface
@@ -103,7 +103,7 @@ fn fs() -> @location(0) vec4<f32> {
 
     let start = std::time::Instant::now();
 
-    let _ = event_loop.run(move |event, target| {
+    let _ = event_loop.run(move |event, target: &winit::event_loop::ActiveEventLoop| {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 winit::event::WindowEvent::CloseRequested => target.exit(),

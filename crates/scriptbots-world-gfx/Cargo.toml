@@ -15,6 +15,7 @@ bytemuck = { version = "1.16", features = ["derive"] }
 glam = { version = "0.30", default-features = false, features = ["std"] }
 tracing = { version = "0.1" }
 futures-intrusive = "0.5"
+pollster = "0.4"
 
 [features]
 default = []
@@ -23,7 +24,14 @@ perf_counters = []
 
 
 [dev-dependencies]
-pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
-winit = { version = "0.29", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "wayland", "x11"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
 
