@@ -19,5 +19,6 @@ futures-intrusive = "0.5"
 [features]
 default = []
 compute_binning = []
+perf_counters = []
 
 

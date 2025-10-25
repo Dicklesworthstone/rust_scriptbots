@@ -101,7 +101,7 @@
 - Bigger wins require reducing scalar control-flow inside the hot loops and processing neighbors in blocks (4–8) where we can execute the same arithmetic in lockstep.
 
 ### Goals and Success Criteria
-- Primary: Improve ticks/sec by 15–30% at 5k–10k agents in CPU-only builds on typical 8–16 core machines while preserving deterministic physics and outputs within the project’s defined tolerances.
+- Primary: Improve ticks/sec by 15–30% at 5k–10k agents in CPU-only builds on typical 8–16 core machines while preserving deterministic physics and outputs within the project's defined tolerances.
 - Secondary: Keep code readable and maintainable with minified risk: SIMD behind a feature gate (`simd_wide`) and scalar fallback always compiled and tested.
 - Determinism: Maintain identical outputs vs. scalar path at single-threaded and multi-threaded settings (order preservation and stable floating-point reduction strategies).
 
@@ -140,7 +140,7 @@
   - Preserve output application order by iterating buckets in stable order and emitting per-index results identically.
   - Avoid horizontal reductions that change addition order; accumulate per-agent values in the same index order as the scalar loop (append per-lane in increasing index).
 - Tests:
-  - Seeded determinism tests already ensure summary equivalence. We’ll add specific equality checks for sensors and combat hits on micro scenes (small neighborhoods) across scalar vs. SIMD modes and across thread counts.
+  - Seeded determinism tests already ensure summary equivalence. We'll add specific equality checks for sensors and combat hits on micro scenes (small neighborhoods) across scalar vs. SIMD modes and across thread counts.
 
 ### Data Layout & Indexing
 - SoA snapshots: Continue to expand `work_*` vectors for everything used inside hot loops (eye FOVs, eye directions, trait modifiers, sound emitters, heading sin/cos) to maximize cache locality and enable contiguous reads in SIMD lanes.
@@ -677,17 +677,17 @@ Implementation notes [2025-10-23]:
    - CopyTextureToBuffer into a row‑padded staging buffer (wgpu requires 256‑byte alignment for `bytes_per_row`). We compute stride = align(width * 4, 256).
    - Triple‑buffered staging:
      - Allocate 3 persistent `wgpu::Buffer`s in MAP_READ | COPY_DST usage; rotate each frame.
-     - Issue copy → `buffer.slice(..).map_async(Read)` without awaiting; poll via a lightweight fence API and read only when `IsReady`. The previous frame’s buffer is typically ready by the time we need to upload to GPUI, avoiding stalls.
+     - Issue copy → `buffer.slice(..).map_async(Read)` without awaiting; poll via a lightweight fence API and read only when `IsReady`. The previous frame's buffer is typically ready by the time we need to upload to GPUI, avoiding stalls.
    - GPUI image persistence:
      - Maintain persistent GPUI image objects/buffers sized to the current viewport; reuse them every frame (no reallocations).
-     - CPU‑side memcpy from mapped staging into GPUI’s image backing memory; then invalidate/mark dirty for GPUI to present.
-   - Ring‑buffer the uploads: when a frame’s staging map isn’t ready, skip re‑upload and reuse the last image (prevents blocking the UI thread).
+     - CPU‑side memcpy from mapped staging into GPUI's image backing memory; then invalidate/mark dirty for GPUI to present.
+   - Ring‑buffer the uploads: when a frame's staging map isn't ready, skip re‑upload and reuse the last image (prevents blocking the UI thread).
 
 3) Color/format discipline
    - Always RGBA8 sRGB for the render target and GPUI image. No per‑pixel swizzles or conversions. No tonemapping on CPU.
 
 4) Resize & scale
-   - Renderer tracks `world_view_size` separately from the window; when GPUI’s layout changes, call `resize` to recreate the color target and the three staging buffers with correctly aligned rows.
+   - Renderer tracks `world_view_size` separately from the window; when GPUI's layout changes, call `resize` to recreate the color target and the three staging buffers with correctly aligned rows.
    - Snapshots include world size; camera maps world→view consistently; culling uses updated frustum.
 
 5) Integration in `scriptbots-render`
@@ -712,7 +712,7 @@ Implementation notes [2025-10-23]:
    - Typical added latency: ~1 frame at 60–120 FPS. Acceptable for the simulation; HUD remains interactive.
 
 8) 4K/High‑refresh guidance
-   - 4K@60 (~33.2 MB/frame) is fine on PCIe 4.0 and Apple Silicon unified memory. 4K@120 approaches ~8 GB/s round‑trip; still feasible on high‑end systems but we’ll expose a toggle to halve the world buffer rate or resolution when needed.
+   - 4K@60 (~33.2 MB/frame) is fine on PCIe 4.0 and Apple Silicon unified memory. 4K@120 approaches ~8 GB/s round‑trip; still feasible on high‑end systems but we'll expose a toggle to halve the world buffer rate or resolution when needed.
    - If we outgrow readback at ultra‑high refresh rates, we can add a zero‑copy external‑texture path later (requires GPUI API support).
 
 ### Deliverables
@@ -741,13 +741,122 @@ Implementation notes [2025-10-23]:
 - 2025-10-24: Created new crate `scriptbots-world-gfx` (workspace member) with initial `WorldRenderer` skeleton, RGBA8 sRGB color target, and triple‑buffered readback ring API (non‑blocking poll). This establishes the offscreen render + readback contract for GPUI composition. Next: wire minimal terrain/agent pipelines and the GPUI compositor stub.
 - 2025-10-24: Implemented two instanced pipelines (terrain + agents). Terrain uses a texture‑atlas, linear sampling, and alpha blending; agents render as SDF circles with rim highlights for premium visuals. Added viewport uniform (bind groups) and correct NDC mapping, plus per‑frame updates and resize propagation. Next: biome-aware atlas UVs, water shimmer/slope accents, CPU frustum culling, and GPUI compositor upload path.
  - 2025-10-24: Terrain atlas UV mapping and visual polish landed. Generated a compact 3×2 atlas (Deep/ Shallow water, Sand, Grass, Bloom, Rock) and wired UV selection per tile. Added water shimmer (time-driven) for water tiles and slope-based darkening accents using elevation gradients. Introduced CPU frustum culling for terrain and agents, uniform time in the view UBO, and dynamic instance buffer reallocation. Agents pipeline now uses correct NDC mapping via the view UBO. Next: compositor stub in `scriptbots-render` behind feature `world_wgpu`, persistent GPUI image, and ring-buffered uploads.
- - 2025-10-25: Wired world compositor behind `world_wgpu`. Offscreen render+triple-buffer readback is integrated; interim decimated blit presents the frame in GPUI while we finish persistent image upload. Added camera scale/offset to world-gfx uniforms and shaders so GPUI’s pan/zoom can be passed to the wgpu renderer. Resize propagation is in place; readback and upload buffers persist across frames. Next: swap decimated blit for persistent GPUI image upload/draw; add selection/hover rings in the wgpu agent pass; finalize quality knobs and tests.
+ - 2025-10-25: Wired world compositor behind `world_wgpu`. Offscreen render+triple-buffer readback is integrated; interim decimated blit presents the frame in GPUI while we finish persistent image upload. Added camera scale/offset to world-gfx uniforms and shaders so GPUI's pan/zoom can be passed to the wgpu renderer. Resize propagation is in place; readback and upload buffers persist across frames. Next: swap decimated blit for persistent GPUI image upload/draw; add selection/hover rings in the wgpu agent pass; finalize quality knobs and tests.
  - 2025-10-25: Camera mapping fully wired GPUI→wgpu; culling and transforms use the same pan/zoom. Added selection/hover glow to the agent shader and a renderer quality knob (SB_WGPU_RES_SCALE) and FPS cap (SB_WGPU_MAX_FPS). Next: replace interim decimated blit with persistent GPUI image upload/draw; terrain/agent polish and perf/tests.
+ - 2025-10-25: Replaced interim decimated blit with a persistent image-present path in GPUI (no fork). The compositor now keeps a reusable RGBA buffer with row padding and paints via full/diff modes (SB_WGPU_PRESENT_MODE=full|diff). Diff mode coalesces changed runs to minimize draw calls while avoiding per‑pixel transforms. Camera pan/zoom is forwarded to the wgpu renderer each frame; resize preserves ring buffers and image. Quality knobs: SB_WGPU_RES_SCALE (offscreen resolution), SB_WGPU_MAX_FPS (upload cap). Next: terrain/agent visual polish (atlas variants, caustics tuning), perf probes at 1080p/1440p/4K, and basic stride/row alignment tests.
++ - 2025-10-25: Terrain/agent polish landed. Water caustics tuned (shallow vs deep), subtle biome variation added (grass/bloom/rock) using world‑space hash; atlas generator applies mild vignette for non‑water tiles. Agent boost visuals: warm tint and small rim gain; passed via instance. Added microtests (stride alignment; boost tint clamp) and optional perf counters (feature `perf_counters`) for render/readback timings in `scriptbots-world-gfx`.
 
 ### Maintenance & Risk Notes
 - No GPUI fork. Unmodified upstream stays in `Cargo.toml`.
-- The renderer crate is self‑contained; future upgrades (e.g., zero‑copy textures) won’t impact core/hud code.
+- The renderer crate is self‑contained; future upgrades (e.g., zero‑copy textures) won't impact core/hud code.
 - Platform backends come from wgpu; we test Metal (macOS) and Vulkan (Linux/Windows) in CI where available.
+
+## Cribbed Visual & Renderer Techniques from Open‑Source Rust/wgpu Projects (Detailed Plan)
+
+### Sources (inspiration references)
+- Veloren (voxel RPG): terrain/sky/atmospherics, stylized lighting, wind‑driven vegetation.
+- Ambient (engine): clustered forward lighting, HDR + bloom + tonemapping stack, render‑graph discipline.
+- Bevy (engine): PBR on wgpu, cascaded shadow maps, HDR pipeline, SSAO, bloom.
+- rend3 (renderer lib): clean framegraph/passes, materials/camera/exposure, light binning.
+- wgpu examples / Learn wgpu: shadow mapping, compute particles, sky models, deferred/forward variants.
+
+We adapt techniques to our 2D world view rendered in wgpu with offscreen composition in GPUI. The focus is stylized clarity, performance, and determinism.
+
+### Feature Matrix → Implementation Notes
+
+- Post‑FX chain (HDR → tonemap → bloom → vignette → LUT color grade)
+  - Why: immediate perceived quality bump; cheap compared to geometry changes.
+  - Implementation:
+    - Add a full‑screen post pass after world render, before readback: `post.wgsl` sampling the world color.
+    - HDR buffer: keep world target linear (already RGBA8 sRGB). For HDR‑like headroom, add optional `Rgba16Float` offscreen when `SB_WGPU_HDR=1`; fallback to current 8‑bit with gentle curve.
+    - Tonemapping: ACES fitted curve with exposure parameter (uniform). Env knobs: `SB_WGPU_TONEMAP=aces|filmic|reinhard`, `SB_WGPU_EXPOSURE`.
+    - Bloom: dual‑kawase or mips‑based blur pyramid. Knobs: `SB_WGPU_BLOOM=1`, `SB_WGPU_BLOOM_THRESH` (0..1), `SB_WGPU_BLOOM_INTENSITY`.
+    - Vignette + LUT: mild vignette (configurable) and optional 3D LUT sampling for palette modes. Knob: `SB_WGPU_LUT_PATH` (feature‑gated file IO off by default).
+  - Determinism: all math pure/algebraic, no temporal accumulation by default; TAA behind opt‑in.
+
+- Atmospherics (height‑fog + stylized sky)
+  - Why: depth separation and mood at minimal cost, as used by Veloren/Bevy samples.
+  - Implementation:
+    - Height‑fog in post pass: fog factor from agent/terrain world y or per‑pixel proxy depth (screen y) for 2D; exponential density with color from sky gradient.
+    - Sky gradient: time‑of‑day driven 2‑color or 3‑stop gradient; uniform time already present.
+  - Knobs: `SB_WGPU_FOG=off|low|med|high`, `SB_WGPU_FOG_COLOR`, `SB_WGPU_DAY_PHASE`.
+
+- Water polish (flow/foam/fresnel)
+  - Why: water is a large visual element; Ambient/Bevy water demos show strong payoff.
+  - Implementation:
+    - Extend terrain FS: sample normal map (blue noise or small tile), add Fresnel tint based on view angle proxy (2D: use screen‑space gradient), animated flow via UV perturb (2‑channel flow map).
+    - Shoreline foam: derive foam mask from local slope or a precomputed distance field to land.
+  - Knobs: `SB_WGPU_WATER_NORMALS=on`, `SB_WGPU_WATER_FLOW=on`, `SB_WGPU_WATER_FOAM=on`.
+
+- Clustered/Tile light bins (forward+)
+  - Why: many small ephemeral lights (spikes, reproduction bursts) without N×pixels cost.
+  - Implementation (Phase 2+):
+    - Compute pass: bin N lights into a 2D tile grid (or 3D clusters with slice by view y/depth proxy), write SSBO of indices.
+    - Post or world pass blends sampled light accumulation additively.
+  - Knobs: `SB_WGPU_LIGHTS=off|tile`, `SB_WGPU_LIGHT_TILE=16` (px), light cap.
+  - Determinism: stable sort of lights by id; bins built from deterministic scene snapshot.
+
+- SSAO‑lite (grounding)
+  - Why: subtle grounding under agents/terrain features (Bevy/GTAO inspired) at small cost.
+  - Implementation: screen‑space sample kernel over world texture brightness/normal proxy (derive pseudo normal from terrain slope); darken ambient.
+  - Knobs: `SB_WGPU_SSAO=off|low|med`, radius/samples.
+  - Determinism: fixed kernel, no noise textures; or use precomputed blue noise table seeded by tick.
+
+- GPU particles (compute)
+  - Why: dynamic “life” (impacts, births, deaths) as seen in engines and wgpu particle examples.
+  - Implementation:
+    - Storage buffer of particles updated in compute (spawn/age/physics), render as instanced quads in a cheap pass.
+    - Hooks: spike hits, reproduction events stream short‑lived particles.
+  - Knobs: `SB_WGPU_PARTICLES=on`, caps for counts and spawn per event; quality tier scales with render scale.
+  - Determinism: seed spawns from event id/tick; update in fixed order.
+
+- Anti‑aliasing (FXAA/SMAA) and TAA (optional)
+  - Why: sharper visuals on thin geometry/text; common in Bevy/rend3 pipelines.
+  - Implementation: post‑pass FXAA first; TAA gated behind `SB_WGPU_TAA=1` (requires velocity buffer or estimated motion; default off).
+  - Knobs: `SB_WGPU_FXAA=1`, `SB_WGPU_TAA=0`.
+
+### Render Graph & Pass Ordering (single offscreen target)
+1) world: terrain + agents → world_color
+2) optional particles add → world_color
+3) post: tonemap → tmp
+4) bloom: extract + blur → bloom_tex
+5) composite: tmp + bloom + vignette + fog/sky + (optional) AO → present_color
+6) readback: present_color → staging ring (existing)
+
+We will keep a small render‑graph struct in `scriptbots-world-gfx` that owns passes, textures, and recreates them on resize or flag changes. All toggles wired to env vars first, then to runtime knobs.
+
+### Feature Flags, Env Knobs, and Defaults
+- Flags: `perf_counters` (landed), `postfx` (new), `particles` (new), `cluster_lights` (new; later).
+- Env default toggles:
+  - `SB_WGPU_TONEMAP=aces`, `SB_WGPU_BLOOM=1`, `SB_WGPU_FXAA=1`, `SB_WGPU_FOG=low`.
+  - Quality scaling: honor `SB_WGPU_RES_SCALE` and skip expensive passes when scale < 0.6.
+
+### Determinism & Testing Strategy
+- No temporal accumulation by default; where used (TAA), keep off unless explicitly enabled.
+- Fixed kernels, stable orderings (lights/particles/events sorted by id/tick).
+- Tests:
+  - Unit: clamp/tonemap curves monotonicity; bloom threshold correctness; fog factor ranges.
+  - Headless snapshot: render seeded scenes, hash present_color; assert stable hashes across runs/platforms (within epsilon on float tolerant compare for HDR path; strict for 8‑bit path).
+
+### Performance Targets & Budgets (1080p reference)
+- Baseline (no post): unchanged vs. current.
+- Post‑FX minimal (FXAA + ACES): ≤ 0.6 ms/frame.
+- Bloom (dual‑kawase) medium: ≤ 1.2 ms/frame.
+- Fog + vignette + LUT: ≤ 0.4 ms/frame.
+- Particles (5k quads): ≤ 0.8 ms/frame on mid‑tier dGPU; skip above thresholds.
+Knobs gate work under `SB_WGPU_MAX_FPS` and reuse last‑ready frame when budgets exceeded.
+
+### Rollout Phases
+1) Post‑FX MVP: FXAA + ACES + mild vignette; hooks and uniforms; tests + docs.
+2) Bloom + fog/sky: extraction/blur chain; height‑fog; quality knobs; snapshot tests.
+3) Water polish: normals/flow/foam; LUT grading (optional).
+4) Particles compute pass: event hooks; caps; determinism tests.
+5) (Optional) SSAO‑lite + tile lights: gated behind flags; perf validation.
+
+### Integration Notes
+- No GPUI fork. World image presented exactly as today; only the offscreen wgpu pipeline changes.
+- Preserve readback path/stride math; tests remain valid. Respect `SB_WGPU_RES_SCALE` and `SB_WGPU_MAX_FPS`.
+- Expose runtime toggles via REST/MCP once stable (mirror envs → knobs).
 
 
 ## Sandbox Map Creator (Wave Function Collapse) — Comprehensive Roadmap [Currently In Progress - GPT-5 Codex 2025-10-23]

@@ -29,6 +29,7 @@ pub struct AgentInstance {
     pub color: [f32; 4],
     pub selection: u32,    // 0=None, 1=Hovered, 2=Selected/Focused
     pub glow: f32,         // 0..1 extra glow (e.g., reproduction/spike)
+    pub boost: f32,        // 0..1 boost intensity
 }
 
 pub struct WorldRenderer {
@@ -45,6 +46,10 @@ pub struct WorldRenderer {
     cam_scale: f32,
     cam_offset: (f32, f32),
     start_time: Instant,
+    #[cfg(feature = "perf_counters")]
+    last_render_ms: f32,
+    #[cfg(feature = "perf_counters")]
+    last_readback_ms: f32,
 }
 
 pub struct RenderFrame {
@@ -80,6 +85,10 @@ impl WorldRenderer {
             cam_scale: 1.0,
             cam_offset: (0.0, 0.0),
             start_time: Instant::now(),
+            #[cfg(feature = "perf_counters")]
+            last_render_ms: 0.0,
+            #[cfg(feature = "perf_counters")]
+            last_readback_ms: 0.0,
         })
     }
 
@@ -104,6 +113,8 @@ impl WorldRenderer {
     }
 
     pub fn render(&mut self, snapshot: &WorldSnapshot) -> RenderFrame {
+        #[cfg(feature = "perf_counters")]
+        let t0 = Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.render") });
@@ -128,14 +139,23 @@ impl WorldRenderer {
         self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
         self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
         self.queue.submit(Some(encoder.finish()));
+        #[cfg(feature = "perf_counters")]
+        { self.last_render_ms = t0.elapsed().as_secs_f32() * 1000.0; }
         RenderFrame { extent: self.size }
     }
 
     pub fn copy_to_readback(&mut self, _frame: &RenderFrame) -> Result<(), String> {
+        #[cfg(feature = "perf_counters")]
+        let t0 = Instant::now();
         self.readback.copy(&self.device, &self.queue, &self.color)
+            .map(|_| ())
+            .and_then(|_| { #[cfg(feature = "perf_counters")] { self.last_readback_ms = t0.elapsed().as_secs_f32() * 1000.0; } Ok(()) })
     }
 
     pub fn mapped_rgba(&mut self) -> Option<ReadbackView<'_>> { self.readback.mapped() }
+
+    #[cfg(feature = "perf_counters")]
+    pub fn last_timings_ms(&self) -> (f32, f32) { (self.last_render_ms, self.last_readback_ms) }
 }
 
 fn create_color(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
@@ -247,6 +267,39 @@ impl ReadbackRing {
 fn align_256(n: u32) -> u32 { ((n + 255) / 256) * 256 }
 
 // ---------------- View uniforms (viewport size) ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::align_256;
+
+    #[test]
+    fn stride_alignment_is_multiple_of_256() {
+        let widths = [1u32, 2, 63, 64, 65, 257, 1023, 1920, 2560, 3840];
+        for w in widths {
+            let raw = w * 4; // RGBA8 bytes per row without alignment
+            let aligned = align_256(raw);
+            assert_eq!(aligned % 256, 0, "aligned stride must be a multiple of 256 for width {w}");
+            assert!(aligned >= raw, "aligned stride must be >= raw stride");
+            assert!(aligned <= raw + 255, "aligned stride must not exceed raw+255");
+        }
+    }
+
+    #[test]
+    fn agent_boost_tint_within_bounds() {
+        // approximate the WGSL tint effect: base.rgb + (boost*0.35)*vec3(0.6,0.2,0.0)
+        for &boost in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let tint = boost * 0.35;
+            let add = [tint * 0.6, tint * 0.2, 0.0];
+            let mut base = [0.4f32, 0.5, 0.6];
+            for i in 0..3 {
+                base[i] = (base[i] + add[i]).clamp(0.0, 1.0);
+            }
+            assert!((0.0..=1.0).contains(&base[0]));
+            assert!((0.0..=1.0).contains(&base[1]));
+            assert!((0.0..=1.0).contains(&base[2]));
+        }
+    }
+}
 
 struct ViewUniforms {
     buf: wgpu::Buffer,
@@ -427,7 +480,18 @@ impl TerrainPipeline {
                         let px = col * self.tile_w + x;
                         let py = row * self.tile_h + y;
                         let offset = ((py * self.atlas_w + px) * 4) as usize;
-                        pixels[offset..offset + 4].copy_from_slice(&color);
+                        let mut rgba = color;
+                        // add gentle vignette/variation for non-water tiles
+                        if idx >= 2 {
+                            let fx = (x as f32 / self.tile_w as f32 - 0.5).abs();
+                            let fy = (y as f32 / self.tile_h as f32 - 0.5).abs();
+                            let vignette = (fx.max(fy) * 0.12) as f32;
+                            let dim = (1.0 - vignette).clamp(0.85, 1.0);
+                            rgba[0] = ((rgba[0] as f32) * dim) as u8;
+                            rgba[1] = ((rgba[1] as f32) * dim) as u8;
+                            rgba[2] = ((rgba[2] as f32) * dim) as u8;
+                        }
+                        pixels[offset..offset + 4].copy_from_slice(&rgba);
                     }
                 }
             }
@@ -537,6 +601,7 @@ struct VsOut {
   @location(0) uv: vec2<f32>,
   @location(1) kind: u32,
   @location(2) slope: f32,
+  @location(3) world: vec2<f32>,
 };
 
 struct View { v0: vec4<f32>, v1: vec4<f32> }; // v0=(viewport.x,viewport.y,time,scale) v1=(offset_x,offset_y,_,_)
@@ -557,6 +622,7 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
   o.uv = mix(inst.uv.xy, inst.uv.zw, p);
   o.kind = inst.kind;
   o.slope = inst.slope;
+  o.world = inst.pos;
   return o;
 }
 
@@ -570,14 +636,23 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   if (v.kind <= 1u) {
     let time = view.v0.z;
     let wave = sin((v.uv.x * 40.0 + v.uv.y * 28.0) + time * 2.2);
-    let shimmer = 0.05 + 0.07 * wave;
-    // subtle caustics grid for shallow water
-    let ca = (sin(v.uv.x * 160.0 + time * 1.8) * sin(v.uv.y * 140.0 + time * 1.6)) * 0.04;
+    let shimmer = 0.04 + 0.06 * wave;
+    // tuned caustics: stronger on shallow (kind==1), very subtle on deep (kind==0)
+    let ca_s = (sin(v.uv.x * 160.0 + time * 1.7) * sin(v.uv.y * 140.0 + time * 1.5));
+    let ca_amp = select(0.01, 0.05, v.kind == 1u);
+    let ca = ca_s * ca_amp;
     base.rgb = clamp(base.rgb + vec3<f32>(shimmer + ca), vec3<f32>(0.0), vec3<f32>(1.0));
   } else {
     // slope accents (darken proportionally)
     let darken = clamp(1.0 - v.slope * 0.35, 0.0, 1.0);
     base.rgb *= vec3<f32>(darken);
+  }
+  // subtle biome variation for grass/bloom/rock (kinds 3,4,5)
+  if (v.kind >= 3u && v.kind <= 5u) {
+    // stable hash from world coords -> [-1,1] noise
+    let h = fract(sin(dot(v.world, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    let n = (h * 2.0 - 1.0) * 0.06; // +/-6% brightness tweak
+    base.rgb = clamp(base.rgb * (1.0 + n), vec3<f32>(0.0), vec3<f32>(1.0));
   }
   return base;
 }
@@ -600,7 +675,8 @@ struct AgentInstanceGpu {
     color: [f32; 4],
     selection: u32,
     glow: f32,
-    _pad2: [f32; 2],
+    boost: f32,
+    _pad2: [f32; 1],
 }
 
 impl AgentPipeline {
@@ -610,7 +686,7 @@ impl AgentPipeline {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("agents.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4, 4 => Uint32, 5 => Float32] }] },
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4, 4 => Uint32, 5 => Float32, 6 => Float32] }] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: None,
@@ -642,7 +718,7 @@ impl AgentPipeline {
             if cx + radius < 0.0 || cx - radius > vp_w || cy + radius < 0.0 || cy - radius > vp_h {
                 continue;
             }
-            staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color, selection: a.selection, glow: a.glow, _pad2: [0.0, 0.0] });
+            staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color, selection: a.selection, glow: a.glow, boost: a.boost, _pad2: [0.0] });
         }
         if !staging.is_empty() {
             let needed = (staging.len() * std::mem::size_of::<AgentInstanceGpu>()) as u64;
@@ -671,6 +747,7 @@ struct InInst {
   @location(3) color: vec4<f32>,
   @location(4) selection: u32,
   @location(5) glow: f32,
+  @location(6) boost: f32,
 };
 
 struct VsOut {
@@ -680,6 +757,7 @@ struct VsOut {
   @location(2) radius: f32,
   @location(3) selection: u32,
   @location(4) glow: f32,
+  @location(5) boost: f32,
 };
 
 struct View { v0: vec4<f32>, v1: vec4<f32> }; // v0=(viewport.x,viewport.y,time,scale) v1=(offset_x,offset_y,_,_)
@@ -701,6 +779,7 @@ fn vs_main(inst: InInst, @builtin(vertex_index) vid: u32) -> VsOut {
   o.radius = inst.size; // pixel radius
   o.selection = inst.selection;
   o.glow = inst.glow;
+  o.boost = inst.boost;
   return o;
 }
 
@@ -713,8 +792,11 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   var base = v.color;
   base.a = base.a * edge;
   let sel_glow = select(0.0, 0.25, v.selection == 1u) + select(0.0, 0.45, v.selection == 2u);
+  let boost_tint = v.boost * 0.35;
+  // apply subtle boost tint towards warm color when boosting
+  base.rgb = clamp(base.rgb + vec3<f32>(boost_tint * 0.6, boost_tint * 0.2, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
   let glow = max(sel_glow, v.glow);
-  let rim_col = vec4<f32>(1.0, 1.0, 1.0, glow) * rim;
+  let rim_col = vec4<f32>(1.0, 1.0, 1.0, glow + v.boost * 0.2) * rim;
   return clamp(base + rim_col, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 "#;

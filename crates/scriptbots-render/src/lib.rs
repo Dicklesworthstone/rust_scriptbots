@@ -44,12 +44,14 @@ mod world_compositor {
         // Raw RGBA buffer we reuse to avoid realloc; GPUI will copy per frame
         rgba: Vec<u8>,
         bytes_per_row: u32,
+        // Previous frame for diff-based present
+        prev: Vec<u8>,
     }
 
     impl GpuiImage {
         fn new(size: (u32, u32), bytes_per_row: u32) -> Self {
             let cap = (bytes_per_row as usize) * (size.1 as usize);
-            Self { size, rgba: vec![0u8; cap], bytes_per_row }
+            Self { size, rgba: vec![0u8; cap], bytes_per_row, prev: vec![0u8; cap] }
         }
         fn ensure(&mut self, size: (u32, u32), bytes_per_row: u32) {
             if self.size != size || self.bytes_per_row != bytes_per_row {
@@ -57,12 +59,105 @@ mod world_compositor {
                 self.bytes_per_row = bytes_per_row;
                 let cap = (bytes_per_row as usize) * (size.1 as usize);
                 self.rgba.resize(cap, 0u8);
+                self.prev.resize(cap, 0u8);
             }
         }
         fn upload_from_readback(&mut self, view: &ReadbackView<'_>) {
             self.ensure((view.width, view.height), view.bytes_per_row);
+            let new_len = (self.bytes_per_row as usize) * (self.size.1 as usize);
+            if self.prev.len() != new_len { self.prev.resize(new_len, 0); }
+            // swap buffers: previous frame lands in self.prev; current buffer becomes the new target
+            std::mem::swap(&mut self.prev, &mut self.rgba);
             let src = view.bytes();
             self.rgba[..src.len()].copy_from_slice(src);
+        }
+
+        // Paint the full image using row-run coalescing (viewport-scaled)
+        fn paint_full(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+            let vw = f32::from(bounds.size.width).max(1.0);
+            let vh = f32::from(bounds.size.height).max(1.0);
+            let img_w = self.size.0.max(1);
+            let img_h = self.size.1.max(1);
+            let row = self.bytes_per_row as usize;
+
+            let sx = (vw / img_w as f32).max(0.0001);
+            let sy = (vh / img_h as f32).max(0.0001);
+
+            // Background to avoid tiny gaps from float math
+            window.paint_quad(fill(bounds, Background::from(rgb(0x000000))));
+
+            for y in 0..(img_h as usize) {
+                let y0 = f32::from(bounds.origin.y) + (y as f32) * sy;
+                let y1 = (y0 + sy).min(f32::from(bounds.origin.y) + vh);
+                let mut x = 0usize;
+                while x < (img_w as usize) {
+                    let off = y * row + x * 4;
+                    let r0 = self.rgba[off];
+                    let g0 = self.rgba[off + 1];
+                    let b0 = self.rgba[off + 2];
+                    let a0 = self.rgba[off + 3];
+                    let mut run = x + 1;
+                    while run < (img_w as usize) {
+                        let o = y * row + run * 4;
+                        if self.rgba[o] == r0 && self.rgba[o + 1] == g0 && self.rgba[o + 2] == b0 && self.rgba[o + 3] == a0 {
+                            run += 1;
+                        } else { break; }
+                    }
+                    let x0 = f32::from(bounds.origin.x) + (x as f32) * sx;
+                    let x1 = (x0 + (run - x) as f32 * sx).min(f32::from(bounds.origin.x) + vw);
+                    let cell_bounds = Bounds::new(
+                        point(px(x0), px(y0)),
+                        size(px((x1 - x0).max(0.0)), px((y1 - y0).max(0.0))),
+                    );
+                    window.paint_quad(fill(cell_bounds, Background::from(Rgba { r: (r0 as f32) / 255.0, g: (g0 as f32) / 255.0, b: (b0 as f32) / 255.0, a: (a0 as f32) / 255.0 })));
+                    x = run;
+                }
+            }
+        }
+
+        // Paint only changed runs vs. previous frame
+        fn paint_diff(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+            let vw = f32::from(bounds.size.width).max(1.0);
+            let vh = f32::from(bounds.size.height).max(1.0);
+            let img_w = self.size.0.max(1);
+            let img_h = self.size.1.max(1);
+            let row = self.bytes_per_row as usize;
+
+            let sx = (vw / img_w as f32).max(0.0001);
+            let sy = (vh / img_h as f32).max(0.0001);
+
+            // Do not clear background; unchanged regions remain
+            for y in 0..(img_h as usize) {
+                let mut x = 0usize;
+                while x < (img_w as usize) {
+                    let off = y * row + x * 4;
+                    let changed = self.rgba[off..off + 4] != self.prev[off..off + 4];
+                    if !changed { x += 1; continue; }
+                    let r0 = self.rgba[off];
+                    let g0 = self.rgba[off + 1];
+                    let b0 = self.rgba[off + 2];
+                    let a0 = self.rgba[off + 3];
+                    let mut run = x + 1;
+                    while run < (img_w as usize) {
+                        let o = y * row + run * 4;
+                        if self.rgba[o..o + 4] == self.prev[o..o + 4] { break; }
+                        // extend run only while color matches to keep draw calls minimal
+                        if self.rgba[o] == r0 && self.rgba[o + 1] == g0 && self.rgba[o + 2] == b0 && self.rgba[o + 3] == a0 {
+                            run += 1;
+                        } else { break; }
+                    }
+                    let y0 = f32::from(bounds.origin.y) + (y as f32) * sy;
+                    let y1 = (y0 + sy).min(f32::from(bounds.origin.y) + vh);
+                    let x0 = f32::from(bounds.origin.x) + (x as f32) * sx;
+                    let x1 = (x0 + (run - x) as f32 * sx).min(f32::from(bounds.origin.x) + vw);
+                    let cell_bounds = Bounds::new(
+                        point(px(x0), px(y0)),
+                        size(px((x1 - x0).max(0.0)), px((y1 - y0).max(0.0))),
+                    );
+                    window.paint_quad(fill(cell_bounds, Background::from(Rgba { r: (r0 as f32) / 255.0, g: (g0 as f32) / 255.0, b: (b0 as f32) / 255.0, a: (a0 as f32) / 255.0 })));
+                    x = run;
+                }
+            }
         }
     }
 
@@ -135,8 +230,10 @@ mod world_compositor {
                 }
             }
             let render_size = if self.render_scale < 0.9999 {
-                (((target_size.0 as f32) * self.render_scale) as u32).max(1).min(target_size.0),
-                (((target_size.1 as f32) * self.render_scale) as u32).max(1).min(target_size.1)
+                (
+                    (((target_size.0 as f32) * self.render_scale) as u32).max(1).min(target_size.0),
+                    (((target_size.1 as f32) * self.render_scale) as u32).max(1).min(target_size.1),
+                )
             } else { target_size };
             if self.ensure_renderer(render_size).is_err() { return; }
             let r = self.renderer.as_mut().unwrap();
@@ -157,71 +254,10 @@ mod world_compositor {
 
         pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) {
             if let Some(img) = &self.image {
-                // Decimated blit: draw colored tiles sampling the readback. Keeps draw calls bounded.
-                let vw = f32::from(bounds.size.width).max(1.0);
-                let vh = f32::from(bounds.size.height).max(1.0);
-                let img_w = img.size.0.max(1);
-                let img_h = img.size.1.max(1);
-                let row = img.bytes_per_row as usize;
-
-                // Choose a tile size so total tiles ~<= limit (override via SB_WGPU_TILE_TARGET)
-                let target_tiles: f32 = std::env::var("SB_WGPU_TILE_TARGET").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(32000.0);
-                let area = vw * vh;
-                let mut tile_px = ( (area / target_tiles).sqrt() ).max(2.0);
-                // Adjust tile resolution based on current zoom: when zoomed out (scale<1), increase tile size; when zoomed in, decrease tile size
-                let zoom_factor = self.cam_scale.max(0.1);
-                tile_px = (tile_px * (1.0 / zoom_factor)).clamp(2.0, 14.0);
-
-                let tiles_x = (vw / tile_px).ceil() as usize;
-                let tiles_y = (vh / tile_px).ceil() as usize;
-
-                // Map viewport pixels to image pixels
-                let sx = img_w as f32 / vw;
-                let sy = img_h as f32 / vh;
-
-                // Background (avoid gaps due to rounding)
-                window.paint_quad(fill(bounds, Background::from(rgb(0x000000))));
-
-                for ty in 0..tiles_y {
-                    let y0 = ty as f32 * tile_px;
-                    let y1 = (y0 + tile_px).min(vh);
-                    let sample_y = ((y0 + y1) * 0.5 * sy).floor() as usize;
-                    let sample_y = sample_y.min(img_h as usize - 1);
-
-                    // Coalesce horizontal runs with identical sampled color to reduce draw calls
-                    let mut tx = 0usize;
-                    while tx < tiles_x {
-                        let x0 = tx as f32 * tile_px;
-                        let sample_x0 = ((x0 + (tile_px * 0.5)) * sx).floor() as usize;
-                        let sample_x0 = sample_x0.min(img_w as usize - 1);
-                        let off0 = sample_y * row + sample_x0 * 4;
-                        let r0 = img.rgba[off0];
-                        let g0 = img.rgba[off0 + 1];
-                        let b0 = img.rgba[off0 + 2];
-                        let a0 = img.rgba[off0 + 3];
-
-                        let mut run_end = tx + 1;
-                        while run_end < tiles_x {
-                            let rx0 = run_end as f32 * tile_px;
-                            let sxr = ((rx0 + (tile_px * 0.5)) * sx).floor() as usize;
-                            let sxr = sxr.min(img_w as usize - 1);
-                            let off_r = sample_y * row + sxr * 4;
-                            if img.rgba[off_r] == r0 && img.rgba[off_r + 1] == g0 && img.rgba[off_r + 2] == b0 && img.rgba[off_r + 3] == a0 {
-                                run_end += 1;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        let x1 = ((run_end as f32) * tile_px).min(vw);
-                        let cell_bounds = Bounds::new(
-                            point(px(f32::from(bounds.origin.x) + x0), px(f32::from(bounds.origin.y) + y0)),
-                            size(px(x1 - x0), px(y1 - y0)),
-                        );
-                        window.paint_quad(fill(cell_bounds, Background::from(Rgba { r: (r0 as f32) / 255.0, g: (g0 as f32) / 255.0, b: (b0 as f32) / 255.0, a: (a0 as f32) / 255.0 })));
-
-                        tx = run_end;
-                    }
+                let mode = std::env::var("SB_WGPU_PRESENT_MODE").ok();
+                match mode.as_deref() {
+                    Some("full") => img.paint_full(bounds, window),
+                    Some("diff") | _ => img.paint_diff(bounds, window),
                 }
             }
         }
@@ -303,6 +339,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
                 color: [a.color[0], a.color[1], a.color[2], 1.0],
                 selection: sel,
                 glow,
+                boost: if a.spiked { 1.0 } else { 0.0 },
             }
         })
         .collect();
@@ -486,7 +523,6 @@ struct SimulationView {
     // Per-agent short history of brain outputs for inspector sparklines
     brain_history: std::collections::HashMap<AgentId, OutputHistory>,
 }
-
 impl SimulationView {
     fn new(
         world: Arc<Mutex<WorldState>>,
@@ -1228,7 +1264,6 @@ impl SimulationView {
         // Use a conservative 3-column grid to avoid clipping on smaller window sizes; rows wrap gracefully.
         div().grid().grid_cols(3).gap_4().children(cards)
     }
-
     fn render_analytics_panel(&self, snapshot: &HudSnapshot) -> Div {
         let Some(analytics) = snapshot.analytics.as_ref() else {
             return div();
@@ -1639,7 +1674,6 @@ impl SimulationView {
             self.render_canvas_placeholder(snapshot)
         }
     }
-
     fn render_canvas_world(
         &self,
         snapshot: &HudSnapshot,
@@ -1696,9 +1730,11 @@ impl SimulationView {
                             .map(|s| s.focused_agent.is_some())
                             .unwrap_or(false);
                         if has_focus_after {
-                            this.set_follow_mode(FollowMode::Selected, cx);
+                            this.controls.follow_mode = FollowMode::Selected;
+                            cx.notify();
                         } else if had_focus_before && !has_focus_after {
-                            this.set_follow_mode(FollowMode::Off, cx);
+                            this.controls.follow_mode = FollowMode::Off;
+                            cx.notify();
                         }
                     }
                     if this.set_shift_inspect(event.modifiers.shift) {
@@ -2017,7 +2053,6 @@ impl SimulationView {
 
         cx.notify();
     }
-
     fn adjust_agent_mutation_rates(
         &mut self,
         agent_id: AgentId,
@@ -2079,10 +2114,22 @@ impl SimulationView {
             CommandAction::ToggleBrush => self.toggle_brush_state(cx),
             CommandAction::ToggleNarration => self.toggle_narration(cx),
             CommandAction::CyclePalette => self.cycle_palette(cx),
-            CommandAction::ToggleSimulationPause => self.toggle_simulation_pause(cx),
-            CommandAction::ToggleAgentDraw => self.toggle_agent_draw(cx),
-            CommandAction::ToggleFoodOverlay => self.toggle_food_overlay(cx),
-            CommandAction::ToggleAgentOutline => self.toggle_agent_outline(cx),
+            CommandAction::ToggleSimulationPause => {
+                let paused = !self.controls.paused;
+                self.set_simulation_paused(paused, cx);
+            }
+            CommandAction::ToggleAgentDraw => {
+                self.controls.draw_agents = !self.controls.draw_agents;
+                cx.notify();
+            }
+            CommandAction::ToggleFoodOverlay => {
+                self.controls.draw_food = !self.controls.draw_food;
+                cx.notify();
+            }
+            CommandAction::ToggleAgentOutline => {
+                let enabled = !self.controls.agent_outline;
+                self.set_agent_outline(enabled, cx);
+            }
             CommandAction::IncreaseSimulationSpeed => self.adjust_simulation_speed(0.25, cx),
             CommandAction::DecreaseSimulationSpeed => self.adjust_simulation_speed(-0.25, cx),
             CommandAction::AddCrossoverAgents => self.spawn_crossover_agent(cx),
@@ -2769,53 +2816,6 @@ impl SimulationView {
         }
         cx.notify();
     }
-
-    fn set_follow_mode(&mut self, mode: FollowMode, cx: &mut Context<Self>) {
-        if self.controls.follow_mode == mode {
-            return;
-        }
-        self.controls.follow_mode = mode;
-        info!(mode = ?mode, "Follow mode updated");
-        cx.notify();
-    }
-
-    fn set_world_closed(&mut self, closed: bool, cx: &mut Context<Self>) {
-        let mut updated = false;
-        if let Ok(mut world) = self.world.lock()
-            && world.is_closed() != closed
-        {
-            world.set_closed(closed);
-            updated = true;
-        }
-        if updated {
-            info!(closed, "Updated closed environment toggle");
-            #[cfg(feature = "audio")]
-            if let Some(audio) = self.audio.as_mut() {
-                audio.play(&audio.toggle_sound);
-            }
-            cx.notify();
-        }
-    }
-
-    fn toggle_simulation_pause(&mut self, cx: &mut Context<Self>) {
-        let next = !self.controls.paused;
-        self.set_simulation_paused(next, cx);
-    }
-
-    fn toggle_agent_draw(&mut self, cx: &mut Context<Self>) {
-        let next = !self.controls.draw_agents;
-        self.set_draw_agents(next, cx);
-    }
-    fn toggle_food_overlay(&mut self, cx: &mut Context<Self>) {
-        let next = !self.controls.draw_food;
-        self.set_draw_food(next, cx);
-    }
-
-    fn toggle_agent_outline(&mut self, cx: &mut Context<Self>) {
-        let next = !self.controls.agent_outline;
-        self.set_agent_outline(next, cx);
-    }
-
     fn adjust_simulation_speed(&mut self, delta: f32, cx: &mut Context<Self>) {
         let mut speed = self.controls.speed_multiplier + delta;
         speed = speed.clamp(0.25, 4.0);
@@ -2841,7 +2841,6 @@ impl SimulationView {
             cx.notify();
         }
     }
-
     fn spawn_agent_with_bias_internal(&self, world: &mut WorldState, herbivore_bias: f32) -> bool {
         let width = world.config().world_width as f32;
         let height = world.config().world_height as f32;
@@ -2941,14 +2940,11 @@ impl SimulationView {
     }
 
     fn toggle_closed_environment(&mut self, cx: &mut Context<Self>) {
-        let next = {
-            if let Ok(world) = self.world.lock() {
-                !world.is_closed()
-            } else {
-                return;
-            }
-        };
-        self.set_world_closed(next, cx);
+        let next = if let Ok(world) = self.world.lock() { !world.is_closed() } else { return; };
+        if let Ok(mut world) = self.world.lock() {
+            world.set_closed(next);
+        }
+        cx.notify();
     }
 
     fn toggle_follow_selected(&mut self, cx: &mut Context<Self>) {
@@ -2956,7 +2952,8 @@ impl SimulationView {
             FollowMode::Selected => FollowMode::Off,
             _ => FollowMode::Selected,
         };
-        self.set_follow_mode(next, cx);
+        self.controls.follow_mode = next;
+        cx.notify();
     }
 
     fn toggle_follow_oldest(&mut self, cx: &mut Context<Self>) {
@@ -2964,7 +2961,8 @@ impl SimulationView {
             FollowMode::Oldest => FollowMode::Off,
             _ => FollowMode::Oldest,
         };
-        self.set_follow_mode(next, cx);
+        self.controls.follow_mode = next;
+        cx.notify();
     }
 
     fn cycle_palette(&mut self, cx: &mut Context<Self>) {
@@ -3548,7 +3546,6 @@ impl SimulationView {
                     .child("Disabling stores the last interval for quick re-enable."),
             )
     }
-
     fn render_selection_controls(
         &self,
         inspector: &InspectorSnapshot,
@@ -3938,13 +3935,16 @@ impl SimulationView {
             this.set_agent_outline(false, cx);
         });
         let follow_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_follow_mode(FollowMode::Off, cx);
+            this.controls.follow_mode = FollowMode::Off;
+            cx.notify();
         });
         let follow_selected = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_follow_mode(FollowMode::Selected, cx);
+            this.controls.follow_mode = FollowMode::Selected;
+            cx.notify();
         });
         let follow_oldest = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_follow_mode(FollowMode::Oldest, cx);
+            this.controls.follow_mode = FollowMode::Oldest;
+            cx.notify();
         });
         let spawn_crossover = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.spawn_crossover_agent(cx);
@@ -3955,11 +3955,13 @@ impl SimulationView {
         let spawn_herbivore = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.spawn_agent_with_tendency(1.0, cx);
         });
-        let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_world_closed(true, cx);
-        });
         let open_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_world_closed(false, cx);
+            if let Ok(mut world) = this.world.lock() { world.set_closed(false); }
+            cx.notify();
+        });
+        let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            if let Ok(mut world) = this.world.lock() { world.set_closed(true); }
+            cx.notify();
         });
 
         let style_toggle = |button: Div, active: bool| {
@@ -4234,17 +4236,6 @@ impl SimulationView {
                 .on_mouse_down(MouseButton::Left, spawn_herbivore),
         ]);
 
-        let closed_on_button = style_toggle(
-            div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Closed ON")
-                .on_mouse_down(MouseButton::Left, close_world),
-            snapshot.is_closed,
-        );
         let closed_off_button = style_toggle(
             div()
                 .rounded_md()
@@ -4258,6 +4249,17 @@ impl SimulationView {
                 ))
                 .on_mouse_down(MouseButton::Left, open_world),
             !snapshot.is_closed,
+        );
+        let closed_on_button = style_toggle(
+            div()
+                .rounded_md()
+                .border_1()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child("Closed ON")
+                .on_mouse_down(MouseButton::Left, close_world),
+            snapshot.is_closed,
         );
 
         div()
