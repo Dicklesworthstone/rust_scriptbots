@@ -59,6 +59,8 @@ pub struct RenderFrame {
 
 impl WorldRenderer {
     pub async fn new(adapter: &wgpu::Adapter, size: (u32, u32)) -> Result<Self, String> {
+        // Guard against zero-sized viewports (can happen during early window init on some platforms)
+        let size = (size.0.max(1), size.1.max(1));
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
@@ -181,6 +183,8 @@ impl WorldRenderer {
 }
 
 fn create_color(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
+    // Defensive clamp to ensure valid texture extent
+    let size = (size.0.max(1), size.1.max(1));
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("world.color"),
         size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
@@ -226,6 +230,8 @@ impl ReadbackView {
 impl ReadbackRing {
     pub fn new(device: &wgpu::Device, extent: (u32, u32), format: wgpu::TextureFormat) -> Result<Self, String> {
         assert_eq!(format, wgpu::TextureFormat::Rgba8UnormSrgb, "only RGBA8 sRGB supported for readback");
+        // Clamp extent to avoid zero-sized buffers which are invalid on some backends
+        let extent = (extent.0.max(1), extent.1.max(1));
         let bytes_per_row = align_256(extent.0 * 4);
         let size_bytes = bytes_per_row as u64 * extent.1 as u64;
         let mk = || device.create_buffer(&wgpu::BufferDescriptor {

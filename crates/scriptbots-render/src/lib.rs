@@ -222,6 +222,8 @@ mod world_compositor {
         }
 
         pub fn render_snapshot(&mut self, snapshot: &GfxSnapshot, target_size: (u32, u32)) {
+            // Root-cause guard: skip rendering when target is zero-sized (startup/minimize)
+            if target_size.0 == 0 || target_size.1 == 0 { return; }
             // Optional FPS cap: skip re-render and reuse last-ready image if interval not elapsed
             if self.min_interval > 0.0 {
                 if let Some(last) = self.last_submit {
@@ -235,7 +237,7 @@ mod world_compositor {
                     (((target_size.0 as f32) * self.render_scale) as u32).max(1).min(target_size.0),
                     (((target_size.1 as f32) * self.render_scale) as u32).max(1).min(target_size.1),
                 )
-            } else { target_size };
+            } else { (target_size.0.max(1), target_size.1.max(1)) };
             if self.ensure_renderer(render_size).is_err() { return; }
             let r = self.renderer.as_mut().unwrap();
             r.set_camera(self.cam_scale, self.cam_offset);
@@ -289,7 +291,13 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let mut comp = comp.lock().ok().expect("compositor mutex");
 
     let world_size = state.frame.world_size;
-    let viewport = (u32::from(bounds.size.width), u32::from(bounds.size.height));
+    // Root-cause guard: GPUI may report 0x0 during initial layout or when minimized
+    let vw_u32 = u32::from(bounds.size.width);
+    let vh_u32 = u32::from(bounds.size.height);
+    if vw_u32 == 0 || vh_u32 == 0 {
+        return;
+    }
+    let viewport = (vw_u32, vh_u32);
 
     // Calculate camera scale/offset to map world pixels -> viewport pixels exactly as GPUI would
     // Reuse the same mapping used in paint_frame
