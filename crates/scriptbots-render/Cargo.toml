@@ -15,10 +15,15 @@ rand = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 scriptbots-world-gfx = { path = "../scriptbots-world-gfx", optional = true }
 pollster = { version = "0.4", optional = true }
-wgpu = { version = "27", optional = true }
 naga = { version = "27", features = ["termcolor"] }
 
 [features]
 default = ["world_wgpu"]
 audio = ["kira"]
 world_wgpu = ["scriptbots-world-gfx", "pollster", "wgpu"]
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+wgpu = { version = "27", optional = true, default-features = false, features = ["vulkan", "wgsl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "27", optional = true, default-features = false, features = ["metal", "wgsl"] }

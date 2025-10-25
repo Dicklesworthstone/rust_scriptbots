@@ -10,7 +10,7 @@ name = "scriptbots_world_gfx"
 path = "src/lib.rs"
 
 [dependencies]
-wgpu = { version = "27" }
+wgpu = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
 bytemuck = { version = "1.16", features = ["derive"] }
 glam = { version = "0.30", default-features = false, features = ["std"] }
 tracing = { version = "0.1" }
