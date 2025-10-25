@@ -105,6 +105,66 @@ impl UniformGridIndex {
         }
     }
 
+    /// Visit candidate neighbor buckets and provide SoA x[]/y[] slices using caller scratch buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_neighbor_bucket_positions_with_scratch(
+        &self,
+        agent_idx: usize,
+        radius: f32,
+        scratch_x: &mut Vec<f32>,
+        scratch_y: &mut Vec<f32>,
+        visitor: &mut dyn FnMut(&[f32], &[f32], &[usize]),
+    ) {
+        if agent_idx >= self.positions.len() || radius < 0.0 {
+            return;
+        }
+        let (cell_x, cell_y) = self.agent_cells[agent_idx];
+        let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
+
+        for dx in -cell_radius..=cell_radius {
+            for dy in -cell_radius..=cell_radius {
+                let nx = Self::wrap(cell_x + dx, self.cells_x);
+                let ny = Self::wrap(cell_y + dy, self.cells_y);
+                match &self.buckets {
+                    Buckets::Dense(b) => {
+                        let lin = self.linear_index(nx, ny);
+                        let indices = &b[lin];
+                        if indices.is_empty() {
+                            continue;
+                        }
+                        scratch_x.clear();
+                        scratch_y.clear();
+                        scratch_x.reserve(indices.len());
+                        scratch_y.reserve(indices.len());
+                        for &other_idx in indices.iter() {
+                            let (x, y) = self.positions[other_idx];
+                            scratch_x.push(x);
+                            scratch_y.push(y);
+                        }
+                        visitor(scratch_x.as_slice(), scratch_y.as_slice(), indices);
+                    }
+                    Buckets::Sparse(m) => {
+                        if let Some(indices) = m.get(&(nx, ny)) {
+                            if indices.is_empty() {
+                                continue;
+                            }
+                            scratch_x.clear();
+                            scratch_y.clear();
+                            scratch_x.reserve(indices.len());
+                            scratch_y.reserve(indices.len());
+                            for &other_idx in indices.iter() {
+                                let (x, y) = self.positions[other_idx];
+                                scratch_x.push(x);
+                                scratch_y.push(y);
+                            }
+                            visitor(scratch_x.as_slice(), scratch_y.as_slice(), indices);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[inline]
     const fn wrap(value: i32, max: i32) -> i32 {
         ((value % max) + max) % max

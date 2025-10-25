@@ -14,7 +14,9 @@ kira = { workspace = true, optional = true }
 rand = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 scriptbots-world-gfx = { path = "../scriptbots-world-gfx", optional = true }
+pollster = { version = "0.3", optional = true }
+wgpu = { version = "0.20", optional = true }
 
 [features]
 audio = ["kira"]
-world_wgpu = ["scriptbots-world-gfx"]
+world_wgpu = ["scriptbots-world-gfx", "pollster", "wgpu"]

@@ -37,23 +37,292 @@ use tracing::{error, info, warn};
 #[cfg(feature = "world_wgpu")]
 mod world_compositor {
     use super::*;
-    use scriptbots_world_gfx::{WorldSnapshot as GfxSnapshot, WorldRenderer};
-    struct Compositor {
-        renderer: Option<WorldRenderer>,
-        last_bytes_per_row: u32,
-        last_size: (u32, u32),
-        // In a fuller implementation, keep a persistent GPUI image handle here
+    use scriptbots_world_gfx::{WorldRenderer, WorldSnapshot as GfxSnapshot, ReadbackView};
+
+    pub struct GpuiImage {
+        size: (u32, u32),
+        // Raw RGBA buffer we reuse to avoid realloc; GPUI will copy per frame
+        rgba: Vec<u8>,
+        bytes_per_row: u32,
     }
-    impl Compositor {
-        fn new() -> Self {
-            Self { renderer: None, last_bytes_per_row: 0, last_size: (0, 0) }
+
+    impl GpuiImage {
+        fn new(size: (u32, u32), bytes_per_row: u32) -> Self {
+            let cap = (bytes_per_row as usize) * (size.1 as usize);
+            Self { size, rgba: vec![0u8; cap], bytes_per_row }
         }
-        fn render_and_upload(&mut self, snapshot: &GfxSnapshot, size: (u32, u32)) {
-            // Initialization and render are no-ops in this stub; full upload path will map and blit into GPUI image
-            let _ = (snapshot, size);
+        fn ensure(&mut self, size: (u32, u32), bytes_per_row: u32) {
+            if self.size != size || self.bytes_per_row != bytes_per_row {
+                self.size = size;
+                self.bytes_per_row = bytes_per_row;
+                let cap = (bytes_per_row as usize) * (size.1 as usize);
+                self.rgba.resize(cap, 0u8);
+            }
+        }
+        fn upload_from_readback(&mut self, view: &ReadbackView<'_>) {
+            self.ensure((view.width, view.height), view.bytes_per_row);
+            let src = view.bytes();
+            self.rgba[..src.len()].copy_from_slice(src);
+        }
+    }
+
+    pub struct Compositor {
+        renderer: Option<WorldRenderer>,
+        image: Option<GpuiImage>,
+        adapter: Option<wgpu::Adapter>,
+        cam_scale: f32,
+        cam_offset: (f32, f32),
+        last_submit: Option<std::time::Instant>,
+        min_interval: f32, // seconds; 0 = uncapped
+        render_scale: f32, // 0<scale<=1; offscreen resolution scale
+    }
+
+    impl Compositor {
+        pub fn new() -> Self {
+            let max_fps = std::env::var("SB_WGPU_MAX_FPS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+            let min_interval = if max_fps > 0.0 { (1.0 / max_fps).max(0.001) } else { 0.0 };
+            let render_scale = std::env::var("SB_WGPU_RES_SCALE").ok().and_then(|s| s.parse::<f32>().ok()).map(|v| v.clamp(0.25, 1.0)).unwrap_or(1.0);
+            Self { renderer: None, image: None, adapter: None, cam_scale: 1.0, cam_offset: (0.0, 0.0), last_submit: None, min_interval, render_scale }
+        }
+
+        pub fn set_camera_params(&mut self, scale: f32, offset: (f32, f32)) {
+            self.cam_scale = scale;
+            self.cam_offset = offset;
+            if let Some(r) = self.renderer.as_mut() { r.set_camera(scale, offset); }
+        }
+
+        fn ensure_renderer(&mut self, size: (u32, u32)) -> Result<(), String> {
+            if self.adapter.is_none() {
+                // Create a headless adapter suitable for offscreen rendering
+                let instance = wgpu::Instance::default();
+                let future = async {
+                    instance
+                        .request_adapter(&wgpu::RequestAdapterOptions {
+                            power_preference: wgpu::PowerPreference::HighPerformance,
+                            compatible_surface: None,
+                            force_fallback_adapter: false,
+                        })
+                        .await
+                        .ok_or_else(|| "wgpu adapter not available".to_string())
+                };
+                let adapter = pollster::block_on(future)?;
+                self.adapter = Some(adapter);
+            }
+            let need_new = self.renderer.is_none();
+            if need_new {
+                let adapter = self.adapter.as_ref().unwrap();
+                let future = scriptbots_world_gfx::WorldRenderer::new(adapter, size);
+                let mut renderer = pollster::block_on(future)?;
+                renderer.set_camera(self.cam_scale, self.cam_offset);
+                self.renderer = Some(renderer);
+            }
+            Ok(())
+        }
+
+        pub fn resize(&mut self, size: (u32, u32)) {
+            if let Some(r) = self.renderer.as_mut() {
+                let _ = r.resize(size);
+            }
+        }
+
+        pub fn render_snapshot(&mut self, snapshot: &GfxSnapshot, target_size: (u32, u32)) {
+            // Optional FPS cap: skip re-render and reuse last-ready image if interval not elapsed
+            if self.min_interval > 0.0 {
+                if let Some(last) = self.last_submit {
+                    if last.elapsed().as_secs_f32() < self.min_interval {
+                        return;
+                    }
+                }
+            }
+            let render_size = if self.render_scale < 0.9999 {
+                (((target_size.0 as f32) * self.render_scale) as u32).max(1).min(target_size.0),
+                (((target_size.1 as f32) * self.render_scale) as u32).max(1).min(target_size.1)
+            } else { target_size };
+            if self.ensure_renderer(render_size).is_err() { return; }
+            let r = self.renderer.as_mut().unwrap();
+            r.set_camera(self.cam_scale, self.cam_offset);
+            let _ = r.resize(render_size);
+            let _frame = r.render(snapshot);
+            let _ = r.copy_to_readback(&_frame);
+            if let Some(view) = r.mapped_rgba() {
+                if self.image.is_none() {
+                    self.image = Some(GpuiImage::new((view.width, view.height), view.bytes_per_row));
+                }
+                if let Some(img) = self.image.as_mut() {
+                    img.upload_from_readback(&view);
+                }
+                self.last_submit = Some(std::time::Instant::now());
+            }
+        }
+
+        pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+            if let Some(img) = &self.image {
+                // Decimated blit: draw colored tiles sampling the readback. Keeps draw calls bounded.
+                let vw = f32::from(bounds.size.width).max(1.0);
+                let vh = f32::from(bounds.size.height).max(1.0);
+                let img_w = img.size.0.max(1);
+                let img_h = img.size.1.max(1);
+                let row = img.bytes_per_row as usize;
+
+                // Choose a tile size so total tiles ~<= limit (override via SB_WGPU_TILE_TARGET)
+                let target_tiles: f32 = std::env::var("SB_WGPU_TILE_TARGET").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(32000.0);
+                let area = vw * vh;
+                let mut tile_px = ( (area / target_tiles).sqrt() ).max(2.0);
+                // Adjust tile resolution based on current zoom: when zoomed out (scale<1), increase tile size; when zoomed in, decrease tile size
+                let zoom_factor = self.cam_scale.max(0.1);
+                tile_px = (tile_px * (1.0 / zoom_factor)).clamp(2.0, 14.0);
+
+                let tiles_x = (vw / tile_px).ceil() as usize;
+                let tiles_y = (vh / tile_px).ceil() as usize;
+
+                // Map viewport pixels to image pixels
+                let sx = img_w as f32 / vw;
+                let sy = img_h as f32 / vh;
+
+                // Background (avoid gaps due to rounding)
+                window.paint_quad(fill(bounds, Background::from(rgb(0x000000))));
+
+                for ty in 0..tiles_y {
+                    let y0 = ty as f32 * tile_px;
+                    let y1 = (y0 + tile_px).min(vh);
+                    let sample_y = ((y0 + y1) * 0.5 * sy).floor() as usize;
+                    let sample_y = sample_y.min(img_h as usize - 1);
+
+                    // Coalesce horizontal runs with identical sampled color to reduce draw calls
+                    let mut tx = 0usize;
+                    while tx < tiles_x {
+                        let x0 = tx as f32 * tile_px;
+                        let sample_x0 = ((x0 + (tile_px * 0.5)) * sx).floor() as usize;
+                        let sample_x0 = sample_x0.min(img_w as usize - 1);
+                        let off0 = sample_y * row + sample_x0 * 4;
+                        let r0 = img.rgba[off0];
+                        let g0 = img.rgba[off0 + 1];
+                        let b0 = img.rgba[off0 + 2];
+                        let a0 = img.rgba[off0 + 3];
+
+                        let mut run_end = tx + 1;
+                        while run_end < tiles_x {
+                            let rx0 = run_end as f32 * tile_px;
+                            let sxr = ((rx0 + (tile_px * 0.5)) * sx).floor() as usize;
+                            let sxr = sxr.min(img_w as usize - 1);
+                            let off_r = sample_y * row + sxr * 4;
+                            if img.rgba[off_r] == r0 && img.rgba[off_r + 1] == g0 && img.rgba[off_r + 2] == b0 && img.rgba[off_r + 3] == a0 {
+                                run_end += 1;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let x1 = ((run_end as f32) * tile_px).min(vw);
+                        let cell_bounds = Bounds::new(
+                            point(px(f32::from(bounds.origin.x) + x0), px(f32::from(bounds.origin.y) + y0)),
+                            size(px(x1 - x0), px(y1 - y0)),
+                        );
+                        window.paint_quad(fill(cell_bounds, Background::from(Rgba { r: (r0 as f32) / 255.0, g: (g0 as f32) / 255.0, b: (b0 as f32) / 255.0, a: (a0 as f32) / 255.0 })));
+
+                        tx = run_end;
+                    }
+                }
+            }
         }
     }
 }
+
+#[cfg(feature = "world_wgpu")]
+fn use_wgpu_renderer() -> bool {
+    static CHOICE: OnceLock<bool> = OnceLock::new();
+    *CHOICE.get_or_init(|| {
+        match std::env::var("SB_RENDERER").ok().as_deref() {
+            Some("canvas") => false,
+            Some("wgpu") => true,
+            _ => true,
+        }
+    })
+}
+
+#[cfg(not(feature = "world_wgpu"))]
+fn use_wgpu_renderer() -> bool { false }
+
+#[cfg(feature = "world_wgpu")]
+fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
+    use scriptbots_world_gfx::WorldSnapshot as GfxSnapshot;
+    use world_compositor::Compositor;
+    static COMPOSITOR: OnceLock<std::sync::Mutex<Compositor>> = OnceLock::new();
+    let comp = COMPOSITOR.get_or_init(|| std::sync::Mutex::new(Compositor::new()));
+    let mut comp = comp.lock().ok().expect("compositor mutex");
+
+    let world_size = state.frame.world_size;
+    let viewport = (u32::from(bounds.size.width), u32::from(bounds.size.height));
+
+    // Calculate camera scale/offset to map world pixels -> viewport pixels exactly as GPUI would
+    // Reuse the same mapping used in paint_frame
+    let origin_x = f32::from(bounds.origin.x);
+    let origin_y = f32::from(bounds.origin.y);
+    let width_px = f32::from(bounds.size.width).max(1.0);
+    let height_px = f32::from(bounds.size.height).max(1.0);
+    let world_w = world_size.0.max(1.0);
+    let world_h = world_size.1.max(1.0);
+    let base_scale = (width_px / world_w).min(height_px / world_h).max(0.0001);
+    let scale = base_scale * state.camera.lock().map(|c| c.zoom).unwrap_or(1.0);
+    let pad_x = (width_px - world_w * scale) * 0.5;
+    let pad_y = (height_px - world_h * scale) * 0.5;
+    let (off_px_x, off_px_y) = state.camera.lock().map(|c| c.offset_px).unwrap_or((0.0, 0.0));
+    let cam_offset = (origin_x + pad_x + off_px_x, origin_y + pad_y + off_px_y);
+
+    // Build a minimal snapshot from the current RenderFrame
+    let terrain_dims = state.frame.terrain.dimensions;
+    let tiles_u32: Vec<u32> = state
+        .frame
+        .terrain
+        .tiles
+        .iter()
+        .map(|t| match t.kind {
+            TerrainKind::DeepWater => 0,
+            TerrainKind::ShallowWater => 1,
+            TerrainKind::Sand => 2,
+            TerrainKind::Grass => 3,
+            TerrainKind::Bloom => 4,
+            TerrainKind::Rock => 5,
+        })
+        .collect();
+    let elevation: Vec<f32> = state.frame.terrain.tiles.iter().map(|t| t.elevation).collect();
+    let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = state
+        .frame
+        .agents
+        .iter()
+        .map(|a| {
+            let sel = match a.selection { SelectionState::Hovered => 1u32, SelectionState::Selected => 2u32, SelectionState::None => 0u32 };
+            let dyn_radius = (state.frame.agent_base_radius + a.spike_length * 0.25).max(6.0);
+            let glow_from_indicator = (a.indicator.intensity * 0.35).clamp(0.0, 1.0);
+            let glow_from_spike = if a.spiked { 0.45 } else { 0.0 };
+            let glow_from_repro = (a.reproduction_intent * 0.25).clamp(0.0, 0.6);
+            let glow = glow_from_indicator.max(glow_from_spike).max(glow_from_repro);
+            scriptbots_world_gfx::AgentInstance {
+                position: [a.position.x, a.position.y],
+                size: dyn_radius,
+                color: [a.color[0], a.color[1], a.color[2], 1.0],
+                selection: sel,
+                glow,
+            }
+        })
+        .collect();
+
+    let terrain_view = scriptbots_world_gfx::TerrainView {
+        dims: terrain_dims,
+        cell_size: state.frame.terrain.cell_size,
+        tiles: &tiles_u32,
+        elevation: Some(&elevation),
+    };
+    let snapshot = GfxSnapshot { world_size, terrain: terrain_view, agents: &agents_gpu };
+
+    // Render using current camera mapping
+    comp.set_camera_params(scale, cam_offset);
+    comp.render_snapshot(&snapshot, viewport);
+    comp.paint_world(bounds, window);
+}
+
+#[cfg(not(feature = "world_wgpu"))]
+fn paint_world_with_wgpu(_state: &CanvasState, _bounds: Bounds<Pixels>, _window: &mut Window) {}
 
 fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
     let mut delta = target - origin;
@@ -603,7 +872,6 @@ impl SimulationView {
 
         self.apply_hover_change(hovered)
     }
-
     fn apply_hover_change(&mut self, hovered: Option<AgentId>) -> bool {
         let prev_hover = self
             .inspector
@@ -1240,7 +1508,6 @@ impl SimulationView {
             .child(insights_row)
             .child(brain_panel)
     }
-
     fn render_history(&self, snapshot: &HudSnapshot) -> Div {
         let header = div()
             .flex()
@@ -1392,7 +1659,14 @@ impl SimulationView {
 
         let canvas_element = canvas(
             move |_, _, _| canvas_state.clone(),
-            move |bounds, state, window, _| paint_frame(&state, bounds, window),
+            move |bounds, state, window, _| {
+                #[cfg(feature = "world_wgpu")]
+                if use_wgpu_renderer() {
+                    paint_world_with_wgpu(&state, bounds, window);
+                    return;
+                }
+                paint_frame(&state, bounds, window)
+            },
         )
         .flex_1();
 
@@ -1881,7 +2155,6 @@ impl SimulationView {
             self.matches_search(label) || self.matches_search(value) || self.matches_search(desc)
         })
     }
-
     /// Check if a category has any matching parameters (for conditional rendering during search)
     /// Note: This duplicates param construction logic to avoid API changes, prioritizing clarity
     fn category_has_matches(&self, category: ConfigCategory) -> bool {
@@ -2533,7 +2806,6 @@ impl SimulationView {
         let next = !self.controls.draw_agents;
         self.set_draw_agents(next, cx);
     }
-
     fn toggle_food_overlay(&mut self, cx: &mut Context<Self>) {
         let next = !self.controls.draw_food;
         self.set_draw_food(next, cx);
@@ -4217,7 +4489,6 @@ impl SimulationView {
                     .child(frame_summary),
             )
     }
-
     fn render_accessibility_panel(&self, cx: &mut Context<Self>) -> Div {
         let palette_buttons: Vec<Div> = ColorPaletteMode::ALL
             .iter()
@@ -4658,7 +4929,6 @@ impl SimulationView {
                 snapshot.tick, snapshot.agent_count
             )))
     }
-
     fn render_overlay(&self, snapshot: &HudSnapshot) -> Div {
         let mut lines: Vec<String> = if let Some(summary) = snapshot.summary.as_ref() {
             vec![
@@ -6078,7 +6348,6 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
     }
     div().flex().flex_col().gap_1().children(rows)
 }
-
 fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
     let mut rows: Vec<Div> = Vec::new();
     if let Some(act) = activations {
@@ -7299,7 +7568,6 @@ enum ConfigCategory {
     Population,
     Persistence,
 }
-
 impl ConfigCategory {
     fn label(self) -> &'static str {
         match self {
@@ -7949,7 +8217,6 @@ fn rgba_from_triplet_with_alpha(color: [f32; 3], alpha: f32) -> Rgba {
         a: alpha.clamp(0.0, 1.0),
     }
 }
-
 fn rgba_from_hex(hex: u32, alpha: f32) -> Rgba {
     let r = ((hex >> 16) & 0xff) as f32 / 255.0;
     let g = ((hex >> 8) & 0xff) as f32 / 255.0;
@@ -8593,7 +8860,6 @@ fn legend_item(color: Rgba, label: &str) -> Div {
         .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color))
         .child(label.to_string())
 }
-
 fn paint_history_chart(bounds: Bounds<Pixels>, data: &HistoryChartData, window: &mut Window) {
     let origin = bounds.origin;
     let bounds_size = bounds.size;
@@ -9205,7 +9471,6 @@ fn terrain_water_caustic_color(
     color = scale_rgb(color, 0.9 + tile.moisture * 0.2);
     apply_palette(color, palette)
 }
-
 fn paint_sparkline(bounds: Bounds<Pixels>, state: SparklineState, window: &mut Window) {
     let origin = bounds.origin;
     let bounds_size = bounds.size;

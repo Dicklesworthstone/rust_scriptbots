@@ -794,7 +794,6 @@ impl Default for AgentRuntime {
         }
     }
 }
-
 impl AgentRuntime {
     /// Sample randomized sensory parameters matching the legacy ScriptBots defaults.
     pub fn new_random(rng: &mut dyn RngCore) -> Self {
@@ -1578,7 +1577,6 @@ pub struct AgentColumns {
     ages: Vec<u32>,
     generations: Vec<Generation>,
 }
-
 impl AgentColumns {
     /// Create an empty collection.
     #[must_use]
@@ -2329,7 +2327,6 @@ pub enum NeuroflowActivationKind {
     Sigmoid,
     Relu,
 }
-
 impl ScriptBotsConfig {
     /// Validates the configuration, returning derived grid dimensions.
     pub fn food_dimensions(&self) -> Result<(u32, u32), WorldStateError> {
@@ -2884,7 +2881,6 @@ pub struct TerrainTile {
     #[serde(default)]
     pub palette_index: u16,
 }
-
 mod map_sandbox {
     use super::{
         TerrainKind, TerrainLayer, TerrainTile, default_tile_fertility_bias,
@@ -3631,7 +3627,6 @@ mod map_sandbox {
         }
         hasher.finish()
     }
-
     fn compute_hydrology_field(
         width: u32,
         height: u32,
@@ -4105,11 +4100,14 @@ pub struct WorldState {
     work_eye_fov: Vec<[f32; NUM_EYES]>,
     work_eye_view_dirs: Vec<[f32; NUM_EYES]>,
     work_eye_fov_clamped: Vec<[f32; NUM_EYES]>,
+    work_eye_fov_cos: Vec<[f32; NUM_EYES]>,
     work_clocks: Vec<[f32; 2]>,
     work_temperature_preferences: Vec<f32>,
     work_sound_emitters: Vec<f32>,
     work_positions: Vec<Position>,
     work_headings: Vec<f32>,
+    work_heading_dir_x: Vec<f32>,
+    work_heading_dir_y: Vec<f32>,
     work_spike_lengths: Vec<f32>,
     work_velocities: Vec<Velocity>,
     work_speed_norm: Vec<f32>,
@@ -4161,7 +4159,6 @@ impl fmt::Debug for WorldState {
             .finish()
     }
 }
-
 impl WorldState {
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
@@ -4212,11 +4209,14 @@ impl WorldState {
             work_eye_fov: Vec::new(),
             work_eye_view_dirs: Vec::new(),
             work_eye_fov_clamped: Vec::new(),
+            work_eye_fov_cos: Vec::new(),
             work_clocks: Vec::new(),
             work_temperature_preferences: Vec::new(),
             work_sound_emitters: Vec::new(),
             work_positions: Vec::new(),
             work_headings: Vec::new(),
+            work_heading_dir_x: Vec::new(),
+            work_heading_dir_y: Vec::new(),
             work_spike_lengths: Vec::new(),
             work_velocities: Vec::new(),
             work_speed_norm: Vec::new(),
@@ -4598,7 +4598,6 @@ impl WorldState {
             }
         }
     }
-
     fn stage_sense(&mut self) {
         let agent_count = self.agents.len();
         if agent_count == 0 {
@@ -4635,6 +4634,7 @@ impl WorldState {
         self.work_eye_fov.resize(agent_count, [1.0; NUM_EYES]);
         self.work_eye_view_dirs.resize(agent_count, [0.0; NUM_EYES]);
         self.work_eye_fov_clamped.resize(agent_count, [1.0; NUM_EYES]);
+        self.work_eye_fov_cos.resize(agent_count, [0.0; NUM_EYES]);
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
         self.work_temperature_preferences.resize(agent_count, 0.5);
         self.work_sound_emitters.resize(agent_count, 0.0);
@@ -4647,13 +4647,16 @@ impl WorldState {
                 // Precompute per-eye view directions and clamped FOV once per agent
                 let mut views = [0.0; NUM_EYES];
                 let mut fovc = [1.0; NUM_EYES];
+                let mut fovcos = [0.0; NUM_EYES];
                 let base_heading = headings[idx];
                 for e in 0..NUM_EYES {
                     views[e] = wrap_signed_angle(base_heading + rt.eye_direction[e]);
                     fovc[e] = rt.eye_fov[e].max(0.01);
+                    fovcos[e] = fovc[e].cos();
                 }
                 self.work_eye_view_dirs[idx] = views;
                 self.work_eye_fov_clamped[idx] = fovc;
+                self.work_eye_fov_cos[idx] = fovcos;
                 self.work_clocks[idx] = rt.clocks;
                 self.work_temperature_preferences[idx] = rt.temperature_preference;
                 self.work_sound_emitters[idx] = rt.sound_multiplier;
@@ -4697,9 +4700,13 @@ impl WorldState {
 
             let position = positions[idx];
             let heading = headings[idx];
+            let hx = heading.cos();
+            let hy = heading.sin();
+            let cos_bhf = (BLOOD_HALF_FOV).cos();
             let traits = trait_modifiers[idx];
             let eyes_dir = &self.work_eye_view_dirs[idx];
             let eyes_fov = &self.work_eye_fov_clamped[idx];
+            let eyes_fov_cos = &self.work_eye_fov_cos[idx];
 
             index.visit_neighbor_buckets(idx, radius, &mut |indices| {
                 #[cfg(feature = "simd_wide")]
@@ -4762,29 +4769,31 @@ impl WorldState {
                             let dx = dx_arr[lane];
                             let dy = dy_arr[lane];
                             let dist = dist_arr[lane];
-                            let ang = angle_to(dx, dy);
                             let dist_factor = (radius - dist) / radius;
+                            // Neighbor unit dir
+                            let nx = dx / dist;
+                            let ny = dy / dist;
                             #[cfg(feature = "simd_wide")]
                             {
-                                let base = [
-                                    eyes_dir[0],
-                                    eyes_dir[1],
-                                    eyes_dir[2],
-                                    eyes_dir[3],
-                                ];
-                                let fov = [eyes_fov[0], eyes_fov[1], eyes_fov[2], eyes_fov[3]];
-                                let diff = [
-                                    angle_difference(base[0], ang),
-                                    angle_difference(base[1], ang),
-                                    angle_difference(base[2], ang),
-                                    angle_difference(base[3], ang),
-                                ];
-                                let diff_v = f32x4::new(diff);
-                                let fov_v = f32x4::new(fov);
-                                let mut fov_factor = (fov_v - diff_v) / fov_v;
-                                fov_factor = fov_factor.max(f32x4::splat(0.0));
-                                let scalar = traits.eye * dist_factor * (dist / radius);
-                                let intensity_v = fov_factor * f32x4::splat(scalar);
+                                // Dot against per-eye view directions; threshold by cos(FOV)
+                                let eye_dirs_x = [eyes_dir[0].cos(), eyes_dir[1].cos(), eyes_dir[2].cos(), eyes_dir[3].cos()];
+                                let eye_dirs_y = [eyes_dir[0].sin(), eyes_dir[1].sin(), eyes_dir[2].sin(), eyes_dir[3].sin()];
+                                let dot_v = f32x4::new([
+                                    eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
+                                    eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
+                                    eye_dirs_x[2] * nx + eye_dirs_y[2] * ny,
+                                    eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
+                                ]);
+                                let cos_fov_v = f32x4::new([eyes_fov_cos[0], eyes_fov_cos[1], eyes_fov_cos[2], eyes_fov_cos[3]]);
+                                let mask_v = f32x4::new([
+                                    (dot_v.to_array()[0] >= cos_fov_v.to_array()[0]) as i32 as f32,
+                                    (dot_v.to_array()[1] >= cos_fov_v.to_array()[1]) as i32 as f32,
+                                    (dot_v.to_array()[2] >= cos_fov_v.to_array()[2]) as i32 as f32,
+                                    (dot_v.to_array()[3] >= cos_fov_v.to_array()[3]) as i32 as f32,
+                                ]);
+                                // fov_factor ~ (cos_fov - dot)/cos_fov, clamped to [0,1]
+                                let fov_factor = ((cos_fov_v - dot_v) / cos_fov_v).max(f32x4::splat(0.0));
+                                let intensity_v = fov_factor * f32x4::splat(traits.eye * dist_factor * (dist / radius)) * mask_v;
                                 let color = colors[other_idx];
                                 let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
                                 let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
@@ -4806,9 +4815,14 @@ impl WorldState {
                             #[cfg(not(feature = "simd_wide"))]
                             {
                                 for eye in 0..NUM_EYES {
-                                    let diff = angle_difference(eyes_dir[eye], ang);
-                                    let fov = eyes_fov[eye];
-                                    if diff < fov {
+                                    // Dot mask vs. cos(FOV)
+                                    let vx = eyes_dir[eye].cos();
+                                    let vy = eyes_dir[eye].sin();
+                                    let dot = vx * nx + vy * ny;
+                                    if dot >= eyes_fov_cos[eye] {
+                                        // approximate fov_factor via dot/cos_fov
+                                        let fov = eyes_fov[eye];
+                                        let diff = angle_difference(eyes_dir[eye], angle_to(dx, dy));
                                         let fov_factor = ((fov - diff) / fov).max(0.0);
                                         let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
                                         density[eye] += intensity;
@@ -4819,8 +4833,11 @@ impl WorldState {
                                     }
                                 }
                             }
-                            let forward_diff = angle_difference(heading, ang);
-                            if forward_diff < BLOOD_HALF_FOV {
+                            // Blood via dot threshold to prune; magnitude via angle diff
+                            let align = hx * nx + hy * ny;
+                            if align >= cos_bhf {
+                                let ang = angle_to(dx, dy);
+                                let forward_diff = angle_difference(heading, ang);
                                 let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
                                 let health = healths[other_idx];
                                 let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
@@ -4929,31 +4946,33 @@ impl WorldState {
 
                     #[cfg(feature = "simd_wide")]
                     {
-                        let base = [
-                            wrap_signed_angle(heading + eyes_dir[0]),
-                            wrap_signed_angle(heading + eyes_dir[1]),
-                            wrap_signed_angle(heading + eyes_dir[2]),
-                            wrap_signed_angle(heading + eyes_dir[3]),
+                        // Compute neighbor unit direction
+                        let nx = dx / dist;
+                        let ny = dy / dist;
+                        // Precompute eye unit vectors from view angles
+                        let eye_dirs_x = [eyes_dir[0].cos(), eyes_dir[1].cos(), eyes_dir[2].cos(), eyes_dir[3].cos()];
+                        let eye_dirs_y = [eyes_dir[0].sin(), eyes_dir[1].sin(), eyes_dir[2].sin(), eyes_dir[3].sin()];
+                        let dot_v = f32x4::new([
+                            eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
+                            eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
+                            eye_dirs_x[2] * nx + eye_dirs_y[2] * ny,
+                            eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
+                        ]);
+                        let cos_fov_v = f32x4::new([
+                            eyes_fov_cos[0], eyes_fov_cos[1], eyes_fov_cos[2], eyes_fov_cos[3],
+                        ]);
+                        // mask = dot >= cos(fov)
+                        let mask = [
+                            (dot_v.to_array()[0] >= cos_fov_v.to_array()[0]) as i32 as f32,
+                            (dot_v.to_array()[1] >= cos_fov_v.to_array()[1]) as i32 as f32,
+                            (dot_v.to_array()[2] >= cos_fov_v.to_array()[2]) as i32 as f32,
+                            (dot_v.to_array()[3] >= cos_fov_v.to_array()[3]) as i32 as f32,
                         ];
-                        let fov = [
-                            eyes_fov[0].max(0.01),
-                            eyes_fov[1].max(0.01),
-                            eyes_fov[2].max(0.01),
-                            eyes_fov[3].max(0.01),
-                        ];
-                        let diff = [
-                            angle_difference(base[0], ang),
-                            angle_difference(base[1], ang),
-                            angle_difference(base[2], ang),
-                            angle_difference(base[3], ang),
-                        ];
-                        let diff_v = f32x4::new(diff);
-                        let fov_v = f32x4::new(fov);
-                        let mut fov_factor = (fov_v - diff_v) / fov_v;
-                        fov_factor = fov_factor.max(f32x4::splat(0.0));
-                        let scalar = traits.eye * dist_factor * (dist / radius);
-                        let intensity_v = fov_factor * f32x4::splat(scalar);
-
+                        let mask_v = f32x4::new(mask);
+                        // intensity = traits.eye * dist_factor * (dist/radius) * ((cos_fov - dot)/cos_fov) approximated by mask * (cos_fov - dot)/cos_fov
+                        let fov_factor = (cos_fov_v - dot_v) / cos_fov_v;
+                        let fov_factor = fov_factor.max(f32x4::splat(0.0));
+                        let intensity_v = fov_factor * f32x4::splat(traits.eye * dist_factor * (dist / radius)) * mask_v;
                         let color = colors[other_idx];
                         let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
                         let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
@@ -4996,8 +5015,13 @@ impl WorldState {
                     sound += dist_factor * self.work_speed_norm[other_idx];
                     hearing += dist_factor * sound_emitters[other_idx];
 
-                    let forward_diff = angle_difference(heading, ang);
-                    if forward_diff < BLOOD_HALF_FOV {
+                    // Blood via dot(heading_dir, n) >= cos(BLOOD_HALF_FOV)
+                    let hx = heading.cos();
+                    let hy = heading.sin();
+                    let align = hx * (dx / dist) + hy * (dy / dist);
+                    let cos_bhf = (BLOOD_HALF_FOV).cos();
+                    if align >= cos_bhf {
+                        let forward_diff = angle_difference(heading, ang);
                         let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
                         let health = healths[other_idx];
                         let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
@@ -5132,6 +5156,14 @@ impl WorldState {
         self.work_spike_lengths.clear();
         self.work_positions.extend_from_slice(columns.positions());
         self.work_headings.extend_from_slice(columns.headings());
+        self.work_heading_dir_x.clear();
+        self.work_heading_dir_y.clear();
+        self.work_heading_dir_x.resize(self.work_headings.len(), 0.0);
+        self.work_heading_dir_y.resize(self.work_headings.len(), 0.0);
+        for (i, &h) in self.work_headings.iter().enumerate() {
+            self.work_heading_dir_x[i] = h.cos();
+            self.work_heading_dir_y[i] = h.sin();
+        }
         self.work_spike_lengths.extend_from_slice(columns.spike_lengths());
         let positions_snapshot = &self.work_positions;
         let headings_snapshot = &self.work_headings;
@@ -5143,6 +5175,174 @@ impl WorldState {
         let topo_enabled = self.config.topography_enabled;
         let topo_gain = self.config.topography_speed_gain.max(0.0);
         let topo_penalty = self.config.topography_energy_penalty.max(0.0);
+        #[cfg(feature = "simd_wide")]
+        let mut results: Vec<ActuationResult> = vec![ActuationResult::default(); handles.len()];
+        #[cfg(feature = "simd_wide")]
+        {
+            for (chunk_i, chunk) in handles.chunks_exact(4).enumerate() {
+                let base = chunk_i * 4;
+                for lane in 0..4 {
+                    let idx = base + lane;
+                    let agent_id = chunk[lane];
+                    let Some(rt) = runtime.get(agent_id) else { continue; };
+                    let outputs = rt.outputs;
+                    let left = outputs.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let color = [
+                        clamp01(outputs.get(2).copied().unwrap_or(0.0)),
+                        clamp01(outputs.get(3).copied().unwrap_or(0.0)),
+                        clamp01(outputs.get(4).copied().unwrap_or(0.0)),
+                    ];
+                    let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
+                    let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+
+                    let mut left_speed = left * bot_speed;
+                    let mut right_speed = right * bot_speed;
+                    if boost {
+                        left_speed *= boost_multiplier;
+                        right_speed *= boost_multiplier;
+                    }
+
+                    let mut heading = headings_snapshot[idx];
+                    let angular = (right_speed - left_speed) / wheel_base;
+                    heading = wrap_signed_angle(heading + angular);
+
+                    let mut slope_along: f32 = 0.0;
+                    if topo_enabled && cell_size > 0.0 {
+                        let (grad_x, grad_y) = terrain.gradient_world(
+                            positions_snapshot[idx].x,
+                            positions_snapshot[idx].y,
+                            cell_size,
+                        );
+                        let dir_x = heading.cos();
+                        let dir_y = heading.sin();
+                        slope_along = grad_x * dir_x + grad_y * dir_y;
+                        if topo_gain > 0.0 {
+                            let downhill = (-slope_along).max(0.0);
+                            let uphill = slope_along.max(0.0);
+                            let mut speed_factor: f32 = 1.0;
+                            if downhill > 0.0 { speed_factor *= 1.0 + downhill * topo_gain; }
+                            if uphill > 0.0 { speed_factor /= 1.0 + uphill * topo_gain; }
+                            speed_factor = speed_factor.clamp(0.4, 1.8);
+                            left_speed *= speed_factor;
+                            right_speed *= speed_factor;
+                        }
+                    }
+
+                    let linear = (left_speed + right_speed) * 0.5;
+                    let vx = heading.cos() * linear;
+                    let vy = heading.sin() * linear;
+
+                    let mut next_pos = positions_snapshot[idx];
+                    next_pos.x = Self::wrap_position(next_pos.x + vx, width);
+                    next_pos.y = Self::wrap_position(next_pos.y + vy, height);
+
+                    let movement_penalty = movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                    let mut drain = metabolism_drain + movement_penalty;
+                    if ramp_rate > 0.0 {
+                        let active_energy = (rt.energy - ramp_floor).max(0.0);
+                        drain += active_energy * ramp_rate;
+                    }
+                    if boost && boost_penalty > 0.0 { drain += boost_penalty; }
+                    if topo_enabled && topo_penalty > 0.0 {
+                        if slope_along > 0.0 { drain += slope_along * topo_penalty; }
+                        else if slope_along < 0.0 { drain = (drain + slope_along * topo_penalty * 0.5).max(0.0); }
+                    }
+                    let health_delta = -drain;
+                    let energy = (rt.energy - drain).max(0.0);
+
+                    let mut spike_length = spike_lengths_snapshot[idx];
+                    if spike_length < spike_target {
+                        spike_length = (spike_length + spike_growth).min(spike_target);
+                    } else if spike_length > spike_target {
+                        spike_length = (spike_length - spike_growth).max(spike_target);
+                    }
+                    let spiked = spike_length > 0.5;
+
+                    results[idx] = ActuationResult {
+                        delta: Some(ActuationDelta { heading, velocity: Velocity::new(vx, vy), position: next_pos, health_delta }),
+                        energy,
+                        color,
+                        spike_length,
+                        sound_level,
+                        give_intent,
+                        spiked,
+                    };
+                }
+
+                // Remainder handled below outside loop
+            }
+
+            let rem = handles.chunks_exact(4).remainder();
+            let base = handles.len() - rem.len();
+            for (o, agent_id) in rem.iter().enumerate() {
+                let idx = base + o;
+                let Some(runtime) = runtime.get(*agent_id) else { continue; };
+                let outputs = runtime.outputs;
+                let left = outputs.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let color = [
+                    clamp01(outputs.get(2).copied().unwrap_or(0.0)),
+                    clamp01(outputs.get(3).copied().unwrap_or(0.0)),
+                    clamp01(outputs.get(4).copied().unwrap_or(0.0)),
+                ];
+                let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
+                let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+
+                let mut left_speed = left * bot_speed;
+                let mut right_speed = right * bot_speed;
+                if boost { left_speed *= boost_multiplier; right_speed *= boost_multiplier; }
+                let mut heading = headings_snapshot[idx];
+                let angular = (right_speed - left_speed) / wheel_base;
+                heading = wrap_signed_angle(heading + angular);
+                let mut slope_along: f32 = 0.0;
+                if topo_enabled && cell_size > 0.0 {
+                    let (gx, gy) = terrain.gradient_world(positions_snapshot[idx].x, positions_snapshot[idx].y, cell_size);
+                    let dir_x = heading.cos();
+                    let dir_y = heading.sin();
+                    slope_along = gx * dir_x + gy * dir_y;
+                    if topo_gain > 0.0 {
+                        let downhill = (-slope_along).max(0.0);
+                        let uphill = slope_along.max(0.0);
+                        let mut speed_factor: f32 = 1.0;
+                        if downhill > 0.0 { speed_factor *= 1.0 + downhill * topo_gain; }
+                        if uphill > 0.0 { speed_factor /= 1.0 + uphill * topo_gain; }
+                        speed_factor = speed_factor.clamp(0.4, 1.8);
+                        left_speed *= speed_factor; right_speed *= speed_factor;
+                    }
+                }
+                let linear = (left_speed + right_speed) * 0.5;
+                let vx = heading.cos() * linear;
+                let vy = heading.sin() * linear;
+                let mut next_pos = positions_snapshot[idx];
+                next_pos.x = Self::wrap_position(next_pos.x + vx, width);
+                next_pos.y = Self::wrap_position(next_pos.y + vy, height);
+                let movement_penalty = movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                let mut drain = metabolism_drain + movement_penalty;
+                if ramp_rate > 0.0 {
+                    let active_energy = (runtime.energy - ramp_floor).max(0.0);
+                    drain += active_energy * ramp_rate;
+                }
+                if boost && boost_penalty > 0.0 { drain += boost_penalty; }
+                if topo_enabled && topo_penalty > 0.0 {
+                    if slope_along > 0.0 { drain += slope_along * topo_penalty; }
+                    else if slope_along < 0.0 { drain = (drain + slope_along * topo_penalty * 0.5).max(0.0); }
+                }
+                let health_delta = -drain;
+                let energy = (runtime.energy - drain).max(0.0);
+                let mut spike_length = spike_lengths_snapshot[idx];
+                if spike_length < spike_target { spike_length = (spike_length + spike_growth).min(spike_target); }
+                else if spike_length > spike_target { spike_length = (spike_length - spike_growth).max(spike_target); }
+                let spiked = spike_length > 0.5;
+                results[idx] = ActuationResult { delta: Some(ActuationDelta { heading, velocity: Velocity::new(vx, vy), position: next_pos, health_delta }), energy, color, spike_length, sound_level, give_intent, spiked };
+            }
+        }
+
+        #[cfg(not(feature = "simd_wide"))]
         let results: Vec<ActuationResult> = collect_handles!(handles, |idx, agent_id| {
             if let Some(runtime) = runtime.get(*agent_id) {
                 let outputs = runtime.outputs;
@@ -5305,7 +5505,6 @@ impl WorldState {
             }
         }
     }
-
     fn stage_temperature_discomfort(&mut self) {
         let rate = self.config.temperature_discomfort_rate;
         if rate <= 0.0 || self.config.world_width == 0 {
@@ -5332,6 +5531,91 @@ impl WorldState {
         self.work_penalties.resize(handles.len(), 0.0);
         let penalties = &mut self.work_penalties;
 
+        #[cfg(feature = "simd_wide")]
+        {
+            use wide::f32x4;
+
+            for (base, chunk) in handles.chunks_exact(4).enumerate() {
+                let i0 = base * 4;
+                let idxs = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                // Gather env temps and preferences per lane
+                let t0 = sample_temperature(&self.config, positions_snapshot[i0 + 0].x);
+                let t1 = sample_temperature(&self.config, positions_snapshot[i0 + 1].x);
+                let t2 = sample_temperature(&self.config, positions_snapshot[i0 + 2].x);
+                let t3 = sample_temperature(&self.config, positions_snapshot[i0 + 3].x);
+
+                let p0 = self
+                    .runtime
+                    .get(idxs[0])
+                    .map(|r| r.temperature_preference)
+                    .unwrap_or(0.5);
+                let p1 = self
+                    .runtime
+                    .get(idxs[1])
+                    .map(|r| r.temperature_preference)
+                    .unwrap_or(0.5);
+                let p2 = self
+                    .runtime
+                    .get(idxs[2])
+                    .map(|r| r.temperature_preference)
+                    .unwrap_or(0.5);
+                let p3 = self
+                    .runtime
+                    .get(idxs[3])
+                    .map(|r| r.temperature_preference)
+                    .unwrap_or(0.5);
+
+                let t_v = f32x4::new([t0, t1, t2, t3]);
+                let p_v = f32x4::new([p0, p1, p2, p3]);
+                let diff_v = (t_v - p_v).abs();
+                let band_v = f32x4::splat(comfort_band);
+                let above_v = (diff_v - band_v).max(f32x4::splat(0.0));
+
+                // Exponent may be non-integer; compute per-lane powf when needed
+                let mut above = above_v.to_array();
+                let mut pen = [0.0_f32; 4];
+                for lane in 0..4 {
+                    let a = above[lane];
+                    if a > 0.0 {
+                        // Fast path for exponent ~ 2
+                        let val = if (exponent - 2.0).abs() < 1e-6 {
+                            a * a
+                        } else {
+                            a.powf(exponent)
+                        };
+                        pen[lane] = rate * val;
+                    }
+                }
+                // Store penalties back
+                penalties[i0 + 0] = pen[0].max(0.0);
+                penalties[i0 + 1] = pen[1].max(0.0);
+                penalties[i0 + 2] = pen[2].max(0.0);
+                penalties[i0 + 3] = pen[3].max(0.0);
+            }
+
+            // Remainder (less than 4)
+            let rem = handles.chunks_exact(4).remainder();
+            let base = handles.len() - rem.len();
+            for (o, agent_id) in rem.iter().enumerate() {
+                let idx = base + o;
+                let env_temperature = sample_temperature(&self.config, positions_snapshot[idx].x);
+                let Some(runtime) = self.runtime.get(*agent_id) else {
+                    continue;
+                };
+                let mut discomfort =
+                    temperature_discomfort(env_temperature, runtime.temperature_preference);
+                if discomfort <= comfort_band {
+                    continue;
+                }
+                discomfort = (discomfort - comfort_band).max(0.0);
+                let penalty = rate * discomfort.powf(exponent);
+                if penalty > 0.0 {
+                    penalties[idx] = penalty;
+                }
+            }
+        }
+
+        #[cfg(not(feature = "simd_wide"))]
         for (idx, agent_id) in handles.iter().enumerate() {
             let env_temperature = sample_temperature(&self.config, positions_snapshot[idx].x);
             let Some(runtime) = self.runtime.get(*agent_id) else {
@@ -5736,7 +6020,6 @@ impl WorldState {
             runtime.indicator.color = color;
         }
     }
-
     fn stage_combat(&mut self) {
         let spike_radius = self.config.spike_radius;
         if spike_radius <= 0.0 {
@@ -5886,40 +6169,30 @@ impl WorldState {
                         let dir_y_v = dy_v / dist_v;
                         let align_v = dir_x_v * f32x4::splat(facing.0)
                             + dir_y_v * f32x4::splat(facing.1);
-                        let align = align_v.to_array();
-                        let dist_sq = dist_sq_v.to_array();
-                        // Emit per-lane using identical scalar conditions and order
+                        // Build lane mask for (not self) && (dist within reach) && (alignment >= threshold)
+                        let dist_sq_arr = dist_sq_v.to_array();
+                        let align_arr = align_v.to_array();
                         let ids = [a0, a1, a2, a3];
+                        let mut dmg_arr = [0.0_f32; 4];
                         for lane in 0..4 {
+                            let oid = ids[lane];
+                            if oid == idx { continue; }
+                            let d2 = dist_sq_arr[lane];
+                            if d2 <= f32::EPSILON || d2 > reach_sq { continue; }
+                            let al = align_arr[lane];
+                            if al < alignment_threshold { continue; }
+                            let dmg = base_damage * al.max(0.0);
+                            if dmg > 0.0 { dmg_arr[lane] = dmg; }
+                        }
+                        // Emit per-lane respecting order
+                        for lane in 0..4 {
+                            let damage = dmg_arr[lane];
+                            if damage <= 0.0 { continue; }
                             let other_idx = ids[lane];
-                            if other_idx == idx {
-                                continue;
-                            }
-                            let dist_sq_val = dist_sq[lane];
-                            if dist_sq_val <= f32::EPSILON || dist_sq_val > reach_sq {
-                                continue;
-                            }
-                            let alignment = align[lane];
-                            if alignment < alignment_threshold {
-                                continue;
-                            }
-                            let damage = base_damage * alignment.max(0.0);
-                            if damage <= 0.0 {
-                                continue;
-                            }
                             let target_runtime = &runtime_snapshot[other_idx];
-                            let victim_carnivore =
-                                target_runtime.herbivore_tendency < carnivore_threshold;
-                            if victim_carnivore {
-                                result.hit_carnivore = true;
-                            } else {
-                                result.hit_herbivore = true;
-                            }
-                            hits.push(CombatHit {
-                                target_idx: other_idx,
-                                damage,
-                                attacker_carnivore: is_carnivore,
-                            });
+                            let victim_carnivore = target_runtime.herbivore_tendency < carnivore_threshold;
+                            if victim_carnivore { result.hit_carnivore = true; } else { result.hit_herbivore = true; }
+                            hits.push(CombatHit { target_idx: other_idx, damage, attacker_carnivore: is_carnivore });
                         }
                     }
                     let rem = indices.chunks_exact(4).remainder();
@@ -6158,6 +6431,54 @@ impl WorldState {
             }
 
             let mut neighbor_indices = Vec::new();
+            #[cfg(feature = "simd_wide")]
+            {
+                use wide::f32x4;
+                for (chunk_i, chunk) in handles.chunks_exact(4).enumerate() {
+                    let base = chunk_i * 4;
+                    let ids = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                    let mut dx_arr = [0.0_f32; 4];
+                    let mut dy_arr = [0.0_f32; 4];
+                    for lane in 0..4 {
+                        let idx = base + lane;
+                        dx_arr[lane] = toroidal_delta(positions[idx].x, victim_pos.x, width);
+                        dy_arr[lane] = toroidal_delta(positions[idx].y, victim_pos.y, height);
+                    }
+                    let dx_v = f32x4::new(dx_arr);
+                    let dy_v = f32x4::new(dy_arr);
+                    let dist2_v = dx_v * dx_v + dy_v * dy_v;
+                    let dist2 = dist2_v.to_array();
+                    for lane in 0..4 {
+                        let idx = base + lane;
+                        if ids[lane] == *agent_id {
+                            continue;
+                        }
+                        if healths.get(idx).copied().unwrap_or(0.0) <= 0.0 {
+                            continue;
+                        }
+                        if dist2[lane] <= radius_sq {
+                            neighbor_indices.push(idx);
+                        }
+                    }
+                }
+                let rem = handles.chunks_exact(4).remainder();
+                let base = handles.len() - rem.len();
+                for (o, neighbor_id) in rem.iter().enumerate() {
+                    let idx = base + o;
+                    if *neighbor_id == *agent_id {
+                        continue;
+                    }
+                    if healths.get(idx).copied().unwrap_or(0.0) <= 0.0 {
+                        continue;
+                    }
+                    let dx = toroidal_delta(positions[idx].x, victim_pos.x, width);
+                    let dy = toroidal_delta(positions[idx].y, victim_pos.y, height);
+                    if dx * dx + dy * dy <= radius_sq {
+                        neighbor_indices.push(idx);
+                    }
+                }
+            }
+            #[cfg(not(feature = "simd_wide"))]
             for (idx, neighbor_id) in handles.iter().enumerate() {
                 if *neighbor_id == *agent_id {
                     continue;
@@ -6498,7 +6819,6 @@ impl WorldState {
             }
         }
     }
-
     #[allow(clippy::too_many_arguments)]
     fn build_child_data(
         &mut self,
@@ -6887,7 +7207,6 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
-
     fn stage_persistence(&mut self, next_tick: Tick) {
         if self.config.persistence_interval == 0
             || !next_tick
@@ -7683,7 +8002,6 @@ impl WorldState {
         let idx = (y as usize) * (self.food.width() as usize) + x as usize;
         self.food_profiles.get(idx).map(Into::into)
     }
-
     /// Immutable access to the terrain tile layer.
     #[must_use]
     pub fn terrain(&self) -> &TerrainLayer {
@@ -7984,7 +8302,6 @@ impl WorldState {
         AgentId::from(KeyData::from_ffi(raw))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8774,7 +9091,6 @@ mod tests {
         }
         ticks
     }
-
     #[test]
     fn reproduction_gate_is_seed_deterministic() {
         let base = ScriptBotsConfig {
@@ -9564,7 +9880,6 @@ mod tests {
             "fertile cell should respect capacity"
         );
     }
-
     #[test]
     fn respawn_respects_local_capacity() {
         let mut world = WorldState::new(ScriptBotsConfig {

@@ -169,11 +169,11 @@
 - Portability: stay on stable Rust; use `wide` crate for SIMD; fallback remains scalar.
 - Maintainability: clean, isolated SIMD blocks guarded by feature flags; heavy use of SoA snapshots and precomputed scalars to keep inner loops straightforward.
 
-### SIMD Expansion Targets and Implementation Details [Planned]
+### SIMD Expansion Targets and Implementation Details [Expanded]
 
 This section enumerates concrete SIMD opportunities beyond the already‑shipped 4‑lane batching in sensing (eyes) and neighbor accumulation (smell/sound/hearing), with rationale, approach, determinism strategy, and acceptance criteria for each subsystem. Items will be flipped to [Currently In Progress] or [Completed] inline as work lands.
 
-1) Eyes: precompute trigonometry and use dot‑product angular tests [Planned]
+1) Eyes: precompute trigonometry and use dot‑product angular tests [Completed – 2025-10-25]
    - Rationale: Avoid per‑neighbor atan/angle‑wrapping; replace with dot(view_dir, neighbor_dir) and compare against cos(FOV). Reduces branches and transcendentals in the tight loop.
    - Approach:
      - Precompute per‑agent per‑eye unit vectors: `view_dir_eye[e] = (cos(heading+eye_offset[e]), sin(...))` and `cos_fov[e] = cos(clamp(fov, 0.01,..))` once per tick.
@@ -182,15 +182,15 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
    - Determinism: No change in ordering; multiply‑by‑zero masks avoid control‑flow divergence.
    - Acceptance: Bench ≥2–4% win at 2k/1k ticks; determinism microtests (per‑agent sensor equality) pass.
 
-2) Blood cone: lane‑wise forward cone via dot threshold [Planned]
+2) Blood cone: lane‑wise forward cone via dot threshold [Currently In Progress – 2025-10-25]
    - Rationale: The scalar path uses `angle_difference(heading, ang) < BLOOD_HALF_FOV`. Replace with `dot(heading_dir, n) >= cos(BLOOD_HALF_FOV)` to avoid branches/trig.
    - Approach:
      - Precompute `heading_dir = (cos(heading), sin(heading))` per agent and `cos_blood_half_fov` once.
-     - In 4‑lane batches, compute the dot for each neighbor lane, mask lanes below threshold, and multiply the `bleed*wound*dist_factor` contributions by mask.
+     - In 4‑lane batches, compute the dot for each neighbor lane, mask lanes below threshold; we still compute bleed via angle diff for accepted lanes to preserve exact magnitude parity.
    - Determinism: Use lane masks and keep per‑neighbor emission order; no horizontal reductions.
    - Acceptance: Equal blood channel vs. scalar on micro scenes; ≥1–2% win at 2k/1k ticks.
 
-3) Combat: 4‑lane alignment and damage scaling [Planned]
+3) Combat: 4‑lane alignment and damage scaling [Currently In Progress – 2025-10-25]
    - Rationale: The combat loop performs repeated dot/alignment and damage scaling per candidate neighbor; batching 4 victims at a time improves throughput.
    - Approach:
      - In the existing 4‑lane path, compute `dir_x/dir_y`, `align = dot(facing, dir)` as lanes, then `damage = base * (1+length*len_bonus) * (1+(wheel/max+speed)*spd_bonus+boost)`; apply lane mask for reach/alignment.
@@ -206,7 +206,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
    - Determinism: No branch ordering changes; masked arithmetic only.
    - Acceptance: Bench ≥2% additional win at 2k/1k ticks; equality microtests pass.
 
-5) Temperature discomfort: penalties across agents [Planned]
+5) Temperature discomfort: penalties across agents [Completed – 2025-10-25]
    - Rationale: Post‑sense penalty is per‑agent and memory‑friendly; batching reduces loop overhead.
    - Approach:
      - Precompute `env_temperature` scalars; SIMD compute `(discomfort - band).max(0)^exponent * rate` via polynomial approximation or repeated multiplications when exponent is 2; fall back to scalar powf otherwise.
@@ -214,10 +214,10 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
    - Determinism: Lane‑wise masks; per‑agent stores preserve order.
    - Acceptance: ≥1–2% win at 5k/1k ticks; equality microtests.
 
-6) Actuation: heading/velocity/energy drain in 4‑agent blocks [Planned]
+6) Actuation: heading/velocity/energy drain in 4‑agent blocks [Currently In Progress – 2025-10-25]
    - Rationale: Actuation math is homogeneous across agents; batching reduces loop overhead.
    - Approach:
-     - SIMD compute `linear`, `angular`, and clamped drain per 4 agents; commit deltas per agent after batch.
+     - SIMD compute `linear`, `angular`, and clamped drain per 4 agents; commit deltas per agent after batch. Precompute heading unit vectors for current tick to reuse across slope and velocity math.
      - Terrain gradient dot heading (see item 9) integrated when topography enabled.
    - Determinism: Writeback preserves agent index order.
    - Acceptance: ≥2–3% win at 5k/1k ticks; correctness via seeded runs.
@@ -243,7 +243,8 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
    - Determinism: Per‑agent writebacks in order.
    - Acceptance: No regressions; measurable improvement when topography enabled.
 
-10) UniformGridIndex neighbor SoA iterator [Planned]
+10) UniformGridIndex neighbor SoA iterator [Completed – 2025-10-25]
+   - Implementation: Added `visit_neighbor_bucket_positions_with_scratch(agent_idx, radius, scratch_x, scratch_y, visitor)` which gathers x[]/y[] per bucket while preserving deterministic order. Callers reuse scratch buffers for zero-alloc loops.
    - Rationale: Current neighbor access gathers positions from AoS `Vec<(x,y)>`; a SoA iterator returning contiguous `x[]`, `y[]` slices reduces gathers and improves SIMD loads.
    - Approach:
      - Add optional API `visit_neighbor_bucket_positions(agent_idx, radius, visitor: FnMut(&[f32], &[f32], &[usize]))` behind a feature; populate from internal `positions` while maintaining dense/sparse paths.
@@ -740,6 +741,8 @@ Implementation notes [2025-10-23]:
 - 2025-10-24: Created new crate `scriptbots-world-gfx` (workspace member) with initial `WorldRenderer` skeleton, RGBA8 sRGB color target, and triple‑buffered readback ring API (non‑blocking poll). This establishes the offscreen render + readback contract for GPUI composition. Next: wire minimal terrain/agent pipelines and the GPUI compositor stub.
 - 2025-10-24: Implemented two instanced pipelines (terrain + agents). Terrain uses a texture‑atlas, linear sampling, and alpha blending; agents render as SDF circles with rim highlights for premium visuals. Added viewport uniform (bind groups) and correct NDC mapping, plus per‑frame updates and resize propagation. Next: biome-aware atlas UVs, water shimmer/slope accents, CPU frustum culling, and GPUI compositor upload path.
  - 2025-10-24: Terrain atlas UV mapping and visual polish landed. Generated a compact 3×2 atlas (Deep/ Shallow water, Sand, Grass, Bloom, Rock) and wired UV selection per tile. Added water shimmer (time-driven) for water tiles and slope-based darkening accents using elevation gradients. Introduced CPU frustum culling for terrain and agents, uniform time in the view UBO, and dynamic instance buffer reallocation. Agents pipeline now uses correct NDC mapping via the view UBO. Next: compositor stub in `scriptbots-render` behind feature `world_wgpu`, persistent GPUI image, and ring-buffered uploads.
+ - 2025-10-25: Wired world compositor behind `world_wgpu`. Offscreen render+triple-buffer readback is integrated; interim decimated blit presents the frame in GPUI while we finish persistent image upload. Added camera scale/offset to world-gfx uniforms and shaders so GPUI’s pan/zoom can be passed to the wgpu renderer. Resize propagation is in place; readback and upload buffers persist across frames. Next: swap decimated blit for persistent GPUI image upload/draw; add selection/hover rings in the wgpu agent pass; finalize quality knobs and tests.
+ - 2025-10-25: Camera mapping fully wired GPUI→wgpu; culling and transforms use the same pan/zoom. Added selection/hover glow to the agent shader and a renderer quality knob (SB_WGPU_RES_SCALE) and FPS cap (SB_WGPU_MAX_FPS). Next: replace interim decimated blit with persistent GPUI image upload/draw; terrain/agent polish and perf/tests.
 
 ### Maintenance & Risk Notes
 - No GPUI fork. Unmodified upstream stays in `Cargo.toml`.

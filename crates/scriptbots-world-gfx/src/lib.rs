@@ -27,6 +27,8 @@ pub struct AgentInstance {
     pub position: [f32; 2],
     pub size: f32,
     pub color: [f32; 4],
+    pub selection: u32,    // 0=None, 1=Hovered, 2=Selected/Focused
+    pub glow: f32,         // 0..1 extra glow (e.g., reproduction/spike)
 }
 
 pub struct WorldRenderer {
@@ -40,6 +42,8 @@ pub struct WorldRenderer {
     terrain: TerrainPipeline,
     agents: AgentPipeline,
     view: ViewUniforms,
+    cam_scale: f32,
+    cam_offset: (f32, f32),
     start_time: Instant,
 }
 
@@ -73,6 +77,8 @@ impl WorldRenderer {
             terrain,
             agents,
             view,
+            cam_scale: 1.0,
+            cam_offset: (0.0, 0.0),
             start_time: Instant::now(),
         })
     }
@@ -88,17 +94,22 @@ impl WorldRenderer {
         self.readback = ReadbackRing::new(&self.device, new_size, self.format)?;
         // keep time monotonic across resizes
         let elapsed = self.start_time.elapsed().as_secs_f32();
-        self.view.update(&self.queue, new_size, elapsed);
+        self.view.update(&self.queue, new_size, elapsed, self.cam_scale, self.cam_offset);
         Ok(())
+    }
+
+    pub fn set_camera(&mut self, scale: f32, offset: (f32, f32)) {
+        self.cam_scale = scale;
+        self.cam_offset = offset;
     }
 
     pub fn render(&mut self, snapshot: &WorldSnapshot) -> RenderFrame {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world.render") });
-        // Ensure view uniforms match current viewport and time
+        // Ensure view uniforms match current viewport, time, and camera
         let elapsed = self.start_time.elapsed().as_secs_f32();
-        self.view.update(&self.queue, self.size, elapsed);
+        self.view.update(&self.queue, self.size, elapsed, self.cam_scale, self.cam_offset);
         // Background clear
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -114,8 +125,8 @@ impl WorldRenderer {
             });
         }
         // Terrain + agents
-        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size);
-        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size);
+        self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
+        self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
         self.queue.submit(Some(encoder.finish()));
         RenderFrame { extent: self.size }
     }
@@ -245,7 +256,7 @@ struct ViewUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ViewData { viewport: [f32; 2], time: f32, _pad: f32 }
+struct ViewData { v0: [f32; 4], v1: [f32; 4] }
 
 impl ViewUniforms {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32)) -> Self {
@@ -274,12 +285,14 @@ impl ViewUniforms {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
         });
         let this = Self { buf, layout, bg };
-        this.update(queue, size, 0.0);
+        this.update(queue, size, 0.0, 1.0, (0.0, 0.0));
         this
     }
 
-    fn update(&self, queue: &wgpu::Queue, size: (u32, u32), time: f32) {
-        let data = ViewData { viewport: [size.0 as f32, size.1 as f32], time, _pad: 0.0 };
+    fn update(&self, queue: &wgpu::Queue, size: (u32, u32), time: f32, scale: f32, offset: (f32, f32)) {
+        let v0 = [size.0 as f32, size.1 as f32, time, scale];
+        let v1 = [offset.0, offset.1, 0.0, 0.0];
+        let data = ViewData { v0, v1 };
         queue.write_buffer(&self.buf, 0, bytemuck::bytes_of(&data));
     }
 }
@@ -453,7 +466,7 @@ impl TerrainPipeline {
         self.vbuf_capacity_bytes = cap;
     }
 
-    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32)) {
+    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32), scale: f32, offset: (f32, f32)) {
         // Build tile instances for visible terrain with simple CPU frustum culling.
         let (tw, th) = snapshot.terrain.dims;
         let cell = snapshot.terrain.cell_size as f32;
@@ -472,8 +485,12 @@ impl TerrainPipeline {
             for x in 0..tw as i32 {
                 let px = x as f32 * cell;
                 let py = y as f32 * cell;
-                // cull offscreen tiles
-                if px >= vp_w || py >= vp_h || px + cell <= 0.0 || py + cell <= 0.0 { continue; }
+                // Convert to pixel-space for culling using camera
+                let min_x_px = px * scale + offset.0;
+                let min_y_px = py * scale + offset.1;
+                let max_x_px = min_x_px + cell * scale;
+                let max_y_px = min_y_px + cell * scale;
+                if max_x_px < 0.0 || max_y_px < 0.0 || min_x_px > vp_w || min_y_px > vp_h { continue; }
                 let idx = (y as usize) * (tw as usize) + (x as usize);
                 let tile_id = snapshot.terrain.tiles.get(idx).copied().unwrap_or(3);
                 let uv = self.atlas_uv_for(tile_id);
@@ -522,7 +539,7 @@ struct VsOut {
   @location(2) slope: f32,
 };
 
-struct View { viewport: vec2<f32>, time: f32, _pad: f32 };
+struct View { v0: vec4<f32>, v1: vec4<f32> }; // v0=(viewport.x,viewport.y,time,scale) v1=(offset_x,offset_y,_,_)
 @group(1) @binding(0) var<uniform> view: View;
 
 @vertex
@@ -531,7 +548,11 @@ fn vs_main(inst: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
   var quad = array<vec2<f32>, 4>(vec2<f32>(0.0,0.0), vec2<f32>(1.0,0.0), vec2<f32>(0.0,1.0), vec2<f32>(1.0,1.0));
   let p = quad[vid];
   let xy = inst.pos + p * inst.size;
-  let ndc = vec2<f32>(xy.x / view.viewport.x * 2.0 - 1.0, 1.0 - (xy.y / view.viewport.y * 2.0));
+  let viewport = view.v0.xy;
+  let scale = view.v0.w;
+  let offset = view.v1.xy;
+  let pos = (inst.pos + p * inst.size) * scale + offset;
+  let ndc = vec2<f32>(pos.x / viewport.x * 2.0 - 1.0, 1.0 - (pos.y / viewport.y * 2.0));
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
   o.uv = mix(inst.uv.xy, inst.uv.zw, p);
   o.kind = inst.kind;
@@ -547,9 +568,12 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   var base = textureSample(atlas_tex, atlas_smp, v.uv);
   // water shimmer for Deep/Shallow water kinds (0,1)
   if (v.kind <= 1u) {
-    let wave = sin((v.uv.x * 40.0 + v.uv.y * 28.0) + view.time * 2.2);
+    let time = view.v0.z;
+    let wave = sin((v.uv.x * 40.0 + v.uv.y * 28.0) + time * 2.2);
     let shimmer = 0.05 + 0.07 * wave;
-    base.rgb = clamp(base.rgb + vec3<f32>(shimmer), vec3<f32>(0.0), vec3<f32>(1.0));
+    // subtle caustics grid for shallow water
+    let ca = (sin(v.uv.x * 160.0 + time * 1.8) * sin(v.uv.y * 140.0 + time * 1.6)) * 0.04;
+    base.rgb = clamp(base.rgb + vec3<f32>(shimmer + ca), vec3<f32>(0.0), vec3<f32>(1.0));
   } else {
     // slope accents (darken proportionally)
     let darken = clamp(1.0 - v.slope * 0.35, 0.0, 1.0);
@@ -574,6 +598,9 @@ struct AgentInstanceGpu {
     size: f32,
     _pad: f32,
     color: [f32; 4],
+    selection: u32,
+    glow: f32,
+    _pad2: [f32; 2],
 }
 
 impl AgentPipeline {
@@ -583,7 +610,7 @@ impl AgentPipeline {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("agents.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4] }] },
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4, 4 => Uint32, 5 => Float32] }] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: None,
@@ -603,16 +630,19 @@ impl AgentPipeline {
         self.vbuf_capacity_bytes = cap;
     }
 
-    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32)) {
+    fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, view_tex: &wgpu::TextureView, view_uniforms: &ViewUniforms, snapshot: &WorldSnapshot, viewport: (u32, u32), scale: f32, offset: (f32, f32)) {
         let mut staging: Vec<AgentInstanceGpu> = Vec::with_capacity(snapshot.agents.len());
         let (vp_w, vp_h) = (viewport.0 as f32, viewport.1 as f32);
         for a in snapshot.agents {
             // CPU frustum culling (pixel-space); assumes positions/sizes are pixels in this pass
             let half = a.size * 0.5;
-            if a.position[0] + half < 0.0 || a.position[0] - half > vp_w || a.position[1] + half < 0.0 || a.position[1] - half > vp_h {
+            let cx = a.position[0] * scale + offset.0;
+            let cy = a.position[1] * scale + offset.1;
+            let radius = half * scale;
+            if cx + radius < 0.0 || cx - radius > vp_w || cy + radius < 0.0 || cy - radius > vp_h {
                 continue;
             }
-            staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color });
+            staging.push(AgentInstanceGpu { pos: a.position, size: a.size, _pad: 0.0, color: a.color, selection: a.selection, glow: a.glow, _pad2: [0.0, 0.0] });
         }
         if !staging.is_empty() {
             let needed = (staging.len() * std::mem::size_of::<AgentInstanceGpu>()) as u64;
@@ -639,6 +669,8 @@ struct InInst {
   @location(1) size: f32,
   @location(2) _pad: f32,
   @location(3) color: vec4<f32>,
+  @location(4) selection: u32,
+  @location(5) glow: f32,
 };
 
 struct VsOut {
@@ -646,9 +678,11 @@ struct VsOut {
   @location(0) color: vec4<f32>,
   @location(1) local: vec2<f32>,
   @location(2) radius: f32,
+  @location(3) selection: u32,
+  @location(4) glow: f32,
 };
 
-struct View { viewport: vec2<f32>, time: f32, _pad: f32 };
+struct View { v0: vec4<f32>, v1: vec4<f32> }; // v0=(viewport.x,viewport.y,time,scale) v1=(offset_x,offset_y,_,_)
 @group(0) @binding(0) var<uniform> view: View;
 
 @vertex
@@ -656,12 +690,17 @@ fn vs_main(inst: InInst, @builtin(vertex_index) vid: u32) -> VsOut {
   var o: VsOut;
   var quad = array<vec2<f32>, 4>(vec2<f32>(-0.5,-0.5), vec2<f32>(0.5,-0.5), vec2<f32>(-0.5,0.5), vec2<f32>(0.5,0.5));
   let l = quad[vid];
-  let world = inst.pos + l * inst.size;
-  let ndc = vec2<f32>(world.x / view.viewport.x * 2.0 - 1.0, 1.0 - (world.y / view.viewport.y * 2.0));
+  let viewport = view.v0.xy;
+  let scale = view.v0.w;
+  let offset = view.v1.xy;
+  let world = (inst.pos + l * inst.size) * scale + offset;
+  let ndc = vec2<f32>(world.x / viewport.x * 2.0 - 1.0, 1.0 - (world.y / viewport.y * 2.0));
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
   o.color = inst.color;
   o.local = l;          // range [-0.5, 0.5]
   o.radius = inst.size; // pixel radius
+  o.selection = inst.selection;
+  o.glow = inst.glow;
   return o;
 }
 
@@ -673,7 +712,9 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let rim = smoothstep(1.02, 0.98, d);   // thin rim near edge
   var base = v.color;
   base.a = base.a * edge;
-  let rim_col = vec4<f32>(1.0, 1.0, 1.0, 0.25) * rim;
+  let sel_glow = select(0.0, 0.25, v.selection == 1u) + select(0.0, 0.45, v.selection == 2u);
+  let glow = max(sel_glow, v.glow);
+  let rim_col = vec4<f32>(1.0, 1.0, 1.0, glow) * rim;
   return clamp(base + rim_col, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 "#;
