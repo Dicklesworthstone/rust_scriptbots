@@ -551,11 +551,13 @@ mod wgpu_capture_test {
 fn use_wgpu_renderer() -> bool {
     static CHOICE: OnceLock<bool> = OnceLock::new();
     *CHOICE.get_or_init(|| {
-        match std::env::var("SB_RENDERER").ok().as_deref() {
+        let choice = match std::env::var("SB_RENDERER").ok().as_deref() {
             Some("canvas") => false,
             Some("wgpu") => true,
             _ => true,
-        }
+        };
+        tracing::info!(choice, env = %std::env::var("SB_RENDERER").unwrap_or_default(), "use_wgpu_renderer decision");
+        choice
     })
 }
 
@@ -569,6 +571,8 @@ fn use_wgpu_renderer() -> bool { false }
     static COMPOSITOR: OnceLock<std::sync::Mutex<Compositor>> = OnceLock::new();
     let comp = COMPOSITOR.get_or_init(|| std::sync::Mutex::new(Compositor::new()));
     let mut comp = comp.lock().ok().expect("compositor mutex");
+
+    tracing::info!("entered paint_world_with_wgpu");
 
     let world_size = state.frame.world_size;
     // Root-cause guard: GPUI may report 0x0 during initial layout or when minimized
