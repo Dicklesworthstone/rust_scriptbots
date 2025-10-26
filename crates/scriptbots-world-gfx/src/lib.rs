@@ -146,9 +146,7 @@ impl WorldRenderer {
         // Terrain + agents
         let vis_tiles = self.terrain.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
         let vis_agents = self.agents.encode(&self.device, &self.queue, &mut encoder, &self.color_view, &self.view, snapshot, self.size, self.cam_scale, self.cam_offset);
-        if std::env::var("SB_WGPU_LOG_VIS").ok().as_deref() == Some("1") {
-            tracing::info!(tiles = vis_tiles, agents = vis_agents, "wgpu visible instances");
-        }
+        tracing::info!(tiles = vis_tiles, agents = vis_agents, "wgpu visible instances");
         // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
         if self.ensure_post() {
             if let Some(p) = self.post.as_mut() {

@@ -656,6 +656,8 @@ fn use_wgpu_renderer() -> bool { false }
     };
     let snapshot = GfxSnapshot { world_size, terrain: terrain_view, agents: &agents_gpu };
 
+    tracing::info!(vw=width_px, vh=height_px, world_w=world_w, world_h=world_h, base_scale=base_scale, scale=scale, pad_x=pad_x, pad_y=pad_y, off_x=off_px_x, off_y=off_px_y, cam_off_x=cam_offset.0, cam_off_y=cam_offset.1, "wgpu camera mapping");
+
     // Render using current camera mapping
     comp.set_camera_params(scale, cam_offset);
     comp.render_snapshot(&snapshot, viewport);
