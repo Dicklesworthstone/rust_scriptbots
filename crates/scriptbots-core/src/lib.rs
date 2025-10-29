@@ -8706,12 +8706,13 @@ mod tests {
             rng_seed: Some(42),
             ..ScriptBotsConfig::default()
         };
+        let expected_width = config.world_width;
         let mut world = WorldState::new(config).expect("world");
         assert_eq!(world.agent_count(), 0);
         assert_eq!(world.food().width(), 100);
         assert_eq!(world.food().height(), 100);
         assert_eq!(world.food().get(0, 0), Some(0.25));
-        assert_eq!(world.config().world_width, config.world_width);
+        assert_eq!(world.config().world_width, expected_width);
 
         let id = world.spawn_agent(sample_agent(5));
         assert_eq!(world.agent_count(), 1);

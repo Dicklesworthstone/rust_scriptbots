@@ -137,6 +137,7 @@ See the migration roadmap in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_U
 ```bash
 cargo check
 ```
+> **CPU tuning note:** Workspace builds now default to a portable baseline so CI runners don’t require AVX2/“native” features. Set `RUSTFLAGS="-C target-cpu=native"` locally (all launch scripts already do this) if you want host-specific tuning.
 
 ### Run the app shell
 ```bash

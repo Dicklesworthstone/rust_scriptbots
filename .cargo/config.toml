@@ -6,7 +6,7 @@ target = "x86_64-unknown-linux-gnu"
 linker = "clang"
 rustflags = [
     "-C","link-arg=-fuse-ld=mold",
-    # Use an AVX2-class baseline so CI runners avoid SIGILL while still getting SIMD tuning.
+    # Default to an AVX2-class baseline so CI avoids SIGILL; launch scripts add RUSTFLAGS=\"-C target-cpu=native\" for local tuning.
     "-C","target-cpu=x86-64-v3",
 ]
 
