@@ -8,7 +8,6 @@ RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DE
 4. **Mandatory explicit plan:** Even after explicit user authorization, restate the command verbatim, list exactly what will be affected, and wait for a confirmation that your understanding is correct. Only then may you execute it—if anything remains ambiguous, refuse and escalate.
 5. **Document the confirmation:** When running any approved destructive command, record (in the session notes / final response) the exact user text that authorized it, the command actually run, and the execution time. If that record is absent, the operation did not happen.
 
-
 In general, you should try to follow all suggested best practices listed in the file `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`
 
 NEVER run a script that processes/changes code files in this repo, EVER! That sort of brittle, regex based stuff is always a huge disaster and creates far more problems than it ever solves. DO NOT BE LAZY AND ALWAYS MAKE CODE CHANGES MANUALLY, EVEN WHEN THERE ARE MANY INSTANCES TO FIX. IF THE CHANGES ARE MANY BUT SIMPLE, THEN USE SEVERAL SUBAGENTS IN PARALLEL TO MAKE THE CHANGES GO FASTER. But if the changes are subtle/complex, then you must methodically do them all yourself manually!
@@ -20,7 +19,6 @@ We need to AVOID uncontrolled proliferation of code files. If you want to change
 We want all console output to be informative, detailed, stylish, colorful, etc. by fully leveraging the relevant Rust libraries wherever possible.
 
 If you aren't 100% sure about how to use a third party library, then you must SEARCH ONLINE to find the latest documentation website for the library to understand how it is supposed to work and the latest (late-2025) suggested best practices and usage.
-
 
 **CRITICAL:** Whenever you make any substantive changes or additions to the code, you MUST check that you didn't introduce any type errors or lint errors. You can do this in the usual way for a Rust project.
 

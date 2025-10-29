@@ -203,16 +203,16 @@ impl WorldRenderer {
             "wgpu visible instances"
         );
         // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
-        if self.ensure_post() {
-            if let Some(p) = self.post.as_mut() {
-                p.run(
-                    &self.device,
-                    &self.queue,
-                    &mut encoder,
-                    &self.color_view,
-                    self.size,
-                );
-            }
+        if self.ensure_post()
+            && let Some(p) = self.post.as_mut()
+        {
+            p.run(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &self.color_view,
+                self.size,
+            );
         }
         self.queue.submit(Some(encoder.finish()));
         #[cfg(feature = "perf_counters")]
@@ -232,13 +232,11 @@ impl WorldRenderer {
         };
         self.readback
             .copy(&self.device, &self.queue, src_tex)
-            .map(|_| ())
-            .and_then(|_| {
+            .map(|_| {
                 #[cfg(feature = "perf_counters")]
                 {
                     self.last_readback_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 }
-                Ok(())
             })
     }
 
@@ -486,7 +484,7 @@ impl ReadbackRing {
 }
 
 fn align_256(n: u32) -> u32 {
-    ((n + 255) / 256) * 256
+    n.div_ceil(256) * 256
 }
 
 // ---------------- View uniforms (viewport size) ----------------
@@ -782,7 +780,7 @@ impl TerrainPipeline {
                         if idx >= 2 {
                             let fx = (x as f32 / self.tile_w as f32 - 0.5).abs();
                             let fy = (y as f32 / self.tile_h as f32 - 0.5).abs();
-                            let vignette = (fx.max(fy) * 0.12) as f32;
+                            let vignette = fx.max(fy) * 0.12;
                             let dim = (1.0 - vignette).clamp(0.85, 1.0);
                             rgba[0] = ((rgba[0] as f32) * dim) as u8;
                             rgba[1] = ((rgba[1] as f32) * dim) as u8;
@@ -853,6 +851,7 @@ impl TerrainPipeline {
         self.vbuf_capacity_bytes = cap;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode(
         &mut self,
         device: &wgpu::Device,
@@ -1092,6 +1091,7 @@ impl AgentPipeline {
         self.vbuf_capacity_bytes = cap;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode(
         &mut self,
         device: &wgpu::Device,

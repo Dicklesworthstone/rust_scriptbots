@@ -4510,7 +4510,7 @@ impl WorldState {
                             cap_eff_v = cap_eff_v.min(global_cap_v).max(f32x4::splat(0.0));
                             let out_v = val_v.max(f32x4::splat(0.0)).min(cap_eff_v);
                             let out_arr = out_v.to_array();
-                            row[x + 0] = out_arr[0];
+                            row[x] = out_arr[0];
                             row[x + 1] = out_arr[1];
                             row[x + 2] = out_arr[2];
                             row[x + 3] = out_arr[3];
@@ -4823,8 +4823,7 @@ impl WorldState {
                         // Zero out invalid lanes (self, <= eps, > radius^2)
                         let dsq = dist_sq_v.to_array();
                         let mut df = df_v.to_array();
-                        for lane in 0..4 {
-                            let oid = ids[lane];
+                        for (lane, oid) in ids.iter().enumerate() {
                             if oid == idx || dsq[lane] <= f32::EPSILON || dsq[lane] > radius_sq {
                                 df[lane] = 0.0;
                             }
@@ -4851,8 +4850,7 @@ impl WorldState {
 
                         // Eyes and blood per-lane for these four
                         let dist_arr = dist_v.to_array();
-                        for lane in 0..4 {
-                            let other_idx = ids[lane];
+                        for (lane, &other_idx) in ids.iter().enumerate() {
                             if df[lane] <= 0.0 {
                                 continue;
                             }

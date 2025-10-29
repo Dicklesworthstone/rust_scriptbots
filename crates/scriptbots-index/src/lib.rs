@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
+type BucketVisitor<'a> = dyn FnMut(&[f32], &[f32], &[usize]) + 'a;
+
 /// Errors emitted by spatial index implementations.
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -105,7 +107,7 @@ impl UniformGridIndex {
         }
     }
 
-    /// Visit candidate neighbor buckets and provide SoA x[]/y[] slices using caller scratch buffers.
+    /// Visit candidate neighbor buckets and provide structure-of-arrays (`x`, `y`) slices using caller scratch buffers.
     #[allow(clippy::too_many_arguments)]
     pub fn visit_neighbor_bucket_positions_with_scratch(
         &self,
@@ -113,7 +115,7 @@ impl UniformGridIndex {
         radius: f32,
         scratch_x: &mut Vec<f32>,
         scratch_y: &mut Vec<f32>,
-        visitor: &mut dyn FnMut(&[f32], &[f32], &[usize]),
+        visitor: &mut BucketVisitor<'_>,
     ) {
         if agent_idx >= self.positions.len() || radius < 0.0 {
             return;
@@ -136,7 +138,7 @@ impl UniformGridIndex {
                         scratch_y.clear();
                         scratch_x.reserve(indices.len());
                         scratch_y.reserve(indices.len());
-                        for &other_idx in indices.iter() {
+                        for &other_idx in indices {
                             let (x, y) = self.positions[other_idx];
                             scratch_x.push(x);
                             scratch_y.push(y);
@@ -152,7 +154,7 @@ impl UniformGridIndex {
                             scratch_y.clear();
                             scratch_x.reserve(indices.len());
                             scratch_y.reserve(indices.len());
-                            for &other_idx in indices.iter() {
+                            for &other_idx in indices {
                                 let (x, y) = self.positions[other_idx];
                                 scratch_x.push(x);
                                 scratch_y.push(y);
