@@ -5,7 +5,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
-use scriptbots_core::{BrainRunner, BrainActivations, ActivationLayer, INPUT_SIZE, OUTPUT_SIZE};
+use scriptbots_core::{ActivationLayer, BrainActivations, BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 
 use crate::{Brain, BrainKind, into_runner};
 
@@ -289,7 +289,9 @@ impl Brain for MlpBrain {
         self
     }
 
-    fn snapshot_activations(&self) -> Option<BrainActivations> { Some(self.activations()) }
+    fn snapshot_activations(&self) -> Option<BrainActivations> {
+        Some(self.activations())
+    }
 }
 
 // Specialized adapter impl removed; generic adapter in lib.rs downcasts to call `activations()`.

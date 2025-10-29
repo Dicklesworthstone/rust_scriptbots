@@ -1,11 +1,14 @@
 [build]
 # Consolidated build config
-rustflags = ["-C", "target-cpu=native"]
 target = "x86_64-unknown-linux-gnu"
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C","link-arg=-fuse-ld=mold","-C","target-cpu=native"]
+rustflags = [
+    "-C","link-arg=-fuse-ld=mold",
+    # Use an AVX2-class baseline so CI runners avoid SIGILL while still getting SIMD tuning.
+    "-C","target-cpu=x86-64-v3",
+]
 
 [env]
 CC_x86_64_pc_windows_gnullvm = "/data/projects/rust_scriptbots/toolchains/llvm-mingw-20251021-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang"

@@ -1,5 +1,5 @@
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::cmp::Reverse;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 // removed duplicate import
 
 use crossfire::TrySendError;
@@ -32,7 +32,10 @@ pub struct ConfigSnapshot {
 impl ConfigSnapshot {
     fn from_world(config: &ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
         let config_value = serde_json::to_value(config).map_err(ControlError::serialization)?;
-        Ok(Self { tick: tick.0, config: config_value })
+        Ok(Self {
+            tick: tick.0,
+            config: config_value,
+        })
     }
 
     fn from_config(config: ScriptBotsConfig, tick: Tick) -> Result<Self, ControlError> {
@@ -196,7 +199,9 @@ impl ControlHandle {
         {
             const MAX_PIXELS: u64 = 64 * 1024 * 1024; // 64M px guardrail
             if (width as u64) * (height as u64) > MAX_PIXELS {
-                return Err(ControlError::InvalidPatch("requested image too large".into()));
+                return Err(ControlError::InvalidPatch(
+                    "requested image too large".into(),
+                ));
             }
             let world = self.lock_world()?;
             let bytes = render_png_offscreen(&world, width, height);
@@ -206,7 +211,9 @@ impl ControlHandle {
         {
             // Reference params to avoid unused warnings in non-GUI builds
             let _ = (width, height);
-            Err(ControlError::InvalidPatch("PNG snapshot requires gui feature".into()))
+            Err(ControlError::InvalidPatch(
+                "PNG snapshot requires gui feature".into(),
+            ))
         }
     }
 
@@ -262,7 +269,10 @@ impl ControlHandle {
 
     /// Flatten the configuration into individual knob descriptors for discovery.
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
-        let rev = { let world = self.lock_world()?; world.config_audit().len() };
+        let rev = {
+            let world = self.lock_world()?;
+            world.config_audit().len()
+        };
         if let Some((cached_rev, cached)) = self.knobs_cache.lock().unwrap().as_ref()
             && *cached_rev == rev
         {
@@ -271,7 +281,8 @@ impl ControlHandle {
         let (rev2, config_value) = {
             let world = self.lock_world()?;
             let rev2 = world.config_audit().len();
-            let value = serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
+            let value =
+                serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
             (rev2, value)
         };
         let mut entries = Vec::with_capacity(256);
@@ -302,7 +313,9 @@ impl ControlHandle {
                     EventKind::Birth,
                     summary.births as u32,
                 ));
-                if events.len() >= limit { break; }
+                if events.len() >= limit {
+                    break;
+                }
             }
             if summary.deaths > 0 {
                 events.push(EventEntry::new(
@@ -310,7 +323,9 @@ impl ControlHandle {
                     EventKind::Death,
                     summary.deaths as u32,
                 ));
-                if events.len() >= limit { break; }
+                if events.len() >= limit {
+                    break;
+                }
             }
             if summary.spike_hits > 0 {
                 events.push(EventEntry::new(
@@ -318,7 +333,9 @@ impl ControlHandle {
                     EventKind::Combat,
                     summary.spike_hits as u32,
                 ));
-                if events.len() >= limit { break; }
+                if events.len() >= limit {
+                    break;
+                }
             }
         }
         Ok(events)
@@ -363,7 +380,10 @@ impl ControlHandle {
         drop(world); // release lock before sorting
 
         if limit == 0 {
-            return Ok(Scoreboard { top_predators: Vec::new(), oldest: Vec::new() });
+            return Ok(Scoreboard {
+                top_predators: Vec::new(),
+                oldest: Vec::new(),
+            });
         }
 
         partial_top_k(&mut carnivores, limit, cmp_score);
@@ -392,13 +412,18 @@ impl ControlHandle {
 
         let world = self.lock_world()?;
         let current_tick = world.tick();
-        let mut config_value = serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
+        let mut config_value =
+            serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
         let mut path = SmallVec::<[&str; 8]>::new();
         merge_value(&mut config_value, &patch, &mut path)?;
         let json_str = serde_json::to_string(&config_value).map_err(ControlError::serialization)?;
         let mut de = serde_json::Deserializer::from_str(&json_str);
-        let new_config: ScriptBotsConfig = serde_path_to_error::deserialize::<_, ScriptBotsConfig>(&mut de)
-            .map_err(|e: serde_path_to_error::Error<serde_json::Error>| ControlError::InvalidPatch(format!("{} at {}", e, e.path())))?;
+        let new_config: ScriptBotsConfig = serde_path_to_error::deserialize::<_, ScriptBotsConfig>(
+            &mut de,
+        )
+        .map_err(|e: serde_path_to_error::Error<serde_json::Error>| {
+            ControlError::InvalidPatch(format!("{} at {}", e, e.path()))
+        })?;
         let (food_w, food_h) = new_config
             .food_dimensions()
             .map_err(|err| ControlError::InvalidPatch(err.to_string()))?;
@@ -447,9 +472,7 @@ fn insert_path(map: &mut Map<String, Value>, path: &str, value: Value) -> Result
             .entry(seg.to_owned())
             .or_insert_with(|| Value::Object(Map::new()));
         cur = entry.as_object_mut().ok_or_else(|| {
-            ControlError::InvalidPatch(format!(
-                "intermediate segment '{seg}' is not an object"
-            ))
+            ControlError::InvalidPatch(format!("intermediate segment '{seg}' is not an object"))
         })?;
         seg = next;
     }
@@ -469,9 +492,7 @@ fn set_f64(target: &mut Value, v: f64, path: &[&str]) -> Result<(), ControlError
             path_display(path)
         )));
     }
-    *target = Value::Number(
-        serde_json::Number::from_f64(v).expect("checked finite above"),
-    );
+    *target = Value::Number(serde_json::Number::from_f64(v).expect("checked finite above"));
     Ok(())
 }
 
@@ -561,8 +582,12 @@ fn merge_value<'a>(
             }
             Value::String(_) => {
                 let parsed = match patch.as_str().map(|s| s.trim().to_ascii_lowercase()) {
-                    Some(s) if matches!(s.as_str(), "true" | "1" | "yes" | "on" | "t" | "y") => true,
-                    Some(s) if matches!(s.as_str(), "false" | "0" | "no" | "off" | "f" | "n") => false,
+                    Some(s) if matches!(s.as_str(), "true" | "1" | "yes" | "on" | "t" | "y") => {
+                        true
+                    }
+                    Some(s) if matches!(s.as_str(), "false" | "0" | "no" | "off" | "f" | "n") => {
+                        false
+                    }
                     _ => {
                         return Err(ControlError::InvalidPatch(format!(
                             "cannot coerce '{:?}' to bool for {}",
@@ -731,7 +756,9 @@ fn flatten_value(prefix: &mut String, value: &Value, entries: &mut Vec<KnobEntry
         Value::Object(map) => {
             let base = prefix.len();
             for (k, v) in map {
-                if base != 0 { prefix.push('.'); }
+                if base != 0 {
+                    prefix.push('.');
+                }
                 prefix.push_str(k);
                 flatten_value(prefix, v, entries);
                 prefix.truncate(base);

@@ -82,10 +82,14 @@ fn main() -> Result<()> {
     // Auto-tune: run a quick sweep for the chosen storage mode, apply best settings, then continue.
     let mut thresholds = thresholds;
     if let Some(ticks) = cli.auto_tune {
-        if let Some(best) = pick_best_for_storage(&config, ticks, cli.storage, cli.threads, cli.low_power)? {
+        if let Some(best) =
+            pick_best_for_storage(&config, ticks, cli.storage, cli.threads, cli.low_power)?
+        {
             // Apply threads if not explicitly set
             if cli.threads.is_none() {
-                unsafe { std::env::set_var("SCRIPTBOTS_MAX_THREADS", best.threads.to_string()); }
+                unsafe {
+                    std::env::set_var("SCRIPTBOTS_MAX_THREADS", best.threads.to_string());
+                }
             }
             // Apply thresholds if not provided via CLI
             if cli.storage_thresholds.is_none() {
@@ -100,8 +104,14 @@ fn main() -> Result<()> {
                 "{} Auto-tune selected: threads={} storage={} thresholds={},{},{},{} ({:.0} tps)",
                 "✔".green().bold(),
                 best.threads,
-                match cli.storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
-                best.tick, best.agent, best.event, best.metric,
+                match cli.storage {
+                    StorageMode::DuckDb => "duckdb",
+                    StorageMode::Memory => "memory",
+                },
+                best.tick,
+                best.agent,
+                best.event,
+                best.metric,
                 best.tps
             );
         }
@@ -109,10 +119,14 @@ fn main() -> Result<()> {
 
     // Configure low-power / thread budget before world creation so the Rayon pool is capped.
     if let Some(threads) = cli.threads {
-        unsafe { std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string()); }
+        unsafe {
+            std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
+        }
     } else if cli.low_power {
         // Conservative default: 2 worker threads unless explicitly overridden by --threads
-        unsafe { std::env::set_var("SCRIPTBOTS_MAX_THREADS", "2"); }
+        unsafe {
+            std::env::set_var("SCRIPTBOTS_MAX_THREADS", "2");
+        }
     }
 
     // Apply OS-level priority niceness where supported.
@@ -128,17 +142,28 @@ fn main() -> Result<()> {
 
     // Renderer debug toggles
     if cli.debug_watermark {
-        unsafe { std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1"); }
+        unsafe {
+            std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1");
+        }
     }
     if cli.renderer_safe || cli.low_power {
-        unsafe { std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1"); }
+        unsafe {
+            std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
+        }
     }
     // Prefer terminal renderer in low-power auto mode unless FORCE_GUI is explicitly set
     if cli.low_power
         && matches!(cli.mode, RendererMode::Auto)
-        && !matches!(env::var("SCRIPTBOTS_FORCE_GUI").ok().and_then(|v| parse_bool(&v)), Some(true))
+        && !matches!(
+            env::var("SCRIPTBOTS_FORCE_GUI")
+                .ok()
+                .and_then(|v| parse_bool(&v)),
+            Some(true)
+        )
     {
-        unsafe { std::env::set_var("SCRIPTBOTS_FORCE_TERMINAL", "1"); }
+        unsafe {
+            std::env::set_var("SCRIPTBOTS_FORCE_TERMINAL", "1");
+        }
     }
 
     let (world, storage) = bootstrap_world(config, cli.storage, thresholds)?;
@@ -156,7 +181,10 @@ fn main() -> Result<()> {
             let bytes = {
                 let guard = world.lock().expect("world mutex poisoned");
                 // Prefer wgpu compositor path if requested via env; otherwise fallback CPU raster
-                let bytes = if matches!(std::env::var("SB_WGPU_DUMP").ok().as_deref(), Some("1" | "true" | "yes" | "on")) {
+                let bytes = if matches!(
+                    std::env::var("SB_WGPU_DUMP").ok().as_deref(),
+                    Some("1" | "true" | "yes" | "on")
+                ) {
                     scriptbots_render::world_compositor::render_wgpu_png_offscreen(&guard, w, h)
                 } else {
                     render_png_offscreen(&guard, w, h)
@@ -207,7 +235,7 @@ fn main() -> Result<()> {
 
 #[cfg(unix)]
 fn apply_process_niceness(low_power: bool) -> Result<()> {
-    use libc::{id_t, setpriority, PRIO_PROCESS};
+    use libc::{PRIO_PROCESS, id_t, setpriority};
     // Always reduce CPU priority a bit when low_power; otherwise keep default niceness.
     if low_power {
         unsafe {
@@ -224,11 +252,15 @@ fn apply_process_niceness(low_power: bool) -> Result<()> {
 #[cfg(windows)]
 fn apply_process_niceness(low_power: bool) -> Result<()> {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
     };
     unsafe {
         let handle = GetCurrentProcess();
-        let class = if low_power { BELOW_NORMAL_PRIORITY_CLASS } else { 0 };
+        let class = if low_power {
+            BELOW_NORMAL_PRIORITY_CLASS
+        } else {
+            0
+        };
         if class != 0 {
             let _ = SetPriorityClass(handle, class);
         }
@@ -372,12 +404,21 @@ fn thresholds_from_cli(cli: &AppCli) -> ThresholdsOverride {
         let agent = parts.next().and_then(|p| p.parse::<usize>().ok());
         let event = parts.next().and_then(|p| p.parse::<usize>().ok());
         let metric = parts.next().and_then(|p| p.parse::<usize>().ok());
-        return ThresholdsOverride { tick, agent, event, metric };
+        return ThresholdsOverride {
+            tick,
+            agent,
+            event,
+            metric,
+        };
     }
     ThresholdsOverride::default()
 }
 
-fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode, thresholds: ThresholdsOverride) -> Result<(SharedWorld, SharedStorage)> {
+fn bootstrap_world(
+    config: ScriptBotsConfig,
+    storage_mode: StorageMode,
+    thresholds: ThresholdsOverride,
+) -> Result<(SharedWorld, SharedStorage)> {
     let storage_path =
         env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
     if let Some(parent) = Path::new(&storage_path)
@@ -392,8 +433,15 @@ fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode, threshol
         StorageMode::DuckDb => {
             // Helper to try opening a pipeline with current thresholds
             let try_open = |path: &str| -> std::result::Result<StoragePipeline, StorageError> {
-                match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
-                    (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(path, t, a, e, m),
+                match (
+                    thresholds.tick,
+                    thresholds.agent,
+                    thresholds.event,
+                    thresholds.metric,
+                ) {
+                    (Some(t), Some(a), Some(e), Some(m)) => {
+                        StoragePipeline::with_thresholds(path, t, a, e, m)
+                    }
                     _ => StoragePipeline::new(path),
                 }
             };
@@ -415,13 +463,21 @@ fn bootstrap_world(config: ScriptBotsConfig, storage_mode: StorageMode, threshol
                             let p = std::path::Path::new(&storage_path);
                             let parent = p.parent();
                             let (stem, ext) = (
-                                p.file_stem().and_then(|s| s.to_str()).unwrap_or("scriptbots"),
+                                p.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("scriptbots"),
                                 p.extension().and_then(|e| e.to_str()).unwrap_or("duckdb"),
                             );
                             let file = format!("{}.run-{}-{}.{}", stem, pid, ts, ext);
-                            if let Some(dir) = parent { dir.join(file) } else { std::path::PathBuf::from(file) }
+                            if let Some(dir) = parent {
+                                dir.join(file)
+                            } else {
+                                std::path::PathBuf::from(file)
+                            }
                         };
-                        if let Some(parent) = fallback_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                        if let Some(parent) =
+                            fallback_path.parent().filter(|d| !d.as_os_str().is_empty())
+                        {
                             std::fs::create_dir_all(parent)?;
                         }
                         println!(
@@ -739,7 +795,10 @@ fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Rendere
             #[cfg(not(feature = "gui"))]
             {
                 warn!("GUI feature not enabled; falling back to terminal renderer");
-                return Ok((RendererMode::Terminal, Box::new(TerminalRenderer::default())));
+                return Ok((
+                    RendererMode::Terminal,
+                    Box::new(TerminalRenderer::default()),
+                ));
             }
             #[cfg(feature = "gui")]
             {
@@ -751,11 +810,14 @@ fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Rendere
                         "SCRIPTBOTS_FORCE_GUI=1".cyan(),
                         "--mode terminal".cyan()
                     );
-                    return Ok((RendererMode::Terminal, Box::new(TerminalRenderer::default())));
+                    return Ok((
+                        RendererMode::Terminal,
+                        Box::new(TerminalRenderer::default()),
+                    ));
                 }
                 Ok((RendererMode::Gui, Box::new(GuiRenderer)))
             }
-        },
+        }
         RendererMode::Terminal => Ok((
             RendererMode::Terminal,
             Box::new(TerminalRenderer::default()),
@@ -799,7 +861,6 @@ impl Renderer for GuiRenderer {
             let _ = ctx;
             bail!("GUI feature not enabled; recompile with --features gui or use --mode terminal");
         }
-        
     }
 }
 
@@ -1047,12 +1108,20 @@ fn profile_world_steps_with_storage(
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
 ) -> Result<()> {
-    let storage_path = env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
+    let storage_path =
+        env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
     let pipeline = match storage_mode {
         StorageMode::DuckDb => {
             let try_open = |path: &str| -> std::result::Result<StoragePipeline, StorageError> {
-                match (thresholds.tick, thresholds.agent, thresholds.event, thresholds.metric) {
-                    (Some(t), Some(a), Some(e), Some(m)) => StoragePipeline::with_thresholds(path, t, a, e, m),
+                match (
+                    thresholds.tick,
+                    thresholds.agent,
+                    thresholds.event,
+                    thresholds.metric,
+                ) {
+                    (Some(t), Some(a), Some(e), Some(m)) => {
+                        StoragePipeline::with_thresholds(path, t, a, e, m)
+                    }
                     _ => StoragePipeline::new(path),
                 }
             };
@@ -1072,13 +1141,21 @@ fn profile_world_steps_with_storage(
                             let p = std::path::Path::new(&storage_path);
                             let parent = p.parent();
                             let (stem, ext) = (
-                                p.file_stem().and_then(|s| s.to_str()).unwrap_or("scriptbots"),
+                                p.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("scriptbots"),
                                 p.extension().and_then(|e| e.to_str()).unwrap_or("duckdb"),
                             );
                             let file = format!("{}.run-{}-{}.{}", stem, pid, ts, ext);
-                            if let Some(dir) = parent { dir.join(file) } else { std::path::PathBuf::from(file) }
+                            if let Some(dir) = parent {
+                                dir.join(file)
+                            } else {
+                                std::path::PathBuf::from(file)
+                            }
                         };
-                        if let Some(parent) = fallback_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                        if let Some(parent) =
+                            fallback_path.parent().filter(|d| !d.as_os_str().is_empty())
+                        {
                             std::fs::create_dir_all(parent)?;
                         }
                         println!(
@@ -1118,7 +1195,10 @@ fn profile_world_steps_with_storage(
     println!(
         "{} Headless with-storage({}): {} ticks in {:.3}s ({:.0} tps)",
         "✔".green().bold(),
-        match storage_mode { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
+        match storage_mode {
+            StorageMode::DuckDb => "duckdb",
+            StorageMode::Memory => "memory",
+        },
         tick_limit,
         secs,
         tps
@@ -1145,7 +1225,11 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
     let exe = std::env::current_exe().context("failed to get current exe path")?;
 
     // Candidate configurations
-    let thread_candidates: Vec<usize> = if let Some(t) = cli.threads { vec![t] } else { vec![1, 2, 4, 8] };
+    let thread_candidates: Vec<usize> = if let Some(t) = cli.threads {
+        vec![t]
+    } else {
+        vec![1, 2, 4, 8]
+    };
     let storage_candidates = [StorageMode::Memory, StorageMode::DuckDb];
     let threshold_candidates: Vec<&str> = vec![
         "64,2048,512,512",
@@ -1174,13 +1258,22 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
                 cmd.env("SCRIPTBOTS_DET_RUN", "0");
                 cmd.env("RUST_LOG", "error");
                 cmd.arg("--profile-storage-steps").arg(ticks.to_string());
-                cmd.arg("--storage").arg(match storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" });
+                cmd.arg("--storage").arg(match storage {
+                    StorageMode::DuckDb => "duckdb",
+                    StorageMode::Memory => "memory",
+                });
                 cmd.arg("--storage-thresholds").arg(thresholds);
                 cmd.arg("--threads").arg(threads.to_string());
-                if cli.low_power { cmd.arg("--low-power"); }
+                if cli.low_power {
+                    cmd.arg("--low-power");
+                }
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::null());
-                let out = cmd.output().with_context(|| format!("sweep run failed (thr={threads}, storage={storage:?}, thres={thresholds})"))?;
+                let out = cmd.output().with_context(|| {
+                    format!(
+                        "sweep run failed (thr={threads}, storage={storage:?}, thres={thresholds})"
+                    )
+                })?;
                 if !out.status.success() {
                     continue;
                 }
@@ -1191,19 +1284,35 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
                         "128,4096,1024,1024" => "128,4096,1024,1024",
                         _ => "256,4096,2048,1024",
                     };
-                    results.push(ResultRow { threads, storage, thresholds: thresholds_static, tps });
+                    results.push(ResultRow {
+                        threads,
+                        storage,
+                        thresholds: thresholds_static,
+                        tps,
+                    });
                 }
             }
         }
     }
 
-    results.sort_by(|a, b| b.tps.partial_cmp(&a.tps).unwrap_or(std::cmp::Ordering::Equal));
-    println!("{} Automated profile sweep ({} ticks):", "▶".bright_blue().bold(), ticks);
+    results.sort_by(|a, b| {
+        b.tps
+            .partial_cmp(&a.tps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    println!(
+        "{} Automated profile sweep ({} ticks):",
+        "▶".bright_blue().bold(),
+        ticks
+    );
     for row in results.iter().take(8) {
         println!(
             "    threads={:<2} storage={:<6} thresholds={:<20} {:>8.0} tps",
             row.threads,
-            match row.storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
+            match row.storage {
+                StorageMode::DuckDb => "duckdb",
+                StorageMode::Memory => "memory",
+            },
             row.thresholds,
             row.tps
         );
@@ -1214,7 +1323,10 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
             "{} Best: threads={} storage={} thresholds={} ({:.0} tps)",
             "✔".green().bold(),
             best.threads,
-            match best.storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" },
+            match best.storage {
+                StorageMode::DuckDb => "duckdb",
+                StorageMode::Memory => "memory",
+            },
             best.thresholds,
             best.tps
         );
@@ -1242,7 +1354,11 @@ fn pick_best_for_storage(
 ) -> Result<Option<BestPick>> {
     let exe = std::env::current_exe().context("failed to get current exe path")?;
 
-    let thread_candidates: Vec<usize> = if let Some(t) = pinned_threads { vec![t] } else { vec![1, 2, 4, 8] };
+    let thread_candidates: Vec<usize> = if let Some(t) = pinned_threads {
+        vec![t]
+    } else {
+        vec![1, 2, 4, 8]
+    };
     let threshold_candidates: Vec<&str> = vec![
         "64,2048,512,512",
         "128,4096,1024,1024",
@@ -1256,22 +1372,43 @@ fn pick_best_for_storage(
             cmd.env("SCRIPTBOTS_DET_RUN", "0");
             cmd.env("RUST_LOG", "error");
             cmd.arg("--profile-storage-steps").arg(ticks.to_string());
-            cmd.arg("--storage").arg(match storage { StorageMode::DuckDb => "duckdb", StorageMode::Memory => "memory" });
+            cmd.arg("--storage").arg(match storage {
+                StorageMode::DuckDb => "duckdb",
+                StorageMode::Memory => "memory",
+            });
             cmd.arg("--storage-thresholds").arg(thresholds);
             cmd.arg("--threads").arg(threads.to_string());
-            if low_power { cmd.arg("--low-power"); }
+            if low_power {
+                cmd.arg("--low-power");
+            }
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
             let out = cmd.output()?;
-            if !out.status.success() { continue; }
+            if !out.status.success() {
+                continue;
+            }
             if let Some(tps) = parse_tps_from_stdout(&out.stdout) {
                 let parts: Vec<_> = thresholds.split(',').collect();
                 if parts.len() == 4 {
-                    if let (Ok(tk), Ok(ag), Ok(ev), Ok(me)) = (parts[0].parse(), parts[1].parse(), parts[2].parse(), parts[3].parse()) {
-                        let candidate = BestPick { threads, tick: tk, agent: ag, event: ev, metric: me, tps };
+                    if let (Ok(tk), Ok(ag), Ok(ev), Ok(me)) = (
+                        parts[0].parse(),
+                        parts[1].parse(),
+                        parts[2].parse(),
+                        parts[3].parse(),
+                    ) {
+                        let candidate = BestPick {
+                            threads,
+                            tick: tk,
+                            agent: ag,
+                            event: ev,
+                            metric: me,
+                            tps,
+                        };
                         match &best {
                             Some(b) if b.tps >= candidate.tps => {}
-                            _ => { best = Some(candidate); }
+                            _ => {
+                                best = Some(candidate);
+                            }
                         }
                     }
                 }

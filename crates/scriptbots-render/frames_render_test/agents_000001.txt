@@ -1,0 +1,9 @@
+width=640
+height=360
+stride=2560
+populated_bytes=921600
+nonzero_bytes=917839
+checksum=127094865
+min_byte=0
+max_byte=255
+sample_rgba=[255, 255, 255, 255]

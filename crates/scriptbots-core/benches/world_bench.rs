@@ -1,7 +1,7 @@
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use std::time::Duration;
-use scriptbots_core::WorldState;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use scriptbots_core::ScriptBotsConfig;
+use scriptbots_core::WorldState;
+use std::time::Duration;
 
 fn bench_world_steps(c: &mut Criterion) {
     let mut group = c.benchmark_group("world_step");
@@ -125,5 +125,3 @@ fn bench_world_steps(c: &mut Criterion) {
 
 criterion_group!(benches, bench_world_steps);
 criterion_main!(benches);
-
-

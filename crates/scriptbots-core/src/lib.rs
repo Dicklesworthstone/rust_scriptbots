@@ -2292,7 +2292,10 @@ impl Default for ScriptBotsConfig {
             history_capacity: 256,
             persistence_interval: 0,
             analytics_stride: AnalyticsStride::default(),
-            neuroflow: NeuroflowSettings { enabled: true, ..NeuroflowSettings::default() },
+            neuroflow: NeuroflowSettings {
+                enabled: true,
+                ..NeuroflowSettings::default()
+            },
             control: ControlSettings::default(),
         }
     }
@@ -4407,7 +4410,12 @@ impl WorldState {
                                 if xs[2] + 1 == width { 0 } else { xs[2] + 1 },
                                 if xs[3] + 1 == width { 0 } else { xs[3] + 1 },
                             ];
-                            let idxs = [y * width + xs[0], y * width + xs[1], y * width + xs[2], y * width + xs[3]];
+                            let idxs = [
+                                y * width + xs[0],
+                                y * width + xs[1],
+                                y * width + xs[2],
+                                y * width + xs[3],
+                            ];
                             let prev_v = f32x4::new([
                                 previous[idxs[0]],
                                 previous[idxs[1]],
@@ -4443,9 +4451,45 @@ impl WorldState {
                                 let neigh = (left_v + right_v + up_v + down_v) * f32x4::splat(0.25);
                                 val_v = val_v + f32x4::splat(diffusion) * (neigh - prev_v);
                             }
-                            let cap_arr = idxs.map(|i| profiles.get(i).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 }).capacity);
-                            let grow_arr = idxs.map(|i| profiles.get(i).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 }).growth_multiplier);
-                            let decay_arr = idxs.map(|i| profiles.get(i).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 }).decay_multiplier);
+                            let cap_arr = idxs.map(|i| {
+                                profiles
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(FoodCellProfile {
+                                        capacity: food_max,
+                                        growth_multiplier: 1.0,
+                                        decay_multiplier: 1.0,
+                                        fertility: 0.0,
+                                        nutrient_density: 0.3,
+                                    })
+                                    .capacity
+                            });
+                            let grow_arr = idxs.map(|i| {
+                                profiles
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(FoodCellProfile {
+                                        capacity: food_max,
+                                        growth_multiplier: 1.0,
+                                        decay_multiplier: 1.0,
+                                        fertility: 0.0,
+                                        nutrient_density: 0.3,
+                                    })
+                                    .growth_multiplier
+                            });
+                            let decay_arr = idxs.map(|i| {
+                                profiles
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(FoodCellProfile {
+                                        capacity: food_max,
+                                        growth_multiplier: 1.0,
+                                        decay_multiplier: 1.0,
+                                        fertility: 0.0,
+                                        nutrient_density: 0.3,
+                                    })
+                                    .decay_multiplier
+                            });
                             let cap_v = f32x4::new(cap_arr);
                             let grow_v = f32x4::new(grow_arr);
                             let decay_v = f32x4::new(decay_arr);
@@ -4454,7 +4498,8 @@ impl WorldState {
                             }
                             if growth > 0.0 && food_max > 0.0 {
                                 let norm = val_v / f32x4::splat(food_max);
-                                let delta = f32x4::splat(growth) * grow_v * (f32x4::splat(1.0) - norm);
+                                let delta =
+                                    f32x4::splat(growth) * grow_v * (f32x4::splat(1.0) - norm);
                                 val_v = val_v + delta * f32x4::splat(food_max);
                             }
                             // Clamp to capacity and global cap
@@ -4478,7 +4523,13 @@ impl WorldState {
                             let idx = y * width + x;
                             let previous_value = previous[idx];
                             let mut value = previous_value;
-                            let profile = profiles.get(idx).copied().unwrap_or(FoodCellProfile { capacity: food_max, growth_multiplier: 1.0, decay_multiplier: 1.0, fertility: 0.0, nutrient_density: 0.3 });
+                            let profile = profiles.get(idx).copied().unwrap_or(FoodCellProfile {
+                                capacity: food_max,
+                                growth_multiplier: 1.0,
+                                decay_multiplier: 1.0,
+                                fertility: 0.0,
+                                nutrient_density: 0.3,
+                            });
                             if diffusion > 0.0 {
                                 let left = previous[y * width + left_col];
                                 let right = previous[y * width + right_col];
@@ -4487,15 +4538,20 @@ impl WorldState {
                                 let neighbor_avg = (left + right + up + down) * 0.25;
                                 value += diffusion * (neighbor_avg - previous_value);
                             }
-                            if decay > 0.0 { value -= decay * profile.decay_multiplier * value; }
+                            if decay > 0.0 {
+                                value -= decay * profile.decay_multiplier * value;
+                            }
                             if growth > 0.0 && food_max > 0.0 {
                                 let normalized = value / food_max;
-                                let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
+                                let growth_delta =
+                                    growth * profile.growth_multiplier * (1.0 - normalized);
                                 value += growth_delta * food_max;
                             }
                             let mut capacity = profile.capacity.max(previous_value);
                             let global_cap = food_max.max(previous_value);
-                            if capacity > global_cap { capacity = global_cap; }
+                            if capacity > global_cap {
+                                capacity = global_cap;
+                            }
                             capacity = capacity.max(0.0);
                             row[x] = value.clamp(0.0, capacity);
                         }
@@ -4507,16 +4563,13 @@ impl WorldState {
                         let idx = y * width + x;
                         let previous_value = previous[idx];
                         let mut value = previous_value;
-                        let profile = profiles
-                            .get(idx)
-                            .copied()
-                            .unwrap_or(FoodCellProfile {
-                                capacity: food_max,
-                                growth_multiplier: 1.0,
-                                decay_multiplier: 1.0,
-                                fertility: 0.0,
-                                nutrient_density: 0.3,
-                            });
+                        let profile = profiles.get(idx).copied().unwrap_or(FoodCellProfile {
+                            capacity: food_max,
+                            growth_multiplier: 1.0,
+                            decay_multiplier: 1.0,
+                            fertility: 0.0,
+                            nutrient_density: 0.3,
+                        });
                         if diffusion > 0.0 {
                             let left = previous[y * width + left_col];
                             let right = previous[y * width + right_col];
@@ -4532,7 +4585,8 @@ impl WorldState {
 
                         if growth > 0.0 && food_max > 0.0 {
                             let normalized = value / food_max;
-                            let growth_delta = growth * profile.growth_multiplier * (1.0 - normalized);
+                            let growth_delta =
+                                growth * profile.growth_multiplier * (1.0 - normalized);
                             value += growth_delta * food_max;
                         }
 
@@ -4558,16 +4612,13 @@ impl WorldState {
                     let idx = y * width + x;
                     let previous_value = previous[idx];
                     let mut value = previous_value;
-                    let profile = profiles
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(FoodCellProfile {
-                            capacity: food_max,
-                            growth_multiplier: 1.0,
-                            decay_multiplier: 1.0,
-                            fertility: 0.0,
-                            nutrient_density: 0.3,
-                        });
+                    let profile = profiles.get(idx).copied().unwrap_or(FoodCellProfile {
+                        capacity: food_max,
+                        growth_multiplier: 1.0,
+                        decay_multiplier: 1.0,
+                        fertility: 0.0,
+                        nutrient_density: 0.3,
+                    });
                     if diffusion > 0.0 {
                         let left = previous[y * width + left_col];
                         let right = previous[y * width + right_col];
@@ -4629,11 +4680,14 @@ impl WorldState {
         let runtime = &self.runtime;
 
         // Populate reusable runtime-derived SoA buffers
-        self.work_trait_modifiers.resize(agent_count, TraitModifiers::default());
-        self.work_eye_directions.resize(agent_count, [0.0; NUM_EYES]);
+        self.work_trait_modifiers
+            .resize(agent_count, TraitModifiers::default());
+        self.work_eye_directions
+            .resize(agent_count, [0.0; NUM_EYES]);
         self.work_eye_fov.resize(agent_count, [1.0; NUM_EYES]);
         self.work_eye_view_dirs.resize(agent_count, [0.0; NUM_EYES]);
-        self.work_eye_fov_clamped.resize(agent_count, [1.0; NUM_EYES]);
+        self.work_eye_fov_clamped
+            .resize(agent_count, [1.0; NUM_EYES]);
         self.work_eye_fov_cos.resize(agent_count, [0.0; NUM_EYES]);
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
         self.work_temperature_preferences.resize(agent_count, 0.5);
@@ -4679,12 +4733,26 @@ impl WorldState {
             // Ensure FOV and directions contain finite values
             let mut ok = true;
             for dir in eye_directions.iter() {
-                for &d in dir.iter() { if !d.is_finite() { ok = false; break; } }
-                if !ok { break; }
+                for &d in dir.iter() {
+                    if !d.is_finite() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
             }
             for fovs in eye_fov.iter() {
-                for &f in fovs.iter() { if !f.is_finite() { ok = false; break; } }
-                if !ok { break; }
+                for &f in fovs.iter() {
+                    if !f.is_finite() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
             }
             ok
         });
@@ -4785,7 +4853,9 @@ impl WorldState {
                         let dist_arr = dist_v.to_array();
                         for lane in 0..4 {
                             let other_idx = ids[lane];
-                            if df[lane] <= 0.0 { continue; }
+                            if df[lane] <= 0.0 {
+                                continue;
+                            }
                             let dx = dx_arr[lane];
                             let dy = dy_arr[lane];
                             let dist = dist_arr[lane];
@@ -4796,15 +4866,30 @@ impl WorldState {
                             #[cfg(feature = "simd_wide")]
                             {
                                 // Dot against per-eye view directions; threshold by cos(FOV)
-                                let eye_dirs_x = [eyes_dir[0].cos(), eyes_dir[1].cos(), eyes_dir[2].cos(), eyes_dir[3].cos()];
-                                let eye_dirs_y = [eyes_dir[0].sin(), eyes_dir[1].sin(), eyes_dir[2].sin(), eyes_dir[3].sin()];
+                                let eye_dirs_x = [
+                                    eyes_dir[0].cos(),
+                                    eyes_dir[1].cos(),
+                                    eyes_dir[2].cos(),
+                                    eyes_dir[3].cos(),
+                                ];
+                                let eye_dirs_y = [
+                                    eyes_dir[0].sin(),
+                                    eyes_dir[1].sin(),
+                                    eyes_dir[2].sin(),
+                                    eyes_dir[3].sin(),
+                                ];
                                 let dot_v = f32x4::new([
                                     eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
                                     eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
                                     eye_dirs_x[2] * nx + eye_dirs_y[2] * ny,
                                     eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
                                 ]);
-                                let cos_fov_v = f32x4::new([eyes_fov_cos[0], eyes_fov_cos[1], eyes_fov_cos[2], eyes_fov_cos[3]]);
+                                let cos_fov_v = f32x4::new([
+                                    eyes_fov_cos[0],
+                                    eyes_fov_cos[1],
+                                    eyes_fov_cos[2],
+                                    eyes_fov_cos[3],
+                                ]);
                                 let mask_v = f32x4::new([
                                     (dot_v.to_array()[0] >= cos_fov_v.to_array()[0]) as i32 as f32,
                                     (dot_v.to_array()[1] >= cos_fov_v.to_array()[1]) as i32 as f32,
@@ -4812,10 +4897,14 @@ impl WorldState {
                                     (dot_v.to_array()[3] >= cos_fov_v.to_array()[3]) as i32 as f32,
                                 ]);
                                 // fov_factor ~ (cos_fov - dot)/cos_fov, clamped to [0,1]
-                                let fov_factor = ((cos_fov_v - dot_v) / cos_fov_v).max(f32x4::splat(0.0));
-                                let intensity_v = fov_factor * f32x4::splat(traits.eye * dist_factor * (dist / radius)) * mask_v;
+                                let fov_factor =
+                                    ((cos_fov_v - dot_v) / cos_fov_v).max(f32x4::splat(0.0));
+                                let intensity_v = fov_factor
+                                    * f32x4::splat(traits.eye * dist_factor * (dist / radius))
+                                    * mask_v;
                                 let color = colors[other_idx];
-                                let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
+                                let mut dens =
+                                    f32x4::new([density[0], density[1], density[2], density[3]]);
                                 let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
                                 let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
                                 let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
@@ -4827,10 +4916,22 @@ impl WorldState {
                                 let out_r = r.to_array();
                                 let out_g = g.to_array();
                                 let out_b = b.to_array();
-                                density[0] = out_d[0]; density[1] = out_d[1]; density[2] = out_d[2]; density[3] = out_d[3];
-                                eye_r[0] = out_r[0]; eye_r[1] = out_r[1]; eye_r[2] = out_r[2]; eye_r[3] = out_r[3];
-                                eye_g[0] = out_g[0]; eye_g[1] = out_g[1]; eye_g[2] = out_g[2]; eye_g[3] = out_g[3];
-                                eye_b[0] = out_b[0]; eye_b[1] = out_b[1]; eye_b[2] = out_b[2]; eye_b[3] = out_b[3];
+                                density[0] = out_d[0];
+                                density[1] = out_d[1];
+                                density[2] = out_d[2];
+                                density[3] = out_d[3];
+                                eye_r[0] = out_r[0];
+                                eye_r[1] = out_r[1];
+                                eye_r[2] = out_r[2];
+                                eye_r[3] = out_r[3];
+                                eye_g[0] = out_g[0];
+                                eye_g[1] = out_g[1];
+                                eye_g[2] = out_g[2];
+                                eye_g[3] = out_g[3];
+                                eye_b[0] = out_b[0];
+                                eye_b[1] = out_b[1];
+                                eye_b[2] = out_b[2];
+                                eye_b[3] = out_b[3];
                             }
                             #[cfg(not(feature = "simd_wide"))]
                             {
@@ -4842,9 +4943,11 @@ impl WorldState {
                                     if dot >= eyes_fov_cos[eye] {
                                         // approximate fov_factor via dot/cos_fov
                                         let fov = eyes_fov[eye];
-                                        let diff = angle_difference(eyes_dir[eye], angle_to(dx, dy));
+                                        let diff =
+                                            angle_difference(eyes_dir[eye], angle_to(dx, dy));
                                         let fov_factor = ((fov - diff) / fov).max(0.0);
-                                        let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
+                                        let intensity =
+                                            traits.eye * fov_factor * dist_factor * (dist / radius);
                                         density[eye] += intensity;
                                         let color = colors[other_idx];
                                         eye_r[eye] += intensity * color[0];
@@ -4879,7 +4982,9 @@ impl WorldState {
                         let dist = dist_sq_val.sqrt();
                         let ang = angle_to(dx, dy);
                         let dist_factor = (radius - dist) / radius;
-                        if dist_factor <= 0.0 { continue; }
+                        if dist_factor <= 0.0 {
+                            continue;
+                        }
                         smell += dist_factor;
                         sound += dist_factor * self.work_speed_norm[other_idx];
                         hearing += dist_factor * sound_emitters[other_idx];
@@ -4900,7 +5005,8 @@ impl WorldState {
                             let scalar = traits.eye * dist_factor * (dist / radius);
                             let intensity_v = fov_factor * f32x4::splat(scalar);
                             let color = colors[other_idx];
-                            let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
+                            let mut dens =
+                                f32x4::new([density[0], density[1], density[2], density[3]]);
                             let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
                             let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
                             let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
@@ -4912,10 +5018,22 @@ impl WorldState {
                             let out_r = r.to_array();
                             let out_g = g.to_array();
                             let out_b = b.to_array();
-                            density[0] = out_d[0]; density[1] = out_d[1]; density[2] = out_d[2]; density[3] = out_d[3];
-                            eye_r[0] = out_r[0]; eye_r[1] = out_r[1]; eye_r[2] = out_r[2]; eye_r[3] = out_r[3];
-                            eye_g[0] = out_g[0]; eye_g[1] = out_g[1]; eye_g[2] = out_g[2]; eye_g[3] = out_g[3];
-                            eye_b[0] = out_b[0]; eye_b[1] = out_b[1]; eye_b[2] = out_b[2]; eye_b[3] = out_b[3];
+                            density[0] = out_d[0];
+                            density[1] = out_d[1];
+                            density[2] = out_d[2];
+                            density[3] = out_d[3];
+                            eye_r[0] = out_r[0];
+                            eye_r[1] = out_r[1];
+                            eye_r[2] = out_r[2];
+                            eye_r[3] = out_r[3];
+                            eye_g[0] = out_g[0];
+                            eye_g[1] = out_g[1];
+                            eye_g[2] = out_g[2];
+                            eye_g[3] = out_g[3];
+                            eye_b[0] = out_b[0];
+                            eye_b[1] = out_b[1];
+                            eye_b[2] = out_b[2];
+                            eye_b[3] = out_b[3];
                         }
                         #[cfg(not(feature = "simd_wide"))]
                         {
@@ -4924,7 +5042,8 @@ impl WorldState {
                                 let fov = eyes_fov[eye];
                                 if diff < fov {
                                     let fov_factor = ((fov - diff) / fov).max(0.0);
-                                    let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
+                                    let intensity =
+                                        traits.eye * fov_factor * dist_factor * (dist / radius);
                                     density[eye] += intensity;
                                     let color = colors[other_idx];
                                     eye_r[eye] += intensity * color[0];
@@ -4970,8 +5089,18 @@ impl WorldState {
                         let nx = dx / dist;
                         let ny = dy / dist;
                         // Precompute eye unit vectors from view angles
-                        let eye_dirs_x = [eyes_dir[0].cos(), eyes_dir[1].cos(), eyes_dir[2].cos(), eyes_dir[3].cos()];
-                        let eye_dirs_y = [eyes_dir[0].sin(), eyes_dir[1].sin(), eyes_dir[2].sin(), eyes_dir[3].sin()];
+                        let eye_dirs_x = [
+                            eyes_dir[0].cos(),
+                            eyes_dir[1].cos(),
+                            eyes_dir[2].cos(),
+                            eyes_dir[3].cos(),
+                        ];
+                        let eye_dirs_y = [
+                            eyes_dir[0].sin(),
+                            eyes_dir[1].sin(),
+                            eyes_dir[2].sin(),
+                            eyes_dir[3].sin(),
+                        ];
                         let dot_v = f32x4::new([
                             eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
                             eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
@@ -4979,7 +5108,10 @@ impl WorldState {
                             eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
                         ]);
                         let cos_fov_v = f32x4::new([
-                            eyes_fov_cos[0], eyes_fov_cos[1], eyes_fov_cos[2], eyes_fov_cos[3],
+                            eyes_fov_cos[0],
+                            eyes_fov_cos[1],
+                            eyes_fov_cos[2],
+                            eyes_fov_cos[3],
                         ]);
                         // mask = dot >= cos(fov)
                         let mask = [
@@ -4992,7 +5124,9 @@ impl WorldState {
                         // intensity = traits.eye * dist_factor * (dist/radius) * ((cos_fov - dot)/cos_fov) approximated by mask * (cos_fov - dot)/cos_fov
                         let fov_factor = (cos_fov_v - dot_v) / cos_fov_v;
                         let fov_factor = fov_factor.max(f32x4::splat(0.0));
-                        let intensity_v = fov_factor * f32x4::splat(traits.eye * dist_factor * (dist / radius)) * mask_v;
+                        let intensity_v = fov_factor
+                            * f32x4::splat(traits.eye * dist_factor * (dist / radius))
+                            * mask_v;
                         let color = colors[other_idx];
                         let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
                         let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
@@ -5006,10 +5140,22 @@ impl WorldState {
                         let out_r = r.to_array();
                         let out_g = g.to_array();
                         let out_b = b.to_array();
-                        density[0] = out_d[0]; density[1] = out_d[1]; density[2] = out_d[2]; density[3] = out_d[3];
-                        eye_r[0] = out_r[0]; eye_r[1] = out_r[1]; eye_r[2] = out_r[2]; eye_r[3] = out_r[3];
-                        eye_g[0] = out_g[0]; eye_g[1] = out_g[1]; eye_g[2] = out_g[2]; eye_g[3] = out_g[3];
-                        eye_b[0] = out_b[0]; eye_b[1] = out_b[1]; eye_b[2] = out_b[2]; eye_b[3] = out_b[3];
+                        density[0] = out_d[0];
+                        density[1] = out_d[1];
+                        density[2] = out_d[2];
+                        density[3] = out_d[3];
+                        eye_r[0] = out_r[0];
+                        eye_r[1] = out_r[1];
+                        eye_r[2] = out_r[2];
+                        eye_r[3] = out_r[3];
+                        eye_g[0] = out_g[0];
+                        eye_g[1] = out_g[1];
+                        eye_g[2] = out_g[2];
+                        eye_g[3] = out_g[3];
+                        eye_b[0] = out_b[0];
+                        eye_b[1] = out_b[1];
+                        eye_b[2] = out_b[2];
+                        eye_b[3] = out_b[3];
                     }
                     #[cfg(not(feature = "simd_wide"))]
                     {
@@ -5019,7 +5165,8 @@ impl WorldState {
                             let fov = eyes_fov[eye].max(0.01);
                             if diff < fov {
                                 let fov_factor = ((fov - diff) / fov).max(0.0);
-                                let intensity = traits.eye * fov_factor * dist_factor * (dist / radius);
+                                let intensity =
+                                    traits.eye * fov_factor * dist_factor * (dist / radius);
                                 density[eye] += intensity;
                                 let color = colors[other_idx];
                                 eye_r[eye] += intensity * color[0];
@@ -5177,13 +5324,16 @@ impl WorldState {
         self.work_headings.extend_from_slice(columns.headings());
         self.work_heading_dir_x.clear();
         self.work_heading_dir_y.clear();
-        self.work_heading_dir_x.resize(self.work_headings.len(), 0.0);
-        self.work_heading_dir_y.resize(self.work_headings.len(), 0.0);
+        self.work_heading_dir_x
+            .resize(self.work_headings.len(), 0.0);
+        self.work_heading_dir_y
+            .resize(self.work_headings.len(), 0.0);
         for (i, &h) in self.work_headings.iter().enumerate() {
             self.work_heading_dir_x[i] = h.cos();
             self.work_heading_dir_y[i] = h.sin();
         }
-        self.work_spike_lengths.extend_from_slice(columns.spike_lengths());
+        self.work_spike_lengths
+            .extend_from_slice(columns.spike_lengths());
         let positions_snapshot = &self.work_positions;
         let headings_snapshot = &self.work_headings;
         let spike_lengths_snapshot = &self.work_spike_lengths;
@@ -5203,7 +5353,9 @@ impl WorldState {
                 for lane in 0..4 {
                     let idx = base + lane;
                     let agent_id = chunk[lane];
-                    let Some(rt) = runtime.get(agent_id) else { continue; };
+                    let Some(rt) = runtime.get(agent_id) else {
+                        continue;
+                    };
                     let outputs = rt.outputs;
                     let left = outputs.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                     let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -5242,8 +5394,12 @@ impl WorldState {
                             let downhill = (-slope_along).max(0.0);
                             let uphill = slope_along.max(0.0);
                             let mut speed_factor: f32 = 1.0;
-                            if downhill > 0.0 { speed_factor *= 1.0 + downhill * topo_gain; }
-                            if uphill > 0.0 { speed_factor /= 1.0 + uphill * topo_gain; }
+                            if downhill > 0.0 {
+                                speed_factor *= 1.0 + downhill * topo_gain;
+                            }
+                            if uphill > 0.0 {
+                                speed_factor /= 1.0 + uphill * topo_gain;
+                            }
                             speed_factor = speed_factor.clamp(0.4, 1.8);
                             left_speed *= speed_factor;
                             right_speed *= speed_factor;
@@ -5258,16 +5414,22 @@ impl WorldState {
                     next_pos.x = Self::wrap_position(next_pos.x + vx, width);
                     next_pos.y = Self::wrap_position(next_pos.y + vy, height);
 
-                    let movement_penalty = movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                    let movement_penalty =
+                        movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
                     let mut drain = metabolism_drain + movement_penalty;
                     if ramp_rate > 0.0 {
                         let active_energy = (rt.energy - ramp_floor).max(0.0);
                         drain += active_energy * ramp_rate;
                     }
-                    if boost && boost_penalty > 0.0 { drain += boost_penalty; }
+                    if boost && boost_penalty > 0.0 {
+                        drain += boost_penalty;
+                    }
                     if topo_enabled && topo_penalty > 0.0 {
-                        if slope_along > 0.0 { drain += slope_along * topo_penalty; }
-                        else if slope_along < 0.0 { drain = (drain + slope_along * topo_penalty * 0.5).max(0.0); }
+                        if slope_along > 0.0 {
+                            drain += slope_along * topo_penalty;
+                        } else if slope_along < 0.0 {
+                            drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
+                        }
                     }
                     let health_delta = -drain;
                     let energy = (rt.energy - drain).max(0.0);
@@ -5281,7 +5443,12 @@ impl WorldState {
                     let spiked = spike_length > 0.5;
 
                     results[idx] = ActuationResult {
-                        delta: Some(ActuationDelta { heading, velocity: Velocity::new(vx, vy), position: next_pos, health_delta }),
+                        delta: Some(ActuationDelta {
+                            heading,
+                            velocity: Velocity::new(vx, vy),
+                            position: next_pos,
+                            health_delta,
+                        }),
                         energy,
                         color,
                         spike_length,
@@ -5298,7 +5465,9 @@ impl WorldState {
             let base = handles.len() - rem.len();
             for (o, agent_id) in rem.iter().enumerate() {
                 let idx = base + o;
-                let Some(runtime) = runtime.get(*agent_id) else { continue; };
+                let Some(runtime) = runtime.get(*agent_id) else {
+                    continue;
+                };
                 let outputs = runtime.outputs;
                 let left = outputs.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                 let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -5314,13 +5483,20 @@ impl WorldState {
 
                 let mut left_speed = left * bot_speed;
                 let mut right_speed = right * bot_speed;
-                if boost { left_speed *= boost_multiplier; right_speed *= boost_multiplier; }
+                if boost {
+                    left_speed *= boost_multiplier;
+                    right_speed *= boost_multiplier;
+                }
                 let mut heading = headings_snapshot[idx];
                 let angular = (right_speed - left_speed) / wheel_base;
                 heading = wrap_signed_angle(heading + angular);
                 let mut slope_along: f32 = 0.0;
                 if topo_enabled && cell_size > 0.0 {
-                    let (gx, gy) = terrain.gradient_world(positions_snapshot[idx].x, positions_snapshot[idx].y, cell_size);
+                    let (gx, gy) = terrain.gradient_world(
+                        positions_snapshot[idx].x,
+                        positions_snapshot[idx].y,
+                        cell_size,
+                    );
                     let dir_x = heading.cos();
                     let dir_y = heading.sin();
                     slope_along = gx * dir_x + gy * dir_y;
@@ -5328,10 +5504,15 @@ impl WorldState {
                         let downhill = (-slope_along).max(0.0);
                         let uphill = slope_along.max(0.0);
                         let mut speed_factor: f32 = 1.0;
-                        if downhill > 0.0 { speed_factor *= 1.0 + downhill * topo_gain; }
-                        if uphill > 0.0 { speed_factor /= 1.0 + uphill * topo_gain; }
+                        if downhill > 0.0 {
+                            speed_factor *= 1.0 + downhill * topo_gain;
+                        }
+                        if uphill > 0.0 {
+                            speed_factor /= 1.0 + uphill * topo_gain;
+                        }
                         speed_factor = speed_factor.clamp(0.4, 1.8);
-                        left_speed *= speed_factor; right_speed *= speed_factor;
+                        left_speed *= speed_factor;
+                        right_speed *= speed_factor;
                     }
                 }
                 let linear = (left_speed + right_speed) * 0.5;
@@ -5340,24 +5521,46 @@ impl WorldState {
                 let mut next_pos = positions_snapshot[idx];
                 next_pos.x = Self::wrap_position(next_pos.x + vx, width);
                 next_pos.y = Self::wrap_position(next_pos.y + vy, height);
-                let movement_penalty = movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
+                let movement_penalty =
+                    movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
                 let mut drain = metabolism_drain + movement_penalty;
                 if ramp_rate > 0.0 {
                     let active_energy = (runtime.energy - ramp_floor).max(0.0);
                     drain += active_energy * ramp_rate;
                 }
-                if boost && boost_penalty > 0.0 { drain += boost_penalty; }
+                if boost && boost_penalty > 0.0 {
+                    drain += boost_penalty;
+                }
                 if topo_enabled && topo_penalty > 0.0 {
-                    if slope_along > 0.0 { drain += slope_along * topo_penalty; }
-                    else if slope_along < 0.0 { drain = (drain + slope_along * topo_penalty * 0.5).max(0.0); }
+                    if slope_along > 0.0 {
+                        drain += slope_along * topo_penalty;
+                    } else if slope_along < 0.0 {
+                        drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
+                    }
                 }
                 let health_delta = -drain;
                 let energy = (runtime.energy - drain).max(0.0);
                 let mut spike_length = spike_lengths_snapshot[idx];
-                if spike_length < spike_target { spike_length = (spike_length + spike_growth).min(spike_target); }
-                else if spike_length > spike_target { spike_length = (spike_length - spike_growth).max(spike_target); }
+                if spike_length < spike_target {
+                    spike_length = (spike_length + spike_growth).min(spike_target);
+                } else if spike_length > spike_target {
+                    spike_length = (spike_length - spike_growth).max(spike_target);
+                }
                 let spiked = spike_length > 0.5;
-                results[idx] = ActuationResult { delta: Some(ActuationDelta { heading, velocity: Velocity::new(vx, vy), position: next_pos, health_delta }), energy, color, spike_length, sound_level, give_intent, spiked };
+                results[idx] = ActuationResult {
+                    delta: Some(ActuationDelta {
+                        heading,
+                        velocity: Velocity::new(vx, vy),
+                        position: next_pos,
+                        health_delta,
+                    }),
+                    energy,
+                    color,
+                    spike_length,
+                    sound_level,
+                    give_intent,
+                    spiked,
+                };
             }
         }
 
@@ -5544,7 +5747,8 @@ impl WorldState {
             .max(f32::EPSILON);
 
         self.work_positions.clear();
-        self.work_positions.extend_from_slice(self.agents.columns().positions());
+        self.work_positions
+            .extend_from_slice(self.agents.columns().positions());
         let positions_snapshot = &self.work_positions;
         self.work_penalties.clear();
         self.work_penalties.resize(handles.len(), 0.0);
@@ -5695,7 +5899,8 @@ impl WorldState {
         let cell_size = self.config.food_cell_size as f32;
         // Reuse buffers: positions, handles, sharers
         self.work_positions.clear();
-        self.work_positions.extend_from_slice(self.agents.columns().positions());
+        self.work_positions
+            .extend_from_slice(self.agents.columns().positions());
         let positions = &self.work_positions;
 
         self.work_handles.clear();
@@ -6069,7 +6274,8 @@ impl WorldState {
         let headings = self.agents.columns().headings();
         // Reuse velocity buffer
         self.work_velocities.clear();
-        self.work_velocities.extend_from_slice(self.agents.columns().velocities());
+        self.work_velocities
+            .extend_from_slice(self.agents.columns().velocities());
         let velocities = &self.work_velocities;
         let spike_lengths = self.agents.columns().spike_lengths();
         // Reuse position_pairs buffer for index rebuild
@@ -6186,8 +6392,8 @@ impl WorldState {
                         let dist_v = dist_sq_v.sqrt();
                         let dir_x_v = dx_v / dist_v;
                         let dir_y_v = dy_v / dist_v;
-                        let align_v = dir_x_v * f32x4::splat(facing.0)
-                            + dir_y_v * f32x4::splat(facing.1);
+                        let align_v =
+                            dir_x_v * f32x4::splat(facing.0) + dir_y_v * f32x4::splat(facing.1);
                         // Build lane mask for (not self) && (dist within reach) && (alignment >= threshold)
                         let dist_sq_arr = dist_sq_v.to_array();
                         let align_arr = align_v.to_array();
@@ -6195,23 +6401,42 @@ impl WorldState {
                         let mut dmg_arr = [0.0_f32; 4];
                         for lane in 0..4 {
                             let oid = ids[lane];
-                            if oid == idx { continue; }
+                            if oid == idx {
+                                continue;
+                            }
                             let d2 = dist_sq_arr[lane];
-                            if d2 <= f32::EPSILON || d2 > reach_sq { continue; }
+                            if d2 <= f32::EPSILON || d2 > reach_sq {
+                                continue;
+                            }
                             let al = align_arr[lane];
-                            if al < alignment_threshold { continue; }
+                            if al < alignment_threshold {
+                                continue;
+                            }
                             let dmg = base_damage * al.max(0.0);
-                            if dmg > 0.0 { dmg_arr[lane] = dmg; }
+                            if dmg > 0.0 {
+                                dmg_arr[lane] = dmg;
+                            }
                         }
                         // Emit per-lane respecting order
                         for lane in 0..4 {
                             let damage = dmg_arr[lane];
-                            if damage <= 0.0 { continue; }
+                            if damage <= 0.0 {
+                                continue;
+                            }
                             let other_idx = ids[lane];
                             let target_runtime = &runtime_snapshot[other_idx];
-                            let victim_carnivore = target_runtime.herbivore_tendency < carnivore_threshold;
-                            if victim_carnivore { result.hit_carnivore = true; } else { result.hit_herbivore = true; }
-                            hits.push(CombatHit { target_idx: other_idx, damage, attacker_carnivore: is_carnivore });
+                            let victim_carnivore =
+                                target_runtime.herbivore_tendency < carnivore_threshold;
+                            if victim_carnivore {
+                                result.hit_carnivore = true;
+                            } else {
+                                result.hit_herbivore = true;
+                            }
+                            hits.push(CombatHit {
+                                target_idx: other_idx,
+                                damage,
+                                attacker_carnivore: is_carnivore,
+                            });
                         }
                     }
                     let rem = indices.chunks_exact(4).remainder();

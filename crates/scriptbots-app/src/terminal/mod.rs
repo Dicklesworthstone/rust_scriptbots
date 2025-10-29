@@ -22,11 +22,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Widget, Clear},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Widget},
 };
 use scriptbots_core::{
-    AgentId, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
-    BrainActivations,
+    AgentId, BrainActivations, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
 };
 use scriptbots_storage::MetricReading;
 use serde::Serialize;
@@ -334,7 +333,11 @@ impl<'a> TerminalApp<'a> {
 
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(if self.expanded { [Constraint::Percentage(58), Constraint::Percentage(42)] } else { [Constraint::Percentage(62), Constraint::Percentage(38)] })
+            .constraints(if self.expanded {
+                [Constraint::Percentage(58), Constraint::Percentage(42)]
+            } else {
+                [Constraint::Percentage(62), Constraint::Percentage(38)]
+            })
             .split(outer[1]);
 
         // Draw the map while avoiding holding an external borrow across &mut self
@@ -386,7 +389,9 @@ impl<'a> TerminalApp<'a> {
             // Draw a full-screen dimmed backdrop, then the help panel on top
             let size = frame.area();
             let overlay_style = if self.palette.has_color() {
-                Style::default().bg(Color::Black).add_modifier(Modifier::DIM)
+                Style::default()
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::DIM)
             } else {
                 Style::default()
             };
@@ -402,7 +407,8 @@ impl<'a> TerminalApp<'a> {
         }
         if let Ok(mut guard) = self.storage.try_lock() {
             if let Ok(readings) = guard.latest_metrics(256)
-                && let Some(ana) = parse_terminal_analytics(tick, self.snapshot.agent_count, &readings)
+                && let Some(ana) =
+                    parse_terminal_analytics(tick, self.snapshot.agent_count, &readings)
             {
                 self.analytics = Some(ana);
                 self.analytics_tick = Some(tick);
@@ -483,10 +489,8 @@ impl<'a> TerminalApp<'a> {
 
         // Add a compact, persistent help hint
         line.spans.push(Span::raw("  "));
-        line.spans.push(Span::styled(
-            "Help: ?/h",
-            self.palette.accent_style(),
-        ));
+        line.spans
+            .push(Span::styled("Help: ?/h", self.palette.accent_style()));
 
         let paragraph = Paragraph::new(line).block(
             Block::default()
@@ -554,7 +558,11 @@ impl<'a> TerminalApp<'a> {
             Span::raw(format!("mean {:>5.2}", snapshot.food.mean)),
         ]));
         // Per-diet mini bars
-        let max_class = diet.herbivores.max(diet.omnivores).max(diet.carnivores).max(1);
+        let max_class = diet
+            .herbivores
+            .max(diet.omnivores)
+            .max(diet.carnivores)
+            .max(1);
         let mkbar = |count: usize| -> String {
             let width = ((count * 20) / max_class).clamp(0, 20);
             "█".repeat(width)
@@ -562,15 +570,24 @@ impl<'a> TerminalApp<'a> {
         lines.push(Line::from(vec![
             Span::styled("Bars  ", self.palette.header_style()),
             Span::styled("H ", self.palette.diet_style(DietClass::Herbivore)),
-            Span::styled(mkbar(diet.herbivores), self.palette.diet_style(DietClass::Herbivore)),
+            Span::styled(
+                mkbar(diet.herbivores),
+                self.palette.diet_style(DietClass::Herbivore),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("      O ", self.palette.diet_style(DietClass::Omnivore)),
-            Span::styled(mkbar(diet.omnivores), self.palette.diet_style(DietClass::Omnivore)),
+            Span::styled(
+                mkbar(diet.omnivores),
+                self.palette.diet_style(DietClass::Omnivore),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("      C ", self.palette.diet_style(DietClass::Carnivore)),
-            Span::styled(mkbar(diet.carnivores), self.palette.diet_style(DietClass::Carnivore)),
+            Span::styled(
+                mkbar(diet.carnivores),
+                self.palette.diet_style(DietClass::Carnivore),
+            ),
         ]));
 
         let paragraph = Paragraph::new(Text::from(lines)).block(
@@ -628,8 +645,18 @@ impl<'a> TerminalApp<'a> {
                 .data(&energy_data);
             frame.render_widget(spark, trend_layout[1]);
         }
-        let births_data: Vec<u64> = snapshot.history.iter().rev().map(|e| e.births as u64).collect();
-        let deaths_data: Vec<u64> = snapshot.history.iter().rev().map(|e| e.deaths as u64).collect();
+        let births_data: Vec<u64> = snapshot
+            .history
+            .iter()
+            .rev()
+            .map(|e| e.births as u64)
+            .collect();
+        let deaths_data: Vec<u64> = snapshot
+            .history
+            .iter()
+            .rev()
+            .map(|e| e.deaths as u64)
+            .collect();
         if !births_data.is_empty() {
             let spark = Sparkline::default()
                 .style(Style::default().fg(Color::Green))
@@ -670,10 +697,7 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw_map(&mut self, frame: &mut Frame<'_>, area: Rect, world_size: (u32, u32)) {
-        let title = format!(
-            "World Map {}×{}",
-            world_size.0, world_size.1
-        );
+        let title = format!("World Map {}×{}", world_size.0, world_size.1);
         let block = Block::default()
             .title(self.palette.title(title))
             .borders(Borders::ALL);
@@ -687,7 +711,9 @@ impl<'a> TerminalApp<'a> {
             }
             // Bump stamp for this frame; keep 0 reserved
             self.map_stamp = self.map_stamp.wrapping_add(1);
-            if self.map_stamp == 0 { self.map_stamp = 1; }
+            if self.map_stamp == 0 {
+                self.map_stamp = 1;
+            }
             frame.render_widget(
                 MapWidget {
                     snapshot: &self.snapshot,
@@ -792,49 +818,86 @@ impl<'a> TerminalApp<'a> {
                 Span::raw(format!("μ {:>4.1}  max {:>3}", ana.age_mean, ana.age_max)),
                 Span::raw("  "),
                 Span::styled("Boost ", self.palette.accent_style()),
-                Span::raw(format!("{:>3} ({:>4.1}%)", ana.boost_count, ana.boost_ratio * 100.0)),
+                Span::raw(format!(
+                    "{:>3} ({:>4.1}%)",
+                    ana.boost_count,
+                    ana.boost_ratio * 100.0
+                )),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Food ", self.palette.header_style()),
-                Span::raw(format!("μ {:>4.2}  σ {:>4.2}", ana.food_mean, ana.food_stddev)),
+                Span::raw(format!(
+                    "μ {:>4.2}  σ {:>4.2}",
+                    ana.food_mean, ana.food_stddev
+                )),
                 Span::raw("  "),
                 Span::styled("Gen ", self.palette.header_style()),
-                Span::raw(format!("μ {:>4.1}  max {:>3.0}", ana.generation_mean, ana.generation_max)),
+                Span::raw(format!(
+                    "μ {:>4.1}  max {:>3.0}",
+                    ana.generation_mean, ana.generation_max
+                )),
             ]));
             if area.width > 60 {
                 lines.push(Line::from(vec![
                     Span::styled("Temp ", self.palette.header_style()),
-                    Span::raw(format!("pref μ {:>4.2} σ {:>4.2}  discomfort σ {:>4.2}",
-                        ana.temperature_preference_mean, ana.temperature_preference_stddev, ana.temperature_discomfort_stddev)),
+                    Span::raw(format!(
+                        "pref μ {:>4.2} σ {:>4.2}  discomfort σ {:>4.2}",
+                        ana.temperature_preference_mean,
+                        ana.temperature_preference_stddev,
+                        ana.temperature_discomfort_stddev
+                    )),
                 ]));
             }
             lines.push(Line::from(vec![
                 Span::styled("Mutation ", self.palette.header_style()),
-                Span::raw(format!("pri μ {:>4.2}  sec μ {:>4.2}", ana.mutation_primary_mean, ana.mutation_secondary_mean)),
+                Span::raw(format!(
+                    "pri μ {:>4.2}  sec μ {:>4.2}",
+                    ana.mutation_primary_mean, ana.mutation_secondary_mean
+                )),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Behavior H ", self.palette.header_style()),
-                Span::raw(format!("sens {:>4.2}  out {:>4.2}", ana.behavior_sensor_entropy, ana.behavior_output_entropy)),
+                Span::raw(format!(
+                    "sens {:>4.2}  out {:>4.2}",
+                    ana.behavior_sensor_entropy, ana.behavior_output_entropy
+                )),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Food Δ ", self.palette.header_style()),
-                Span::raw(format!("μ {:>+5.2}  |μ| {:>4.2}", ana.food_delta_mean, ana.food_delta_mean_abs)),
+                Span::raw(format!(
+                    "μ {:>+5.2}  |μ| {:>4.2}",
+                    ana.food_delta_mean, ana.food_delta_mean_abs
+                )),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Deaths ", self.palette.header_style()),
                 Span::raw(format!("total {:>4}", ana.deaths_total)),
                 Span::raw("  "),
                 Span::styled("Births ", self.palette.header_style()),
-                Span::raw(format!("{:>4}  hybrid {:>3} ({:>4.1}%)", ana.births_total, ana.births_hybrid, ana.births_hybrid_ratio * 100.0)),
+                Span::raw(format!(
+                    "{:>4}  hybrid {:>3} ({:>4.1}%)",
+                    ana.births_total,
+                    ana.births_hybrid,
+                    ana.births_hybrid_ratio * 100.0
+                )),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Diet E ", self.palette.header_style()),
-                Span::raw(format!("H {:.2} O {:.2} C {:.2}", ana.herbivore_avg_energy, ana.hybrid_avg_energy, ana.carnivore_avg_energy)),
+                Span::raw(format!(
+                    "H {:.2} O {:.2} C {:.2}",
+                    ana.herbivore_avg_energy, ana.hybrid_avg_energy, ana.carnivore_avg_energy
+                )),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Traits μ ", self.palette.header_style()),
-                Span::raw(format!("smell {:.2} sound {:.2} hear {:.2} eye {:.2} blood {:.2}",
-                    ana.traits_smell_mean, ana.traits_sound_mean, ana.traits_hearing_mean, ana.traits_eye_mean, ana.traits_blood_mean)),
+                Span::raw(format!(
+                    "smell {:.2} sound {:.2} hear {:.2} eye {:.2} blood {:.2}",
+                    ana.traits_smell_mean,
+                    ana.traits_sound_mean,
+                    ana.traits_hearing_mean,
+                    ana.traits_eye_mean,
+                    ana.traits_blood_mean
+                )),
             ]));
             // Temperature comfort
             let comfort = (1.0 - ana.temperature_discomfort_mean.max(0.0)).clamp(0.0, 1.0);
@@ -845,65 +908,113 @@ impl<'a> TerminalApp<'a> {
                 Span::styled("█".repeat(width), Style::default().fg(Color::LightGreen)),
             ]));
         } else {
-            lines.push(Line::from(vec![Span::raw("Analytics warming up… (run a few ticks) ")]));
+            lines.push(Line::from(vec![Span::raw(
+                "Analytics warming up… (run a few ticks) ",
+            )]));
         }
 
         // Legend for brain paging
         if self.snapshot.agent_count > 0 {
             let ai = self.focused_agent_cursor % self.snapshot.agent_count;
             let total_layers = self.snapshot.brain_layers.len();
-            let li = if total_layers == 0 { 0 } else { self.activation_layer_index.min(total_layers - 1) };
+            let li = if total_layers == 0 {
+                0
+            } else {
+                self.activation_layer_index.min(total_layers - 1)
+            };
             lines.push(Line::from(vec![
                 Span::styled("Focus ", self.palette.header_style()),
-                Span::raw(format!("agent #{:>3}  layer {:>2}/{}  row {:>3}", ai, li, total_layers, self.activation_row_offset)),
+                Span::raw(format!(
+                    "agent #{:>3}  layer {:>2}/{}  row {:>3}",
+                    ai, li, total_layers, self.activation_row_offset
+                )),
             ]));
         }
 
         // Compact brain activation row if available (pull selected layer)
-        if let Some(layer) = self.snapshot.brain_activations_layer_indexed(self.activation_layer_index)
-            && layer.width > 0 && layer.height > 0
+        if let Some(layer) = self
+            .snapshot
+            .brain_activations_layer_indexed(self.activation_layer_index)
+            && layer.width > 0
+            && layer.height > 0
         {
-                let cols = layer.width;
-                let start_row = self.activation_row_offset.min(layer.height.saturating_sub(1));
-                let rows_to_show = 3.min(layer.height - start_row);
-                for r in 0..rows_to_show {
-                    let row_index = start_row + r;
-                    let start = row_index * cols;
-                    let end = start + cols;
-                    let slice = &layer.values[start..end.min(layer.values.len())];
-                    if self.palette.is_emoji() && area.width > 40 {
-                        let take = cols.min(16);
-                        let mut row = String::new();
-                        for v in slice.iter().take(take) {
-                            let v = (*v).clamp(0.0, 1.0);
-                            let ch = if v > 0.85 { '🔥' } else if v > 0.6 { '🌶' } else if v > 0.35 { '✨' } else if v > 0.15 { '·' } else { ' ' };
-                            row.push(ch);
-                        }
-                        lines.push(Line::from(vec![
-                            if r == 0 { Span::styled("Brain ", self.palette.header_style()) } else { Span::raw("      ") },
-                            Span::raw(row),
-                        ]));
-                    } else {
-                        let take = cols.min(32);
-                        let mut row = String::new();
-                        for v in slice.iter().take(take) {
-                            let v = (*v).clamp(0.0, 1.0);
-                            let ch = if v > 0.8 { '█' } else if v > 0.6 { '▆' } else if v > 0.4 { '▅' } else if v > 0.2 { '▃' } else if v > 0.1 { '▂' } else { '▁' };
-                            row.push(ch);
-                        }
-                        lines.push(Line::from(vec![
-                            if r == 0 { Span::styled("Brain ", self.palette.header_style()) } else { Span::raw("      ") },
-                            Span::raw(row),
-                        ]));
+            let cols = layer.width;
+            let start_row = self
+                .activation_row_offset
+                .min(layer.height.saturating_sub(1));
+            let rows_to_show = 3.min(layer.height - start_row);
+            for r in 0..rows_to_show {
+                let row_index = start_row + r;
+                let start = row_index * cols;
+                let end = start + cols;
+                let slice = &layer.values[start..end.min(layer.values.len())];
+                if self.palette.is_emoji() && area.width > 40 {
+                    let take = cols.min(16);
+                    let mut row = String::new();
+                    for v in slice.iter().take(take) {
+                        let v = (*v).clamp(0.0, 1.0);
+                        let ch = if v > 0.85 {
+                            '🔥'
+                        } else if v > 0.6 {
+                            '🌶'
+                        } else if v > 0.35 {
+                            '✨'
+                        } else if v > 0.15 {
+                            '·'
+                        } else {
+                            ' '
+                        };
+                        row.push(ch);
                     }
+                    lines.push(Line::from(vec![
+                        if r == 0 {
+                            Span::styled("Brain ", self.palette.header_style())
+                        } else {
+                            Span::raw("      ")
+                        },
+                        Span::raw(row),
+                    ]));
+                } else {
+                    let take = cols.min(32);
+                    let mut row = String::new();
+                    for v in slice.iter().take(take) {
+                        let v = (*v).clamp(0.0, 1.0);
+                        let ch = if v > 0.8 {
+                            '█'
+                        } else if v > 0.6 {
+                            '▆'
+                        } else if v > 0.4 {
+                            '▅'
+                        } else if v > 0.2 {
+                            '▃'
+                        } else if v > 0.1 {
+                            '▂'
+                        } else {
+                            '▁'
+                        };
+                        row.push(ch);
+                    }
+                    lines.push(Line::from(vec![
+                        if r == 0 {
+                            Span::styled("Brain ", self.palette.header_style())
+                        } else {
+                            Span::raw("      ")
+                        },
+                        Span::raw(row),
+                    ]));
                 }
             }
+        }
 
         // Layers list (indices) when space permits
         if area.width > 48 && !self.snapshot.brain_layers.is_empty() {
             let mut layer_labels = String::new();
             for (i, layer) in self.snapshot.brain_layers.iter().enumerate() {
-                if i == self.activation_layer_index { layer_labels.push('>'); } else { layer_labels.push(' '); }
+                if i == self.activation_layer_index {
+                    layer_labels.push('>');
+                } else {
+                    layer_labels.push(' ');
+                }
                 if let Some(name) = &layer.name {
                     layer_labels.push_str(&format!("{}  ", name));
                 } else {
@@ -934,7 +1045,10 @@ impl<'a> TerminalApp<'a> {
                 let spans = vec![
                     Span::styled(format!("{:<10}", entry.label), self.palette.header_style()),
                     Span::raw("  "),
-                    Span::raw(format!("{:>4} {:>5.1}%  ⚡{:>4.2}", entry.count, share, entry.avg_energy)),
+                    Span::raw(format!(
+                        "{:>4} {:>5.1}%  ⚡{:>4.2}",
+                        entry.count, share, entry.avg_energy
+                    )),
                 ];
                 items.push(ListItem::new(Line::from(spans)));
                 rows += 1;
@@ -1017,7 +1131,9 @@ impl<'a> TerminalApp<'a> {
             )]),
             Line::raw(" Terrain: 🌊 deep water, 💧 shallow, 🏜 sand, 🌿 grass, 🌺 bloom, 🪨 rock"),
             Line::raw("          lush/barren variants may appear: 🐟, 🌴, 🌾, 🥀"),
-            Line::raw(" Agents:  single 🐇 herb, 🦝 omni, 🦊 carn; small groups 🐑/🐻/🐺; large 👥"),
+            Line::raw(
+                " Agents:  single 🐇 herb, 🦝 omni, 🦊 carn; small groups 🐑/🐻/🐺; large 👥",
+            ),
             Line::raw("          boosted 🚀; spike peak ⚔ (underlined)"),
             Line::raw(" Narrow:  width-1 symbols: ≈ ~ · \" * ^; agents h/H, o/O, c/C; groups @"),
         ];
@@ -1113,7 +1229,11 @@ impl<'a> TerminalApp<'a> {
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
-                    if self.palette.is_emoji() { "Emoji mode ON" } else { "Emoji mode OFF" },
+                    if self.palette.is_emoji() {
+                        "Emoji mode ON"
+                    } else {
+                        "Emoji mode OFF"
+                    },
                 );
             }
             (KeyCode::Char('n') | KeyCode::Char('N'), _) => {
@@ -1122,7 +1242,11 @@ impl<'a> TerminalApp<'a> {
                     self.push_event(
                         self.snapshot.tick,
                         EventKind::Info,
-                        if self.palette.is_emoji_narrow() { "Narrow symbols ON" } else { "Narrow symbols OFF" },
+                        if self.palette.is_emoji_narrow() {
+                            "Narrow symbols ON"
+                        } else {
+                            "Narrow symbols OFF"
+                        },
                     );
                 } else {
                     self.push_event(
@@ -1156,7 +1280,11 @@ impl<'a> TerminalApp<'a> {
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
-                    if self.expanded { "Expanded panels ON" } else { "Expanded panels OFF" },
+                    if self.expanded {
+                        "Expanded panels ON"
+                    } else {
+                        "Expanded panels OFF"
+                    },
                 );
             }
             (KeyCode::Char('?') | KeyCode::Char('h'), _) => {
@@ -1172,12 +1300,16 @@ impl<'a> TerminalApp<'a> {
                 );
             }
             (KeyCode::Char('['), _) => {
-                if self.activation_layer_index > 0 { self.activation_layer_index -= 1; }
+                if self.activation_layer_index > 0 {
+                    self.activation_layer_index -= 1;
+                }
             }
             (KeyCode::Char(']'), _) => {
                 if !self.snapshot.brain_layers.is_empty() {
                     let max = self.snapshot.brain_layers.len() - 1;
-                    if self.activation_layer_index < max { self.activation_layer_index += 1; }
+                    if self.activation_layer_index < max {
+                        self.activation_layer_index += 1;
+                    }
                 }
             }
             (KeyCode::Up, _) => {
@@ -1264,15 +1396,26 @@ impl<'a> TerminalApp<'a> {
                 let agent_id_opt = match self.focus_lock {
                     FocusLockMode::Manual => {
                         if snap.agent_count > 0 {
-                            world.agents().iter_handles().nth(self.focused_agent_cursor % snap.agent_count)
-                        } else { None }
+                            world
+                                .agents()
+                                .iter_handles()
+                                .nth(self.focused_agent_cursor % snap.agent_count)
+                        } else {
+                            None
+                        }
                     }
-                    FocusLockMode::TopPredator => {
-                        snap.leaderboard.first().and_then(|e| world.agents().iter_handles().find(|h| h.data().as_ffi() == e.label))
-                    }
-                    FocusLockMode::Oldest => {
-                        snap.oldest.first().and_then(|e| world.agents().iter_handles().find(|h| h.data().as_ffi() == e.label))
-                    }
+                    FocusLockMode::TopPredator => snap.leaderboard.first().and_then(|e| {
+                        world
+                            .agents()
+                            .iter_handles()
+                            .find(|h| h.data().as_ffi() == e.label)
+                    }),
+                    FocusLockMode::Oldest => snap.oldest.first().and_then(|e| {
+                        world
+                            .agents()
+                            .iter_handles()
+                            .find(|h| h.data().as_ffi() == e.label)
+                    }),
                 };
                 if let Some(agent_id) = agent_id_opt
                     && let Some(rt) = world.runtime().get(agent_id)
@@ -1464,7 +1607,11 @@ fn parse_terminal_analytics(
 
     let boost_count = as_count("behavior.boost.count");
     let boost_ratio = value("behavior.boost.ratio").unwrap_or_else(|| {
-        if agent_count > 0 { boost_count as f64 / agent_count as f64 } else { 0.0 }
+        if agent_count > 0 {
+            boost_count as f64 / agent_count as f64
+        } else {
+            0.0
+        }
     });
 
     // Brain shares aggregation
@@ -1472,16 +1619,24 @@ fn parse_terminal_analytics(
     for (name, &v) in &metrics {
         if let Some(rest) = name.strip_prefix("brain.population.") {
             if let Some(label) = rest.strip_suffix(".count") {
-                let entry = brain_map.entry(label.to_string()).or_insert(BrainShareEntry {
-                    label: label.to_string(), count: 0, avg_energy: 0.0
-                });
+                let entry = brain_map
+                    .entry(label.to_string())
+                    .or_insert(BrainShareEntry {
+                        label: label.to_string(),
+                        count: 0,
+                        avg_energy: 0.0,
+                    });
                 entry.count = v.max(0.0).round() as usize;
                 continue;
             }
             if let Some(label) = rest.strip_suffix(".avg_energy") {
-                let entry = brain_map.entry(label.to_string()).or_insert(BrainShareEntry {
-                    label: label.to_string(), count: 0, avg_energy: 0.0
-                });
+                let entry = brain_map
+                    .entry(label.to_string())
+                    .or_insert(BrainShareEntry {
+                        label: label.to_string(),
+                        count: 0,
+                        avg_energy: 0.0,
+                    });
                 entry.avg_energy = v;
             }
         }
@@ -1753,7 +1908,10 @@ impl CellOccupancy {
         stamp: u32,
     ) {
         if self.stamp != stamp {
-            *self = CellOccupancy { stamp, ..Default::default() };
+            *self = CellOccupancy {
+                stamp,
+                ..Default::default()
+            };
         }
         match class {
             DietClass::Herbivore => self.herbivores = self.herbivores.saturating_add(1),
@@ -1833,17 +1991,21 @@ impl Snapshot {
         let world_width = config.world_width.max(1) as f32;
         let world_height = config.world_height.max(1) as f32;
 
-        let summary = world.history().next_back().cloned().unwrap_or_else(|| TickSummary {
-            tick: world.tick(),
-            agent_count,
-            births: 0,
-            deaths: 0,
-            total_energy: 0.0,
-            average_energy: 0.0,
-            average_health: 0.0,
-            max_age: 0,
-            spike_hits: 0,
-        });
+        let summary = world
+            .history()
+            .next_back()
+            .cloned()
+            .unwrap_or_else(|| TickSummary {
+                tick: world.tick(),
+                agent_count,
+                births: 0,
+                deaths: 0,
+                total_energy: 0.0,
+                average_energy: 0.0,
+                average_health: 0.0,
+                max_age: 0,
+                spike_hits: 0,
+            });
         let history: Vec<HistoryEntry> = world
             .history()
             .rev()
@@ -2178,13 +2340,31 @@ impl Palette {
     fn heading_char_ascii(heading: f32) -> char {
         let normalized = heading.rem_euclid(TAU);
         let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
-        match sector { 0 => '>', 1 => '/', 2 => '^', 3 => '\\', 4 => '<', 5 => '/', 6 => 'v', _ => '\\' }
+        match sector {
+            0 => '>',
+            1 => '/',
+            2 => '^',
+            3 => '\\',
+            4 => '<',
+            5 => '/',
+            6 => 'v',
+            _ => '\\',
+        }
     }
 
     fn heading_char_pretty(heading: f32) -> char {
         let normalized = heading.rem_euclid(TAU);
         let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
-        match sector { 0 => '→', 1 => '↗', 2 => '↑', 3 => '↖', 4 => '←', 5 => '↙', 6 => '↓', _ => '↘' }
+        match sector {
+            0 => '→',
+            1 => '↗',
+            2 => '↑',
+            3 => '↖',
+            4 => '←',
+            5 => '↙',
+            6 => '↓',
+            _ => '↘',
+        }
     }
     fn detect() -> Self {
         let level = on_cached(Stream::Stdout);
@@ -2199,7 +2379,9 @@ impl Palette {
             } else {
                 // Auto-detect: prefer ON when stdout is a real terminal, UTF-8 locale, and not a
                 // known minimal TERM. This is heuristic but works well in practice.
-                let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+                let term = std::env::var("TERM")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 let looks_modern_term = !matches!(term.as_str(), "" | "dumb" | "linux" | "vt100");
                 let locale = std::env::var("LC_ALL")
                     .ok()
@@ -2213,7 +2395,11 @@ impl Palette {
             }
         };
         // Default narrow mode off; users can toggle if their terminal misaligns emojis
-        Self { level, emoji, emoji_narrow: false }
+        Self {
+            level,
+            emoji,
+            emoji_narrow: false,
+        }
     }
 
     fn header_style(&self) -> Style {
@@ -2281,13 +2467,23 @@ impl Palette {
         self.level.is_some()
     }
 
-    fn is_emoji(&self) -> bool { self.emoji }
+    fn is_emoji(&self) -> bool {
+        self.emoji
+    }
 
-    fn toggle_emoji(&mut self) { self.emoji = !self.emoji; }
+    fn toggle_emoji(&mut self) {
+        self.emoji = !self.emoji;
+    }
 
-    fn is_emoji_narrow(&self) -> bool { self.emoji && self.emoji_narrow }
+    fn is_emoji_narrow(&self) -> bool {
+        self.emoji && self.emoji_narrow
+    }
 
-    fn toggle_emoji_narrow(&mut self) { if self.emoji { self.emoji_narrow = !self.emoji_narrow; } }
+    fn toggle_emoji_narrow(&mut self) {
+        if self.emoji {
+            self.emoji_narrow = !self.emoji_narrow;
+        }
+    }
 
     fn diet_color(&self, diet: DietClass) -> Color {
         match diet {
@@ -2303,12 +2499,60 @@ impl Palette {
             .is_some_and(|level| level.has_16m || level.has_256);
         let (mut glyph, fg, bg) = if self.emoji {
             match kind {
-                TerrainKind::DeepWater => (if self.is_emoji_narrow() { '≈' } else { '🌊' }, Color::Cyan, Color::Blue),
-                TerrainKind::ShallowWater => (if self.is_emoji_narrow() { '~' } else { '💧' }, Color::Cyan, if rich_color { Color::Rgb(0, 80, 160) } else { Color::Blue }),
-                TerrainKind::Sand => (if self.is_emoji_narrow() { '·' } else { '🏜' }, Color::Yellow, if rich_color { Color::Rgb(160, 120, 50) } else { Color::Yellow }),
-                TerrainKind::Grass => (if self.is_emoji_narrow() { '"' } else { '🌿' }, Color::LightGreen, if rich_color { Color::Rgb(30, 90, 30) } else { Color::Green }),
-                TerrainKind::Bloom => (if self.is_emoji_narrow() { '*' } else { '🌺' }, Color::Magenta, if rich_color { Color::Rgb(100, 30, 100) } else { Color::Magenta }),
-                TerrainKind::Rock => (if self.is_emoji_narrow() { '^' } else { '🪨' }, Color::Gray, if rich_color { Color::Rgb(70, 70, 70) } else { Color::DarkGray }),
+                TerrainKind::DeepWater => (
+                    if self.is_emoji_narrow() {
+                        '≈'
+                    } else {
+                        '🌊'
+                    },
+                    Color::Cyan,
+                    Color::Blue,
+                ),
+                TerrainKind::ShallowWater => (
+                    if self.is_emoji_narrow() { '~' } else { '💧' },
+                    Color::Cyan,
+                    if rich_color {
+                        Color::Rgb(0, 80, 160)
+                    } else {
+                        Color::Blue
+                    },
+                ),
+                TerrainKind::Sand => (
+                    if self.is_emoji_narrow() { '·' } else { '🏜' },
+                    Color::Yellow,
+                    if rich_color {
+                        Color::Rgb(160, 120, 50)
+                    } else {
+                        Color::Yellow
+                    },
+                ),
+                TerrainKind::Grass => (
+                    if self.is_emoji_narrow() { '"' } else { '🌿' },
+                    Color::LightGreen,
+                    if rich_color {
+                        Color::Rgb(30, 90, 30)
+                    } else {
+                        Color::Green
+                    },
+                ),
+                TerrainKind::Bloom => (
+                    if self.is_emoji_narrow() { '*' } else { '🌺' },
+                    Color::Magenta,
+                    if rich_color {
+                        Color::Rgb(100, 30, 100)
+                    } else {
+                        Color::Magenta
+                    },
+                ),
+                TerrainKind::Rock => (
+                    if self.is_emoji_narrow() { '^' } else { '🪨' },
+                    Color::Gray,
+                    if rich_color {
+                        Color::Rgb(70, 70, 70)
+                    } else {
+                        Color::DarkGray
+                    },
+                ),
             }
         } else {
             match kind {
@@ -2400,22 +2644,62 @@ impl Palette {
         let mut glyph = if self.emoji {
             match total {
                 0 => ' ',
-                1 => {
-                    occupancy
+                1 => occupancy
                     .mean_heading()
                     .map(|ang| self.heading_char(ang))
                     .unwrap_or_else(|| match class {
-                        DietClass::Herbivore => if self.is_emoji_narrow() { 'h' } else { '🐇' },
-                        DietClass::Omnivore => if self.is_emoji_narrow() { 'o' } else { '🦝' },
-                        DietClass::Carnivore => if self.is_emoji_narrow() { 'c' } else { '🦊' },
-                    })
-                },
+                        DietClass::Herbivore => {
+                            if self.is_emoji_narrow() {
+                                'h'
+                            } else {
+                                '🐇'
+                            }
+                        }
+                        DietClass::Omnivore => {
+                            if self.is_emoji_narrow() {
+                                'o'
+                            } else {
+                                '🦝'
+                            }
+                        }
+                        DietClass::Carnivore => {
+                            if self.is_emoji_narrow() {
+                                'c'
+                            } else {
+                                '🦊'
+                            }
+                        }
+                    }),
                 2..=3 => match class {
-                    DietClass::Herbivore => if self.is_emoji_narrow() { 'H' } else { '🐑' },
-                    DietClass::Omnivore => if self.is_emoji_narrow() { 'O' } else { '🐻' },
-                    DietClass::Carnivore => if self.is_emoji_narrow() { 'C' } else { '🐺' },
+                    DietClass::Herbivore => {
+                        if self.is_emoji_narrow() {
+                            'H'
+                        } else {
+                            '🐑'
+                        }
+                    }
+                    DietClass::Omnivore => {
+                        if self.is_emoji_narrow() {
+                            'O'
+                        } else {
+                            '🐻'
+                        }
+                    }
+                    DietClass::Carnivore => {
+                        if self.is_emoji_narrow() {
+                            'C'
+                        } else {
+                            '🐺'
+                        }
+                    }
                 },
-                _ => if self.is_emoji_narrow() { '@' } else { '👥' },
+                _ => {
+                    if self.is_emoji_narrow() {
+                        '@'
+                    } else {
+                        '👥'
+                    }
+                }
             }
         } else {
             match total {
@@ -2445,10 +2729,18 @@ impl Palette {
             style = style.add_modifier(Modifier::REVERSED);
         }
         if occupancy.boosted {
-            glyph = if self.emoji && !self.is_emoji_narrow() { '🚀' } else { glyph };
+            glyph = if self.emoji && !self.is_emoji_narrow() {
+                '🚀'
+            } else {
+                glyph
+            };
         }
         if occupancy.spike_peak > 0.6 {
-            glyph = if self.emoji && !self.is_emoji_narrow() { '⚔' } else { '!' };
+            glyph = if self.emoji && !self.is_emoji_narrow() {
+                '⚔'
+            } else {
+                '!'
+            };
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         if let Some(tendency) = occupancy.mean_tendency() {
@@ -2461,7 +2753,13 @@ impl Palette {
         (glyph, style)
     }
 
-    fn heading_char(&self, heading: f32) -> char { if self.is_emoji_narrow() { Self::heading_char_ascii(heading) } else { Self::heading_char_pretty(heading) } }
+    fn heading_char(&self, heading: f32) -> char {
+        if self.is_emoji_narrow() {
+            Self::heading_char_ascii(heading)
+        } else {
+            Self::heading_char_pretty(heading)
+        }
+    }
 }
 
 struct MapWidget<'a> {
@@ -2704,7 +3002,15 @@ struct BrainLayerView {
 
 impl BrainLayerView {
     fn vec_from_activations(act: &BrainActivations) -> Vec<BrainLayerView> {
-        act.layers.iter().map(|l| BrainLayerView { width: l.width, height: l.height, values: l.values.clone(), name: Some(l.name.clone()) }).collect()
+        act.layers
+            .iter()
+            .map(|l| BrainLayerView {
+                width: l.width,
+                height: l.height,
+                values: l.values.clone(),
+                name: Some(l.name.clone()),
+            })
+            .collect()
     }
 }
 

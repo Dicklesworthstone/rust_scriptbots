@@ -235,7 +235,8 @@ impl NeighborhoodIndex for UniformGridIndex {
         self.agent_cells.resize(positions.len(), (0, 0));
 
         // Decide dense vs sparse layout based on total cell count.
-        let total_cells_u64 = i128::from(i64::from(self.cells_x)) * i128::from(i64::from(self.cells_y));
+        let total_cells_u64 =
+            i128::from(i64::from(self.cells_x)) * i128::from(i64::from(self.cells_y));
         let total_cells: Option<usize> = if total_cells_u64 >= 0 {
             usize::try_from(total_cells_u64).ok()
         } else {
@@ -252,10 +253,7 @@ impl NeighborhoodIndex for UniformGridIndex {
                 counts[lin] += 1;
             }
 
-            let mut dense: Vec<Vec<usize>> = counts
-                .into_iter()
-                .map(Vec::with_capacity)
-                .collect();
+            let mut dense: Vec<Vec<usize>> = counts.into_iter().map(Vec::with_capacity).collect();
 
             for (idx, &(cx, cy)) in self.agent_cells.iter().enumerate() {
                 let lin = self.linear_index(cx, cy);

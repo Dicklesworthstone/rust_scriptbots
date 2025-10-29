@@ -324,6 +324,8 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
   - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]
   - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build. [Completed - GPT-5 Codex 2025-10-22]
+ - [Currently In Progress - 2025-10-29 WhiteCat] Audit failing CI runs (fmt, wasm-pack, cross-platform checks, replay determinism) and collect log excerpts for remediation plan.
+ - [Currently In Progress - 2025-10-29 WhiteCat] Fix Windows test failure by retaining `ScriptBotsConfig` ownership in `scriptbots-core` tests (clone before `WorldState::new` where config is reused).
  - [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI: generate baseline/candidate DuckDB runs in headless terminal mode and diff event streams via CLI (`--replay-db`, `--compare-db`).
  - [Completed - GPT-5 Codex 2025-10-23] Wasm CI job builds `scriptbots-web` via `wasm-pack` and runs headless Chrome tests (Playwright-provisioned Chromium).
 
@@ -1133,6 +1135,9 @@ Knobs gate work under `SB_WGPU_MAX_FPS` and reuse last‑ready frame when budget
 ### Execution TODOs [Currently In Progress]
 - [Currently In Progress - 2025-10-23] Terminal renderer v2 visual overhaul (denser map glyphs, biome layers, agent inspectors, sparkline telemetry, narrative event log, configurable palettes).
 - [Currently In Progress - 2025-10-23] Global parallelism guard to cap rayon thread pool (default ≤4, env override), preventing ScriptBots processes from saturating host CPUs.
+- [Currently In Progress - 2025-10-29 OrangeHill] CI hygiene sweep: reconcile workspace rustfmt drift and restore formatter compliance without automated scripts.
+- [Currently In Progress - 2025-10-29 OrangeHill] CI wasm/WebAssembly lane: extend wasm-opt feature flags to allow saturating float-to-int truncation emitted by Rust 1.85.
+- [Currently In Progress - 2025-10-29 OrangeHill] CI replay determinism: draft portable `target-cpu` strategy so release binaries avoid SIGILL on hosted runners.
 - [Completed - 2025-10-22] Dependency alignment: restored `thiserror`, added terminal dependencies (`supports-color`, ratatui already present), and confirmed no redundant `utoipa-axum` entries remain.
 - [Completed - 2025-10-22] CLI mode integration: `resolve_renderer` now detects headless environments, honors override env vars, and logs terminal fallback activation.
 - [Completed - 2025-10-22] Terminal renderer scaffolding: new `terminal` module implements the shared `Renderer` trait with the crossterm/ratatui event loop.

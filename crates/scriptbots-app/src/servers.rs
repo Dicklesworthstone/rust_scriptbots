@@ -845,15 +845,27 @@ async fn get_agents_debug(
             b.energy
                 .partial_cmp(&a.energy)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.health.partial_cmp(&a.health).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| {
+                    b.health
+                        .partial_cmp(&a.health)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| b.age.cmp(&a.age))
                 .then_with(|| a.agent_id.cmp(&b.agent_id))
         }),
         AgentDebugSort::AgeDesc => agents.sort_by(|a, b| {
             b.age
                 .cmp(&a.age)
-                .then_with(|| b.energy.partial_cmp(&a.energy).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| b.health.partial_cmp(&a.health).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| {
+                    b.energy
+                        .partial_cmp(&a.energy)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    b.health
+                        .partial_cmp(&a.health)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| a.agent_id.cmp(&b.agent_id))
         }),
     }

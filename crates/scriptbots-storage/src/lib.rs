@@ -4,6 +4,7 @@
 #[link(name = "rstrtmgr")]
 unsafe extern "system" {}
 
+use crossbeam_channel as xchan;
 use duckdb::{Connection, Transaction, params};
 use scriptbots_core::{
     AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord, PersistenceBatch,
@@ -17,7 +18,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     thread,
 };
-use crossbeam_channel as xchan;
 use thiserror::Error;
 
 const DEFAULT_TICK_BUFFER: usize = 32;
@@ -1056,7 +1056,11 @@ impl StoragePipeline {
 
 impl WorldPersistence for StoragePipeline {
     fn on_tick(&mut self, payload: &PersistenceBatch) {
-        if self.tx.send(StorageCommand::Persist(Box::new(payload.clone()))).is_err() {
+        if self
+            .tx
+            .send(StorageCommand::Persist(Box::new(payload.clone())))
+            .is_err()
+        {
             eprintln!(
                 "storage worker channel closed; tick {} dropped",
                 payload.summary.tick.0

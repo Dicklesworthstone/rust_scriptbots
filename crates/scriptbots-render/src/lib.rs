@@ -9,10 +9,10 @@ use gpui::{
 use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::{
-    AgentColumns, AgentData, AgentId, AgentRuntime, ControlCommand, Generation,
-    IndicatorState, MutationRates, Position, ScriptBotsConfig, SelectionState,
-    TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
-    BrainActivations, ActivationLayer, ActivationEdge,
+    ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
+    BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, Position,
+    ScriptBotsConfig, SelectionState, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
+    TraitModifiers, Velocity, WorldState,
 };
 use scriptbots_storage::{MetricReading, Storage};
 use std::{
@@ -37,9 +37,8 @@ use tracing::{error, info, warn};
 #[cfg(feature = "world_wgpu")]
 pub mod world_compositor {
     use super::*;
-    use scriptbots_world_gfx::{WorldRenderer, WorldSnapshot as GfxSnapshot, ReadbackView};
-    use scriptbots_core::{WorldState, TerrainKind, SelectionState};
-    
+    use scriptbots_core::{SelectionState, TerrainKind, WorldState};
+    use scriptbots_world_gfx::{ReadbackView, WorldRenderer, WorldSnapshot as GfxSnapshot};
 
     pub struct GpuiImage {
         size: (u32, u32),
@@ -53,7 +52,12 @@ pub mod world_compositor {
     impl GpuiImage {
         fn new(size: (u32, u32), bytes_per_row: u32) -> Self {
             let cap = (bytes_per_row as usize) * (size.1 as usize);
-            Self { size, rgba: vec![0u8; cap], bytes_per_row, prev: vec![0u8; cap] }
+            Self {
+                size,
+                rgba: vec![0u8; cap],
+                bytes_per_row,
+                prev: vec![0u8; cap],
+            }
         }
         fn ensure(&mut self, size: (u32, u32), bytes_per_row: u32) {
             if self.size != size || self.bytes_per_row != bytes_per_row {
@@ -67,7 +71,9 @@ pub mod world_compositor {
         fn upload_from_readback(&mut self, view: &ReadbackView) {
             self.ensure((view.width, view.height), view.bytes_per_row);
             let new_len = (self.bytes_per_row as usize) * (self.size.1 as usize);
-            if self.prev.len() != new_len { self.prev.resize(new_len, 0); }
+            if self.prev.len() != new_len {
+                self.prev.resize(new_len, 0);
+            }
             // swap buffers: previous frame lands in self.prev; current buffer becomes the new target
             std::mem::swap(&mut self.prev, &mut self.rgba);
             let src = view.bytes();
@@ -101,9 +107,15 @@ pub mod world_compositor {
                     let mut run = x + 1;
                     while run < (img_w as usize) {
                         let o = y * row + run * 4;
-                        if self.rgba[o] == r0 && self.rgba[o + 1] == g0 && self.rgba[o + 2] == b0 && self.rgba[o + 3] == a0 {
+                        if self.rgba[o] == r0
+                            && self.rgba[o + 1] == g0
+                            && self.rgba[o + 2] == b0
+                            && self.rgba[o + 3] == a0
+                        {
                             run += 1;
-                        } else { break; }
+                        } else {
+                            break;
+                        }
                     }
                     let x0 = f32::from(bounds.origin.x) + (x as f32) * sx;
                     let x1 = (x0 + (run - x) as f32 * sx).min(f32::from(bounds.origin.x) + vw);
@@ -111,7 +123,15 @@ pub mod world_compositor {
                         point(px(x0), px(y0)),
                         size(px((x1 - x0).max(0.0)), px((y1 - y0).max(0.0))),
                     );
-                    window.paint_quad(fill(cell_bounds, Background::from(Rgba { r: (r0 as f32) / 255.0, g: (g0 as f32) / 255.0, b: (b0 as f32) / 255.0, a: (a0 as f32) / 255.0 })));
+                    window.paint_quad(fill(
+                        cell_bounds,
+                        Background::from(Rgba {
+                            r: (r0 as f32) / 255.0,
+                            g: (g0 as f32) / 255.0,
+                            b: (b0 as f32) / 255.0,
+                            a: (a0 as f32) / 255.0,
+                        }),
+                    ));
                     x = run;
                 }
             }
@@ -134,7 +154,10 @@ pub mod world_compositor {
                 while x < (img_w as usize) {
                     let off = y * row + x * 4;
                     let changed = self.rgba[off..off + 4] != self.prev[off..off + 4];
-                    if !changed { x += 1; continue; }
+                    if !changed {
+                        x += 1;
+                        continue;
+                    }
                     let r0 = self.rgba[off];
                     let g0 = self.rgba[off + 1];
                     let b0 = self.rgba[off + 2];
@@ -142,11 +165,19 @@ pub mod world_compositor {
                     let mut run = x + 1;
                     while run < (img_w as usize) {
                         let o = y * row + run * 4;
-                        if self.rgba[o..o + 4] == self.prev[o..o + 4] { break; }
+                        if self.rgba[o..o + 4] == self.prev[o..o + 4] {
+                            break;
+                        }
                         // extend run only while color matches to keep draw calls minimal
-                        if self.rgba[o] == r0 && self.rgba[o + 1] == g0 && self.rgba[o + 2] == b0 && self.rgba[o + 3] == a0 {
+                        if self.rgba[o] == r0
+                            && self.rgba[o + 1] == g0
+                            && self.rgba[o + 2] == b0
+                            && self.rgba[o + 3] == a0
+                        {
                             run += 1;
-                        } else { break; }
+                        } else {
+                            break;
+                        }
                     }
                     let y0 = f32::from(bounds.origin.y) + (y as f32) * sy;
                     let y1 = (y0 + sy).min(f32::from(bounds.origin.y) + vh);
@@ -156,11 +187,38 @@ pub mod world_compositor {
                         point(px(x0), px(y0)),
                         size(px((x1 - x0).max(0.0)), px((y1 - y0).max(0.0))),
                     );
-                    window.paint_quad(fill(cell_bounds, Background::from(Rgba { r: (r0 as f32) / 255.0, g: (g0 as f32) / 255.0, b: (b0 as f32) / 255.0, a: (a0 as f32) / 255.0 })));
+                    window.paint_quad(fill(
+                        cell_bounds,
+                        Background::from(Rgba {
+                            r: (r0 as f32) / 255.0,
+                            g: (g0 as f32) / 255.0,
+                            b: (b0 as f32) / 255.0,
+                            a: (a0 as f32) / 255.0,
+                        }),
+                    ));
                     x = run;
                 }
             }
         }
+    }
+
+    fn readback_stats(view: &ReadbackView) -> (u64, usize) {
+        let stride = view.bytes_per_row as usize;
+        let row_bytes = (view.width as usize) * 4;
+        let src = view.bytes();
+        let mut checksum = 0u64;
+        let mut non_zero = 0usize;
+        for y in 0..(view.height as usize) {
+            let start = y * stride;
+            let end = start.saturating_add(row_bytes).min(src.len());
+            for &byte in &src[start..end] {
+                checksum = checksum.wrapping_add(u64::from(byte));
+                if byte != 0 {
+                    non_zero += 1;
+                }
+            }
+        }
+        (checksum, non_zero)
     }
 
     pub struct Compositor {
@@ -185,22 +243,57 @@ pub mod world_compositor {
 
     impl Compositor {
         pub fn new() -> Self {
-            let max_fps = std::env::var("SB_WGPU_MAX_FPS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(60.0);
-            let min_interval = if max_fps > 0.0 { (1.0 / max_fps).max(0.001) } else { 0.0 };
-            let render_scale = std::env::var("SB_WGPU_RES_SCALE").ok().and_then(|s| s.parse::<f32>().ok()).map(|v| v.clamp(0.25, 1.0)).unwrap_or(1.0);
+            let max_fps = std::env::var("SB_WGPU_MAX_FPS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(60.0);
+            let min_interval = if max_fps > 0.0 {
+                (1.0 / max_fps).max(0.001)
+            } else {
+                0.0
+            };
+            let render_scale = std::env::var("SB_WGPU_RES_SCALE")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|v| v.clamp(0.25, 1.0))
+                .unwrap_or(1.0);
             // Frame capture controls (opt-in)
             let save_enabled = env_flag("SB_WGPU_SAVE_FRAMES");
-            let save_dir = std::env::var("SB_WGPU_SAVE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("frames"));
-            let save_every = std::env::var("SB_WGPU_SAVE_EVERY").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n > 0).unwrap_or(1);
-            let save_prefix = std::env::var("SB_WGPU_SAVE_PREFIX").unwrap_or_else(|_| "frame".to_string());
+            let save_dir = std::env::var("SB_WGPU_SAVE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("frames"));
+            let save_every = std::env::var("SB_WGPU_SAVE_EVERY")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1);
+            let save_prefix =
+                std::env::var("SB_WGPU_SAVE_PREFIX").unwrap_or_else(|_| "frame".to_string());
             let force_first_capture = true; // one-time capture for diagnostics
-            Self { renderer: None, image: None, adapter: None, cam_scale: 1.0, cam_offset: (0.0, 0.0), last_submit: None, min_interval, render_scale, save_enabled, save_dir, save_every, save_counter: 0, save_prefix, force_first_capture }
+            Self {
+                renderer: None,
+                image: None,
+                adapter: None,
+                cam_scale: 1.0,
+                cam_offset: (0.0, 0.0),
+                last_submit: None,
+                min_interval,
+                render_scale,
+                save_enabled,
+                save_dir,
+                save_every,
+                save_counter: 0,
+                save_prefix,
+                force_first_capture,
+            }
         }
 
         pub fn set_camera_params(&mut self, scale: f32, offset: (f32, f32)) {
             self.cam_scale = scale;
             self.cam_offset = offset;
-            if let Some(r) = self.renderer.as_mut() { r.set_camera(scale, offset); }
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_camera(scale, offset);
+            }
         }
 
         fn ensure_renderer(&mut self, size: (u32, u32)) -> Result<(), String> {
@@ -240,7 +333,9 @@ pub mod world_compositor {
 
         pub fn render_snapshot(&mut self, snapshot: &GfxSnapshot, target_size: (u32, u32)) {
             // Root-cause guard: skip rendering when target is zero-sized (startup/minimize)
-            if target_size.0 == 0 || target_size.1 == 0 { return; }
+            if target_size.0 == 0 || target_size.1 == 0 {
+                return;
+            }
             // Optional FPS cap: skip re-render and reuse last-ready image if interval not elapsed
             if self.min_interval > 0.0 {
                 if let Some(last) = self.last_submit {
@@ -251,15 +346,27 @@ pub mod world_compositor {
             }
             let render_size = if self.render_scale < 0.9999 {
                 (
-                    (((target_size.0 as f32) * self.render_scale) as u32).max(1).min(target_size.0),
-                    (((target_size.1 as f32) * self.render_scale) as u32).max(1).min(target_size.1),
+                    (((target_size.0 as f32) * self.render_scale) as u32)
+                        .max(1)
+                        .min(target_size.0),
+                    (((target_size.1 as f32) * self.render_scale) as u32)
+                        .max(1)
+                        .min(target_size.1),
                 )
-            } else { (target_size.0.max(1), target_size.1.max(1)) };
-            if self.ensure_renderer(render_size).is_err() { return; }
+            } else {
+                (target_size.0.max(1), target_size.1.max(1))
+            };
+            if self.ensure_renderer(render_size).is_err() {
+                return;
+            }
             let r = self.renderer.as_mut().unwrap();
             // When rendering at a reduced offscreen resolution, scale the camera mapping
             // so CPU culling and shader NDC math remain consistent with the smaller viewport.
-            let rs = if self.render_scale < 0.9999 { self.render_scale } else { 1.0 };
+            let rs = if self.render_scale < 0.9999 {
+                self.render_scale
+            } else {
+                1.0
+            };
             let effective_scale = self.cam_scale * rs;
             let effective_offset = (self.cam_offset.0 * rs, self.cam_offset.1 * rs);
             r.set_camera(effective_scale, effective_offset);
@@ -272,22 +379,44 @@ pub mod world_compositor {
                 for _ in 0..64 {
                     std::hint::spin_loop();
                     view_opt = r.mapped_rgba();
-                    if view_opt.is_some() { break; }
+                    if view_opt.is_some() {
+                        break;
+                    }
                 }
             }
             if let Some(view) = view_opt {
                 self.save_view_if_requested(&view);
                 // Lazy-initialize image with known dimensions; avoid stale size from previous runs
                 if self.image.is_none() {
-                    self.image = Some(GpuiImage::new((view.width, view.height), view.bytes_per_row));
+                    self.image = Some(GpuiImage::new(
+                        (view.width, view.height),
+                        view.bytes_per_row,
+                    ));
                 }
                 if let Some(img) = self.image.as_mut() {
                     img.ensure((view.width, view.height), view.bytes_per_row);
                     img.upload_from_readback(&view);
                 }
+                if env_flag("SB_WGPU_READBACK_CHECKSUM") {
+                    let (checksum, non_zero) = readback_stats(&view);
+                    tracing::info!(
+                        width = view.width,
+                        height = view.height,
+                        stride = view.bytes_per_row,
+                        checksum,
+                        checksum_hex = format!("{checksum:016x}"),
+                        non_zero_bytes = non_zero,
+                        "wgpu readback checksum"
+                    );
+                }
                 self.last_submit = Some(std::time::Instant::now());
                 if env_flag("SB_WGPU_LOG_VIS") {
-                    tracing::info!(width = view.width, height = view.height, stride = view.bytes_per_row, "wgpu readback mapped");
+                    tracing::info!(
+                        width = view.width,
+                        height = view.height,
+                        stride = view.bytes_per_row,
+                        "wgpu readback mapped"
+                    );
                 }
             } else if env_flag("SB_WGPU_LOG_VIS") {
                 tracing::info!("wgpu readback not yet mapped");
@@ -296,7 +425,9 @@ pub mod world_compositor {
 
         pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
             if let Some(img) = &self.image {
-                let mode = std::env::var("SB_WGPU_PRESENT_MODE").ok().or_else(|| Some("full".to_string()));
+                let mode = std::env::var("SB_WGPU_PRESENT_MODE")
+                    .ok()
+                    .or_else(|| Some("full".to_string()));
                 match mode.as_deref() {
                     Some("full") => img.paint_full(bounds, window),
                     Some("diff") | _ => img.paint_diff(bounds, window),
@@ -317,10 +448,16 @@ pub mod world_compositor {
                 return;
             }
             self.save_counter = self.save_counter.saturating_add(1);
-            if ((self.save_counter - 1) % (self.save_every as u64)) != 0 { return; }
+            if ((self.save_counter - 1) % (self.save_every as u64)) != 0 {
+                return;
+            }
 
             // Ensure directory exists
-            let target_dir = if self.save_enabled { self.save_dir.clone() } else { std::path::PathBuf::from("frames_live") };
+            let target_dir = if self.save_enabled {
+                self.save_dir.clone()
+            } else {
+                std::path::PathBuf::from("frames_live")
+            };
             let _ = std::fs::create_dir_all(&target_dir);
             // Repack from padded rows into tightly packed RGBA8 buffer
             let width = view.width;
@@ -347,6 +484,9 @@ pub mod world_compositor {
                 image::ColorType::Rgba8,
                 image::ImageFormat::Png,
             );
+            if env_flag("SB_WGPU_READBACK_CHECKSUM") {
+                tracing::info!(?path, width, height, "wgpu readback frame saved");
+            }
             // Only force one capture
             self.force_first_capture = false;
         }
@@ -378,7 +518,11 @@ pub mod world_compositor {
             .agents
             .iter()
             .map(|a| {
-                let sel = match a.selection { SelectionState::Hovered => 1u32, SelectionState::Selected => 2u32, SelectionState::None => 0u32 };
+                let sel = match a.selection {
+                    SelectionState::Hovered => 1u32,
+                    SelectionState::Selected => 2u32,
+                    SelectionState::None => 0u32,
+                };
                 let dyn_radius = (frame.agent_base_radius + a.spike_length * 0.25).max(6.0);
                 let glow = (a.indicator.intensity * 0.35).clamp(0.0, 1.0);
                 scriptbots_world_gfx::AgentInstance {
@@ -394,7 +538,12 @@ pub mod world_compositor {
 
         let snapshot = GfxSnapshot {
             world_size,
-            terrain: scriptbots_world_gfx::TerrainView { dims, cell_size: frame.terrain.cell_size, tiles: &tiles_u32, elevation: Some(&elevation) },
+            terrain: scriptbots_world_gfx::TerrainView {
+                dims,
+                cell_size: frame.terrain.cell_size,
+                tiles: &tiles_u32,
+                elevation: Some(&elevation),
+            },
             agents: &agents_gpu,
         };
 
@@ -402,7 +551,9 @@ pub mod world_compositor {
         let mut comp = Compositor::new();
         let width_px = width as f32;
         let height_px = height as f32;
-        let base_scale = (width_px / world_size.0).min(height_px / world_size.1).max(0.0001);
+        let base_scale = (width_px / world_size.0)
+            .min(height_px / world_size.1)
+            .max(0.0001);
         let pad_x = (width_px - world_size.0 * base_scale) * 0.5;
         let pad_y = (height_px - world_size.1 * base_scale) * 0.5;
         comp.set_camera_params(base_scale, (pad_x, pad_y));
@@ -423,7 +574,13 @@ pub mod world_compositor {
             }
             let mut cursor = std::io::Cursor::new(&mut png);
             let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
-            let _ = image::ImageEncoder::write_image(encoder, &tight, width, height, image::ExtendedColorType::Rgba8);
+            let _ = image::ImageEncoder::write_image(
+                encoder,
+                &tight,
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            );
         }
         png
     }
@@ -432,7 +589,7 @@ pub mod world_compositor {
 #[cfg(all(test, feature = "world_wgpu"))]
 mod wgpu_capture_test {
     use super::world_compositor::Compositor;
-    use scriptbots_world_gfx::{WorldSnapshot as GfxSnapshot, TerrainView, AgentInstance};
+    use scriptbots_world_gfx::{AgentInstance, TerrainView, WorldSnapshot as GfxSnapshot};
 
     #[test]
     fn wgpu_capture_smoke() {
@@ -453,7 +610,12 @@ mod wgpu_capture_test {
         let tiles: Vec<u32> = vec![3u32; (dims.0 * dims.1) as usize];
         let snapshot = GfxSnapshot {
             world_size: (6000.0, 6000.0),
-            terrain: TerrainView { dims, cell_size: 100, tiles: &tiles, elevation: None },
+            terrain: TerrainView {
+                dims,
+                cell_size: 100,
+                tiles: &tiles,
+                elevation: None,
+            },
             agents: &[] as &[AgentInstance],
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
@@ -463,8 +625,12 @@ mod wgpu_capture_test {
         let dir = std::path::Path::new("frames_render_test");
         assert!(dir.exists(), "frames_render_test dir should exist");
         // Best-effort check for at least one PNG file
-        let produced = std::fs::read_dir(dir).ok()
-            .map(|it| it.filter_map(|e| e.ok()).any(|e| e.path().extension().map(|s| s == "png").unwrap_or(false)))
+        let produced = std::fs::read_dir(dir)
+            .ok()
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().map(|s| s == "png").unwrap_or(false))
+            })
             .unwrap_or(false);
         assert!(produced, "expected at least one PNG to be written");
     }
@@ -495,7 +661,9 @@ mod wgpu_capture_test {
 
         // Fit entire world into the viewport (match the GPUI mapping)
         let world_size = (6000.0f32, 6000.0f32);
-        let base_scale = (viewport.0 as f32 / world_size.0).min(viewport.1 as f32 / world_size.1).max(0.0001);
+        let base_scale = (viewport.0 as f32 / world_size.0)
+            .min(viewport.1 as f32 / world_size.1)
+            .max(0.0001);
         let pad_x = (viewport.0 as f32 - world_size.0 * base_scale) * 0.5;
         let pad_y = (viewport.1 as f32 - world_size.1 * base_scale) * 0.5;
         comp.set_camera_params(base_scale, (pad_x, pad_y));
@@ -522,7 +690,12 @@ mod wgpu_capture_test {
 
         let snapshot = GfxSnapshot {
             world_size,
-            terrain: TerrainView { dims, cell_size: 100, tiles: &tiles, elevation: None },
+            terrain: TerrainView {
+                dims,
+                cell_size: 100,
+                tiles: &tiles,
+                elevation: None,
+            },
             agents: &agents,
         };
 
@@ -533,15 +706,16 @@ mod wgpu_capture_test {
         assert!(dir.exists(), "frames_render_test dir should exist");
         let produced = std::fs::read_dir(dir)
             .ok()
-            .map(|it| it.filter_map(|e| e.ok()).any(|e| {
-                let p = e.path();
-                p.extension().map(|s| s == "png").unwrap_or(false)
-                    && p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with("agents_"))
-                        .unwrap_or(false)
-            }))
+            .map(|it| {
+                it.filter_map(|e| e.ok()).any(|e| {
+                    let p = e.path();
+                    p.extension().map(|s| s == "png").unwrap_or(false)
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("agents_"))
+                            .unwrap_or(false)
+                })
+            })
             .unwrap_or(false);
         assert!(produced, "expected at least one agents PNG to be written");
     }
@@ -562,10 +736,12 @@ fn use_wgpu_renderer() -> bool {
 }
 
 #[cfg(not(feature = "world_wgpu"))]
-fn use_wgpu_renderer() -> bool { false }
+fn use_wgpu_renderer() -> bool {
+    false
+}
 
 #[cfg(feature = "world_wgpu")]
-    fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
+fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     use scriptbots_world_gfx::WorldSnapshot as GfxSnapshot;
     use world_compositor::Compositor;
     static COMPOSITOR: OnceLock<std::sync::Mutex<Compositor>> = OnceLock::new();
@@ -593,21 +769,31 @@ fn use_wgpu_renderer() -> bool { false }
     let scale = base_scale * state.camera.lock().map(|c| c.zoom).unwrap_or(1.0);
     let pad_x = (width_px - world_w * scale) * 0.5;
     let pad_y = (height_px - world_h * scale) * 0.5;
-    let (off_px_x, off_px_y) = state.camera.lock().map(|c| c.offset_px).unwrap_or((0.0, 0.0));
+    let (off_px_x, off_px_y) = state
+        .camera
+        .lock()
+        .map(|c| c.offset_px)
+        .unwrap_or((0.0, 0.0));
     // Offscreen world renderer uses (0,0) origin; include only pad and camera offset
     let cam_offset = (pad_x + off_px_x, pad_y + off_px_y);
 
-        if env_flag("SB_WGPU_LOG_CAM") {
-            tracing::info!(
-                vw = width_px, vh = height_px,
-                world_w = world_w, world_h = world_h,
-                base_scale = base_scale, scale = scale,
-                pad_x = pad_x, pad_y = pad_y,
-                off_x = off_px_x, off_y = off_px_y,
-                cam_off_x = cam_offset.0, cam_off_y = cam_offset.1,
-                "wgpu camera mapping"
-            );
-        }
+    if env_flag("SB_WGPU_LOG_CAM") {
+        tracing::info!(
+            vw = width_px,
+            vh = height_px,
+            world_w = world_w,
+            world_h = world_h,
+            base_scale = base_scale,
+            scale = scale,
+            pad_x = pad_x,
+            pad_y = pad_y,
+            off_x = off_px_x,
+            off_y = off_px_y,
+            cam_off_x = cam_offset.0,
+            cam_off_y = cam_offset.1,
+            "wgpu camera mapping"
+        );
+    }
 
     // Build a minimal snapshot from the current RenderFrame
     let terrain_dims = state.frame.terrain.dimensions;
@@ -625,18 +811,30 @@ fn use_wgpu_renderer() -> bool { false }
             TerrainKind::Rock => 5,
         })
         .collect();
-    let elevation: Vec<f32> = state.frame.terrain.tiles.iter().map(|t| t.elevation).collect();
+    let elevation: Vec<f32> = state
+        .frame
+        .terrain
+        .tiles
+        .iter()
+        .map(|t| t.elevation)
+        .collect();
     let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = state
         .frame
         .agents
         .iter()
         .map(|a| {
-            let sel = match a.selection { SelectionState::Hovered => 1u32, SelectionState::Selected => 2u32, SelectionState::None => 0u32 };
+            let sel = match a.selection {
+                SelectionState::Hovered => 1u32,
+                SelectionState::Selected => 2u32,
+                SelectionState::None => 0u32,
+            };
             let dyn_radius = (state.frame.agent_base_radius + a.spike_length * 0.25).max(6.0);
             let glow_from_indicator = (a.indicator.intensity * 0.35).clamp(0.0, 1.0);
             let glow_from_spike = if a.spiked { 0.45 } else { 0.0 };
             let glow_from_repro = (a.reproduction_intent * 0.25).clamp(0.0, 0.6);
-            let glow = glow_from_indicator.max(glow_from_spike).max(glow_from_repro);
+            let glow = glow_from_indicator
+                .max(glow_from_spike)
+                .max(glow_from_repro);
             scriptbots_world_gfx::AgentInstance {
                 position: [a.position.x, a.position.y],
                 size: dyn_radius,
@@ -654,9 +852,27 @@ fn use_wgpu_renderer() -> bool { false }
         tiles: &tiles_u32,
         elevation: Some(&elevation),
     };
-    let snapshot = GfxSnapshot { world_size, terrain: terrain_view, agents: &agents_gpu };
+    let snapshot = GfxSnapshot {
+        world_size,
+        terrain: terrain_view,
+        agents: &agents_gpu,
+    };
 
-    tracing::info!(vw=width_px, vh=height_px, world_w=world_w, world_h=world_h, base_scale=base_scale, scale=scale, pad_x=pad_x, pad_y=pad_y, off_x=off_px_x, off_y=off_px_y, cam_off_x=cam_offset.0, cam_off_y=cam_offset.1, "wgpu camera mapping");
+    tracing::info!(
+        vw = width_px,
+        vh = height_px,
+        world_w = world_w,
+        world_h = world_h,
+        base_scale = base_scale,
+        scale = scale,
+        pad_x = pad_x,
+        pad_y = pad_y,
+        off_x = off_px_x,
+        off_y = off_px_y,
+        cam_off_x = cam_offset.0,
+        cam_off_y = cam_offset.1,
+        "wgpu camera mapping"
+    );
 
     // Render using current camera mapping
     comp.set_camera_params(scale, cam_offset);
@@ -695,8 +911,7 @@ static RENDER_WATERMARK: OnceLock<bool> = OnceLock::new();
 static RENDER_SAFE: OnceLock<bool> = OnceLock::new();
 
 fn watermark_enabled() -> bool {
-    *RENDER_WATERMARK
-        .get_or_init(|| env_flag("SCRIPTBOTS_RENDER_WATERMARK"))
+    *RENDER_WATERMARK.get_or_init(|| env_flag("SCRIPTBOTS_RENDER_WATERMARK"))
 }
 
 fn safe_mode_enabled() -> bool {
@@ -954,7 +1169,11 @@ impl SimulationView {
         }
         // Adaptive cap: reduce max steps under low FPS to keep UI responsive
         let avg_ms = self.last_perf.average_ms.max(0.0);
-        let dynamic_cap = if avg_ms > 16.0 { (MAX_SIM_STEPS_PER_FRAME / 2).max(1) } else { MAX_SIM_STEPS_PER_FRAME };
+        let dynamic_cap = if avg_ms > 16.0 {
+            (MAX_SIM_STEPS_PER_FRAME / 2).max(1)
+        } else {
+            MAX_SIM_STEPS_PER_FRAME
+        };
         if steps > dynamic_cap {
             steps = dynamic_cap;
         }
@@ -2026,7 +2245,9 @@ impl SimulationView {
                             .lock()
                             .map(|s| s.focused_agent.is_some())
                             .unwrap_or(false)
-                    } else { false };
+                    } else {
+                        false
+                    };
 
                     let mut changed = this.update_selection_from_point(event.position, extend);
 
@@ -3249,7 +3470,11 @@ impl SimulationView {
     }
 
     fn toggle_closed_environment(&mut self, cx: &mut Context<Self>) {
-        let next = if let Ok(world) = self.world.lock() { !world.is_closed() } else { return; };
+        let next = if let Ok(world) = self.world.lock() {
+            !world.is_closed()
+        } else {
+            return;
+        };
         if let Ok(mut world) = self.world.lock() {
             world.set_closed(next);
         }
@@ -4265,11 +4490,15 @@ impl SimulationView {
             this.spawn_agent_with_tendency(1.0, cx);
         });
         let open_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            if let Ok(mut world) = this.world.lock() { world.set_closed(false); }
+            if let Ok(mut world) = this.world.lock() {
+                world.set_closed(false);
+            }
             cx.notify();
         });
         let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            if let Ok(mut world) = this.world.lock() { world.set_closed(true); }
+            if let Ok(mut world) = this.world.lock() {
+                world.set_closed(true);
+            }
             cx.notify();
         });
 
@@ -5016,19 +5245,9 @@ impl SimulationView {
                 detail.trait_modifiers.eye,
                 detail.trait_modifiers.blood
             )))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x94a3b8))
-                    .child("Sensors")
-            )
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Sensors"))
             .child(sensor_bars)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x94a3b8))
-                    .child("Outputs")
-            )
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Outputs"))
             .child(output_bars)
             .child(render_activation_heatmaps(&detail.brain_activations))
             .child(self.render_output_sparklines_for(detail.agent_id))
@@ -5054,15 +5273,30 @@ impl SimulationView {
                     .flex()
                     .gap_2()
                     .items_center()
-                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(label.to_string()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(label.to_string()),
+                    )
                     .child(div().relative().child(track).child(fill))
-                    .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!("{:.2}", v)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5f5))
+                            .child(format!("{:.2}", v)),
+                    )
             };
             rows.push(mk("H", h, rgba_from_hex(0x22c55e, 0.95)));
             rows.push(mk("O", o, rgba_from_hex(0xf59e0b, 0.95)));
             rows.push(mk("C", c, rgba_from_hex(0xef4444, 0.95)));
         } else {
-            rows.push(div().text_xs().text_color(rgb(0x475569)).child("Diet gauges: analytics pending"));
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x475569))
+                    .child("Diet gauges: analytics pending"),
+            );
         }
         div()
             .flex()
@@ -5074,7 +5308,12 @@ impl SimulationView {
             .bg(rgb(0x0f172a))
             .px_3()
             .py_2()
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Diet avg energy"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Diet avg energy"),
+            )
             .children(rows)
     }
     fn render_mutation_controls(
@@ -6633,15 +6872,19 @@ impl SimulationView {
 fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
     let mut rows: Vec<Div> = Vec::new();
     let max_show = if is_sensor { 8 } else { 6 };
-    let max_val = values.iter().copied().fold(0.0_f32, |m, v| m.max(v.abs())).max(1e-3);
+    let max_val = values
+        .iter()
+        .copied()
+        .fold(0.0_f32, |m, v| m.max(v.abs()))
+        .max(1e-3);
     for (idx, v) in values.iter().copied().take(max_show).enumerate() {
         let width = (v.abs() / max_val).clamp(0.0, 1.0);
-        let color = if is_sensor { rgb(0x60a5fa) } else { rgb(0xf59e0b) };
-        let bar = div()
-            .w(px(160.0 * width))
-            .h(px(8.0))
-            .bg(color)
-            .rounded_sm();
+        let color = if is_sensor {
+            rgb(0x60a5fa)
+        } else {
+            rgb(0xf59e0b)
+        };
+        let bar = div().w(px(160.0 * width)).h(px(8.0)).bg(color).rounded_sm();
         let label = div()
             .text_xs()
             .text_color(rgb(0x94a3b8))
@@ -6654,7 +6897,12 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
                 .items_center()
                 .child(label)
                 .child(bar)
-                .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!("{v:.2}"))),
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xcbd5f5))
+                        .child(format!("{v:.2}")),
+                ),
         );
     }
     div().flex().flex_col().gap_1().children(rows)
@@ -6678,7 +6926,9 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
                 .map(|a| a.connections.clone())
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|e| e.from < state.width * state.height && e.to < state.width * state.height)
+                .filter(|e| {
+                    e.from < state.width * state.height && e.to < state.width * state.height
+                })
                 .take(64)
                 .collect();
 
@@ -6695,7 +6945,12 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(state.name.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(state.name.clone()),
+                    )
                     .child(div().relative().child(canvas_el).child(edges_canvas)),
             );
         }
@@ -6703,16 +6958,20 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
         if !act.connections.is_empty() {
             let mut lines: Vec<Div> = Vec::new();
             for edge in act.connections.iter().take(8) {
-                lines.push(div().text_xs().text_color(rgb(0x64748b)).child(
-                    format!("edge {}→{} w={:.2}", edge.from, edge.to, edge.weight)
-                ));
+                lines.push(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                    "edge {}→{} w={:.2}",
+                    edge.from, edge.to, edge.weight
+                )));
             }
-            rows.push(
-                div().flex().flex_col().gap_0().children(lines)
-            );
+            rows.push(div().flex().flex_col().gap_0().children(lines));
         }
     } else {
-        rows.push(div().text_xs().text_color(rgb(0x475569)).child("Activations: not available"));
+        rows.push(
+            div()
+                .text_xs()
+                .text_color(rgb(0x475569))
+                .child("Activations: not available"),
+        );
     }
     div()
         .flex()
@@ -6724,12 +6983,20 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
         .bg(rgb(0x0f172a))
         .px_3()
         .py_2()
-        .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Brain activations"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x94a3b8))
+                .child("Brain activations"),
+        )
         .children(rows)
 }
 
 fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window: &mut Window) {
-    window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1223, 0.92))));
+    window.paint_quad(fill(
+        bounds,
+        Background::from(rgba_from_hex(0x0b1223, 0.92)),
+    ));
     let origin = bounds.origin;
     let bounds_size = bounds.size;
     let width = f32::from(bounds_size.width).max(1.0);
@@ -6741,10 +7008,22 @@ fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window
     for y in 0..rows {
         for x in 0..cols {
             let idx = y as usize * layer.width + x as usize;
-            let v = layer.values.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let color = lerp_rgba(rgba_from_hex(0x1e293b, 0.95), rgba_from_hex(0x22d3ee, 0.95), v);
+            let v = layer
+                .values
+                .get(idx)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let color = lerp_rgba(
+                rgba_from_hex(0x1e293b, 0.95),
+                rgba_from_hex(0x22d3ee, 0.95),
+                v,
+            );
             let rect = Bounds::new(
-                point(px(f32::from(origin.x) + x as f32 * cell_w), px(f32::from(origin.y) + y as f32 * cell_h)),
+                point(
+                    px(f32::from(origin.x) + x as f32 * cell_w),
+                    px(f32::from(origin.y) + y as f32 * cell_h),
+                ),
                 size(px(cell_w.max(1.0)), px(cell_h.max(1.0))),
             );
             window.paint_quad(fill(rect, Background::from(color)));
@@ -6758,7 +7037,9 @@ fn paint_activation_edges(
     window: &mut Window,
 ) {
     let (cols, rows, edges) = state;
-    if cols == 0 || rows == 0 || edges.is_empty() { return; }
+    if cols == 0 || rows == 0 || edges.is_empty() {
+        return;
+    }
     let origin = bounds.origin;
     let size = bounds.size;
     let width = f32::from(size.width).max(1.0);
@@ -6780,7 +7061,11 @@ fn paint_activation_edges(
         path.move_to(point(px(x1), px(y1)));
         path.line_to(point(px(x2), px(y2)));
         if let Ok(path) = path.build() {
-            let color = if edge.weight >= 0.0 { rgba_from_hex(0x22d3ee, 0.85) } else { rgba_from_hex(0xf471b5, 0.85) };
+            let color = if edge.weight >= 0.0 {
+                rgba_from_hex(0x22d3ee, 0.85)
+            } else {
+                rgba_from_hex(0xf471b5, 0.85)
+            };
             window.paint_path(path, color);
         }
     }
@@ -6799,7 +7084,9 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
     let sensors = detail.sensors.clone();
     let radar_canvas = canvas(
         move |_, _, _| (sensors.clone(), outputs.clone()),
-        move |bounds, state, window, _| paint_brain_radar(bounds, state.0.as_slice(), state.1.as_slice(), window),
+        move |bounds, state, window, _| {
+            paint_brain_radar(bounds, state.0.as_slice(), state.1.as_slice(), window)
+        },
     )
     .w(px(180.0))
     .h(px(120.0));
@@ -6815,16 +7102,34 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .px_3()
         .py_2()
         .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Brain"))
-        .child(div().text_sm().text_color(rgb(0xcbd5f5)).child(detail.brain_descriptor.clone()))
-        .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!("dominant o{} {:.2}", best_idx, best_val)))
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(0xcbd5f5))
+                .child(detail.brain_descriptor.clone()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x94a3b8))
+                .child(format!("dominant o{} {:.2}", best_idx, best_val)),
+        )
         .child(radar_canvas)
 }
-fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &[f32], outputs: &[f32], window: &mut Window) {
+fn paint_brain_radar(
+    bounds: Bounds<Pixels>,
+    sensors: &[f32],
+    outputs: &[f32],
+    window: &mut Window,
+) {
     let origin = bounds.origin;
     let size = bounds.size;
     let width = f32::from(size.width).max(1.0);
     let height = f32::from(size.height).max(1.0);
-    window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1223, 0.92))));
+    window.paint_quad(fill(
+        bounds,
+        Background::from(rgba_from_hex(0x0b1223, 0.92)),
+    ));
     let cx = f32::from(origin.x) + width * 0.5;
     let cy = f32::from(origin.y) + height * 0.58;
     let radius = (width.min(height) * 0.42).max(24.0);
@@ -6837,14 +7142,20 @@ fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &[f32], outputs: &[f32], w
             let ang = (i as f32) / (n as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
             let x = cx + radius * ring * ang.cos();
             let y = cy + radius * ring * ang.sin();
-            if i == 0 { ring_path.move_to(point(px(x), px(y))); } else { ring_path.line_to(point(px(x), px(y))); }
+            if i == 0 {
+                ring_path.move_to(point(px(x), px(y)));
+            } else {
+                ring_path.line_to(point(px(x), px(y)));
+            }
         }
         // close polygon
         let ang0 = -std::f32::consts::FRAC_PI_2;
         let x0 = cx + radius * ring * ang0.cos();
         let y0 = cy + radius * ring * ang0.sin();
         ring_path.line_to(point(px(x0), px(y0)));
-        if let Ok(path) = ring_path.build() { window.paint_path(path, rgba_from_hex(0x1e293b, 0.9)); }
+        if let Ok(path) = ring_path.build() {
+            window.paint_path(path, rgba_from_hex(0x1e293b, 0.9));
+        }
     }
 
     // Spokes
@@ -6855,7 +7166,9 @@ fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &[f32], outputs: &[f32], w
         let mut spoke = PathBuilder::stroke(px(1.0));
         spoke.move_to(point(px(cx), px(cy)));
         spoke.line_to(point(px(x), px(y)));
-        if let Ok(path) = spoke.build() { window.paint_path(path, rgba_from_hex(0x1e293b, 0.9)); }
+        if let Ok(path) = spoke.build() {
+            window.paint_path(path, rgba_from_hex(0x1e293b, 0.9));
+        }
     }
 
     // Sensor heat ring around the radar (real sensor activations)
@@ -6872,7 +7185,9 @@ fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &[f32], outputs: &[f32], w
         let mut seg = PathBuilder::stroke(px(3.0));
         seg.move_to(point(px(x1), px(y1)));
         seg.line_to(point(px(x2), px(y2)));
-        if let Ok(path) = seg.build() { window.paint_path(path, rgba_from_hex(0xf97316, 0.85)); }
+        if let Ok(path) = seg.build() {
+            window.paint_path(path, rgba_from_hex(0xf97316, 0.85));
+        }
     }
 
     // Filled polygon of output magnitudes (clamped 0..1)
@@ -6883,9 +7198,15 @@ fn paint_brain_radar(bounds: Bounds<Pixels>, sensors: &[f32], outputs: &[f32], w
         let ang = (i as f32) / (m as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
         let x = cx + radius * val * ang.cos();
         let y = cy + radius * val * ang.sin();
-        if i == 0 { poly.move_to(point(px(x), px(y))); } else { poly.line_to(point(px(x), px(y))); }
+        if i == 0 {
+            poly.move_to(point(px(x), px(y)));
+        } else {
+            poly.line_to(point(px(x), px(y)));
+        }
     }
-    if let Ok(path) = poly.build() { window.paint_path(path, rgba_from_hex(0x22d3ee, 0.35)); }
+    if let Ok(path) = poly.build() {
+        window.paint_path(path, rgba_from_hex(0x22d3ee, 0.35));
+    }
 }
 /// Render a simple PNG snapshot of the current world without a live window.
 /// This is a coarse, deterministic rasterization intended for REST exports.
@@ -7003,27 +7324,27 @@ impl Render for SimulationView {
                 .child(self.render_canvas(&snapshot, cx))
         } else {
             div()
-            .size_full()
-            .relative()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x0f172a))
-            .text_color(rgb(0xf8fafc))
-            .p_6()
-            .gap_4()
+                .size_full()
+                .relative()
+                .flex()
+                .flex_col()
+                .bg(rgb(0x0f172a))
+                .text_color(rgb(0xf8fafc))
+                .p_6()
+                .gap_4()
                 .child(self.render_header(&snapshot, cx))
-            .child(self.render_summary(&snapshot))
-            .child(self.render_analytics_panel(&snapshot))
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .flex_1()
-                    .child(self.render_history(&snapshot))
-                    .child(self.render_canvas(&snapshot, cx))
-                    .child(self.render_inspector(&snapshot, cx)),
-            )
-            .child(self.render_footer(&snapshot))
+                .child(self.render_summary(&snapshot))
+                .child(self.render_analytics_panel(&snapshot))
+                .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .flex_1()
+                        .child(self.render_history(&snapshot))
+                        .child(self.render_canvas(&snapshot, cx))
+                        .child(self.render_inspector(&snapshot, cx)),
+                )
+                .child(self.render_footer(&snapshot))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     this.handle_key_down(event, cx);
                 }))
@@ -7075,7 +7396,9 @@ impl OutputHistory {
         }
         for (i, &v) in outputs.iter().enumerate() {
             let q = &mut self.series[i];
-            if q.len() == self.capacity { q.pop_front(); }
+            if q.len() == self.capacity {
+                q.pop_front();
+            }
             q.push_back(v);
         }
     }
@@ -7140,7 +7463,12 @@ impl SimulationView {
                 .bg(rgb(0x0f172a))
                 .px_3()
                 .py_2()
-                .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Output history"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child("Output history"),
+                )
                 .child(spark_canvas);
         }
         div()
@@ -7150,18 +7478,30 @@ impl SimulationView {
             .bg(rgb(0x0f172a))
             .px_3()
             .py_2()
-            .child(div().text_xs().text_color(rgb(0x475569)).child("Collecting output history…"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x475569))
+                    .child("Collecting output history…"),
+            )
     }
 }
 
-fn paint_output_sparklines(bounds: Bounds<Pixels>, state: &OutputSparklineState, window: &mut Window) {
+fn paint_output_sparklines(
+    bounds: Bounds<Pixels>,
+    state: &OutputSparklineState,
+    window: &mut Window,
+) {
     let origin = bounds.origin;
     let size = bounds.size;
     let width = f32::from(size.width).max(1.0);
     let height = f32::from(size.height).max(1.0);
 
     // Background
-    window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1223, 0.92))));
+    window.paint_quad(fill(
+        bounds,
+        Background::from(rgba_from_hex(0x0b1223, 0.92)),
+    ));
 
     // Compute global min/max
     let mut min_v = 0.0_f32;
@@ -7171,11 +7511,17 @@ fn paint_output_sparklines(bounds: Bounds<Pixels>, state: &OutputSparklineState,
         max_v = f32::NEG_INFINITY;
         for s in &state.series {
             for &v in s {
-                if v < min_v { min_v = v; }
-                if v > max_v { max_v = v; }
+                if v < min_v {
+                    min_v = v;
+                }
+                if v > max_v {
+                    max_v = v;
+                }
             }
         }
-        if (max_v - min_v).abs() < 1e-6 { max_v = min_v + 1.0; }
+        if (max_v - min_v).abs() < 1e-6 {
+            max_v = min_v + 1.0;
+        }
     }
 
     let colors = [
@@ -7189,15 +7535,23 @@ fn paint_output_sparklines(bounds: Bounds<Pixels>, state: &OutputSparklineState,
         let y0 = (1.0 - (-min_v / (max_v - min_v))) * height;
         let mut baseline = PathBuilder::stroke(px(1.0));
         baseline.move_to(point(px(f32::from(origin.x)), px(f32::from(origin.y) + y0)));
-        baseline.line_to(point(px(f32::from(origin.x) + width), px(f32::from(origin.y) + y0)));
+        baseline.line_to(point(
+            px(f32::from(origin.x) + width),
+            px(f32::from(origin.y) + y0),
+        ));
         if let Ok(path) = baseline.build() {
             window.paint_path(path, rgba_from_hex(0x1e293b, 0.9));
         }
     }
 
     for (si, series) in state.series.iter().enumerate() {
-        if series.len() < 2 { continue; }
-        let color = colors.get(si).copied().unwrap_or(rgba_from_hex(0x94a3b8, 0.95));
+        if series.len() < 2 {
+            continue;
+        }
+        let color = colors
+            .get(si)
+            .copied()
+            .unwrap_or(rgba_from_hex(0x94a3b8, 0.95));
         let step_x = width / (series.len() as f32 - 1.0);
         let mut path = PathBuilder::stroke(px(1.8));
         for (i, &v) in series.iter().enumerate() {
@@ -9000,11 +9354,11 @@ impl RenderFrame {
         let estimated_agents = arena.len();
         let mut agents = Vec::with_capacity(estimated_agents);
         for (idx, agent_id) in arena.iter_handles().enumerate() {
-                let runtime_entry = runtime.get(agent_id);
-                let selection = runtime_entry.map(|rt| rt.selection).unwrap_or_default();
-                let indicator = runtime_entry.map(|rt| rt.indicator).unwrap_or_default();
-                let spiked = runtime_entry.map(|rt| rt.spiked).unwrap_or(false);
-                let reproduction_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
+            let runtime_entry = runtime.get(agent_id);
+            let selection = runtime_entry.map(|rt| rt.selection).unwrap_or_default();
+            let indicator = runtime_entry.map(|rt| rt.indicator).unwrap_or_default();
+            let spiked = runtime_entry.map(|rt| rt.spiked).unwrap_or(false);
+            let reproduction_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
 
             agents.push(AgentRenderData {
                 agent_id,
@@ -9149,9 +9503,24 @@ impl HistoryChartData {
                 .collect()
         };
 
-        let agents = to_points(decimated.iter().map(|e| e.agent_count as f32 / scale_agents).collect());
-        let births = to_points(decimated.iter().map(|e| e.births as f32 / scale_births).collect());
-        let deaths = to_points(decimated.iter().map(|e| e.deaths as f32 / scale_deaths).collect());
+        let agents = to_points(
+            decimated
+                .iter()
+                .map(|e| e.agent_count as f32 / scale_agents)
+                .collect(),
+        );
+        let births = to_points(
+            decimated
+                .iter()
+                .map(|e| e.births as f32 / scale_births)
+                .collect(),
+        );
+        let deaths = to_points(
+            decimated
+                .iter()
+                .map(|e| e.deaths as f32 / scale_deaths)
+                .collect(),
+        );
 
         Some(Self {
             width,
@@ -9419,7 +9788,7 @@ struct CameraState {
     last_world_size: (f32, f32),
     last_scale: f32,
     last_base_scale: f32,
-        centered_once: bool,
+    centered_once: bool,
 }
 
 impl Default for CameraState {
@@ -9607,9 +9976,17 @@ fn paint_terrain_layer(
     const MAX_TERRAIN_QUADS_DEFAULT: usize = 140_000;
     const MAX_TERRAIN_QUADS_SAFE: usize = 40_000;
     let total_cells = width.saturating_mul(height).max(1);
-    let max_quads = if safe_mode_enabled() { MAX_TERRAIN_QUADS_SAFE } else { MAX_TERRAIN_QUADS_DEFAULT };
+    let max_quads = if safe_mode_enabled() {
+        MAX_TERRAIN_QUADS_SAFE
+    } else {
+        MAX_TERRAIN_QUADS_DEFAULT
+    };
     let stride_quads = ((total_cells as f32 / max_quads as f32).sqrt().ceil() as usize).max(1);
-    let stride_pixels = if cell_px < 1.5 { (1.5 / cell_px).ceil() as usize } else { 1 };
+    let stride_pixels = if cell_px < 1.5 {
+        (1.5 / cell_px).ceil() as usize
+    } else {
+        1
+    };
     let stride = stride_quads.max(stride_pixels).clamp(1, 64);
 
     if stride > 1 {
@@ -9618,14 +9995,21 @@ fn paint_terrain_layer(
         for y in (0..height).step_by(stride) {
             for x in (0..width).step_by(stride) {
                 let idx = y * width + x;
-                let Some(tile) = terrain.tiles.get(idx).copied() else { continue };
+                let Some(tile) = terrain.tiles.get(idx).copied() else {
+                    continue;
+                };
                 let px_x = offset_x + (x as f32 * cell_world * scale);
                 let px_y = offset_y + (y as f32 * cell_world * scale);
-                if px_x > view_right || px_y > view_bottom || px_x + block_px < view_left || px_y + block_px < view_top {
+                if px_x > view_right
+                    || px_y > view_bottom
+                    || px_x + block_px < view_left
+                    || px_y + block_px < view_top
+                {
                     continue;
                 }
                 let surface = terrain_surface_color(tile, daylight, palette);
-                let bounds = Bounds::new(point(px(px_x), px(px_y)), size(px(block_px), px(block_px)));
+                let bounds =
+                    Bounds::new(point(px(px_x), px(px_y)), size(px(block_px), px(block_px)));
                 window.paint_quad(fill(bounds, Background::from(surface)));
             }
         }
@@ -9642,7 +10026,11 @@ fn paint_terrain_layer(
 
             let px_x = offset_x + (x as f32 * cell_world * scale);
             let px_y = offset_y + (y as f32 * cell_world * scale);
-            if px_x > view_right || px_y > view_bottom || px_x + cell_px < view_left || px_y + cell_px < view_top {
+            if px_x > view_right
+                || px_y > view_bottom
+                || px_x + cell_px < view_left
+                || px_y + cell_px < view_top
+            {
                 continue;
             }
 
@@ -10013,7 +10401,11 @@ fn apply_post_processing(
                 if strength > 0.01 {
                     let alpha = (0.22 + (1.0 - daylight) * 0.14) * strength;
                     let edge_base = rgba_from_hex(0x01040c, alpha.clamp(0.05, 0.55));
-                    let edge_color = if matches!(palette, ColorPaletteMode::Natural) { edge_base } else { apply_palette(edge_base, palette) };
+                    let edge_color = if matches!(palette, ColorPaletteMode::Natural) {
+                        edge_base
+                    } else {
+                        apply_palette(edge_base, palette)
+                    };
                     let top_bounds = Bounds::new(
                         point(px(origin_x), px(origin_y)),
                         size(px(width_px), px(height_px * 0.18)),
@@ -10027,7 +10419,11 @@ fn apply_post_processing(
 
                     let side_alpha = (alpha * 0.8).clamp(0.04, 0.45);
                     let side_base = rgba_from_hex(0x020816, side_alpha);
-                    let side_color = if matches!(palette, ColorPaletteMode::Natural) { side_base } else { apply_palette(side_base, palette) };
+                    let side_color = if matches!(palette, ColorPaletteMode::Natural) {
+                        side_base
+                    } else {
+                        apply_palette(side_base, palette)
+                    };
                     let side_width = width_px * 0.08;
                     let left_bounds = Bounds::new(
                         point(px(origin_x), px(origin_y)),
@@ -10057,7 +10453,11 @@ fn apply_post_processing(
                         rgba_from_hex(0x22c55e, 0.10 * strength),
                         daylight.clamp(0.0, 1.0),
                     );
-                    let bloom_color = if matches!(palette, ColorPaletteMode::Natural) { bloom_base } else { apply_palette(bloom_base, palette) };
+                    let bloom_color = if matches!(palette, ColorPaletteMode::Natural) {
+                        bloom_base
+                    } else {
+                        apply_palette(bloom_base, palette)
+                    };
                     window.paint_quad(fill(bloom_bounds, Background::from(bloom_color)));
                 }
             }
@@ -10070,7 +10470,11 @@ fn apply_post_processing(
                         let scanline_bounds =
                             Bounds::new(point(px(origin_x), px(y)), size(px(width_px), px(1.0)));
                         let scan_base = rgba_from_hex(0x020816, alpha);
-                        let scan_color = if matches!(palette, ColorPaletteMode::Natural) { scan_base } else { apply_palette(scan_base, palette) };
+                        let scan_color = if matches!(palette, ColorPaletteMode::Natural) {
+                            scan_base
+                        } else {
+                            apply_palette(scan_base, palette)
+                        };
                         window.paint_quad(fill(scanline_bounds, Background::from(scan_color)));
                         y += spacing_px;
                     }
@@ -10113,7 +10517,11 @@ fn paint_film_grain(
             }
             let base_hex = if noise > 0.6 { 0xffffff } else { 0x0f172a };
             let base = rgba_from_hex(base_hex, alpha.clamp(0.01, 0.12));
-            let color = if matches!(palette, ColorPaletteMode::Natural) { base } else { apply_palette(base, palette) };
+            let color = if matches!(palette, ColorPaletteMode::Natural) {
+                base
+            } else {
+                apply_palette(base, palette)
+            };
             let x = f32::from(origin.x) + col as f32 * cell_w;
             let y = f32::from(origin.y) + row as f32 * cell_h;
             let cell_bounds = Bounds::new(point(px(x), px(y)), size(px(cell_w), px(cell_h)));
@@ -10153,7 +10561,11 @@ fn paint_debug_overlays(
     let mut sense_path: Option<PathBuilder> = None;
     let mut vel_shaft_path: Option<PathBuilder> = None;
     let mut vel_head_path: Option<PathBuilder> = None;
-    let mut crosshair_path = if focus_agent.is_some() { Some(PathBuilder::stroke(px(1.6))) } else { None };
+    let mut crosshair_path = if focus_agent.is_some() {
+        Some(PathBuilder::stroke(px(1.6)))
+    } else {
+        None
+    };
 
     // If nothing is requested, return early
     if !wants_sense && !wants_velocity && crosshair_path.is_none() {
@@ -10170,14 +10582,23 @@ fn paint_debug_overlays(
         let px_y = offset_y + agent.position.y * scale;
 
         // Cull debug overlays off-screen (with a small margin)
-        if px_x < view_left - 64.0 || px_x > view_right + 64.0 || px_y < view_top - 64.0 || px_y > view_bottom + 64.0 {
+        if px_x < view_left - 64.0
+            || px_x > view_right + 64.0
+            || px_y < view_top - 64.0
+            || px_y > view_bottom + 64.0
+        {
             continue;
         }
 
         if wants_sense
-            && matches!(agent.selection, SelectionState::Selected | SelectionState::Hovered)
+            && matches!(
+                agent.selection,
+                SelectionState::Selected | SelectionState::Hovered
+            )
         {
-            if sense_path.is_none() { sense_path = Some(PathBuilder::stroke(px(1.4))); }
+            if sense_path.is_none() {
+                sense_path = Some(PathBuilder::stroke(px(1.4)));
+            }
             let builder = sense_path.as_mut().expect("sense_path just created");
             let radius_px = (frame.sense_radius * scale).max(4.0);
             append_arc_polyline(builder, px_x, px_y, radius_px, 0.0, 360.0);
@@ -10198,8 +10619,12 @@ fn paint_debug_overlays(
                 let tip_x = px_x + norm_x * arrow_length;
                 let tip_y = px_y + norm_y * arrow_length;
 
-                if vel_shaft_path.is_none() { vel_shaft_path = Some(PathBuilder::stroke(px(1.6))); }
-                let builder = vel_shaft_path.as_mut().expect("vel_shaft_path just created");
+                if vel_shaft_path.is_none() {
+                    vel_shaft_path = Some(PathBuilder::stroke(px(1.6)));
+                }
+                let builder = vel_shaft_path
+                    .as_mut()
+                    .expect("vel_shaft_path just created");
                 builder.move_to(point(px(px_x), px(px_y)));
                 builder.line_to(point(px(tip_x), px(tip_y)));
 
@@ -10217,7 +10642,9 @@ fn paint_debug_overlays(
                 let right_x = tip_x - back * norm_x - side * perp_x;
                 let right_y = tip_y - back * norm_y - side * perp_y;
 
-                if vel_head_path.is_none() { vel_head_path = Some(PathBuilder::stroke(px(1.2))); }
+                if vel_head_path.is_none() {
+                    vel_head_path = Some(PathBuilder::stroke(px(1.2)));
+                }
                 let builder = vel_head_path.as_mut().expect("vel_head_path just created");
                 builder.move_to(point(px(tip_x), px(tip_y)));
                 builder.line_to(point(px(left_x), px(left_y)));
@@ -10229,11 +10656,11 @@ fn paint_debug_overlays(
         if Some(agent.agent_id) == focus_agent
             && let Some(builder) = crosshair_path.as_mut()
         {
-                let cross = (frame.agent_base_radius * scale).max(6.0);
-                builder.move_to(point(px(px_x - cross), px(px_y)));
-                builder.line_to(point(px(px_x + cross), px(px_y)));
-                builder.move_to(point(px(px_x), px(px_y - cross)));
-                builder.line_to(point(px(px_x), px(px_y + cross)));
+            let cross = (frame.agent_base_radius * scale).max(6.0);
+            builder.move_to(point(px(px_x - cross), px(px_y)));
+            builder.line_to(point(px(px_x + cross), px(px_y)));
+            builder.move_to(point(px(px_x), px(px_y - cross)));
+            builder.line_to(point(px(px_x), px(px_y + cross)));
         }
     }
 
@@ -10297,16 +10724,23 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     // Offscreen guard: if the world render rect lies completely outside the canvas,
     // recenter on world midpoint to avoid a blank view after extreme panning.
-    let (mut offset_x, mut offset_y) = (origin_x + pad_x + camera_guard.offset_px.0,
-                                        origin_y + pad_y + camera_guard.offset_px.1);
+    let (mut offset_x, mut offset_y) = (
+        origin_x + pad_x + camera_guard.offset_px.0,
+        origin_y + pad_y + camera_guard.offset_px.1,
+    );
     let mut render_left = offset_x;
     let mut render_top = offset_y;
     let mut render_right = offset_x + render_w;
     let mut render_bottom = offset_y + render_h;
-    let fully_offscreen =
-        render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
+    let fully_offscreen = render_right < view_left
+        || render_left > view_right
+        || render_bottom < view_top
+        || render_top > view_bottom;
     if fully_offscreen {
-        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
+        let world_center = Position {
+            x: frame.world_size.0 * 0.5,
+            y: frame.world_size.1 * 0.5,
+        };
         camera_guard.center_on(world_center);
         // Recompute offsets with updated camera state
         offset_x = origin_x + pad_x + camera_guard.offset_px.0;
@@ -10322,7 +10756,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     );
     // On the first GUI paint, ensure the map is centered and fully visible.
     if !camera_guard.centered_once {
-        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
+        let world_center = Position {
+            x: frame.world_size.0 * 0.5,
+            y: frame.world_size.1 * 0.5,
+        };
         camera_guard.center_on(world_center);
         camera_guard.centered_once = true;
         // Recompute offsets after forcing center once
@@ -10335,13 +10772,15 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     }
     // Second-chance offscreen guard: now that render metrics are recorded, a
     // recenter can compute correct offsets on the very first frame.
-    let fully_offscreen_after_metrics =
-        (offset_x + render_w) < view_left
-            || offset_x > view_right
-            || (offset_y + render_h) < view_top
-            || offset_y > view_bottom;
+    let fully_offscreen_after_metrics = (offset_x + render_w) < view_left
+        || offset_x > view_right
+        || (offset_y + render_h) < view_top
+        || offset_y > view_bottom;
     if fully_offscreen_after_metrics {
-        let world_center = Position { x: frame.world_size.0 * 0.5, y: frame.world_size.1 * 0.5 };
+        let world_center = Position {
+            x: frame.world_size.0 * 0.5,
+            y: frame.world_size.1 * 0.5,
+        };
         camera_guard.center_on(world_center);
         // Offsets will be recomputed after any follow-target recentering below
     }
@@ -10364,8 +10803,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     // (observed on some Windows setups on first frame), draw this frame using a
     // deterministic centered offset so content is visible. This does not mutate
     // camera state; subsequent frames will use the camera's offsets.
-    let still_offscreen =
-        render_right < view_left || render_left > view_right || render_bottom < view_top || render_top > view_bottom;
+    let still_offscreen = render_right < view_left
+        || render_left > view_right
+        || render_bottom < view_top
+        || render_top > view_bottom;
     if still_offscreen {
         offset_x = origin_x + (width_px - render_w) * 0.5;
         offset_y = origin_y + (height_px - render_h) * 0.5;
@@ -10379,10 +10820,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     if safe_mode_enabled() {
         // Conservative background fill (bypass gradient blending that could expose format issues)
-        window.paint_quad(fill(
-            bounds,
-            Background::from(rgba_from_hex(0x0b1120, 1.0)),
-        ));
+        window.paint_quad(fill(bounds, Background::from(rgba_from_hex(0x0b1120, 1.0))));
     } else {
         let sky_base = lerp_rgba(
             rgba_from_hex(0x050b16, 1.0),
@@ -10391,21 +10829,26 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         );
         window.paint_quad(fill(
             bounds,
-            Background::from(if palette_is_natural { sky_base } else { apply_palette(sky_base, frame.palette) }),
+            Background::from(if palette_is_natural {
+                sky_base
+            } else {
+                apply_palette(sky_base, frame.palette)
+            }),
         ));
     }
 
     let horizon_height = height_px * 0.35;
     if !safe_mode_enabled() && horizon_height > 1.0 {
         let horizon_bounds = Bounds::new(
-            point(
-                px(origin_x),
-                px(origin_y + height_px - horizon_height),
-            ),
+            point(px(origin_x), px(origin_y + height_px - horizon_height)),
             size(px(width_px), px(horizon_height)),
         );
         let horizon_base = rgba_from_hex(0xffa94d, (0.12 + 0.25 * daylight).clamp(0.0, 0.3));
-        let horizon_color = if palette_is_natural { horizon_base } else { apply_palette(horizon_base, frame.palette) };
+        let horizon_color = if palette_is_natural {
+            horizon_base
+        } else {
+            apply_palette(horizon_base, frame.palette)
+        };
         window.paint_quad(fill(horizon_bounds, Background::from(horizon_color)));
     }
 
@@ -10416,7 +10859,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             size(px(width_px), px(height_px * 0.25)),
         );
         let aurora_base = rgba_from_hex(0x2fd3ff, 0.18 * aurora_strength);
-        let aurora_color = if palette_is_natural { aurora_base } else { apply_palette(aurora_base, frame.palette) };
+        let aurora_color = if palette_is_natural {
+            aurora_base
+        } else {
+            apply_palette(aurora_base, frame.palette)
+        };
         window.paint_quad(fill(aurora_bounds, Background::from(aurora_color)));
     }
 
@@ -10438,13 +10885,21 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let cell_world = frame.food_cell_size as f32;
     let _cell_px = (cell_world * scale).max(1.0);
     let max_food = frame.food_max.max(f32::EPSILON);
-    let inv_max_food: f32 = if max_food > 0.0 { 1.0_f32 / max_food } else { 0.0_f32 };
+    let inv_max_food: f32 = if max_food > 0.0 {
+        1.0_f32 / max_food
+    } else {
+        0.0_f32
+    };
 
     if controls.draw_food {
         // Compute visible cell range to cull off-screen food cells
         let cell_world = frame.food_cell_size as f32;
         let cell_px = (cell_world * scale).max(1.0);
-        let inv_cell_px = if cell_px > f32::EPSILON { 1.0 / cell_px } else { 0.0 };
+        let inv_cell_px = if cell_px > f32::EPSILON {
+            1.0 / cell_px
+        } else {
+            0.0
+        };
         let mut x_min = ((view_left - offset_x) * inv_cell_px).floor() as isize;
         let mut x_max = ((view_right - offset_x) * inv_cell_px).ceil() as isize;
         let mut y_min = ((view_top - offset_y) * inv_cell_px).floor() as isize;
@@ -10459,12 +10914,30 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             const FOOD_BINS: usize = 24;
             for y in y_min as usize..=y_max as usize {
                 let mut builders: [Option<PathBuilder>; FOOD_BINS] = [
-                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
+                    Some(PathBuilder::fill()),
                 ];
                 let mut colors: [Option<Rgba>; FOOD_BINS] = [None; FOOD_BINS];
                 for x in x_min as usize..=x_max as usize {
@@ -10475,16 +10948,23 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     }
                     let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
                     let mut color = food_color(intensity);
-                    let shade_wave = ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
+                    let shade_wave =
+                        ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
                     let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
                     color = scale_rgb(color, shade);
-                    if !palette_is_natural { color = apply_palette(color, frame.palette); }
+                    if !palette_is_natural {
+                        color = apply_palette(color, frame.palette);
+                    }
 
                     // Quantize based on luminance to group similar colors
                     let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-                    let mut bin = ((luma * (FOOD_BINS as f32)) as isize).clamp(0, (FOOD_BINS as isize) - 1) as usize;
+                    let mut bin = ((luma * (FOOD_BINS as f32)) as isize)
+                        .clamp(0, (FOOD_BINS as isize) - 1)
+                        as usize;
                     // Avoid bin 0 swallowing very dark but present cells when alpha is tiny
-                    if bin == 0 && luma > 0.0 { bin = 1; }
+                    if bin == 0 && luma > 0.0 {
+                        bin = 1;
+                    }
 
                     let px_x = offset_x + (x as f32 * cell_world * scale);
                     let px_y = offset_y + (y as f32 * cell_world * scale);
@@ -10526,7 +11006,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         ((x as f32 * 0.35 + y as f32 * 0.27) + day_phase).sin() * 0.5 + 0.5;
                     let shade = (0.75 + 0.35 * shade_wave).clamp(0.0, 1.3);
                     color = scale_rgb(color, shade);
-                    if !palette_is_natural { color = apply_palette(color, frame.palette); }
+                    if !palette_is_natural {
+                        color = apply_palette(color, frame.palette);
+                    }
                     let px_x = offset_x + (x as f32 * cell_world * scale);
                     let px_y = offset_y + (y as f32 * cell_world * scale);
                     let cell_bounds =
@@ -10542,12 +11024,30 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             // Quantized batching for agent body quads to reduce draw calls under heavy load
             const AGENT_BINS: usize = 24;
             let mut builders: [Option<PathBuilder>; AGENT_BINS] = [
-                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
-                Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()), Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
+                Some(PathBuilder::fill()),
             ];
             let mut colors: [Option<Rgba>; AGENT_BINS] = [None; AGENT_BINS];
 
@@ -10559,18 +11059,27 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 let half = size_px * 0.5;
 
                 // Cull off-screen agents
-                if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
+                if px_x + half < view_left
+                    || px_x - half > view_right
+                    || px_y + half < view_top
+                    || px_y - half > view_bottom
+                {
                     continue;
                 }
 
                 // Body color (approximate binning by luminance)
                 let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
                 let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-            let mut color = agent_color(agent, agent_shade);
-            if !palette_is_natural { color = apply_palette(color, frame.palette); }
+                let mut color = agent_color(agent, agent_shade);
+                if !palette_is_natural {
+                    color = apply_palette(color, frame.palette);
+                }
                 let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-                let mut bin = ((luma * (AGENT_BINS as f32)) as isize).clamp(0, (AGENT_BINS as isize) - 1) as usize;
-                if bin == 0 && luma > 0.0 { bin = 1; }
+                let mut bin = ((luma * (AGENT_BINS as f32)) as isize)
+                    .clamp(0, (AGENT_BINS as isize) - 1) as usize;
+                if bin == 0 && luma > 0.0 {
+                    bin = 1;
+                }
 
                 // Append rectangle for agent body
                 if let Some(builder) = builders[bin].as_mut() {
@@ -10606,7 +11115,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 let half = size_px * 0.5;
 
                 // Cull off-screen agents
-                if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
+                if px_x + half < view_left
+                    || px_x - half > view_right
+                    || px_y + half < view_top
+                    || px_y - half > view_bottom
+                {
                     continue;
                 }
                 // Inline highlights without allocating
@@ -10615,7 +11128,12 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         SelectionState::Selected => {
                             let factor = 1.8;
                             let highlight = apply_palette(
-                                Rgba { r: 0.20, g: 0.65, b: 0.96, a: 0.35 },
+                                Rgba {
+                                    r: 0.20,
+                                    g: 0.65,
+                                    b: 0.96,
+                                    a: 0.35,
+                                },
                                 frame.palette,
                             );
                             let highlight_size = size_px * factor;
@@ -10629,7 +11147,12 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         SelectionState::Hovered => {
                             let factor = 1.4;
                             let highlight = apply_palette(
-                                Rgba { r: 0.92, g: 0.58, b: 0.20, a: 0.30 },
+                                Rgba {
+                                    r: 0.92,
+                                    g: 0.58,
+                                    b: 0.20,
+                                    a: 0.30,
+                                },
                                 frame.palette,
                             );
                             let highlight_size = size_px * factor;
@@ -10646,7 +11169,12 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     if focus_agent == Some(agent.agent_id) {
                         let factor = 2.05;
                         let highlight = apply_palette(
-                            Rgba { r: 0.45, g: 0.88, b: 0.97, a: 0.32 },
+                            Rgba {
+                                r: 0.45,
+                                g: 0.88,
+                                b: 0.97,
+                                a: 0.32,
+                            },
                             frame.palette,
                         );
                         let highlight_size = size_px * factor;
@@ -10722,7 +11250,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
                 let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
                 let mut color = agent_color(agent, agent_shade);
-                if !palette_is_natural { color = apply_palette(color, frame.palette); }
+                if !palette_is_natural {
+                    color = apply_palette(color, frame.palette);
+                }
                 window.paint_quad(fill(agent_bounds, Background::from(color)));
             }
         }
@@ -10750,7 +11280,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
                 let size_px = (dynamic_radius * scale).max(2.0);
                 let half = size_px * 0.5;
-                if px_x + half < view_left || px_x - half > view_right || px_y + half < view_top || px_y - half > view_bottom {
+                if px_x + half < view_left
+                    || px_x - half > view_right
+                    || px_y + half < view_top
+                    || px_y - half > view_bottom
+                {
                     continue;
                 }
 
@@ -10780,7 +11314,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             point(px(origin_x + 6.0), px(origin_y + 6.0)),
             size(px(6.0), px(6.0)),
         );
-        window.paint_quad(fill(mark_bounds, Background::from(rgba_from_hex(0xff00aa, 1.0))));
+        window.paint_quad(fill(
+            mark_bounds,
+            Background::from(rgba_from_hex(0xff00aa, 1.0)),
+        ));
     }
 }
 

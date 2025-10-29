@@ -11,7 +11,10 @@ use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use scriptbots_brain::{Brain, BrainKind, into_runner};
-use scriptbots_core::{BrainRunner, BrainActivations, ActivationLayer, NeuroflowActivationKind, NeuroflowSettings, WorldState};
+use scriptbots_core::{
+    ActivationLayer, BrainActivations, BrainRunner, NeuroflowActivationKind, NeuroflowSettings,
+    WorldState,
+};
 use std::sync::Arc;
 
 /// Number of inputs inherited from the simulation sensors.
@@ -238,10 +241,22 @@ impl Brain for NeuroflowBrain {
         let layers = value.get("layers")?.as_array()?.to_vec();
         let mut result_layers: Vec<ActivationLayer> = Vec::new();
         for (li, layer_val) in layers.iter().enumerate() {
-            let y = layer_val.get("y").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let values: Vec<f32> = y.into_iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
+            let y = layer_val
+                .get("y")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let values: Vec<f32> = y
+                .into_iter()
+                .filter_map(|v| v.as_f64())
+                .map(|v| v as f32)
+                .collect();
             let width = (values.len() as f32).sqrt().ceil() as usize;
-            let height = if width == 0 { 0 } else { values.len().div_ceil(width) };
+            let height = if width == 0 {
+                0
+            } else {
+                values.len().div_ceil(width)
+            };
             result_layers.push(ActivationLayer {
                 name: format!("nf.layer.{li}"),
                 width,
@@ -249,7 +264,10 @@ impl Brain for NeuroflowBrain {
                 values,
             });
         }
-        Some(BrainActivations { layers: result_layers, connections: Vec::new() })
+        Some(BrainActivations {
+            layers: result_layers,
+            connections: Vec::new(),
+        })
     }
 }
 
