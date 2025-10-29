@@ -55,18 +55,16 @@ impl ApplicationHandler for ClearApp {
         let window: &'static Window = Box::leak(window_box);
 
         let surface = self.instance.create_surface(window).expect("surface");
-        let adapter = pollster::block_on(self.instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
+        let adapter =
+            pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            },
-        ))
-        .expect("adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor::default(),
-        ))
-        .expect("device");
+            }))
+            .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("device");
 
         let size = window.inner_size();
         let format = surface
@@ -104,9 +102,11 @@ impl ApplicationHandler for ClearApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(new_size) => {
-                if let (Some(surface), Some(device), Some(cfg)) =
-                    (self.surface.as_ref(), self.device.as_ref(), self.config.as_mut())
-                {
+                if let (Some(surface), Some(device), Some(cfg)) = (
+                    self.surface.as_ref(),
+                    self.device.as_ref(),
+                    self.config.as_mut(),
+                ) {
                     cfg.width = new_size.width.max(1);
                     cfg.height = new_size.height.max(1);
                     surface.configure(device, cfg);
@@ -135,9 +135,10 @@ impl ApplicationHandler for ClearApp {
                     let view = frame
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
-                    let mut encoder = device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor { label: Some("clear") },
-                    );
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("clear"),
+                        });
                     {
                         let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("clear.pass"),
@@ -180,5 +181,3 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     let _ = event_loop.run_app(&mut app);
 }
-
-

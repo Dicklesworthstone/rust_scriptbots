@@ -202,23 +202,72 @@ pub mod world_compositor {
         }
     }
 
-    fn readback_stats(view: &ReadbackView) -> (u64, usize) {
+    #[derive(Clone, Copy, Debug)]
+    struct ReadbackDigest {
+        width: u32,
+        height: u32,
+        stride: u32,
+        checksum: u64,
+        non_zero: usize,
+        populated_bytes: usize,
+        min_byte: u8,
+        max_byte: u8,
+        sample_rgba: [u8; 4],
+    }
+
+    fn readback_stats(view: &ReadbackView) -> ReadbackDigest {
         let stride = view.bytes_per_row as usize;
         let row_bytes = (view.width as usize) * 4;
         let src = view.bytes();
         let mut checksum = 0u64;
         let mut non_zero = 0usize;
+        let mut min_byte = u8::MAX;
+        let mut max_byte = u8::MIN;
+        let mut populated = 0usize;
         for y in 0..(view.height as usize) {
             let start = y * stride;
             let end = start.saturating_add(row_bytes).min(src.len());
-            for &byte in &src[start..end] {
+            let row = &src[start..end];
+            populated = populated.saturating_add(row.len());
+            for &byte in row {
                 checksum = checksum.wrapping_add(u64::from(byte));
                 if byte != 0 {
                     non_zero += 1;
                 }
+                if byte < min_byte {
+                    min_byte = byte;
+                }
+                if byte > max_byte {
+                    max_byte = byte;
+                }
             }
         }
-        (checksum, non_zero)
+        if populated == 0 {
+            min_byte = 0;
+            max_byte = 0;
+        }
+        let mut sample = [0u8; 4];
+        if view.width > 0 && view.height > 0 {
+            let sample_x = (view.width / 2) as usize;
+            let sample_y = (view.height / 2) as usize;
+            let offset = sample_y
+                .saturating_mul(stride)
+                .saturating_add(sample_x.saturating_mul(4));
+            if offset + 4 <= src.len() {
+                sample.copy_from_slice(&src[offset..offset + 4]);
+            }
+        }
+        ReadbackDigest {
+            width: view.width,
+            height: view.height,
+            stride: view.bytes_per_row,
+            checksum,
+            non_zero,
+            populated_bytes: populated,
+            min_byte,
+            max_byte,
+            sample_rgba: sample,
+        }
     }
 
     pub struct Compositor {
@@ -385,7 +434,7 @@ pub mod world_compositor {
                 }
             }
             if let Some(view) = view_opt {
-                self.save_view_if_requested(&view);
+                let digest = readback_stats(&view);
                 // Lazy-initialize image with known dimensions; avoid stale size from previous runs
                 if self.image.is_none() {
                     self.image = Some(GpuiImage::new(
@@ -397,24 +446,40 @@ pub mod world_compositor {
                     img.ensure((view.width, view.height), view.bytes_per_row);
                     img.upload_from_readback(&view);
                 }
+                self.save_view_if_requested(&view, &digest);
                 if env_flag("SB_WGPU_READBACK_CHECKSUM") {
-                    let (checksum, non_zero) = readback_stats(&view);
                     tracing::info!(
-                        width = view.width,
-                        height = view.height,
-                        stride = view.bytes_per_row,
-                        checksum,
-                        checksum_hex = format!("{checksum:016x}"),
-                        non_zero_bytes = non_zero,
+                        width = digest.width,
+                        height = digest.height,
+                        stride = digest.stride,
+                        checksum = digest.checksum,
+                        checksum_hex = format!("{:016x}", digest.checksum),
+                        non_zero_bytes = digest.non_zero,
+                        populated_bytes = digest.populated_bytes,
+                        min_byte = digest.min_byte,
+                        max_byte = digest.max_byte,
+                        sample_r = digest.sample_rgba[0],
+                        sample_g = digest.sample_rgba[1],
+                        sample_b = digest.sample_rgba[2],
+                        sample_a = digest.sample_rgba[3],
                         "wgpu readback checksum"
                     );
                 }
                 self.last_submit = Some(std::time::Instant::now());
                 if env_flag("SB_WGPU_LOG_VIS") {
                     tracing::info!(
-                        width = view.width,
-                        height = view.height,
-                        stride = view.bytes_per_row,
+                        width = digest.width,
+                        height = digest.height,
+                        stride = digest.stride,
+                        checksum = digest.checksum,
+                        non_zero_bytes = digest.non_zero,
+                        populated_bytes = digest.populated_bytes,
+                        min_byte = digest.min_byte,
+                        max_byte = digest.max_byte,
+                        sample_r = digest.sample_rgba[0],
+                        sample_g = digest.sample_rgba[1],
+                        sample_b = digest.sample_rgba[2],
+                        sample_a = digest.sample_rgba[3],
                         "wgpu readback mapped"
                     );
                 }
@@ -443,7 +508,7 @@ pub mod world_compositor {
             }
         }
 
-        fn save_view_if_requested(&mut self, view: &ReadbackView) {
+        fn save_view_if_requested(&mut self, view: &ReadbackView, digest: &ReadbackDigest) {
             if !self.save_enabled && !(self.force_first_capture && self.save_counter == 0) {
                 return;
             }
@@ -484,9 +549,47 @@ pub mod world_compositor {
                 image::ColorType::Rgba8,
                 image::ImageFormat::Png,
             );
-            if env_flag("SB_WGPU_READBACK_CHECKSUM") {
-                tracing::info!(?path, width, height, "wgpu readback frame saved");
+            let meta_path = path.with_extension("txt");
+            let checksum_hex = format!("{:016x}", digest.checksum);
+            let meta = format!(
+                "width={}\nheight={}\nstride={}\npopulated_bytes={}\nnonzero_bytes={}\nchecksum_decimal={}\nchecksum_hex={}\nmin_byte={}\nmax_byte={}\nsample_rgba={:?}\n",
+                digest.width,
+                digest.height,
+                digest.stride,
+                digest.populated_bytes,
+                digest.non_zero,
+                digest.checksum,
+                checksum_hex,
+                digest.min_byte,
+                digest.max_byte,
+                digest.sample_rgba
+            );
+            if let Err(err) = std::fs::write(&meta_path, meta) {
+                warn!(
+                    target = "scriptbots::render::wgpu",
+                    path = %meta_path.display(),
+                    "failed to write readback metadata: {err:?}"
+                );
             }
+            info!(
+                target = "scriptbots::render::wgpu",
+                path = %path.display(),
+                meta = %meta_path.display(),
+                width = digest.width,
+                height = digest.height,
+                stride = digest.stride,
+                populated_bytes = digest.populated_bytes,
+                non_zero_bytes = digest.non_zero,
+                checksum = digest.checksum,
+                checksum_hex,
+                min_byte = digest.min_byte,
+                max_byte = digest.max_byte,
+                sample_r = digest.sample_rgba[0],
+                sample_g = digest.sample_rgba[1],
+                sample_b = digest.sample_rgba[2],
+                sample_a = digest.sample_rgba[3],
+                "wgpu readback frame saved"
+            );
             // Only force one capture
             self.force_first_capture = false;
         }

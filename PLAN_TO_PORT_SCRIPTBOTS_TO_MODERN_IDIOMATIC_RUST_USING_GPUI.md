@@ -406,6 +406,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
   - [Completed - GPT-5 Codex 2025-10-22: Performance diagnostics panel (frame time/fps tracking, live stats overlay); follow-up: wire GPU backend counters once exposed.]
   - [Completed - GPT-5 Codex 2025-10-22: Terrain/lighting polish (dynamic sky palette, food tile shading, reproduction/spike VFX); follow-up: hook palettes to configurable themes.]
   - [Completed - GPT-5 Codex 2025-10-22: Input rebinding & accessibility (keyboard remaps, colorblind-safe palettes, narration hooks); follow-up: stream narration events into audio/log subsystem.]
+  - [Currently In Progress - 2025-10-29 ChartreuseSnow & PurpleHill: Instrument GPUI compositor readback/diff pipeline to diagnose blank viewport regression.]
 
 ## Migration Roadmap
 1. **Project Bootstrap (Week 1)**

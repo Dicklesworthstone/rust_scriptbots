@@ -64,14 +64,16 @@ impl ApplicationHandler for TriangleApp {
         let window: &'static Window = Box::leak(window_box);
 
         let surface = self.instance.create_surface(window).expect("surface");
-        let adapter = pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .expect("adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .expect("device");
+        let adapter =
+            pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            }))
+            .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("device");
 
         let size = window.inner_size();
         let format = surface
@@ -142,7 +144,10 @@ fn fs() -> @location(0) vec4<f32> {
         let time_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("time.bg"),
             layout: &layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: time_buf.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: time_buf.as_entire_binding(),
+            }],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -163,7 +168,11 @@ fn fs() -> @location(0) vec4<f32> {
                 module: &shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -184,20 +193,35 @@ fn fs() -> @location(0) vec4<f32> {
         self.pipeline = Some(pipeline);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(new_size) => {
-                if let (Some(surface), Some(device), Some(cfg)) =
-                    (self.surface.as_ref(), self.device.as_ref(), self.config.as_mut())
-                {
+                if let (Some(surface), Some(device), Some(cfg)) = (
+                    self.surface.as_ref(),
+                    self.device.as_ref(),
+                    self.config.as_mut(),
+                ) {
                     cfg.width = new_size.width.max(1);
                     cfg.height = new_size.height.max(1);
                     surface.configure(device, cfg);
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let (Some(surface), Some(device), Some(queue), Some(cfg), Some(time_buf), Some(time_bg), Some(pipeline)) = (
+                if let (
+                    Some(surface),
+                    Some(device),
+                    Some(queue),
+                    Some(cfg),
+                    Some(time_buf),
+                    Some(time_bg),
+                    Some(pipeline),
+                ) = (
                     self.surface.as_ref(),
                     self.device.as_ref(),
                     self.queue.as_ref(),
@@ -224,7 +248,10 @@ fn fs() -> @location(0) vec4<f32> {
                     let view = frame
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
-                    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("triangle") });
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("triangle"),
+                        });
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("triangle.pass"),
@@ -233,7 +260,12 @@ fn fs() -> @location(0) vec4<f32> {
                                 depth_slice: None,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.06, g: 0.08, b: 0.12, a: 1.0 }),
+                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: 0.06,
+                                        g: 0.08,
+                                        b: 0.12,
+                                        a: 1.0,
+                                    }),
                                     store: wgpu::StoreOp::Store,
                                 },
                             })],
@@ -265,4 +297,3 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     let _ = event_loop.run_app(&mut app);
 }
-
