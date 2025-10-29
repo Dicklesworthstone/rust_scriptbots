@@ -10831,14 +10831,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         origin_x + pad_x + camera_guard.offset_px.0,
         origin_y + pad_y + camera_guard.offset_px.1,
     );
-    let mut render_left = offset_x;
-    let mut render_top = offset_y;
-    let mut render_right = offset_x + render_w;
-    let mut render_bottom = offset_y + render_h;
-    let fully_offscreen = render_right < view_left
-        || render_left > view_right
-        || render_bottom < view_top
-        || render_top > view_bottom;
+    let fully_offscreen = (offset_x + render_w) < view_left
+        || offset_x > view_right
+        || (offset_y + render_h) < view_top
+        || offset_y > view_bottom;
     if fully_offscreen {
         let world_center = Position {
             x: frame.world_size.0 * 0.5,
@@ -10868,24 +10864,17 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         // Recompute offsets after forcing center once
         offset_x = origin_x + pad_x + camera_guard.offset_px.0;
         offset_y = origin_y + pad_y + camera_guard.offset_px.1;
-        render_left = offset_x;
-        render_top = offset_y;
-        render_right = offset_x + render_w;
-        render_bottom = offset_y + render_h;
-    }
-    // Second-chance offscreen guard: now that render metrics are recorded, a
-    // recenter can compute correct offsets on the very first frame.
-    let fully_offscreen_after_metrics = (offset_x + render_w) < view_left
-        || offset_x > view_right
-        || (offset_y + render_h) < view_top
-        || offset_y > view_bottom;
-    if fully_offscreen_after_metrics {
-        let world_center = Position {
-            x: frame.world_size.0 * 0.5,
-            y: frame.world_size.1 * 0.5,
-        };
-        camera_guard.center_on(world_center);
-        // Offsets will be recomputed after any follow-target recentering below
+        let fully_offscreen_after_center = (offset_x + render_w) < view_left
+            || offset_x > view_right
+            || (offset_y + render_h) < view_top
+            || offset_y > view_bottom;
+        if fully_offscreen_after_center {
+            let world_center = Position {
+                x: frame.world_size.0 * 0.5,
+                y: frame.world_size.1 * 0.5,
+            };
+            camera_guard.center_on(world_center);
+        }
     }
 
     if controls.follow_mode != FollowMode::Off
@@ -10896,20 +10885,15 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     // Follow target may change camera offset; recompute offsets if it did
     offset_x = origin_x + pad_x + camera_guard.offset_px.0;
     offset_y = origin_y + pad_y + camera_guard.offset_px.1;
-    // Finalize render rect from the latest camera offsets
-    render_left = offset_x;
-    render_top = offset_y;
-    render_right = offset_x + render_w;
-    render_bottom = offset_y + render_h;
 
     // Final guard: if the computed render rect is still fully outside the view
     // (observed on some Windows setups on first frame), draw this frame using a
     // deterministic centered offset so content is visible. This does not mutate
     // camera state; subsequent frames will use the camera's offsets.
-    let still_offscreen = render_right < view_left
-        || render_left > view_right
-        || render_bottom < view_top
-        || render_top > view_bottom;
+    let still_offscreen = (offset_x + render_w) < view_left
+        || offset_x > view_right
+        || (offset_y + render_h) < view_top
+        || offset_y > view_bottom;
     if still_offscreen {
         offset_x = origin_x + (width_px - render_w) * 0.5;
         offset_y = origin_y + (height_px - render_h) * 0.5;

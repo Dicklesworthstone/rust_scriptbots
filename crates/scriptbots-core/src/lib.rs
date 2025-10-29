@@ -4823,7 +4823,7 @@ impl WorldState {
                         // Zero out invalid lanes (self, <= eps, > radius^2)
                         let dsq = dist_sq_v.to_array();
                         let mut df = df_v.to_array();
-                        for (lane, oid) in ids.iter().enumerate() {
+                        for (lane, &oid) in ids.iter().enumerate() {
                             if oid == idx || dsq[lane] <= f32::EPSILON || dsq[lane] > radius_sq {
                                 df[lane] = 0.0;
                             }
