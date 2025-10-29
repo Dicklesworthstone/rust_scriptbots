@@ -101,8 +101,8 @@ impl HydrologySnapshot {
             height: state.height(),
             total_water_depth,
             mean_water_depth: total_water_depth / cell_count,
-            flooded_shallow_count: shallow as u32,
-            flooded_deep_count: deep as u32,
+            flooded_shallow_count: saturating_u32(shallow),
+            flooded_deep_count: saturating_u32(deep),
             shallow_threshold: Self::SHALLOW_THRESHOLD,
             deep_threshold: Self::DEEP_THRESHOLD,
             water_depth: state.water_depth().to_vec(),
@@ -112,6 +112,10 @@ impl HydrologySnapshot {
             spill_elevation: state.field().spill_elevation().to_vec(),
         }
     }
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Enumeration describing the primitive type of a knob.
@@ -311,7 +315,7 @@ impl ControlHandle {
                 events.push(EventEntry::new(
                     summary.tick.0,
                     EventKind::Birth,
-                    summary.births as u32,
+                    saturating_u32(summary.births),
                 ));
                 if events.len() >= limit {
                     break;
@@ -321,7 +325,7 @@ impl ControlHandle {
                 events.push(EventEntry::new(
                     summary.tick.0,
                     EventKind::Death,
-                    summary.deaths as u32,
+                    saturating_u32(summary.deaths),
                 ));
                 if events.len() >= limit {
                     break;
@@ -331,7 +335,7 @@ impl ControlHandle {
                 events.push(EventEntry::new(
                     summary.tick.0,
                     EventKind::Combat,
-                    summary.spike_hits as u32,
+                    summary.spike_hits,
                 ));
                 if events.len() >= limit {
                     break;

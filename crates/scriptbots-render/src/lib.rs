@@ -580,6 +580,10 @@ pub mod world_compositor {
             }
         }
 
+        pub(crate) fn render_scale_factor(&self) -> f32 {
+            self.render_scale
+        }
+
         fn save_view_if_requested(&mut self, view: &ReadbackView, digest: &ReadbackDigest) {
             if !self.save_enabled && !(self.force_first_capture && self.save_counter == 0) {
                 return;
@@ -958,7 +962,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         1.0
     };
     if env_flag("SB_WGPU_LAYOUT_LOG") {
-        let render_scale = comp.render_scale;
+        let render_scale = comp.render_scale_factor();
         tracing::info!(
             viewport_width = width_px,
             viewport_height = height_px,

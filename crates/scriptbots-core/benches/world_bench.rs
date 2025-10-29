@@ -3,6 +3,7 @@ use scriptbots_core::ScriptBotsConfig;
 use scriptbots_core::WorldState;
 use std::time::Duration;
 
+#[allow(clippy::field_reassign_with_default)]
 fn bench_world_steps(c: &mut Criterion) {
     let mut group = c.benchmark_group("world_step");
     // Increase iteration time for more stable results and allow env overrides

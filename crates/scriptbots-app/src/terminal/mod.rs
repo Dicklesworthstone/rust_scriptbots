@@ -405,14 +405,13 @@ impl<'a> TerminalApp<'a> {
         if self.analytics_tick == Some(tick) {
             return;
         }
-        if let Ok(mut guard) = self.storage.try_lock() {
-            if let Ok(readings) = guard.latest_metrics(256)
-                && let Some(ana) =
-                    parse_terminal_analytics(tick, self.snapshot.agent_count, &readings)
-            {
-                self.analytics = Some(ana);
-                self.analytics_tick = Some(tick);
-            }
+        if let Ok(mut guard) = self.storage.try_lock()
+            && let Ok(readings) = guard.latest_metrics(256)
+            && let Some(ana) =
+                parse_terminal_analytics(tick, self.snapshot.agent_count, &readings)
+        {
+            self.analytics = Some(ana);
+            self.analytics_tick = Some(tick);
         }
     }
 
