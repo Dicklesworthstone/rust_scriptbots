@@ -847,6 +847,7 @@ impl Renderer for GuiRenderer {
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
         #[cfg(feature = "gui")]
         {
+            prepare_linux_gui_backend();
             run_demo(
                 Arc::clone(&ctx.world),
                 Some(Arc::clone(&ctx.storage)),
@@ -887,6 +888,92 @@ fn should_use_terminal_mode() -> bool {
     }
 
     false
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_gui_backend() {
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if let Err(error) = maybe_force_x11_for_legacy_wayland() {
+            tracing::debug!(%error, "Wayland backend probe failed; leaving backend selection unchanged");
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_linux_gui_backend() {}
+
+#[cfg(target_os = "linux")]
+fn maybe_force_x11_for_legacy_wayland() -> Result<()> {
+    use std::env;
+    use wayland_client::{
+        Connection, Dispatch, Proxy, QueueHandle,
+        globals::{GlobalListContents, registry_queue_init},
+        protocol::{wl_compositor, wl_registry, wl_surface},
+    };
+
+    struct RegistryProbe;
+
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for RegistryProbe {
+        fn event(
+            _state: &mut Self,
+            _proxy: &wl_registry::WlRegistry,
+            _event: wl_registry::Event,
+            _data: &GlobalListContents,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    // Respect explicit backend overrides or GUI forcing.
+    if env::var_os("WINIT_UNIX_BACKEND").is_some() {
+        return Ok(());
+    }
+    if matches!(
+        env::var("SCRIPTBOTS_FORCE_GUI")
+            .ok()
+            .and_then(|value| parse_bool(&value)),
+        Some(true)
+    ) {
+        return Ok(());
+    }
+
+    let Some(display) = env::var_os("WAYLAND_DISPLAY") else {
+        return Ok(());
+    };
+    if display.is_empty() {
+        return Ok(());
+    }
+
+    let connection = Connection::connect_to_env()?;
+    let (globals, _queue) = registry_queue_init::<RegistryProbe>(&connection)?;
+    let required = wl_surface::REQ_SET_BUFFER_SCALE_SINCE;
+
+    let compositor_version = globals.contents().with_list(|globals| {
+        globals
+            .iter()
+            .find(|global| global.interface == wl_compositor::WlCompositor::interface().name)
+            .map(|global| global.version)
+    });
+
+    if let Some(version) = compositor_version {
+        if version < required {
+            // SAFETY: Modifying the process environment before spawning GUI worker threads.
+            unsafe {
+                env::set_var("WINIT_UNIX_BACKEND", "x11");
+            }
+            tracing::warn!(
+                version,
+                required,
+                "Wayland compositor version too old (v{version}); forcing WINIT_UNIX_BACKEND=x11. Set SCRIPTBOTS_FORCE_GUI=1 to override."
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
@@ -1747,6 +1834,10 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
 
+    fn default_cli() -> AppCli {
+        AppCli::parse_from(["scriptbots-app"])
+    }
+
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn with_env_lock<F: FnOnce()>(f: F) {
@@ -1852,21 +1943,10 @@ activation = "Sigmoid"
     fn write_config_honors_format_and_exit_flag() {
         let dir = tempdir().expect("tempdir");
         let output = dir.path().join("effective.toml");
-        let cli = AppCli {
-            mode: RendererMode::Auto,
-            config_layers: Vec::new(),
-            replay_db: None,
-            compare_db: None,
-            tick_limit: None,
-            auto_pause_below: None,
-            auto_pause_age_above: None,
-            auto_pause_on_spike: false,
-            print_config: false,
-            write_config: Some(output.clone()),
-            config_format: ConfigFormat::Toml,
-            config_only: true,
-            det_check: None,
-        };
+        let mut cli = default_cli();
+        cli.write_config = Some(output.clone());
+        cli.config_format = ConfigFormat::Toml;
+        cli.config_only = true;
 
         let config = ScriptBotsConfig {
             world_width: 1234,
@@ -1890,21 +1970,10 @@ activation = "Sigmoid"
     fn emit_config_continue_when_not_config_only() {
         let dir = tempdir().expect("tempdir");
         let output = dir.path().join("effective.ron");
-        let cli = AppCli {
-            mode: RendererMode::Auto,
-            config_layers: Vec::new(),
-            replay_db: None,
-            compare_db: None,
-            tick_limit: None,
-            auto_pause_below: None,
-            auto_pause_age_above: None,
-            auto_pause_on_spike: false,
-            print_config: false,
-            write_config: Some(output.clone()),
-            config_format: ConfigFormat::Ron,
-            config_only: false,
-            det_check: None,
-        };
+        let mut cli = default_cli();
+        cli.write_config = Some(output.clone());
+        cli.config_format = ConfigFormat::Ron;
+        cli.config_only = false;
 
         let config = ScriptBotsConfig::default();
 
@@ -1956,13 +2025,14 @@ activation = "Sigmoid"
     #[cfg(feature = "neuro")]
     #[test]
     fn neuroflow_installation_respects_toggle() {
+        let expected_base = if cfg!(feature = "ml") { 2 } else { 1 };
         let mut config = ScriptBotsConfig::default();
         config.neuroflow.enabled = false;
         let mut world = WorldState::new(config).expect("world");
         let keys = install_brains(&mut world);
         assert_eq!(
             keys.len(),
-            1,
+            expected_base,
             "NeuroFlow brain should not register when disabled"
         );
 
@@ -1975,8 +2045,8 @@ activation = "Sigmoid"
         let keys_enabled = install_brains(&mut world_enabled);
         assert_eq!(
             keys_enabled.len(),
-            2,
-            "Expected both MLP and NeuroFlow brains"
+            expected_base + 1,
+            "Expected baseline brains plus NeuroFlow"
         );
 
         let neuro_key = *keys_enabled.last().expect("neuro key");
@@ -1987,7 +2057,7 @@ activation = "Sigmoid"
 
         let mut world_repeat = WorldState::new(config_enabled).expect("world");
         let keys_repeat = install_brains(&mut world_repeat);
-        assert_eq!(keys_repeat.len(), 2);
+        assert_eq!(keys_repeat.len(), expected_base + 1);
         let neuro_repeat = *keys_repeat.last().unwrap();
         let agent_repeat = world_repeat.spawn_agent(AgentData::default());
         assert!(world_repeat.bind_agent_brain(agent_repeat, neuro_repeat));

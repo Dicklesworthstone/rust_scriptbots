@@ -46,6 +46,9 @@ windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Syste
 mimalloc = { version = "0.1", optional = true }
 num_cpus = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+
 [features]
 default = ["ml", "neuro", "fast-alloc"]
 gui = ["dep:scriptbots-render"]

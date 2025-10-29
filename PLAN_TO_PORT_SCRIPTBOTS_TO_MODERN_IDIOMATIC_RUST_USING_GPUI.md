@@ -324,11 +324,12 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
   - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]
   - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build. [Completed - GPT-5 Codex 2025-10-22]
- - [Currently In Progress - 2025-10-29 WhiteCat] Audit failing CI runs (fmt, wasm-pack, cross-platform checks, replay determinism) and collect log excerpts for remediation plan.
- - [Currently In Progress - 2025-10-29 OrangeHill] CI hygiene sweep: rustfmt across workspace, wasm-pack compatibility fix (`--enable-nontrapping-float-to-int`), and portable `target-cpu=x86-64-v3` baseline so CI avoids SIGILL while retaining local `native` opt-in via `RUSTFLAGS`.
- - [Completed - 2025-10-29 BlackMountain] Fix Windows test failure in `scriptbots-core` by capturing config fields before moving into `WorldState::new` (no clone required).
- - [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI: generate baseline/candidate DuckDB runs in headless terminal mode and diff event streams via CLI (`--replay-db`, `--compare-db`).
- - [Completed - GPT-5 Codex 2025-10-23] Wasm CI job builds `scriptbots-web` via `wasm-pack` and runs headless Chrome tests (Playwright-provisioned Chromium).
+- [Currently In Progress - 2025-10-29 WhiteCat] Audit failing CI runs (fmt, wasm-pack, cross-platform checks, replay determinism) and collect log excerpts for remediation plan.
+- [Currently In Progress - 2025-10-29 OrangeHill] CI hygiene sweep: rustfmt across workspace, wasm-pack compatibility fix (`--enable-nontrapping-float-to-int`), and portable `target-cpu=x86-64-v3` baseline so CI avoids SIGILL while retaining local `native` opt-in via `RUSTFLAGS`.
+- [Completed - 2025-10-29 BlackMountain] Fix Windows test failure in `scriptbots-core` by capturing config fields before moving into `WorldState::new` (no clone required).
+- [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI: generate baseline/candidate DuckDB runs in headless terminal mode and diff event streams via CLI (`--replay-db`, `--compare-db`).
+- [Completed - GPT-5 Codex 2025-10-23] Wasm CI job builds `scriptbots-web` via `wasm-pack` and runs headless Chrome tests (Playwright-provisioned Chromium).
+- [Currently In Progress - 2025-10-29 RedStone] Wayland compositor version fallback so Linux GUI no longer panics on wl_compositor v2 hosts.
 
 ## Advanced Brain Architecture Strategy
 - Trait hierarchy: extend the `Brain` interface with marker traits (`EvolvableBrain`, `TrainableBrain`, `BatchBrain`) so the world loop can branch on capabilities (e.g., some brains may not support online learning).
@@ -1141,6 +1142,7 @@ Knobs gate work under `SB_WGPU_MAX_FPS` and reuse last‑ready frame when budget
 - [Currently In Progress - 2025-10-29 OrangeHill] CI wasm/WebAssembly lane: extend wasm-opt feature flags to allow saturating float-to-int truncation emitted by Rust 1.85.
 - [Currently In Progress - 2025-10-29 OrangeHill] CI replay determinism: draft portable `target-cpu` strategy so release binaries avoid SIGILL on hosted runners.
 - [Currently In Progress - 2025-10-29 OrangeHill & BlueDog] wasm-pack: keep `wasm-opt` enabled via `--enable-nontrapping-float-to-int` (Binaryen 116 compatible); re-run CI to confirm, and only disable `wasm-opt` if runners still fail.
+- [Completed - 2025-10-29 PinkMountain] SIMD smell lane guard verification: confirmed current `for (lane, &oid)` pattern already dereferences neighbor indices; replay determinism failure was from an earlier revision.
 - [Completed - 2025-10-22] Dependency alignment: restored `thiserror`, added terminal dependencies (`supports-color`, ratatui already present), and confirmed no redundant `utoipa-axum` entries remain.
 - [Completed - 2025-10-22] CLI mode integration: `resolve_renderer` now detects headless environments, honors override env vars, and logs terminal fallback activation.
 - [Completed - 2025-10-22] Terminal renderer scaffolding: new `terminal` module implements the shared `Renderer` trait with the crossterm/ratatui event loop.
