@@ -4449,7 +4449,7 @@ impl WorldState {
                             let mut val_v = prev_v;
                             if diffusion > 0.0 {
                                 let neigh = (left_v + right_v + up_v + down_v) * f32x4::splat(0.25);
-                                val_v = val_v + f32x4::splat(diffusion) * (neigh - prev_v);
+                                val_v += f32x4::splat(diffusion) * (neigh - prev_v);
                             }
                             let cap_arr = idxs.map(|i| {
                                 profiles
@@ -4494,13 +4494,13 @@ impl WorldState {
                             let grow_v = f32x4::new(grow_arr);
                             let decay_v = f32x4::new(decay_arr);
                             if decay > 0.0 {
-                                val_v = val_v - f32x4::splat(decay) * decay_v * val_v;
+                                val_v -= f32x4::splat(decay) * decay_v * val_v;
                             }
                             if growth > 0.0 && food_max > 0.0 {
                                 let norm = val_v / f32x4::splat(food_max);
                                 let delta =
                                     f32x4::splat(growth) * grow_v * (f32x4::splat(1.0) - norm);
-                                val_v = val_v + delta * f32x4::splat(food_max);
+                                val_v += delta * f32x4::splat(food_max);
                             }
                             // Clamp to capacity and global cap
                             let prev_cap_v = prev_v; // previous_value for max with capacity floor
