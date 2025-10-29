@@ -140,7 +140,7 @@ jobs:
       - name: wasm-pack test (headless Chrome)
         env:
           CHROMIUM: ${{ steps.chromium.outputs.path }}
-        run: wasm-pack test crates/scriptbots-web --headless --chrome
+        run: wasm-pack test --headless --chrome crates/scriptbots-web
 
   replay:
     name: Replay Determinism (ubuntu)

@@ -5058,7 +5058,6 @@ impl WorldState {
                             blood += bleed * dist_factor * wound;
                         }
                     }
-                    return;
                 }
                 #[cfg(not(feature = "simd_wide"))]
                 for &other_idx in indices {
@@ -5304,6 +5303,41 @@ impl WorldState {
         let ramp_rate = self.config.metabolism_ramp_rate;
         let boost_penalty = self.config.metabolism_boost_penalty.max(0.0);
 
+        #[derive(Copy, Clone)]
+        struct DecodedOutputs {
+            left: f32,
+            right: f32,
+            color: [f32; 3],
+            spike_target: f32,
+            boost: bool,
+            sound_level: f32,
+            give_intent: f32,
+        }
+
+        fn decode_outputs(outputs: [f32; OUTPUT_SIZE]) -> DecodedOutputs {
+            let [
+                left,
+                right,
+                color_r,
+                color_g,
+                color_b,
+                spike,
+                boost_raw,
+                sound_level,
+                give_intent,
+            ] = outputs;
+
+            DecodedOutputs {
+                left: left.clamp(0.0, 1.0),
+                right: right.clamp(0.0, 1.0),
+                color: [clamp01(color_r), clamp01(color_g), clamp01(color_b)],
+                spike_target: spike.clamp(0.0, 1.0),
+                boost: boost_raw > 0.5,
+                sound_level: sound_level.clamp(0.0, 1.0),
+                give_intent: give_intent.clamp(0.0, 1.0),
+            }
+        }
+
         // Reuse handles buffer
         self.work_handles.clear();
         self.work_handles.extend(self.agents.iter_handles());
@@ -5348,28 +5382,16 @@ impl WorldState {
         {
             for (chunk_i, chunk) in handles.chunks_exact(4).enumerate() {
                 let base = chunk_i * 4;
-                for lane in 0..4 {
+                for (lane, &agent_id) in chunk.iter().enumerate() {
                     let idx = base + lane;
-                    let agent_id = chunk[lane];
                     let Some(rt) = runtime.get(agent_id) else {
                         continue;
                     };
-                    let outputs = rt.outputs;
-                    let left = outputs.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let color = [
-                        clamp01(outputs.get(2).copied().unwrap_or(0.0)),
-                        clamp01(outputs.get(3).copied().unwrap_or(0.0)),
-                        clamp01(outputs.get(4).copied().unwrap_or(0.0)),
-                    ];
-                    let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
-                    let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let decoded = decode_outputs(rt.outputs);
 
-                    let mut left_speed = left * bot_speed;
-                    let mut right_speed = right * bot_speed;
-                    if boost {
+                    let mut left_speed = decoded.left * bot_speed;
+                    let mut right_speed = decoded.right * bot_speed;
+                    if decoded.boost {
                         left_speed *= boost_multiplier;
                         right_speed *= boost_multiplier;
                     }
@@ -5419,7 +5441,7 @@ impl WorldState {
                         let active_energy = (rt.energy - ramp_floor).max(0.0);
                         drain += active_energy * ramp_rate;
                     }
-                    if boost && boost_penalty > 0.0 {
+                    if decoded.boost && boost_penalty > 0.0 {
                         drain += boost_penalty;
                     }
                     if topo_enabled && topo_penalty > 0.0 {
@@ -5433,10 +5455,10 @@ impl WorldState {
                     let energy = (rt.energy - drain).max(0.0);
 
                     let mut spike_length = spike_lengths_snapshot[idx];
-                    if spike_length < spike_target {
-                        spike_length = (spike_length + spike_growth).min(spike_target);
-                    } else if spike_length > spike_target {
-                        spike_length = (spike_length - spike_growth).max(spike_target);
+                    if spike_length < decoded.spike_target {
+                        spike_length = (spike_length + spike_growth).min(decoded.spike_target);
+                    } else if spike_length > decoded.spike_target {
+                        spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                     }
                     let spiked = spike_length > 0.5;
 
@@ -5448,10 +5470,10 @@ impl WorldState {
                             health_delta,
                         }),
                         energy,
-                        color,
+                        color: decoded.color,
                         spike_length,
-                        sound_level,
-                        give_intent,
+                        sound_level: decoded.sound_level,
+                        give_intent: decoded.give_intent,
                         spiked,
                     };
                 }
@@ -5466,22 +5488,11 @@ impl WorldState {
                 let Some(runtime) = runtime.get(*agent_id) else {
                     continue;
                 };
-                let outputs = runtime.outputs;
-                let left = outputs.get(0).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let color = [
-                    clamp01(outputs.get(2).copied().unwrap_or(0.0)),
-                    clamp01(outputs.get(3).copied().unwrap_or(0.0)),
-                    clamp01(outputs.get(4).copied().unwrap_or(0.0)),
-                ];
-                let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
-                let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let decoded = decode_outputs(runtime.outputs);
 
-                let mut left_speed = left * bot_speed;
-                let mut right_speed = right * bot_speed;
-                if boost {
+                let mut left_speed = decoded.left * bot_speed;
+                let mut right_speed = decoded.right * bot_speed;
+                if decoded.boost {
                     left_speed *= boost_multiplier;
                     right_speed *= boost_multiplier;
                 }
@@ -5526,7 +5537,7 @@ impl WorldState {
                     let active_energy = (runtime.energy - ramp_floor).max(0.0);
                     drain += active_energy * ramp_rate;
                 }
-                if boost && boost_penalty > 0.0 {
+                if decoded.boost && boost_penalty > 0.0 {
                     drain += boost_penalty;
                 }
                 if topo_enabled && topo_penalty > 0.0 {
@@ -5539,10 +5550,10 @@ impl WorldState {
                 let health_delta = -drain;
                 let energy = (runtime.energy - drain).max(0.0);
                 let mut spike_length = spike_lengths_snapshot[idx];
-                if spike_length < spike_target {
-                    spike_length = (spike_length + spike_growth).min(spike_target);
-                } else if spike_length > spike_target {
-                    spike_length = (spike_length - spike_growth).max(spike_target);
+                if spike_length < decoded.spike_target {
+                    spike_length = (spike_length + spike_growth).min(decoded.spike_target);
+                } else if spike_length > decoded.spike_target {
+                    spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                 }
                 let spiked = spike_length > 0.5;
                 results[idx] = ActuationResult {
@@ -5553,10 +5564,10 @@ impl WorldState {
                         health_delta,
                     }),
                     energy,
-                    color,
+                    color: decoded.color,
                     spike_length,
-                    sound_level,
-                    give_intent,
+                    sound_level: decoded.sound_level,
+                    give_intent: decoded.give_intent,
                     spiked,
                 };
             }
@@ -5565,22 +5576,11 @@ impl WorldState {
         #[cfg(not(feature = "simd_wide"))]
         let results: Vec<ActuationResult> = collect_handles!(handles, |idx, agent_id| {
             if let Some(runtime) = runtime.get(*agent_id) {
-                let outputs = runtime.outputs;
-                let left = outputs.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let right = outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let color = [
-                    clamp01(outputs.get(2).copied().unwrap_or(0.0)),
-                    clamp01(outputs.get(3).copied().unwrap_or(0.0)),
-                    clamp01(outputs.get(4).copied().unwrap_or(0.0)),
-                ];
-                let spike_target = outputs.get(5).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let boost = outputs.get(6).copied().unwrap_or(0.0) > 0.5;
-                let sound_level = outputs.get(7).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let give_intent = outputs.get(8).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let decoded = decode_outputs(runtime.outputs);
 
-                let mut left_speed = left * bot_speed;
-                let mut right_speed = right * bot_speed;
-                if boost {
+                let mut left_speed = decoded.left * bot_speed;
+                let mut right_speed = decoded.right * bot_speed;
+                if decoded.boost {
                     left_speed *= boost_multiplier;
                     right_speed *= boost_multiplier;
                 }
@@ -5629,7 +5629,7 @@ impl WorldState {
                     let active_energy = (runtime.energy - ramp_floor).max(0.0);
                     drain += active_energy * ramp_rate;
                 }
-                if boost && boost_penalty > 0.0 {
+                if decoded.boost && boost_penalty > 0.0 {
                     drain += boost_penalty;
                 }
                 if topo_enabled && topo_penalty > 0.0 {
@@ -5643,10 +5643,10 @@ impl WorldState {
                 let energy = (runtime.energy - drain).max(0.0);
 
                 let mut spike_length = spike_lengths_snapshot[idx];
-                if spike_length < spike_target {
-                    spike_length = (spike_length + spike_growth).min(spike_target);
-                } else if spike_length > spike_target {
-                    spike_length = (spike_length - spike_growth).max(spike_target);
+                if spike_length < decoded.spike_target {
+                    spike_length = (spike_length + spike_growth).min(decoded.spike_target);
+                } else if spike_length > decoded.spike_target {
+                    spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                 }
                 let spiked = spike_length > 0.5;
 
@@ -5658,10 +5658,10 @@ impl WorldState {
                         health_delta,
                     }),
                     energy,
-                    color,
+                    color: decoded.color,
                     spike_length,
-                    sound_level,
-                    give_intent,
+                    sound_level: decoded.sound_level,
+                    give_intent: decoded.give_intent,
                     spiked,
                 }
             } else {
@@ -5760,7 +5760,7 @@ impl WorldState {
                 let i0 = base * 4;
                 let idxs = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 // Gather env temps and preferences per lane
-                let t0 = sample_temperature(&self.config, positions_snapshot[i0 + 0].x);
+                let t0 = sample_temperature(&self.config, positions_snapshot[i0].x);
                 let t1 = sample_temperature(&self.config, positions_snapshot[i0 + 1].x);
                 let t2 = sample_temperature(&self.config, positions_snapshot[i0 + 2].x);
                 let t3 = sample_temperature(&self.config, positions_snapshot[i0 + 3].x);
@@ -5808,7 +5808,7 @@ impl WorldState {
                     }
                 }
                 // Store penalties back
-                penalties[i0 + 0] = pen[0].max(0.0);
+                penalties[i0] = pen[0].max(0.0);
                 penalties[i0 + 1] = pen[1].max(0.0);
                 penalties[i0 + 2] = pen[2].max(0.0);
                 penalties[i0 + 3] = pen[3].max(0.0);

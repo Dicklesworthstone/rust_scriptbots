@@ -34,7 +34,7 @@ The log pane (bottom of the sidebar) captures bootstrap and performance events s
 For determinism validation, run the accompanying WASM parity test:
 
 ```bash
-wasm-pack test crates/scriptbots-web --headless --chrome
+wasm-pack test --headless --chrome crates/scriptbots-web
 ```
 
 The test compares snapshots produced by the WASM harness with native `WorldState` execution to ensure the exported bindings preserve simulation state exactly.

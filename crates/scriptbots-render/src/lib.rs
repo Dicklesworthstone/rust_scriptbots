@@ -279,6 +279,9 @@ pub mod world_compositor {
         last_submit: Option<std::time::Instant>,
         min_interval: f32, // seconds; 0 = uncapped
         render_scale: f32, // 0<scale<=1; offscreen resolution scale
+        allow_software_adapter: bool,
+        adapter_failure: Option<String>,
+        adapter_failure_reported: bool,
         // Optional frame capture
         save_enabled: bool,
         save_dir: std::path::PathBuf,
@@ -328,6 +331,10 @@ pub mod world_compositor {
                 last_submit: None,
                 min_interval,
                 render_scale,
+                allow_software_adapter: env_flag("SB_WGPU_ALLOW_SOFTWARE_ADAPTER")
+                    || env_flag("SB_WGPU_ALLOW_CPU"),
+                adapter_failure: None,
+                adapter_failure_reported: false,
                 save_enabled,
                 save_dir,
                 save_every,
@@ -346,6 +353,9 @@ pub mod world_compositor {
         }
 
         fn ensure_renderer(&mut self, size: (u32, u32)) -> Result<(), String> {
+            if let Some(reason) = self.adapter_failure.clone() {
+                return Err(reason);
+            }
             if self.adapter.is_none() {
                 // Create a headless adapter suitable for offscreen rendering
                 let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -359,14 +369,55 @@ pub mod world_compositor {
                         .await;
                     res.map_err(|_| "wgpu adapter not available".to_string())
                 };
-                let adapter = pollster::block_on(future)?;
+                let adapter = match pollster::block_on(future) {
+                    Ok(adapter) => adapter,
+                    Err(err) => {
+                        self.record_adapter_failure(err.clone());
+                        return Err(err);
+                    }
+                };
+                let info = adapter.get_info();
+                info!(
+                    adapter = %info.name,
+                    device_type = ?info.device_type,
+                    backend = ?info.backend,
+                    vendor = format!("{:#x}", info.vendor),
+                    "Selected wgpu adapter"
+                );
+                let name_lower = info.name.to_ascii_lowercase();
+                let is_software = matches!(
+                    info.device_type,
+                    wgpu::DeviceType::Cpu | wgpu::DeviceType::Other
+                ) || name_lower.contains("llvmpipe")
+                    || name_lower.contains("lavapipe")
+                    || name_lower.contains("swiftshader");
+                if is_software && !self.allow_software_adapter {
+                    let reason = format!(
+                        "wgpu adapter \"{}\" (vendor {:#x}) is software-only; using CPU canvas",
+                        info.name, info.vendor
+                    );
+                    self.record_adapter_failure(reason.clone());
+                    return Err(reason);
+                } else if is_software {
+                    warn!(
+                        adapter = %info.name,
+                        vendor = format!("{:#x}", info.vendor),
+                        "wgpu adapter is software-only; continuing due to SB_WGPU_ALLOW_SOFTWARE_ADAPTER"
+                    );
+                }
                 self.adapter = Some(adapter);
             }
-            let need_new = self.renderer.is_none();
-            if need_new {
+            if self.renderer.is_none() {
                 let adapter = self.adapter.as_ref().unwrap();
                 let future = scriptbots_world_gfx::WorldRenderer::new(adapter, size);
-                let mut renderer = pollster::block_on(future)?;
+                let mut renderer = match pollster::block_on(future) {
+                    Ok(renderer) => renderer,
+                    Err(err) => {
+                        let reason = format!("wgpu renderer init failed: {err}");
+                        self.record_adapter_failure(reason.clone());
+                        return Err(reason);
+                    }
+                };
                 renderer.set_camera(self.cam_scale, self.cam_offset);
                 self.renderer = Some(renderer);
             }
@@ -406,6 +457,7 @@ pub mod world_compositor {
                 (target_size.0.max(1), target_size.1.max(1))
             };
             if self.ensure_renderer(render_size).is_err() {
+                self.maybe_report_adapter_failure();
                 return;
             }
             let r = self.renderer.as_mut().unwrap();
@@ -485,6 +537,26 @@ pub mod world_compositor {
                 }
             } else if env_flag("SB_WGPU_LOG_VIS") {
                 tracing::info!("wgpu readback not yet mapped");
+            }
+        }
+
+        fn record_adapter_failure(&mut self, reason: String) {
+            self.adapter_failure = Some(reason);
+            self.adapter_failure_reported = false;
+            self.adapter = None;
+            self.renderer = None;
+        }
+
+        fn maybe_report_adapter_failure(&mut self) {
+            if self.adapter_failure_reported {
+                return;
+            }
+            if let Some(reason) = self.adapter_failure.as_ref() {
+                warn!(
+                    %reason,
+                    "Disabling wgpu compositor; falling back to CPU canvas renderer"
+                );
+                self.adapter_failure_reported = true;
             }
         }
 
@@ -879,6 +951,28 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         .unwrap_or((0.0, 0.0));
     // Offscreen world renderer uses (0,0) origin; include only pad and camera offset
     let cam_offset = (pad_x + off_px_x, pad_y + off_px_y);
+
+    let zoom = if base_scale > 0.0 {
+        scale / base_scale
+    } else {
+        1.0
+    };
+    if env_flag("SB_WGPU_LAYOUT_LOG") {
+        let render_scale = comp.render_scale;
+        tracing::info!(
+            viewport_width = width_px,
+            viewport_height = height_px,
+            world_width = world_w,
+            world_height = world_h,
+            pad_x,
+            pad_y,
+            offset_x = cam_offset.0,
+            offset_y = cam_offset.1,
+            zoom,
+            render_scale,
+            "wgpu_canvas_layout"
+        );
+    }
 
     if env_flag("SB_WGPU_LOG_CAM") {
         tracing::info!(
@@ -10841,9 +10935,6 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             y: frame.world_size.1 * 0.5,
         };
         camera_guard.center_on(world_center);
-        // Recompute offsets with updated camera state
-        offset_x = origin_x + pad_x + camera_guard.offset_px.0;
-        offset_y = origin_y + pad_y + camera_guard.offset_px.1;
         // Values will be recomputed below after any follow-target recentering
     }
 
@@ -10885,6 +10976,23 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     // Follow target may change camera offset; recompute offsets if it did
     offset_x = origin_x + pad_x + camera_guard.offset_px.0;
     offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+
+    if env_flag("SB_CPU_LAYOUT_LOG") {
+        tracing::info!(
+            viewport_width = width_px,
+            viewport_height = height_px,
+            world_width = world_w,
+            world_height = world_h,
+            origin_x,
+            origin_y,
+            pad_x,
+            pad_y,
+            offset_x,
+            offset_y,
+            zoom = camera_guard.zoom,
+            "cpu_canvas_layout"
+        );
+    }
 
     // Final guard: if the computed render rect is still fully outside the view
     // (observed on some Windows setups on first frame), draw this frame using a

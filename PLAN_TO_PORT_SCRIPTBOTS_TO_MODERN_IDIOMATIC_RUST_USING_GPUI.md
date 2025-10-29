@@ -326,9 +326,11 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build. [Completed - GPT-5 Codex 2025-10-22]
 - [Currently In Progress - 2025-10-29 WhiteCat] Audit failing CI runs (fmt, wasm-pack, cross-platform checks, replay determinism) and collect log excerpts for remediation plan.
 - [Currently In Progress - 2025-10-29 OrangeHill] CI hygiene sweep: rustfmt across workspace, wasm-pack compatibility fix (`--enable-nontrapping-float-to-int`), and portable `target-cpu=x86-64-v3` baseline so CI avoids SIGILL while retaining local `native` opt-in via `RUSTFLAGS`.
+- [Currently In Progress - 2025-10-29 LilacLake] Update `AppCli` test helpers to construct complete structs, unblocking Windows/macOS CI jobs after recent CLI flag additions.
 - [Completed - 2025-10-29 BlackMountain] Fix Windows test failure in `scriptbots-core` by capturing config fields before moving into `WorldState::new` (no clone required).
 - [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI: generate baseline/candidate DuckDB runs in headless terminal mode and diff event streams via CLI (`--replay-db`, `--compare-db`).
 - [Completed - GPT-5 Codex 2025-10-23] Wasm CI job builds `scriptbots-web` via `wasm-pack` and runs headless Chrome tests (Playwright-provisioned Chromium).
+- [Completed - 2025-10-29 LilacLake] Adjusted GitHub Actions wasm job to pass `--headless --chrome` before the crate path so wasm-pack’s latest CLI recognizes the browser target.
 - [Currently In Progress - 2025-10-29 RedStone] Wayland compositor version fallback so Linux GUI no longer panics on wl_compositor v2 hosts.
 
 ## Advanced Brain Architecture Strategy
@@ -408,7 +410,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
   - [Completed - GPT-5 Codex 2025-10-22: Performance diagnostics panel (frame time/fps tracking, live stats overlay); follow-up: wire GPU backend counters once exposed.]
   - [Completed - GPT-5 Codex 2025-10-22: Terrain/lighting polish (dynamic sky palette, food tile shading, reproduction/spike VFX); follow-up: hook palettes to configurable themes.]
   - [Completed - GPT-5 Codex 2025-10-22: Input rebinding & accessibility (keyboard remaps, colorblind-safe palettes, narration hooks); follow-up: stream narration events into audio/log subsystem.]
-  - [Currently In Progress - 2025-10-29 ChartreuseSnow & PurpleHill: Instrument GPUI compositor readback/diff pipeline to diagnose blank viewport regression.]
+  - [Currently In Progress - 2025-10-29 ChartreuseSnow, PurpleHill & BlackSnow: Instrument GPUI compositor readback/diff pipeline to diagnose blank viewport regression.]
 
 ## Migration Roadmap
 1. **Project Bootstrap (Week 1)**
