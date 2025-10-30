@@ -947,32 +947,24 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let height_px = f32::from(bounds.size.height).max(1.0);
     let world_w = world_size.0.max(1.0);
     let world_h = world_size.1.max(1.0);
-    let base_scale = (width_px / world_w).min(height_px / world_h).max(0.0001);
     let mut camera_guard = state.camera.lock().expect("camera mutex poisoned");
-    camera_guard.ensure_default_zoom(base_scale);
-    camera_guard.record_render_metrics(
+    let layout = camera_guard.layout(
         (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
         (width_px, height_px),
         (world_w, world_h),
-        base_scale,
     );
-    if !camera_guard.is_centered() {
-        let world_center = Position {
-            x: world_w * 0.5,
-            y: world_h * 0.5,
-        };
-        camera_guard.center_on(world_center);
-        camera_guard.mark_centered();
-    }
-    let zoom = camera_guard.zoom();
-    let (off_px_x, off_px_y) = camera_guard.offset();
     drop(camera_guard);
 
-    let scale = base_scale * zoom;
-    let pad_x = (width_px - world_w * scale) * 0.5;
-    let pad_y = (height_px - world_h * scale) * 0.5;
-    // Offscreen world renderer uses (0,0) origin; include only pad and camera offset
-    let cam_offset = (pad_x + off_px_x, pad_y + off_px_y);
+    let scale = layout.scale;
+    let base_scale = layout.base_scale;
+    let pad_x = layout.pad.0;
+    let pad_y = layout.pad.1;
+    // Offscreen world renderer uses (0,0) origin; include only pad and camera offset relative to origin
+    let cam_offset = (
+        layout.offset.0 - f32::from(bounds.origin.x),
+        layout.offset.1 - f32::from(bounds.origin.y),
+    );
+    let zoom = scale / base_scale;
 
     if env_flag("SB_WGPU_LAYOUT_LOG") {
         let render_scale = comp.render_scale_factor();
@@ -1081,8 +1073,8 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         scale = scale,
         pad_x = pad_x,
         pad_y = pad_y,
-        off_x = off_px_x,
-        off_y = off_px_y,
+        offset_x = layout.offset.0,
+        offset_y = layout.offset.1,
         cam_off_x = cam_offset.0,
         cam_off_y = cam_offset.1,
         "wgpu camera mapping"

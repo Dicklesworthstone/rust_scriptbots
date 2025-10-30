@@ -78,14 +78,19 @@ Agent overlays contribute additional colours (selection ring `#FFFF00`, boost ou
 
 | Asset | Description | SHA256 |
 | --- | --- | --- |
-| `legacy_default.png` | Default camera framing, no selection, food overlay on. | `d2c528791f9cde234436fe874632eaf336b959a50e7bab6a3be14f1e651b77ea` |
-| `legacy_selected_agent.png` | Same scene after selecting central agent; shows HUD panel, indicator ribbons, selection halo. | `3d38aabffa50868fea3c30122305d9719d9f3e9d6a8b04bd660e9231fe9768bc` |
-| `legacy_food_peak.png` | Food overlay emphasised after toggling `[f]`; highlights full grids with blue-toward-green gradient. | `eca81feffb3ccdf33dd82c406f16101354c1673293e0c78756b622dfa6ad52aa` |
+| `legacy_default.png` (+ `legacy_default_overlay.svg`) | Default camera framing, no selection, food overlay on. | `8e9e407ad0c9ebef870b879eb0fa92c30fa76034301c2804937f644cb7e30c84` |
+| `legacy_selected_agent.png` (+ `legacy_selected_overlay.svg`) | Same scene after selecting central agent; shows HUD panel, indicator ribbons, selection halo. | `3a5275239e392e518e469c9f07410924b316273b2f695c306c7ffa52dc63e922` |
+| `legacy_food_peak.png` (+ `legacy_food_peak_overlay.svg`) | Food overlay emphasised after toggling `[f]`; highlights full grids with blue-toward-green gradient. | `3f355f970c8712720e3ff58ec74a5d8c7a1a30eff36bb9078962fb121fa671d2` |
+| `legacy_food_off.png` | Food overlay disabled to reveal raw terrain palette basemap. | `a9446fd2cd405b60eb7782fcb098f082f974a06d179330e9d325fd014571f7a2` |
+| `legacy_zoomed_hud.png` | Slight zoom after middle-button drag, capturing HUD text legibility and agent detail. | `d113b13b59556db4f1e215450297370576a6d45bdc34f764262fb95e81103fa8` |
+| (future) `legacy_follow_modes.png` | Capture follow behaviour (`s`, `o`) once automation lands. | _pending_ |
+| (future) `legacy_camera_pan.png` | Capture pan extremes once scripted. | _pending_ |
+| (future) `legacy_terminal.png` | Capture terminal renderer baseline. | _pending_ |
+| (future) `legacy_terminal_zoom.png` | Capture terminal zoom overlay. | _pending_ |
 
-All captures collected via automated script (see `legacy_capture_checklist.md`), ensuring reproducibility. The screenshots include the agent HUD, terrain palette, and donation ring contexts referenced throughout this spec.
+All captures collected via `capture_legacy_render.sh` (see `legacy_capture_checklist.md`), ensuring reproducibility. Companion SVG overlays provide precise ROIs for documentation and automated diff tooling.
 
 ## Open Questions / Follow-ups
 
-1. Capture annotated overlays (SVG or markdown) pointing to each labelled element for onboarding docs.
-2. Extend capture script to toggle follow modes (`s`, `o`) so that camera recenter behaviour can be illustrated visually.
-3. Record time-series FPS/agent counts from a longer legacy session to model variability beyond the initial 10-second window.
+1. Extend capture script to toggle follow modes (`s`, `o`) so that camera recenter behaviour can be illustrated visually.
+2. Record time-series FPS/agent counts from a longer legacy session to model variability beyond the initial 10-second window.

@@ -53,6 +53,15 @@ pub struct Camera {
     pan_anchor: Option<Point<Pixels>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ViewLayout {
+    pub base_scale: f32,
+    pub scale: f32,
+    pub pad: (f32, f32),
+    pub offset: (f32, f32),
+    pub render_size: (f32, f32),
+}
+
 impl Default for Camera {
     fn default() -> Self {
         Self::new(CameraConfig::default())
@@ -275,6 +284,93 @@ impl Camera {
         let y = self.state.last_canvas_origin.1 + pad_y + self.state.offset_px.1 + point.1 * scale;
         Some((x, y))
     }
+
+    pub fn layout(
+        &mut self,
+        canvas_origin: (f32, f32),
+        canvas_size: (f32, f32),
+        world_size: (f32, f32),
+    ) -> ViewLayout {
+        let width_px = canvas_size.0.max(1.0);
+        let height_px = canvas_size.1.max(1.0);
+        let world_w = world_size.0.max(1.0);
+        let world_h = world_size.1.max(1.0);
+        let base_scale = (width_px / world_w).min(height_px / world_h).max(0.0001);
+
+        self.ensure_default_zoom(base_scale);
+
+        let mut layout = self.compute_layout(canvas_origin, canvas_size, world_size, base_scale);
+
+        self.record_render_metrics(canvas_origin, canvas_size, world_size, base_scale);
+
+        let world_center = Position {
+            x: world_size.0 * 0.5,
+            y: world_size.1 * 0.5,
+        };
+
+        if layout.fully_offscreen {
+            self.center_on(world_center);
+            layout = self.compute_layout(canvas_origin, canvas_size, world_size, base_scale);
+            self.record_render_metrics(canvas_origin, canvas_size, world_size, base_scale);
+        }
+
+        if !self.state.centered_once {
+            self.center_on(world_center);
+            layout = self.compute_layout(canvas_origin, canvas_size, world_size, base_scale);
+            self.state.centered_once = true;
+            self.record_render_metrics(canvas_origin, canvas_size, world_size, base_scale);
+
+            if layout.fully_offscreen {
+                self.center_on(world_center);
+                layout = self.compute_layout(canvas_origin, canvas_size, world_size, base_scale);
+                self.record_render_metrics(canvas_origin, canvas_size, world_size, base_scale);
+            }
+        }
+
+        ViewLayout {
+            base_scale,
+            scale: layout.scale,
+            pad: (layout.pad_x, layout.pad_y),
+            offset: (layout.offset_x, layout.offset_y),
+            render_size: (layout.render_w, layout.render_h),
+        }
+    }
+
+    fn compute_layout(
+        &self,
+        canvas_origin: (f32, f32),
+        canvas_size: (f32, f32),
+        world_size: (f32, f32),
+        base_scale: f32,
+    ) -> LayoutComputation {
+        let width_px = canvas_size.0.max(1.0);
+        let height_px = canvas_size.1.max(1.0);
+        let world_w = world_size.0.max(1.0);
+        let world_h = world_size.1.max(1.0);
+
+        let scale = base_scale * self.state.zoom;
+        let render_w = world_w * scale;
+        let render_h = world_h * scale;
+        let pad_x = (width_px - render_w) * 0.5;
+        let pad_y = (height_px - render_h) * 0.5;
+        let offset_x = canvas_origin.0 + pad_x + self.state.offset_px.0;
+        let offset_y = canvas_origin.1 + pad_y + self.state.offset_px.1;
+        let fully_offscreen = (offset_x + render_w) < canvas_origin.0
+            || offset_x > (canvas_origin.0 + width_px)
+            || (offset_y + render_h) < canvas_origin.1
+            || offset_y > (canvas_origin.1 + height_px);
+
+        LayoutComputation {
+            scale,
+            render_w,
+            render_h,
+            pad_x,
+            pad_y,
+            offset_x,
+            offset_y,
+            fully_offscreen,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -418,4 +514,15 @@ mod tests {
             recovered
         );
     }
+}
+
+struct LayoutComputation {
+    scale: f32,
+    render_w: f32,
+    render_h: f32,
+    pad_x: f32,
+    pad_y: f32,
+    offset_x: f32,
+    offset_y: f32,
+    fully_offscreen: bool,
 }

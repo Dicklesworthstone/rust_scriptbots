@@ -59,12 +59,12 @@ Expose `CameraSnapshot` struct with derived data: effective_scale, view_rect, et
 
 ### Ownership Matrix (needs confirmation)
 
-| Stage | Scope | Suggested Owner(s) | Status |
+| Stage | Scope | Owner(s) | Status |
 | --- | --- | --- | --- |
-| 1 | Extract `camera.rs`, port math, add unit tests (`camera/tests.rs`) | PurpleBear (lead), reviewer TBD | In Progress |
-| 2 | Wire GPUI renderer + terminal/offscreen paths to new module | LilacLake (UI focus) | Pending |
+| 1 | Extract `camera.rs`, port math, add unit tests (`camera/tests.rs`) | PurpleBear (impl) · PinkMountain (review) | Completed 2025-10-30 |
+| 2 | Wire GPUI renderer + terminal/offscreen paths to new module | PinkMountain | In Progress |
 | 3 | UX bindings (shortcuts, HUD indicators) | RedCastle (render UX) | Pending |
-| 4 | Regression tests & docs update | PurpleBear (tests) + OrangeSnow (docs QA) | Pending |
+| 4 | Regression tests & docs update | PurpleBear (tests) · OrangeSnow (docs QA) | Pending |
 
 Please update the table once ownership is claimed so we can reflect it in PLAN §2.
 

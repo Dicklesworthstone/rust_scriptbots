@@ -11,8 +11,8 @@
 - ✅ Annotated ROI tables for each screenshot available in `docs/rendering_reference/legacy_reference_annotations.md` to guide downstream automation.
 - ✅ Headless capture recipe documented in `legacy_capture_checklist.md` (manual path retained, scripted path added for CI repeatability).
 
-### 1.2 Specification Deliverables [Spec Doc Drafted]
-- Rendering spec resides in `docs/rendering_reference/legacy_renderer_spec.md`; screenshots/ROIs complete. Next step: convert ROI tables into SVG overlays for onboarding docs (owner TBD).
+### 1.2 Specification Deliverables [Completed – RedCastle 2025-10-30]
+- Rendering spec resides in `docs/rendering_reference/legacy_renderer_spec.md`, now linked to companion SVG overlays (`legacy_*_overlay.svg`) for onboarding docs and regression tooling.
 - Reference PNGs + SHA256 published in `docs/rendering_reference/` (`checksums.txt`).
 - Diff table for keyboard/mouse controls captured in §Camera & Transform Semantics of the spec; consider duplicating into quick-reference appendix for easier cross-team consumption.
 
@@ -30,45 +30,37 @@
 - **Coordination ask:** please edit this subsection to add `[Currently In Progress – <YourName>]` next to any bullet you pick up, and drop a quick status line in `docs/rendering_reference/coordination.md` (created below) so we avoid duplicate effort.
 
 
-## 2. Build a Real Camera System [Stage 1 In Progress – PurpleBear]
+## 2. Build a Real Camera System [Stage 2 In Progress – PinkMountain]
 
-### 2.1 Camera Abstraction [Currently In Progress – PurpleBear]
-- Dedicated `Camera` struct with:
-  - `fit_world(viewport_size, world_size)`
-  - `fit_selection(bounds)`
-  - `zoom_to_cursor(cursor, delta)`
-  - `recenter(world_point)`
-  - `screen_to_world` / `world_to_screen`
-- Store configuration (min/max zoom, pan limits) in config file.
-- Draft API + integration stages captured in `docs/rendering_reference/camera_refactor_proposal.md`; ownership matrix awaiting sign-off.
+- Stage 1 delivered: `camera::Camera` module extracted, renderer migrated to use it, and invariants/unit tests landed (`camera::tests`, `camera_invariants_tests`).
+- Stage 2 focus: wire the new API through GPUI input handlers, terminal renderer, and offscreen paths while queuing UX improvements for later stages.
 
-### 2.2 Deterministic Initial State [Currently In Progress – PurpleBear]
-- Compute base scale from world + viewport using strictly defined math.
-- Default zoom = legacy multipliers; record in snapshots.
-- Persist camera state across sessions only when explicitly saved.
+### 2.1 Camera Abstraction [Completed – PurpleBear 2025-10-30]
+- `crates/scriptbots-render/src/camera/mod.rs` encapsulates zoom/pan math, exposes snapshots, and replaces the old inline `CameraState`.
+- Mutex upgrades completed; renderer now owns `Arc<Mutex<Camera>>` and shares snapshots with pickers and tests.
 
-### 2.3 User Interaction UX [Currently In Progress – PurpleBear]
-- Provide explicit controls:
-  - UI buttons (fit world, fit selection, reset transform).
-  - Keyboard shortcuts (e.g., `Ctrl+0` for reset, `Ctrl+=`/`Ctrl+-` for zoom, arrows or WASD to pan).
-  - Scroll wheel zoom to cursor with sensible speed.
-- Display camera HUD (zoom factor, pan offset, world coordinates under cursor).
-- Add smooth pan/zoom transitions (optional) to avoid jarring jumps.
+### 2.2 Deterministic Initial State [Completed – PurpleBear 2025-10-30]
+- `Camera::ensure_default_zoom` locks legacy scale (`0.2`) against computed base scale; recorded in viewport metrics for deterministic snapshots.
+- Default world-centering happens once per render cycle, matching GLUT behaviour.
 
-### 2.4 Testing and Telemetry [Currently In Progress – PurpleBear]
-- Unit tests validating camera transformations (coordination with PurpleBear on viewport invariants).
-- Snapshot tests covering zoom levels.
-- Instrument metrics (zoom range, pan range, invalid transforms) so QA can monitor usage.
+### 2.3 User Interaction UX [Stage 2 In Progress – PinkMountain]
+- TODO: route GPUI mouse/keyboard events through `Camera::start_pan/update_pan/apply_scroll` without syncing legacy helpers.
+- TODO: add `Camera::world_to_screen` consumers for HUD overlays and inspector panels.
+- TODO: schedule follow-mode refactor (fit-selection buttons) after Stage 2 baseline is stable.
+
+### 2.4 Testing and Telemetry [Ongoing – PinkMountain]
+- Stage 1 unit + invariant tests complete; extend coverage in Stage 2 to include terminal/offscreen camera parity and HUD coordinate readouts.
+- Coordinate with PurpleBear to hook new assertions into the snapshot harness once Stage 2 lands.
 
 
 ## 3. Match and Improve the Classic Visuals [Needs Lead]
 
-### 3.1 Palette and Styling [Owner Needed]
+### 3.1 Palette and Styling [Currently In Progress – RedCastle]
 - Recreate the six terrain colours from the GLUT shader.
 - Define agent colour rules (herbivore vs carnivore tinting, health indicators).
 - Implement halo, spike, selection rings, and indicator pulses (matching timing).
 
-### 3.2 Agent Legibility [Owner Needed]
+### 3.2 Agent Legibility [Currently In Progress – RedCastle]
 - Increase default render radius or draw scaled sprites so agents remain visible at overview zooms.
 - Add drop shadows or outlines for contrast against terrain.
 - Provide optional AO/lighting/elevation shading.
