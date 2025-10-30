@@ -664,6 +664,7 @@ Implementation notes [2025-10-23]:
 - Deterministic visuals (no racey CPU/GPU feedback loops). GPUI retains input, overlays, inspector panels, and charts.
 - Clean, testable crate boundaries: world renderer is a small, well‑documented wgpu crate with no GPUI dependency; GPUI owns composition only.
 - [Currently In Progress - 2025-10-30 OrangeSnow] Restore legacy geometry parity (6000×3000 world bounds, 50px food grid, 10px agent base radius) so GPUI and wgpu renders line up with the original GLUT visuals.
+- [Currently In Progress - 2025-10-30 BlackSnow] Align GPUI camera/window defaults with the legacy GLUT renderer (initial zoom ≈0.2 on a 1600×900 viewport, CPU canvas as safe default) so out-of-box visuals match the reference build.
 
 ### Architecture Overview
 1) New crate: `crates/scriptbots-world-gfx`

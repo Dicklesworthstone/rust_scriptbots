@@ -907,7 +907,7 @@ fn use_wgpu_renderer() -> bool {
         let choice = match std::env::var("SB_RENDERER").ok().as_deref() {
             Some("canvas") => false,
             Some("wgpu") => true,
-            _ => true,
+            _ => false,
         };
         tracing::info!(choice, env = %std::env::var("SB_RENDERER").unwrap_or_default(), "use_wgpu_renderer decision");
         choice
@@ -945,22 +945,18 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let world_w = world_size.0.max(1.0);
     let world_h = world_size.1.max(1.0);
     let base_scale = (width_px / world_w).min(height_px / world_h).max(0.0001);
-    let scale = base_scale * state.camera.lock().map(|c| c.zoom).unwrap_or(1.0);
+    let mut camera_guard = state.camera.lock().expect("camera mutex poisoned");
+    camera_guard.ensure_default_zoom(base_scale);
+    let zoom = camera_guard.zoom;
+    let (off_px_x, off_px_y) = camera_guard.offset_px;
+    drop(camera_guard);
+
+    let scale = base_scale * zoom;
     let pad_x = (width_px - world_w * scale) * 0.5;
     let pad_y = (height_px - world_h * scale) * 0.5;
-    let (off_px_x, off_px_y) = state
-        .camera
-        .lock()
-        .map(|c| c.offset_px)
-        .unwrap_or((0.0, 0.0));
     // Offscreen world renderer uses (0,0) origin; include only pad and camera offset
     let cam_offset = (pad_x + off_px_x, pad_y + off_px_y);
 
-    let zoom = if base_scale > 0.0 {
-        scale / base_scale
-    } else {
-        1.0
-    };
     if env_flag("SB_WGPU_LAYOUT_LOG") {
         let render_scale = comp.render_scale_factor();
         tracing::info!(
@@ -1179,7 +1175,7 @@ pub fn run_demo(
         }
 
         // Window B: Dedicated simulation viewport (minimal chrome)
-        let sim_bounds = Bounds::centered(None, size(px(1024.0), px(768.0)), app);
+        let sim_bounds = Bounds::centered(None, size(px(1600.0), px(900.0)), app);
         let mut sim_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(sim_bounds)),
             ..Default::default()
@@ -9982,6 +9978,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
 struct CameraState {
     offset_px: (f32, f32),
     zoom: f32,
+    zoom_initialized: bool,
     panning: bool,
     pan_anchor: Option<Point<Pixels>>,
     last_canvas_origin: (f32, f32),
@@ -9997,6 +9994,7 @@ impl Default for CameraState {
         Self {
             offset_px: (0.0, 0.0),
             zoom: Self::default_zoom(),
+            zoom_initialized: false,
             panning: false,
             pan_anchor: None,
             last_canvas_origin: (0.0, 0.0),
@@ -10008,6 +10006,8 @@ impl Default for CameraState {
         }
     }
 }
+const LEGACY_CAMERA_SCALE: f32 = 0.2;
+
 impl CameraState {
     const MIN_ZOOM: f32 = 0.4;
     const MAX_ZOOM: f32 = 2.5;
@@ -10040,6 +10040,18 @@ impl CameraState {
     fn end_pan(&mut self) {
         self.panning = false;
         self.pan_anchor = None;
+    }
+
+    fn ensure_default_zoom(&mut self, base_scale: f32) {
+        if self.zoom_initialized {
+            return;
+        }
+        if base_scale <= 0.0 {
+            return;
+        }
+        let desired = (LEGACY_CAMERA_SCALE / base_scale).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        self.zoom = desired;
+        self.zoom_initialized = true;
     }
 
     fn apply_scroll(&mut self, event: &ScrollWheelEvent) -> bool {
@@ -10078,6 +10090,7 @@ impl CameraState {
         self.zoom = new_zoom;
         self.offset_px.0 = cursor_x - origin_x - pad_x_new - world_x * new_scale;
         self.offset_px.1 = cursor_y - origin_y - pad_y_new - world_y * new_scale;
+        self.zoom_initialized = true;
         true
     }
 
@@ -10911,6 +10924,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let origin_y = f32::from(origin.y);
 
     let base_scale = (width_px / world_w).min(height_px / world_h).max(0.000_1);
+    camera_guard.ensure_default_zoom(base_scale);
     let scale = base_scale * camera_guard.zoom;
     let render_w = world_w * scale;
     let render_h = world_h * scale;

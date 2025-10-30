@@ -176,7 +176,7 @@ fn main() -> Result<()> {
                 .png_size
                 .as_deref()
                 .and_then(parse_png_size)
-                .unwrap_or((1280, 720));
+                .unwrap_or((1600, 900));
 
             let bytes = {
                 let guard = world.lock().expect("world mutex poisoned");
