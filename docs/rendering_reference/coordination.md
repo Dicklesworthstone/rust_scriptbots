@@ -11,6 +11,7 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - PurpleBear: Added Stage 1 extraction checklist (`docs/rendering_reference/camera_refactor_task_breakdown.md`) detailing current camera touchpoints, extraction steps, and open questions for the eventual owner.
 - PurpleBear & PinkMountain: Completed Stage 1 camera extraction (PLAN §2.1/§2.2/§2.4) — `camera/mod.rs` merged, renderer now uses `Camera`, and unit/invariant tests landed.
 - PurpleBear: Added `render_regression` GitHub Actions job (Ubuntu + Windows) running snapshot + camera invariants with path filters and diff artifact uploads; PLAN §1.3 CI bullet marked complete.
+- PurpleBear: Stage 2 wiring underway – GPUI/wgpu/CPU render paths now consume `Camera::layout`; offscreen snapshot still pending follow-up.
 - PinkMountain: Claimed PLAN §1.3 viewport invariants; aligning tests with new camera module. Will share progress updates as camera Stage 1 lands.
 - PinkMountain: Drafted Stage 1 work breakdown for camera refactor (`camera_stage1_plan.md`); Stage 2 wiring underway pending visuals/CI ownership.
 - PinkMountain: Owning Stage 2 camera wiring (GPUI + terminal/offscreen integration) per PLAN §2.3/§2.4 updates.

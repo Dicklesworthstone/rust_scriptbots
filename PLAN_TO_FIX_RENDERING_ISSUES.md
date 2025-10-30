@@ -30,7 +30,7 @@
 - **Coordination ask:** please edit this subsection to add `[Currently In Progress – <YourName>]` next to any bullet you pick up, and drop a quick status line in `docs/rendering_reference/coordination.md` (created below) so we avoid duplicate effort.
 
 
-## 2. Build a Real Camera System [Stage 2 In Progress – PinkMountain]
+## 2. Build a Real Camera System [Stage 2 In Progress – PurpleBear]
 
 - Stage 1 delivered: `camera::Camera` module extracted, renderer migrated to use it, and invariants/unit tests landed (`camera::tests`, `camera_invariants_tests`).
 - Stage 2 focus: wire the new API through GPUI input handlers, terminal renderer, and offscreen paths while queuing UX improvements for later stages.
@@ -43,12 +43,12 @@
 - `Camera::ensure_default_zoom` locks legacy scale (`0.2`) against computed base scale; recorded in viewport metrics for deterministic snapshots.
 - Default world-centering happens once per render cycle, matching GLUT behaviour.
 
-### 2.3 User Interaction UX [Stage 2 In Progress – PinkMountain]
+### 2.3 User Interaction UX [Stage 2 In Progress – PurpleBear]
 - TODO: route GPUI mouse/keyboard events through `Camera::start_pan/update_pan/apply_scroll` without syncing legacy helpers.
 - TODO: add `Camera::world_to_screen` consumers for HUD overlays and inspector panels.
 - TODO: schedule follow-mode refactor (fit-selection buttons) after Stage 2 baseline is stable.
 
-### 2.4 Testing and Telemetry [Ongoing – PinkMountain]
+### 2.4 Testing and Telemetry [Ongoing – PurpleBear]
 - Stage 1 unit + invariant tests complete; extend coverage in Stage 2 to include terminal/offscreen camera parity and HUD coordinate readouts.
 - Coordinate with PurpleBear to hook new assertions into the snapshot harness once Stage 2 lands.
 

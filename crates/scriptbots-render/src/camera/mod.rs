@@ -78,11 +78,13 @@ impl Camera {
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn zoom(&self) -> f32 {
         self.state.zoom
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn offset(&self) -> (f32, f32) {
         self.state.offset_px
@@ -93,11 +95,13 @@ impl Camera {
         self.panning
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn is_centered(&self) -> bool {
         self.state.centered_once
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn mark_centered(&mut self) {
         self.state.centered_once = true;

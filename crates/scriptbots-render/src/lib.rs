@@ -945,34 +945,37 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     // Reuse the same mapping used in paint_frame
     let width_px = f32::from(bounds.size.width).max(1.0);
     let height_px = f32::from(bounds.size.height).max(1.0);
-    let world_w = world_size.0.max(1.0);
-    let world_h = world_size.1.max(1.0);
+    let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+    let world_dims = (world_size.0.max(1.0), world_size.1.max(1.0));
     let mut camera_guard = state.camera.lock().expect("camera mutex poisoned");
-    let layout = camera_guard.layout(
-        (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
-        (width_px, height_px),
-        (world_w, world_h),
-    );
+    let mut layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+
+    if state.controls.follow_mode != FollowMode::Off
+        && let Some(target) = state.follow_target
+    {
+        camera_guard.center_on(target);
+        layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+    }
+
+    let zoom = camera_guard.zoom();
     drop(camera_guard);
 
     let scale = layout.scale;
     let base_scale = layout.base_scale;
     let pad_x = layout.pad.0;
     let pad_y = layout.pad.1;
+    let off_px_x = layout.offset.0;
+    let off_px_y = layout.offset.1;
     // Offscreen world renderer uses (0,0) origin; include only pad and camera offset relative to origin
-    let cam_offset = (
-        layout.offset.0 - f32::from(bounds.origin.x),
-        layout.offset.1 - f32::from(bounds.origin.y),
-    );
-    let zoom = scale / base_scale;
+    let cam_offset = (off_px_x - origin.0, off_px_y - origin.1);
 
     if env_flag("SB_WGPU_LAYOUT_LOG") {
         let render_scale = comp.render_scale_factor();
         tracing::info!(
             viewport_width = width_px,
             viewport_height = height_px,
-            world_width = world_w,
-            world_height = world_h,
+            world_width = world_dims.0,
+            world_height = world_dims.1,
             pad_x,
             pad_y,
             offset_x = cam_offset.0,
@@ -987,8 +990,8 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         tracing::info!(
             vw = width_px,
             vh = height_px,
-            world_w = world_w,
-            world_h = world_h,
+            world_w = world_dims.0,
+            world_h = world_dims.1,
             base_scale = base_scale,
             scale = scale,
             pad_x = pad_x,
@@ -1067,8 +1070,8 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     tracing::info!(
         vw = width_px,
         vh = height_px,
-        world_w = world_w,
-        world_h = world_h,
+        world_w = world_dims.0,
+        world_h = world_dims.1,
         base_scale = base_scale,
         scale = scale,
         pad_x = pad_x,
@@ -7443,12 +7446,12 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
                 });
             let food = world.food().get(tx, ty).unwrap_or(0.0);
             let base = match tile.kind {
-                TerrainKind::DeepWater => (40u8, 80u8, 200u8),
-                TerrainKind::ShallowWater => (60, 120, 220),
-                TerrainKind::Sand => (210, 200, 160),
-                TerrainKind::Grass => (60, 160, 60),
-                TerrainKind::Bloom => (200, 120, 200),
-                TerrainKind::Rock => (100, 100, 110),
+                TerrainKind::DeepWater => (30u8, 63u8, 102u8),
+                TerrainKind::ShallowWater => (47, 115, 179),
+                TerrainKind::Sand => (177, 78, 7),
+                TerrainKind::Grass => (80, 169, 19),
+                TerrainKind::Bloom => (121, 212, 109),
+                TerrainKind::Rock => (169, 177, 186),
             };
             let food_shade = (food.clamp(0.0, 1.0) * 90.0) as u8;
             let r = base.0.saturating_add(food_shade);
@@ -10128,19 +10131,52 @@ fn paint_terrain_layer(
     }
 }
 
+const LEGACY_TERRAIN_BASE: [[f32; 3]; 6] = [
+    [0.117_647, 0.247_059, 0.400_000], // Deep water (#1E3F66)
+    [0.184_314, 0.450_980, 0.701_961], // Shallow water (#2F73B3)
+    [0.694_118, 0.305_882, 0.027_451], // Sand (#B14E07)
+    [0.313_725, 0.662_745, 0.074_510], // Grass (#50A913)
+    [0.474_510, 0.831_373, 0.427_451], // Bloom (#79D46D)
+    [0.662_745, 0.694_118, 0.729_412], // Rock (#A9B1BA)
+];
+
+const LEGACY_TERRAIN_ACCENT: [[f32; 3]; 6] = [
+    [0.211_765, 0.462_745, 0.650_980], // Deep water caustics (#3676A6)
+    [0.345_098, 0.658_824, 0.878_431], // Shallow water shimmer (#58A8E0)
+    [0.823_529, 0.490_196, 0.184_314], // Sand highlights (#D27D2F)
+    [0.423_529, 0.890_196, 0.223_529], // Grass fertility glow (#6CE339)
+    [0.615_686, 0.960_784, 0.627_451], // Bloom energy (#9DF5A0)
+    [0.823_529, 0.854_902, 0.898_039], // Rock snowcaps (#D2DAE5)
+];
+
+#[inline]
+fn terrain_kind_index(kind: TerrainKind) -> usize {
+    match kind {
+        TerrainKind::DeepWater => 0,
+        TerrainKind::ShallowWater => 1,
+        TerrainKind::Sand => 2,
+        TerrainKind::Grass => 3,
+        TerrainKind::Bloom => 4,
+        TerrainKind::Rock => 5,
+    }
+}
+
+#[inline]
+fn terrain_base_color(kind: TerrainKind) -> [f32; 3] {
+    LEGACY_TERRAIN_BASE[terrain_kind_index(kind)]
+}
+
+#[inline]
+fn terrain_accent_color(kind: TerrainKind) -> [f32; 3] {
+    LEGACY_TERRAIN_ACCENT[terrain_kind_index(kind)]
+}
+
 fn terrain_surface_color(
     tile: TerrainTileVisual,
     daylight: f32,
     palette: ColorPaletteMode,
 ) -> Rgba {
-    let base = match tile.kind {
-        TerrainKind::DeepWater => [0.05, 0.11, 0.23],
-        TerrainKind::ShallowWater => [0.12, 0.34, 0.46],
-        TerrainKind::Sand => [0.40, 0.33, 0.20],
-        TerrainKind::Grass => [0.20, 0.34, 0.18],
-        TerrainKind::Bloom => [0.18, 0.42, 0.22],
-        TerrainKind::Rock => [0.34, 0.33, 0.41],
-    };
+    let base = terrain_base_color(tile.kind);
 
     let mut color = rgba_from_triplet_with_alpha(base, 1.0);
     let brightness = match tile.kind {
@@ -10171,14 +10207,7 @@ fn terrain_slope_accent_color(
     highlight_shift: f32,
     palette: ColorPaletteMode,
 ) -> Rgba {
-    let accent = match tile.kind {
-        TerrainKind::DeepWater => [0.23, 0.58, 0.86],
-        TerrainKind::ShallowWater => [0.45, 0.82, 0.98],
-        TerrainKind::Sand => [0.75, 0.57, 0.29],
-        TerrainKind::Grass => [0.34, 0.66, 0.28],
-        TerrainKind::Bloom => [0.52, 0.86, 0.44],
-        TerrainKind::Rock => [0.78, 0.78, 0.86],
-    };
+    let accent = terrain_accent_color(tile.kind);
     let alpha = (0.09 + tile.slope * highlight_shift).clamp(0.04, 0.42);
     let mut color = rgba_from_triplet_with_alpha(accent, alpha);
     color = scale_rgb(color, 0.85 + tile.accent * 0.4);
@@ -10731,27 +10760,45 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let origin = bounds.origin;
     let bounds_size = bounds.size;
 
+    let world_w = frame.world_size.0.max(1.0);
+    let world_h = frame.world_size.1.max(1.0);
+
     let low_fps = state.perf.fps > 0.0 && state.perf.fps < 30.0;
     let very_low_fps = state.perf.fps > 0.0 && state.perf.fps < 24.0;
     let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);
 
     let mut camera_guard = camera.lock().expect("camera lock poisoned");
 
-    let world_w = frame.world_size.0.max(1.0);
-    let world_h = frame.world_size.1.max(1.0);
-
     let width_px = f32::from(bounds_size.width).max(1.0);
     let height_px = f32::from(bounds_size.height).max(1.0);
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
-    let base_scale = (width_px / world_w).min(height_px / world_h).max(0.000_1);
-    camera_guard.ensure_default_zoom(base_scale);
-    let scale = base_scale * camera_guard.zoom();
-    let render_w = world_w * scale;
-    let render_h = world_h * scale;
-    let pad_x = (width_px - render_w) * 0.5;
-    let pad_y = (height_px - render_h) * 0.5;
+    let mut layout = camera_guard.layout(
+        (origin_x, origin_y),
+        (width_px, height_px),
+        frame.world_size,
+    );
+
+    if controls.follow_mode != FollowMode::Off
+        && let Some(target) = follow_target
+    {
+        camera_guard.center_on(target);
+        layout = camera_guard.layout(
+            (origin_x, origin_y),
+            (width_px, height_px),
+            frame.world_size,
+        );
+    }
+
+    let scale = layout.scale;
+    let base_scale = layout.base_scale;
+    let render_w = layout.render_size.0;
+    let render_h = layout.render_size.1;
+    let pad_x = layout.pad.0;
+    let pad_y = layout.pad.1;
+    let mut offset_x = layout.offset.0;
+    let mut offset_y = layout.offset.1;
 
     // Compute view bounds in window space used for culling and offscreen checks
     let view_left = origin_x;
@@ -10759,77 +10806,19 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let view_right = view_left + width_px;
     let view_bottom = view_top + height_px;
 
-    // Offscreen guard: if the world render rect lies completely outside the canvas,
-    // recenter on world midpoint to avoid a blank view after extreme panning.
-    let mut offset = camera_guard.offset();
-    let (mut offset_x, mut offset_y) = (origin_x + pad_x + offset.0, origin_y + pad_y + offset.1);
-    let fully_offscreen = (offset_x + render_w) < view_left
-        || offset_x > view_right
-        || (offset_y + render_h) < view_top
-        || offset_y > view_bottom;
-    if fully_offscreen {
-        let world_center = Position {
-            x: frame.world_size.0 * 0.5,
-            y: frame.world_size.1 * 0.5,
-        };
-        camera_guard.center_on(world_center);
-        // Values will be recomputed below after any follow-target recentering
-    }
-
-    camera_guard.record_render_metrics(
-        (origin_x, origin_y),
-        (width_px, height_px),
-        frame.world_size,
-        base_scale,
-    );
-    // On the first GUI paint, ensure the map is centered and fully visible.
-    if !camera_guard.is_centered() {
-        let world_center = Position {
-            x: frame.world_size.0 * 0.5,
-            y: frame.world_size.1 * 0.5,
-        };
-        camera_guard.center_on(world_center);
-        camera_guard.mark_centered();
-        // Recompute offsets after forcing center once
-        offset = camera_guard.offset();
-        offset_x = origin_x + pad_x + offset.0;
-        offset_y = origin_y + pad_y + offset.1;
-        let fully_offscreen_after_center = (offset_x + render_w) < view_left
-            || offset_x > view_right
-            || (offset_y + render_h) < view_top
-            || offset_y > view_bottom;
-        if fully_offscreen_after_center {
-            let world_center = Position {
-                x: frame.world_size.0 * 0.5,
-                y: frame.world_size.1 * 0.5,
-            };
-            camera_guard.center_on(world_center);
-        }
-    }
-
-    if controls.follow_mode != FollowMode::Off
-        && let Some(target) = follow_target
-    {
-        camera_guard.center_on(target);
-    }
-    // Follow target may change camera offset; recompute offsets if it did
-    offset = camera_guard.offset();
-    offset_x = origin_x + pad_x + offset.0;
-    offset_y = origin_y + pad_y + offset.1;
-
     if env_flag("SB_CPU_LAYOUT_LOG") {
         tracing::info!(
             viewport_width = width_px,
             viewport_height = height_px,
-            world_width = world_w,
-            world_height = world_h,
+            world_width = frame.world_size.0,
+            world_height = frame.world_size.1,
             origin_x,
             origin_y,
             pad_x,
             pad_y,
             offset_x,
             offset_y,
-            zoom = camera_guard.zoom(),
+            zoom = scale / base_scale,
             "cpu_canvas_layout"
         );
     }
@@ -11089,8 +11078,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             for agent in &frame.agents {
                 let px_x = offset_x + agent.position.x * scale;
                 let px_y = offset_y + agent.position.y * scale;
-                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
-                let size_px = (dynamic_radius * scale).max(2.0);
+                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
+                let size_px = (dynamic_radius * scale).max(4.0);
                 let half = size_px * 0.5;
 
                 // Cull off-screen agents
@@ -11145,8 +11134,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             for agent in &frame.agents {
                 let px_x = offset_x + agent.position.x * scale;
                 let px_y = offset_y + agent.position.y * scale;
-                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
-                let size_px = (dynamic_radius * scale).max(2.0);
+                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
+                let size_px = (dynamic_radius * scale).max(4.0);
                 let half = size_px * 0.5;
 
                 // Cull off-screen agents
@@ -11157,17 +11146,38 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 {
                     continue;
                 }
+
+                if !low_fps {
+                    let shadow_size = size_px * 1.25;
+                    let shadow_half = shadow_size * 0.5;
+                    let shadow_offset_x = scale.clamp(1.0, 6.0) * 0.6;
+                    let shadow_offset_y = scale.clamp(1.0, 7.0) * 1.1;
+                    let shadow_bounds = Bounds::new(
+                        point(px(px_x - shadow_half + shadow_offset_x), px(px_y - shadow_half + shadow_offset_y)),
+                        size(px(shadow_size), px(shadow_size)),
+                    );
+                    let shadow_color = apply_palette(
+                        Rgba {
+                            r: 0.05,
+                            g: 0.08,
+                            b: 0.10,
+                            a: 0.38,
+                        },
+                        frame.palette,
+                    );
+                    window.paint_quad(fill(shadow_bounds, Background::from(shadow_color)));
+                }
                 // Inline highlights without allocating
                 if !very_low_fps {
                     match agent.selection {
                         SelectionState::Selected => {
-                            let factor = 1.8;
+                            let factor = 1.85;
                             let highlight = apply_palette(
                                 Rgba {
-                                    r: 0.20,
-                                    g: 0.65,
-                                    b: 0.96,
-                                    a: 0.35,
+                                    r: 0.98,
+                                    g: 0.82,
+                                    b: 0.32,
+                                    a: 0.36,
                                 },
                                 frame.palette,
                             );
@@ -11180,13 +11190,13 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                             window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
                         }
                         SelectionState::Hovered => {
-                            let factor = 1.4;
+                            let factor = 1.45;
                             let highlight = apply_palette(
                                 Rgba {
-                                    r: 0.92,
-                                    g: 0.58,
-                                    b: 0.20,
-                                    a: 0.30,
+                                    r: 0.94,
+                                    g: 0.56,
+                                    b: 0.22,
+                                    a: 0.26,
                                 },
                                 frame.palette,
                             );
@@ -11205,9 +11215,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         let factor = 2.05;
                         let highlight = apply_palette(
                             Rgba {
-                                r: 0.45,
-                                g: 0.88,
-                                b: 0.97,
+                                r: 0.40,
+                                g: 0.82,
+                                b: 0.94,
                                 a: 0.32,
                             },
                             frame.palette,
@@ -11307,13 +11317,13 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
         // Batched agent outlines pass
         if controls.agent_outline && !very_low_fps {
-            let mut outline_builder = PathBuilder::stroke(px(1.8));
+            let mut outline_builder = PathBuilder::stroke(px(2.6));
 
             for agent in &frame.agents {
                 let px_x = offset_x + agent.position.x * scale;
                 let px_y = offset_y + agent.position.y * scale;
-                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(6.0);
-                let size_px = (dynamic_radius * scale).max(2.0);
+                let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
+                let size_px = (dynamic_radius * scale).max(4.0);
                 let half = size_px * 0.5;
                 if px_x + half < view_left
                     || px_x - half > view_right
@@ -11327,7 +11337,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 append_arc_polyline(&mut outline_builder, px_x, px_y, outline_radius, 0.0, 360.0);
             }
             if let Ok(path) = outline_builder.build() {
-                window.paint_path(path, rgba_from_hex(0xffffff, 0.35));
+                window.paint_path(path, rgba_from_hex(0x10151a, 0.78));
             }
         }
     }
@@ -11359,10 +11369,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 fn food_color(intensity: f32) -> Rgba {
     let clamped = intensity.clamp(0.0, 1.0);
     Rgba {
-        r: 0.06 + 0.25 * clamped,
-        g: 0.22 + 0.55 * clamped,
-        b: 0.12 + 0.25 * clamped,
-        a: 0.2 + 0.45 * clamped,
+        r: (0.16 + 0.20 * clamped).clamp(0.0, 1.0),
+        g: (0.46 + 0.36 * clamped).clamp(0.0, 1.0),
+        b: (0.19 + 0.18 * clamped).clamp(0.0, 1.0),
+        a: 0.18 + 0.42 * clamped,
     }
 }
 
@@ -11370,13 +11380,18 @@ fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
     let base_r = agent.color[0].clamp(0.0, 1.0);
     let base_g = agent.color[1].clamp(0.0, 1.0);
     let base_b = agent.color[2].clamp(0.0, 1.0);
-    let health_factor = (agent.health / 2.0).clamp(0.35, 1.0);
+    let health_factor = (agent.health / 2.0).clamp(0.45, 1.0);
+
+    let blend_channel = |base: f32| {
+        let lit = base * health_factor * shade;
+        (lit * 0.85 + base * 0.15).max(0.08).min(1.0)
+    };
 
     Rgba {
-        r: (base_r * health_factor * shade).clamp(0.0, 1.0),
-        g: (base_g * health_factor * shade).clamp(0.0, 1.0),
-        b: (base_b * health_factor * shade).clamp(0.0, 1.0),
-        a: 0.9,
+        r: blend_channel(base_r),
+        g: blend_channel(base_g),
+        b: blend_channel(base_b),
+        a: 0.96,
     }
 }
 

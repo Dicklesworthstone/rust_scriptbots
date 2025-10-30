@@ -39,4 +39,9 @@ _Updated: 2025-10-30 – drafted by PurpleBear for Stage 1 deep dive._
 2. Do we persist `last_canvas_*` inside camera or inside snapshot? (Recommendation: keep in camera so `screen_to_world` remains a pure method post-update.)
 3. Should `Camera` expose change notifications (e.g., returning a `CameraUpdate` struct) or should GPUI poll after mutations? (Leaning toward update struct to minimize redundant repaints.)
 
+### Stage 2 TODOs (ongoing)
+
+- [ ] Update `render_png_offscreen` to leverage `Camera::layout`/`world_to_screen` so offscreen snapshots match interactive view.
+- [ ] Replace remaining manual pad/offset math in HUD overlays with helpers from `Camera` (e.g., `ViewLayout`).
+
 Please add notes inline or update the checklist once ownership is confirmed.
