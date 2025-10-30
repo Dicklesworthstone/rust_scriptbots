@@ -784,14 +784,14 @@ mod wgpu_capture_test {
         let _ = std::fs::create_dir_all("frames_render_test");
         let mut comp = Compositor::new();
         let viewport = (640u32, 360u32);
-        // Simple 60x34 grass snapshot
-        let dims = (60u32, 34u32);
+        // Simple 120x60 grass snapshot (50-unit cells matching default config)
+        let dims = (120u32, 60u32);
         let tiles: Vec<u32> = vec![3u32; (dims.0 * dims.1) as usize];
         let snapshot = GfxSnapshot {
-            world_size: (6000.0, 6000.0),
+            world_size: (6000.0, 3000.0),
             terrain: TerrainView {
                 dims,
-                cell_size: 100,
+                cell_size: 50,
                 tiles: &tiles,
                 elevation: None,
             },
@@ -829,8 +829,8 @@ mod wgpu_capture_test {
         let mut comp = Compositor::new();
         let viewport = (640u32, 360u32);
 
-        // Patterned 60x34 terrain across all six kinds
-        let dims = (60u32, 34u32);
+        // Patterned 120x60 terrain across all six kinds
+        let dims = (120u32, 60u32);
         let mut tiles: Vec<u32> = Vec::with_capacity((dims.0 * dims.1) as usize);
         for y in 0..dims.1 {
             for x in 0..dims.0 {
@@ -839,7 +839,7 @@ mod wgpu_capture_test {
         }
 
         // Fit entire world into the viewport (match the GPUI mapping)
-        let world_size = (6000.0f32, 6000.0f32);
+        let world_size = (6000.0f32, 3000.0f32);
         let base_scale = (viewport.0 as f32 / world_size.0)
             .min(viewport.1 as f32 / world_size.1)
             .max(0.0001);
@@ -871,7 +871,7 @@ mod wgpu_capture_test {
             world_size,
             terrain: TerrainView {
                 dims,
-                cell_size: 100,
+                cell_size: 50,
                 tiles: &tiles,
                 elevation: None,
             },
@@ -9588,7 +9588,7 @@ impl RenderFrame {
             food_cells,
             food_max: config.food_max,
             agents,
-            agent_base_radius: (config.spike_radius * 0.5).max(12.0),
+            agent_base_radius: config.bot_radius.max(1.0),
             sense_radius: config.sense_radius,
             post_stack: build_post_process_stack(world, palette),
             palette,

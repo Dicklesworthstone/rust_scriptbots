@@ -284,12 +284,13 @@ mod capture_smoke_test {
         let size = (640, 360);
         let mut renderer =
             pollster::block_on(WorldRenderer::new(&adapter, size)).expect("renderer");
-        let tiles = vec![3u32; (60 * 34) as usize];
+        let dims = (120u32, 60u32);
+        let tiles = vec![3u32; (dims.0 * dims.1) as usize];
         let snapshot = WorldSnapshot {
-            world_size: (6000.0, 6000.0),
+            world_size: (6000.0, 3000.0),
             terrain: TerrainView {
-                dims: (60, 34),
-                cell_size: 100,
+                dims,
+                cell_size: 50,
                 tiles: &tiles,
                 elevation: None,
             },

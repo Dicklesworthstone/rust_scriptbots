@@ -663,6 +663,7 @@ Implementation notes [2025-10-23]:
 - Smooth 60–120 FPS world rendering at 1080p/1440p with 10k+ agents under typical settings.
 - Deterministic visuals (no racey CPU/GPU feedback loops). GPUI retains input, overlays, inspector panels, and charts.
 - Clean, testable crate boundaries: world renderer is a small, well‑documented wgpu crate with no GPUI dependency; GPUI owns composition only.
+- [Currently In Progress - 2025-10-30 OrangeSnow] Restore legacy geometry parity (6000×3000 world bounds, 50px food grid, 10px agent base radius) so GPUI and wgpu renders line up with the original GLUT visuals.
 
 ### Architecture Overview
 1) New crate: `crates/scriptbots-world-gfx`

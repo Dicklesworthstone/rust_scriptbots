@@ -2204,8 +2204,8 @@ impl Default for ScriptBotsConfig {
     fn default() -> Self {
         Self {
             world_width: 6_000,
-            world_height: 6_000,
-            food_cell_size: 60,
+            world_height: 3_000,
+            food_cell_size: 50,
             initial_food: 0.0,
             rng_seed: None,
             chart_flush_interval: 1_000,
