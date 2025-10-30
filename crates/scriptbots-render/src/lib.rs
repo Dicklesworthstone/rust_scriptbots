@@ -1037,17 +1037,24 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
                 SelectionState::Selected => 2u32,
                 SelectionState::None => 0u32,
             };
-            let dyn_radius = (state.frame.agent_base_radius + a.spike_length * 0.25).max(6.0);
+            let dyn_radius = (state.frame.agent_base_radius + a.spike_length * 0.25).max(8.0);
             let glow_from_indicator = (a.indicator.intensity * 0.35).clamp(0.0, 1.0);
             let glow_from_spike = if a.spiked { 0.45 } else { 0.0 };
             let glow_from_repro = (a.reproduction_intent * 0.25).clamp(0.0, 0.6);
             let glow = glow_from_indicator
                 .max(glow_from_spike)
                 .max(glow_from_repro);
+            let shade_wave =
+                ((a.position.x + a.position.y) * 0.04 + state.frame.tick as f32 * 0.00025).cos();
+            let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
+            let mut body = agent_color(a, agent_shade);
+            if !matches!(state.frame.palette, ColorPaletteMode::Natural) {
+                body = apply_palette(body, state.frame.palette);
+            }
             scriptbots_world_gfx::AgentInstance {
                 position: [a.position.x, a.position.y],
                 size: dyn_radius,
-                color: [a.color[0], a.color[1], a.color[2], 1.0],
+                color: [body.r, body.g, body.b, body.a],
                 selection: sel,
                 glow,
                 boost: if a.spiked { 1.0 } else { 0.0 },
@@ -11153,7 +11160,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     let shadow_offset_x = scale.clamp(1.0, 6.0) * 0.6;
                     let shadow_offset_y = scale.clamp(1.0, 7.0) * 1.1;
                     let shadow_bounds = Bounds::new(
-                        point(px(px_x - shadow_half + shadow_offset_x), px(px_y - shadow_half + shadow_offset_y)),
+                        point(
+                            px(px_x - shadow_half + shadow_offset_x),
+                            px(px_y - shadow_half + shadow_offset_y),
+                        ),
                         size(px(shadow_size), px(shadow_size)),
                     );
                     let shadow_color = apply_palette(
