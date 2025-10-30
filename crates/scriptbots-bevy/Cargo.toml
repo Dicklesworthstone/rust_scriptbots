@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
-bevy = { version = "0.14", features = ["dynamic_linking"] }
+bevy = { version = "0.14" }
 tracing = { workspace = true }

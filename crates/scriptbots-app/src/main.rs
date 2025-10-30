@@ -776,6 +776,8 @@ fn merge_layer(base: &mut JsonValue, layer: JsonValue) {
 enum RendererMode {
     Auto,
     Gui,
+    #[cfg(feature = "bevy_render")]
+    Bevy,
     Terminal,
 }
 
@@ -784,6 +786,8 @@ impl RendererMode {
         match self {
             Self::Auto => "auto",
             Self::Gui => "gui",
+            #[cfg(feature = "bevy_render")]
+            Self::Bevy => "bevy",
             Self::Terminal => "terminal",
         }
     }
@@ -823,6 +827,16 @@ fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Rendere
                 }
                 Ok((RendererMode::Gui, Box::new(GuiRenderer)))
             }
+        }
+        #[cfg(feature = "bevy_render")]
+        RendererMode::Bevy => Ok((RendererMode::Bevy, Box::new(BevyRenderer::default()))),
+        #[cfg(not(feature = "bevy_render"))]
+        RendererMode::Bevy => {
+            warn!("Bevy renderer requested, but binary was built without bevy_render. Falling back to terminal UI.");
+            Ok((
+                RendererMode::Terminal,
+                Box::new(TerminalRenderer::default()),
+            ))
         }
         RendererMode::Terminal => Ok((
             RendererMode::Terminal,
@@ -868,6 +882,22 @@ impl Renderer for GuiRenderer {
             let _ = ctx;
             bail!("GUI feature not enabled; recompile with --features gui or use --mode terminal");
         }
+    }
+}
+
+#[cfg(feature = "bevy_render")]
+#[derive(Default)]
+struct BevyRenderer;
+
+#[cfg(feature = "bevy_render")]
+impl Renderer for BevyRenderer {
+    fn name(&self) -> &'static str {
+        "bevy"
+    }
+
+    fn run(&self, _ctx: RendererContext<'_>) -> Result<()> {
+        prepare_linux_gui_backend();
+        scriptbots_bevy::run_stub_renderer()
     }
 }
 
