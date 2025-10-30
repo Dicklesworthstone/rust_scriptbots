@@ -57,6 +57,17 @@ Expose `CameraSnapshot` struct with derived data: effective_scale, view_rect, et
 3. **Stage 3 – UX Enhancements:** map new shortcuts (Ctrl+0 reset, Ctrl+=/- zoom, WASD pan) and expose HUD overlay showing zoom factor & cursor coordinates.
 4. **Stage 4 – Testing:** add snapshot tests verifying camera invariants (Rust tests invoking `Camera` directly). Hook into new regression harness once built.
 
+### Ownership Matrix (needs confirmation)
+
+| Stage | Scope | Suggested Owner(s) | Status |
+| --- | --- | --- | --- |
+| 1 | Extract `camera.rs`, port math, add unit tests (`camera/tests.rs`) | PurpleBear (lead), reviewer TBD | In Progress |
+| 2 | Wire GPUI renderer + terminal/offscreen paths to new module | LilacLake (UI focus) | Pending |
+| 3 | UX bindings (shortcuts, HUD indicators) | RedCastle (render UX) | Pending |
+| 4 | Regression tests & docs update | PurpleBear (tests) + OrangeSnow (docs QA) | Pending |
+
+Please update the table once ownership is claimed so we can reflect it in PLAN §2.
+
 ## Risks / Open Questions
 
 - Need agreement on pan limits: infinite vs. clamped to world bounds with padding. Proposal: default clamp to keep world fully visible, configurable for debugging.

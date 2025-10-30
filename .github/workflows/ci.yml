@@ -201,3 +201,70 @@ jobs:
             --replay-db ci-baseline.duckdb \
             --compare-db ci-candidate.duckdb \
             --tick-limit 128
+
+  render_regression:
+    name: Render Regression (${{ matrix.os }})
+    needs: checks
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect render-related changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            render:
+              - 'crates/scriptbots-render/**'
+              - 'docs/rendering_reference/**'
+              - 'PLAN_TO_FIX_RENDERING_ISSUES.md'
+              - '.github/workflows/ci.yml'
+
+      - name: Skip render regression (no relevant changes)
+        if: ${{ github.event_name == 'pull_request' && steps.changes.outputs.render != 'true' }}
+        run: echo "No renderer changes detected; skipping snapshot harness."
+
+      - name: Install mold linker and system deps (Linux)
+        if: ${{ matrix.os == 'ubuntu-24.04' && (github.event_name != 'pull_request' || steps.changes.outputs.render == 'true') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo artifacts
+        if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: render-${{ matrix.os }}
+
+      - name: Run snapshot + camera invariants
+        if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p scriptbots-render -- --nocapture
+
+      - name: Upload snapshot diffs
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: render-diffs-${{ matrix.os }}
+          path: target/snapshot-failures/

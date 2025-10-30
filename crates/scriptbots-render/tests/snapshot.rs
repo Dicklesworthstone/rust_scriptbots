@@ -22,7 +22,9 @@ fn golden_dir() -> PathBuf {
 fn register_brains(world: &mut WorldState) -> u64 {
     world
         .brain_registry_mut()
-        .register(MlpBrain::KIND.as_str(), |seed_rng| MlpBrain::runner(seed_rng))
+        .register(MlpBrain::KIND.as_str(), |seed_rng| {
+            MlpBrain::runner(seed_rng)
+        })
 }
 
 fn seed_agents(world: &mut WorldState, brain_key: u64) {
@@ -57,9 +59,7 @@ fn rust_renderer_matches_golden_snapshot() {
     let expected = fs::read(&golden_path).expect("golden snapshot missing; generate via harness");
 
     if png != expected {
-        let failure_dir = project_root()
-            .join("target")
-            .join("snapshot-failures");
+        let failure_dir = project_root().join("target").join("snapshot-failures");
         fs::create_dir_all(&failure_dir).expect("create failure dir");
         let actual_path = failure_dir.join("rust_default.actual.png");
         fs::write(&actual_path, &png).expect("write actual snapshot");

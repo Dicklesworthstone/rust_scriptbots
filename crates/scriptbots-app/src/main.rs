@@ -621,11 +621,7 @@ struct AppCli {
     )]
     config_layers: Vec<PathBuf>,
     /// RNG seed override for deterministic runs.
-    #[arg(
-        long = "rng-seed",
-        value_name = "SEED",
-        env = "SCRIPTBOTS_RNG_SEED"
-    )]
+    #[arg(long = "rng-seed", value_name = "SEED", env = "SCRIPTBOTS_RNG_SEED")]
     rng_seed: Option<u64>,
     /// Path to a DuckDB run to verify via headless deterministic replay.
     #[arg(long = "replay-db", value_name = "FILE", env = "SCRIPTBOTS_REPLAY_DB")]

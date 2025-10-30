@@ -21,19 +21,18 @@
   - `crates/scriptbots-render/tests/snapshot.rs` exercises `render_png_offscreen` with a seeded `ScriptBotsConfig`, 16 seeded agents, and 120 warmup ticks, comparing against `docs/rendering_reference/golden/rust_default.png` (diffs land in `target/snapshot-failures/`).  
   - Golden PNG generated via `cargo run -p scriptbots-app --no-default-features --features gui --bin scriptbots-app -- --rng-seed 424242 --dump-png docs/rendering_reference/golden/rust_default.png --png-size 1600x900 --threads 1 --low-power`.  
   - SHA256 recorded in `docs/rendering_reference/checksums.txt`; see `snapshot_harness_design.md` for follow-up ideas (perceptual diff, additional scenes).
-- **Viewport invariants** [Currently In Progress – PinkMountain]  
-  - Add unit test verifying `screen_to_world` maps `(0,0)` → bottom-left and `(world_width, world_height)` → top-right within tolerance.  
-  - Introduce assertion that default zoom keeps agents > N pixels radius (avoid “dust speck” regressions).
-- **CI integration** *(seeking owner)*  
-  - Extend GitHub Action matrix (Linux + Windows) to run snapshot + invariants.  
-  - Configure path filter so PRs touching rendering/camera automatically trigger the job.  
-  - Emit actionable failure message linking to captured ROI callouts (`docs/rendering_reference/legacy_reference_annotations.md`).
+- **Viewport invariants** [Completed – PinkMountain & PurpleBear 2025-10-30]  
+  - `camera_invariants_tests` (see `crates/scriptbots-render/src/lib.rs`) computes viewport padding and asserts the visible bounds map to `(0,0)` and `(world_width, world_height)` via `screen_to_world`.  
+  - Same suite verifies default zoom keeps `bot_radius` ≥ 2 pixels using differential sampling around the viewport midpoint.
+- **CI integration** [Completed – PurpleBear 2025-10-30]  
+  - `.github/workflows/ci.yml` now includes a `render_regression` job (Ubuntu + Windows) that runs `cargo test -p scriptbots-render -- --nocapture`, uploads `target/snapshot-failures/` artifacts on diff, and uses `dorny/paths-filter` to skip PR runs without renderer-related changes.  
+  - Future follow-up: broaden path filter if additional rendering assets land outside current patterns.
 - **Coordination ask:** please edit this subsection to add `[Currently In Progress – <YourName>]` next to any bullet you pick up, and drop a quick status line in `docs/rendering_reference/coordination.md` (created below) so we avoid duplicate effort.
 
 
-## 2. Build a Real Camera System [Currently In Progress – PinkMountain]
+## 2. Build a Real Camera System [Stage 1 In Progress – PurpleBear]
 
-### 2.1 Camera Abstraction [Currently In Progress – PinkMountain]
+### 2.1 Camera Abstraction [Currently In Progress – PurpleBear]
 - Dedicated `Camera` struct with:
   - `fit_world(viewport_size, world_size)`
   - `fit_selection(bounds)`
@@ -41,14 +40,14 @@
   - `recenter(world_point)`
   - `screen_to_world` / `world_to_screen`
 - Store configuration (min/max zoom, pan limits) in config file.
-- Draft API + integration stages captured in `docs/rendering_reference/camera_refactor_proposal.md`; implementation staging doc to follow after consensus review.
+- Draft API + integration stages captured in `docs/rendering_reference/camera_refactor_proposal.md`; ownership matrix awaiting sign-off.
 
-### 2.2 Deterministic Initial State [Currently In Progress – PinkMountain]
+### 2.2 Deterministic Initial State [Currently In Progress – PurpleBear]
 - Compute base scale from world + viewport using strictly defined math.
 - Default zoom = legacy multipliers; record in snapshots.
 - Persist camera state across sessions only when explicitly saved.
 
-### 2.3 User Interaction UX [Currently In Progress – PinkMountain]
+### 2.3 User Interaction UX [Currently In Progress – PurpleBear]
 - Provide explicit controls:
   - UI buttons (fit world, fit selection, reset transform).
   - Keyboard shortcuts (e.g., `Ctrl+0` for reset, `Ctrl+=`/`Ctrl+-` for zoom, arrows or WASD to pan).
@@ -56,7 +55,7 @@
 - Display camera HUD (zoom factor, pan offset, world coordinates under cursor).
 - Add smooth pan/zoom transitions (optional) to avoid jarring jumps.
 
-### 2.4 Testing and Telemetry [Currently In Progress – PinkMountain]
+### 2.4 Testing and Telemetry [Currently In Progress – PurpleBear]
 - Unit tests validating camera transformations (coordination with PurpleBear on viewport invariants).
 - Snapshot tests covering zoom levels.
 - Instrument metrics (zoom range, pan range, invalid transforms) so QA can monitor usage.

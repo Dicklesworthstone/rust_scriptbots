@@ -1,5 +1,8 @@
 //! GPUI rendering layer for ScriptBots.
 
+mod camera;
+
+use camera::{Camera, CameraSnapshot};
 use gpui::{
     App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
@@ -953,16 +956,16 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         (world_w, world_h),
         base_scale,
     );
-    if !camera_guard.centered_once {
+    if !camera_guard.is_centered() {
         let world_center = Position {
             x: world_w * 0.5,
             y: world_h * 0.5,
         };
         camera_guard.center_on(world_center);
-        camera_guard.centered_once = true;
+        camera_guard.mark_centered();
     }
-    let zoom = camera_guard.zoom;
-    let (off_px_x, off_px_y) = camera_guard.offset_px;
+    let zoom = camera_guard.zoom();
+    let (off_px_x, off_px_y) = camera_guard.offset();
     drop(camera_guard);
 
     let scale = base_scale * zoom;
@@ -1234,7 +1237,7 @@ struct SimulationView {
     title: SharedString,
     command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
-    camera: Arc<Mutex<CameraState>>,
+    camera: Arc<Mutex<Camera>>,
     inspector: Arc<Mutex<InspectorState>>,
     playback: PlaybackState,
     perf: PerfStats,
@@ -1280,7 +1283,7 @@ impl SimulationView {
             title,
             command_drain,
             command_submit,
-            camera: Arc::new(Mutex::new(CameraState::default())),
+            camera: Arc::new(Mutex::new(Camera::default())),
             inspector: Arc::new(Mutex::new(inspector_state)),
             playback: PlaybackState::new(240),
             perf: PerfStats::new(240),
@@ -1313,10 +1316,10 @@ impl SimulationView {
         self.minimal_canvas_mode = true;
     }
 
-    fn camera_snapshot(&self) -> CameraState {
+    fn camera_snapshot(&self) -> CameraSnapshot {
         self.camera
             .lock()
-            .map(|camera| camera.clone())
+            .map(|camera| camera.snapshot())
             .unwrap_or_default()
     }
 
@@ -2510,7 +2513,7 @@ impl SimulationView {
                     if camera.update_pan(event.position) {
                         changed = true;
                     }
-                    panning = camera.panning;
+                    panning = camera.is_panning();
                 }
 
                 if panning {
@@ -9533,7 +9536,7 @@ struct AgentRenderData {
 #[derive(Clone)]
 struct CanvasState {
     frame: RenderFrame,
-    camera: Arc<Mutex<CameraState>>,
+    camera: Arc<Mutex<Camera>>,
     focus_agent: Option<AgentId>,
     controls: ControlsSnapshot,
     debug: DebugOverlayState,
@@ -9986,291 +9989,6 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
         marker_bounds,
         Background::from(rgba_from_hex(0x93c5fd, 0.65)),
     ));
-}
-
-#[derive(Clone)]
-struct CameraState {
-    offset_px: (f32, f32),
-    zoom: f32,
-    zoom_initialized: bool,
-    panning: bool,
-    pan_anchor: Option<Point<Pixels>>,
-    last_canvas_origin: (f32, f32),
-    last_canvas_size: (f32, f32),
-    last_world_size: (f32, f32),
-    last_scale: f32,
-    last_base_scale: f32,
-    centered_once: bool,
-}
-
-impl Default for CameraState {
-    fn default() -> Self {
-        Self {
-            offset_px: (0.0, 0.0),
-            zoom: Self::default_zoom(),
-            zoom_initialized: false,
-            panning: false,
-            pan_anchor: None,
-            last_canvas_origin: (0.0, 0.0),
-            last_canvas_size: (1.0, 1.0),
-            last_world_size: (1.0, 1.0),
-            last_scale: 1.0,
-            last_base_scale: 1.0,
-            centered_once: false,
-        }
-    }
-}
-const LEGACY_CAMERA_SCALE: f32 = 0.2;
-
-impl CameraState {
-    const MIN_ZOOM: f32 = 0.4;
-    const MAX_ZOOM: f32 = 2.5;
-    fn default_zoom() -> f32 {
-        1.0
-    }
-
-    fn start_pan(&mut self, cursor: Point<Pixels>) {
-        self.panning = true;
-        self.pan_anchor = Some(cursor);
-    }
-
-    fn update_pan(&mut self, cursor: Point<Pixels>) -> bool {
-        if !self.panning {
-            return false;
-        }
-        if let Some(anchor) = self.pan_anchor {
-            let dx = f32::from(cursor.x) - f32::from(anchor.x);
-            let dy = f32::from(cursor.y) - f32::from(anchor.y);
-            if dx.abs() > f32::EPSILON || dy.abs() > f32::EPSILON {
-                self.offset_px.0 += dx;
-                self.offset_px.1 += dy;
-                self.pan_anchor = Some(cursor);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn end_pan(&mut self) {
-        self.panning = false;
-        self.pan_anchor = None;
-    }
-
-    fn ensure_default_zoom(&mut self, base_scale: f32) {
-        if self.zoom_initialized {
-            return;
-        }
-        if base_scale <= 0.0 {
-            return;
-        }
-        let desired = (LEGACY_CAMERA_SCALE / base_scale).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
-        self.zoom = desired;
-        self.zoom_initialized = true;
-    }
-
-    fn apply_scroll(&mut self, event: &ScrollWheelEvent) -> bool {
-        let scroll_y = match event.delta {
-            ScrollDelta::Pixels(delta) => -f32::from(delta.y) / 120.0,
-            ScrollDelta::Lines(lines) => -lines.y,
-        };
-        if scroll_y.abs() < 0.01 {
-            return false;
-        }
-
-        let old_zoom = self.zoom;
-        let new_zoom = (self.zoom * (1.0 + scroll_y * 0.1)).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
-        if (new_zoom - old_zoom).abs() < f32::EPSILON {
-            return false;
-        }
-
-        let cursor_x = f32::from(event.position.x);
-        let cursor_y = f32::from(event.position.y);
-
-        let old_scale = self.last_scale.max(1e-6);
-        let base_scale = self.last_base_scale.max(1e-6);
-        let new_scale = base_scale * new_zoom;
-
-        let pad_x_old = (self.last_canvas_size.0 - self.last_world_size.0 * old_scale) * 0.5;
-        let pad_y_old = (self.last_canvas_size.1 - self.last_world_size.1 * old_scale) * 0.5;
-        let pad_x_new = (self.last_canvas_size.0 - self.last_world_size.0 * new_scale) * 0.5;
-        let pad_y_new = (self.last_canvas_size.1 - self.last_world_size.1 * new_scale) * 0.5;
-
-        let origin_x = self.last_canvas_origin.0;
-        let origin_y = self.last_canvas_origin.1;
-
-        let world_x = (cursor_x - origin_x - pad_x_old - self.offset_px.0) / old_scale;
-        let world_y = (cursor_y - origin_y - pad_y_old - self.offset_px.1) / old_scale;
-
-        self.zoom = new_zoom;
-        self.offset_px.0 = cursor_x - origin_x - pad_x_new - world_x * new_scale;
-        self.offset_px.1 = cursor_y - origin_y - pad_y_new - world_y * new_scale;
-        self.zoom_initialized = true;
-        true
-    }
-
-    fn record_render_metrics(
-        &mut self,
-        canvas_origin: (f32, f32),
-        canvas_size: (f32, f32),
-        world_size: (f32, f32),
-        base_scale: f32,
-    ) {
-        self.last_canvas_origin = canvas_origin;
-        self.last_canvas_size = canvas_size;
-        self.last_world_size = world_size;
-        self.last_base_scale = base_scale;
-        self.last_scale = base_scale * self.zoom;
-    }
-
-    fn center_on(&mut self, position: Position) {
-        let scale = self.last_base_scale * self.zoom;
-        if !scale.is_finite() || scale <= f32::EPSILON {
-            return;
-        }
-
-        let center_x = self.last_canvas_origin.0 + self.last_canvas_size.0 * 0.5;
-        let center_y = self.last_canvas_origin.1 + self.last_canvas_size.1 * 0.5;
-        let pad_x = (self.last_canvas_size.0 - self.last_world_size.0 * scale) * 0.5;
-        let pad_y = (self.last_canvas_size.1 - self.last_world_size.1 * scale) * 0.5;
-
-        let world_screen_x =
-            self.last_canvas_origin.0 + pad_x + self.offset_px.0 + position.x * scale;
-        let world_screen_y =
-            self.last_canvas_origin.1 + pad_y + self.offset_px.1 + position.y * scale;
-
-        self.offset_px.0 += center_x - world_screen_x;
-        self.offset_px.1 += center_y - world_screen_y;
-    }
-
-    fn screen_to_world(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
-        let scale = self.last_scale;
-        if scale <= f32::EPSILON {
-            return None;
-        }
-        let canvas_x = f32::from(point.x);
-        let canvas_y = f32::from(point.y);
-        let origin_x = self.last_canvas_origin.0;
-        let origin_y = self.last_canvas_origin.1;
-        let canvas_width = self.last_canvas_size.0;
-        let canvas_height = self.last_canvas_size.1;
-        let world_w = self.last_world_size.0;
-        let world_h = self.last_world_size.1;
-
-        let render_w = world_w * scale;
-        let render_h = world_h * scale;
-        let pad_x = (canvas_width - render_w) * 0.5;
-        let pad_y = (canvas_height - render_h) * 0.5;
-
-        let world_x = (canvas_x - origin_x - pad_x - self.offset_px.0) / scale;
-        let world_y = (canvas_y - origin_y - pad_y - self.offset_px.1) / scale;
-
-        if !world_x.is_finite() || !world_y.is_finite() {
-            return None;
-        }
-
-        if world_x < 0.0 || world_y < 0.0 || world_x > world_w || world_y > world_h {
-            return None;
-        }
-
-        Some((world_x, world_y))
-    }
-}
-
-#[cfg(test)]
-mod camera_invariants_tests {
-    use super::*;
-    use gpui::{px, Point};
-    use scriptbots_core::ScriptBotsConfig;
-
-    const VIEWPORT: (f32, f32) = (1600.0, 900.0);
-    const WORLD: (f32, f32) = (6000.0, 3000.0);
-
-    fn base_scale() -> f32 {
-        (VIEWPORT.0 / WORLD.0).min(VIEWPORT.1 / WORLD.1)
-    }
-
-    fn configured_camera() -> CameraState {
-        let mut camera = CameraState::default();
-        let base = base_scale();
-        camera.ensure_default_zoom(base);
-        camera.record_render_metrics((0.0, 0.0), VIEWPORT, WORLD, base);
-        camera
-    }
-
-    fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
-        (a - b).abs() <= eps
-    }
-
-    #[test]
-    fn screen_to_world_maps_corners_within_bounds() {
-        let camera = configured_camera();
-        let top_left = camera
-            .screen_to_world(Point { x: px(0.0), y: px(0.0) })
-            .expect("top-left maps");
-        assert!(
-            approx_eq(top_left.0, 0.0, 1e-3),
-            "expected x≈0.0, got {}",
-            top_left.0
-        );
-        assert!(
-            approx_eq(top_left.1, 0.0, 1e-3),
-            "expected y≈0.0, got {}",
-            top_left.1
-        );
-
-        let bottom_right = camera
-            .screen_to_world(Point {
-                x: px(VIEWPORT.0),
-                y: px(VIEWPORT.1),
-            })
-            .expect("bottom-right maps");
-        assert!(
-            approx_eq(bottom_right.0, WORLD.0, 1e-3),
-            "expected x≈{}, got {}",
-            WORLD.0,
-            bottom_right.0
-        );
-        assert!(
-            approx_eq(bottom_right.1, WORLD.1, 1e-3),
-            "expected y≈{}, got {}",
-            WORLD.1,
-            bottom_right.1
-        );
-    }
-
-    #[test]
-    fn default_zoom_keeps_agents_visible() {
-        let camera = configured_camera();
-        let mid_point = Point {
-            x: px(VIEWPORT.0 * 0.5),
-            y: px(VIEWPORT.1 * 0.5),
-        };
-        let world_mid = camera
-            .screen_to_world(mid_point)
-            .expect("midpoint maps to world");
-        let world_next = camera
-            .screen_to_world(Point {
-                x: px(VIEWPORT.0 * 0.5 + 1.0),
-                y: px(VIEWPORT.1 * 0.5),
-            })
-            .expect("adjacent pixel maps to world");
-
-        let world_units_per_px = (world_next.0 - world_mid.0).abs();
-        assert!(
-            world_units_per_px > 0.0,
-            "world units per pixel should be positive"
-        );
-
-        let pixels_per_world = 1.0 / world_units_per_px;
-        let bot_radius = ScriptBotsConfig::default().bot_radius;
-        let pixel_radius = pixels_per_world * bot_radius;
-
-        assert!(
-            pixel_radius >= 2.0,
-            "expected pixel radius ≥ 2.0, got {}",
-            pixel_radius
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11037,7 +10755,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     let base_scale = (width_px / world_w).min(height_px / world_h).max(0.000_1);
     camera_guard.ensure_default_zoom(base_scale);
-    let scale = base_scale * camera_guard.zoom;
+    let scale = base_scale * camera_guard.zoom();
     let render_w = world_w * scale;
     let render_h = world_h * scale;
     let pad_x = (width_px - render_w) * 0.5;
@@ -11051,10 +10769,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     // Offscreen guard: if the world render rect lies completely outside the canvas,
     // recenter on world midpoint to avoid a blank view after extreme panning.
-    let (mut offset_x, mut offset_y) = (
-        origin_x + pad_x + camera_guard.offset_px.0,
-        origin_y + pad_y + camera_guard.offset_px.1,
-    );
+    let mut offset = camera_guard.offset();
+    let (mut offset_x, mut offset_y) = (origin_x + pad_x + offset.0, origin_y + pad_y + offset.1);
     let fully_offscreen = (offset_x + render_w) < view_left
         || offset_x > view_right
         || (offset_y + render_h) < view_top
@@ -11075,16 +10791,17 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         base_scale,
     );
     // On the first GUI paint, ensure the map is centered and fully visible.
-    if !camera_guard.centered_once {
+    if !camera_guard.is_centered() {
         let world_center = Position {
             x: frame.world_size.0 * 0.5,
             y: frame.world_size.1 * 0.5,
         };
         camera_guard.center_on(world_center);
-        camera_guard.centered_once = true;
+        camera_guard.mark_centered();
         // Recompute offsets after forcing center once
-        offset_x = origin_x + pad_x + camera_guard.offset_px.0;
-        offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+        offset = camera_guard.offset();
+        offset_x = origin_x + pad_x + offset.0;
+        offset_y = origin_y + pad_y + offset.1;
         let fully_offscreen_after_center = (offset_x + render_w) < view_left
             || offset_x > view_right
             || (offset_y + render_h) < view_top
@@ -11104,8 +10821,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         camera_guard.center_on(target);
     }
     // Follow target may change camera offset; recompute offsets if it did
-    offset_x = origin_x + pad_x + camera_guard.offset_px.0;
-    offset_y = origin_y + pad_y + camera_guard.offset_px.1;
+    offset = camera_guard.offset();
+    offset_x = origin_x + pad_x + offset.0;
+    offset_y = origin_y + pad_y + offset.1;
 
     if env_flag("SB_CPU_LAYOUT_LOG") {
         tracing::info!(
@@ -11119,7 +10837,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             pad_y,
             offset_x,
             offset_y,
-            zoom = camera_guard.zoom,
+            zoom = camera_guard.zoom(),
             "cpu_canvas_layout"
         );
     }
