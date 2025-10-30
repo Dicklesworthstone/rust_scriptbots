@@ -4887,7 +4887,7 @@ impl SimulationView {
         });
         let follow_off = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.controls.follow_mode = FollowMode::Off;
-            cx.notify();
+            this.fit_world_view(cx);
         });
         let follow_selected = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.controls.follow_mode = FollowMode::Selected;
@@ -11154,11 +11154,19 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
-    let mut layout = camera_guard.layout(
-        (origin_x, origin_y),
-        (width_px, height_px),
-        frame.world_size,
-    );
+    let mut layout =
+        camera_guard.layout((origin_x, origin_y), (width_px, height_px), frame.world_size);
+
+    let coverage_too_small = layout.render_size.0 < width_px * 0.25
+        || layout.render_size.1 < height_px * 0.25;
+    let coverage_too_large = layout.render_size.0 > width_px * 6.0
+        || layout.render_size.1 > height_px * 6.0;
+
+    if coverage_too_small || coverage_too_large {
+        camera_guard.fit_world();
+        layout =
+            camera_guard.layout((origin_x, origin_y), (width_px, height_px), frame.world_size);
+    }
 
     if controls.follow_mode != FollowMode::Off
         && let Some(target) = follow_target

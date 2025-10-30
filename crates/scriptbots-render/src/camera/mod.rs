@@ -166,8 +166,9 @@ impl Camera {
         let min_y = bounds_min.y.min(bounds_max.y);
         let max_y = bounds_min.y.max(bounds_max.y);
 
-        let width_world = (max_x - min_x).max(1.0);
-        let height_world = (max_y - min_y).max(1.0);
+        let min_extent = 200.0;
+        let width_world = (max_x - min_x).max(min_extent);
+        let height_world = (max_y - min_y).max(min_extent);
 
         let available_w = (canvas.0 - padding_px * 2.0).max(32.0);
         let available_h = (canvas.1 - padding_px * 2.0).max(32.0);
