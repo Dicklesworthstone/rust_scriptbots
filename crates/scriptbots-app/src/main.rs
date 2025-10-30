@@ -7,6 +7,8 @@ use scriptbots_app::{
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
+#[cfg(feature = "bevy_render")]
+use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
     AgentData, NeuroflowActivationKind, ReplayEventKind, ScriptBotsConfig, TickSummary,
@@ -210,6 +212,30 @@ fn main() -> Result<()> {
             let _ = path;
             bail!("--dump-png requires GUI feature; recompile with --features gui");
         }
+    }
+    #[cfg(feature = "bevy_render")]
+    if let Some(path) = cli.dump_bevy_png.as_ref() {
+        let (w, h) = cli
+            .png_size
+            .as_deref()
+            .and_then(parse_png_size)
+            .unwrap_or((1600, 900));
+        let bytes = {
+            let guard = world.lock().expect("world mutex poisoned");
+            render_bevy_png(&guard, w, h)?
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, &bytes)?;
+        println!(
+            "{} Wrote Bevy snapshot {} ({}x{})",
+            "✔".green().bold(),
+            path.display(),
+            w,
+            h
+        );
+        return Ok(());
     }
     let control_config = ControlServerConfig::from_env();
     let (control_runtime, command_drain, command_submit) =
@@ -683,6 +709,10 @@ struct AppCli {
     /// Write an offscreen PNG snapshot and exit (no UI).
     #[arg(long = "dump-png", value_name = "FILE")]
     dump_png: Option<PathBuf>,
+    /// Write a Bevy offscreen PNG (requires bevy_render feature) and exit (no UI).
+    #[cfg(feature = "bevy_render")]
+    #[arg(long = "dump-bevy-png", value_name = "FILE")]
+    dump_bevy_png: Option<PathBuf>,
     /// Snapshot size for --dump-png, formatted as WIDTHxHEIGHT (e.g., 1280x720).
     #[arg(long = "png-size", value_name = "WxH")]
     png_size: Option<String>,
@@ -833,7 +863,9 @@ fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Rendere
             }
             #[cfg(not(feature = "bevy_render"))]
             {
-                warn!("Bevy renderer requested, but binary was built without bevy_render. Falling back to terminal UI.");
+                warn!(
+                    "Bevy renderer requested, but binary was built without bevy_render. Falling back to terminal UI."
+                );
                 return Ok((
                     RendererMode::Terminal,
                     Box::new(TerminalRenderer::default()),
@@ -897,9 +929,12 @@ impl Renderer for BevyRenderer {
         "bevy"
     }
 
-    fn run(&self, _ctx: RendererContext<'_>) -> Result<()> {
+    fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
         prepare_linux_gui_backend();
-        scriptbots_bevy::run_stub_renderer()
+        let bevy_ctx = BevyRendererContext {
+            world: Arc::clone(&ctx.world),
+        };
+        scriptbots_bevy::run_renderer(bevy_ctx)
     }
 }
 
@@ -1832,7 +1867,7 @@ fn parse_activation(raw: &str) -> Option<NeuroflowActivationKind> {
     }
 }
 
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "bevy_render"))]
 fn parse_png_size(raw: &str) -> Option<(u32, u32)> {
     let lower = raw.trim().to_ascii_lowercase();
     let mut parts = lower.split('x');

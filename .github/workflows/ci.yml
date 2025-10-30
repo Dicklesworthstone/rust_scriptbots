@@ -222,6 +222,7 @@ jobs:
           filters: |
             render:
               - 'crates/scriptbots-render/**'
+              - 'crates/scriptbots-bevy/**'
               - 'docs/rendering_reference/**'
               - 'PLAN_TO_FIX_RENDERING_ISSUES.md'
               - '.github/workflows/ci.yml'
@@ -261,6 +262,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p scriptbots-render -- --nocapture
+          cargo test -p scriptbots-bevy --features bevy_render -- --nocapture
 
       - name: Upload snapshot diffs
         if: failure()

@@ -28,3 +28,8 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - RedSnow (2025-10-30 17:28 UTC): Completed Stage 2.3 HUD debug overlay refactor; `paint_debug_overlays` and the batched agent outline pass now call `CameraSnapshot::world_to_screen` to stay aligned with zoom/pan math.
 - RedSnow (2025-10-30 19:15 UTC): Updated PLAN §2 status to completed; follow-mode fit chips now documented and Stage 2/3 milestones closed out.
 - RedSnow (2025-10-30 20:18 UTC): Started PLAN_TO_INTEGRATE_BEVY_ENGINE_TO_SCRIPTBOTS Phase 0 (feature flag + crate scaffold + CLI plumbing).
+- RedSnow (2025-10-30 21:04 UTC): Bevy renderer now streams world snapshots via worker thread, renders ground plane + agent spheres, is selectable with `--mode bevy`, ships a snapshot test comparing against `docs/rendering_reference/golden/bevy_default.png`, adds mouse orbit + WASD pan + `F` follow / Q/E yaw / PageUp/PageDown pitch camera controls, and includes a camera smoke test in `tests/camera.rs`.
+- RedSnow (2025-10-30 21:32 UTC): CI render job now covers `cargo test -p scriptbots-bevy --features bevy_render` so Bevy snapshot/camera tests run on PRs.
+- RedSnow (2025-10-30 21:50 UTC): Added Bevy HUD overlay (tick, agents, follow state, camera metrics) driven by live snapshots.
+- OrangeLake (2025-10-30 23:35 UTC): Picking up PLAN_TO_INTEGRATE_BEVY_ENGINE_TO_SCRIPTBOTS Phase 2 camera polish (fit selection, follow parity, easing) and Phase 3 HUD parity expansion (selection/FPS/playback metrics).
+- OrangeLake (2025-10-30 23:58 UTC): Landed Bevy camera polish (`F` cycle, Ctrl+S/O follow, Ctrl+F/W fits, easing) plus HUD parity metrics (selection details, playback rate, FPS, world stats); PLAN phases 2–3 marked ready for review.
