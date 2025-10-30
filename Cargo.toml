@@ -14,9 +14,6 @@ members = [
     "crates/scriptbots-web",
 ]
 
-[workspace.features]
-bevy_render = []
-
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
