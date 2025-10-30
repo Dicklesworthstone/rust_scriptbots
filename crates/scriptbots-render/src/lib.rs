@@ -2,7 +2,7 @@
 
 mod camera;
 
-use camera::{Camera, CameraSnapshot};
+use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
     App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
@@ -956,8 +956,6 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         camera_guard.center_on(target);
         layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
     }
-
-    let zoom = camera_guard.zoom();
     drop(camera_guard);
 
     let scale = layout.scale;
@@ -980,7 +978,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
             pad_y,
             offset_x = cam_offset.0,
             offset_y = cam_offset.1,
-            zoom,
+            zoom = scale / base_scale,
             render_scale,
             "wgpu_canvas_layout"
         );
@@ -1446,6 +1444,56 @@ impl SimulationView {
             .and_then(|camera| camera.screen_to_world(position))
     }
 
+    fn world_to_screen_coords(&self, position: Position) -> Option<(f32, f32)> {
+        self.camera
+            .lock()
+            .ok()
+            .and_then(|camera| camera.world_to_screen((position.x, position.y)))
+    }
+
+    fn fit_world_view(&self, cx: &mut Context<Self>) {
+        if let Ok(mut camera) = self.camera.lock() {
+            camera.fit_world();
+        }
+        cx.notify();
+    }
+
+    fn fit_selection_view(&self, bounds: (Position, Position), cx: &mut Context<Self>) {
+        if let Ok(mut camera) = self.camera.lock() {
+            camera.fit_bounds(bounds.0, bounds.1, 120.0);
+        }
+        cx.notify();
+    }
+
+    fn selection_bounds(&self, inspector: &InspectorSnapshot) -> Option<(Position, Position)> {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+
+        let mut push_pos = |pos: Position| {
+            min_x = min_x.min(pos.x);
+            min_y = min_y.min(pos.y);
+            max_x = max_x.max(pos.x);
+            max_y = max_y.max(pos.y);
+        };
+
+        for entry in &inspector.selected {
+            push_pos(entry.position);
+        }
+        if let Some(detail) = inspector.focused.as_ref() {
+            push_pos(detail.position);
+        } else if let Some(hover) = inspector.hovered.as_ref() {
+            push_pos(hover.position);
+        }
+
+        if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite() {
+            Some((Position::new(min_x, min_y), Position::new(max_x, max_y)))
+        } else {
+            None
+        }
+    }
+
     fn selection_pick_radius(&self, world: &WorldState) -> f32 {
         (world.config().bot_radius * 3.0).max(24.0)
     }
@@ -1854,6 +1902,33 @@ impl SimulationView {
                 controls.follow_mode.label(),
                 theme.chip_follow,
             ));
+        }
+
+        let fit_world_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.fit_world_view(cx);
+        });
+        let fit_world_chip = self
+            .header_chip(theme, "🧭", "Fit World", theme.chip_open)
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.92))
+            .on_mouse_down(MouseButton::Left, fit_world_listener);
+        chips_row = chips_row.child(fit_world_chip);
+
+        if let Some(bounds) = self.selection_bounds(&snapshot.inspector) {
+            let min = (bounds.0.x, bounds.0.y);
+            let max = (bounds.1.x, bounds.1.y);
+            let fit_sel_listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                this.fit_selection_view(
+                    (Position::new(min.0, min.1), Position::new(max.0, max.1)),
+                    cx,
+                );
+            });
+            let fit_sel_chip = self
+                .header_chip(theme, "🔎", "Fit Selection", theme.chip_follow)
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.92))
+                .on_mouse_down(MouseButton::Left, fit_sel_listener);
+            chips_row = chips_row.child(fit_sel_chip);
         }
 
         div()
@@ -4095,6 +4170,16 @@ impl SimulationView {
                 "H {:.2} · Age {} · Gen {}",
                 entry.health, entry.age, entry.generation.0
             )))
+            .child({
+                let world_text =
+                    format!("World ({:.1}, {:.1})", entry.position.x, entry.position.y);
+                let line = if let Some((sx, sy)) = self.world_to_screen_coords(entry.position) {
+                    format!("{} · Screen ({:.0}, {:.0})", world_text, sx, sy)
+                } else {
+                    world_text
+                };
+                div().text_xs().text_color(rgb(0x64748b)).child(line)
+            })
     }
 
     fn render_inspector_brush_tools(
@@ -5561,10 +5646,16 @@ impl SimulationView {
                 "Energy {:.2} · Health {:.2} · Spike {:.1}",
                 detail.energy, detail.health, detail.spike_length
             )))
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-                "Pos ({:.1}, {:.1}) · Brain {}",
-                detail.position.x, detail.position.y, detail.brain_descriptor
-            )))
+            .child({
+                let mut text = format!(
+                    "Pos ({:.1}, {:.1}) · Brain {}",
+                    detail.position.x, detail.position.y, detail.brain_descriptor
+                );
+                if let Some((sx, sy)) = self.world_to_screen_coords(detail.position) {
+                    text.push_str(&format!(" · Screen ({:.0}, {:.0})", sx, sy));
+                }
+                div().text_xs().text_color(rgb(0x94a3b8)).child(text)
+            })
             .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
                 "Mutation rates p{:.3} s{:.3}",
                 detail.mutation_rates.primary, detail.mutation_rates.secondary
@@ -5865,11 +5956,33 @@ impl SimulationView {
         lines.push(snapshot.controls.follow_mode.label().to_string());
 
         let inspector = &snapshot.inspector;
-        if let Some(focus_id) = inspector.focus_id {
+        if let Some(detail) = inspector.focused.as_ref() {
+            if let Some((sx, sy)) = self.world_to_screen_coords(detail.position) {
+                lines.push(format!(
+                    "Focus {:?} · world ({:.1}, {:.1}) · screen ({:.0}, {:.0})",
+                    detail.agent_id, detail.position.x, detail.position.y, sx, sy
+                ));
+            } else {
+                lines.push(format!(
+                    "Focus {:?} · world ({:.1}, {:.1})",
+                    detail.agent_id, detail.position.x, detail.position.y
+                ));
+            }
+        } else if let Some(focus_id) = inspector.focus_id {
             lines.push(format!("Focus {:?}", focus_id));
         }
         if let Some(hover) = inspector.hovered.as_ref() {
-            lines.push(format!("Hover {}", hover.label));
+            if let Some((sx, sy)) = self.world_to_screen_coords(hover.position) {
+                lines.push(format!(
+                    "Hover {} · world ({:.1}, {:.1}) · screen ({:.0}, {:.0})",
+                    hover.label, hover.position.x, hover.position.y, sx, sy
+                ));
+            } else {
+                lines.push(format!(
+                    "Hover {} · world ({:.1}, {:.1})",
+                    hover.label, hover.position.x, hover.position.y
+                ));
+            }
         }
         lines.push(format!(
             "Brush {} · radius {:.0} · Probe {}",
@@ -5923,15 +6036,23 @@ impl SimulationView {
 
         if self.shift_inspect {
             if let Some(hover) = inspector.hovered.as_ref() {
-                lines.push(format!(
+                let mut entry = format!(
                     "Inspect {} · E {:.2} · H {:.2} · Age {} · Gen {}",
                     hover.label, hover.energy, hover.health, hover.age, hover.generation.0
-                ));
+                );
+                if let Some((sx, sy)) = self.world_to_screen_coords(hover.position) {
+                    entry.push_str(&format!(" · screen ({:.0}, {:.0})", sx, sy));
+                }
+                lines.push(entry);
             } else if let Some(detail) = inspector.focused.as_ref() {
-                lines.push(format!(
+                let mut entry = format!(
                     "Inspect {:?} · E {:.2} · H {:.2} · Age {} · Gen {}",
                     detail.agent_id, detail.energy, detail.health, detail.age, detail.generation.0
-                ));
+                );
+                if let Some((sx, sy)) = self.world_to_screen_coords(detail.position) {
+                    entry.push_str(&format!(" · screen ({:.0}, {:.0})", sx, sy));
+                }
+                lines.push(entry);
                 if let Some((best_idx, best_value)) = detail
                     .outputs
                     .iter()
@@ -7579,16 +7700,11 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
     let mut img: ImageBuffer<ImgRgba<u8>, Vec<u8>> = ImageBuffer::new(width, height);
 
     let config = world.config();
-    let world_w = config.world_width as f32;
-    let world_h = config.world_height as f32;
+    let world_size = (config.world_width as f32, config.world_height as f32);
     let cell_size = config.food_cell_size as f32;
 
     let mut camera = Camera::default();
-    let _layout = camera.layout(
-        (0.0, 0.0),
-        (width as f32, height as f32),
-        (world_w, world_h),
-    );
+    let layout = camera.layout((0.0, 0.0), (width as f32, height as f32), world_size);
 
     let terrain = world.terrain();
     let food = world.food();
@@ -7652,9 +7768,7 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
     let cols = world.agents().columns();
     for (idx, handle) in world.agents().iter_handles().enumerate() {
         let pos = cols.positions()[idx];
-        let world_x = pos.x * world_w;
-        let world_y = pos.y * world_h;
-        let Some((screen_x, screen_y)) = camera.world_to_screen((world_x, world_y)) else {
+        let Some((screen_x, screen_y)) = camera.world_to_screen((pos.x, pos.y)) else {
             continue;
         };
         let fx = screen_x.round() as i32;
@@ -7664,7 +7778,10 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
             .get(handle)
             .map(|rt| rt.energy)
             .unwrap_or(0.5);
-        let radius = (2.0 + 3.0 * energy.clamp(0.0, 1.0)) as i32;
+        let base_radius = config.bot_radius.max(1.0);
+        let scale = layout.scale.max(f32::EPSILON);
+        let energy_boost = base_radius * (0.5 + energy.clamp(0.0, 1.0));
+        let radius = (scale * energy_boost).round().max(2.0) as i32;
         let tendency = world
             .runtime()
             .get(handle)
@@ -9239,6 +9356,7 @@ struct AgentListEntry {
     generation: Generation,
     age: u32,
     is_focused: bool,
+    position: Position,
 }
 
 impl AgentListEntry {
@@ -9252,6 +9370,7 @@ impl AgentListEntry {
         let age = columns.ages()[row];
         let health = columns.health()[row];
         let color = columns.colors()[row];
+        let position = columns.positions()[row];
 
         let label = format!("#{row} · {:?} · Gen {}", agent_id, generation.0);
 
@@ -9264,6 +9383,7 @@ impl AgentListEntry {
             generation,
             age,
             is_focused: false,
+            position,
         }
     }
 }
@@ -10867,13 +10987,17 @@ fn paint_debug_overlays(
     frame: &RenderFrame,
     focus_agent: Option<AgentId>,
     debug: DebugOverlayState,
-    offset_x: f32,
-    offset_y: f32,
-    scale: f32,
+    camera: &CameraSnapshot,
+    layout: &ViewLayout,
     bounds: Bounds<Pixels>,
     window: &mut Window,
 ) {
     if !debug.enabled {
+        return;
+    }
+
+    let scale = layout.scale;
+    if scale <= f32::EPSILON {
         return;
     }
 
@@ -10900,8 +11024,10 @@ fn paint_debug_overlays(
     let view_bottom = view_top + f32::from(bounds.size.height);
 
     for agent in &frame.agents {
-        let px_x = offset_x + agent.position.x * scale;
-        let px_y = offset_y + agent.position.y * scale;
+        let Some((px_x, px_y)) = camera.world_to_screen((agent.position.x, agent.position.y))
+        else {
+            continue;
+        };
 
         // Cull debug overlays off-screen (with a small margin)
         if px_x < view_left - 64.0
@@ -11007,6 +11133,7 @@ fn paint_debug_overlays(
         window.paint_path(path, rgba_from_hex(0xfacc15, 0.9));
     }
 }
+
 fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     let frame = &state.frame;
     let camera = &state.camera;
@@ -11043,6 +11170,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             frame.world_size,
         );
     }
+
+    let mut camera_snapshot = camera_guard.snapshot();
 
     let scale = layout.scale;
     let base_scale = layout.base_scale;
@@ -11088,6 +11217,13 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         offset_x = origin_x + (width_px - render_w) * 0.5;
         offset_y = origin_y + (height_px - render_h) * 0.5;
     }
+
+    camera_snapshot.last_canvas_origin = (origin_x, origin_y);
+    camera_snapshot.last_canvas_size = (width_px, height_px);
+    camera_snapshot.last_world_size = frame.world_size;
+    camera_snapshot.last_scale = scale;
+    camera_snapshot.last_base_scale = base_scale;
+    camera_snapshot.offset_px = (offset_x - origin_x - pad_x, offset_y - origin_y - pad_y);
 
     drop(camera_guard);
 
@@ -11564,9 +11700,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             frame,
             focus_agent,
             debug,
-            offset_x,
-            offset_y,
-            scale,
+            &camera_snapshot,
+            &layout,
             bounds,
             window,
         );
@@ -11576,8 +11711,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             let mut outline_builder = PathBuilder::stroke(px(2.6));
 
             for agent in &frame.agents {
-                let px_x = offset_x + agent.position.x * scale;
-                let px_y = offset_y + agent.position.y * scale;
+                let Some((px_x, px_y)) =
+                    camera_snapshot.world_to_screen((agent.position.x, agent.position.y))
+                else {
+                    continue;
+                };
                 let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
                 let size_px = (dynamic_radius * scale).max(4.0);
                 let half = size_px * 0.5;

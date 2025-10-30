@@ -46,6 +46,27 @@ pub struct CameraSnapshot {
     pub panning: bool,
 }
 
+impl CameraSnapshot {
+    pub fn world_to_screen(&self, point: (f32, f32)) -> Option<(f32, f32)> {
+        let scale = self.last_scale;
+        if scale <= f32::EPSILON {
+            return None;
+        }
+
+        let world_w = self.last_world_size.0;
+        let world_h = self.last_world_size.1;
+        if point.0 < 0.0 || point.0 > world_w || point.1 < 0.0 || point.1 > world_h {
+            return None;
+        }
+
+        let pad_x = (self.last_canvas_size.0 - world_w * scale) * 0.5;
+        let pad_y = (self.last_canvas_size.1 - world_h * scale) * 0.5;
+        let x = self.last_canvas_origin.0 + pad_x + self.offset_px.0 + point.0 * scale;
+        let y = self.last_canvas_origin.1 + pad_y + self.offset_px.1 + point.1 * scale;
+        Some((x, y))
+    }
+}
+
 pub struct Camera {
     config: CameraConfig,
     state: CameraState,
@@ -116,6 +137,57 @@ impl Camera {
             .clamp(self.config.min_zoom, self.config.max_zoom);
         self.state.zoom = desired;
         self.state.zoom_initialized = true;
+    }
+
+    pub fn fit_world(&mut self) {
+        if self.state.last_base_scale <= f32::EPSILON {
+            return;
+        }
+        let base_scale = self.state.last_base_scale;
+        let zoom = (self.config.legacy_scale / base_scale)
+            .clamp(self.config.min_zoom, self.config.max_zoom);
+        self.state.zoom = zoom;
+        self.state.offset_px = (0.0, 0.0);
+        self.state.centered_once = true;
+        self.state.zoom_initialized = true;
+    }
+
+    pub fn fit_bounds(&mut self, bounds_min: Position, bounds_max: Position, padding_px: f32) {
+        if self.state.last_base_scale <= f32::EPSILON {
+            return;
+        }
+        let canvas = self.state.last_canvas_size;
+        if canvas.0 <= f32::EPSILON || canvas.1 <= f32::EPSILON {
+            return;
+        }
+
+        let min_x = bounds_min.x.min(bounds_max.x);
+        let max_x = bounds_min.x.max(bounds_max.x);
+        let min_y = bounds_min.y.min(bounds_max.y);
+        let max_y = bounds_min.y.max(bounds_max.y);
+
+        let width_world = (max_x - min_x).max(1.0);
+        let height_world = (max_y - min_y).max(1.0);
+
+        let available_w = (canvas.0 - padding_px * 2.0).max(32.0);
+        let available_h = (canvas.1 - padding_px * 2.0).max(32.0);
+
+        let target_scale_x = available_w / width_world;
+        let target_scale_y = available_h / height_world;
+        let target_scale = target_scale_x.min(target_scale_y).max(1e-6);
+
+        let base_scale = self.state.last_base_scale;
+        let mut target_zoom = target_scale / base_scale;
+        target_zoom = target_zoom.clamp(self.config.min_zoom, self.config.max_zoom);
+        self.state.zoom = target_zoom;
+        self.state.zoom_initialized = true;
+
+        let center = Position {
+            x: (min_x + max_x) * 0.5,
+            y: (min_y + max_y) * 0.5,
+        };
+        self.center_on(center);
+        self.state.centered_once = true;
     }
 
     pub fn start_pan(&mut self, cursor: Point<Pixels>) {

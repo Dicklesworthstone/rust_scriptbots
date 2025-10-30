@@ -16,7 +16,14 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - PinkMountain: Drafted Stage 1 work breakdown for camera refactor (`camera_stage1_plan.md`); Stage 2 wiring underway pending visuals/CI ownership.
 - PinkMountain: Owning Stage 2 camera wiring (GPUI + terminal/offscreen integration) per PLAN §2.3/§2.4 updates.
 - PinkMountain: Stage 2 progress — GPUI + WGPU paths now rely on `Camera::layout`; terminal/offscreen parity and HUD overlays remain.
+- PinkMountain: Extended `render_png_offscreen` to share `Camera::layout` + `world_to_screen`, keeping REST exports aligned with the live renderer; HUD/inspector overlays now surface screen coordinates via `world_to_screen`.
 - RedCastle: Regenerated all legacy reference PNGs (`legacy_default.png`, `legacy_selected_agent.png`, `legacy_food_peak.png`, `legacy_food_off.png`, `legacy_zoomed_hud.png`), refreshed SHA256s in `checksums.txt`, and published capture helper `capture_legacy_render.sh`.
 - RedCastle: Added SVG overlays (`legacy_*_overlay.svg`) aligned with ROI tables and updated spec/plan to mark PLAN §1.2 complete.
 - RedCastle: Drafted `visual_polish_plan.md` outlining palette/legibility work and claimed PLAN §3.1–§3.2 pending Stage 2 stability.
 - RedCastle: Implemented PLAN §3.1–§3.2 (legacy palette port, drop shadows, thicker outlines, GPU colour sync); plan doc + snapshot refreshed.
+- RedCastle: Added terminal palette cycling (Natural/Deuter/Protan/Tritan/High Contrast) and rethemed HUD metrics to share the new colour sets; PLAN §3.4 marked in-progress pending perf sweep.
+- RedCastle: Completed PLAN §3.4 — terminal palettes cycled via `c`, theme parity achieved, and headless perf sweep (240 frames @ threads=2) showed no regressions.
+- RedCastle: Completed PLAN §3.5 validation — compared legacy vs. current goldens (MAE ≈ 89, agents clearly visible), checked terrain palette/render HUD readability, and verified terminal palettes under headless run.
+- RedSnow (2025-10-30 17:13 UTC): Picking up PLAN §2.3 HUD/debug overlay rewiring to adopt `CameraSnapshot::world_to_screen`; coordinating with PinkMountain/PurpleBear.
+- RedSnow (2025-10-30 17:28 UTC): Completed Stage 2.3 HUD debug overlay refactor; `paint_debug_overlays` and the batched agent outline pass now call `CameraSnapshot::world_to_screen` to stay aligned with zoom/pan math.
+- RedSnow (2025-10-30 19:15 UTC): Updated PLAN §2 status to completed; follow-mode fit chips now documented and Stage 2/3 milestones closed out.

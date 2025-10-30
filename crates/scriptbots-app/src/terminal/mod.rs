@@ -484,6 +484,12 @@ impl<'a> TerminalApp<'a> {
             ),
             self.palette.accent_style(),
         ));
+        line.spans.push(Span::raw("  "));
+        line.spans.push(Span::styled(
+            format!("Palette {}", self.palette.mode_label()),
+            self.palette.accent_style(),
+        ));
+        line.spans.push(Span::raw(" (c to cycle)"));
 
         // Add a compact, persistent help hint
         line.spans.push(Span::raw("  "));
@@ -1115,6 +1121,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" S        Save ASCII screenshot"),
             Line::raw(" e        Toggle emoji mode"),
             Line::raw(" n        Toggle narrow symbols (emoji-compatible alignment)"),
+            Line::raw(" c        Cycle palette (accessibility modes)"),
             Line::raw(" b        Toggle metrics baseline (set/clear)"),
             Line::raw(" x        Toggle expanded panels (auto-on on wide terminals)"),
             Line::raw(" [ / ]    Cycle brain layers (console view)"),
@@ -1166,6 +1173,10 @@ impl<'a> TerminalApp<'a> {
             | (KeyCode::Char('Q'), _)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 return Ok(true);
+            }
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                self.palette.cycle_mode();
+                return Ok(false);
             }
             (KeyCode::Char(' '), _) => {
                 self.paused = !self.paused;
@@ -2328,13 +2339,213 @@ fn report_file_path_from_env() -> Option<PathBuf> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalPaletteMode {
+    Natural,
+    Deuteranopia,
+    Protanopia,
+    Tritanopia,
+    HighContrast,
+}
+
+impl TerminalPaletteMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Natural => Self::Deuteranopia,
+            Self::Deuteranopia => Self::Protanopia,
+            Self::Protanopia => Self::Tritanopia,
+            Self::Tritanopia => Self::HighContrast,
+            Self::HighContrast => Self::Natural,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Natural => "Natural",
+            Self::Deuteranopia => "Deuteranopia",
+            Self::Protanopia => "Protanopia",
+            Self::Tritanopia => "Tritanopia",
+            Self::HighContrast => "High Contrast",
+        }
+    }
+}
+
 struct Palette {
     level: Option<ColorLevel>,
     emoji: bool,
     emoji_narrow: bool,
+    mode: TerminalPaletteMode,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalTheme {
+    header: Color,
+    accent: Color,
+    paused_fg: Color,
+    paused_bg: Color,
+    running_fg: Color,
+    running_bg: Color,
+    diet: [Color; 3],
+    event: [Color; 4],
+    population_spark: Color,
+    energy_spark: Color,
+    terrain_fg: [Color; 6],
+    terrain_bg: [Color; 6],
+}
+
+fn rgb(hex: u32) -> Color {
+    Color::Rgb(
+        ((hex >> 16) & 0xFF) as u8,
+        ((hex >> 8) & 0xFF) as u8,
+        (hex & 0xFF) as u8,
+    )
 }
 
 impl Palette {
+    fn theme(&self) -> TerminalTheme {
+        match self.mode {
+            TerminalPaletteMode::Natural => TerminalTheme {
+                header: rgb(0x93c5fd),
+                accent: rgb(0x38bdf8),
+                paused_fg: rgb(0x0f172a),
+                paused_bg: rgb(0xf97316),
+                running_fg: rgb(0x0f172a),
+                running_bg: rgb(0x22c55e),
+                diet: [rgb(0x22c55e), rgb(0xfacc15), rgb(0xcb2a3b)],
+                event: [rgb(0x22c55e), rgb(0xf97316), rgb(0xfacc15), rgb(0x60a5fa)],
+                population_spark: rgb(0x22c55e),
+                energy_spark: rgb(0xf59e0b),
+                terrain_fg: [
+                    rgb(0x1E3F66),
+                    rgb(0x2F73B3),
+                    rgb(0xB14E07),
+                    rgb(0x50A913),
+                    rgb(0x79D46D),
+                    rgb(0xA9B1BA),
+                ],
+                terrain_bg: [
+                    rgb(0x132234),
+                    rgb(0x1B4669),
+                    rgb(0x6A3B0B),
+                    rgb(0x2F5F17),
+                    rgb(0x3F6F47),
+                    rgb(0x5A5F65),
+                ],
+            },
+            TerminalPaletteMode::Deuteranopia => TerminalTheme {
+                header: rgb(0xcbd5f5),
+                accent: rgb(0x60a5fa),
+                paused_fg: rgb(0x082f49),
+                paused_bg: rgb(0xfbbf24),
+                running_fg: rgb(0x082f49),
+                running_bg: rgb(0x2dd4bf),
+                diet: [rgb(0x2dd4bf), rgb(0xfbbf24), rgb(0xf87171)],
+                event: [rgb(0x2dd4bf), rgb(0xf87171), rgb(0xfbbf24), rgb(0x60a5fa)],
+                population_spark: rgb(0x2dd4bf),
+                energy_spark: rgb(0xfbbf24),
+                terrain_fg: [
+                    rgb(0x214c67),
+                    rgb(0x2f6f8f),
+                    rgb(0x8b5f29),
+                    rgb(0x4c8241),
+                    rgb(0x6cbf8a),
+                    rgb(0x8d95a1),
+                ],
+                terrain_bg: [
+                    rgb(0x142d38),
+                    rgb(0x1f4555),
+                    rgb(0x5c3f1c),
+                    rgb(0x315031),
+                    rgb(0x3d6b4d),
+                    rgb(0x555b63),
+                ],
+            },
+            TerminalPaletteMode::Protanopia => TerminalTheme {
+                header: rgb(0xe2e8f0),
+                accent: rgb(0x7dd3fc),
+                paused_fg: rgb(0x082f49),
+                paused_bg: rgb(0xfbbf24),
+                running_fg: rgb(0x082f49),
+                running_bg: rgb(0x38bdf8),
+                diet: [rgb(0x38bdf8), rgb(0xfbbf24), rgb(0xf472b6)],
+                event: [rgb(0x38bdf8), rgb(0xf472b6), rgb(0xfbbf24), rgb(0x7dd3fc)],
+                population_spark: rgb(0x38bdf8),
+                energy_spark: rgb(0xfbbf24),
+                terrain_fg: [
+                    rgb(0x274164),
+                    rgb(0x3570a5),
+                    rgb(0x8a6134),
+                    rgb(0x5d8c3d),
+                    rgb(0x7ecf86),
+                    rgb(0x95a4b5),
+                ],
+                terrain_bg: [
+                    rgb(0x14273a),
+                    rgb(0x1f4a67),
+                    rgb(0x533c26),
+                    rgb(0x304f2a),
+                    rgb(0x3c6541),
+                    rgb(0x505761),
+                ],
+            },
+            TerminalPaletteMode::Tritanopia => TerminalTheme {
+                header: rgb(0xf5f5f4),
+                accent: rgb(0xf97316),
+                paused_fg: rgb(0x0b1120),
+                paused_bg: rgb(0x22c55e),
+                running_fg: rgb(0x0b1120),
+                running_bg: rgb(0xf97316),
+                diet: [rgb(0xfb7185), rgb(0xfacc15), rgb(0x6366f1)],
+                event: [rgb(0xfb7185), rgb(0x6366f1), rgb(0xfacc15), rgb(0xf97316)],
+                population_spark: rgb(0xfb7185),
+                energy_spark: rgb(0xfacc15),
+                terrain_fg: [
+                    rgb(0x3b4f7f),
+                    rgb(0x4f6ad6),
+                    rgb(0xb45309),
+                    rgb(0x10b981),
+                    rgb(0x34d399),
+                    rgb(0x818cf8),
+                ],
+                terrain_bg: [
+                    rgb(0x1f2941),
+                    rgb(0x2a3f75),
+                    rgb(0x5f3a17),
+                    rgb(0x0d3d2c),
+                    rgb(0x155940),
+                    rgb(0x373a74),
+                ],
+            },
+            TerminalPaletteMode::HighContrast => TerminalTheme {
+                header: rgb(0xf8fafc),
+                accent: rgb(0x38bdf8),
+                paused_fg: rgb(0x000000),
+                paused_bg: rgb(0xfacc15),
+                running_fg: rgb(0x000000),
+                running_bg: rgb(0xf97316),
+                diet: [rgb(0xffffff), rgb(0xfacc15), rgb(0xff5555)],
+                event: [rgb(0xffffff), rgb(0xff5555), rgb(0xfacc15), rgb(0x38bdf8)],
+                population_spark: rgb(0xffffff),
+                energy_spark: rgb(0xfacc15),
+                terrain_fg: [
+                    rgb(0xffffff),
+                    rgb(0xd9e3ff),
+                    rgb(0xffe9b0),
+                    rgb(0xb7ffc8),
+                    rgb(0xffc7ff),
+                    rgb(0xd9d9d9),
+                ],
+                terrain_bg: [
+                    rgb(0x000000),
+                    rgb(0x000000),
+                    rgb(0x000000),
+                    rgb(0x000000),
+                    rgb(0x000000),
+                    rgb(0x000000),
+                ],
+            },
+        }
+    }
     fn heading_char_ascii(heading: f32) -> char {
         let normalized = heading.rem_euclid(TAU);
         let sector = ((normalized / (PI / 4.0)).round() as i32) & 7;
@@ -2393,44 +2604,62 @@ impl Palette {
             }
         };
         // Default narrow mode off; users can toggle if their terminal misaligns emojis
+        let mode = std::env::var("SCRIPTBOTS_TERMINAL_PALETTE")
+            .ok()
+            .and_then(|raw| match raw.to_ascii_lowercase().as_str() {
+                "natural" => Some(TerminalPaletteMode::Natural),
+                "deuter" | "deuteranopia" => Some(TerminalPaletteMode::Deuteranopia),
+                "protan" | "protanopia" => Some(TerminalPaletteMode::Protanopia),
+                "tritan" | "tritanopia" => Some(TerminalPaletteMode::Tritanopia),
+                "high" | "high_contrast" | "high-contrast" => {
+                    Some(TerminalPaletteMode::HighContrast)
+                }
+                _ => None,
+            })
+            .unwrap_or(TerminalPaletteMode::Natural);
         Self {
             level,
             emoji,
             emoji_narrow: false,
+            mode,
         }
     }
 
     fn header_style(&self) -> Style {
+        let theme = self.theme();
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.header)
             .add_modifier(Modifier::BOLD)
     }
 
     fn accent_style(&self) -> Style {
-        Style::default().fg(Color::LightMagenta)
+        Style::default().fg(self.theme().accent)
     }
 
     fn paused_style(&self) -> Style {
+        let theme = self.theme();
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::DarkGray)
+            .fg(theme.paused_fg)
+            .bg(theme.paused_bg)
             .add_modifier(Modifier::BOLD)
     }
 
     fn running_style(&self) -> Style {
+        let theme = self.theme();
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
+            .fg(theme.running_fg)
+            .bg(theme.running_bg)
             .add_modifier(Modifier::BOLD)
     }
 
     fn speed_style(&self, speed: f32) -> Style {
+        let theme = self.theme();
         let color = if speed > 1.0 {
-            Color::Yellow
+            theme.accent
         } else if speed <= 0.0 {
-            Color::DarkGray
+            theme.paused_bg
         } else {
-            Color::LightCyan
+            theme.population_spark
         };
         Style::default().fg(color)
     }
@@ -2444,19 +2673,20 @@ impl Palette {
     }
 
     fn population_spark_style(&self) -> Style {
-        Style::default().fg(Color::Green)
+        Style::default().fg(self.theme().population_spark)
     }
 
     fn energy_spark_style(&self) -> Style {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(self.theme().energy_spark)
     }
 
     fn event_style(&self, kind: EventKind) -> Style {
+        let theme = self.theme();
         let color = match kind {
-            EventKind::Birth => Color::Green,
-            EventKind::Death => Color::Red,
-            EventKind::Population => Color::Yellow,
-            EventKind::Info => Color::Cyan,
+            EventKind::Birth => theme.event[0],
+            EventKind::Death => theme.event[1],
+            EventKind::Population => theme.event[2],
+            EventKind::Info => theme.event[3],
         };
         Style::default().fg(color)
     }
@@ -2473,6 +2703,14 @@ impl Palette {
         self.emoji = !self.emoji;
     }
 
+    fn cycle_mode(&mut self) {
+        self.mode = self.mode.next();
+    }
+
+    fn mode_label(&self) -> &'static str {
+        self.mode.label()
+    }
+
     fn is_emoji_narrow(&self) -> bool {
         self.emoji && self.emoji_narrow
     }
@@ -2484,10 +2722,11 @@ impl Palette {
     }
 
     fn diet_color(&self, diet: DietClass) -> Color {
+        let theme = self.theme();
         match diet {
-            DietClass::Herbivore => Color::Green,
-            DietClass::Omnivore => Color::Yellow,
-            DietClass::Carnivore => Color::Red,
+            DietClass::Herbivore => theme.diet[0],
+            DietClass::Omnivore => theme.diet[1],
+            DietClass::Carnivore => theme.diet[2],
         }
     }
 
@@ -2495,112 +2734,86 @@ impl Palette {
         let rich_color = self
             .level
             .is_some_and(|level| level.has_16m || level.has_256);
+        let idx = match kind {
+            TerrainKind::DeepWater => 0,
+            TerrainKind::ShallowWater => 1,
+            TerrainKind::Sand => 2,
+            TerrainKind::Grass => 3,
+            TerrainKind::Bloom => 4,
+            TerrainKind::Rock => 5,
+        };
+        let theme = self.theme();
+        let rich_fg = theme.terrain_fg[idx];
+        let rich_bg = theme.terrain_bg[idx];
+        let (fallback_fg, fallback_bg) = match kind {
+            TerrainKind::DeepWater => (Color::Blue, Color::Black),
+            TerrainKind::ShallowWater => (Color::Cyan, Color::Blue),
+            TerrainKind::Sand => (Color::Yellow, Color::Black),
+            TerrainKind::Grass => (Color::Green, Color::Black),
+            TerrainKind::Bloom => (Color::Magenta, Color::Black),
+            TerrainKind::Rock => (Color::Gray, Color::Black),
+        };
+        let (base_fg, base_bg) = if rich_color {
+            (rich_fg, rich_bg)
+        } else {
+            (fallback_fg, fallback_bg)
+        };
         let (mut glyph, fg, bg) = if self.emoji {
-            match kind {
-                TerrainKind::DeepWater => (
+            let glyph = match kind {
+                TerrainKind::DeepWater => {
                     if self.is_emoji_narrow() {
                         '≈'
                     } else {
                         '🌊'
-                    },
-                    Color::Cyan,
-                    Color::Blue,
-                ),
-                TerrainKind::ShallowWater => (
-                    if self.is_emoji_narrow() { '~' } else { '💧' },
-                    Color::Cyan,
-                    if rich_color {
-                        Color::Rgb(0, 80, 160)
+                    }
+                }
+                TerrainKind::ShallowWater => {
+                    if self.is_emoji_narrow() {
+                        '~'
                     } else {
-                        Color::Blue
-                    },
-                ),
-                TerrainKind::Sand => (
-                    if self.is_emoji_narrow() { '·' } else { '🏜' },
-                    Color::Yellow,
-                    if rich_color {
-                        Color::Rgb(160, 120, 50)
+                        '💧'
+                    }
+                }
+                TerrainKind::Sand => {
+                    if self.is_emoji_narrow() {
+                        '·'
                     } else {
-                        Color::Yellow
-                    },
-                ),
-                TerrainKind::Grass => (
-                    if self.is_emoji_narrow() { '"' } else { '🌿' },
-                    Color::LightGreen,
-                    if rich_color {
-                        Color::Rgb(30, 90, 30)
+                        '🏜'
+                    }
+                }
+                TerrainKind::Grass => {
+                    if self.is_emoji_narrow() {
+                        '"'
                     } else {
-                        Color::Green
-                    },
-                ),
-                TerrainKind::Bloom => (
-                    if self.is_emoji_narrow() { '*' } else { '🌺' },
-                    Color::Magenta,
-                    if rich_color {
-                        Color::Rgb(100, 30, 100)
+                        '🌿'
+                    }
+                }
+                TerrainKind::Bloom => {
+                    if self.is_emoji_narrow() {
+                        '*'
                     } else {
-                        Color::Magenta
-                    },
-                ),
-                TerrainKind::Rock => (
-                    if self.is_emoji_narrow() { '^' } else { '🪨' },
-                    Color::Gray,
-                    if rich_color {
-                        Color::Rgb(70, 70, 70)
+                        '🌺'
+                    }
+                }
+                TerrainKind::Rock => {
+                    if self.is_emoji_narrow() {
+                        '^'
                     } else {
-                        Color::DarkGray
-                    },
-                ),
-            }
+                        '🪨'
+                    }
+                }
+            };
+            (glyph, base_fg, base_bg)
         } else {
-            match kind {
-                TerrainKind::DeepWater => ('≈', Color::Cyan, Color::Blue),
-                TerrainKind::ShallowWater => (
-                    '~',
-                    Color::Cyan,
-                    if rich_color {
-                        Color::Rgb(0, 80, 160)
-                    } else {
-                        Color::Blue
-                    },
-                ),
-                TerrainKind::Sand => (
-                    '·',
-                    Color::Yellow,
-                    if rich_color {
-                        Color::Rgb(160, 120, 50)
-                    } else {
-                        Color::Yellow
-                    },
-                ),
-                TerrainKind::Grass => (
-                    '"',
-                    Color::LightGreen,
-                    if rich_color {
-                        Color::Rgb(30, 90, 30)
-                    } else {
-                        Color::Green
-                    },
-                ),
-                TerrainKind::Bloom => (
-                    '*',
-                    Color::Magenta,
-                    if rich_color {
-                        Color::Rgb(100, 30, 100)
-                    } else {
-                        Color::Magenta
-                    },
-                ),
-                TerrainKind::Rock => (
-                    '^',
-                    Color::Gray,
-                    if rich_color {
-                        Color::Rgb(70, 70, 70)
-                    } else {
-                        Color::DarkGray
-                    },
-                ),
-            }
+            let glyph = match kind {
+                TerrainKind::DeepWater => '≈',
+                TerrainKind::ShallowWater => '~',
+                TerrainKind::Sand => '·',
+                TerrainKind::Grass => '"',
+                TerrainKind::Bloom => '*',
+                TerrainKind::Rock => '^',
+            };
+            (glyph, base_fg, base_bg)
         };
         // Food-driven flourish: swap glyph for lush/barren variants when in emoji mode
         if self.emoji && !self.is_emoji_narrow() {

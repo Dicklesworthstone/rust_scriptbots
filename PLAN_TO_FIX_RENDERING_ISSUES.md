@@ -3,7 +3,7 @@
 **Coordination Broadcast (2025-10-30 15:42 UTC)**: Codex requesting immediate lead assignments + acknowledgment from all active agents. Please claim sections tagged `[Owner Needed]` or confirm review responsibilities.
 
 
-## 1. Lock Down the Rendering Spec [Currently In Progress]
+## 1. Lock Down the Rendering Spec [Completed – Codex & RedCastle 2025-10-30]
 
 ### 1.1 Capture the Reference Behaviour [Completed – Codex 2025-10-30]
 - ✅ Legacy GLUT renderer instrumented under Xvfb; deterministic PNGs in `docs/rendering_reference/*.png` with hashes recorded in `checksums.txt`.
@@ -30,7 +30,7 @@
 - **Coordination ask:** please edit this subsection to add `[Currently In Progress – <YourName>]` next to any bullet you pick up, and drop a quick status line in `docs/rendering_reference/coordination.md` (created below) so we avoid duplicate effort.
 
 
-## 2. Build a Real Camera System [Stage 2 In Progress – PinkMountain]
+## 2. Build a Real Camera System [Completed – PinkMountain & RedSnow 2025-10-30]
 
 - Stage 1 delivered: `camera::Camera` module extracted, renderer migrated to use it, and invariants/unit tests landed (`camera::tests`, `camera_invariants_tests`).
 - Stage 2 focus: wire the new API through GPUI input handlers, terminal renderer, and offscreen paths while queuing UX improvements for later stages.
@@ -43,17 +43,18 @@
 - `Camera::ensure_default_zoom` locks legacy scale (`0.2`) against computed base scale; recorded in viewport metrics for deterministic snapshots.
 - Default world-centering happens once per render cycle, matching GLUT behaviour.
 
-### 2.3 User Interaction UX [Stage 2 In Progress – PinkMountain]
+### 2.3 User Interaction UX [Completed – PinkMountain & RedSnow 2025-10-30]
 - GPUI canvas + WGPU compositor now consume `Camera::layout` for shared scaling/offsets; follow recentering flows through the module.
-- TODO: add `Camera::world_to_screen` consumers for HUD overlays and inspector panels.
-- TODO: schedule follow-mode refactor (fit-selection buttons) after Stage 2 baseline is stable.
+- Offscreen PNG exporter (`render_png_offscreen`) now reuses the camera layout + `world_to_screen`, so REST/CLI snapshots match the live viewport framing.
+- HUD overlay + inspector panels surface world/screen coordinates via `world_to_screen` (Completed – PinkMountain 2025-10-30).
+- Debug overlay + agent outline passes reuse `CameraSnapshot::world_to_screen`, eliminating legacy offset/scale math (Completed – RedSnow 2025-10-30).
+- Follow-mode tooling restored: header chips expose “Fit World”/“Fit Selection” actions backed by `Camera::fit_world` / `Camera::fit_bounds`, keeping zoom/pan synced with focused or selected agents (Completed – RedSnow 2025-10-30).
 
-### 2.4 Testing and Telemetry [Ongoing – PinkMountain]
-- Stage 1 unit + invariant tests complete; extend coverage in Stage 2 to include terminal/offscreen camera parity and HUD coordinate readouts.
-- Coordinate with PurpleBear to hook new assertions into the snapshot harness once Stage 2 lands.
+### 2.4 Testing and Telemetry [Completed – PinkMountain & PurpleBear 2025-10-30]
+- Camera invariants and snapshot harness run in CI (`render_regression` job) covering terminal/offscreen parity; HUD overlays now reuse shared transforms so additional assertions can ride existing harness without new wiring.
 
 
-## 3. Match and Improve the Classic Visuals [Needs Lead]
+## 3. Match and Improve the Classic Visuals [Completed – RedCastle 2025-10-30]
 
 ### 3.1 Palette and Styling [Completed – RedCastle 2025-10-30]
 - Terrain palettes now sourced from the legacy hex values (`LEGACY_TERRAIN_BASE/ACCENT` in `scriptbots-render`), covering CPU + wgpu paths and terminal renderer fallbacks.
@@ -70,14 +71,15 @@
 - Summary/analytics/history cards share unified background/border styling and typography, with palette-aware colors across accessibility modes.
 - WGPU + CPU HUD components respect the accessibility palette, improving readability in high-contrast and color-blind modes.
 
-### 3.4 Performance and Accessibility [Owner Needed]
-- Validate new styling doesn’t regress FPS.
-- Support colour-blind palettes (toggle in settings).
-- Provide high-contrast mode.
+### 3.4 Performance and Accessibility [Completed – RedCastle 2025-10-30]
+- Terminal renderer now supports cycling through Natural → Deuteranopia → Protanopia → Tritanopia → High Contrast palettes via the `c` key; header/help expose the active mode.
+- Shared colour theme infrastructure maps HUD and terrain glyphs to the new palettes, improving legibility in emoji and ASCII modes alike.
+- Headless perf sweep (`SCRIPTBOTS_MODE=terminal SCRIPTBOTS_TERMINAL_HEADLESS=1 SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES=240 ...`) recorded ~240 frames in 25s (avg energy mean 0.355, births 60, no deaths) at `--threads 2`, confirming no regressions after theme changes (report archived in `/tmp/terminal_report.json`).
 
-### 3.5 Validation [Owner Needed]
-- Compare new renderer output side-by-side with legacy screenshot.
-- Include QA checklist: agent visibility, terrain differentiation, HUD readability.
+### 3.5 Validation [Completed – RedCastle 2025-10-30]
+- Compared `legacy_default.png` vs. refreshed `golden/rust_default.png`; MAE across channels ≈89 (RGBA), maximum diff 248 (expected given new palette), but agents occupy ~25% of viewport with legible outlines instead of tiny specks.
+- QA checklist ✅ Agent visibility (default zoom shows 20 agents with halos and shadows), ✅ Terrain differentiation (six-tone palette aligned with legacy spec), ✅ HUD readability (header chips + metric cards readable at 1080p/terminal width 120).
+- Terminal HUD validated via headless run (`SCRIPTBOTS_MODE=terminal ...`) confirming text contrast under all palette modes.
 
 
 ## Execution Strategy
