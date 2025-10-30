@@ -130,6 +130,8 @@ _Prepared by RedSnow — 2025-10-30_
 | 4 | Interactivity | Agent selection, follow toggles, command buttons. | Round-trip commands (select agent) confirmed via simulation logs. |
 | 5 | Polish + QA | Performance tuning, lighting, debug overlays, CI integration. | Bevy path passes `render_regression` job + manual smoke checklist. |
 
+- Progress (2025-10-30 – RedSnow): Scaffolded `scriptbots-bevy` crate, workspace feature flag, CLI `--renderer=bevy`, and stub window launcher. Pending manual runtime verification before marking Phase 0 complete.
+
 ---
 
 ## 6. Testing & Regression Strategy

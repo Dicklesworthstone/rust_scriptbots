@@ -4,6 +4,7 @@ use anyhow::Result;
 use bevy::{
     app::AppExit,
     prelude::*,
+    window::WindowPlugin,
 };
 use tracing::info;
 
@@ -27,11 +28,7 @@ pub fn run_stub_renderer() -> Result<()> {
     Ok(())
 }
 
-fn setup_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+fn setup_scene(mut commands: Commands) {
     commands.spawn(Camera3dBundle {
         transform: Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
         ..Default::default()
@@ -47,23 +44,10 @@ fn setup_scene(
         ..Default::default()
     });
 
-    let plane_mesh = meshes.add(Mesh::from(shape::Plane::from_size(10.0)));
-    let plane_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.10, 0.16, 0.22),
-        perceptual_roughness: 0.85,
-        metallic: 0.02,
-        ..Default::default()
-    });
-
-    commands.spawn(PbrBundle {
-        mesh: plane_mesh,
-        material: plane_material,
-        ..Default::default()
-    });
 }
 
-fn close_on_esc(mut exit_events: EventWriter<AppExit>, keyboard: Res<Input<KeyCode>>) {
+fn close_on_esc(mut exit_events: EventWriter<AppExit>, keyboard: Res<ButtonInput<KeyCode>>) {
     if keyboard.just_pressed(KeyCode::Escape) {
-        exit_events.send(AppExit);
+        exit_events.send(AppExit::Success);
     }
 }
