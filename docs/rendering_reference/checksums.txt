@@ -1,0 +1,6 @@
+# Legacy rendering reference assets (SHA256)
+# Captured via Xvfb + ImageMagick from original GLUT renderer on 2025-10-30.
+d2c528791f9cde234436fe874632eaf336b959a50e7bab6a3be14f1e651b77ea  legacy_default.png
+3d38aabffa50868fea3c30122305d9719d9f3e9d6a8b04bd660e9231fe9768bc  legacy_selected_agent.png
+eca81feffb3ccdf33dd82c406f16101354c1673293e0c78756b622dfa6ad52aa  legacy_food_peak.png
+c6caf85cfea32a17020967d27756ed7196cf06c7a97f02cfd7967827060d4dd4  golden/rust_default.png

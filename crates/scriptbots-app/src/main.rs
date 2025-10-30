@@ -543,6 +543,9 @@ fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
     };
     config = apply_config_layers(config, &cli.config_layers)?;
     apply_env_overrides(&mut config);
+    if let Some(seed) = cli.rng_seed {
+        config.rng_seed = Some(seed);
+    }
     if let Some(limit) = cli.auto_pause_below {
         config.control.auto_pause_population_below = Some(limit);
     }
@@ -617,6 +620,13 @@ struct AppCli {
         value_delimiter = ';'
     )]
     config_layers: Vec<PathBuf>,
+    /// RNG seed override for deterministic runs.
+    #[arg(
+        long = "rng-seed",
+        value_name = "SEED",
+        env = "SCRIPTBOTS_RNG_SEED"
+    )]
+    rng_seed: Option<u64>,
     /// Path to a DuckDB run to verify via headless deterministic replay.
     #[arg(long = "replay-db", value_name = "FILE", env = "SCRIPTBOTS_REPLAY_DB")]
     replay_db: Option<PathBuf>,
@@ -1963,6 +1973,15 @@ activation = "Sigmoid"
         let written = fs::read_to_string(&output).expect("read output");
         assert!(written.contains("world_width = 1234"));
         assert!(written.contains("rng_seed = 42"));
+    }
+
+    #[test]
+    #[serial]
+    fn rng_seed_cli_override_applies() {
+        let mut cli = default_cli();
+        cli.rng_seed = Some(2025);
+        let config = compose_config(&cli).expect("compose config");
+        assert_eq!(config.rng_seed, Some(2025));
     }
 
     #[test]

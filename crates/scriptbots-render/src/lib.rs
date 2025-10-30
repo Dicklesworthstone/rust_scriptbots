@@ -947,6 +947,20 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let base_scale = (width_px / world_w).min(height_px / world_h).max(0.0001);
     let mut camera_guard = state.camera.lock().expect("camera mutex poisoned");
     camera_guard.ensure_default_zoom(base_scale);
+    camera_guard.record_render_metrics(
+        (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
+        (width_px, height_px),
+        (world_w, world_h),
+        base_scale,
+    );
+    if !camera_guard.centered_once {
+        let world_center = Position {
+            x: world_w * 0.5,
+            y: world_h * 0.5,
+        };
+        camera_guard.center_on(world_center);
+        camera_guard.centered_once = true;
+    }
     let zoom = camera_guard.zoom;
     let (off_px_x, off_px_y) = camera_guard.offset_px;
     drop(camera_guard);
@@ -9975,7 +9989,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
 }
 
 #[derive(Clone)]
-struct CameraState {
+pub(crate) struct CameraState {
     offset_px: (f32, f32),
     zoom: f32,
     zoom_initialized: bool,
@@ -10042,7 +10056,7 @@ impl CameraState {
         self.pan_anchor = None;
     }
 
-    fn ensure_default_zoom(&mut self, base_scale: f32) {
+    pub(crate) fn ensure_default_zoom(&mut self, base_scale: f32) {
         if self.zoom_initialized {
             return;
         }
@@ -10094,7 +10108,7 @@ impl CameraState {
         true
     }
 
-    fn record_render_metrics(
+    pub(crate) fn record_render_metrics(
         &mut self,
         canvas_origin: (f32, f32),
         canvas_size: (f32, f32),
@@ -10128,7 +10142,7 @@ impl CameraState {
         self.offset_px.1 += center_y - world_screen_y;
     }
 
-    fn screen_to_world(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
+    pub(crate) fn screen_to_world(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
         let scale = self.last_scale;
         if scale <= f32::EPSILON {
             return None;
