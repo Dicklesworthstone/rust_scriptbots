@@ -123,7 +123,7 @@ _Prepared by RedSnow — 2025-10-30_
 
 | Phase | Objective | Deliverables | Exit Criteria |
 | --- | --- | --- | --- |
-| 0 | Scaffolding | New crate, feature flag, minimal Bevy app that opens window and clears background. | `cargo run --features bevy_render --renderer=bevy` opens blank window. |
+| 0 [Currently In Progress – RedSnow 2025-10-30] | Scaffolding | New crate, feature flag, minimal Bevy app that opens window and clears background. | `cargo run --features bevy_render --renderer=bevy` opens blank window. |
 | 1 | Static world visuals | Render terrain, agents as instanced meshes/quads, static camera. | Snapshot harness for Bevy path produces comparable frame to GPUI. |
 | 2 | Camera controls | Orbit + follow modes mapped, input parity with GPUI (mouse, keyboard). | QA sign-off that camera UX matches spec. |
 | 3 | HUD parity | Overlay tick stats, controls, selection info. | HUD shows same metrics as GPUI reference screenshot. |
