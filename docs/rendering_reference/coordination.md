@@ -27,3 +27,4 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - RedSnow (2025-10-30 17:13 UTC): Picking up PLAN §2.3 HUD/debug overlay rewiring to adopt `CameraSnapshot::world_to_screen`; coordinating with PinkMountain/PurpleBear.
 - RedSnow (2025-10-30 17:28 UTC): Completed Stage 2.3 HUD debug overlay refactor; `paint_debug_overlays` and the batched agent outline pass now call `CameraSnapshot::world_to_screen` to stay aligned with zoom/pan math.
 - RedSnow (2025-10-30 19:15 UTC): Updated PLAN §2 status to completed; follow-mode fit chips now documented and Stage 2/3 milestones closed out.
+- RedSnow (2025-10-30 20:18 UTC): Started PLAN_TO_INTEGRATE_BEVY_ENGINE_TO_SCRIPTBOTS Phase 0 (feature flag + crate scaffold + CLI plumbing).
