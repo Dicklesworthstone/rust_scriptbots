@@ -1786,17 +1786,8 @@ impl SimulationView {
     }
 
     fn render_header(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
-        let status_text = if snapshot.is_closed {
-            "Closed Ecosystem"
-        } else {
-            "Open Ecosystem"
-        };
-        let status_color = if snapshot.is_closed {
-            rgb(0xf97316)
-        } else {
-            rgb(0x22c55e)
-        };
-
+        let theme = hud_theme(self.accessibility.palette);
+        let controls = snapshot.controls;
         let subline = format!(
             "Tick #{}, epoch {}, {} active agents",
             snapshot.tick, snapshot.epoch, snapshot.agent_count
@@ -1816,6 +1807,55 @@ impl SimulationView {
             .flex_none()
         };
 
+        let mut chips_row = div().flex().gap_2().items_center();
+        let run_label = if controls.paused { "Paused" } else { "Running" };
+        let run_icon = if controls.paused { "⏸" } else { "▶" };
+        let run_bg = if controls.paused {
+            theme.chip_paused
+        } else {
+            theme.chip_running
+        };
+        chips_row = chips_row.child(self.header_chip(theme, run_icon, run_label, run_bg));
+
+        let mut env_chip = self.header_chip(
+            theme,
+            if snapshot.is_closed { "🔒" } else { "🌐" },
+            if snapshot.is_closed { "Closed" } else { "Open" },
+            if snapshot.is_closed {
+                theme.chip_closed
+            } else {
+                theme.chip_open
+            },
+        );
+        env_chip = env_chip
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.92))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+                    this.toggle_closed_environment(cx);
+                }),
+            );
+        chips_row = chips_row.child(env_chip);
+
+        if !controls.paused {
+            let speed = if (controls.speed_multiplier - 1.0).abs() < f32::EPSILON {
+                "Speed ×1".to_string()
+            } else {
+                format!("Speed ×{}", self.format_float(controls.speed_multiplier, 2))
+            };
+            chips_row = chips_row.child(self.header_chip(theme, "⚡", speed, theme.chip_follow));
+        }
+
+        if !matches!(controls.follow_mode, FollowMode::Off) {
+            chips_row = chips_row.child(self.header_chip(
+                theme,
+                "🎯",
+                controls.follow_mode.label(),
+                theme.chip_follow,
+            ));
+        }
+
         div()
             .flex()
             .justify_between()
@@ -1832,40 +1872,42 @@ impl SimulationView {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_3xl().child(self.title.clone()))
-                            .child(div().text_sm().text_color(rgb(0x94a3b8)).child(subline)),
+                            .child(
+                                div()
+                                    .text_3xl()
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(self.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(theme.text_subtle))
+                                    .child(subline),
+                            ),
                     ),
             )
             .child(
                 div()
                     .flex()
+                    .flex_col()
+                    .items_end()
                     .gap_2()
-                    .items_center()
+                    .child(chips_row)
                     .child(
                         div()
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .bg(status_color)
                             .text_sm()
-                            .text_color(rgb(0x0f172a))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x16a34a)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-                                    this.toggle_closed_environment(cx);
-                                }),
-                            )
-                            .child(status_text),
-                    )
-                    .child(div().text_sm().text_color(rgb(0x94a3b8)).child(format!(
-                        "World {}×{} · History cap {}",
-                        snapshot.world_size.0, snapshot.world_size.1, snapshot.history_capacity
-                    ))),
+                            .text_color(rgb(theme.text_subtle))
+                            .child(format!(
+                                "World {}×{} · History cap {}",
+                                snapshot.world_size.0,
+                                snapshot.world_size.1,
+                                snapshot.history_capacity
+                            )),
+                    ),
             )
     }
     fn render_summary(&self, snapshot: &HudSnapshot) -> Div {
+        let theme = hud_theme(self.accessibility.palette);
         let mut cards: Vec<Div> = Vec::new();
 
         if let Some(metrics) = snapshot.summary.as_ref() {
@@ -1884,6 +1926,7 @@ impl SimulationView {
             let health_series = sparkline_from_history(history, |entry| entry.average_health);
 
             cards.push(self.metric_card(
+                &theme,
                 "Tick",
                 metrics.tick.to_string(),
                 0x38bdf8,
@@ -1891,6 +1934,7 @@ impl SimulationView {
                 None,
             ));
             cards.push(self.metric_card(
+                &theme,
                 "Agents",
                 metrics.agent_count.to_string(),
                 0x22c55e,
@@ -1898,6 +1942,7 @@ impl SimulationView {
                 agents_series.clone(),
             ));
             cards.push(self.metric_card(
+                &theme,
                 "Births / Deaths",
                 format!("{} / {}", metrics.births, metrics.deaths),
                 growth_accent,
@@ -1905,6 +1950,7 @@ impl SimulationView {
                 growth_series.clone(),
             ));
             cards.push(self.metric_card(
+                &theme,
                 "Avg Energy",
                 self.format_float(metrics.average_energy, 2),
                 0xf59e0b,
@@ -1915,6 +1961,7 @@ impl SimulationView {
                 energy_series.clone(),
             ));
             cards.push(self.metric_card(
+                &theme,
                 "Avg Health",
                 self.format_float(metrics.average_health, 2),
                 0x8b5cf6,
@@ -1929,19 +1976,19 @@ impl SimulationView {
                     .gap_2()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x1d4ed8))
-                    .bg(rgb(0x111827))
+                    .border_color(rgb(theme.card_border))
+                    .bg(rgb(theme.card_bg))
                     .p_5()
                     .child(
                         div()
                             .text_lg()
-                            .text_color(rgb(0x93c5fd))
+                            .text_color(rgb(theme.text_primary))
                             .child("No metrics yet"),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x64748b))
+                            .text_color(rgb(theme.text_subtle))
                             .child("Run the simulation to generate tick summaries."),
                     ),
             );
@@ -1964,6 +2011,7 @@ impl SimulationView {
             )
         };
         cards.push(self.metric_card(
+            &theme,
             "Frame Time",
             frame_value,
             0x14b8a6,
@@ -1981,7 +2029,7 @@ impl SimulationView {
         } else {
             format!("Samples {}", perf.sample_count)
         };
-        cards.push(self.metric_card("FPS", fps_value, 0xf97316, Some(fps_detail), None));
+        cards.push(self.metric_card(&theme, "FPS", fps_value, 0xf97316, Some(fps_detail), None));
 
         let controls = snapshot.controls;
         let speed_value = if controls.paused {
@@ -1998,6 +2046,7 @@ impl SimulationView {
             controls.follow_mode.label()
         );
         cards.push(self.metric_card(
+            &theme,
             "Sim Controls",
             speed_value,
             0x60a5fa,
@@ -2013,6 +2062,7 @@ impl SimulationView {
             return div();
         };
 
+        let theme = hud_theme(self.accessibility.palette);
         let total_agents = snapshot
             .summary
             .as_ref()
@@ -2027,6 +2077,7 @@ impl SimulationView {
 
         let trophic_cards = vec![
             self.metric_card(
+                &theme,
                 "Carnivores",
                 analytics.carnivores.to_string(),
                 0xcb2a3b,
@@ -2037,6 +2088,7 @@ impl SimulationView {
                 None,
             ),
             self.metric_card(
+                &theme,
                 "Herbivores",
                 analytics.herbivores.to_string(),
                 0x22c55e,
@@ -2047,6 +2099,7 @@ impl SimulationView {
                 None,
             ),
             self.metric_card(
+                &theme,
                 "Hybrids",
                 analytics.hybrids.to_string(),
                 0x8b5cf6,
@@ -2062,7 +2115,7 @@ impl SimulationView {
             .justify_between()
             .gap_4()
             .text_xs()
-            .text_color(rgb(0x94a3b8))
+            .text_color(rgb(theme.text_subtle))
             .child(div().child(format!("Tick {}", analytics.tick)))
             .child(div().child(format!("Boosts {}", analytics.boost_count)))
             .child(div().child(format!("Births {}", analytics.births_total)));
@@ -2073,18 +2126,28 @@ impl SimulationView {
             .gap_1()
             .p_3()
             .rounded_lg()
-            .bg(rgb(0x0e172a))
+            .bg(rgb(theme.card_bg))
             .border_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(rgb(theme.card_border))
             .child(div().text_sm().text_color(rgb(0x7dd3fc)).child("Resources"))
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                "Total {:.1} · Mean {:.3} · σ {:.3}",
-                analytics.food_total, analytics.food_mean, analytics.food_stddev
-            )))
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-                "Δ mean {:.4} · |Δ| {:.4}",
-                analytics.food_delta_mean, analytics.food_delta_mean_abs
-            )));
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Total {:.1} · Mean {:.3} · σ {:.3}",
+                        analytics.food_total, analytics.food_mean, analytics.food_stddev
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_subtle))
+                    .child(format!(
+                        "Δ mean {:.4} · |Δ| {:.4}",
+                        analytics.food_delta_mean, analytics.food_delta_mean_abs
+                    )),
+            );
 
         let mutation_panel = div()
             .flex()
@@ -2092,18 +2155,28 @@ impl SimulationView {
             .gap_1()
             .p_3()
             .rounded_lg()
-            .bg(rgb(0x101a2e))
+            .bg(rgb(theme.card_bg))
             .border_1()
-            .border_color(rgb(0x1f2a3d))
+            .border_color(rgb(theme.card_border))
             .child(div().text_sm().text_color(rgb(0xfbbf24)).child("Mutation"))
-            .child(div().text_xs().text_color(rgb(0xfef3c7)).child(format!(
-                "Primary {:.4} ± {:.4}",
-                analytics.mutation_primary_mean, analytics.mutation_primary_stddev
-            )))
-            .child(div().text_xs().text_color(rgb(0xfef3c7)).child(format!(
-                "Secondary {:.4} ± {:.4}",
-                analytics.mutation_secondary_mean, analytics.mutation_secondary_stddev
-            )));
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Primary {:.4} ± {:.4}",
+                        analytics.mutation_primary_mean, analytics.mutation_primary_stddev
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Secondary {:.4} ± {:.4}",
+                        analytics.mutation_secondary_mean, analytics.mutation_secondary_stddev
+                    )),
+            );
 
         let behavior_panel = div()
             .flex()
@@ -2111,43 +2184,68 @@ impl SimulationView {
             .gap_1()
             .p_3()
             .rounded_lg()
-            .bg(rgb(0x111d31))
+            .bg(rgb(theme.card_bg))
             .border_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(rgb(theme.card_border))
             .child(div().text_sm().text_color(rgb(0x93c5fd)).child("Behavior"))
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                "Sensors μ {:.3} · H {:.3}",
-                analytics.behavior_sensor_mean, analytics.behavior_sensor_entropy
-            )))
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                "Outputs μ {:.3} · H {:.3}",
-                analytics.behavior_output_mean, analytics.behavior_output_entropy
-            )));
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Sensors μ {:.3} · H {:.3}",
+                        analytics.behavior_sensor_mean, analytics.behavior_sensor_entropy
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Outputs μ {:.3} · H {:.3}",
+                        analytics.behavior_output_mean, analytics.behavior_output_entropy
+                    )),
+            );
         let age_panel = div()
             .flex()
             .flex_col()
             .gap_1()
             .p_3()
             .rounded_lg()
-            .bg(rgb(0x101624))
+            .bg(rgb(theme.card_bg))
             .border_1()
-            .border_color(rgb(0x1d2738))
+            .border_color(rgb(theme.card_border))
             .child(div().text_sm().text_color(rgb(0xf59e0b)).child("Age"))
-            .child(div().text_xs().text_color(rgb(0xfef3c7)).child(format!(
-                "Mean {:.2} · Max {:.0} · Gen μ {:.1}",
-                analytics.age_mean, analytics.age_max, analytics.generation_mean
-            )))
-            .child(div().text_xs().text_color(rgb(0xfdba74)).child(format!(
-                "Gen max {:.0} · Hybrid births {} ({:.1}%)",
-                analytics.generation_max,
-                analytics.births_hybrid,
-                analytics.births_hybrid_ratio * 100.0
-            )))
-            .child(div().text_xs().text_color(rgb(0xfdba74)).child(format!(
-                "Repro μ {:.2} · Boost {:.1}%",
-                analytics.reproduction_counter_mean,
-                analytics.boost_ratio * 100.0
-            )));
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Mean {:.2} · Max {:.0} · Gen μ {:.1}",
+                        analytics.age_mean, analytics.age_max, analytics.generation_mean
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Gen max {:.0} · Hybrid births {} ({:.1}%)",
+                        analytics.generation_max,
+                        analytics.births_hybrid,
+                        analytics.births_hybrid_ratio * 100.0
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_subtle))
+                    .child(format!(
+                        "Repro μ {:.2} · Boost {:.1}%",
+                        analytics.reproduction_counter_mean,
+                        analytics.boost_ratio * 100.0
+                    )),
+            );
 
         let temperature_panel = div()
             .flex()
@@ -2155,23 +2253,35 @@ impl SimulationView {
             .gap_1()
             .p_3()
             .rounded_lg()
-            .bg(rgb(0x121f33))
+            .bg(rgb(theme.card_bg))
             .border_1()
-            .border_color(rgb(0x1f2f46))
+            .border_color(rgb(theme.card_border))
             .child(
                 div()
                     .text_sm()
                     .text_color(rgb(0x38bdf8))
                     .child("Temperature"),
             )
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                "Preference μ {:.3} · σ {:.3}",
-                analytics.temperature_preference_mean, analytics.temperature_preference_stddev
-            )))
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-                "Discomfort μ {:.3} · σ {:.3}",
-                analytics.temperature_discomfort_mean, analytics.temperature_discomfort_stddev
-            )));
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(format!(
+                        "Preference μ {:.3} · σ {:.3}",
+                        analytics.temperature_preference_mean,
+                        analytics.temperature_preference_stddev
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_subtle))
+                    .child(format!(
+                        "Discomfort μ {:.3} · σ {:.3}",
+                        analytics.temperature_discomfort_mean,
+                        analytics.temperature_discomfort_stddev
+                    )),
+            );
 
         let mortality_panel = {
             let total = analytics.deaths_total.max(1);
@@ -2182,7 +2292,7 @@ impl SimulationView {
                     .flex()
                     .justify_between()
                     .text_xs()
-                    .text_color(rgb(0xe2e8f0))
+                    .text_color(rgb(theme.text_primary))
                     .child(div().child(label_text))
                     .child(div().child(format!("{count} ({ratio:.1}%)")))
             };
@@ -2193,9 +2303,9 @@ impl SimulationView {
                 .gap_1()
                 .p_3()
                 .rounded_lg()
-                .bg(rgb(0x160f24))
+                .bg(rgb(theme.card_bg))
                 .border_1()
-                .border_color(rgb(0x27193a))
+                .border_color(rgb(theme.card_border))
                 .child(div().text_sm().text_color(rgb(0xf472b6)).child("Mortality"))
                 .child(make_row("Carnivore", analytics.deaths_combat_carnivore))
                 .child(make_row("Herbivore", analytics.deaths_combat_herbivore))
@@ -2207,7 +2317,7 @@ impl SimulationView {
                         .flex()
                         .justify_between()
                         .text_xs()
-                        .text_color(rgb(0x94a3b8))
+                        .text_color(rgb(theme.text_subtle))
                         .child(div().child("Total"))
                         .child(div().child(analytics.deaths_total.to_string())),
                 )
@@ -2228,7 +2338,7 @@ impl SimulationView {
             div()
                 .flex()
                 .text_xs()
-                .text_color(rgb(0x64748b))
+                .text_color(rgb(theme.text_subtle))
                 .gap_4()
                 .child(div().w(px(140.0)).child("BRAIN"))
                 .child(div().w(px(80.0)).child("COUNT"))
@@ -2240,7 +2350,7 @@ impl SimulationView {
             brain_rows.push(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(theme.text_subtle))
                     .child("No brain metrics yet"),
             );
         } else {
@@ -2252,7 +2362,7 @@ impl SimulationView {
                         .gap_4()
                         .items_center()
                         .text_xs()
-                        .text_color(rgb(0xe2e8f0))
+                        .text_color(rgb(theme.text_primary))
                         .child(div().w(px(140.0)).child(entry.label.clone()))
                         .child(div().w(px(80.0)).child(entry.count.to_string()))
                         .child(div().w(px(80.0)).child(format!("{share:.1}%")))
@@ -2267,9 +2377,9 @@ impl SimulationView {
             .gap_2()
             .p_3()
             .rounded_lg()
-            .bg(rgb(0x0d1626))
+            .bg(rgb(theme.card_bg))
             .border_1()
-            .border_color(rgb(0x1a2337))
+            .border_color(rgb(theme.card_border))
             .child(
                 div()
                     .text_sm()
@@ -2288,6 +2398,7 @@ impl SimulationView {
             .child(brain_panel)
     }
     fn render_history(&self, snapshot: &HudSnapshot) -> Div {
+        let theme = hud_theme(self.accessibility.palette);
         let header = div()
             .flex()
             .justify_between()
@@ -2295,27 +2406,32 @@ impl SimulationView {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x93c5fd))
+                    .text_color(rgb(theme.text_primary))
                     .child("Recent Tick History"),
             )
-            .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
-                "Showing {} of {} entries",
-                snapshot.recent_history.len(),
-                snapshot.history_capacity
-            )));
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_subtle))
+                    .child(format!(
+                        "Showing {} of {} entries",
+                        snapshot.recent_history.len(),
+                        snapshot.history_capacity
+                    )),
+            );
 
         let rows: Vec<Div> = if snapshot.recent_history.is_empty() {
             vec![
                 div()
                     .rounded_lg()
-                    .bg(rgb(0x0f172a))
+                    .bg(rgb(theme.card_bg))
                     .border_1()
-                    .border_color(rgb(0x1d4ed8))
+                    .border_color(rgb(theme.card_border))
                     .p_4()
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x64748b))
+                            .text_color(rgb(theme.text_subtle))
                             .child("No persisted tick history yet."),
                     ),
             ]
@@ -2326,9 +2442,9 @@ impl SimulationView {
                 .enumerate()
                 .map(|(idx, entry)| {
                     let row_bg = if idx % 2 == 0 {
-                        rgb(0x111b2b)
+                        rgb(theme.card_bg)
                     } else {
-                        rgb(0x0f172a)
+                        rgb(0x101a2e)
                     };
                     let growth = entry.net_growth();
                     let growth_color = if growth >= 0 {
@@ -2352,7 +2468,7 @@ impl SimulationView {
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(0x94a3b8))
+                                .text_color(rgb(theme.text_subtle))
                                 .child(format!("Tick {}", entry.tick)),
                         )
                         .child(
@@ -2363,7 +2479,7 @@ impl SimulationView {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(rgb(0xf8fafc))
+                                        .text_color(rgb(theme.text_primary))
                                         .child(format!("Agents {}", entry.agent_count)),
                                 )
                                 .child(
@@ -2387,7 +2503,7 @@ impl SimulationView {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(rgb(0xfacc15))
+                                        .text_color(rgb(theme.text_primary))
                                         .child(format!("⌀ energy {:.2}", entry.average_energy)),
                                 ),
                         )
@@ -2400,9 +2516,9 @@ impl SimulationView {
             .flex_col()
             .w(px(280.0))
             .flex_none()
-            .bg(rgb(0x111827))
+            .bg(rgb(theme.card_bg))
             .border_1()
-            .border_color(rgb(0x1d4ed8))
+            .border_color(rgb(theme.card_border))
             .rounded_xl()
             .shadow_lg()
             .p_4()
@@ -6029,8 +6145,31 @@ impl SimulationView {
             ))
     }
 
+    fn header_chip(
+        &self,
+        theme: HudTheme,
+        icon: &str,
+        label: impl Into<String>,
+        bg_hex: u32,
+    ) -> Div {
+        let label = label.into();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .rounded_full()
+            .bg(rgb(bg_hex))
+            .text_sm()
+            .text_color(rgb(theme.chip_text))
+            .child(div().text_sm().child(SharedString::from(icon.to_string())))
+            .child(div().text_sm().child(label))
+    }
+
     fn metric_card(
         &self,
+        theme: &HudTheme,
         label: &str,
         value: String,
         accent_hex: u32,
@@ -6058,7 +6197,7 @@ impl SimulationView {
             .rounded_lg()
             .border_1()
             .border_color(accent)
-            .bg(rgb(0x111827))
+            .bg(rgb(theme.card_bg))
             .shadow_md()
             .p_4()
             .child(
@@ -6071,10 +6210,20 @@ impl SimulationView {
                     ),
                 ),
             )
-            .child(div().text_3xl().child(value));
+            .child(
+                div()
+                    .text_3xl()
+                    .text_color(rgb(theme.text_primary))
+                    .child(value),
+            );
 
         if let Some(detail_text) = detail {
-            card = card.child(div().text_sm().text_color(rgb(0x94a3b8)).child(detail_text));
+            card = card.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme.text_subtle))
+                    .child(detail_text),
+            );
         }
 
         if let Some(series) = sparkline {
@@ -6096,9 +6245,9 @@ impl SimulationView {
                 div()
                     .mt(px(6.0))
                     .rounded_md()
-                    .bg(rgb(0x0a1628))
+                    .bg(rgb(theme.spark_bg))
                     .border_1()
-                    .border_color(rgb(0x1f2a3d))
+                    .border_color(rgb(theme.spark_border))
                     .px_3()
                     .py_2()
                     .child(spark_canvas),
@@ -7429,51 +7578,87 @@ fn paint_brain_radar(
 pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
     let mut img: ImageBuffer<ImgRgba<u8>, Vec<u8>> = ImageBuffer::new(width, height);
 
-    // Background from terrain + food
+    let config = world.config();
+    let world_w = config.world_width as f32;
+    let world_h = config.world_height as f32;
+    let cell_size = config.food_cell_size as f32;
+
+    let mut camera = Camera::default();
+    let _layout = camera.layout(
+        (0.0, 0.0),
+        (width as f32, height as f32),
+        (world_w, world_h),
+    );
+
+    let terrain = world.terrain();
+    let food = world.food();
+
+    let default_tile = TerrainTile {
+        kind: TerrainKind::Grass,
+        elevation: 0.5,
+        moisture: 0.5,
+        accent: 0.0,
+        fertility_bias: 0.0,
+        temperature_bias: 0.5,
+        palette_index: 0,
+    };
+
     for y in 0..height {
         for x in 0..width {
-            let u = (x as f32 + 0.5) / width as f32;
-            let v = (y as f32 + 0.5) / height as f32;
-            let tx = (u * world.terrain().width() as f32)
-                .clamp(0.0, (world.terrain().width() - 1) as f32) as u32;
-            let ty = (v * world.terrain().height() as f32)
-                .clamp(0.0, (world.terrain().height() - 1) as f32) as u32;
-            let tile = world
-                .terrain()
-                .tile(tx, ty)
-                .copied()
-                .unwrap_or(TerrainTile {
-                    kind: TerrainKind::Grass,
-                    elevation: 0.5,
-                    moisture: 0.5,
-                    accent: 0.0,
-                    fertility_bias: 0.0,
-                    temperature_bias: 0.5,
-                    palette_index: 0,
-                });
-            let food = world.food().get(tx, ty).unwrap_or(0.0);
-            let base = match tile.kind {
-                TerrainKind::DeepWater => (30u8, 63u8, 102u8),
-                TerrainKind::ShallowWater => (47, 115, 179),
-                TerrainKind::Sand => (177, 78, 7),
-                TerrainKind::Grass => (80, 169, 19),
-                TerrainKind::Bloom => (121, 212, 109),
-                TerrainKind::Rock => (169, 177, 186),
+            let world_point = camera.screen_to_world(Point {
+                x: px(x as f32 + 0.5),
+                y: px(y as f32 + 0.5),
+            });
+
+            let rgba = if let Some((world_x, world_y)) = world_point {
+                let tx = (world_x / cell_size).floor() as i32;
+                let ty = (world_y / cell_size).floor() as i32;
+                if tx >= 0
+                    && ty >= 0
+                    && (tx as u32) < terrain.width()
+                    && (ty as u32) < terrain.height()
+                {
+                    let tile = terrain
+                        .tile(tx as u32, ty as u32)
+                        .copied()
+                        .unwrap_or(default_tile);
+                    let food_val = food.get(tx as u32, ty as u32).unwrap_or(0.0);
+                    let base = match tile.kind {
+                        TerrainKind::DeepWater => (30u8, 63u8, 102u8),
+                        TerrainKind::ShallowWater => (47, 115, 179),
+                        TerrainKind::Sand => (177, 78, 7),
+                        TerrainKind::Grass => (80, 169, 19),
+                        TerrainKind::Bloom => (121, 212, 109),
+                        TerrainKind::Rock => (169, 177, 186),
+                    };
+                    let food_shade = (food_val.clamp(0.0, 1.0) * 90.0) as u8;
+                    ImgRgba([
+                        base.0.saturating_add(food_shade),
+                        base.1.saturating_add(food_shade / 2),
+                        base.2,
+                        255,
+                    ])
+                } else {
+                    ImgRgba([10, 16, 24, 255])
+                }
+            } else {
+                ImgRgba([10, 16, 24, 255])
             };
-            let food_shade = (food.clamp(0.0, 1.0) * 90.0) as u8;
-            let r = base.0.saturating_add(food_shade);
-            let g = base.1.saturating_add(food_shade / 2);
-            let b = base.2;
-            img.put_pixel(x, y, ImgRgba([r, g, b, 255]));
+
+            img.put_pixel(x, y, rgba);
         }
     }
 
-    // Agents overlay as small discs
     let cols = world.agents().columns();
     for (idx, handle) in world.agents().iter_handles().enumerate() {
         let pos = cols.positions()[idx];
-        let fx = (pos.x.clamp(0.0, 1.0) * (width as f32 - 1.0)) as i32;
-        let fy = (pos.y.clamp(0.0, 1.0) * (height as f32 - 1.0)) as i32;
+        let world_x = pos.x * world_w;
+        let world_y = pos.y * world_h;
+        let Some((screen_x, screen_y)) = camera.world_to_screen((world_x, world_y)) else {
+            continue;
+        };
+        let fx = screen_x.round() as i32;
+        let fy = screen_y.round() as i32;
         let energy = world
             .runtime()
             .get(handle)
@@ -8671,6 +8856,71 @@ impl ColorPaletteMode {
 struct AccessibilitySettings {
     palette: ColorPaletteMode,
     narration_enabled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HudTheme {
+    card_bg: u32,
+    card_border: u32,
+    spark_bg: u32,
+    spark_border: u32,
+    text_primary: u32,
+    text_subtle: u32,
+    chip_text: u32,
+    chip_running: u32,
+    chip_paused: u32,
+    chip_open: u32,
+    chip_closed: u32,
+    chip_follow: u32,
+}
+
+fn hud_theme(mode: ColorPaletteMode) -> HudTheme {
+    match mode {
+        ColorPaletteMode::HighContrast => HudTheme {
+            card_bg: 0x06090f,
+            card_border: 0xf8fafc,
+            spark_bg: 0x0b121f,
+            spark_border: 0xf8fafc,
+            text_primary: 0xf8fafc,
+            text_subtle: 0xcbd5f5,
+            chip_text: 0x020617,
+            chip_running: 0xf97316,
+            chip_paused: 0xfacc15,
+            chip_open: 0x38bdf8,
+            chip_closed: 0xf87171,
+            chip_follow: 0x8b5cf6,
+        },
+        ColorPaletteMode::Deuteranopia
+        | ColorPaletteMode::Protanopia
+        | ColorPaletteMode::Tritanopia => HudTheme {
+            card_bg: 0x0f172a,
+            card_border: 0x1f2a3d,
+            spark_bg: 0x0b1626,
+            spark_border: 0x27364c,
+            text_primary: 0xf8fafc,
+            text_subtle: 0x9aa7c0,
+            chip_text: 0x0f172a,
+            chip_running: 0x2dd4bf,
+            chip_paused: 0xfacc15,
+            chip_open: 0x60a5fa,
+            chip_closed: 0xf97316,
+            chip_follow: 0xa855f7,
+        },
+        ColorPaletteMode::Natural => HudTheme {
+            card_bg: 0x0f172a,
+            card_border: 0x1f2a3d,
+            spark_bg: 0x0b1626,
+            spark_border: 0x1f2a3d,
+            text_primary: 0xf8fafc,
+            text_subtle: 0x94a3b8,
+            chip_text: 0x0f172a,
+            chip_running: 0x22c55e,
+            chip_paused: 0xf59e0b,
+            chip_open: 0x38bdf8,
+            chip_closed: 0xf97316,
+            chip_follow: 0x8b5cf6,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -10766,10 +11016,6 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let follow_target = state.follow_target;
     let origin = bounds.origin;
     let bounds_size = bounds.size;
-
-    let world_w = frame.world_size.0.max(1.0);
-    let world_h = frame.world_size.1.max(1.0);
-
     let low_fps = state.perf.fps > 0.0 && state.perf.fps < 30.0;
     let very_low_fps = state.perf.fps > 0.0 && state.perf.fps < 24.0;
     let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);

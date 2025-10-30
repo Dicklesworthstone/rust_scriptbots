@@ -41,7 +41,7 @@ _Updated: 2025-10-30 – drafted by PurpleBear for Stage 1 deep dive._
 
 ### Stage 2 TODOs (ongoing)
 
-- [ ] Update `render_png_offscreen` to leverage `Camera::layout`/`world_to_screen` so offscreen snapshots match interactive view.
+- [x] Update `render_png_offscreen` to leverage `Camera::layout`/`world_to_screen` so offscreen snapshots match interactive view.
 - [ ] Replace remaining manual pad/offset math in HUD overlays with helpers from `Camera` (e.g., `ViewLayout`).
 
 Please add notes inline or update the checklist once ownership is confirmed.

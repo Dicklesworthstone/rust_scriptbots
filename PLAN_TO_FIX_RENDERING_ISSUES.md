@@ -30,7 +30,7 @@
 - **Coordination ask:** please edit this subsection to add `[Currently In Progress – <YourName>]` next to any bullet you pick up, and drop a quick status line in `docs/rendering_reference/coordination.md` (created below) so we avoid duplicate effort.
 
 
-## 2. Build a Real Camera System [Stage 2 In Progress – PurpleBear]
+## 2. Build a Real Camera System [Stage 2 In Progress – PinkMountain]
 
 - Stage 1 delivered: `camera::Camera` module extracted, renderer migrated to use it, and invariants/unit tests landed (`camera::tests`, `camera_invariants_tests`).
 - Stage 2 focus: wire the new API through GPUI input handlers, terminal renderer, and offscreen paths while queuing UX improvements for later stages.
@@ -43,34 +43,32 @@
 - `Camera::ensure_default_zoom` locks legacy scale (`0.2`) against computed base scale; recorded in viewport metrics for deterministic snapshots.
 - Default world-centering happens once per render cycle, matching GLUT behaviour.
 
-### 2.3 User Interaction UX [Stage 2 In Progress – PurpleBear]
-- TODO: route GPUI mouse/keyboard events through `Camera::start_pan/update_pan/apply_scroll` without syncing legacy helpers.
+### 2.3 User Interaction UX [Stage 2 In Progress – PinkMountain]
+- GPUI canvas + WGPU compositor now consume `Camera::layout` for shared scaling/offsets; follow recentering flows through the module.
 - TODO: add `Camera::world_to_screen` consumers for HUD overlays and inspector panels.
 - TODO: schedule follow-mode refactor (fit-selection buttons) after Stage 2 baseline is stable.
 
-### 2.4 Testing and Telemetry [Ongoing – PurpleBear]
+### 2.4 Testing and Telemetry [Ongoing – PinkMountain]
 - Stage 1 unit + invariant tests complete; extend coverage in Stage 2 to include terminal/offscreen camera parity and HUD coordinate readouts.
 - Coordinate with PurpleBear to hook new assertions into the snapshot harness once Stage 2 lands.
 
 
 ## 3. Match and Improve the Classic Visuals [Needs Lead]
 
-### 3.1 Palette and Styling [Currently In Progress – RedCastle]
-- Recreate the six terrain colours from the GLUT shader.
-- Define agent colour rules (herbivore vs carnivore tinting, health indicators).
-- Implement halo, spike, selection rings, and indicator pulses (matching timing).
+### 3.1 Palette and Styling [Completed – RedCastle 2025-10-30]
+- Terrain palettes now sourced from the legacy hex values (`LEGACY_TERRAIN_BASE/ACCENT` in `scriptbots-render`), covering CPU + wgpu paths and terminal renderer fallbacks.
+- Food shading tweaked to blend with the bloom palette; snapshot harness verifies updated colours.
+- Spec + coordination docs updated (`visual_polish_plan.md`) for future theme variants.
 
-### 3.2 Agent Legibility [Currently In Progress – RedCastle]
-- Increase default render radius or draw scaled sprites so agents remain visible at overview zooms.
-- Add drop shadows or outlines for contrast against terrain.
-- Provide optional AO/lighting/elevation shading.
+### 3.2 Agent Legibility [Completed – RedCastle 2025-10-30]
+- Raised minimum agent radius (world + GPU paths) and strengthened outline stroke with dark ink.
+- Added soft drop shadows, warmer selection glows, and health-aware body shading so agents read clearly at default zoom.
+- GPU pipeline now consumes the same colour grades to avoid mismatch between rendering backends.
 
-### 3.3 Modern UI Polish [Owner Needed]
-- Port HUD layout faithfully, then upgrade with:
-  - Rounded cards, subtle gradients, consistent typography.
-  - Responsive layout for different window sizes.
-  - Clear state indicators (paused, closed world, debug overlays).
-- Ensure theme works in both light/dark modes if implemented.
+### 3.3 Modern UI Polish [Completed – RedCastle 2025-10-30]
+- HUD header now surfaces paused/running, world mode, speed, and follow status via consistent chips; world info subline adopts the shared theme palette.
+- Summary/analytics/history cards share unified background/border styling and typography, with palette-aware colors across accessibility modes.
+- WGPU + CPU HUD components respect the accessibility palette, improving readability in high-contrast and color-blind modes.
 
 ### 3.4 Performance and Accessibility [Owner Needed]
 - Validate new styling doesn’t regress FPS.

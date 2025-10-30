@@ -11,10 +11,12 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - PurpleBear: Added Stage 1 extraction checklist (`docs/rendering_reference/camera_refactor_task_breakdown.md`) detailing current camera touchpoints, extraction steps, and open questions for the eventual owner.
 - PurpleBear & PinkMountain: Completed Stage 1 camera extraction (PLAN §2.1/§2.2/§2.4) — `camera/mod.rs` merged, renderer now uses `Camera`, and unit/invariant tests landed.
 - PurpleBear: Added `render_regression` GitHub Actions job (Ubuntu + Windows) running snapshot + camera invariants with path filters and diff artifact uploads; PLAN §1.3 CI bullet marked complete.
-- PurpleBear: Stage 2 wiring underway – GPUI/wgpu/CPU render paths now consume `Camera::layout`; offscreen snapshot still pending follow-up.
+- PurpleBear: Stage 2 wiring underway – GPUI/wgpu/CPU render paths now consume `Camera::layout`; offscreen snapshot updated to use `world_to_screen` for parity with interactive view.
 - PinkMountain: Claimed PLAN §1.3 viewport invariants; aligning tests with new camera module. Will share progress updates as camera Stage 1 lands.
 - PinkMountain: Drafted Stage 1 work breakdown for camera refactor (`camera_stage1_plan.md`); Stage 2 wiring underway pending visuals/CI ownership.
 - PinkMountain: Owning Stage 2 camera wiring (GPUI + terminal/offscreen integration) per PLAN §2.3/§2.4 updates.
+- PinkMountain: Stage 2 progress — GPUI + WGPU paths now rely on `Camera::layout`; terminal/offscreen parity and HUD overlays remain.
 - RedCastle: Regenerated all legacy reference PNGs (`legacy_default.png`, `legacy_selected_agent.png`, `legacy_food_peak.png`, `legacy_food_off.png`, `legacy_zoomed_hud.png`), refreshed SHA256s in `checksums.txt`, and published capture helper `capture_legacy_render.sh`.
 - RedCastle: Added SVG overlays (`legacy_*_overlay.svg`) aligned with ROI tables and updated spec/plan to mark PLAN §1.2 complete.
 - RedCastle: Drafted `visual_polish_plan.md` outlining palette/legibility work and claimed PLAN §3.1–§3.2 pending Stage 2 stability.
+- RedCastle: Implemented PLAN §3.1–§3.2 (legacy palette port, drop shadows, thicker outlines, GPU colour sync); plan doc + snapshot refreshed.

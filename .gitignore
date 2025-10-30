@@ -16,3 +16,4 @@ scriptbots*.db
 scriptbots*.db.wal
 crates/scriptbots-render/frames_render_test/*.png
 *.png
+/tmp/
