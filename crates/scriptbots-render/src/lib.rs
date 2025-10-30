@@ -218,6 +218,19 @@ pub mod world_compositor {
         sample_rgba: [u8; 4],
     }
 
+    impl ReadbackDigest {
+        fn is_visually_blank(&self) -> bool {
+            if self.populated_bytes == 0 {
+                return true;
+            }
+            if self.non_zero == 0 {
+                return true;
+            }
+            let dynamic_range = self.max_byte.saturating_sub(self.min_byte);
+            dynamic_range < 12
+        }
+    }
+
     fn readback_stats(view: &ReadbackView) -> ReadbackDigest {
         let stride = view.bytes_per_row as usize;
         let row_bytes = (view.width as usize) * 4;
@@ -294,6 +307,7 @@ pub mod world_compositor {
         // Capture the very first frame even when save is disabled, so we can
         // diagnose blank screens without user setup.
         force_first_capture: bool,
+        last_digest: Option<ReadbackDigest>,
     }
 
     impl Compositor {
@@ -344,6 +358,7 @@ pub mod world_compositor {
                 save_counter: 0,
                 save_prefix,
                 force_first_capture,
+                last_digest: None,
             }
         }
 
@@ -437,6 +452,7 @@ pub mod world_compositor {
         pub fn render_snapshot(&mut self, snapshot: &GfxSnapshot, target_size: (u32, u32)) {
             // Root-cause guard: skip rendering when target is zero-sized (startup/minimize)
             if target_size.0 == 0 || target_size.1 == 0 {
+                self.last_digest = None;
                 return;
             }
             // Optional FPS cap: skip re-render and reuse last-ready image if interval not elapsed
@@ -460,6 +476,7 @@ pub mod world_compositor {
                 (target_size.0.max(1), target_size.1.max(1))
             };
             if self.ensure_renderer(render_size).is_err() {
+                self.last_digest = None;
                 self.maybe_report_adapter_failure();
                 return;
             }
@@ -490,6 +507,7 @@ pub mod world_compositor {
             }
             if let Some(view) = view_opt {
                 let digest = readback_stats(&view);
+                self.last_digest = Some(digest.clone());
                 // Lazy-initialize image with known dimensions; avoid stale size from previous runs
                 if self.image.is_none() {
                     self.image = Some(GpuiImage::new(
@@ -563,8 +581,22 @@ pub mod world_compositor {
             }
         }
 
-        pub fn paint_world(&self, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
+        pub fn paint_world(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
             if let Some(img) = &self.image {
+                if let Some(digest) = self.last_digest.as_ref()
+                    && digest.is_visually_blank()
+                {
+                    if env_flag("SB_WGPU_LOG_VIS") {
+                        tracing::warn!(
+                            checksum = digest.checksum,
+                            non_zero = digest.non_zero,
+                            min_byte = digest.min_byte,
+                            max_byte = digest.max_byte,
+                            "wgpu readback appears blank; falling back to CPU canvas"
+                        );
+                    }
+                    return false;
+                }
                 let mode = std::env::var("SB_WGPU_PRESENT_MODE")
                     .ok()
                     .or_else(|| Some("full".to_string()));
@@ -578,6 +610,7 @@ pub mod world_compositor {
                 if env_flag("SB_WGPU_LOG_VIS") {
                     tracing::info!("wgpu image not available; painting placeholder");
                 }
+                self.last_digest = None;
                 window.paint_quad(fill(bounds, Background::from(rgb(0x091220))));
                 false
             }
@@ -950,11 +983,29 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     let mut camera_guard = state.camera.lock().expect("camera mutex poisoned");
     let mut layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
 
+    let coverage_too_small =
+        layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
+    let coverage_too_large =
+        layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
+    if coverage_too_small || coverage_too_large {
+        camera_guard.fit_world();
+        layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+    }
+
     if state.controls.follow_mode != FollowMode::Off
         && let Some(target) = state.follow_target
     {
         camera_guard.center_on(target);
         layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+
+        let follow_coverage_small =
+            layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
+        let follow_coverage_large =
+            layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
+        if follow_coverage_small || follow_coverage_large {
+            camera_guard.fit_world();
+            layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+        }
     }
     drop(camera_guard);
 
@@ -11154,18 +11205,24 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
-    let mut layout =
-        camera_guard.layout((origin_x, origin_y), (width_px, height_px), frame.world_size);
+    let mut layout = camera_guard.layout(
+        (origin_x, origin_y),
+        (width_px, height_px),
+        frame.world_size,
+    );
 
-    let coverage_too_small = layout.render_size.0 < width_px * 0.25
-        || layout.render_size.1 < height_px * 0.25;
-    let coverage_too_large = layout.render_size.0 > width_px * 6.0
-        || layout.render_size.1 > height_px * 6.0;
+    let coverage_too_small =
+        layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
+    let coverage_too_large =
+        layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
 
     if coverage_too_small || coverage_too_large {
         camera_guard.fit_world();
-        layout =
-            camera_guard.layout((origin_x, origin_y), (width_px, height_px), frame.world_size);
+        layout = camera_guard.layout(
+            (origin_x, origin_y),
+            (width_px, height_px),
+            frame.world_size,
+        );
     }
 
     if controls.follow_mode != FollowMode::Off
@@ -11177,6 +11234,19 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             (width_px, height_px),
             frame.world_size,
         );
+
+        let follow_coverage_small =
+            layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
+        let follow_coverage_large =
+            layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
+        if follow_coverage_small || follow_coverage_large {
+            camera_guard.fit_world();
+            layout = camera_guard.layout(
+                (origin_x, origin_y),
+                (width_px, height_px),
+                frame.world_size,
+            );
+        }
     }
 
     let mut camera_snapshot = camera_guard.snapshot();
