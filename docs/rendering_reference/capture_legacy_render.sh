@@ -46,23 +46,24 @@ echo "Window id: $WIN" >>"$LOG"
 sleep 2
 run_capture default -window root
 
-xdotool windowactivate "$WIN"
+xdotool windowactivate "$WIN" || true
+xdotool windowraise "$WIN" || true
 sleep 0.5
 xdotool mousemove --window "$WIN" 800 450
-xdotool click --window "$WIN" 1
+xdotool click --window "$WIN" 1 || true
 sleep 1
 run_capture selected -window root
 
-xdotool key --window "$WIN" f
+xdotool key --window "$WIN" f || true
 sleep 1
 run_capture food_off -window root
-xdotool key --window "$WIN" f
+xdotool key --window "$WIN" f || true
 sleep 1
 run_capture food_on -window root
 
-xdotool mousedown --window "$WIN" 2
-xdotool mousemove_relative --window "$WIN" 0 120
-xdotool mouseup --window "$WIN" 2
+xdotool mousedown --window "$WIN" 2 || true
+xdotool mousemove_relative -- 0 120 || true
+xdotool mouseup --window "$WIN" 2 || true
 sleep 1
 run_capture zoomed -window root
 

@@ -9989,7 +9989,7 @@ fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut
 }
 
 #[derive(Clone)]
-pub(crate) struct CameraState {
+struct CameraState {
     offset_px: (f32, f32),
     zoom: f32,
     zoom_initialized: bool,
@@ -10056,7 +10056,7 @@ impl CameraState {
         self.pan_anchor = None;
     }
 
-    pub(crate) fn ensure_default_zoom(&mut self, base_scale: f32) {
+    fn ensure_default_zoom(&mut self, base_scale: f32) {
         if self.zoom_initialized {
             return;
         }
@@ -10108,7 +10108,7 @@ impl CameraState {
         true
     }
 
-    pub(crate) fn record_render_metrics(
+    fn record_render_metrics(
         &mut self,
         canvas_origin: (f32, f32),
         canvas_size: (f32, f32),
@@ -10142,7 +10142,7 @@ impl CameraState {
         self.offset_px.1 += center_y - world_screen_y;
     }
 
-    pub(crate) fn screen_to_world(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
+    fn screen_to_world(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
         let scale = self.last_scale;
         if scale <= f32::EPSILON {
             return None;
@@ -10175,6 +10175,104 @@ impl CameraState {
         Some((world_x, world_y))
     }
 }
+
+#[cfg(test)]
+mod camera_invariants_tests {
+    use super::*;
+    use gpui::{px, Point};
+    use scriptbots_core::ScriptBotsConfig;
+
+    const VIEWPORT: (f32, f32) = (1600.0, 900.0);
+    const WORLD: (f32, f32) = (6000.0, 3000.0);
+
+    fn base_scale() -> f32 {
+        (VIEWPORT.0 / WORLD.0).min(VIEWPORT.1 / WORLD.1)
+    }
+
+    fn configured_camera() -> CameraState {
+        let mut camera = CameraState::default();
+        let base = base_scale();
+        camera.ensure_default_zoom(base);
+        camera.record_render_metrics((0.0, 0.0), VIEWPORT, WORLD, base);
+        camera
+    }
+
+    fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
+        (a - b).abs() <= eps
+    }
+
+    #[test]
+    fn screen_to_world_maps_corners_within_bounds() {
+        let camera = configured_camera();
+        let top_left = camera
+            .screen_to_world(Point { x: px(0.0), y: px(0.0) })
+            .expect("top-left maps");
+        assert!(
+            approx_eq(top_left.0, 0.0, 1e-3),
+            "expected x≈0.0, got {}",
+            top_left.0
+        );
+        assert!(
+            approx_eq(top_left.1, 0.0, 1e-3),
+            "expected y≈0.0, got {}",
+            top_left.1
+        );
+
+        let bottom_right = camera
+            .screen_to_world(Point {
+                x: px(VIEWPORT.0),
+                y: px(VIEWPORT.1),
+            })
+            .expect("bottom-right maps");
+        assert!(
+            approx_eq(bottom_right.0, WORLD.0, 1e-3),
+            "expected x≈{}, got {}",
+            WORLD.0,
+            bottom_right.0
+        );
+        assert!(
+            approx_eq(bottom_right.1, WORLD.1, 1e-3),
+            "expected y≈{}, got {}",
+            WORLD.1,
+            bottom_right.1
+        );
+    }
+
+    #[test]
+    fn default_zoom_keeps_agents_visible() {
+        let camera = configured_camera();
+        let mid_point = Point {
+            x: px(VIEWPORT.0 * 0.5),
+            y: px(VIEWPORT.1 * 0.5),
+        };
+        let world_mid = camera
+            .screen_to_world(mid_point)
+            .expect("midpoint maps to world");
+        let world_next = camera
+            .screen_to_world(Point {
+                x: px(VIEWPORT.0 * 0.5 + 1.0),
+                y: px(VIEWPORT.1 * 0.5),
+            })
+            .expect("adjacent pixel maps to world");
+
+        let world_units_per_px = (world_next.0 - world_mid.0).abs();
+        assert!(
+            world_units_per_px > 0.0,
+            "world units per pixel should be positive"
+        );
+
+        let pixels_per_world = 1.0 / world_units_per_px;
+        let bot_radius = ScriptBotsConfig::default().bot_radius;
+        let pixel_radius = pixels_per_world * bot_radius;
+
+        assert!(
+            pixel_radius >= 2.0,
+            "expected pixel radius ≥ 2.0, got {}",
+            pixel_radius
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_terrain_layer(
     terrain: &TerrainFrame,
