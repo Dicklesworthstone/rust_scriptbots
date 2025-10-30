@@ -10,8 +10,12 @@ members = [
     "crates/scriptbots-render",
     "crates/scriptbots-world-gfx",
     "crates/scriptbots-app",
+    "crates/scriptbots-bevy",
     "crates/scriptbots-web",
 ]
+
+[workspace.features]
+bevy_render = []
 
 [workspace.package]
 version = "0.1.0"
