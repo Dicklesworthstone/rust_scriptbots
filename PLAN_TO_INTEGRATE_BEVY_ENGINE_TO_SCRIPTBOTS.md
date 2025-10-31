@@ -211,8 +211,10 @@ _Prepared by RedSnow — 2025-10-30_
   - [x] Added scenario configs (`docs/rendering_reference/configs/{dense_agents,storm_event}.toml`) aligned with measurement plan.
   - [x] Prepare turnkey benchmarking script for GPU-capable hosts and circulate instructions.
   - [ ] Capture CPU/GPU timings for three canonical seeds across GPUI vs Bevy.
-    - [ ] Linux • GPUI • `default`  — _Blocked (requires Vulkan-capable workstation)._
-    - [ ] Linux • Bevy  • `default`  — _Blocked (requires Vulkan-capable workstation)._
+    - [ ] Linux • GPUI • `default`  — _Blocked (requires Vulkan-capable workstation)._  \
+          Attempted 2025-10-31 on CI host; run stalled awaiting presentation surface (see `logs/perf/20251031_default_gui.log`).
+    - [ ] Linux • Bevy  • `default`  — _Blocked (requires Vulkan-capable workstation)._  \
+          Current build fails (`TerrainChunkStats` field mismatches, borrow move) when compiling `scriptbots-bevy` with `--features bevy_render`; captured in `logs/perf/20251031_default_bevy.log`.
     - [ ] Linux • GPUI • `dense_agents`  — _Blocked (requires Vulkan-capable workstation)._
     - [ ] Linux • Bevy  • `dense_agents`  — _Blocked (requires Vulkan-capable workstation)._
     - [ ] Linux • GPUI • `storm_event`  — _Blocked (requires Vulkan-capable workstation)._
@@ -220,6 +222,7 @@ _Prepared by RedSnow — 2025-10-30_
     - [ ] Windows • GPUI • all scenarios  — _Pending hardware scheduling._
     - [ ] Windows • Bevy • all scenarios  — _Pending hardware scheduling._
   - [ ] Record baseline FPS, frame time percentiles, and simulation ticks/sec; log results to `docs/perf/bevy_vs_gpui.md` once vetted.
+    - [x] Added `scripts/parse_perf_logs.py` to summarise SB_DIAGNOSTICS output (CSV/CLI).
   - [x] Derived initial golden diff metrics (MAE/RMSE) between `rust_default.png` and `bevy_default.png` as a reference point.
 - [x] [Completed – BrownLake 2025-10-31] Instrument diagnostics
   - [x] Enable Bevy `FrameTimeDiagnosticsPlugin` + custom tracing spans gated by `SB_DIAGNOSTICS`.
@@ -425,7 +428,7 @@ Once phases progress, update this document inline with `[In Progress – <Name>]
 
 ### Visual Polish Execution TODO [Currently In Progress - GPT-5 Codex 2025-10-31]
 
-- [ ] Lighting: instantiate chunk-scoped reflection probes on the 0.16 clustered path and publish the bake/refresh playbook.  
+- [x] Lighting: instantiate chunk-scoped reflection probes on the 0.16 clustered path and publish the bake/refresh playbook.  _[Completed – BrownCreek 2025-10-31: per-chunk `LightProbe` + `EnvironmentMapLight` spawning in `sync_terrain`, configurable via `ReflectionProbeAssets`]_  
 - [ ] Lighting: prototype 0.17 DLSS/FSR3 and ray-traced area lights for cinematic capture presets.  
 - [ ] Tone mapping: add ACES/AgX/TonyMcMapface toggles plus per-camera auto exposure curves wired to `render.config.toml`.  
 - [ ] Atmosphere: author biome fog/sky profiles using 0.15 volumetric volumes and humidity/time-of-day hooks.  
@@ -437,3 +440,17 @@ Once phases progress, update this document inline with `[In Progress – <Name>]
 - [ ] Spike FX: build spline-based spike meshes and pair them with Hanabi impact bursts plus decal scorch marks.  
 - [ ] Weather/hydrology: implement `WeatherState` resource, puddle decals, and splash particles tied to hydrology events.  
 - [ ] Tooling: extend debug overlay (weather, hydrology, behavior) and automate HDR/PNG snapshot comparisons in CI.
+
+#### Reflection Probe Bake & Refresh Playbook (2025-10-31 – BrownCreek)
+
+1. **Runtime topology** – `sync_terrain` now registers a `LightProbe` + `EnvironmentMapLight` entity for every WFC terrain chunk, reusing shared handles from `ReflectionProbeAssets`. Probes inherit chunk bounds (width/depth from cell size, height capped at `max(chunk_height, 20.0)`) and refresh automatically whenever chunk signatures change.
+2. **Baking cubemaps**  
+   a. Capture or author HDR cubemaps for your biome (`diffuse` + prefiltered `specular`).  
+   b. Place assets under `assets/lighting/` (e.g., `biome_sunrise_diffuse.ktx2`, `biome_sunrise_specular.ktx2`).  
+   c. Extend `setup_scene` (temporary) or a forthcoming loader to swap `ReflectionProbeAssets` handles to the new textures; hot-reload will update all chunk probes on the next frame.
+3. **Refreshing after terrain edits** – Set `SB_PROBES_REBUILD=1` (env var) or call the forthcoming `probe_refresh` console command to force chunk probes to respawn after major heightfield edits; otherwise signature deltas trigger rebuilds automatically.
+4. **Validation checklist**  
+   - Use `bevy_inspector` / `render_debug probes` (planned) to visualize probe volumes and confirm coverage.  
+   - Run `cargo test -p scriptbots-bevy -- --nocapture probe_parity` once the benchmark harness lands to ensure chunk counts match terrain chunk registry.  
+   - Capture before/after screenshots and attach to `docs/perf/bevy_vs_gpui.md` to document reflection improvements.
+5. **Next steps** – Wire an asset-driven loader (TBD) so designers can select cubemaps per biome without code edits, and integrate probe coverage visualizations into the upcoming debug overlay task.

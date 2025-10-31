@@ -10717,7 +10717,9 @@ fn paint_agent_avatar(
         let distance = body_radius * (0.4 + 0.35 * (i as f32 / NUM_EYES as f32) + 0.25);
         let eye_center = (px_x + cos_eye * distance, px_y + sin_eye * distance);
         let mut eye_radius = base_eye_radius * (0.65 + agent.trait_eye.clamp(0.4, 2.5) * 0.35);
-        eye_radius = eye_radius.clamp(1.6, body_radius * 0.38);
+        let max_eye_radius = body_radius * 0.38;
+        let min_eye_radius = 1.6_f32.min(max_eye_radius);
+        eye_radius = eye_radius.min(max_eye_radius).max(min_eye_radius);
 
         let mut eye = PathBuilder::fill();
         append_circle_polygon(&mut eye, eye_center.0, eye_center.1, eye_radius);

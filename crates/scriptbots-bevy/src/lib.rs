@@ -7,13 +7,11 @@ use bevy::camera::prelude::*;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::light::{EnvironmentMapLight, LightProbe};
 use bevy::math::primitives::Sphere;
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
-use bevy::render::{
-    render_resource::PrimitiveTopology,
-    texture::{Extent3d, TextureDimension, TextureFormat},
-};
+use bevy::render::render_resource::PrimitiveTopology;
 use bevy::ui::{BorderColor, BorderRadius};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use bevy_mesh::{Indices, Mesh};
@@ -774,6 +772,11 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     });
     commands.insert_resource(CameraRig::default());
 
+    commands.insert_resource(ReflectionProbeAssets {
+        diffuse: Handle::default(),
+        specular: Handle::default(),
+    });
+
     commands.spawn((
         Camera2d::default(),
         Transform::default(),
@@ -988,6 +991,7 @@ fn sync_world(
     assets: Res<AgentMeshAsset>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    probe_assets: Res<ReflectionProbeAssets>,
 ) {
     let Some(snapshot) = state.latest.as_ref() else {
         return;
@@ -1033,6 +1037,7 @@ fn sync_world(
         &mut terrain_registry,
         meshes.as_mut(),
         materials.as_mut(),
+        probe_assets.as_ref(),
     );
     sync_agents(
         snapshot,
@@ -1743,6 +1748,7 @@ fn sync_terrain(
     registry: &mut TerrainChunkRegistry,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    probe_assets: &ReflectionProbeAssets,
 ) {
     let dims = snapshot.terrain_height.dims;
     if dims.x == 0 || dims.y == 0 {
@@ -1793,7 +1799,16 @@ fn sync_terrain(
                         update_chunk_material(materials, &record.material, &built.stats);
                         record.signature = built.stats.signature;
                         record.bounds = bounds;
+                        record.stats = built.stats;
                     }
+                    sync_reflection_probe(
+                        commands,
+                        probe_assets,
+                        record,
+                        bounds,
+                        &built.stats,
+                        snapshot,
+                    );
                     record.last_tick = snapshot.tick;
                 }
                 None => {
@@ -1809,6 +1824,13 @@ fn sync_terrain(
                             InheritedVisibility::default(),
                         ))
                         .id();
+                    let probe = spawn_reflection_probe(
+                        commands,
+                        probe_assets,
+                        bounds,
+                        &built.stats,
+                        snapshot,
+                    );
                     registry.chunks.insert(
                         key,
                         TerrainChunkRecord {
@@ -1818,6 +1840,8 @@ fn sync_terrain(
                             bounds,
                             signature: built.stats.signature,
                             last_tick: snapshot.tick,
+                            probe: Some(probe),
+                            stats: built.stats,
                         },
                     );
                 }
@@ -1833,10 +1857,13 @@ fn sync_terrain(
         .collect();
 
     for key in stale {
-        if let Some(record) = registry.chunks.remove(&key) {
+        if let Some(mut record) = registry.chunks.remove(&key) {
             commands.entity(record.entity).despawn();
             meshes.remove(&record.mesh);
             materials.remove(&record.material);
+            if let Some(probe_entity) = record.probe.take() {
+                commands.entity(probe_entity).despawn();
+            }
         }
     }
 }
@@ -1883,15 +1910,84 @@ fn update_chunk_material(
     }
 }
 
+fn sync_reflection_probe(
+    commands: &mut Commands,
+    assets: &ReflectionProbeAssets,
+    record: &mut TerrainChunkRecord,
+    bounds: TerrainChunkBounds,
+    stats: &TerrainChunkStats,
+    snapshot: &WorldSnapshot,
+) {
+    if let Some(entity) = record.probe {
+        let transform = chunk_probe_transform(bounds, stats, snapshot);
+        commands.entity(entity).insert(transform);
+    } else {
+        let probe = spawn_reflection_probe(commands, assets, bounds, stats, snapshot);
+        record.probe = Some(probe);
+    }
+}
+
+fn spawn_reflection_probe(
+    commands: &mut Commands,
+    assets: &ReflectionProbeAssets,
+    bounds: TerrainChunkBounds,
+    stats: &TerrainChunkStats,
+    snapshot: &WorldSnapshot,
+) -> Entity {
+    let transform = chunk_probe_transform(bounds, stats, snapshot);
+    commands
+        .spawn((
+            LightProbe::new(),
+            EnvironmentMapLight {
+                diffuse_map: assets.diffuse.clone(),
+                specular_map: assets.specular.clone(),
+                intensity: 3500.0,
+                rotation: Quat::IDENTITY,
+                affects_lightmapped_mesh_diffuse: true,
+            },
+            transform,
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ))
+        .id()
+}
+
+fn chunk_probe_transform(
+    bounds: TerrainChunkBounds,
+    stats: &TerrainChunkStats,
+    snapshot: &WorldSnapshot,
+) -> Transform {
+    let cell = snapshot.terrain_height.cell_size.max(1) as f32;
+    let half = snapshot.world_size * 0.5;
+
+    let min_x = bounds.origin.x as f32 * cell - half.x;
+    let max_x = (bounds.origin.x + bounds.size.x) as f32 * cell - half.x;
+    let max_z = half.y - bounds.origin.y as f32 * cell;
+    let min_z = half.y - (bounds.origin.y + bounds.size.y) as f32 * cell;
+
+    let center_x = (min_x + max_x) * 0.5;
+    let center_z = (min_z + max_z) * 0.5;
+    let width = stats.world_extent.x.max(cell);
+    let depth = stats.world_extent.y.max(cell);
+    let height = stats.max_height.max(20.0);
+
+    Transform::from_translation(Vec3::new(center_x, height * 0.5, center_z))
+        .with_scale(Vec3::new(width, height, depth))
+}
+
 struct BuiltChunk {
     mesh: Mesh,
     stats: TerrainChunkStats,
 }
 
+#[derive(Clone, Copy)]
 struct TerrainChunkStats {
     mean_moisture: f32,
     mean_slope: f32,
     height_factor: f32,
+    max_height: f32,
+    world_extent: Vec2,
     signature: TerrainChunkSignature,
 }
 
@@ -1997,6 +2093,11 @@ fn build_chunk_mesh(
         mean_moisture: (sum_moisture / vertex_total) as f32,
         mean_slope: (sum_slope / vertex_total) as f32,
         height_factor: (max_height / height_scale).clamp(0.0, 1.0),
+        max_height,
+        world_extent: Vec2::new(
+            bounds.size.x.max(1) as f32 * cell_size,
+            bounds.size.y.max(1) as f32 * cell_size,
+        ),
         signature: TerrainChunkSignature::new(sum_height, sum_moisture, sum_accent, max_height),
     };
 

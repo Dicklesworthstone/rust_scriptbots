@@ -66,11 +66,12 @@ Using the existing reference PNGs, the difference between the GPUI and Bevy defa
 
 These values provide a pre-flight baseline before collecting live runtime numbers. Update this section after regenerating goldens or once new lighting passes land.
 
-> **Headless environment note (2025-10-31):** Attempting to run the GPUI or Bevy renderers under `WGPU_BACKEND=gl` in this CI/container environment stalls or panics because no presentation surface/device is available. Metrics capture is therefore blocked until we can run on a workstation with a real graphics backend.
+> **Headless environment note (2025-10-31):** Attempting to run the GPUI or Bevy renderers under `WGPU_BACKEND=gl` in this CI/container environment stalls or panics because no presentation surface/device is available. Metrics capture is therefore blocked until we can run on a workstation with a real graphics backend. \
+> Additional 2025-10-31 update: GPUI run (`logs/perf/20251031_default_gui.log`) confirmed the stall; Bevy build currently fails with `TerrainChunkStats` field changes (see `logs/perf/20251031_default_bevy.log`) and must be repaired before benchmarking.
 
 ## 4. Follow-up Checklist
 
-- [ ] Automate log parsing into CSV summaries (TBD).
+- [x] Automate log parsing into CSV summaries (`scripts/parse_perf_logs.py`).
 - [ ] Attach representative PNGs per scenario (GPUI + Bevy) for qualitative review.
 - [ ] Update `docs/rendering_reference/checksums.txt` after regenerating goldens.
 - [ ] Execute 30-minute soak tests (Linux Vulkan, Windows Vulkan/D3D12) while capturing diagnostic logs (`SB_DIAGNOSTICS=1`) and memory charts.

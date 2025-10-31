@@ -1452,7 +1452,7 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let pupil_color = vec3<f32>(0.08, 0.11, 0.18);
   for (var i: i32 = 0; i < 4; i = i + 1) {
     let angle = eye_dirs[i];
-    let dir = vec2<f32>(sin(angle), cos(angle));
+    let dir = vec2<f32>(cos(angle), sin(angle));
     let distance = body_radius * (0.4 + 0.35 * f32(i) / 4.0 + 0.25);
     let eye_center = dir * distance;
     var eye_radius = base_eye_radius * (0.65 + trait_eye * 0.35);
