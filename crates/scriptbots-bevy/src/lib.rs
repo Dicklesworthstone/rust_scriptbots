@@ -252,6 +252,31 @@ impl Default for SimulationControl {
     }
 }
 
+fn apply_simulation_command_to_state(state: &mut SimControlData, command: &SimulationCommand) {
+    if let Some(paused) = command.paused {
+        state.paused = paused;
+        if paused {
+            state.auto_pause_reason = None;
+        }
+    }
+    if let Some(speed) = command.speed_multiplier {
+        state.speed_multiplier = speed.clamp(0.0, MAX_SPEED);
+        if state.speed_multiplier <= MIN_SPEED {
+            state.paused = true;
+        }
+    }
+    if command.step_once {
+        state.step_requested = true;
+        state.paused = true;
+    }
+}
+
+fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCommand) {
+    if !(submitter.submit)(ControlCommand::UpdateSimulation(command)) {
+        warn!("failed to enqueue simulation control command");
+    }
+}
+
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
@@ -1184,63 +1209,88 @@ fn handle_selection_input(
 
 fn handle_playback_buttons(
     controls: Res<SimulationControl>,
+    submitter: Option<Res<CommandSubmitter>>,
     mut query: Query<(&PlaybackButton, &Interaction), (Changed<Interaction>, With<Button>)>,
 ) {
     for (button, interaction) in query.iter_mut() {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        controls.update(|state| match button.action {
-            PlaybackAction::Play => {
-                state.paused = false;
-                if state.speed_multiplier <= MIN_SPEED {
-                    state.speed_multiplier = 1.0;
-                }
-                state.step_requested = false;
-                state.auto_pause_reason = None;
-                info!("Bevy playback: resume");
-            }
-            PlaybackAction::Pause => {
-                state.paused = true;
-                state.step_requested = false;
-                info!("Bevy playback: pause");
-            }
-            PlaybackAction::Step => {
-                state.step_requested = true;
-                state.auto_pause_reason = None;
-                info!("Bevy playback: step once");
-            }
-            PlaybackAction::SpeedDown => {
-                state.speed_multiplier = (state.speed_multiplier - SPEED_STEP).max(MIN_SPEED);
-                if state.speed_multiplier <= MIN_SPEED {
-                    state.speed_multiplier = 0.0;
-                    state.paused = true;
-                    info!("Bevy playback: speed set to 0.0 (paused)");
-                } else {
+        let mut command_to_send: Option<SimulationCommand> = None;
+        controls.update(|state| {
+            let mut command = SimulationCommand::default();
+            match button.action {
+                PlaybackAction::Play => {
                     state.paused = false;
+                    if state.speed_multiplier <= MIN_SPEED {
+                        state.speed_multiplier = 1.0;
+                    }
+                    state.step_requested = false;
+                    state.auto_pause_reason = None;
+                    command.paused = Some(false);
+                    command.speed_multiplier = Some(state.speed_multiplier);
+                    info!("Bevy playback: resume");
+                }
+                PlaybackAction::Pause => {
+                    state.paused = true;
+                    state.step_requested = false;
+                    command.paused = Some(true);
+                    info!("Bevy playback: pause");
+                }
+                PlaybackAction::Step => {
+                    state.step_requested = true;
+                    state.auto_pause_reason = None;
+                    state.paused = true;
+                    command.paused = Some(true);
+                    command.step_once = true;
+                    info!("Bevy playback: step once");
+                }
+                PlaybackAction::SpeedDown => {
+                    state.speed_multiplier = (state.speed_multiplier - SPEED_STEP).max(MIN_SPEED);
+                    if state.speed_multiplier <= MIN_SPEED {
+                        state.speed_multiplier = 0.0;
+                        state.paused = true;
+                        info!("Bevy playback: speed set to 0.0 (paused)");
+                    } else {
+                        state.paused = false;
+                        info!(
+                            "Bevy playback: speed decreased to {:.1}",
+                            state.speed_multiplier
+                        );
+                    }
+                    state.auto_pause_reason = None;
+                    command.speed_multiplier = Some(state.speed_multiplier);
+                    command.paused = Some(state.paused);
+                }
+                PlaybackAction::SpeedUp => {
+                    state.speed_multiplier =
+                        (state.speed_multiplier + SPEED_STEP).clamp(SPEED_STEP, MAX_SPEED);
+                    state.paused = false;
+                    state.auto_pause_reason = None;
+                    command.speed_multiplier = Some(state.speed_multiplier);
+                    command.paused = Some(false);
                     info!(
-                        "Bevy playback: speed decreased to {:.1}",
+                        "Bevy playback: speed increased to {:.1}",
                         state.speed_multiplier
                     );
                 }
-                state.auto_pause_reason = None;
             }
-            PlaybackAction::SpeedUp => {
-                state.speed_multiplier =
-                    (state.speed_multiplier + SPEED_STEP).clamp(SPEED_STEP, MAX_SPEED);
-                state.paused = false;
-                state.auto_pause_reason = None;
-                info!(
-                    "Bevy playback: speed increased to {:.1}",
-                    state.speed_multiplier
-                );
-            }
+            command_to_send = Some(command);
         });
+
+        if let (Some(submitter), Some(command)) = (submitter.as_ref(), command_to_send) {
+            submit_simulation_command(submitter, command);
+        }
     }
 }
 
-fn handle_playback_shortcuts(keys: Res<ButtonInput<KeyCode>>, controls: Res<SimulationControl>) {
+fn handle_playback_shortcuts(
+    keys: Res<ButtonInput<KeyCode>>,
+    controls: Res<SimulationControl>,
+    submitter: Option<Res<CommandSubmitter>>,
+) {
     if keys.just_pressed(KeyCode::Space) {
+        let mut command = SimulationCommand::default();
         controls.update(|state| {
             state.paused = !state.paused;
             if !state.paused && state.speed_multiplier <= MIN_SPEED {
@@ -1249,19 +1299,31 @@ fn handle_playback_shortcuts(keys: Res<ButtonInput<KeyCode>>, controls: Res<Simu
             state.step_requested = false;
             state.auto_pause_reason = None;
             info!(paused = state.paused, "Bevy playback toggled via Space");
+            command.paused = Some(state.paused);
+            command.speed_multiplier = Some(state.speed_multiplier);
         });
+        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
+            submit_simulation_command(submitter, command);
+        }
     }
 
     if keys.just_pressed(KeyCode::KeyN) {
+        let mut command = SimulationCommand::default();
         controls.update(|state| {
             state.step_requested = true;
             state.paused = true;
             state.auto_pause_reason = None;
             info!("Bevy playback: step requested via keyboard");
+            command.paused = Some(true);
+            command.step_once = true;
         });
+        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
+            submit_simulation_command(submitter, command);
+        }
     }
 
     if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
+        let mut command = SimulationCommand::default();
         controls.update(|state| {
             state.speed_multiplier =
                 (state.speed_multiplier + SPEED_STEP).clamp(SPEED_STEP, MAX_SPEED);
@@ -1271,10 +1333,16 @@ fn handle_playback_shortcuts(keys: Res<ButtonInput<KeyCode>>, controls: Res<Simu
                 "Bevy playback: speed increased to {:.1} via keyboard",
                 state.speed_multiplier
             );
+            command.speed_multiplier = Some(state.speed_multiplier);
+            command.paused = Some(false);
         });
+        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
+            submit_simulation_command(submitter, command);
+        }
     }
 
     if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
+        let mut command = SimulationCommand::default();
         controls.update(|state| {
             state.speed_multiplier = (state.speed_multiplier - SPEED_STEP).max(MIN_SPEED);
             if state.speed_multiplier <= MIN_SPEED {
@@ -1289,7 +1357,12 @@ fn handle_playback_shortcuts(keys: Res<ButtonInput<KeyCode>>, controls: Res<Simu
                 );
             }
             state.auto_pause_reason = None;
+            command.speed_multiplier = Some(state.speed_multiplier);
+            command.paused = Some(state.paused);
         });
+        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
+            submit_simulation_command(submitter, command);
+        }
     }
 }
 
@@ -2344,6 +2417,16 @@ fn spawn_simulation_driver(
                 dt = 0.25;
             }
 
+            if let Ok(mut world_guard) = world.lock() {
+                (command_drain.as_ref())(&mut world_guard);
+                let pending = world_guard.drain_simulation_commands();
+                if !pending.is_empty() {
+                    for command in pending {
+                        controls.update(|state| apply_simulation_command_to_state(state, &command));
+                    }
+                }
+            }
+
             let (paused, speed, step_once) = {
                 let mut paused = false;
                 let mut speed = 1.0;
@@ -2362,9 +2445,6 @@ fn spawn_simulation_driver(
             };
 
             if paused && !step_once {
-                if let Ok(mut world_guard) = world.lock() {
-                    (command_drain.as_ref())(&mut world_guard);
-                }
                 thread::sleep(Duration::from_millis(4));
                 continue;
             }
@@ -2388,7 +2468,6 @@ fn spawn_simulation_driver(
             };
 
             if let Ok(mut world_guard) = world.lock() {
-                (command_drain.as_ref())(&mut world_guard);
                 if steps == 0 && !step_once && speed <= MIN_SPEED {
                     drop(world_guard);
                     thread::sleep(Duration::from_millis(4));

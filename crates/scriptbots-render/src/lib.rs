@@ -977,7 +977,14 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     // Calculate camera scale/offset to map world pixels -> viewport pixels exactly as GPUI would
     // Reuse the same mapping used in paint_frame
     let width_px = f32::from(bounds.size.width).max(1.0);
-    let height_px = f32::from(bounds.size.height).max(1.0);
+    let raw_height_px = f32::from(bounds.size.height).max(1.0);
+    let window_bounds = window.bounds();
+    let window_height_px = f32::from(window_bounds.size.height).max(1.0);
+    let height_px = if raw_height_px <= 2.0 && window_height_px > 16.0 {
+        window_height_px
+    } else {
+        raw_height_px
+    };
     let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
     let world_dims = (world_size.0.max(1.0), world_size.1.max(1.0));
     let mut camera_guard = state.camera.lock().expect("camera mutex poisoned");
@@ -10864,6 +10871,8 @@ fn apply_post_processing(
     let bounds_size = bounds.size;
     let width_px = f32::from(bounds_size.width).max(1.0);
     let height_px = f32::from(bounds_size.height).max(1.0);
+    let window_bounds = window.bounds();
+    let window_height_px = f32::from(window_bounds.size.height).max(1.0);
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
@@ -11219,7 +11228,14 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let mut camera_guard = camera.lock().expect("camera lock poisoned");
 
     let width_px = f32::from(bounds_size.width).max(1.0);
-    let height_px = f32::from(bounds_size.height).max(1.0);
+    let raw_height_px = f32::from(bounds_size.height).max(1.0);
+    let window_bounds = window.bounds();
+    let window_height_px = f32::from(window_bounds.size.height).max(1.0);
+    let height_px = if raw_height_px <= 2.0 && window_height_px > 16.0 {
+        window_height_px
+    } else {
+        raw_height_px
+    };
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
@@ -11231,7 +11247,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     tracing::debug!(
         viewport_width = width_px,
+        viewport_height_raw = raw_height_px,
         viewport_height = height_px,
+        window_height = window_height_px,
         render_width = layout.render_size.0,
         render_height = layout.render_size.1,
         pad_x = layout.pad.0,
