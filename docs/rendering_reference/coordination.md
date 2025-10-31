@@ -36,5 +36,4 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - OrangeLake (2025-10-30 23:58 UTC): Landed Bevy camera polish (`F` cycle, Ctrl+S/O follow, Ctrl+F/W fits, easing) plus HUD parity metrics (selection details, playback rate, FPS, world stats); PLAN phases 2–3 marked ready for review.
 - OrangeLake (2025-10-30 23:59 UTC): Starting PLAN_TO_INTEGRATE_BEVY_ENGINE_TO_SCRIPTBOTS Phase 4 (interactive selection + command bridge) to mirror GPUI agent picking and clear commands.
 - OrangeLake (2025-10-31 00:05 UTC): Phase 4 update — Bevy left-click selection now raycasts to the ground plane, honors Shift toggles, and submits `ControlCommand::UpdateSelection` (clear/add/replace) through the shared queue; empty clicks clear selection.
-- OrangeLake (2025-10-31 00:07 UTC): Pinged RedSnow via Agent Mail for Phase 4 review (selection radius, follow toggle parity); waiting on acceptance before coding follow-mode buttons.
 - GPT-5 Codex (2025-10-31 00:45 UTC): Implemented WFC-derived terrain snapshot export, chunked heightfield meshing, and agent elevation sampling in Bevy; terrain now renders as 3D relief ready for material polish.

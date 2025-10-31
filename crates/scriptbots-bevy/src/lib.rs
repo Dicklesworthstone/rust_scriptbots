@@ -5,6 +5,7 @@ use bevy::render::{
     mesh::{Indices, Mesh, PrimitiveTopology},
     render_asset::RenderAssetUsages,
 };
+use bevy::ui::{BorderColor, BorderRadius};
 use bevy::{
     app::AppExit,
     ecs::schedule::IntoSystemConfigs,
@@ -104,6 +105,9 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 poll_snapshots,
                 sync_world,
                 handle_selection_input,
+                handle_follow_button_interactions,
+                handle_clear_selection_button,
+                update_follow_button_colors,
                 control_camera,
                 update_hud,
             )
@@ -292,11 +296,6 @@ struct HudElements {
     playback: Entity,
     fps: Entity,
     world: Entity,
-}
-
-#[derive(Resource, Default)]
-struct FollowButtons {
-    buttons: Vec<(FollowMode, Entity)>,
 }
 
 #[derive(Component)]
@@ -535,6 +534,23 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         color: Color::srgb(0.74, 0.82, 0.94),
         ..Default::default()
     };
+    let button_style = Style {
+        padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+        border: UiRect::all(Val::Px(1.0)),
+        align_items: AlignItems::Center,
+        justify_content: JustifyContent::Center,
+        min_width: Val::Px(120.0),
+        ..Default::default()
+    };
+    let button_row_style = Style {
+        flex_direction: FlexDirection::Row,
+        column_gap: Val::Px(8.0),
+        row_gap: Val::Px(8.0),
+        margin: UiRect::axes(Val::Px(0.0), Val::Px(8.0)),
+        ..Default::default()
+    };
+    let button_base_color = Color::srgba(0.16, 0.22, 0.33, 0.92);
+    let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
 
     let hud_root = commands
         .spawn(NodeBundle {
@@ -595,6 +611,50 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                 secondary_style.clone(),
             ))
             .id();
+        parent
+            .spawn(NodeBundle {
+                style: button_row_style.clone(),
+                ..Default::default()
+            })
+            .with_children(|row| {
+                let spawn_follow_button =
+                    |row: &mut ChildBuilder, mode: FollowMode, label: &str| {
+                        row.spawn((
+                            ButtonBundle {
+                                style: button_style.clone(),
+                                background_color: button_base_color.into(),
+                                border_radius: BorderRadius::all(Val::Px(6.0)),
+                                border_color: BorderColor(button_border_color),
+                                ..Default::default()
+                            },
+                            FollowButton { mode },
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn(TextBundle::from_section(label, secondary_style.clone()));
+                        });
+                    };
+
+                spawn_follow_button(row, FollowMode::Off, "Follow Off");
+                spawn_follow_button(row, FollowMode::Selected, "Follow Selected");
+                spawn_follow_button(row, FollowMode::Oldest, "Follow Oldest");
+
+                row.spawn((
+                    ButtonBundle {
+                        style: button_style.clone(),
+                        background_color: button_base_color.into(),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        border_color: BorderColor(button_border_color),
+                        ..Default::default()
+                    },
+                    ClearSelectionButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn(TextBundle::from_section(
+                        "Clear Selection",
+                        secondary_style.clone(),
+                    ));
+                });
+            });
     });
 
     commands.insert_resource(HudElements {
@@ -929,6 +989,60 @@ fn handle_selection_input(
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
         }
+    }
+}
+
+fn handle_follow_button_interactions(
+    mut rig: ResMut<CameraRig>,
+    mut query: Query<(&FollowButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+) {
+    for (button, interaction) in query.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            rig.toggle_follow_mode(button.mode);
+        }
+    }
+}
+
+fn handle_clear_selection_button(
+    submitter: Option<Res<CommandSubmitter>>,
+    mut rig: ResMut<CameraRig>,
+    mut buttons: Query<&Interaction, (Changed<Interaction>, With<ClearSelectionButton>)>,
+) {
+    let Some(submitter) = submitter else {
+        return;
+    };
+    for interaction in buttons.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            let command = ControlCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Clear,
+                agent_ids: Vec::new(),
+                state: SelectionState::Selected,
+            });
+            (submitter.submit)(command);
+            rig.follow_mode = FollowMode::Off;
+            rig.pan = Vec2::ZERO;
+            rig.recenter_now = true;
+        }
+    }
+}
+
+fn update_follow_button_colors(
+    rig: Res<CameraRig>,
+    mut query: Query<(&FollowButton, &Interaction, &mut BackgroundColor)>,
+) {
+    let active_color = Color::srgba(0.34, 0.26, 0.64, 0.95);
+    let hover_color = Color::srgba(0.22, 0.30, 0.46, 0.95);
+    let idle_color = Color::srgba(0.16, 0.22, 0.33, 0.92);
+
+    for (button, interaction, mut color) in query.iter_mut() {
+        let target = if rig.follow_mode == button.mode {
+            active_color
+        } else if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+            hover_color
+        } else {
+            idle_color
+        };
+        *color = target.into();
     }
 }
 
