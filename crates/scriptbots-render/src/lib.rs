@@ -11932,72 +11932,23 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
                 let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
                 let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-                let mut color = agent_color(agent, agent_shade);
+                let mut body_color = agent_color(agent, agent_shade);
                 if !palette_is_natural {
-                    color = apply_palette(color, frame.palette);
-                }
-                let mut body_path = PathBuilder::fill();
-                append_circle_polygon(&mut body_path, px_x, px_y, half);
-                if let Ok(path) = body_path.build() {
-                    window.paint_path(path, color);
+                    body_color = apply_palette(body_color, frame.palette);
                 }
 
-                if !very_low_fps {
-                    let (heading_sin, heading_cos) = agent.heading.sin_cos();
-                    let pointer_length = half * 1.28;
-                    let pointer_back = half * 0.18;
-                    let pointer_half_width = half * 0.58;
-
-                    let base_center_x = px_x - heading_cos * pointer_back;
-                    let base_center_y = px_y - heading_sin * pointer_back;
-                    let tip_x = px_x + heading_cos * pointer_length;
-                    let tip_y = px_y + heading_sin * pointer_length;
-                    let perp_x = -heading_sin;
-                    let perp_y = heading_cos;
-                    let left_x = base_center_x + perp_x * pointer_half_width;
-                    let left_y = base_center_y + perp_y * pointer_half_width;
-                    let right_x = base_center_x - perp_x * pointer_half_width;
-                    let right_y = base_center_y - perp_y * pointer_half_width;
-
-                    let mut pointer_color = scale_rgb(color, 1.18);
-                    pointer_color.a = (pointer_color.a * 0.92).clamp(0.0, 1.0);
-                    let mut pointer = PathBuilder::fill();
-                    pointer.move_to(point(px(left_x), px(left_y)));
-                    pointer.line_to(point(px(tip_x), px(tip_y)));
-                    pointer.line_to(point(px(right_x), px(right_y)));
-                    pointer.close();
-                    if let Ok(path) = pointer.build() {
-                        window.paint_path(path, pointer_color);
-                    }
-
-                    let spike_length = half * (1.2 + agent.spike_length * 0.95);
-                    let spike_tip_x = px_x + heading_cos * spike_length;
-                    let spike_tip_y = px_y + heading_sin * spike_length;
-                    let mut spike_path = PathBuilder::stroke(px(1.6));
-                    spike_path.move_to(point(px(px_x), px(px_y)));
-                    spike_path.line_to(point(px(spike_tip_x), px(spike_tip_y)));
-                    if let Ok(path) = spike_path.build() {
-                        let spike_color = apply_palette(
-                            if agent.spiked {
-                                Rgba {
-                                    r: 0.95,
-                                    g: 0.35,
-                                    b: 0.18,
-                                    a: 0.85,
-                                }
-                            } else {
-                                Rgba {
-                                    r: 0.82,
-                                    g: 0.52,
-                                    b: 0.18,
-                                    a: 0.60,
-                                }
-                            },
-                            frame.palette,
-                        );
-                        window.paint_path(path, spike_color);
-                    }
-                }
+                paint_agent_avatar(
+                    window,
+                    agent,
+                    (px_x, px_y),
+                    size_px,
+                    scale,
+                    body_color,
+                    frame.palette,
+                    palette_is_natural,
+                    day_phase,
+                    very_low_fps,
+                );
             }
         }
     }
