@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use bytemuck::{Pod, Zeroable};
+use scriptbots_core::NUM_EYES;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -25,11 +26,31 @@ pub struct TerrainView<'a> {
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct AgentInstance {
     pub position: [f32; 2],
-    pub size: f32,
+    pub quad_extent: [f32; 2],
+    pub heading: [f32; 2],
+    pub body_radius: f32,
+    pub body_half_length: f32,
+    pub wheel_offset: f32,
+    pub wheel_radius: f32,
+    pub mouth_open: f32,
+    pub herbivore_tendency: f32,
+    pub temperature_preference: f32,
+    pub food_delta: f32,
+    pub sound_level: f32,
+    pub sound_output: f32,
+    pub wheel_left: f32,
+    pub wheel_right: f32,
+    pub trait_smell: f32,
+    pub trait_sound: f32,
+    pub trait_hearing: f32,
+    pub trait_eye: f32,
+    pub trait_blood: f32,
+    pub selection: f32, // 0=None, 1=Hovered, 2=Selected/Focused
     pub color: [f32; 4],
-    pub selection: u32, // 0=None, 1=Hovered, 2=Selected/Focused
-    pub glow: f32,      // 0..1 extra glow (e.g., reproduction/spike)
-    pub boost: f32,     // 0..1 boost intensity
+    pub glow: f32,  // 0..1 extra glow (e.g., reproduction/spike)
+    pub boost: f32, // 0..1 boost intensity
+    pub eye_dirs: [f32; NUM_EYES],
+    pub eye_fov: [f32; NUM_EYES],
 }
 
 pub struct WorldRenderer {

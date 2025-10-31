@@ -48,3 +48,4 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - BrownLake (2025-10-31 03:24 UTC): Documented the SimulationCommand contract + HUD palette notes inside the Bevy integration plan and pinged RedSnow/OrangeLake for sign-off before closing Phase 4 TODO.
 - BrownLake (2025-10-31 03:31 UTC): Added `run_windows_version_with_bevy.bat` launcher and updated Bevy plan §7.2 to track Windows/Linux/macOS helper parity.
 - BrownLake (2025-10-31 03:36 UTC): Added Linux/macOS Bevy launch scripts, refreshed README quickstart sections, expanded plan §7.2 checklist, and sent Agent Mail announcing the cross-platform helpers.
+- BrownLake (2025-10-31 03:50 UTC): Opened Phase 5 QA checklist in Bevy plan and started instrumentation tasks (FrameTimeDiagnostics/diagnostic logging); awaiting coordination before running benchmarks.

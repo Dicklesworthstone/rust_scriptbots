@@ -196,6 +196,27 @@ _Prepared by RedSnow — 2025-10-30_
 - Progress (2025-10-31 – BrownLake): Documented SimulationCommand handshake + HUD palette updates, updated coordination log, and notified RedSnow/OrangeLake for review.
 - Progress (2025-10-31 – BrownLake): Added cross-platform Bevy launch scripts (Windows/Linux/macOS), updated README quickstart instructions, and closed out plan §7.2 scripting checklist pending QA follow-up.
 
+#### Phase 5 QA & Performance Checklist [Currently In Progress – BrownLake 2025-10-31]
+
+- [ ] Establish benchmark scenarios
+  - [ ] Capture CPU/GPU timings for three canonical seeds (`default`, `dense_agents`, `storm_event`) across GPUI vs Bevy (Linux + Windows).
+  - [ ] Record baseline FPS, frame time percentiles, and simulation ticks/sec; log results to `docs/perf/bevy_vs_gpui.md` once vetted.
+- [ ] [Currently In Progress – BrownLake 2025-10-31] Instrument diagnostics
+  - [ ] Enable Bevy `FrameTimeDiagnosticsPlugin` + custom tracing spans gated by `SB_DIAGNOSTICS`.
+  - [ ] Surface summarized stats in console output (colorized) every 300 frames without flooding logs.
+- [ ] Regression automation
+  - [ ] Extend `render_regression` workflow to run Bevy snapshot/camera tests on Linux headless GPU (reuse existing path filters).
+  - [ ] Add opt-in `cargo test -p scriptbots-bevy -- --include-ignored` job for exhaustive runs before releases.
+- [ ] Visual parity spot-checks
+  - [ ] Rebuild Bevy golden PNG after lighting polish; diff against GPUI using histogram/feature checks documented in §6.1.
+  - [ ] Validate HUD overlays (selection/playback/follow) for readability at 1080p, 1440p, and 4K.
+- [ ] Stability sweeps
+  - [ ] Run 30-minute soak tests on Windows (D3D12 + Vulkan) and Linux (Vulkan) ensuring no panics or runaway memory growth.
+  - [ ] Track auto-pause reasons and ensure SimulationCommand feedback loop remains consistent after long runs.
+- [ ] Coordination
+  - [ ] Confirm responsibilities with OrangeLake/RedSnow via Agent Mail before executing benchmarks.
+  - [ ] Publish findings + required follow-ups in `docs/rendering_reference/coordination.md`.
+
 ---
 
 ## 6. Testing & Regression Strategy

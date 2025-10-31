@@ -4,7 +4,6 @@ use anyhow::{anyhow, Result};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::prelude::*;
-use bevy::ecs::schedule::IntoSystemConfigs;
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::math::primitives::Sphere;
@@ -1002,19 +1001,19 @@ fn update_hud(
 
     if let Some(hud_elements) = hud {
         if let Ok(mut text) = texts.get_mut(hud_elements.tick) {
-            text.sections[0].value = format!("Tick: {}", tick);
+            **text = format!("Tick: {}", tick);
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.agents) {
-            text.sections[0].value = format!(
+            **text = format!(
                 "Agents: {:>4} (selected {:>2})",
                 agent_count, selected_count
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.selection) {
-            text.sections[0].value = selection_text;
+            **text = selection_text.clone();
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.follow) {
-            text.sections[0].value = format!(
+            **text = format!(
                 "Follow: {} • F cycle • Ctrl+S sel • Ctrl+O oldest",
                 rig.follow_mode.label()
             );
@@ -1022,7 +1021,7 @@ fn update_hud(
         if let Ok(mut text) = texts.get_mut(hud_elements.camera) {
             let yaw_deg = rig.yaw.to_degrees();
             let pitch_deg = rig.pitch.to_degrees();
-            text.sections[0].value = format!(
+            **text = format!(
                 "Camera: dist {:>5.0} yaw {:>6.1}° pitch {:>5.1}° • Ctrl+F fit selection • Ctrl+W fit world",
                 rig.distance, yaw_deg, pitch_deg
             );
@@ -1038,7 +1037,7 @@ fn update_hud(
                 message.push_str(" • ");
                 message.push_str(&reason);
             }
-            text.sections[0].value = message;
+            **text = message;
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
             let delta_seconds = time.delta_secs();
@@ -1047,12 +1046,14 @@ fn update_hud(
             } else {
                 0.0
             };
-            text.sections[0].value = format!("FPS: {:>5.1}", fps);
+            **text = format!("FPS: {:>5.1}", fps);
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.world) {
-            text.sections[0].value = format!(
-                "World: {:>4.0}×{:>4.0} • r {:>4.0}",
-                world_size.x, world_size.y, agent_radius
+            **text = format!(
+                "World: {:>4}×{:>4} • r {:>4.1}",
+                world_size.x as i32,
+                world_size.y as i32,
+                agent_radius
             );
         }
     }
@@ -1095,14 +1096,14 @@ fn handle_selection_input(
         None => return,
     };
 
-    let Ok(window) = windows.get_single() else {
+    let Ok(window) = windows.single() else {
         return;
     };
     let Some(cursor_pos) = window.cursor_position() else {
         return;
     };
 
-    let Ok((camera, transform)) = camera_query.get_single() else {
+    let Ok((camera, transform)) = camera_query.single() else {
         return;
     };
     let Some(ray) = camera.viewport_to_world(transform, cursor_pos) else {
@@ -1435,7 +1436,7 @@ fn control_camera(
     mut mouse_wheel: MessageReader<MouseWheel>,
     mut camera_query: Query<&mut Transform, With<PrimaryCamera>>,
 ) {
-    let Ok(mut transform) = camera_query.get_single_mut() else {
+    let Ok(mut transform) = camera_query.single_mut() else {
         mouse_motion.clear();
         mouse_wheel.clear();
         return;
@@ -2186,7 +2187,7 @@ fn sync_agents(
 
     for id in stale {
         if let Some(record) = registry.records.remove(&id) {
-            commands.entity(record.entity).despawn_recursive();
+            commands.entity(record.entity).despawn();
             materials.remove(&record.material);
         }
     }
