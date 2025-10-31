@@ -25,13 +25,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Widget},
 };
 use scriptbots_core::{
-    AgentId, BrainActivations, ControlSettings, TerrainKind, TerrainLayer, TickSummary, WorldState,
+    AgentId, BrainActivations, ControlCommand, ControlSettings, SimulationCommand, TerrainKind,
+    TerrainLayer, TickSummary, WorldState,
 };
 use scriptbots_storage::MetricReading;
 use serde::Serialize;
 use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     CommandDrain, CommandSubmit, ControlRuntime, SharedStorage, SharedWorld,
@@ -190,7 +191,7 @@ struct TerminalApp<'a> {
     storage: SharedStorage,
     _control: &'a ControlRuntime,
     command_drain: CommandDrain,
-    _command_submit: CommandSubmit,
+    command_submit: CommandSubmit,
     tick_interval: Duration,
     draw_interval: Duration,
     speed_multiplier: f32,
@@ -236,7 +237,7 @@ impl<'a> TerminalApp<'a> {
             storage: Arc::clone(&ctx.storage),
             _control: ctx.control_runtime,
             command_drain: Arc::clone(&ctx.command_drain),
-            _command_submit: Arc::clone(&ctx.command_submit),
+            command_submit: Arc::clone(&ctx.command_submit),
             tick_interval: renderer.tick_interval,
             draw_interval: renderer.draw_interval,
             speed_multiplier: 1.0,
@@ -267,9 +268,52 @@ impl<'a> TerminalApp<'a> {
         app
     }
 
+    fn submit_simulation_command(&self, command: SimulationCommand) {
+        if !(self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command)) {
+            warn!("terminal renderer failed to enqueue simulation command");
+        }
+    }
+
+    fn apply_simulation_commands(&mut self, commands: Vec<SimulationCommand>) -> bool {
+        if commands.is_empty() {
+            return false;
+        }
+
+        let mut force_step = false;
+        for command in commands {
+            if let Some(paused) = command.paused {
+                self.paused = paused;
+                if paused {
+                    self.sim_accumulator = 0.0;
+                }
+            }
+            if let Some(speed) = command.speed_multiplier {
+                self.speed_multiplier = speed;
+            }
+            if command.step_once {
+                force_step = true;
+                self.paused = true;
+            }
+        }
+        force_step
+    }
+
     fn maybe_step_simulation(&mut self, now: Instant) {
         let delta = now - self.last_tick;
         self.last_tick = now;
+
+        let mut force_step = false;
+        let pending_commands = if let Ok(mut world) = self.world.lock() {
+            (self.command_drain.as_ref())(&mut world);
+            Some(world.drain_simulation_commands())
+        } else {
+            None
+        };
+        if let Some(pending) = pending_commands {
+            if self.apply_simulation_commands(pending) {
+                force_step = true;
+            }
+        }
 
         let mut steps = 0usize;
 
@@ -295,8 +339,12 @@ impl<'a> TerminalApp<'a> {
             }
         }
 
+        if force_step {
+            steps = steps.max(1);
+            self.paused = true;
+        }
+
         if let Ok(mut world) = self.world.lock() {
-            (self.command_drain.as_ref())(&mut world);
             for _ in 0..steps {
                 world.step();
             }
@@ -306,8 +354,12 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn step_once(&mut self) {
+        self.submit_simulation_command(SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: Some(self.speed_multiplier),
+            step_once: true,
+        });
         if let Ok(mut world) = self.world.lock() {
-            (self.command_drain.as_ref())(&mut world);
             world.step();
         }
         self.refresh_snapshot();
@@ -1185,12 +1237,22 @@ impl<'a> TerminalApp<'a> {
                 } else if self.speed_multiplier <= 0.0 {
                     self.speed_multiplier = 1.0;
                 }
+                self.submit_simulation_command(SimulationCommand {
+                    paused: Some(self.paused),
+                    speed_multiplier: Some(self.speed_multiplier),
+                    step_once: false,
+                });
             }
             (KeyCode::Char('+') | KeyCode::Char('='), _) => {
                 self.speed_multiplier = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
                 if self.speed_multiplier > 0.0 {
                     self.paused = false;
                 }
+                self.submit_simulation_command(SimulationCommand {
+                    paused: Some(self.paused),
+                    speed_multiplier: Some(self.speed_multiplier),
+                    step_once: false,
+                });
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
@@ -1202,6 +1264,11 @@ impl<'a> TerminalApp<'a> {
                 if self.speed_multiplier <= 0.0 {
                     self.paused = true;
                 }
+                self.submit_simulation_command(SimulationCommand {
+                    paused: Some(self.paused),
+                    speed_multiplier: Some(self.speed_multiplier),
+                    step_once: false,
+                });
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,

@@ -40,3 +40,11 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - OrangeLake (2025-10-31 00:52 UTC): Implemented Bevy HUD action row with follow buttons + clear selection; buttons call into the command queue and keep camera follow state aligned with GPUI.
 - OrangeLake (2025-10-31 01:12 UTC): Added keyboard hints/colour states to the follow buttons, instrumented selection/follow logging, and verified behaviour via targeted unit tests (see `Captured command log entries` output in test run).
 - OrangeLake (2025-10-31 01:30 UTC): Kicking off SimulationCommand pipeline + playback styling refresh per Phase 4 TODO checklist; aligning control contract with GPUI/terminal surfaces.
+
+## 2025-10-31
+- BlueMountain (2025-10-31 03:21 UTC): Claimed PLAN §3.2 follow-up to replace CPU quad agent bodies with circular paths, add heading cues, and align tint/boost handling with the GPU renderer snapshot helper.
+- BlueMountain (2025-10-31 03:45 UTC): Expanded §3.2 TODO list for full ScriptBot avatar rendering (wheels, spike, mouth, sensors, diet banding) and will tackle CPU path → GPU parity next.
+- OrangeLake (2025-10-31 02:05 UTC): Simulation commands landed (core enum, Bevy driver, GPUI + terminal emitters), Bevy playback UI restyled with relief palette accents, and targeted tests/cargo checks executed; awaiting RedSnow feedback on broader contract.
+- BrownLake (2025-10-31 03:24 UTC): Documented the SimulationCommand contract + HUD palette notes inside the Bevy integration plan and pinged RedSnow/OrangeLake for sign-off before closing Phase 4 TODO.
+- BrownLake (2025-10-31 03:31 UTC): Added `run_windows_version_with_bevy.bat` launcher and updated Bevy plan §7.2 to track Windows/Linux/macOS helper parity.
+- BrownLake (2025-10-31 03:36 UTC): Added Linux/macOS Bevy launch scripts, refreshed README quickstart sections, expanded plan §7.2 checklist, and sent Agent Mail announcing the cross-platform helpers.

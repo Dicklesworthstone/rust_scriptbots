@@ -226,6 +226,23 @@ Use the convenience scripts in the repo root to launch ScriptBots with sensible 
   - Headless CI snapshot: export `SCRIPTBOTS_TERMINAL_HEADLESS=1` to render against an in-memory buffer
   - Logging: `RUST_LOG=info ./run_linux_terminal_mode.sh`
 
+### Linux — Bevy renderer (Vulkan/GL)
+- Script: `run_linux_with_bevy.sh`
+- Usage:
+  ```bash
+  chmod +x ./run_linux_with_bevy.sh
+  ./run_linux_with_bevy.sh
+  ```
+- What it does:
+  - Detects CPU count (caps default at 8) and passes the value to cargo (`-j`) and the app (`--threads`)
+  - Prefers Vulkan via `WGPU_BACKEND=vulkan`, falling back to GL when Vulkan is unavailable
+  - Enables the Bevy renderer (`--features bevy_render`) and launches with `--mode bevy`
+  - Sets high-performance WGPU hints (`SB_WGPU_PRESENT_MODE=full`, bloom/tonemap/fog defaults) matching the Windows helper
+- Customize:
+  - Limit load: `THREADS=4 ./run_linux_with_bevy.sh`
+  - Force GL: `WGPU_BACKEND=gl ./run_linux_with_bevy.sh`
+  - Append extra flags after the final `--` (e.g., `./run_linux_with_bevy.sh -- --debug-watermark`)
+
 ### macOS — terminal console
 - Script: `run_macos_version_with_console.sh`
 - Usage:
@@ -257,6 +274,23 @@ Use the convenience scripts in the repo root to launch ScriptBots with sensible 
   - Tune threads: edit `--threads 8` or set `SCRIPTBOTS_MAX_THREADS` env
   - Troubleshoot rendering: you can add `--renderer-safe` to the app args if you see a black canvas
 
+### macOS — Bevy renderer (Metal)
+- Script: `run_macos_version_with_bevy.sh`
+- Usage:
+  ```bash
+  chmod +x ./run_macos_version_with_bevy.sh
+  ./run_macos_version_with_bevy.sh
+  ```
+- What it does:
+  - Selects the correct target triple (`aarch64-apple-darwin` on Apple Silicon, `x86_64-apple-darwin` otherwise)
+  - Isolates build artifacts per-arch and clears stray cross-compilation flags
+  - Forces the Metal backend, high-performance power preference, and Bevy feature flag (`--features bevy_render`)
+  - Launches ScriptBots with `--mode bevy` and a default 8-thread budget (override with `THREADS` env)
+- Customize:
+  - Retina tweaks: set `SB_WGPU_RES_SCALE` to `0.5` or `2.0` before running
+  - Lower CPU use: `THREADS=4 ./run_macos_version_with_bevy.sh`
+  - Add Bevy-specific CLI flags after `--`, e.g., `./run_macos_version_with_bevy.sh -- --dump-bevy-png docs/rendering_reference/golden/bevy_default.png`
+
 ### Windows — terminal console (MSVC)
 - Script: `run_windows_version_with_console.bat`
 - Usage:
@@ -283,6 +317,21 @@ Use the convenience scripts in the repo root to launch ScriptBots with sensible 
   - Builds with `--features gui` and launches GUI mode (`--mode gui`) using `--threads 8`
 - Customize:
   - Adjust threads by editing the `--threads` value; add app flags after `--` as needed (e.g., `--debug-watermark`)
+
+### Windows — Bevy renderer (Vulkan/D3D12)
+- Script: `run_windows_version_with_bevy.bat`
+- Usage:
+  - Double-click in Explorer, or run from a Developer PowerShell/Command Prompt:
+    ```bat
+    run_windows_version_with_bevy.bat
+    ```
+- What it does:
+  - Reuses the MSVC target (`x86_64-pc-windows-msvc`) with isolated artifacts under `target-windows-msvc`
+  - Sets high-performance WGPU hints (`WGPU_BACKEND=Vulkan`, `WGPU_POWER_PREFERENCE=high_performance`)
+  - Builds with `--features bevy_render` and launches the Bevy renderer (`--mode bevy`) using `--threads 8`
+- Customize:
+  - To force D3D12 instead of Vulkan: set `set WGPU_BACKEND=d3d12` before running
+  - Add Bevy-only flags (e.g., `--dump-bevy-png`) after the final `--` in the script
 
 Notes (all platforms):
 - The final `-- ...` segment in each script passes flags to the application binary. You can add flags like `--storage memory`, `--profile-steps 1000`, or `--det-check 200` there.

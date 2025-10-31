@@ -4,18 +4,18 @@ mod camera;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
-    App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
-    ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds, WindowOptions, canvas,
-    div, fill, point, prelude::*, px, rgb, size,
+    AlignItems, App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba,
+    ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds,
+    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
     BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, Position,
-    ScriptBotsConfig, SelectionState, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
-    TraitModifiers, Velocity, WorldState,
+    ScriptBotsConfig, SelectionState, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile,
+    TickSummary, TraitModifiers, Velocity, WorldState, NUM_EYES,
 };
 use scriptbots_storage::{MetricReading, Storage};
 use std::{
@@ -746,7 +746,7 @@ pub mod world_compositor {
                     color: [a.color[0], a.color[1], a.color[2], 1.0],
                     selection: sel,
                     glow,
-                    boost: if a.spiked { 1.0 } else { 0.0 },
+                    boost: a.boost.clamp(0.0, 1.0),
                 }
             })
             .collect();
@@ -1390,6 +1390,12 @@ impl SimulationView {
 
     fn set_minimal_canvas_mode(&mut self) {
         self.minimal_canvas_mode = true;
+    }
+
+    fn submit_simulation_command(&self, command: SimulationCommand) {
+        if !(self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command)) {
+            warn!("failed to enqueue simulation command from GPUI renderer");
+        }
     }
 
     fn camera_snapshot(&self) -> CameraSnapshot {
@@ -2718,6 +2724,9 @@ impl SimulationView {
         let canvas_stack = div()
             .relative()
             .flex_1()
+            .h_full()
+            .min_h(px(400.0))
+            .flex_grow()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -3784,6 +3793,11 @@ impl SimulationView {
         self.sim_accumulator = 0.0;
         self.last_sim_instant = Some(Instant::now());
         info!(paused, "Simulation pause state updated");
+        self.submit_simulation_command(SimulationCommand {
+            paused: Some(paused),
+            speed_multiplier: Some(self.controls.speed_multiplier),
+            step_once: false,
+        });
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
             audio.play(&audio.toggle_sound);
@@ -3837,6 +3851,11 @@ impl SimulationView {
             self.controls.speed_multiplier = speed;
             info!(speed = speed, "Adjusted simulation speed");
             self.last_sim_instant = Some(Instant::now());
+            self.submit_simulation_command(SimulationCommand {
+                paused: Some(self.controls.paused),
+                speed_multiplier: Some(speed),
+                step_once: false,
+            });
             #[cfg(feature = "audio")]
             if let Some(audio) = self.audio.as_mut() {
                 audio.play(&audio.toggle_sound);
@@ -7929,15 +7948,19 @@ impl Render for SimulationView {
                 .child(self.render_header(&snapshot, cx))
                 .child(self.render_summary(&snapshot))
                 .child(self.render_analytics_panel(&snapshot))
-                .child(
-                    div()
+                .child({
+                    let mut canvas_row = div()
                         .flex()
                         .gap_4()
                         .flex_1()
+                        .h_full()
+                        .flex_grow()
                         .child(self.render_history(&snapshot))
                         .child(self.render_canvas(&snapshot, cx))
-                        .child(self.render_inspector(&snapshot, cx)),
-                )
+                        .child(self.render_inspector(&snapshot, cx));
+                    canvas_row.style().align_items = Some(AlignItems::Stretch);
+                    canvas_row
+                })
                 .child(self.render_footer(&snapshot))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     this.handle_key_down(event, cx);
@@ -9973,8 +9996,25 @@ struct AgentRenderData {
     color: [f32; 3],
     spike_length: f32,
     velocity: Velocity,
+    heading: f32,
     health: f32,
     age: u32,
+    boost: f32,
+    wheel_left: f32,
+    wheel_right: f32,
+    herbivore_tendency: f32,
+    temperature_preference: f32,
+    food_delta: f32,
+    sound_level: f32,
+    sound_output: f32,
+    sound_multiplier: f32,
+    trait_smell: f32,
+    trait_sound: f32,
+    trait_hearing: f32,
+    trait_eye: f32,
+    trait_blood: f32,
+    eye_dirs: [f32; NUM_EYES],
+    eye_fov: [f32; NUM_EYES],
     selection: SelectionState,
     indicator: IndicatorState,
     spiked: bool,
@@ -10011,6 +10051,8 @@ impl RenderFrame {
         let spikes = columns.spike_lengths();
         let healths = columns.health();
         let velocities = columns.velocities();
+        let headings = columns.headings();
+        let boosts = columns.boosts();
         let ages = columns.ages();
 
         let estimated_agents = arena.len();
@@ -10022,14 +10064,91 @@ impl RenderFrame {
             let spiked = runtime_entry.map(|rt| rt.spiked).unwrap_or(false);
             let reproduction_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
 
+            let (
+                wheel_left,
+                wheel_right,
+                herbivore_tendency,
+                temperature_preference,
+                food_delta,
+                sound_level,
+                sound_output,
+                sound_multiplier,
+                trait_smell,
+                trait_sound,
+                trait_hearing,
+                trait_eye,
+                trait_blood,
+                eye_dirs,
+                eye_fov,
+            ) = runtime_entry
+                .map(|rt| {
+                    let mut eye_dirs = [0.0_f32; NUM_EYES];
+                    let mut eye_fov = [0.0_f32; NUM_EYES];
+                    eye_dirs.copy_from_slice(&rt.eye_direction);
+                    eye_fov.copy_from_slice(&rt.eye_fov);
+                    (
+                        rt.outputs[0],
+                        rt.outputs[1],
+                        rt.herbivore_tendency.clamp(0.0, 1.0),
+                        rt.temperature_preference.clamp(0.0, 1.0),
+                        rt.food_delta,
+                        rt.outputs.get(7).copied().unwrap_or(0.0),
+                        rt.sound_output,
+                        rt.sound_multiplier,
+                        rt.trait_modifiers.smell,
+                        rt.trait_modifiers.sound,
+                        rt.trait_modifiers.hearing,
+                        rt.trait_modifiers.eye,
+                        rt.trait_modifiers.blood,
+                        eye_dirs,
+                        eye_fov,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        0.0,
+                        0.0,
+                        0.5,
+                        0.5,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.3,
+                        0.4,
+                        1.0,
+                        1.5,
+                        1.5,
+                        [0.0; NUM_EYES],
+                        [1.0; NUM_EYES],
+                    )
+                });
+
             agents.push(AgentRenderData {
                 agent_id,
                 position: positions[idx],
                 color: colors[idx],
                 spike_length: spikes[idx],
                 velocity: velocities[idx],
+                heading: headings[idx],
                 health: healths[idx],
                 age: ages[idx],
+                boost: if boosts[idx] { 1.0 } else { 0.0 },
+                 wheel_left,
+                 wheel_right,
+                 herbivore_tendency,
+                 temperature_preference,
+                 food_delta,
+                 sound_level,
+                 sound_output,
+                 sound_multiplier,
+                 trait_smell,
+                 trait_sound,
+                 trait_hearing,
+                 trait_eye,
+                 trait_blood,
+                 eye_dirs,
+                 eye_fov,
                 selection,
                 indicator,
                 spiked,
@@ -10871,8 +10990,6 @@ fn apply_post_processing(
     let bounds_size = bounds.size;
     let width_px = f32::from(bounds_size.width).max(1.0);
     let height_px = f32::from(bounds_size.height).max(1.0);
-    let window_bounds = window.bounds();
-    let window_height_px = f32::from(window_bounds.size.height).max(1.0);
     let origin_x = f32::from(origin.x);
     let origin_y = f32::from(origin.y);
 
@@ -11631,14 +11748,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
                 // Append rectangle for agent body
                 if let Some(builder) = builders[bin].as_mut() {
-                    let x0 = px(px_x - half);
-                    let y0 = px(px_y - half);
-                    let x1 = px(px_x + half);
-                    let y1 = px(px_y + half);
-                    builder.move_to(point(x0, y0));
-                    builder.line_to(point(x1, y0));
-                    builder.line_to(point(x1, y1));
-                    builder.line_to(point(x0, y1));
+                    append_circle_polygon(builder, px_x, px_y, half);
                     builder.close();
                 }
                 if colors[bin].is_none() {
@@ -11672,33 +11782,35 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 }
 
                 if !low_fps {
-                    let shadow_size = size_px * 1.25;
-                    let shadow_half = shadow_size * 0.5;
+                    let shadow_radius = half * 1.25;
                     let shadow_offset_x = scale.clamp(1.0, 6.0) * 0.6;
                     let shadow_offset_y = scale.clamp(1.0, 7.0) * 1.1;
-                    let shadow_bounds = Bounds::new(
-                        point(
-                            px(px_x - shadow_half + shadow_offset_x),
-                            px(px_y - shadow_half + shadow_offset_y),
-                        ),
-                        size(px(shadow_size), px(shadow_size)),
+                    let mut shadow = PathBuilder::fill();
+                    append_circle_polygon(
+                        &mut shadow,
+                        px_x + shadow_offset_x,
+                        px_y + shadow_offset_y,
+                        shadow_radius,
                     );
-                    let shadow_color = apply_palette(
-                        Rgba {
-                            r: 0.05,
-                            g: 0.08,
-                            b: 0.10,
-                            a: 0.38,
-                        },
-                        frame.palette,
-                    );
-                    window.paint_quad(fill(shadow_bounds, Background::from(shadow_color)));
+                    if let Ok(path) = shadow.build() {
+                        let shadow_color = apply_palette(
+                            Rgba {
+                                r: 0.05,
+                                g: 0.08,
+                                b: 0.10,
+                                a: 0.38,
+                            },
+                            frame.palette,
+                        );
+                        window.paint_path(path, shadow_color);
+                    }
                 }
                 // Inline highlights without allocating
                 if !very_low_fps {
                     match agent.selection {
                         SelectionState::Selected => {
                             let factor = 1.85;
+                            let highlight_radius = half * factor;
                             let highlight = apply_palette(
                                 Rgba {
                                     r: 0.98,
@@ -11708,16 +11820,20 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                                 },
                                 frame.palette,
                             );
-                            let highlight_size = size_px * factor;
-                            let highlight_half = highlight_size * 0.5;
-                            let highlight_bounds = Bounds::new(
-                                point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                                size(px(highlight_size), px(highlight_size)),
+                            let mut highlight_path = PathBuilder::fill();
+                            append_circle_polygon(
+                                &mut highlight_path,
+                                px_x,
+                                px_y,
+                                highlight_radius,
                             );
-                            window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                            if let Ok(path) = highlight_path.build() {
+                                window.paint_path(path, highlight);
+                            }
                         }
                         SelectionState::Hovered => {
                             let factor = 1.45;
+                            let highlight_radius = half * factor;
                             let highlight = apply_palette(
                                 Rgba {
                                     r: 0.94,
@@ -11727,19 +11843,23 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                                 },
                                 frame.palette,
                             );
-                            let highlight_size = size_px * factor;
-                            let highlight_half = highlight_size * 0.5;
-                            let highlight_bounds = Bounds::new(
-                                point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                                size(px(highlight_size), px(highlight_size)),
+                            let mut highlight_path = PathBuilder::fill();
+                            append_circle_polygon(
+                                &mut highlight_path,
+                                px_x,
+                                px_y,
+                                highlight_radius,
                             );
-                            window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                            if let Ok(path) = highlight_path.build() {
+                                window.paint_path(path, highlight);
+                            }
                         }
                         SelectionState::None => {}
                     }
 
                     if focus_agent == Some(agent.agent_id) {
                         let factor = 2.05;
+                        let highlight_radius = half * factor;
                         let highlight = apply_palette(
                             Rgba {
                                 r: 0.40,
@@ -11749,13 +11869,11 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                             },
                             frame.palette,
                         );
-                        let highlight_size = size_px * factor;
-                        let highlight_half = highlight_size * 0.5;
-                        let highlight_bounds = Bounds::new(
-                            point(px(px_x - highlight_half), px(px_y - highlight_half)),
-                            size(px(highlight_size), px(highlight_size)),
-                        );
-                        window.paint_quad(fill(highlight_bounds, Background::from(highlight)));
+                        let mut focus_path = PathBuilder::fill();
+                        append_circle_polygon(&mut focus_path, px_x, px_y, highlight_radius);
+                        if let Ok(path) = focus_path.build() {
+                            window.paint_path(path, highlight);
+                        }
                     }
                 }
 
@@ -11763,27 +11881,21 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
                 if agent.indicator.intensity > 0.05 && !low_fps {
                     let effect = agent.indicator.intensity.clamp(0.0, 1.0);
-                    let indicator_size = size_px * (1.2 + effect * 1.4);
-                    let indicator_half = indicator_size * 0.5;
-                    let indicator_bounds = Bounds::new(
-                        point(px(px_x - indicator_half), px(px_y - indicator_half)),
-                        size(px(indicator_size), px(indicator_size)),
-                    );
+                    let indicator_radius = half * (1.2 + effect * 1.4);
                     let indicator_color = apply_palette(
                         rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect),
                         frame.palette,
                     );
-                    window.paint_quad(fill(indicator_bounds, Background::from(indicator_color)));
+                    let mut indicator = PathBuilder::fill();
+                    append_circle_polygon(&mut indicator, px_x, px_y, indicator_radius);
+                    if let Ok(path) = indicator.build() {
+                        window.paint_path(path, indicator_color);
+                    }
                 }
 
                 if agent.reproduction_intent > 0.2 && !low_fps {
                     let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
-                    let pulse_size = size_px * (1.8 + pulse * 1.6);
-                    let pulse_half = pulse_size * 0.5;
-                    let pulse_bounds = Bounds::new(
-                        point(px(px_x - pulse_half), px(px_y - pulse_half)),
-                        size(px(pulse_size), px(pulse_size)),
-                    );
+                    let pulse_radius = half * (1.8 + pulse * 1.6);
                     let pulse_color = apply_palette(
                         Rgba {
                             r: 0.88,
@@ -11793,16 +11905,15 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         },
                         frame.palette,
                     );
-                    window.paint_quad(fill(pulse_bounds, Background::from(pulse_color)));
+                    let mut pulse_path = PathBuilder::fill();
+                    append_circle_polygon(&mut pulse_path, px_x, px_y, pulse_radius);
+                    if let Ok(path) = pulse_path.build() {
+                        window.paint_path(path, pulse_color);
+                    }
                 }
 
                 if agent.spiked {
-                    let spike_size = size_px * 2.2;
-                    let spike_half = spike_size * 0.5;
-                    let spike_bounds = Bounds::new(
-                        point(px(px_x - spike_half), px(px_y - spike_half)),
-                        size(px(spike_size), px(spike_size)),
-                    );
+                    let spike_radius = half * 2.2;
                     let spike_color = apply_palette(
                         Rgba {
                             r: 0.95,
@@ -11812,20 +11923,81 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         },
                         frame.palette,
                     );
-                    window.paint_quad(fill(spike_bounds, Background::from(spike_color)));
+                    let mut spike_path = PathBuilder::fill();
+                    append_circle_polygon(&mut spike_path, px_x, px_y, spike_radius);
+                    if let Ok(path) = spike_path.build() {
+                        window.paint_path(path, spike_color);
+                    }
                 }
 
-                let agent_bounds = Bounds::new(
-                    point(px(px_x - half), px(px_y - half)),
-                    size(px(size_px), px(size_px)),
-                );
                 let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
                 let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
                 let mut color = agent_color(agent, agent_shade);
                 if !palette_is_natural {
                     color = apply_palette(color, frame.palette);
                 }
-                window.paint_quad(fill(agent_bounds, Background::from(color)));
+                let mut body_path = PathBuilder::fill();
+                append_circle_polygon(&mut body_path, px_x, px_y, half);
+                if let Ok(path) = body_path.build() {
+                    window.paint_path(path, color);
+                }
+
+                if !very_low_fps {
+                    let (heading_sin, heading_cos) = agent.heading.sin_cos();
+                    let pointer_length = half * 1.28;
+                    let pointer_back = half * 0.18;
+                    let pointer_half_width = half * 0.58;
+
+                    let base_center_x = px_x - heading_cos * pointer_back;
+                    let base_center_y = px_y - heading_sin * pointer_back;
+                    let tip_x = px_x + heading_cos * pointer_length;
+                    let tip_y = px_y + heading_sin * pointer_length;
+                    let perp_x = -heading_sin;
+                    let perp_y = heading_cos;
+                    let left_x = base_center_x + perp_x * pointer_half_width;
+                    let left_y = base_center_y + perp_y * pointer_half_width;
+                    let right_x = base_center_x - perp_x * pointer_half_width;
+                    let right_y = base_center_y - perp_y * pointer_half_width;
+
+                    let mut pointer_color = scale_rgb(color, 1.18);
+                    pointer_color.a = (pointer_color.a * 0.92).clamp(0.0, 1.0);
+                    let mut pointer = PathBuilder::fill();
+                    pointer.move_to(point(px(left_x), px(left_y)));
+                    pointer.line_to(point(px(tip_x), px(tip_y)));
+                    pointer.line_to(point(px(right_x), px(right_y)));
+                    pointer.close();
+                    if let Ok(path) = pointer.build() {
+                        window.paint_path(path, pointer_color);
+                    }
+
+                    let spike_length = half * (1.2 + agent.spike_length * 0.95);
+                    let spike_tip_x = px_x + heading_cos * spike_length;
+                    let spike_tip_y = px_y + heading_sin * spike_length;
+                    let mut spike_path = PathBuilder::stroke(px(1.6));
+                    spike_path.move_to(point(px(px_x), px(px_y)));
+                    spike_path.line_to(point(px(spike_tip_x), px(spike_tip_y)));
+                    if let Ok(path) = spike_path.build() {
+                        let spike_color = apply_palette(
+                            if agent.spiked {
+                                Rgba {
+                                    r: 0.95,
+                                    g: 0.35,
+                                    b: 0.18,
+                                    a: 0.85,
+                                }
+                            } else {
+                                Rgba {
+                                    r: 0.82,
+                                    g: 0.52,
+                                    b: 0.18,
+                                    a: 0.60,
+                                }
+                            },
+                            frame.palette,
+                        );
+                        window.paint_path(path, spike_color);
+                    }
+                }
             }
         }
     }
@@ -11910,18 +12082,27 @@ fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
     let base_g = agent.color[1].clamp(0.0, 1.0);
     let base_b = agent.color[2].clamp(0.0, 1.0);
     let health_factor = (agent.health / 2.0).clamp(0.45, 1.0);
+    let boost = agent.boost.clamp(0.0, 1.0);
 
     let blend_channel = |base: f32| {
         let lit = base * health_factor * shade;
         (lit * 0.85 + base * 0.15).max(0.08).min(1.0)
     };
 
-    Rgba {
+    let mut color = Rgba {
         r: blend_channel(base_r),
         g: blend_channel(base_g),
         b: blend_channel(base_b),
         a: 0.96,
+    };
+
+    if boost > 0.0 {
+        color.r = (color.r + boost * 0.28).min(1.0);
+        color.g = (color.g + boost * 0.12).min(1.0);
+        color.b = (color.b * (1.0 - boost * 0.18)).clamp(0.0, 1.0);
     }
+
+    color
 }
 
 fn apply_palette(color: Rgba, palette: ColorPaletteMode) -> Rgba {

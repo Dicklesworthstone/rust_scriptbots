@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
-bevy = { version = "0.14" }
+bevy = { version = "0.17" }
+bevy_mesh = { version = "0.17" }
 scriptbots-core = { path = "../scriptbots-core" }
 tracing = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -65,6 +65,29 @@
 - Raised minimum agent radius (world + GPU paths) and strengthened outline stroke with dark ink.
 - Added soft drop shadows, warmer selection glows, and health-aware body shading so agents read clearly at default zoom.
 - GPU pipeline now consumes the same colour grades to avoid mismatch between rendering backends.
+- Follow-up parity: replace CPU quad body rendering with circle paths + heading cues [Currently In Progress – BlueMountain 2025-10-31]
+    - [ ] Inventory runtime data needed for rich agent avatars (wheels, outputs, sensors, diet, audio).
+    - [ ] Extend `AgentRenderData` + snapshot extraction with:
+        - [ ] Left/right wheel outputs or derived speeds.
+        - [ ] Boost flag intensity and reproduction counters.
+        - [ ] Trait modifiers (eye, smell, sound, blood).
+        - [ ] Sensor metadata (eye directions/FOV, sound multiplier).
+        - [ ] Sound output, food delta, herbivore tendency, temperature preference.
+    - [ ] CPU renderer:
+        - [ ] Replace circular body with oriented capsule shell.
+        - [ ] Draw dual wheel assemblies with velocity streaks.
+        - [ ] Render spike spear with length/intensity tint.
+        - [ ] Add mouth aperture that animates with food intake/sound output.
+        - [ ] Encode herbivore vs carnivore banding.
+        - [ ] Paint sensor accessories (eyes/ears) scaled by trait modifiers.
+        - [ ] Maintain selection/indicator/boost halos.
+        - [ ] Keep debug overlays working with new geometry.
+    - [ ] WGPU renderer parity:
+        - [ ] Expand `AgentInstance` payload with new fields.
+        - [ ] Update WGSL shader to render capsule + wheels + spike + mouth.
+        - [ ] Ensure boost/reproduction effects match CPU path.
+    - [ ] Snapshot/offscreen helper updates and golden refresh (once visuals approved).
+    - [ ] Remove temporary CPU fallback rect logic after verifying layout stability.
 
 ### 3.3 Modern UI Polish [Completed – RedCastle 2025-10-30]
 - HUD header now surfaces paused/running, world mode, speed, and follow status via consistent chips; world info subline adopts the shared theme palette.

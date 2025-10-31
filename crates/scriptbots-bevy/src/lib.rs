@@ -1,20 +1,19 @@
 //! Bevy renderer integration for ScriptBots.
 
 use anyhow::{Result, anyhow};
-use bevy::render::{
-    mesh::{Indices, Mesh, PrimitiveTopology},
-    render_asset::RenderAssetUsages,
-};
+use bevy::app::{AppExit, IntoSystemConfigs};
+use bevy::asset::render_asset::RenderAssetUsages;
+use bevy::camera::prelude::*;
+use bevy::ecs::system::NonSendMut;
+use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::math::primitives::Sphere;
+use bevy::pbr::prelude::*;
+use bevy::prelude::*;
+use bevy::render::render_resource::PrimitiveTopology;
+use bevy::ui::prelude::*;
 use bevy::ui::{BorderColor, BorderRadius};
-use bevy::{
-    app::AppExit,
-    ecs::schedule::IntoSystemConfigs,
-    ecs::system::NonSendMut,
-    input::mouse::{MouseMotion, MouseWheel},
-    math::primitives::Sphere,
-    prelude::*,
-    window::{PresentMode, PrimaryWindow, WindowPlugin},
-};
+use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
+use bevy_mesh::{Indices, Mesh};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
     AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
@@ -96,10 +95,11 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     );
 
     let mut app = App::new();
-    app.insert_resource(ClearColor(Color::srgb(0.03, 0.05, 0.09)))
+    app.insert_resource(ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)))
         .insert_resource(AmbientLight {
             color: Color::srgb(0.45, 0.52, 0.65),
             brightness: 800.0,
+            affects_lightmapped_meshes: true,
         })
         .insert_resource(submitter_resource)
         .insert_resource(controls_resource)
@@ -655,22 +655,19 @@ impl WorldSnapshot {
 
 fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.spawn((
-        Camera3dBundle {
-            transform: Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y),
-            ..Default::default()
-        },
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y),
         PrimaryCamera,
     ));
 
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
+    commands.spawn((
+        DirectionalLight {
             illuminance: 9000.0,
             shadows_enabled: true,
-            ..Default::default()
+            ..default()
         },
-        transform: Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y),
-        ..Default::default()
-    });
+        Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
 
     let agent_mesh = meshes.add(Mesh::from(Sphere::new(1.0)));
     commands.insert_resource(AgentMeshAsset {
@@ -680,53 +677,47 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.insert_resource(TerrainChunkRegistry {
         chunk_size: TERRAIN_CHUNK_SIZE,
         height_scale: TERRAIN_HEIGHT_SCALE,
-        ..Default::default()
+        ..default()
     });
     commands.insert_resource(CameraRig::default());
 
-    commands.spawn(Camera2dBundle::default());
+    commands.spawn((Camera2d,));
 
-    let text_style = TextStyle {
-        font_size: 18.0,
-        color: Color::WHITE,
-        ..Default::default()
-    };
-    let secondary_style = TextStyle {
-        font_size: 15.0,
-        color: Color::srgb(0.74, 0.82, 0.94),
-        ..Default::default()
-    };
-    let button_style = Style {
-        padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
-        border: UiRect::all(Val::Px(1.0)),
+    let primary_text_color = Color::WHITE;
+    let secondary_text_color = Color::srgb(0.74, 0.82, 0.94);
+    let primary_font = TextFont::from_font_size(18.0);
+    let secondary_font = TextFont::from_font_size(15.0);
+
+    let button_node = Node {
+        padding: UiRect::axes(px(12.0), px(8.0)),
+        border: UiRect::all(px(1.0)),
         align_items: AlignItems::Center,
         justify_content: JustifyContent::Center,
-        min_width: Val::Px(120.0),
-        ..Default::default()
+        min_width: px(120.0),
+        ..default()
     };
-    let button_row_style = Style {
+    let button_row_node = Node {
         flex_direction: FlexDirection::Row,
-        column_gap: Val::Px(8.0),
-        row_gap: Val::Px(8.0),
-        margin: UiRect::axes(Val::Px(0.0), Val::Px(8.0)),
-        ..Default::default()
+        column_gap: px(8.0),
+        row_gap: px(8.0),
+        margin: UiRect::axes(px(0.0), px(8.0)),
+        ..default()
     };
     let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
 
     let hud_root = commands
-        .spawn(NodeBundle {
-            style: Style {
+        .spawn((
+            Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(12.0),
-                left: Val::Px(12.0),
-                padding: UiRect::all(Val::Px(10.0)),
+                top: px(12.0),
+                left: px(12.0),
+                padding: UiRect::all(px(10.0)),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(6.0),
-                ..Default::default()
+                row_gap: px(6.0),
+                ..default()
             },
-            background_color: Color::srgba(0.07, 0.11, 0.18, 0.72).into(),
-            ..Default::default()
-        })
+            BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.72)),
+        ))
         .id();
 
     let mut tick = Entity::PLACEHOLDER;
@@ -739,60 +730,45 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut world = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
-        tick = parent
-            .spawn(TextBundle::from_section("Tick: --", text_style.clone()))
-            .id();
-        agents = parent
-            .spawn(TextBundle::from_section("Agents: --", text_style.clone()))
-            .id();
-        selection = parent
-            .spawn(TextBundle::from_section(
-                "Selection: --",
-                secondary_style.clone(),
-            ))
-            .id();
-        follow = parent
-            .spawn(TextBundle::from_section("Follow: --", text_style.clone()))
-            .id();
-        camera = parent
-            .spawn(TextBundle::from_section("Camera: --", text_style.clone()))
-            .id();
-        playback = parent
-            .spawn(TextBundle::from_section(
-                "Playback: --",
-                secondary_style.clone(),
-            ))
-            .id();
-        fps = parent
-            .spawn(TextBundle::from_section("FPS: --", secondary_style.clone()))
-            .id();
-        world = parent
-            .spawn(TextBundle::from_section(
-                "World: --",
-                secondary_style.clone(),
-            ))
-            .id();
-        // Playback controls row
+        let mut spawn_text =
+            |parent: &mut ChildBuilder, label: &str, font: &TextFont, color: Color| {
+                parent
+                    .spawn((
+                        Text::new(label.to_string()),
+                        font.clone(),
+                        TextColor(color),
+                    ))
+                    .id()
+            };
+
+        tick = spawn_text(parent, "Tick: --", &primary_font, primary_text_color);
+        agents = spawn_text(parent, "Agents: --", &primary_font, primary_text_color);
+        selection = spawn_text(parent, "Selection: --", &secondary_font, secondary_text_color);
+        follow = spawn_text(parent, "Follow: --", &primary_font, primary_text_color);
+        camera = spawn_text(parent, "Camera: --", &primary_font, primary_text_color);
+        playback = spawn_text(parent, "Playback: --", &secondary_font, secondary_text_color);
+        fps = spawn_text(parent, "FPS: --", &secondary_font, secondary_text_color);
+        world = spawn_text(parent, "World: --", &secondary_font, secondary_text_color);
+
         parent
-            .spawn(NodeBundle {
-                style: button_row_style.clone(),
-                ..Default::default()
-            })
+            .spawn((button_row_node.clone(),))
             .with_children(|row| {
-                let spawn_playback =
+                let mut spawn_playback =
                     |row: &mut ChildBuilder, action: PlaybackAction, label: &str| {
                         row.spawn((
-                            ButtonBundle {
-                                style: button_style.clone(),
-                                background_color: follow_idle_color().into(),
-                                border_radius: BorderRadius::all(Val::Px(6.0)),
-                                border_color: BorderColor(button_border_color),
-                                ..Default::default()
-                            },
+                            Button,
+                            button_node.clone(),
+                            BackgroundColor(follow_idle_color()),
+                            BorderRadius::all(px(6.0)),
+                            BorderColor::all(button_border_color),
                             PlaybackButton { action },
                         ))
                         .with_children(|btn| {
-                            btn.spawn(TextBundle::from_section(label, secondary_style.clone()));
+                            btn.spawn((
+                                Text::new(label.to_string()),
+                                secondary_font.clone(),
+                                TextColor(secondary_text_color),
+                            ));
                         });
                     };
 
@@ -804,46 +780,44 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
             });
 
         parent
-            .spawn(NodeBundle {
-                style: button_row_style.clone(),
-                ..Default::default()
-            })
+            .spawn((button_row_node.clone(),))
             .with_children(|row| {
-                let spawn_follow_button =
+                let mut spawn_follow_button =
                     |row: &mut ChildBuilder, mode: FollowMode, label: &str| {
                         row.spawn((
-                            ButtonBundle {
-                                style: button_style.clone(),
-                                background_color: follow_idle_color().into(),
-                                border_radius: BorderRadius::all(Val::Px(6.0)),
-                                border_color: BorderColor(button_border_color),
-                                ..Default::default()
-                            },
+                            Button,
+                            button_node.clone(),
+                            BackgroundColor(follow_idle_color()),
+                            BorderRadius::all(px(6.0)),
+                            BorderColor::all(button_border_color),
                             FollowButton { mode },
                         ))
                         .with_children(|btn| {
-                            btn.spawn(TextBundle::from_section(label, secondary_style.clone()));
+                            btn.spawn((
+                                Text::new(label.to_string()),
+                                secondary_font.clone(),
+                                TextColor(secondary_text_color),
+                            ));
                         });
                     };
 
-                spawn_follow_button(row, FollowMode::Off, "🛑 Follow off (F)");
+               spawn_follow_button(row, FollowMode::Off, "🛑 Follow off (F)");
                 spawn_follow_button(row, FollowMode::Selected, "🎯 Follow selected (Ctrl+S)");
                 spawn_follow_button(row, FollowMode::Oldest, "📜 Follow oldest (Ctrl+O)");
 
                 row.spawn((
-                    ButtonBundle {
-                        style: button_style.clone(),
-                        background_color: follow_idle_color().into(),
-                        border_radius: BorderRadius::all(Val::Px(6.0)),
-                        border_color: BorderColor(button_border_color),
-                        ..Default::default()
-                    },
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(px(6.0)),
+                    BorderColor::all(button_border_color),
                     ClearSelectionButton,
                 ))
                 .with_children(|btn| {
-                    btn.spawn(TextBundle::from_section(
-                        "✖ Clear selection (Esc)",
-                        secondary_style.clone(),
+                    btn.spawn((
+                        Text::new("✖ Clear selection (Esc)".to_string()),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
                     ));
                 });
             });
@@ -1675,7 +1649,9 @@ fn sync_terrain(
                         } else {
                             let mesh_handle = meshes.add(built.mesh);
                             record.mesh = mesh_handle.clone();
-                            commands.entity(record.entity).insert(mesh_handle);
+                            commands
+                                .entity(record.entity)
+                                .insert((Mesh3d(mesh_handle.clone()),));
                         }
                         update_chunk_material(materials, &record.material, &built.stats);
                         record.signature = built.stats.signature;
@@ -1687,12 +1663,10 @@ fn sync_terrain(
                     let mesh_handle = meshes.add(built.mesh);
                     let material_handle = materials.add(create_chunk_material(&built.stats));
                     let entity = commands
-                        .spawn(PbrBundle {
-                            mesh: mesh_handle.clone(),
-                            material: material_handle.clone(),
-                            transform: Transform::IDENTITY,
-                            ..Default::default()
-                        })
+                        .spawn((
+                            Mesh3d(mesh_handle.clone()),
+                            MeshMaterial3d(material_handle.clone()),
+                        ))
                         .id();
                     registry.chunks.insert(
                         key,
@@ -1719,7 +1693,7 @@ fn sync_terrain(
 
     for key in stale {
         if let Some(record) = registry.chunks.remove(&key) {
-            commands.entity(record.entity).despawn_recursive();
+            commands.entity(record.entity).despawn();
             meshes.remove(&record.mesh);
             materials.remove(&record.material);
         }
@@ -2486,7 +2460,6 @@ fn spawn_simulation_driver(
                 let agent_count = world_guard.agent_count();
                 let max_age = world_guard.last_max_age();
                 let spike_hits = world_guard.last_spike_hits();
-                drop(world_guard);
 
                 let mut reason: Option<String> = None;
                 if control.auto_pause_on_spike_hit && spike_hits > 0 {
@@ -2507,12 +2480,19 @@ fn spawn_simulation_driver(
                         state.auto_pause_reason = Some(reason.clone());
                         state.step_requested = false;
                     });
+                    world_guard.enqueue_simulation_command(SimulationCommand {
+                        paused: Some(true),
+                        speed_multiplier: Some(0.0),
+                        step_once: false,
+                    });
                     info!(%reason, "Bevy simulation auto-paused");
                 } else if steps > 0 {
                     controls.update(|state| {
                         state.auto_pause_reason = None;
                     });
                 }
+
+                drop(world_guard);
             }
 
             if steps == 0 {
