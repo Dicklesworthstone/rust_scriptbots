@@ -1,9 +1,10 @@
 //! Bevy renderer integration for ScriptBots.
 
-use anyhow::{Result, anyhow};
-use bevy::app::{AppExit, IntoSystemConfigs};
-use bevy::asset::render_asset::RenderAssetUsages;
+use anyhow::{anyhow, Result};
+use bevy::app::AppExit;
+use bevy::asset::RenderAssetUsages;
 use bevy::camera::prelude::*;
+use bevy::ecs::schedule::IntoSystemConfigs;
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::math::primitives::Sphere;
@@ -95,8 +96,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     );
 
     let mut app = App::new();
-    app.insert_resource(ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)))
-        .insert_resource(AmbientLight {
+    app.insert_resource(AmbientLight {
             color: Color::srgb(0.45, 0.52, 0.65),
             brightness: 800.0,
             affects_lightmapped_meshes: true,
@@ -656,6 +656,10 @@ impl WorldSnapshot {
 fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.spawn((
         Camera3d::default(),
+        Camera {
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
+            ..default()
+        },
         Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y),
         PrimaryCamera,
     ));
@@ -731,22 +735,28 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 
     commands.entity(hud_root).with_children(|parent| {
         let mut spawn_text =
-            |parent: &mut ChildBuilder, label: &str, font: &TextFont, color: Color| {
+            |parent: &mut _, label: &str, font: &TextFont, color: Color| {
                 parent
-                    .spawn((
-                        Text::new(label.to_string()),
-                        font.clone(),
-                        TextColor(color),
-                    ))
+                    .spawn((Text::new(label), font.clone(), TextColor(color)))
                     .id()
             };
 
         tick = spawn_text(parent, "Tick: --", &primary_font, primary_text_color);
         agents = spawn_text(parent, "Agents: --", &primary_font, primary_text_color);
-        selection = spawn_text(parent, "Selection: --", &secondary_font, secondary_text_color);
+        selection = spawn_text(
+            parent,
+            "Selection: --",
+            &secondary_font,
+            secondary_text_color,
+        );
         follow = spawn_text(parent, "Follow: --", &primary_font, primary_text_color);
         camera = spawn_text(parent, "Camera: --", &primary_font, primary_text_color);
-        playback = spawn_text(parent, "Playback: --", &secondary_font, secondary_text_color);
+        playback = spawn_text(
+            parent,
+            "Playback: --",
+            &secondary_font,
+            secondary_text_color,
+        );
         fps = spawn_text(parent, "FPS: --", &secondary_font, secondary_text_color);
         world = spawn_text(parent, "World: --", &secondary_font, secondary_text_color);
 
@@ -754,7 +764,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
             .spawn((button_row_node.clone(),))
             .with_children(|row| {
                 let mut spawn_playback =
-                    |row: &mut ChildBuilder, action: PlaybackAction, label: &str| {
+                    |row: &mut _, action: PlaybackAction, label: &str| {
                         row.spawn((
                             Button,
                             button_node.clone(),
@@ -763,9 +773,9 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                             BorderColor::all(button_border_color),
                             PlaybackButton { action },
                         ))
-                        .with_children(|btn| {
+                        .with_children(|btn: &mut _| {
                             btn.spawn((
-                                Text::new(label.to_string()),
+                                Text::new(label),
                                 secondary_font.clone(),
                                 TextColor(secondary_text_color),
                             ));
@@ -783,7 +793,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
             .spawn((button_row_node.clone(),))
             .with_children(|row| {
                 let mut spawn_follow_button =
-                    |row: &mut ChildBuilder, mode: FollowMode, label: &str| {
+                    |row: &mut _, mode: FollowMode, label: &str| {
                         row.spawn((
                             Button,
                             button_node.clone(),
@@ -792,16 +802,16 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                             BorderColor::all(button_border_color),
                             FollowButton { mode },
                         ))
-                        .with_children(|btn| {
+                        .with_children(|btn: &mut _| {
                             btn.spawn((
-                                Text::new(label.to_string()),
+                                Text::new(label),
                                 secondary_font.clone(),
                                 TextColor(secondary_text_color),
                             ));
                         });
                     };
 
-               spawn_follow_button(row, FollowMode::Off, "🛑 Follow off (F)");
+                spawn_follow_button(row, FollowMode::Off, "🛑 Follow off (F)");
                 spawn_follow_button(row, FollowMode::Selected, "🎯 Follow selected (Ctrl+S)");
                 spawn_follow_button(row, FollowMode::Oldest, "📜 Follow oldest (Ctrl+O)");
 
@@ -815,7 +825,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("✖ Clear selection (Esc)".to_string()),
+                        Text::new("✖ Clear selection (Esc)"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -1031,7 +1041,7 @@ fn update_hud(
             text.sections[0].value = message;
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
-            let delta_seconds = time.delta_seconds();
+            let delta_seconds = time.delta_secs();
             let fps = if delta_seconds > f32::EPSILON {
                 1.0 / delta_seconds
             } else {
@@ -1421,8 +1431,8 @@ fn control_camera(
     state: Res<SnapshotState>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut mouse_motion: EventReader<MouseMotion>,
-    mut mouse_wheel: EventReader<MouseWheel>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    mut mouse_wheel: MessageReader<MouseWheel>,
     mut camera_query: Query<&mut Transform, With<PrimaryCamera>>,
 ) {
     let Ok(mut transform) = camera_query.get_single_mut() else {
@@ -1461,16 +1471,16 @@ fn control_camera(
     }
 
     if keys.pressed(KeyCode::KeyQ) {
-        rig.yaw += time.delta_seconds() * 1.2;
+        rig.yaw += time.delta_secs() * 1.2;
     }
     if keys.pressed(KeyCode::KeyE) {
-        rig.yaw -= time.delta_seconds() * 1.2;
+        rig.yaw -= time.delta_secs() * 1.2;
     }
     if keys.pressed(KeyCode::PageUp) {
-        rig.pitch += time.delta_seconds() * 0.8;
+        rig.pitch += time.delta_secs() * 0.8;
     }
     if keys.pressed(KeyCode::PageDown) {
-        rig.pitch -= time.delta_seconds() * 0.8;
+        rig.pitch -= time.delta_secs() * 0.8;
     }
 
     if buttons.pressed(MouseButton::Right) {
@@ -1500,7 +1510,7 @@ fn control_camera(
     if pan_input.length_squared() > 0.0 {
         let forward = Vec2::new(rig.yaw.cos(), rig.yaw.sin());
         let right = Vec2::new(-forward.y, forward.x);
-        let delta = (right * pan_input.x + forward * pan_input.y) * 600.0 * time.delta_seconds();
+        let delta = (right * pan_input.x + forward * pan_input.y) * 600.0 * time.delta_secs();
         if rig.follow_mode != FollowMode::Off {
             rig.follow_mode = FollowMode::Off;
         }
@@ -1574,7 +1584,7 @@ fn control_camera(
         rig.recenter_now = false;
     }
 
-    let smoothing = 1.0 - (-time.delta_seconds() * CAMERA_SMOOTHING_LERP).exp();
+    let smoothing = 1.0 - (-time.delta_secs() * CAMERA_SMOOTHING_LERP).exp();
     rig.focus_smoothed = rig.focus_smoothed.lerp(target_focus, smoothing);
     rig.distance_smoothed += (rig.distance - rig.distance_smoothed) * smoothing;
 
@@ -2203,12 +2213,11 @@ fn spawn_agent_entity(
     transform.scale = agent_scale(snapshot.agent_radius, assets.base_radius);
 
     let entity = commands
-        .spawn(PbrBundle {
-            mesh: assets.mesh.clone(),
-            material: material.clone(),
+        .spawn((
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(material.clone()),
             transform,
-            ..Default::default()
-        })
+        ))
         .id();
 
     AgentRecord { entity, material }
@@ -2224,7 +2233,7 @@ fn update_agent_entity(
 ) {
     let mut transform = Transform::from_translation(agent_translation(snapshot, agent));
     transform.scale = agent_scale(snapshot.agent_radius, base_radius);
-    commands.entity(record.entity).insert(transform);
+    commands.entity(record.entity).insert((transform,));
 
     if let Some(material) = materials.get_mut(&record.material) {
         let (base_color, emissive) = agent_colors(agent);
@@ -2298,9 +2307,9 @@ fn agent_colors(agent: &AgentVisual) -> (Color, Color) {
     (base, emissive)
 }
 
-fn close_on_esc(mut exit_events: EventWriter<AppExit>, keyboard: Res<ButtonInput<KeyCode>>) {
+fn close_on_esc(mut exit_events: MessageWriter<AppExit>, keyboard: Res<ButtonInput<KeyCode>>) {
     if keyboard.just_pressed(KeyCode::Escape) {
-        exit_events.send(AppExit::Success);
+        exit_events.write(AppExit::Success);
     }
 }
 
@@ -2546,11 +2555,13 @@ mod tests {
 
         let button = app
             .world_mut()
-            .spawn(ButtonBundle::default())
-            .insert(FollowButton {
-                mode: FollowMode::Selected,
-            })
-            .insert(Interaction::Pressed)
+            .spawn((
+                Button,
+                FollowButton {
+                    mode: FollowMode::Selected,
+                },
+                Interaction::Pressed,
+            ))
             .id();
 
         app.update();
@@ -2580,9 +2591,7 @@ mod tests {
         app.insert_resource(CameraRig::default());
 
         app.world_mut()
-            .spawn(ButtonBundle::default())
-            .insert(ClearSelectionButton)
-            .insert(Interaction::Pressed);
+            .spawn((Button, ClearSelectionButton, Interaction::Pressed));
 
         app.update();
 
@@ -2602,11 +2611,13 @@ mod tests {
 
         let button = app
             .world_mut()
-            .spawn(ButtonBundle::default())
-            .insert(PlaybackButton {
-                action: PlaybackAction::SpeedUp,
-            })
-            .insert(Interaction::Pressed)
+            .spawn((
+                Button,
+                PlaybackButton {
+                    action: PlaybackAction::SpeedUp,
+                },
+                Interaction::Pressed,
+            ))
             .id();
 
         app.update();

@@ -13,9 +13,9 @@ use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
-    BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, Position,
-    ScriptBotsConfig, SelectionState, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile,
-    TickSummary, TraitModifiers, Velocity, WorldState, NUM_EYES,
+    BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, NUM_EYES,
+    Position, ScriptBotsConfig, SelectionState, SimulationCommand, TerrainKind, TerrainLayer,
+    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
 };
 use scriptbots_storage::{MetricReading, Storage};
 use std::{
@@ -10134,21 +10134,21 @@ impl RenderFrame {
                 health: healths[idx],
                 age: ages[idx],
                 boost: if boosts[idx] { 1.0 } else { 0.0 },
-                 wheel_left,
-                 wheel_right,
-                 herbivore_tendency,
-                 temperature_preference,
-                 food_delta,
-                 sound_level,
-                 sound_output,
-                 sound_multiplier,
-                 trait_smell,
-                 trait_sound,
-                 trait_hearing,
-                 trait_eye,
-                 trait_blood,
-                 eye_dirs,
-                 eye_fov,
+                wheel_left,
+                wheel_right,
+                herbivore_tendency,
+                temperature_preference,
+                food_delta,
+                sound_level,
+                sound_output,
+                sound_multiplier,
+                trait_smell,
+                trait_sound,
+                trait_hearing,
+                trait_eye,
+                trait_blood,
+                eye_dirs,
+                eye_fov,
                 selection,
                 indicator,
                 spiked,
@@ -10380,6 +10380,478 @@ fn append_arc_polyline(
 
 fn append_circle_polygon(builder: &mut PathBuilder, cx: f32, cy: f32, radius: f32) {
     append_arc_polyline(builder, cx, cy, radius, 0.0, 360.0);
+}
+
+fn append_capsule_polygon(
+    builder: &mut PathBuilder,
+    center: (f32, f32),
+    forward: (f32, f32),
+    right: (f32, f32),
+    half_length: f32,
+    radius: f32,
+    segments: usize,
+) {
+    let segments = segments.max(4);
+    let radius = radius.max(0.5);
+    let half_length = half_length.max(radius + 0.5);
+    let step = std::f32::consts::PI / segments as f32;
+    let offset = (half_length - radius).max(0.0);
+    let front_center = (center.0 + forward.0 * offset, center.1 + forward.1 * offset);
+    let back_center = (center.0 - forward.0 * offset, center.1 - forward.1 * offset);
+
+    let mut first = true;
+    for i in 0..=segments {
+        let theta = i as f32 * step;
+        let (sin_t, cos_t) = theta.sin_cos();
+        let point_x = front_center.0 + right.0 * (cos_t * radius) + forward.0 * (sin_t * radius);
+        let point_y = front_center.1 + right.1 * (cos_t * radius) + forward.1 * (sin_t * radius);
+        if first {
+            builder.move_to(point(px(point_x), px(point_y)));
+            first = false;
+        } else {
+            builder.line_to(point(px(point_x), px(point_y)));
+        }
+    }
+    for i in 0..=segments {
+        let theta = i as f32 * step;
+        let (sin_t, cos_t) = theta.sin_cos();
+        let point_x = back_center.0 - right.0 * (cos_t * radius) - forward.0 * (sin_t * radius);
+        let point_y = back_center.1 - right.1 * (cos_t * radius) - forward.1 * (sin_t * radius);
+        builder.line_to(point(px(point_x), px(point_y)));
+    }
+    builder.close();
+}
+
+fn palette_color(color: Rgba, palette: ColorPaletteMode, palette_is_natural: bool) -> Rgba {
+    if palette_is_natural {
+        color
+    } else {
+        apply_palette(color, palette)
+    }
+}
+
+fn paint_agent_avatar(
+    window: &mut Window,
+    agent: &AgentRenderData,
+    position: (f32, f32),
+    size_px: f32,
+    scale: f32,
+    body_color: Rgba,
+    palette: ColorPaletteMode,
+    palette_is_natural: bool,
+    day_phase: f32,
+    very_low_fps: bool,
+) {
+    let (px_x, px_y) = position;
+    let half = size_px * 0.5;
+    let (sin_h, cos_h) = agent.heading.sin_cos();
+    let forward = (cos_h, sin_h);
+    let right = (-sin_h, cos_h);
+
+    let body_half_length = half * 1.35;
+    let body_radius = (half * 0.72).max(3.0);
+    let wheel_half_length = body_half_length * 0.96;
+    let wheel_radius = (body_radius * 0.38).max(2.0);
+    let wheel_offset = body_radius + wheel_radius * 0.55;
+
+    let left_center = (px_x - right.0 * wheel_offset, px_y - right.1 * wheel_offset);
+    let right_center = (px_x + right.0 * wheel_offset, px_y + right.1 * wheel_offset);
+
+    // Wheels behind body
+    let base_wheel_color = Rgba {
+        r: 0.14,
+        g: 0.16,
+        b: 0.21,
+        a: 1.0,
+    };
+    let wheel_left_speed = agent.wheel_left.clamp(0.0, 1.0);
+    let wheel_right_speed = agent.wheel_right.clamp(0.0, 1.0);
+
+    let mut left_wheel = PathBuilder::fill();
+    append_capsule_polygon(
+        &mut left_wheel,
+        left_center,
+        forward,
+        right,
+        wheel_half_length,
+        wheel_radius,
+        10,
+    );
+    if let Ok(path) = left_wheel.build() {
+        let mut wheel_color = scale_rgb(base_wheel_color, 0.75 + wheel_left_speed * 0.6);
+        wheel_color = palette_color(wheel_color, palette, palette_is_natural);
+        window.paint_path(path, wheel_color);
+    }
+
+    let mut right_wheel = PathBuilder::fill();
+    append_capsule_polygon(
+        &mut right_wheel,
+        right_center,
+        forward,
+        right,
+        wheel_half_length,
+        wheel_radius,
+        10,
+    );
+    if let Ok(path) = right_wheel.build() {
+        let mut wheel_color = scale_rgb(base_wheel_color, 0.75 + wheel_right_speed * 0.6);
+        wheel_color = palette_color(wheel_color, palette, palette_is_natural);
+        window.paint_path(path, wheel_color);
+    }
+
+    if very_low_fps {
+        let mut body_shape = PathBuilder::fill();
+        append_capsule_polygon(
+            &mut body_shape,
+            (px_x, px_y),
+            forward,
+            right,
+            body_half_length,
+            body_radius,
+            12,
+        );
+        if let Ok(path) = body_shape.build() {
+            window.paint_path(path, body_color);
+        }
+
+        let spike_base = body_radius * 0.6;
+        let base_offset = body_half_length - body_radius * 0.25;
+        let tip_offset =
+            body_half_length + body_radius * 0.55 + agent.spike_length * scale * 0.6 + 1.0;
+        let base_left = (
+            px_x + forward.0 * base_offset - right.0 * spike_base,
+            px_y + forward.1 * base_offset - right.1 * spike_base,
+        );
+        let base_right = (
+            px_x + forward.0 * base_offset + right.0 * spike_base,
+            px_y + forward.1 * base_offset + right.1 * spike_base,
+        );
+        let tip = (px_x + forward.0 * tip_offset, px_y + forward.1 * tip_offset);
+        let mut spike_path = PathBuilder::fill();
+        spike_path.move_to(point(px(base_left.0), px(base_left.1)));
+        spike_path.line_to(point(px(base_right.0), px(base_right.1)));
+        spike_path.line_to(point(px(tip.0), px(tip.1)));
+        spike_path.close();
+        if let Ok(path) = spike_path.build() {
+            let spike_color = palette_color(
+                scale_rgb(
+                    Rgba {
+                        r: 0.94,
+                        g: 0.46,
+                        b: 0.26,
+                        a: 0.9,
+                    },
+                    if agent.spiked { 1.25 } else { 1.0 },
+                ),
+                palette,
+                palette_is_natural,
+            );
+            window.paint_path(path, spike_color);
+        }
+        return;
+    }
+
+    // Body shell
+    let mut body_shape = PathBuilder::fill();
+    append_capsule_polygon(
+        &mut body_shape,
+        (px_x, px_y),
+        forward,
+        right,
+        body_half_length,
+        body_radius,
+        16,
+    );
+    if let Ok(path) = body_shape.build() {
+        window.paint_path(path, body_color);
+    }
+
+    // Diet stripe
+    let herb = agent.herbivore_tendency.clamp(0.0, 1.0);
+    let carnivore_color = Rgba {
+        r: 0.88,
+        g: 0.26,
+        b: 0.21,
+        a: 0.42,
+    };
+    let herbivore_color = Rgba {
+        r: 0.24,
+        g: 0.78,
+        b: 0.36,
+        a: 0.42,
+    };
+    let mut stripe_color = lerp_rgba(carnivore_color, herbivore_color, herb);
+    let day_tint = (0.9 + (day_phase - 0.5) * 0.1).clamp(0.75, 1.15);
+    let blood_tint = (0.7 + agent.trait_blood * 0.2).clamp(0.8, 1.35);
+    stripe_color = scale_rgb(stripe_color, (day_tint * blood_tint).clamp(0.7, 1.35));
+    stripe_color = palette_color(stripe_color, palette, palette_is_natural);
+    let mut stripe = PathBuilder::fill();
+    append_capsule_polygon(
+        &mut stripe,
+        (px_x, px_y),
+        forward,
+        right,
+        body_half_length * 0.82,
+        body_radius * 0.45,
+        14,
+    );
+    if let Ok(path) = stripe.build() {
+        window.paint_path(path, stripe_color);
+    }
+
+    // Boost exhaust
+    if agent.boost > 0.05 {
+        let boost_level = agent.boost.clamp(0.0, 1.0);
+        let tail_offset = body_half_length - body_radius * 0.3;
+        let flame_length =
+            body_radius * (1.2 + boost_level * 1.6) + agent.sound_multiplier.max(1.0) * 4.0;
+        let tail_left = (
+            px_x - forward.0 * tail_offset - right.0 * (body_radius * 0.55),
+            px_y - forward.1 * tail_offset - right.1 * (body_radius * 0.55),
+        );
+        let tail_right = (
+            px_x - forward.0 * tail_offset + right.0 * (body_radius * 0.55),
+            px_y - forward.1 * tail_offset + right.1 * (body_radius * 0.55),
+        );
+        let tip = (
+            px_x - forward.0 * (body_half_length + flame_length),
+            px_y - forward.1 * (body_half_length + flame_length),
+        );
+        let mut flame = PathBuilder::fill();
+        flame.move_to(point(px(tail_left.0), px(tail_left.1)));
+        flame.line_to(point(px(tail_right.0), px(tail_right.1)));
+        flame.line_to(point(px(tip.0), px(tip.1)));
+        flame.close();
+        if let Ok(path) = flame.build() {
+            let mut flame_color = Rgba {
+                r: 1.0,
+                g: 0.62,
+                b: 0.22,
+                a: 0.45 + boost_level * 0.35,
+            };
+            flame_color = palette_color(flame_color, palette, palette_is_natural);
+            window.paint_path(path, flame_color);
+        }
+    }
+
+    // Spike spear
+    let spike_base = body_radius * 0.65;
+    let base_offset = body_half_length - body_radius * 0.2;
+    let tip_offset = body_half_length + body_radius * 0.7 + agent.spike_length * scale * 0.85 + 2.0;
+    let base_left = (
+        px_x + forward.0 * base_offset - right.0 * spike_base,
+        px_y + forward.1 * base_offset - right.1 * spike_base,
+    );
+    let base_right = (
+        px_x + forward.0 * base_offset + right.0 * spike_base,
+        px_y + forward.1 * base_offset + right.1 * spike_base,
+    );
+    let tip = (px_x + forward.0 * tip_offset, px_y + forward.1 * tip_offset);
+    let mut spike_path = PathBuilder::fill();
+    spike_path.move_to(point(px(base_left.0), px(base_left.1)));
+    spike_path.line_to(point(px(base_right.0), px(base_right.1)));
+    spike_path.line_to(point(px(tip.0), px(tip.1)));
+    spike_path.close();
+    if let Ok(path) = spike_path.build() {
+        let mut spike_color = Rgba {
+            r: 0.96,
+            g: 0.44,
+            b: 0.24,
+            a: 0.94,
+        };
+        if agent.spiked {
+            spike_color = scale_rgb(spike_color, 1.3);
+        }
+        spike_color = palette_color(spike_color, palette, palette_is_natural);
+        window.paint_path(path, spike_color);
+    }
+
+    // Mouth
+    let eating_level = agent.food_delta.abs().min(1.5);
+    let yelling_level = agent.sound_output.abs().min(1.5);
+    let mouth_open = (0.35 + eating_level * 0.4 + yelling_level * 0.55).clamp(0.35, 1.6);
+    let mouth_half_length = body_radius * 0.62;
+    let mouth_radius = (body_radius * 0.14).max(1.2) * mouth_open;
+    let mouth_offset = body_half_length - body_radius * 0.35;
+    let mouth_center = (
+        px_x + forward.0 * mouth_offset,
+        px_y + forward.1 * mouth_offset,
+    );
+    let mut mouth_color = Rgba {
+        r: 0.85 + eating_level * 0.08,
+        g: 0.28 + eating_level * 0.3,
+        b: 0.32,
+        a: 0.92,
+    };
+    if agent.sound_output > 0.1 {
+        mouth_color = scale_rgb(mouth_color, 1.1 + agent.sound_output * 0.25);
+    }
+    mouth_color = palette_color(mouth_color, palette, palette_is_natural);
+    let mut mouth_path = PathBuilder::fill();
+    append_capsule_polygon(
+        &mut mouth_path,
+        mouth_center,
+        right,
+        forward,
+        mouth_half_length,
+        mouth_radius,
+        10,
+    );
+    if let Ok(path) = mouth_path.build() {
+        window.paint_path(path, mouth_color);
+    }
+
+    // Nose (smell trait)
+    let nose_radius = (body_radius * 0.12).max(1.0) * (0.6 + agent.trait_smell * 0.8);
+    let nose_center = (
+        px_x + forward.0 * (body_half_length - body_radius * 0.2),
+        px_y + forward.1 * (body_half_length - body_radius * 0.2),
+    );
+    let mut nose = PathBuilder::fill();
+    append_circle_polygon(&mut nose, nose_center.0, nose_center.1, nose_radius);
+    if let Ok(path) = nose.build() {
+        let mut nose_color = Rgba {
+            r: 0.92,
+            g: 0.6,
+            b: 0.28,
+            a: 0.8,
+        };
+        nose_color = palette_color(nose_color, palette, palette_is_natural);
+        window.paint_path(path, nose_color);
+    }
+
+    // Ears / auditory fins
+    let ear_scale = (0.6 + agent.trait_hearing * 0.45).clamp(0.6, 1.6);
+    let ear_radius = (body_radius * 0.28).max(1.5) * ear_scale;
+    let ear_offset = body_half_length * 0.15;
+    let ear_center_left = (
+        px_x + forward.0 * (-ear_offset) - right.0 * (body_radius + ear_radius * 0.45),
+        px_y + forward.1 * (-ear_offset) - right.1 * (body_radius + ear_radius * 0.45),
+    );
+    let ear_center_right = (
+        px_x + forward.0 * (-ear_offset) + right.0 * (body_radius + ear_radius * 0.45),
+        px_y + forward.1 * (-ear_offset) + right.1 * (body_radius + ear_radius * 0.45),
+    );
+    let base_ear_color = Rgba {
+        r: 0.32,
+        g: 0.62,
+        b: 0.92,
+        a: 0.85,
+    };
+    for center in [ear_center_left, ear_center_right] {
+        let mut ear = PathBuilder::fill();
+        append_circle_polygon(&mut ear, center.0, center.1, ear_radius);
+        if let Ok(path) = ear.build() {
+            let mut ear_color = scale_rgb(
+                base_ear_color,
+                0.9 + agent.trait_sound.clamp(0.1, 1.4) * 0.45,
+            );
+            ear_color = palette_color(ear_color, palette, palette_is_natural);
+            window.paint_path(path, ear_color);
+        }
+    }
+
+    // Eyes
+    let base_eye_radius = (body_radius * 0.14).max(1.2);
+    for i in 0..NUM_EYES {
+        let dir_angle = agent.heading + agent.eye_dirs[i];
+        let (sin_eye, cos_eye) = dir_angle.sin_cos();
+        let distance = body_radius * (0.4 + 0.35 * (i as f32 / NUM_EYES as f32) + 0.25);
+        let eye_center = (px_x + cos_eye * distance, px_y + sin_eye * distance);
+        let mut eye_radius = base_eye_radius * (0.65 + agent.trait_eye.clamp(0.4, 2.5) * 0.35);
+        eye_radius = eye_radius.clamp(1.6, body_radius * 0.38);
+
+        let mut eye = PathBuilder::fill();
+        append_circle_polygon(&mut eye, eye_center.0, eye_center.1, eye_radius);
+        if let Ok(path) = eye.build() {
+            let mut sclera_color = Rgba {
+                r: 0.97,
+                g: 0.98,
+                b: 1.0,
+                a: 0.95,
+            };
+            sclera_color = palette_color(sclera_color, palette, palette_is_natural);
+            window.paint_path(path, sclera_color);
+        }
+
+        let pupil_radius = eye_radius * (0.35 + agent.eye_fov[i].clamp(0.3, 3.0) * 0.12);
+        let mut pupil = PathBuilder::fill();
+        append_circle_polygon(&mut pupil, eye_center.0, eye_center.1, pupil_radius);
+        if let Ok(path) = pupil.build() {
+            let mut pupil_color = Rgba {
+                r: 0.08,
+                g: 0.11,
+                b: 0.18,
+                a: 0.98,
+            };
+            pupil_color = palette_color(pupil_color, palette, palette_is_natural);
+            window.paint_path(path, pupil_color);
+        }
+    }
+
+    // Vocalization arcs
+    let vocal_level = agent.sound_output.max(agent.sound_level).clamp(0.0, 1.5);
+    if vocal_level > 0.12 {
+        let intensity = vocal_level.clamp(0.0, 1.0);
+        let mouth_radius = (body_radius * 0.14).max(1.2) * (0.35 + intensity * 1.6);
+        let arc_origin = (
+            px_x + forward.0 * (body_half_length + mouth_radius * 0.6),
+            px_y + forward.1 * (body_half_length + mouth_radius * 0.6),
+        );
+        for ring in 0..2 {
+            let radius = mouth_radius * (1.1 + ring as f32 * 0.6);
+            let mut arc = PathBuilder::stroke(px(1.0 + ring as f32));
+            let start_deg = agent.heading.to_degrees() - 35.0 - ring as f32 * 8.0;
+            let sweep = 70.0 + ring as f32 * 6.0;
+            append_arc_polyline(
+                &mut arc,
+                arc_origin.0,
+                arc_origin.1,
+                radius,
+                start_deg,
+                sweep,
+            );
+            if let Ok(path) = arc.build() {
+                let mut arc_color = Rgba {
+                    r: 0.95,
+                    g: 0.68,
+                    b: 0.32,
+                    a: 0.35 + intensity * 0.35,
+                };
+                arc_color = palette_color(arc_color, palette, palette_is_natural);
+                window.paint_path(path, arc_color);
+            }
+        }
+    }
+
+    // Temperature preference marker
+    let temp_pref = agent.temperature_preference.clamp(0.0, 1.0);
+    let mut temp_color = lerp_rgba(
+        Rgba {
+            r: 0.20,
+            g: 0.52,
+            b: 0.96,
+            a: 0.38,
+        },
+        Rgba {
+            r: 0.98,
+            g: 0.42,
+            b: 0.18,
+            a: 0.38,
+        },
+        temp_pref,
+    );
+    temp_color = palette_color(temp_color, palette, palette_is_natural);
+    let temp_center = (
+        px_x - forward.0 * (body_half_length * 0.25),
+        px_y - forward.1 * (body_half_length * 0.25),
+    );
+    let temp_radius = (body_radius * 0.22).max(1.2);
+    let mut temp_ring = PathBuilder::stroke(px(1.2));
+    append_circle_polygon(&mut temp_ring, temp_center.0, temp_center.1, temp_radius);
+    if let Ok(path) = temp_ring.build() {
+        window.paint_path(path, temp_color);
+    }
 }
 
 fn paint_vector_hud(bounds: Bounds<Pixels>, state: &VectorHudState, window: &mut Window) {
@@ -11985,8 +12457,20 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     continue;
                 }
 
-                let outline_radius = (size_px * 0.55).max(3.0);
-                append_arc_polyline(&mut outline_builder, px_x, px_y, outline_radius, 0.0, 360.0);
+                let (sin_h, cos_h) = agent.heading.sin_cos();
+                let forward = (cos_h, sin_h);
+                let right = (-sin_h, cos_h);
+                let outline_half_length = (half * 1.35).max(half + 2.0);
+                let outline_radius = (half * 0.72).max(3.0);
+                append_capsule_polygon(
+                    &mut outline_builder,
+                    (px_x, px_y),
+                    forward,
+                    right,
+                    outline_half_length,
+                    outline_radius,
+                    14,
+                );
             }
             if let Ok(path) = outline_builder.build() {
                 window.paint_path(path, rgba_from_hex(0x10151a, 0.78));
