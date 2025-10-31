@@ -45,8 +45,8 @@ This document tracks the methodology and captured measurements for Phase 5 of 
 
 | Platform | Renderer | Scenario | FPS Mean | FPS P95 | Frame ms Mean | Frame ms P95 | Sim tick/sec | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux (Vulkan) | GPUI | `default` |  |  |  |  |  |  |
-| Linux (Vulkan) | Bevy | `default` |  |  |  |  |  |  |
+| Linux (headless GL) | GPUI | `default` | _blocked (no surface)_ | _blocked_ | _blocked_ | _blocked_ | _blocked_ | Requires real GPU |
+| Linux (headless GL) | Bevy | `default` | _blocked (no adapter)_ | _blocked_ | _blocked_ | _blocked_ | _blocked_ | Requires real GPU |
 | Windows (Vulkan) | GPUI | `default` |  |  |  |  |  |  |
 | Windows (Vulkan) | Bevy | `default` |  |  |  |  |  |  |
 | … | … | `dense_agents` |  |  |  |  |  |  |
@@ -64,7 +64,7 @@ Using the existing reference PNGs, the difference between the GPUI and Bevy defa
 
 These values provide a pre-flight baseline before collecting live runtime numbers. Update this section after regenerating goldens or once new lighting passes land.
 
-> **Headless environment note (2025-10-31):** Attempting to run the GPUI renderer under `WGPU_BACKEND=gl` in this CI/container environment stalls before diagnostics because no surface/device is available. Metrics capture is therefore blocked until we can run on a workstation with a real graphics backend.
+> **Headless environment note (2025-10-31):** Attempting to run the GPUI or Bevy renderers under `WGPU_BACKEND=gl` in this CI/container environment stalls or panics because no presentation surface/device is available. Metrics capture is therefore blocked until we can run on a workstation with a real graphics backend.
 
 ## 4. Follow-up Checklist
 
@@ -72,3 +72,4 @@ These values provide a pre-flight baseline before collecting live runtime number
 - [ ] Attach representative PNGs per scenario (GPUI + Bevy) for qualitative review.
 - [ ] Update `docs/rendering_reference/checksums.txt` after regenerating goldens.
 - [ ] Execute 30-minute soak tests (Linux Vulkan, Windows Vulkan/D3D12) while capturing diagnostic logs (`SB_DIAGNOSTICS=1`) and memory charts.
+  - _Blocked 2025-10-31 (BrownLake): headless environment cannot create GPU device; schedule on workstation._

@@ -11857,12 +11857,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     let scale = layout.scale;
     let base_scale = layout.base_scale;
-    let render_w = layout.render_size.0;
-    let render_h = layout.render_size.1;
     let pad_x = layout.pad.0;
     let pad_y = layout.pad.1;
-    let mut offset_x = layout.offset.0;
-    let mut offset_y = layout.offset.1;
+    let offset_x = layout.offset.0;
+    let offset_y = layout.offset.1;
 
     // Compute view bounds in window space used for culling and offscreen checks
     let view_left = origin_x;
@@ -11891,15 +11889,6 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     // (observed on some Windows setups on first frame), draw this frame using a
     // deterministic centered offset so content is visible. This does not mutate
     // camera state; subsequent frames will use the camera's offsets.
-    let still_offscreen = (offset_x + render_w) < view_left
-        || offset_x > view_right
-        || (offset_y + render_h) < view_top
-        || offset_y > view_bottom;
-    if still_offscreen {
-        offset_x = origin_x + (width_px - render_w) * 0.5;
-        offset_y = origin_y + (height_px - render_h) * 0.5;
-    }
-
     camera_snapshot.last_canvas_origin = (origin_x, origin_y);
     camera_snapshot.last_canvas_size = (width_px, height_px);
     camera_snapshot.last_world_size = frame.world_size;

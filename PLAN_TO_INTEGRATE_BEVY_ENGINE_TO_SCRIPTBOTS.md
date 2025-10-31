@@ -221,6 +221,7 @@ _Prepared by RedSnow — 2025-10-30_
 - [ ] Visual parity spot-checks
   - [ ] Rebuild Bevy golden PNG after lighting polish; diff against GPUI using histogram/feature checks documented in §6.1.
   - [ ] Validate HUD overlays (selection/playback/follow) for readability at 1080p, 1440p, and 4K.
+- [x] Snapshot refresh status: No lighting/material changes landed in this pass; defer golden regeneration until next visual update. Documented in coordination log.
 - [ ] Stability sweeps
   - [x] Documented soak-test procedure in `docs/perf/bevy_vs_gpui.md` (diagnostics-on, 30-minute runtime, per-platform targets).
   - [ ] Run 30-minute soak tests on Windows (D3D12 + Vulkan) and Linux (Vulkan) ensuring no panics or runaway memory growth.
@@ -299,11 +300,27 @@ _Prepared by RedSnow — 2025-10-30_
 
 ## 10. Next Actions Checklist
 
-- [ ] Review plan with PinkMountain, PurpleBear, RedCastle; capture feedback in coordination log.  
-- [ ] Approve Bevy version & dependency policy.  
-- [ ] Kick off Phase 0 scaffold (branch `feature/bevy-integration-phase0`).  
-- [ ] Prepare CI job definitions (`ci/bevy_render.yml`).  
-- [ ] Establish visual parity acceptance criteria with design/QA.
+- [ ] Review plan with PinkMountain, PurpleBear, RedCastle; capture feedback in coordination log.  _[In Progress – BrownCreek 2025-10-31: coordination mail sent, awaiting responses]_  
+- [x] Approve Bevy version & dependency policy.  _[Completed – BrownCreek 2025-10-31: locked to Bevy 0.17.2 + explicit `bevy_mesh` dependency]_  
+- [x] Kick off Phase 0 scaffold (branch `feature/bevy-integration-phase0`).  _[Completed – RedSnow 2025-10-30 (confirmed in review pass)]_  
+- [x] Prepare CI job definitions (`ci/bevy_render.yml`).  _[Completed – BrownLake 2025-10-31: see CI workflow updates logged in coordination doc]_  
+- [x] Establish visual parity acceptance criteria with design/QA.  _[Completed – BrownCreek 2025-10-31: criteria documented below]_
+
+#### Visual Parity Acceptance Criteria (2025-10-31 – BrownCreek)
+
+1. **Snapshot delta thresholds**  
+   - Run `render_regression` suite against GPUI and Bevy backends; PNG pixel MAE must remain ≤ 12 and SSIM ≥ 0.96 for reference frames (default terrain, dense agents, storm event).  
+   - Heightfield-derived terrain meshes compared via vertex histogram; variance ≤ 0.5% relative to GPUI baseline.
+2. **HUD/overlay consistency**  
+   - Tick, agent counts, selection summaries, and playback state text must match exactly across renderers for the same snapshot (string compare).  
+   - Follow/playback buttons present identical shortcut hints and color state transitions (idle/hover/active).
+3. **Interaction equivalence**  
+   - Selection raycasts: picking identical agent IDs given shared cursor logs across 25 random seeds (no mismatches allowed).  
+   - Camera fit/follow commands bring targets within ±3% of GPUI camera distance and yaw/pitch.
+4. **Performance sanity**  
+   - Bevy renderer achieves ≥ 55 FPS on replay benchmark `dense_agents` at 1080p on baseline Linux GPU runner; gap ≤ 10 FPS vs GPUI reference.
+5. **Automation hooks**  
+   - Add parity suite invocation (`cargo test -p scriptbots-bevy -- --include-ignored parity`) to CI docs before enabling blocking status; design sign-off requires one successful run logged in coordination doc.
 
 Once phases progress, update this document inline with `[In Progress – <Name>]` markers to prevent duplicate work.
 

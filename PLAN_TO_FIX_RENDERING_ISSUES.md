@@ -86,8 +86,8 @@
         - [x] Expand `AgentInstance` payload with new fields.
         - [x] Update WGSL shader to render capsule + wheels + spike + mouth.
         - [x] Ensure boost/reproduction effects match CPU path.
-    - [ ] Snapshot/offscreen helper updates and golden refresh (once visuals approved).
-    - [ ] Remove temporary CPU fallback rect logic after verifying layout stability.
+    - [x] Snapshot/offscreen helper updates and golden refresh (once visuals approved) [Completed – BlueMountain 2025-10-31]
+    - [x] Remove temporary CPU fallback rect logic after verifying layout stability.
 
 ### 3.3 Modern UI Polish [Completed – RedCastle 2025-10-30]
 - HUD header now surfaces paused/running, world mode, speed, and follow status via consistent chips; world info subline adopts the shared theme palette.

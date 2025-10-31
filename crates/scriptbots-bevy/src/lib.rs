@@ -730,7 +730,8 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
             clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
             ..default()
         },
-        TransformBundle::from_transform(camera_transform),
+        camera_transform,
+        GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
         PrimaryCamera,
@@ -744,7 +745,8 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
             shadows_enabled: true,
             ..default()
         },
-        TransformBundle::from_transform(light_transform),
+        light_transform,
+        GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
     ));
@@ -763,7 +765,8 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 
     commands.spawn((
         Camera2d::default(),
-        TransformBundle::default(),
+        Transform::default(),
+        GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
     ));
@@ -1789,7 +1792,8 @@ fn sync_terrain(
                         .spawn((
                             Mesh3d(mesh_handle.clone()),
                             MeshMaterial3d(material_handle.clone()),
-                            TransformBundle::default(),
+                            Transform::default(),
+                            GlobalTransform::default(),
                             Visibility::default(),
                             InheritedVisibility::default(),
                         ))
@@ -2332,7 +2336,8 @@ fn spawn_agent_entity(
         .spawn((
             Mesh3d(assets.mesh.clone()),
             MeshMaterial3d(material.clone()),
-            TransformBundle::from_transform(transform),
+            transform,
+            GlobalTransform::default(),
             Visibility::default(),
             InheritedVisibility::default(),
         ))
