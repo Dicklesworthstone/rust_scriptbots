@@ -853,11 +853,24 @@ fn value_to_string(value: &Value, max_len: usize) -> String {
         Value::String(s) => format!("\"{}\"", s),
         other => serde_json::to_string(other).unwrap_or_else(|_| "<error>".to_string()),
     };
-    if raw.len() > max_len {
-        format!("{}…", &raw[..max_len.saturating_sub(1)])
-    } else {
-        raw
+    if max_len == 0 {
+        return String::new();
     }
+
+    let mut chars = raw.chars();
+    let mut truncated = String::new();
+    let mut count = 0usize;
+
+    while let Some(ch) = chars.next() {
+        if count + 1 >= max_len {
+            truncated.push('…');
+            return truncated;
+        }
+        truncated.push(ch);
+        count += 1;
+    }
+
+    raw
 }
 
 fn json_pointer(path: &str) -> String {

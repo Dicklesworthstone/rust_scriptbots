@@ -67,7 +67,9 @@ Using the existing reference PNGs, the difference between the GPUI and Bevy defa
 These values provide a pre-flight baseline before collecting live runtime numbers. Update this section after regenerating goldens or once new lighting passes land.
 
 > **Headless environment note (2025-10-31):** Attempting to run the GPUI or Bevy renderers under `WGPU_BACKEND=gl` in this CI/container environment stalls or panics because no presentation surface/device is available. Metrics capture is therefore blocked until we can run on a workstation with a real graphics backend. \
-> Additional 2025-10-31 update: GPUI run (`logs/perf/20251031_default_gui.log`) confirmed the stall; Bevy build currently fails with `TerrainChunkStats` field changes (see `logs/perf/20251031_default_bevy.log`) and must be repaired before benchmarking.
+> Additional 2025-10-31 update: GPUI run (`logs/perf/20251031_default_gui.log`) confirmed the stall. The Bevy build blocker caused by `TerrainChunkStats` field changes has been resolved; benchmarking is now waiting solely on access to a Vulkan-capable workstation (see forthcoming 2025-10-31 BrownSnow update entry).
+> BrownSnow (2025-10-31 19:19 UTC): Reached out to BrownLake & BlueMountain for immediate Vulkan workstation access; awaiting confirmation to schedule the first benchmark window.
+> WhiteCastle (2025-10-31 19:22 UTC): Contact requests pending approval; soak-test launch cheatsheet added to `docs/rendering_reference/coordination.md` so runs can start as soon as hardware access lands.
 
 ## 4. Follow-up Checklist
 
@@ -76,3 +78,16 @@ These values provide a pre-flight baseline before collecting live runtime number
 - [ ] Update `docs/rendering_reference/checksums.txt` after regenerating goldens.
 - [ ] Execute 30-minute soak tests (Linux Vulkan, Windows Vulkan/D3D12) while capturing diagnostic logs (`SB_DIAGNOSTICS=1`) and memory charts.
   - _Blocked 2025-10-31 (BrownLake): headless environment cannot create GPU device; schedule on workstation._
+
+## 5. Log Capture Template (2025-10-31 – BrownSnow)
+
+Copy/paste the table below into `docs/perf/bevy_vs_gpui.md` as each scenario finishes; attach the corresponding log path so others can validate numbers quickly.
+
+| Date (UTC) | Platform | Renderer | Scenario | Threads | FPS Mean | FPS P95 | Frame ms Mean | Frame ms P95 | Sim tick/sec | Log Path |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2025-10-31 | _TBD_ | _TBD_ | _TBD_ |  |  |  |  |  |  |  |
+
+For every run also record:
+- `SB_DIAGNOSTICS` summary slice (copy the 300-frame report)
+- Peak GPU usage (if available) and any anomalies (e.g., auto-pause triggers)
+- Relevant environment overrides (`WGPU_BACKEND`, `SCRIPTBOTS_MAX_THREADS`, etc.)

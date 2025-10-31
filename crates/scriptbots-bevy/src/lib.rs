@@ -4,24 +4,25 @@ use anyhow::{Result, anyhow};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::prelude::*;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::light::{EnvironmentMapLight, LightProbe};
-use bevy::math::primitives::{Capsule3d, Cone, Cylinder, Rectangle, Sphere, Torus};
+use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
+use bevy::render::view::{ColorGrading, Hdr};
 use bevy::ui::{BorderColor, BorderRadius};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use bevy_mesh::{Indices, Mesh};
-use bevy_core_pipeline::tonemapping::Tonemapping;
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
-use bevy::render::view::{ColorGrading, Hdr};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, IndicatorState, SelectionMode, SelectionState, SelectionUpdate,
-    SimulationCommand, TerrainKind, TraitModifiers, WorldState, NUM_EYES,
+    AgentId, ControlCommand, IndicatorState, RenderSettings, RenderTonemapMode, NUM_EYES,
+    SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TraitModifiers,
+    WorldState,
 };
 use slotmap::Key;
 use std::{
@@ -57,6 +58,13 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         command_submit,
         command_drain,
     } = ctx;
+
+    let initial_render_settings = {
+        let guard = world
+            .lock()
+            .expect("world mutex poisoned while reading render settings");
+        guard.config().render.clone()
+    };
 
     let (tx, rx) = mpsc::channel::<WorldSnapshot>();
     let running = Arc::new(AtomicBool::new(true));
@@ -111,7 +119,10 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_non_send_resource(SnapshotInbox { receiver: rx })
     .insert_resource(SnapshotState::default())
     .insert_resource(AgentRegistry::default())
-    .insert_resource(TonemappingState::default())
+    .insert_resource(AccessibilityState::new())
+    .insert_resource(TonemappingState::from_render_settings(
+        &initial_render_settings,
+    ))
     .add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "ScriptBots • Bevy Renderer".to_string(),
@@ -129,12 +140,20 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             sync_world,
             handle_playback_shortcuts,
             handle_playback_buttons,
+            handle_tonemap_mode_buttons,
+            handle_auto_exposure_toggle,
+            handle_exposure_adjust_buttons,
+            handle_palette_shortcuts,
             handle_selection_input,
             handle_follow_button_interactions,
             handle_clear_selection_button,
             update_playback_button_colors,
             update_follow_button_colors,
+            update_tonemap_button_colors,
+            update_auto_exposure_button_colors,
+            update_exposure_button_colors,
             control_camera,
+            sync_camera_tonemapping,
             update_hud,
         )
             .chain(),
@@ -225,45 +244,13 @@ struct AgentRecord {
     nose: PartRef,
     spike: PartRef,
     boost: PartRef,
-    temp: PartRef,
-    sound_inner: PartRef,
-    sound_outer: PartRef,
     ear_left: PartRef,
     ear_right: PartRef,
     selection: PartRef,
     indicator: PartRef,
+    sound_inner: PartRef,
+    sound_outer: PartRef,
     eyes: Vec<EyePart>,
-}
-
-impl AgentRecord {
-    fn materials(&self) -> impl Iterator<Item = &Handle<StandardMaterial>> {
-        let mut handles: Vec<&Handle<StandardMaterial>> = Vec::new();
-        let mut push_part = |part: &PartRef, store: &mut Vec<&Handle<StandardMaterial>>| {
-            if let Some(handle) = part.material.as_ref() {
-                store.push(handle);
-            }
-        };
-        push_part(&self.body, &mut handles);
-        push_part(&self.stripe, &mut handles);
-        push_part(&self.wheel_left, &mut handles);
-        push_part(&self.wheel_right, &mut handles);
-        push_part(&self.mouth, &mut handles);
-        push_part(&self.nose, &mut handles);
-        push_part(&self.spike, &mut handles);
-        push_part(&self.boost, &mut handles);
-        push_part(&self.temp, &mut handles);
-        push_part(&self.sound_inner, &mut handles);
-        push_part(&self.sound_outer, &mut handles);
-        push_part(&self.ear_left, &mut handles);
-        push_part(&self.ear_right, &mut handles);
-        push_part(&self.selection, &mut handles);
-        push_part(&self.indicator, &mut handles);
-        for eye in &self.eyes {
-            push_part(&eye.sclera, &mut handles);
-            push_part(&eye.pupil, &mut handles);
-        }
-        handles.into_iter()
-    }
 }
 
 #[derive(Resource)]
@@ -275,6 +262,283 @@ struct AgentMeshes {
     sphere: Handle<Mesh>,
     quad: Handle<Mesh>,
     ring: Handle<Mesh>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ColorPaletteMode {
+    #[default]
+    Natural,
+    Deuteranopia,
+    Protanopia,
+    Tritanopia,
+    HighContrast,
+}
+
+impl ColorPaletteMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Natural => Self::Deuteranopia,
+            Self::Deuteranopia => Self::Protanopia,
+            Self::Protanopia => Self::Tritanopia,
+            Self::Tritanopia => Self::HighContrast,
+            Self::HighContrast => Self::Natural,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Natural => "Palette: Natural",
+            Self::Deuteranopia => "Palette: Deuteranopia",
+            Self::Protanopia => "Palette: Protanopia",
+            Self::Tritanopia => "Palette: Tritanopia",
+            Self::HighContrast => "Palette: High Contrast",
+        }
+    }
+}
+
+#[derive(Resource)]
+struct AccessibilityState {
+    palette: ColorPaletteMode,
+}
+
+impl AccessibilityState {
+    fn new() -> Self {
+        Self {
+            palette: ColorPaletteMode::Natural,
+        }
+    }
+
+    fn cycle(&mut self) {
+        self.palette = self.palette.next();
+    }
+
+    fn palette(&self) -> ColorPaletteMode {
+        self.palette
+    }
+}
+
+fn make_material(
+    materials: &mut Assets<StandardMaterial>,
+    base_color: Color,
+    emissive: Color,
+    alpha_mode: AlphaMode,
+    unlit: bool,
+    double_sided: bool,
+) -> Handle<StandardMaterial> {
+    materials.add(StandardMaterial {
+        base_color,
+        emissive: emissive.into(),
+        alpha_mode,
+        unlit,
+        double_sided,
+        ..Default::default()
+    })
+}
+
+fn spawn_part(
+    commands: &mut Commands,
+    mesh_handle: &Handle<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    base_color: Color,
+    emissive: Color,
+    alpha_mode: AlphaMode,
+    unlit: bool,
+    double_sided: bool,
+    transform: Transform,
+) -> PartRef {
+    let material = make_material(
+        materials,
+        base_color,
+        emissive,
+        alpha_mode,
+        unlit,
+        double_sided,
+    );
+    let entity = commands
+        .spawn((
+            Mesh3d(mesh_handle.clone()),
+            MeshMaterial3d(material.clone()),
+            transform,
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ))
+        .id();
+    PartRef {
+        entity,
+        material: Some(material),
+    }
+}
+
+fn update_part_transform(commands: &mut Commands, part: &PartRef, transform: Transform) {
+    commands.entity(part.entity).insert(transform);
+}
+
+fn update_part_colors(
+    materials: &mut Assets<StandardMaterial>,
+    part: &PartRef,
+    base: Color,
+    emissive: Color,
+) {
+    if let Some(handle) = part.material.as_ref() {
+        if let Some(mat) = materials.get_mut(handle) {
+            mat.base_color = base;
+            mat.emissive = emissive.into();
+        }
+    }
+}
+
+fn set_part_visibility(commands: &mut Commands, part: &PartRef, visible: bool) {
+    let visibility = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    commands.entity(part.entity).insert(visibility);
+}
+
+fn apply_palette_rgb(rgb: Vec3, palette: ColorPaletteMode) -> Vec3 {
+    match palette {
+        ColorPaletteMode::Natural => rgb,
+        ColorPaletteMode::HighContrast => {
+            let luminance = 0.2126 * rgb.x + 0.7152 * rgb.y + 0.0722 * rgb.z;
+            if luminance > 0.5 {
+                Vec3::new(
+                    (rgb.x + 0.15).min(1.0),
+                    (rgb.y + 0.15).min(1.0),
+                    (rgb.z + 0.15).min(1.0),
+                )
+            } else {
+                Vec3::new(
+                    (rgb.x * 0.6).clamp(0.0, 1.0),
+                    (rgb.y * 0.6).clamp(0.0, 1.0),
+                    (rgb.z * 0.6).clamp(0.0, 1.0),
+                )
+            }
+        }
+        ColorPaletteMode::Deuteranopia => transform_palette(
+            rgb,
+            [[0.43, 0.72, -0.15], [0.34, 0.57, 0.09], [-0.02, 0.03, 0.97]],
+        ),
+        ColorPaletteMode::Protanopia => transform_palette(
+            rgb,
+            [[0.20, 0.99, -0.19], [0.16, 0.79, 0.04], [0.01, -0.01, 1.00]],
+        ),
+        ColorPaletteMode::Tritanopia => transform_palette(
+            rgb,
+            [[0.95, 0.05, 0.00], [0.00, 0.43, 0.56], [0.00, 0.47, 0.53]],
+        ),
+    }
+}
+
+fn transform_palette(rgb: Vec3, matrix: [[f32; 3]; 3]) -> Vec3 {
+    Vec3::new(
+        (rgb.x * matrix[0][0] + rgb.y * matrix[0][1] + rgb.z * matrix[0][2]).clamp(0.0, 1.0),
+        (rgb.x * matrix[1][0] + rgb.y * matrix[1][1] + rgb.z * matrix[1][2]).clamp(0.0, 1.0),
+        (rgb.x * matrix[2][0] + rgb.y * matrix[2][1] + rgb.z * matrix[2][2]).clamp(0.0, 1.0),
+    )
+}
+
+fn srgb_from_vec_with_palette(rgb: Vec3, alpha: f32, palette: ColorPaletteMode) -> Color {
+    let mapped = apply_palette_rgb(rgb, palette);
+    srgb_from_vec(mapped, alpha)
+}
+
+fn palette_emissive_from_vec(rgb: Vec3, palette: ColorPaletteMode) -> Color {
+    let mapped = apply_palette_rgb(rgb, palette);
+    Color::linear_rgb(mapped.x, mapped.y, mapped.z)
+}
+
+fn clamp01(value: f32) -> f32 {
+    value.clamp(0.0, 1.0)
+}
+
+fn srgb_from_vec(rgb: Vec3, alpha: f32) -> Color {
+    let mut color = Color::srgb(
+        rgb.x.clamp(0.0, 1.0),
+        rgb.y.clamp(0.0, 1.0),
+        rgb.z.clamp(0.0, 1.0),
+    );
+    color.set_alpha(alpha.clamp(0.0, 1.0));
+    color
+}
+
+fn mix_vec3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
+    a + (b - a) * t
+}
+
+fn cleanup_agent_materials(materials: &mut Assets<StandardMaterial>, record: &AgentRecord) {
+    fn remove(materials: &mut Assets<StandardMaterial>, part: &PartRef) {
+        if let Some(handle) = part.material.as_ref() {
+            materials.remove(handle);
+        }
+    }
+
+    remove(materials, &record.body);
+    remove(materials, &record.stripe);
+    remove(materials, &record.wheel_left);
+    remove(materials, &record.wheel_right);
+    remove(materials, &record.mouth);
+    remove(materials, &record.nose);
+    remove(materials, &record.spike);
+    remove(materials, &record.boost);
+    remove(materials, &record.ear_left);
+    remove(materials, &record.ear_right);
+    remove(materials, &record.selection);
+    remove(materials, &record.indicator);
+    remove(materials, &record.sound_inner);
+    remove(materials, &record.sound_outer);
+    for eye in &record.eyes {
+        remove(materials, &eye.sclera);
+        remove(materials, &eye.pupil);
+    }
+}
+
+fn despawn_agent_entities(record: AgentRecord, commands: &mut Commands) {
+    fn despawn(commands: &mut Commands, part: PartRef) {
+        commands.entity(part.entity).despawn();
+    }
+
+    let AgentRecord {
+        root,
+        body,
+        stripe,
+        wheel_left,
+        wheel_right,
+        mouth,
+        nose,
+        spike,
+        boost,
+        ear_left,
+        ear_right,
+        selection,
+        indicator,
+        sound_inner,
+        sound_outer,
+        eyes,
+    } = record;
+
+    for eye in eyes {
+        despawn(commands, eye.sclera);
+        despawn(commands, eye.pupil);
+    }
+
+    despawn(commands, body);
+    despawn(commands, stripe);
+    despawn(commands, wheel_left);
+    despawn(commands, wheel_right);
+    despawn(commands, mouth);
+    despawn(commands, nose);
+    despawn(commands, spike);
+    despawn(commands, boost);
+    despawn(commands, ear_left);
+    despawn(commands, ear_right);
+    despawn(commands, selection);
+    despawn(commands, indicator);
+    despawn(commands, sound_inner);
+    despawn(commands, sound_outer);
+
+    commands.entity(root).despawn();
 }
 
 #[derive(Resource, Clone)]
@@ -560,6 +824,7 @@ struct HudElements {
     fps: Entity,
     world: Entity,
     tonemap: Entity,
+    palette: Entity,
 }
 
 #[derive(Component)]
@@ -607,13 +872,26 @@ impl TonemappingMode {
             TonemappingMode::Tony => Tonemapping::TonyMcMapface,
         }
     }
+
+    fn from_config(mode: RenderTonemapMode) -> Self {
+        match mode {
+            RenderTonemapMode::Aces => TonemappingMode::Aces,
+            RenderTonemapMode::Agx => TonemappingMode::Agx,
+            RenderTonemapMode::Tony => TonemappingMode::Tony,
+        }
+    }
 }
+
+const DEFAULT_AUTO_EXPOSURE_BRIGHTEN: f32 = 3.0;
+const DEFAULT_AUTO_EXPOSURE_DARKEN: f32 = 1.0;
 
 #[derive(Resource)]
 struct TonemappingState {
     mode: TonemappingMode,
     auto_exposure_enabled: bool,
     exposure_bias: f32,
+    auto_exposure_speed_brighten: f32,
+    auto_exposure_speed_darken: f32,
     dirty: bool,
 }
 
@@ -623,8 +901,39 @@ impl Default for TonemappingState {
             mode: TonemappingMode::Aces,
             auto_exposure_enabled: false,
             exposure_bias: 0.0,
+             auto_exposure_speed_brighten: DEFAULT_AUTO_EXPOSURE_BRIGHTEN,
+             auto_exposure_speed_darken: DEFAULT_AUTO_EXPOSURE_DARKEN,
             dirty: true,
         }
+    }
+}
+
+impl TonemappingState {
+    fn from_render_settings(settings: &RenderSettings) -> Self {
+        let mut state = Self::default();
+
+        if let Some(mode) = settings.tonemap_mode {
+            state.mode = TonemappingMode::from_config(mode);
+        }
+        if let Some(bias) = settings.tonemap_exposure_bias {
+            state.exposure_bias = bias;
+        }
+        if let Some(auto) = &settings.auto_exposure {
+            state.auto_exposure_enabled = auto.enabled;
+            if let Some(speed) = auto.speed_brighten {
+                if speed.is_finite() && speed >= 0.0 {
+                    state.auto_exposure_speed_brighten = speed;
+                }
+            }
+            if let Some(speed) = auto.speed_darken {
+                if speed.is_finite() && speed >= 0.0 {
+                    state.auto_exposure_speed_darken = speed;
+                }
+            }
+        }
+
+        state.dirty = true;
+        state
     }
 }
 
@@ -789,10 +1098,27 @@ struct WorldSnapshot {
 struct AgentVisual {
     id: AgentId,
     position: Vec2,
+    heading: f32,
     color: [f32; 3],
     selection: SelectionState,
     health: f32,
     age: u32,
+    spike_length: f32,
+    boost: f32,
+    wheel_left: f32,
+    wheel_right: f32,
+    herbivore_tendency: f32,
+    temperature_preference: f32,
+    food_delta: f32,
+    sound_level: f32,
+    sound_output: f32,
+    sound_multiplier: f32,
+    trait_modifiers: TraitModifiers,
+    eye_dirs: [f32; NUM_EYES],
+    eye_fov: [f32; NUM_EYES],
+    indicator: IndicatorState,
+    reproduction_intent: f32,
+    spiked: bool,
 }
 
 impl WorldSnapshot {
@@ -815,19 +1141,103 @@ impl WorldSnapshot {
         let colors = columns.colors();
         let healths = columns.health();
         let ages = columns.ages();
+        let headings = columns.headings();
+        let spikes = columns.spike_lengths();
+        let boosts = columns.boosts();
         let runtime = world.runtime();
 
         let mut agents = Vec::with_capacity(arena.len());
         for (idx, agent_id) in arena.iter_handles().enumerate() {
             let runtime_entry = runtime.get(agent_id);
-            let selection = runtime_entry.map(|rt| rt.selection).unwrap_or_default();
+            let (
+                selection,
+                wheel_left,
+                wheel_right,
+                herbivore_tendency,
+                temperature_preference,
+                food_delta,
+                sound_level,
+                sound_output,
+                sound_multiplier,
+                trait_modifiers,
+                eye_dirs,
+                eye_fov,
+                indicator,
+                reproduction_intent,
+                spiked,
+            ) = runtime_entry
+                .map(|rt| {
+                    let mut eye_dirs = [0.0_f32; NUM_EYES];
+                    let mut eye_fov = [0.0_f32; NUM_EYES];
+                    eye_dirs.copy_from_slice(&rt.eye_direction);
+                    eye_fov.copy_from_slice(&rt.eye_fov);
+                    (
+                        rt.selection,
+                        rt.outputs.get(0).copied().unwrap_or(0.0),
+                        rt.outputs.get(1).copied().unwrap_or(0.0),
+                        rt.herbivore_tendency,
+                        rt.temperature_preference,
+                        rt.food_delta,
+                        rt.outputs.get(7).copied().unwrap_or(0.0),
+                        rt.sound_output,
+                        rt.sound_multiplier,
+                        TraitModifiers {
+                            smell: rt.trait_modifiers.smell,
+                            sound: rt.trait_modifiers.sound,
+                            hearing: rt.trait_modifiers.hearing,
+                            eye: rt.trait_modifiers.eye,
+                            blood: rt.trait_modifiers.blood,
+                        },
+                        eye_dirs,
+                        eye_fov,
+                        rt.indicator,
+                        rt.give_intent,
+                        rt.spiked,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        SelectionState::None,
+                        0.0,
+                        0.0,
+                        0.5,
+                        0.5,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        TraitModifiers::default(),
+                        [0.0; NUM_EYES],
+                        [1.0; NUM_EYES],
+                        IndicatorState::default(),
+                        0.0,
+                        false,
+                    )
+                });
             agents.push(AgentVisual {
                 id: agent_id,
                 position: Vec2::new(positions[idx].x, positions[idx].y),
+                heading: headings[idx],
                 color: colors[idx],
+                spike_length: spikes[idx],
+                boost: if boosts[idx] { 1.0 } else { 0.0 },
+                wheel_left,
+                wheel_right,
+                herbivore_tendency,
+                temperature_preference,
+                food_delta,
+                sound_level,
+                sound_output,
+                sound_multiplier,
+                trait_modifiers,
+                eye_dirs,
+                eye_fov,
                 selection,
                 health: healths[idx],
                 age: ages[idx],
+                indicator,
+                reproduction_intent,
+                spiked,
             });
         }
 
@@ -887,10 +1297,23 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         InheritedVisibility::default(),
     ));
 
-    let agent_mesh = meshes.add(Mesh::from(Sphere::new(1.0)));
-    commands.insert_resource(AgentMeshAsset {
-        mesh: agent_mesh,
+    let body_mesh = meshes.add(Mesh::from(Capsule3d::new(0.5, 1.6)));
+    let wheel_mesh = meshes.add(Mesh::from(Torus::new(0.3, 0.6)));
+    let spike_mesh = meshes.add(Mesh::from(Cone {
+        radius: 0.45,
+        height: 1.0,
+    }));
+    let sphere_mesh = meshes.add(Mesh::from(Sphere::new(0.5)));
+    let quad_mesh = meshes.add(Mesh::from(Rectangle::new(1.0, 1.0)));
+    let ring_mesh = meshes.add(Mesh::from(Torus::new(0.7, 1.0)));
+    commands.insert_resource(AgentMeshes {
         base_radius: 1.0,
+        body: body_mesh,
+        wheel: wheel_mesh,
+        spike: spike_mesh,
+        sphere: sphere_mesh,
+        quad: quad_mesh,
+        ring: ring_mesh,
     });
     commands.insert_resource(TerrainChunkRegistry {
         chunk_size: TERRAIN_CHUNK_SIZE,
@@ -906,6 +1329,10 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 
     commands.spawn((
         Camera2d::default(),
+        Camera {
+            order: 1,
+            ..Default::default()
+        },
         Transform::default(),
         GlobalTransform::default(),
         Visibility::default(),
@@ -958,6 +1385,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut fps = Entity::PLACEHOLDER;
     let mut world = Entity::PLACEHOLDER;
     let mut tonemap = Entity::PLACEHOLDER;
+    let mut palette = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
         tick = parent
@@ -1019,6 +1447,13 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         tonemap = parent
             .spawn((
                 Text::new("Tone: ACES • AutoExp Off • Bias +0.0"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        palette = parent
+            .spawn((
+                Text::new("Palette: Natural • press C to cycle"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -1189,6 +1624,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         fps,
         world,
         tonemap,
+        palette,
     });
 }
 
@@ -1204,10 +1640,11 @@ fn sync_world(
     mut state: ResMut<SnapshotState>,
     mut registry: ResMut<AgentRegistry>,
     mut terrain_registry: ResMut<TerrainChunkRegistry>,
-    assets: Res<AgentMeshAsset>,
+    agent_meshes: Res<AgentMeshes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     probe_assets: Res<ReflectionProbeAssets>,
+    accessibility: Res<AccessibilityState>,
 ) {
     let Some(snapshot) = state.latest.as_ref() else {
         return;
@@ -1259,8 +1696,9 @@ fn sync_world(
         snapshot,
         &mut commands,
         &mut registry,
-        &assets,
+        agent_meshes.as_ref(),
         materials.as_mut(),
+        accessibility.palette(),
     );
 
     state.last_applied_tick = snapshot_tick;
@@ -1280,6 +1718,7 @@ fn update_hud(
     time: Res<Time>,
     controls: Res<SimulationControl>,
     tonemap_state: Res<TonemappingState>,
+    accessibility: Res<AccessibilityState>,
     mut texts: Query<&mut Text>,
 ) {
     let Some(_) = state.latest.as_ref() else {
@@ -1414,10 +1853,11 @@ fn update_hud(
             };
             **text = format!(
                 "Tone: {} • {} • Bias {:+.1}",
-                mode_label,
-                auto_label,
-                tonemap_state.exposure_bias
+                mode_label, auto_label, tonemap_state.exposure_bias
             );
+        }
+        if let Ok(mut text) = texts.get_mut(hud_elements.palette) {
+            **text = format!("{} • press C to cycle", accessibility.palette().label());
         }
     }
 }
@@ -1808,6 +2248,16 @@ fn handle_exposure_adjust_buttons(
     }
 }
 
+fn handle_palette_shortcuts(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut accessibility: ResMut<AccessibilityState>,
+) {
+    if keys.just_pressed(KeyCode::KeyC) {
+        accessibility.cycle();
+        info!("Bevy palette cycled to {:?}", accessibility.palette());
+    }
+}
+
 fn update_tonemap_button_colors(
     state: Res<TonemappingState>,
     mut query: Query<(&TonemapButton, &Interaction, &mut BackgroundColor)>,
@@ -1859,7 +2309,12 @@ fn sync_camera_tonemapping(
     mut commands: Commands,
     mut state: ResMut<TonemappingState>,
     mut cameras: Query<
-        (Entity, &mut Tonemapping, &mut ColorGrading, Option<&mut AutoExposure>),
+        (
+            Entity,
+            &mut Tonemapping,
+            &mut ColorGrading,
+            Option<&mut AutoExposure>,
+        ),
         With<PrimaryCamera>,
     >,
 ) {
@@ -1867,13 +2322,17 @@ fn sync_camera_tonemapping(
         return;
     }
 
-    if let Ok((entity, mut tonemap, mut grading, auto_exposure)) = cameras.get_single_mut() {
+    if let Ok((entity, mut tonemap, mut grading, auto_exposure)) = cameras.single_mut() {
         *tonemap = state.mode.to_component();
         grading.global.exposure = state.exposure_bias;
 
         match (state.auto_exposure_enabled, auto_exposure) {
             (true, None) => {
-                commands.entity(entity).insert(AutoExposure::default());
+                commands.entity(entity).insert(AutoExposure {
+                    speed_brighten: 3.0,
+                    speed_darken: 1.0,
+                    ..Default::default()
+                });
             }
             (true, Some(mut existing)) => {
                 existing.speed_brighten = 3.0;
@@ -2561,7 +3020,7 @@ fn srgb_to_linear_component(value: f32) -> f32 {
 #[cfg(test)]
 mod terrain_tests {
     use super::*;
-    use bevy::render::mesh::VertexAttributeValues;
+    use bevy_mesh::VertexAttributeValues;
     use scriptbots_core::{TerrainKind, TerrainLayer, TerrainTile};
     use slotmap::KeyData;
 
@@ -2701,10 +3160,27 @@ mod terrain_tests {
         snapshot.agents.push(AgentVisual {
             id: AgentId::from(KeyData::from_ffi(1)),
             position: Vec2::new(50.0, 50.0),
+            heading: 0.0,
             color: [0.5, 0.5, 0.5],
             selection: SelectionState::Selected,
             health: 80.0,
             age: 10,
+            spike_length: 0.0,
+            boost: 0.0,
+            wheel_left: 0.0,
+            wheel_right: 0.0,
+            herbivore_tendency: 0.5,
+            temperature_preference: 0.5,
+            food_delta: 0.0,
+            sound_level: 0.0,
+            sound_output: 0.0,
+            sound_multiplier: 1.0,
+            trait_modifiers: TraitModifiers::default(),
+            eye_dirs: [0.0; NUM_EYES],
+            eye_fov: [1.0; NUM_EYES],
+            indicator: IndicatorState::default(),
+            reproduction_intent: 0.0,
+            spiked: false,
         });
 
         let translation = agent_translation(&snapshot, &snapshot.agents[0]);
@@ -2732,27 +3208,729 @@ fn compute_tile_slope(terrain: &TerrainHeightSnapshot, x: u32, z: u32) -> f32 {
         * 0.25
 }
 
+fn spawn_agent_entity(
+    agent: &AgentVisual,
+    snapshot: &WorldSnapshot,
+    commands: &mut Commands,
+    meshes: &AgentMeshes,
+    materials: &mut Assets<StandardMaterial>,
+    palette: ColorPaletteMode,
+) -> AgentRecord {
+    let root_transform = Transform::from_translation(agent_translation(snapshot, agent))
+        .with_rotation(Quat::from_rotation_y(agent.heading));
+    let root = commands
+        .spawn((
+            root_transform,
+            GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+        ))
+        .id();
+
+    let (body_color, body_emissive) = agent_colors(agent, palette);
+    let body = spawn_part(
+        commands,
+        &meshes.body,
+        materials,
+        body_color,
+        body_emissive,
+        AlphaMode::Opaque,
+        false,
+        false,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(body.entity);
+
+    let stripe = spawn_part(
+        commands,
+        &meshes.quad,
+        materials,
+        Color::srgb(0.4, 0.62, 0.2),
+        Color::linear_rgb(0.2, 0.4, 0.12),
+        AlphaMode::Opaque,
+        false,
+        true,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(stripe.entity);
+
+    let wheel_left = spawn_part(
+        commands,
+        &meshes.wheel,
+        materials,
+        Color::srgb(0.12, 0.14, 0.2),
+        Color::linear_rgb(0.1, 0.12, 0.18),
+        AlphaMode::Opaque,
+        false,
+        false,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(wheel_left.entity);
+
+    let wheel_right = spawn_part(
+        commands,
+        &meshes.wheel,
+        materials,
+        Color::srgb(0.12, 0.14, 0.2),
+        Color::linear_rgb(0.1, 0.12, 0.18),
+        AlphaMode::Opaque,
+        false,
+        false,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(wheel_right.entity);
+
+    let mouth = spawn_part(
+        commands,
+        &meshes.quad,
+        materials,
+        Color::srgb(0.72, 0.2, 0.16),
+        Color::linear_rgb(0.3, 0.08, 0.06),
+        AlphaMode::Blend,
+        true,
+        true,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(mouth.entity);
+
+    let nose = spawn_part(
+        commands,
+        &meshes.sphere,
+        materials,
+        Color::srgb(0.95, 0.86, 0.66),
+        Color::linear_rgb(0.4, 0.28, 0.18),
+        AlphaMode::Opaque,
+        false,
+        false,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(nose.entity);
+
+    let spike = spawn_part(
+        commands,
+        &meshes.spike,
+        materials,
+        Color::srgb(0.86, 0.34, 0.2),
+        Color::linear_rgb(0.6, 0.1, 0.08),
+        AlphaMode::Opaque,
+        false,
+        false,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(spike.entity);
+
+    let boost = spawn_part(
+        commands,
+        &meshes.quad,
+        materials,
+        Color::srgb(0.2, 0.36, 0.95),
+        Color::linear_rgb(0.25, 0.5, 1.18),
+        AlphaMode::Add,
+        true,
+        true,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(boost.entity);
+
+    let ear_left = spawn_part(
+        commands,
+        &meshes.sphere,
+        materials,
+        Color::srgb(0.82, 0.78, 0.58),
+        Color::linear_rgb(0.22, 0.24, 0.12),
+        AlphaMode::Opaque,
+        false,
+        false,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(ear_left.entity);
+
+    let ear_right = spawn_part(
+        commands,
+        &meshes.sphere,
+        materials,
+        Color::srgb(0.82, 0.78, 0.58),
+        Color::linear_rgb(0.22, 0.24, 0.12),
+        AlphaMode::Opaque,
+        false,
+        false,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(ear_right.entity);
+
+    let selection = spawn_part(
+        commands,
+        &meshes.ring,
+        materials,
+        Color::srgb(0.24, 0.52, 1.0),
+        Color::linear_rgb(0.22, 0.58, 1.2),
+        AlphaMode::Add,
+        true,
+        true,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(selection.entity);
+
+    let indicator = spawn_part(
+        commands,
+        &meshes.quad,
+        materials,
+        Color::srgb(0.48, 0.82, 0.36),
+        Color::linear_rgb(0.32, 0.7, 0.26),
+        AlphaMode::Add,
+        true,
+        true,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(indicator.entity);
+
+    let sound_inner = spawn_part(
+        commands,
+        &meshes.quad,
+        materials,
+        Color::srgba(0.3, 0.55, 0.95, 0.0),
+        Color::linear_rgb(0.0, 0.0, 0.0),
+        AlphaMode::Add,
+        true,
+        true,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(sound_inner.entity);
+
+    let sound_outer = spawn_part(
+        commands,
+        &meshes.quad,
+        materials,
+        Color::srgba(0.15, 0.45, 0.95, 0.0),
+        Color::linear_rgb(0.0, 0.0, 0.0),
+        AlphaMode::Add,
+        true,
+        true,
+        Transform::IDENTITY,
+    );
+    commands.entity(root).add_child(sound_outer.entity);
+
+    let mut eyes = Vec::with_capacity(NUM_EYES);
+    for _ in 0..NUM_EYES {
+        let sclera = spawn_part(
+            commands,
+            &meshes.sphere,
+            materials,
+            Color::srgb(0.92, 0.95, 1.0),
+            Color::linear_rgb(0.18, 0.2, 0.24),
+            AlphaMode::Opaque,
+            false,
+            false,
+            Transform::IDENTITY,
+        );
+        let pupil = spawn_part(
+            commands,
+            &meshes.sphere,
+            materials,
+            Color::srgb(0.08, 0.09, 0.12),
+            Color::linear_rgb(0.1, 0.14, 0.2),
+            AlphaMode::Opaque,
+            false,
+            false,
+            Transform::IDENTITY,
+        );
+        commands.entity(root).add_child(sclera.entity);
+        commands.entity(root).add_child(pupil.entity);
+        eyes.push(EyePart { sclera, pupil });
+    }
+
+    let record = AgentRecord {
+        root,
+        body,
+        stripe,
+        wheel_left,
+        wheel_right,
+        mouth,
+        nose,
+        spike,
+        boost,
+        ear_left,
+        ear_right,
+        selection,
+        indicator,
+        sound_inner,
+        sound_outer,
+        eyes,
+    };
+
+    apply_agent_visuals(
+        &record, agent, snapshot, commands, materials, meshes, palette,
+    );
+    record
+}
+
+fn update_agent_entity(
+    record: &AgentRecord,
+    agent: &AgentVisual,
+    snapshot: &WorldSnapshot,
+    commands: &mut Commands,
+    materials: &mut Assets<StandardMaterial>,
+    meshes: &AgentMeshes,
+    palette: ColorPaletteMode,
+) {
+    apply_agent_visuals(
+        record, agent, snapshot, commands, materials, meshes, palette,
+    );
+}
+
+fn apply_agent_visuals(
+    record: &AgentRecord,
+    agent: &AgentVisual,
+    snapshot: &WorldSnapshot,
+    commands: &mut Commands,
+    materials: &mut Assets<StandardMaterial>,
+    meshes: &AgentMeshes,
+    palette: ColorPaletteMode,
+) {
+    use std::f32::consts::FRAC_PI_2;
+
+    let translation = agent_translation(snapshot, agent);
+    let rotation = Quat::from_rotation_y(agent.heading);
+    commands
+        .entity(record.root)
+        .insert(Transform::from_translation(translation).with_rotation(rotation));
+
+    let scale_factor = (snapshot.agent_radius / meshes.base_radius).clamp(0.2, 1024.0);
+    let body_length = scale_factor * 2.35;
+    let body_radius = scale_factor * 0.88;
+
+    let body_transform = Transform {
+        translation: Vec3::ZERO,
+        rotation: Quat::from_rotation_z(FRAC_PI_2),
+        scale: Vec3::new(
+            body_length.max(0.1),
+            body_radius.max(0.1),
+            body_radius.max(0.1),
+        ),
+    };
+    let (body_color, body_emissive) = agent_colors(agent, palette);
+    update_part_transform(commands, &record.body, body_transform);
+    update_part_colors(materials, &record.body, body_color, body_emissive);
+
+    let herbivore = clamp01(agent.herbivore_tendency);
+    let herbivore_rgb = Vec3::new(0.18, 0.84, 0.36);
+    let carnivore_rgb = Vec3::new(0.86, 0.22, 0.2);
+    let mut stripe_rgb = mix_vec3(carnivore_rgb, herbivore_rgb, herbivore);
+    let temp_pref = clamp01(agent.temperature_preference);
+    let temp_accent = mix_vec3(
+        Vec3::new(0.2, 0.45, 1.0),
+        Vec3::new(1.0, 0.52, 0.24),
+        temp_pref,
+    );
+    stripe_rgb = mix_vec3(stripe_rgb, temp_accent, 0.18);
+    let stripe_color = srgb_from_vec_with_palette(stripe_rgb, 0.9, palette);
+    let stripe_emissive_rgb = Vec3::new(
+        stripe_rgb.x * 0.45,
+        stripe_rgb.y * 0.45,
+        stripe_rgb.z * 0.45,
+    );
+    let stripe_emissive = palette_emissive_from_vec(stripe_emissive_rgb, palette);
+    let stripe_transform = Transform {
+        translation: Vec3::new(0.0, body_radius * 0.16, 0.0),
+        rotation: Quat::from_rotation_y(FRAC_PI_2) * Quat::from_rotation_z(FRAC_PI_2),
+        scale: Vec3::new(
+            (body_length * 1.04).max(0.05),
+            (body_radius * 0.3).max(0.05),
+            (body_radius * 0.3).max(0.05),
+        ),
+    };
+    update_part_transform(commands, &record.stripe, stripe_transform);
+    update_part_colors(materials, &record.stripe, stripe_color, stripe_emissive);
+
+    let wheel_offset = body_radius * 1.12;
+    let wheel_vertical = -body_radius * 0.38;
+    let wheel_scale = Vec3::new(
+        (scale_factor * 0.75).max(0.05),
+        (scale_factor * 0.75).max(0.05),
+        (scale_factor * 0.4).max(0.05),
+    );
+    let left_wheel_transform = Transform {
+        translation: Vec3::new(0.0, wheel_vertical, wheel_offset),
+        rotation: Quat::from_rotation_x(FRAC_PI_2),
+        scale: wheel_scale,
+    };
+    let right_wheel_transform = Transform {
+        translation: Vec3::new(0.0, wheel_vertical, -wheel_offset),
+        rotation: Quat::from_rotation_x(FRAC_PI_2),
+        scale: wheel_scale,
+    };
+    update_part_transform(commands, &record.wheel_left, left_wheel_transform);
+    update_part_transform(commands, &record.wheel_right, right_wheel_transform);
+
+    let wheel_base = Vec3::new(0.14, 0.16, 0.22);
+    let left_speed = clamp01(agent.wheel_left.abs());
+    let right_speed = clamp01(agent.wheel_right.abs());
+    let left_rgb = wheel_base * (0.65 + left_speed * 0.55);
+    let right_rgb = wheel_base * (0.65 + right_speed * 0.55);
+    let left_color = srgb_from_vec_with_palette(left_rgb, 1.0, palette);
+    let right_color = srgb_from_vec_with_palette(right_rgb, 1.0, palette);
+    let left_emissive = palette_emissive_from_vec(
+        Vec3::new(
+            left_rgb.x * left_speed * 0.8,
+            left_rgb.y * left_speed * 0.7,
+            left_rgb.z * left_speed * 1.1,
+        ),
+        palette,
+    );
+    let right_emissive = palette_emissive_from_vec(
+        Vec3::new(
+            right_rgb.x * right_speed * 0.8,
+            right_rgb.y * right_speed * 0.7,
+            right_rgb.z * right_speed * 1.1,
+        ),
+        palette,
+    );
+    update_part_colors(materials, &record.wheel_left, left_color, left_emissive);
+    update_part_colors(materials, &record.wheel_right, right_color, right_emissive);
+
+    let vocal_energy = clamp01(agent.sound_output.abs() * agent.sound_multiplier.max(0.1));
+    let mouth_activity =
+        clamp01(agent.food_delta.abs() * 0.75 + vocal_energy * 0.9 + agent.sound_level * 0.35);
+    let mouth_height = scale_factor * (0.25 + 0.6 * mouth_activity);
+    let mouth_depth = scale_factor * 0.12;
+    let mouth_width = body_radius * 0.95;
+    let mouth_transform = Transform {
+        translation: Vec3::new(body_length * 0.58, scale_factor * 0.04, 0.0),
+        rotation: Quat::from_rotation_y(FRAC_PI_2),
+        scale: Vec3::new(
+            mouth_depth.max(0.02),
+            mouth_height.max(0.05),
+            mouth_width.max(0.05),
+        ),
+    };
+    update_part_transform(commands, &record.mouth, mouth_transform);
+    let mouth_rgb = Vec3::new(
+        0.58 + mouth_activity * 0.3,
+        0.1 + mouth_activity * 0.12,
+        0.12 + mouth_activity * 0.08,
+    );
+    let mouth_color = srgb_from_vec_with_palette(mouth_rgb, 0.9, palette);
+    let mouth_emissive = palette_emissive_from_vec(
+        Vec3::new(
+            mouth_rgb.x * mouth_activity * 0.8,
+            mouth_rgb.y * mouth_activity * 0.4,
+            mouth_rgb.z * mouth_activity * 0.3,
+        ),
+        palette,
+    );
+    update_part_colors(materials, &record.mouth, mouth_color, mouth_emissive);
+
+    let nose_transform = Transform {
+        translation: Vec3::new(body_length * 0.63, scale_factor * 0.24, 0.0),
+        rotation: Quat::IDENTITY,
+        scale: Vec3::splat((scale_factor * 0.34).max(0.05)),
+    };
+    update_part_transform(commands, &record.nose, nose_transform);
+    let nose_rgb = mix_vec3(
+        Vec3::new(0.94, 0.84, 0.66),
+        Vec3::new(0.98, 0.92, 0.78),
+        clamp01(agent.trait_modifiers.smell * 0.4),
+    );
+    let nose_color = srgb_from_vec_with_palette(nose_rgb, 1.0, palette);
+    let nose_emissive = palette_emissive_from_vec(
+        Vec3::new(nose_rgb.x * 0.25, nose_rgb.y * 0.2, nose_rgb.z * 0.15),
+        palette,
+    );
+    update_part_colors(materials, &record.nose, nose_color, nose_emissive);
+
+    let spike_ready = if agent.spiked {
+        1.0
+    } else {
+        clamp01(agent.spike_length)
+    };
+    let spike_length = scale_factor * (0.65 + agent.spike_length.max(0.0));
+    let spike_transform = Transform {
+        translation: Vec3::new(
+            body_length * 0.7 + spike_length * 0.5,
+            scale_factor * 0.06,
+            0.0,
+        ),
+        rotation: Quat::from_rotation_z(-FRAC_PI_2),
+        scale: Vec3::new(
+            spike_length.max(0.06),
+            (scale_factor * 0.48).max(0.04),
+            (scale_factor * 0.48).max(0.04),
+        ),
+    };
+    update_part_transform(commands, &record.spike, spike_transform);
+    let spike_rgb = Vec3::new(
+        0.74 + spike_ready * 0.22,
+        0.52 - spike_ready * 0.38,
+        0.24 + spike_ready * 0.14,
+    );
+    let spike_color = srgb_from_vec_with_palette(spike_rgb, 1.0, palette);
+    let spike_emissive = palette_emissive_from_vec(
+        Vec3::new(
+            spike_rgb.x * spike_ready * 0.7,
+            spike_rgb.y * spike_ready * 0.25,
+            spike_rgb.z * spike_ready * 0.25,
+        ),
+        palette,
+    );
+    update_part_colors(materials, &record.spike, spike_color, spike_emissive);
+
+    let boost_strength = clamp01(agent.boost);
+    let boost_transform = Transform {
+        translation: Vec3::new(-body_length * 0.62, -scale_factor * 0.05, 0.0),
+        rotation: Quat::from_rotation_z(FRAC_PI_2),
+        scale: Vec3::new(
+            (scale_factor * (0.6 + boost_strength * 0.9)).max(0.05),
+            (scale_factor * 0.18).max(0.03),
+            (scale_factor * 0.18).max(0.03),
+        ),
+    };
+    update_part_transform(commands, &record.boost, boost_transform);
+    let boost_rgb = Vec3::new(
+        0.22 + boost_strength * 0.25,
+        0.48 + boost_strength * 0.45,
+        1.0 + boost_strength * 0.55,
+    );
+    let boost_color = srgb_from_vec_with_palette(boost_rgb, 0.45 + boost_strength * 0.4, palette);
+    let boost_emissive = palette_emissive_from_vec(
+        Vec3::new(
+            boost_rgb.x * boost_strength * 1.3,
+            boost_rgb.y * boost_strength * 1.45,
+            boost_rgb.z * boost_strength * 1.6,
+        ),
+        palette,
+    );
+    update_part_colors(materials, &record.boost, boost_color, boost_emissive);
+    set_part_visibility(commands, &record.boost, boost_strength > 0.02);
+
+    let hearing = clamp01(agent.trait_modifiers.hearing);
+    let ear_scale = Vec3::new(
+        (scale_factor * (0.3 + hearing * 0.35)).max(0.04),
+        (scale_factor * (0.48 + hearing * 0.4)).max(0.05),
+        (scale_factor * (0.32 + hearing * 0.2)).max(0.04),
+    );
+    let ear_height = body_radius * (0.58 + hearing * 0.1);
+    let ear_offset = body_radius * 0.92;
+    let ear_left_transform = Transform {
+        translation: Vec3::new(-scale_factor * 0.12, ear_height, ear_offset),
+        rotation: Quat::IDENTITY,
+        scale: ear_scale,
+    };
+    let ear_right_transform = Transform {
+        translation: Vec3::new(-scale_factor * 0.12, ear_height, -ear_offset),
+        rotation: Quat::IDENTITY,
+        scale: ear_scale,
+    };
+    update_part_transform(commands, &record.ear_left, ear_left_transform);
+    update_part_transform(commands, &record.ear_right, ear_right_transform);
+    let ear_rgb = Vec3::new(0.82, 0.75 + hearing * 0.18, 0.54);
+    let ear_color = srgb_from_vec_with_palette(ear_rgb, 1.0, palette);
+    let ear_emissive = palette_emissive_from_vec(
+        Vec3::new(ear_rgb.x * 0.18, ear_rgb.y * 0.2, ear_rgb.z * 0.15),
+        palette,
+    );
+    update_part_colors(materials, &record.ear_left, ear_color, ear_emissive);
+    update_part_colors(materials, &record.ear_right, ear_color, ear_emissive);
+
+    let ring_radius_scale = Vec3::splat((body_radius * 1.45).max(0.1));
+    let ring_transform = Transform {
+        translation: Vec3::new(0.0, -body_radius * 0.82, 0.0),
+        rotation: Quat::from_rotation_x(FRAC_PI_2),
+        scale: ring_radius_scale,
+    };
+    update_part_transform(commands, &record.selection, ring_transform);
+    let (ring_alpha, ring_rgb, ring_emissive_scale) = match agent.selection {
+        SelectionState::None => (0.0, Vec3::new(0.18, 0.3, 0.46), 0.0),
+        SelectionState::Hovered => (0.35, Vec3::new(0.24, 0.62, 1.0), 0.65),
+        SelectionState::Selected => (0.65, Vec3::new(0.42, 0.9, 1.2), 0.95),
+    };
+    let ring_color = srgb_from_vec_with_palette(ring_rgb, ring_alpha, palette);
+    let ring_emissive = palette_emissive_from_vec(
+        Vec3::new(
+            ring_rgb.x * ring_emissive_scale,
+            ring_rgb.y * ring_emissive_scale,
+            ring_rgb.z * ring_emissive_scale,
+        ),
+        palette,
+    );
+    update_part_colors(materials, &record.selection, ring_color, ring_emissive);
+    set_part_visibility(commands, &record.selection, ring_alpha > 0.02);
+
+    let indicator_intensity = clamp01(agent.indicator.intensity);
+    let indicator_rgb = Vec3::from_array(agent.indicator.color);
+    let indicator_alpha =
+        0.35 + indicator_intensity * 0.4 + agent.reproduction_intent.clamp(0.0, 1.0) * 0.2;
+    let indicator_color = srgb_from_vec_with_palette(indicator_rgb, indicator_alpha, palette);
+    let indicator_emissive = palette_emissive_from_vec(
+        Vec3::new(
+            indicator_rgb.x * indicator_intensity * 1.3,
+            indicator_rgb.y * indicator_intensity * 1.3,
+            indicator_rgb.z * indicator_intensity * 1.3,
+        ),
+        palette,
+    );
+    let indicator_transform = Transform {
+        translation: Vec3::new(
+            0.0,
+            body_radius * (1.75 + agent.reproduction_intent.clamp(0.0, 1.0) * 0.45),
+            0.0,
+        ),
+        rotation: Quat::from_rotation_y(FRAC_PI_2),
+        scale: Vec3::new(
+            (scale_factor * 0.38).max(0.05),
+            (scale_factor * 0.38).max(0.05),
+            (scale_factor * (0.62 + indicator_intensity * 0.45)).max(0.05),
+        ),
+    };
+    update_part_transform(commands, &record.indicator, indicator_transform);
+    update_part_colors(
+        materials,
+        &record.indicator,
+        indicator_color,
+        indicator_emissive,
+    );
+    set_part_visibility(commands, &record.indicator, indicator_alpha > 0.05);
+
+    let ambient_sound = clamp01(agent.sound_level);
+    let arc_strength = (vocal_energy * 0.8 + ambient_sound * 0.4).clamp(0.0, 1.0);
+    let arc_base_translation = Vec3::new(
+        body_length * (0.75 + arc_strength * 0.25),
+        scale_factor * 0.05,
+        0.0,
+    );
+    let arc_rotation = Quat::from_rotation_y(FRAC_PI_2);
+
+    let inner_visible = arc_strength > 0.02;
+    set_part_visibility(commands, &record.sound_inner, inner_visible);
+    if inner_visible {
+        let inner_scale = Vec3::new(
+            (scale_factor * 0.08).max(0.01),
+            (scale_factor * (0.35 + arc_strength * 0.55)).max(0.05),
+            (scale_factor * 0.05).max(0.01),
+        );
+        let inner_transform = Transform {
+            translation: arc_base_translation + Vec3::new(0.0, scale_factor * 0.04, 0.0),
+            rotation: arc_rotation,
+            scale: inner_scale,
+        };
+        update_part_transform(commands, &record.sound_inner, inner_transform);
+        let inner_rgb = Vec3::new(0.32, 0.6, 1.0);
+        let inner_alpha = 0.15 + arc_strength * 0.55;
+        let inner_color = srgb_from_vec_with_palette(inner_rgb, inner_alpha, palette);
+        let inner_emissive = palette_emissive_from_vec(
+            Vec3::new(
+                inner_rgb.x * (0.6 + arc_strength * 0.8),
+                inner_rgb.y * (0.6 + arc_strength * 0.8),
+                inner_rgb.z * (0.9 + arc_strength * 0.9),
+            ),
+            palette,
+        );
+        update_part_colors(materials, &record.sound_inner, inner_color, inner_emissive);
+    }
+
+    let outer_visible = arc_strength > 0.04;
+    set_part_visibility(commands, &record.sound_outer, outer_visible);
+    if outer_visible {
+        let outer_scale = Vec3::new(
+            (scale_factor * 0.12).max(0.02),
+            (scale_factor * (0.55 + arc_strength * 0.85)).max(0.08),
+            (scale_factor * 0.05).max(0.01),
+        );
+        let outer_transform = Transform {
+            translation: arc_base_translation + Vec3::new(0.0, scale_factor * 0.02, 0.0),
+            rotation: arc_rotation,
+            scale: outer_scale,
+        };
+        update_part_transform(commands, &record.sound_outer, outer_transform);
+        let outer_rgb = Vec3::new(0.18, 0.45, 0.95);
+        let outer_alpha = 0.08 + arc_strength * 0.45;
+        let outer_color = srgb_from_vec_with_palette(outer_rgb, outer_alpha, palette);
+        let outer_emissive = palette_emissive_from_vec(
+            Vec3::new(
+                outer_rgb.x * (0.4 + arc_strength * 0.7),
+                outer_rgb.y * (0.4 + arc_strength * 0.7),
+                outer_rgb.z * (0.6 + arc_strength * 0.8),
+            ),
+            palette,
+        );
+        update_part_colors(materials, &record.sound_outer, outer_color, outer_emissive);
+    }
+
+    let eye_base = scale_factor * (0.22 + clamp01(agent.trait_modifiers.eye) * 0.15);
+    let eye_vertical = body_radius * 0.35;
+    let eye_forward = body_length * 0.42;
+    let pupil_scale = eye_base * 0.45;
+
+    for (idx, eye) in record.eyes.iter().enumerate() {
+        let rel_dir = agent.eye_dirs[idx];
+        let fov = agent.eye_fov[idx];
+        let fov_scale = clamp01(fov / std::f32::consts::PI);
+
+        let lateral = Vec3::new(0.0, 0.0, -rel_dir.sin() * body_radius * 0.42);
+        let forward_bias = Vec3::new(rel_dir.cos().max(0.0) * body_radius * 0.15, 0.0, 0.0);
+        let sclera_translation = Vec3::new(eye_forward, eye_vertical, 0.0) + lateral + forward_bias;
+        let sclera_scale = Vec3::splat((eye_base * (0.88 + fov_scale * 0.4)).max(0.03));
+        let sclera_transform = Transform {
+            translation: sclera_translation,
+            rotation: Quat::IDENTITY,
+            scale: sclera_scale,
+        };
+        update_part_transform(commands, &eye.sclera, sclera_transform);
+
+        let look_dir = Quat::from_rotation_y(rel_dir)
+            .mul_vec3(Vec3::X)
+            .normalize_or_zero();
+        let pupil_translation = sclera_translation + look_dir * (eye_base * 0.35);
+        let pupil_transform = Transform {
+            translation: pupil_translation,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::splat(pupil_scale.max(0.015)),
+        };
+        update_part_transform(commands, &eye.pupil, pupil_transform);
+
+        let sclera_rgb = mix_vec3(
+            Vec3::new(0.92, 0.94, 1.0),
+            Vec3::new(0.88, 0.93, 1.05),
+            clamp01(agent.trait_modifiers.eye * 0.3),
+        );
+        let sclera_color = srgb_from_vec_with_palette(sclera_rgb, 1.0, palette);
+        let sclera_emissive = palette_emissive_from_vec(
+            Vec3::new(sclera_rgb.x * 0.18, sclera_rgb.y * 0.2, sclera_rgb.z * 0.24),
+            palette,
+        );
+        update_part_colors(materials, &eye.sclera, sclera_color, sclera_emissive);
+
+        let pupil_rgb =
+            Vec3::new(0.08, 0.09, 0.12) * (1.0 + clamp01(agent.sound_multiplier - 1.0) * 0.25);
+        let pupil_color = srgb_from_vec_with_palette(pupil_rgb, 1.0, palette);
+        let pupil_emissive = palette_emissive_from_vec(
+            Vec3::new(
+                pupil_rgb.x * vocal_energy * 0.6,
+                pupil_rgb.y * vocal_energy * 0.5,
+                pupil_rgb.z * vocal_energy * 0.9,
+            ),
+            palette,
+        );
+        update_part_colors(materials, &eye.pupil, pupil_color, pupil_emissive);
+    }
+}
+
 fn sync_agents(
     snapshot: &WorldSnapshot,
     commands: &mut Commands,
     registry: &mut AgentRegistry,
-    assets: &AgentMeshAsset,
+    meshes: &AgentMeshes,
     materials: &mut Assets<StandardMaterial>,
+    palette: ColorPaletteMode,
 ) {
     let mut seen: HashSet<AgentId> = HashSet::with_capacity(snapshot.agents.len());
     for agent in &snapshot.agents {
         seen.insert(agent.id);
-        if let Some(record) = registry.records.get(&agent.id) {
+        if let Some(record) = registry.records.get_mut(&agent.id) {
             update_agent_entity(
-                record,
-                agent,
-                snapshot,
-                commands,
-                materials,
-                assets.base_radius,
+                record, agent, snapshot, commands, materials, meshes, palette,
             );
         } else {
-            let record = spawn_agent_entity(agent, snapshot, commands, assets, materials);
+            let record = spawn_agent_entity(agent, snapshot, commands, meshes, materials, palette);
             registry.records.insert(agent.id, record);
         }
     }
@@ -2766,62 +3944,9 @@ fn sync_agents(
 
     for id in stale {
         if let Some(record) = registry.records.remove(&id) {
-            commands.entity(record.entity).despawn();
-            materials.remove(&record.material);
+            cleanup_agent_materials(materials, &record);
+            despawn_agent_entities(record, commands);
         }
-    }
-}
-
-fn spawn_agent_entity(
-    agent: &AgentVisual,
-    snapshot: &WorldSnapshot,
-    commands: &mut Commands,
-    assets: &AgentMeshAsset,
-    materials: &mut Assets<StandardMaterial>,
-) -> AgentRecord {
-    let (base_color, emissive) = agent_colors(agent);
-    let material = materials.add(StandardMaterial {
-        base_color,
-        emissive: emissive.into(),
-        metallic: 0.04,
-        perceptual_roughness: 0.58,
-        reflectance: 0.08,
-        ..Default::default()
-    });
-
-    let mut transform = Transform::from_translation(agent_translation(snapshot, agent));
-    transform.scale = agent_scale(snapshot.agent_radius, assets.base_radius);
-
-    let entity = commands
-        .spawn((
-            Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(material.clone()),
-            transform,
-            GlobalTransform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
-        ))
-        .id();
-
-    AgentRecord { entity, material }
-}
-
-fn update_agent_entity(
-    record: &AgentRecord,
-    agent: &AgentVisual,
-    snapshot: &WorldSnapshot,
-    commands: &mut Commands,
-    materials: &mut Assets<StandardMaterial>,
-    base_radius: f32,
-) {
-    let mut transform = Transform::from_translation(agent_translation(snapshot, agent));
-    transform.scale = agent_scale(snapshot.agent_radius, base_radius);
-    commands.entity(record.entity).insert(transform);
-
-    if let Some(material) = materials.get_mut(&record.material) {
-        let (base_color, emissive) = agent_colors(agent);
-        material.base_color = base_color;
-        material.emissive = emissive.into();
     }
 }
 
@@ -2836,12 +3961,6 @@ fn agent_translation(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Vec3 {
     let z = half.y - agent.position.y;
     Vec3::new(x, terrain_height + snapshot.agent_radius * 0.35, z)
 }
-
-fn agent_scale(agent_radius: f32, base_radius: f32) -> Vec3 {
-    let scale = (agent_radius / base_radius).max(0.25);
-    Vec3::new(scale, scale * 0.35, scale)
-}
-
 const TERRAIN_BASE_COLORS: [[f32; 3]; 6] = [
     [0.117_647, 0.247_059, 0.400_000], // Deep water
     [0.184_314, 0.450_980, 0.701_961], // Shallow water
@@ -2866,27 +3985,31 @@ fn terrain_kind_index(kind: TerrainKind) -> usize {
     }
 }
 
-fn agent_colors(agent: &AgentVisual) -> (Color, Color) {
-    let mut rgb = agent.color;
-    for c in &mut rgb {
-        *c = c.clamp(0.0, 1.0);
-    }
+fn agent_colors(agent: &AgentVisual, palette: ColorPaletteMode) -> (Color, Color) {
+    let mut rgb = Vec3::from_array(agent.color);
+    rgb.x = rgb.x.clamp(0.0, 1.0);
+    rgb.y = rgb.y.clamp(0.0, 1.0);
+    rgb.z = rgb.z.clamp(0.0, 1.0);
+
     let health_factor = (agent.health / 100.0).clamp(0.45, 1.0);
-    let base = Color::srgb(
-        rgb[0] * health_factor,
-        rgb[1] * health_factor,
-        rgb[2] * health_factor,
+    let base_rgb = Vec3::new(
+        rgb.x * health_factor,
+        rgb.y * health_factor,
+        rgb.z * health_factor,
     );
+    let base = srgb_from_vec_with_palette(base_rgb, 1.0, palette);
+
     let highlight = match agent.selection {
         SelectionState::None => 0.12,
         SelectionState::Hovered => 0.28,
         SelectionState::Selected => 0.48,
     };
-    let emissive = Color::linear_rgb(
-        (rgb[0] + highlight * 0.8).min(1.0),
-        (rgb[1] + highlight * 0.6).min(1.0),
-        (rgb[2] + highlight).min(1.0),
+    let emissive_rgb = Vec3::new(
+        (rgb.x + highlight * 0.8).min(1.0),
+        (rgb.y + highlight * 0.6).min(1.0),
+        (rgb.z + highlight).min(1.0),
     );
+    let emissive = palette_emissive_from_vec(emissive_rgb, palette);
     (base, emissive)
 }
 
@@ -2933,7 +4056,7 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Resu
         let center_x = (agent.position.x * scale_x).round() as i32;
         let center_y = ((snapshot.world_size.y - agent.position.y) * scale_y).round() as i32;
         let radius = radius_px.ceil() as i32;
-        let (base_color, _) = agent_colors(agent);
+        let (base_color, _) = agent_colors(agent, ColorPaletteMode::Natural);
         let rgba = color_to_rgba(base_color);
         for dy in -radius..=radius {
             let py = center_y + dy;
@@ -3107,6 +4230,7 @@ fn color_to_rgba(color: Color) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::{MinimalPlugins, prelude::Messages};
     use scriptbots_core::ScriptBotsConfig;
     use std::sync::{Arc, Mutex};
 
@@ -3117,9 +4241,22 @@ mod tests {
         for _ in 0..32 {
             world.step();
         }
-        let png = render_png_offscreen(&world, 640, 360)?;
-        assert!(png.len() > 4096, "expected non-trivial PNG output");
-        assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "invalid PNG header");
+        for (width, height) in [(640, 360), (1920, 1080), (2560, 1440), (3840, 2160)] {
+            let png = render_png_offscreen(&world, width, height)?;
+            assert!(
+                png.len() > 4096,
+                "expected non-trivial PNG output for {}x{}",
+                width,
+                height
+            );
+            assert_eq!(
+                &png[0..8],
+                b"\x89PNG\r\n\x1a\n",
+                "invalid PNG header for {}x{} capture",
+                width,
+                height
+            );
+        }
         Ok(())
     }
 
@@ -3240,5 +4377,287 @@ mod tests {
             snapshot.paused,
             "spacebar shortcut should toggle pause state to true"
         );
+    }
+
+    #[test]
+    fn hud_overlay_populates_metrics() -> Result<()> {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_systems(Update, update_hud);
+
+        let controls = SimulationControl::new();
+        controls.update(|state| {
+            state.paused = true;
+            state.speed_multiplier = 0.0;
+            state.auto_pause_reason = Some("Spike hits detected (3)".to_string());
+        });
+        app.insert_resource(controls);
+        app.insert_resource(CameraRig::default());
+        app.insert_resource(TonemappingState::default());
+        app.insert_resource(AccessibilityState::new());
+
+        let config = ScriptBotsConfig::default();
+        let mut world = WorldState::new(config).expect("world initialization");
+        for _ in 0..48 {
+            world.step();
+        }
+        let snapshot = WorldSnapshot::from_world(&world).expect("world snapshot");
+
+        let state = SnapshotState {
+            latest: Some(snapshot.clone()),
+            last_applied_tick: snapshot.tick,
+            last_reported_tick: 0,
+            focus_point: Vec2::new(snapshot.world_size.x * 0.5, snapshot.world_size.y * 0.5),
+            world_size: snapshot.world_size,
+            world_center: Vec2::new(snapshot.world_size.x * 0.5, snapshot.world_size.y * 0.5),
+            selection_center: None,
+            selection_bounds: None,
+            oldest_position: None,
+            first_agent_position: snapshot.agents.first().map(|agent| agent.position),
+            hud_prev_tick: 0,
+            hud_prev_time: 0.0,
+            sim_rate: 0.0,
+        };
+        app.insert_resource(state);
+
+        fn spawn_label(app: &mut App) -> Entity {
+            app.world_mut().spawn(Text::default()).id()
+        }
+
+        let hud = HudElements {
+            tick: spawn_label(&mut app),
+            agents: spawn_label(&mut app),
+            selection: spawn_label(&mut app),
+            follow: spawn_label(&mut app),
+            camera: spawn_label(&mut app),
+            playback: spawn_label(&mut app),
+            fps: spawn_label(&mut app),
+            world: spawn_label(&mut app),
+            tonemap: spawn_label(&mut app),
+            palette: spawn_label(&mut app),
+        };
+        app.insert_resource(hud);
+
+        let hud_ids = {
+            let hud_ref = app.world().resource::<HudElements>();
+            (
+                hud_ref.tick,
+                hud_ref.agents,
+                hud_ref.selection,
+                hud_ref.follow,
+                hud_ref.camera,
+                hud_ref.playback,
+                hud_ref.fps,
+                hud_ref.world,
+                hud_ref.tonemap,
+                hud_ref.palette,
+            )
+        };
+
+        app.update();
+
+        let world = app.world();
+
+        let tick_text = world
+            .get::<Text>(hud_ids.0)
+            .expect("tick text exists")
+            .as_str()
+            .to_string();
+        assert_eq!(tick_text, format!("Tick: {}", snapshot.tick));
+
+        let agents_text = world
+            .get::<Text>(hud_ids.1)
+            .expect("agents text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            agents_text.starts_with("Agents: "),
+            "agents text missing prefix: {agents_text}"
+        );
+
+        let selection_text = world
+            .get::<Text>(hud_ids.2)
+            .expect("selection text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            selection_text.starts_with("Selection:"),
+            "selection text missing prefix: {selection_text}"
+        );
+
+        let follow_text = world
+            .get::<Text>(hud_ids.3)
+            .expect("follow text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            follow_text.contains("Ctrl+S sel"),
+            "follow text missing shortcut hint: {follow_text}"
+        );
+
+        let camera_text = world
+            .get::<Text>(hud_ids.4)
+            .expect("camera text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            camera_text.contains("Ctrl+W fit world"),
+            "camera text missing fit-world hint: {camera_text}"
+        );
+
+        let playback_text = world
+            .get::<Text>(hud_ids.5)
+            .expect("playback text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            playback_text.contains("Spike hits detected (3)"),
+            "playback text missing auto-pause reason: {playback_text}"
+        );
+
+        let fps_text = world
+            .get::<Text>(hud_ids.6)
+            .expect("fps text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            fps_text.starts_with("FPS:"),
+            "fps text missing prefix: {fps_text}"
+        );
+
+        let world_text = world
+            .get::<Text>(hud_ids.7)
+            .expect("world size text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            world_text.starts_with("World:"),
+            "world text missing prefix: {world_text}"
+        );
+
+        let tonemap_text = world
+            .get::<Text>(hud_ids.8)
+            .expect("tonemap text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            tonemap_text.starts_with("Tone:"),
+            "tonemap text missing prefix: {tonemap_text}"
+        );
+
+        let palette_text = world
+            .get::<Text>(hud_ids.9)
+            .expect("palette text exists")
+            .as_str()
+            .to_string();
+        assert!(
+            palette_text.contains("press C to cycle"),
+            "palette text missing cycle hint: {palette_text}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn follow_mode_keeps_selection_centered() -> Result<()> {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_systems(Update, control_camera);
+
+        app.insert_resource(Time::<bevy::time::Real>::default());
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        for _ in 0..48 {
+            world.step();
+        }
+        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
+        let selection_center =
+            Vec2::new(snapshot.world_size.x * 0.4, snapshot.world_size.y * 0.6);
+        let selection_bounds = (
+            selection_center - Vec2::splat(32.0),
+            selection_center + Vec2::splat(32.0),
+        );
+
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot.clone()),
+            last_applied_tick: snapshot.tick,
+            last_reported_tick: snapshot.tick,
+            focus_point: selection_center,
+            world_size: snapshot.world_size,
+            world_center: Vec2::new(
+                snapshot.world_size.x * 0.5,
+                snapshot.world_size.y * 0.5,
+            ),
+            selection_center: Some(selection_center),
+            selection_bounds: Some(selection_bounds),
+            oldest_position: Some(selection_center),
+            first_agent_position: Some(selection_center),
+            hud_prev_tick: snapshot.tick,
+            hud_prev_time: 0.0,
+            sim_rate: 0.0,
+        });
+
+        let mut rig = CameraRig::default();
+        rig.follow_mode = FollowMode::Selected;
+        rig.recenter_now = true;
+        app.insert_resource(rig);
+
+        let camera_entity = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                GlobalTransform::default(),
+                PrimaryCamera,
+            ))
+            .id();
+
+        app.update();
+
+        let rig = app.world().resource::<CameraRig>();
+        let focus_delta = rig.focus_smoothed.distance(selection_center);
+        let tolerance = selection_center
+            .length()
+            .max(snapshot.world_size.length())
+            * 0.03;
+        assert!(
+            focus_delta <= tolerance,
+            "follow mode should keep focus within tolerance (delta {focus_delta}, limit {tolerance})"
+        );
+        assert!(
+            (rig.follow_mode == FollowMode::Selected),
+            "follow mode should remain Selected"
+        );
+
+        let transform = app
+            .world()
+            .entity(camera_entity)
+            .get::<Transform>()
+            .expect("camera transform");
+        let expected_center = Vec3::new(
+            selection_center.x - snapshot.world_size.x * 0.5,
+            0.0,
+            snapshot.world_size.y * 0.5 - selection_center.y,
+        );
+        let distance_expected = transform.translation.distance(expected_center);
+        assert!(
+            (distance_expected - rig.distance_smoothed).abs() < 1.0,
+            "camera distance should match rig distance ({distance_expected} vs {})",
+            rig.distance_smoothed
+        );
+
+        let forward = transform.forward().normalize_or_zero();
+        let toward_center = (expected_center - transform.translation)
+            .normalize_or_zero();
+        assert!(
+            forward.dot(toward_center) > 0.99,
+            "camera should look at focus center (dot {})",
+            forward.dot(toward_center)
+        );
+
+        Ok(())
     }
 }

@@ -2018,6 +2018,58 @@ pub struct ControlSettings {
     pub auto_pause_on_spike_hit: bool,
 }
 
+/// Render-specific configuration shared across front-ends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenderSettings {
+    /// Preferred tonemapping curve for HDR output. None falls back to renderer defaults.
+    #[serde(default)]
+    pub tonemap_mode: Option<RenderTonemapMode>,
+    /// Exposure bias applied on top of the selected tonemap curve.
+    #[serde(default)]
+    pub tonemap_exposure_bias: Option<f32>,
+    /// Auto-exposure parameters; omitted values defer to renderer defaults.
+    #[serde(default)]
+    pub auto_exposure: Option<RenderAutoExposureSettings>,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            tonemap_mode: None,
+            tonemap_exposure_bias: None,
+            auto_exposure: None,
+        }
+    }
+}
+
+/// Supported tonemapping curves for renderer configuration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderTonemapMode {
+    Aces,
+    Agx,
+    Tony,
+}
+
+impl Default for RenderTonemapMode {
+    fn default() -> Self {
+        Self::Aces
+    }
+}
+
+/// Auto-exposure configuration applied by renderers that support HDR adaption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenderAutoExposureSettings {
+    /// Enable/disable the AutoExposure component.
+    pub enabled: bool,
+    /// Dark-to-bright adaptation speed; None keeps renderer default.
+    #[serde(default)]
+    pub speed_brighten: Option<f32>,
+    /// Bright-to-dark adaptation speed; None keeps renderer default.
+    #[serde(default)]
+    pub speed_darken: Option<f32>,
+}
+
 /// Configuration change audit entry captured in-process.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigAuditEntry {
@@ -2210,6 +2262,9 @@ pub struct ScriptBotsConfig {
     pub neuroflow: NeuroflowSettings,
     /// Control-related runtime behavior toggles.
     pub control: ControlSettings,
+    /// Renderer configuration shared across front-ends.
+    #[serde(default)]
+    pub render: RenderSettings,
 }
 
 impl Default for ScriptBotsConfig {
@@ -2309,6 +2364,7 @@ impl Default for ScriptBotsConfig {
                 ..NeuroflowSettings::default()
             },
             control: ControlSettings::default(),
+            render: RenderSettings::default(),
         }
     }
 }

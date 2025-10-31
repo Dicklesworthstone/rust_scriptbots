@@ -50,6 +50,8 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - BlueMountain (2025-10-31 05:20 UTC): Regenerated `golden/rust_default.png` with new avatars and updated SHA256 in `docs/rendering_reference/checksums.txt`; ready for CI snapshot comparison.
 - BlueMountain (2025-10-31 05:48 UTC): Benchmarking blocked on GPU workstation; GPUI run stalled (see `logs/perf/20251031_default_gui.log`), Bevy build currently failing on `TerrainChunkStats` field changes (`logs/perf/20251031_default_bevy.log`). Scheduling follow-up once hardware + fixes land.
 - BlueMountain (2025-10-31 05:55 UTC): Fixed Bevy shader eye placement bug (sin/cos swap) so GPU avatars match CPU orientation (`crates/scriptbots-world-gfx/src/lib.rs`).
+- BlueMountain (2025-10-31 06:34 UTC): Added Bevy vocalization arcs with amplitude-driven quads, culling inactive overlays, and wired accessibility palette cycling (HUD + key `C`) with per-material palette transforms.
+- BlueMountain (2025-10-31 06:05 UTC): Rebuilt Bevy agent spawning pipeline with multi-part meshes/material helpers, hooked the new runtime fields (wheels/boost/sensors/diet/audio), tinted stripes by temperature preference, and reconciled `TerrainChunkStats` so `cargo check -p scriptbots-app --features bevy_render` succeeds; vocalization arcs still pending per plan §3.2.
 - OrangeLake (2025-10-31 02:05 UTC): Simulation commands landed (core enum, Bevy driver, GPUI + terminal emitters), Bevy playback UI restyled with relief palette accents, and targeted tests/cargo checks executed; awaiting RedSnow feedback on broader contract.
 - BrownLake (2025-10-31 03:24 UTC): Documented the SimulationCommand contract + HUD palette notes inside the Bevy integration plan and pinged RedSnow/OrangeLake for sign-off before closing Phase 4 TODO.
 - BrownLake (2025-10-31 03:31 UTC): Added `run_windows_version_with_bevy.bat` launcher and updated Bevy plan §7.2 to track Windows/Linux/macOS helper parity.
@@ -72,3 +74,69 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - BrownCreek (2025-10-31 03:29 UTC): Sent Agent Mail to BrownLake & OrangeLake requesting alignment on Bevy version target and outstanding renderer work before starting the upgrade.
 - BrownCreek (2025-10-31 04:58 UTC): Upgraded `scriptbots-bevy` to Bevy 0.17.2, ported renderer/UI/tests to the typed camera/mesh/message APIs, refreshed diagnostics logging, and verified `cargo check -p scriptbots-bevy`; full workspace check currently blocked by `scriptbots-world-gfx` lacking a `scriptbots-core` dependency.
 - BrownCreek (2025-10-31 05:12 UTC): Added per-chunk reflection probes (`LightProbe` + `EnvironmentMapLight`) with shared `ReflectionProbeAssets` handles and documented the bake/refresh playbook in the integration plan.
+- ChartreusePond (2025-10-31 05:28 UTC): wired Bevy HUD tone-mapping buttons (ACES/AgX/Tony) with bias + auto-exposure toggles backed by `TonemappingState`, scheduled new systems, and enabled `AutoExposurePlugin`; config surface/offscreen parity still pending before closing PLAN §11 tone mapping TODO.
+- OrangeCreek (2025-10-31 19:15 UTC): Coordinated lane ownership with WhiteCastle & BrownSnow — automation/parity coverage (HUD readability, golden regeneration, regression workflows) assigned to OrangeCreek, benchmark/stability runs to BrownSnow, render polish backlog to WhiteCastle; set BrownSnow as primary reviewer for upcoming Phase 4 SimulationCommand/UI PR with OrangeCreek secondary, and scheduled daily sync for 2025-11-01 16:00 UTC.
+- OrangeCreek (2025-10-31 19:35 UTC): Expanded Bevy unit tests — multi-resolution offscreen captures now cover 1080p/1440p/4K, and `hud_overlay_populates_metrics` asserts HUD text/shortcuts/auto-pause cues match GPUI copy. Follow-mode tolerance check remains blocked pending replay cursor logs; readability screenshots to be captured once GPU workstation access is available.
+- BrownSnow (2025-10-31 19:15 UTC): Logged Bevy plan coordination ownership (Phase 5 §5) and sent Agent Mail outlining immediate actions: unblock GPU benchmark hardware, kick off soak tests once access confirmed, and track daily async updates alongside the 2025-11-01 16:00 UTC sync.
+- BrownSnow (2025-10-31 19:20 UTC): Added explicit 30-minute soak test commands (GPUI + Bevy) to reference during hardware runs (mirrors `scripts/run_perf_benchmarks.sh` defaults):  
+  ```bash
+  # GPUI soak
+  timeout 1800 env SB_DIAGNOSTICS=1 RUST_LOG=info \
+    SCRIPTBOTS_MAX_THREADS=8 SCRIPTBOTS_FORCE_GUI=1 \
+    cargo run -p scriptbots-app --release --features gui -- \
+    --mode gui --rng-seed 424242 --threads 8 \
+    | tee logs/perf/$(date +%Y%m%d)_default_gui_soak.log
+
+  # Bevy soak
+  timeout 1800 env SB_DIAGNOSTICS=1 \
+    RUST_LOG=info,sb::bevy::diagnostics=info \
+    SCRIPTBOTS_MAX_THREADS=8 SCRIPTBOTS_MODE=bevy \
+    cargo run -p scriptbots-app --release --features bevy_render -- \
+    --mode bevy --rng-seed 424242 --threads 8 \
+    | tee logs/perf/$(date +%Y%m%d)_default_bevy_soak.log
+  ```
+  Pending: add scenario-specific `--config` flags (dense_agents/storm_event) and verify whether we want a dedicated CLI duration argument versus relying on `timeout`.
+- BrownSnow (2025-10-31 19:21 UTC): Submitted Agent Mail contact requests to BrownLake and BlueMountain for immediate Vulkan-capable workstation access; awaiting approval before logging the hardware window in `docs/perf/bevy_vs_gpui.md`.
+- BrownSnow (2025-10-31 19:22 UTC): `cargo test -p scriptbots-bevy -- --nocapture` currently fails — `VertexAttributeValues` import path changed (use `bevy_mesh::vertex::VertexAttributeValues`) and `AgentVisual` initializer in `lib.rs` lacks new fields (`boost`, `eye_dirs`, `eye_fov`, etc.). Flagged for BlueMountain/OrangeCreek follow-up before re-enabling regression snapshots.
+- BrownSnow (2025-10-31 19:23 UTC): Rescheduled the immediate coordination huddle per earlier directive; WhiteCastle has since re-slotted it for 2025-10-31 19:45 UTC with updated agenda.
+- BrownSnow (2025-10-31 19:27 UTC): Resolved `cargo test -p scriptbots-bevy -- --nocapture` failures by switching the test import to `bevy_mesh::VertexAttributeValues`; all Bevy unit/snapshot tests now pass locally.
+- BrownSnow (2025-10-31 19:28 UTC): Added log capture template section to `docs/perf/bevy_vs_gpui.md` so perf runs can drop numbers and log paths without reformatting.
+- BrownSnow (2025-10-31 19:29 UTC): Initial agenda draft captured for the (now 19:45 UTC) coordination huddle — focus on (1) hardware access status, (2) HUD readability sweep progress, (3) render polish breakdown milestones, (4) benchmark execution order once GPU slot confirmed.
+- BrownSnow (2025-10-31 19:31 UTC): Verified `scripts/parse_perf_logs.py` pipeline (`python3 scripts/parse_perf_logs.py logs/perf/20251031_default_bevy.log`); script works and warns when diagnostics are missing, so ready for real GPU logs.
+- BrownSnow (2025-10-31 19:33 UTC): Sent OrangeCreek a reminder about the 20:30 UTC huddle plus offer to help prep automation/parity updates before the call.
+- BrownSnow (2025-10-31 19:34 UTC): Created plan section “Coordination Notes – 2025-10-31 20:30 UTC Huddle” to capture outcomes immediately after the meeting (agenda, attendees, action log placeholder).
+- BrownSnow (2025-10-31 19:35 UTC): Added HUD readability capture guidance to the plan (`--dump-bevy-png` + `--png-size` resolutions) so OrangeCreek can start runs once ready.
+- BrownSnow (2025-10-31 19:36 UTC): Ran `cargo check` (default features) to ensure the workspace is still clean before the meeting; only expected unused helper warnings surfaced.
+- BrownSnow (2025-10-31 19:36 UTC): Sent “Pre-huddle sanity checks” mail summarising build status, HUD capture instructions, and pending GPU access prior to the 20:30 UTC sync.
+- WhiteCastle (2025-10-31 19:18 UTC): Issued immediate follow-up assigning active lanes (benchmarks/stability → BrownSnow, automation/parity → OrangeCreek, render polish → WhiteCastle) with review matrix, scheduled 19:45 UTC huddle, and committed to publishing the polish breakdown table + doc before the meeting window.
+- WhiteCastle (2025-10-31 19:22 UTC): Filed contact requests to BrownLake and BlueMountain for a Vulkan-capable workstation slot, pinged BrownSnow/OrangeCreek with status, and prepared an updated soak-test cheatsheet that references the `scripts/run_perf_benchmarks.sh` helper for quicker launches once hardware is available.
+- WhiteCastle (2025-10-31 19:27 UTC): Re-ran `cargo test -p scriptbots-bevy -- --nocapture`; all unit/snapshot tests pass, confirming BrownSnow’s earlier fix holds in the current workspace.
+- WhiteCastle (2025-10-31 19:30 UTC): Sent Agent Mail “Agenda: 19:45 UTC Bevy integration huddle” outlining discussion topics (hardware access, automation/parity progress, render polish kickoff) and confirming attendance.
+
+**Open follow-ups (tracked 2025-10-31 19:30 UTC – WhiteCastle)**
+- Await BrownLake/BlueMountain response on Vulkan workstation booking; log window in `docs/perf/bevy_vs_gpui.md` once confirmed.
+- During 19:45 UTC huddle: collect automation/parity status from OrangeCreek and assign initial render polish tasks (lighting presets vs tone mapping config).
+- After hardware slot scheduled: launch default scenario benchmark first, then queue dense_agents/storm_event + soak tests using cheatsheet commands.
+
+### Soak Test Launch Cheatsheet (2025-10-31 – WhiteCastle)
+
+```bash
+# 30-minute GPUI soak (adjust --threads to host core count)
+SB_DIAGNOSTICS=1 RUST_LOG=info \
+  scripts/run_perf_benchmarks.sh --renderer gui --scenario default \
+  --threads 16 --duration 1800 --output logs/perf/soak_default_gui.log
+
+# 30-minute Bevy soak with dense agents
+SB_DIAGNOSTICS=1 RUST_LOG=info,sb::bevy::diagnostics=info \
+  scripts/run_perf_benchmarks.sh --renderer bevy --scenario dense_agents \
+  --threads 16 --duration 1800 --output logs/perf/soak_dense_agents_bevy.log
+
+# Storm event scenario with explicit Vulkan backend hint (Linux)
+WGPU_BACKEND=vulkan SB_DIAGNOSTICS=1 RUST_LOG=info \
+  scripts/run_perf_benchmarks.sh --renderer bevy --scenario storm_event \
+  --threads 16 --duration 1800 --output logs/perf/soak_storm_bevy.log
+```
+
+Environment reminders:
+- Ensure the target workstation exposes a Vulkan/Metal/D3D12 adapter; headless containers will fail to create a presentation surface.
+- Keep `logs/perf/` writable so `scripts/parse_perf_logs.py` can summarise the captured diagnostics.

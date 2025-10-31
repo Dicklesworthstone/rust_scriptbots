@@ -187,6 +187,13 @@ _Prepared by RedSnow — 2025-10-30_
 | 4 [Currently In Progress – OrangeLake 2025-10-30] | Interactivity | Agent selection, follow toggles, command buttons. | Round-trip commands (select agent) confirmed via simulation logs. |
 | 5 | Polish + QA | Performance tuning, lighting, debug overlays, CI integration. | Bevy path passes `render_regression` job + manual smoke checklist. |
 
+- Phase 2 & 3 Review Punch-List [In Progress – OrangeCreek 2025-10-31]
+  - [x] Validate camera orbit/pan/zoom parity against GPUI shortcuts (`F`, `Ctrl+F`, `Ctrl+W`, `Q/E`, `PageUp/PageDown`, WASD + middle-mouse). _[Completed – OrangeCreek 2025-10-31]_ Reviewed `control_camera` key handling, confirmed bindings match GPUI spec, and exercised via `cargo test -p scriptbots-bevy` (covers camera shortcut + playback unit tests).
+  - [ ] Confirm follow-mode cycle (Off/Selected/Oldest) maintains target in frame within ±3 % distance/yaw tolerance using shared cursor logs. _Blocked pending replay cursor logs; need capture from interactive session to compute deltas._
+  - [x] Exercise HUD overlays for selection details, playback multiplier, FPS, and world stats; verify copy & formatting match GPUI snapshots. _[Completed – OrangeCreek 2025-10-31]_ Added `hud_overlay_populates_metrics` system test to assert shortcut hints, selection copy, and auto-pause messaging align with GPUI strings.
+  - [ ] Capture readability screenshots at 1080p, 1440p, 4K; log findings in `docs/rendering_reference/coordination.md`. _Blocked – automated offscreen renders now pass at target resolutions; awaiting visual QA capture once GPU workstation is free._
+  - [ ] Document review outcomes & sign-off in plan once two reviewers approve.
+
 - Progress (2025-10-30 – RedSnow): Scaffolded `scriptbots-bevy` crate, workspace feature flag, CLI `--renderer=bevy`, and stub window launcher [Phase 0 ✅].
 - Progress (2025-10-30 – RedSnow): Phase 1 baseline in place — Bevy renderer streams live `WorldState` snapshots, displays placeholder ground plane + agent spheres, and logs tick cadence every 120 frames; establishes plumbing for terrain/material upgrades.
 - Progress (2025-10-30 – RedSnow): Minted `docs/rendering_reference/golden/bevy_default.png` via new `--dump-bevy-png` flag; checksum recorded in `docs/rendering_reference/checksums.txt`.
@@ -203,6 +210,8 @@ _Prepared by RedSnow — 2025-10-30_
 - Progress (2025-10-31 – GPT-5 Codex): WFC terrain snapshot export, chunked heightfield meshing, and agent elevation alignment landed; snapshot harness updated for deterministic regeneration.
 - Progress (2025-10-31 – BrownLake): Documented SimulationCommand handshake + HUD palette updates, updated coordination log, and notified RedSnow/OrangeLake for review.
 - Progress (2025-10-31 – BrownLake): Added cross-platform Bevy launch scripts (Windows/Linux/macOS), updated README quickstart instructions, and closed out plan §7.2 scripting checklist pending QA follow-up.
+- Coordination (2025-10-31 – OrangeCreek): Aligned with WhiteCastle & BrownSnow on remaining Bevy integration lanes — OrangeCreek owning automation/parity coverage, BrownSnow handling benchmarks + stability sweeps, WhiteCastle driving render polish backlog; BrownSnow will primary-review the Phase 4 SimulationCommand/UI wiring with an OrangeCreek secondary pass. Initial rolling check-ins pencilled for 2025-10-31 20:30 UTC; superseded by the 19:45 UTC huddle noted below, plus the standing daily sync on 2025-11-01 16:00 UTC.
+- Coordination (2025-10-31 – WhiteCastle): Confirmed immediate execution plan with BrownSnow & OrangeCreek — same lane ownership, 2025-10-31 19:45 UTC huddle to unblock hardware access, automation PRs, and render polish sequencing. Review pairings: BrownSnow primary on automation/parity PRs, OrangeCreek primary on render polish branches, WhiteCastle primary on benchmark/stability artifacts. Target is to lock first deliverables within the next 6 hours and publish status back here.
 
 #### Phase 5 QA & Performance Checklist [Currently In Progress – BrownLake 2025-10-31]
 
@@ -230,40 +239,60 @@ _Prepared by RedSnow — 2025-10-30_
 - [ ] Regression automation
   - [x] Extend `render_regression` workflow to run Bevy snapshot/camera tests on Linux headless GPU (reuse existing path filters).
   - [x] Add opt-in `cargo test -p scriptbots-bevy -- --include-ignored` job for exhaustive runs before releases.
+  - [In Progress – OrangeCreek 2025-10-31] Exercised `render_png_offscreen` at 1080p/1440p/4K via expanded unit test; HUD metrics coverage added (`hud_overlay_populates_metrics`) to guard shortcut copy and auto-pause messaging.
+  - [In Progress – OrangeCreek 2025-10-31] Golden refresh playbook drafted (`BEVY_REGEN_GOLDEN=1 cargo test -p scriptbots-bevy --test snapshot`); awaiting lighting/material updates before executing.
 - [ ] Visual parity spot-checks
   - [ ] Rebuild Bevy golden PNG after lighting polish; diff against GPUI using histogram/feature checks documented in §6.1.
-  - [ ] Validate HUD overlays (selection/playback/follow) for readability at 1080p, 1440p, and 4K.
+  - [In Progress – OrangeCreek 2025-10-31] Automated multi-resolution render smoke tests green; awaiting manual readability review + screenshots for 1080p/1440p/4K capture.
+    - [In Progress – OrangeCreek 2025-10-31] Use `cargo run -p scriptbots-app --features bevy_render -- --mode bevy --dump-bevy-png <out.png> --png-size <WIDTHxHEIGHT>` (1920x1080, 2560x1440, 3840x2160) to capture HUD snapshots; document readability results in the coordination log and attach PNG paths.
 - [x] Snapshot refresh status: No lighting/material changes landed in this pass; defer golden regeneration until next visual update. Documented in coordination log.
 - [ ] Stability sweeps
   - [x] Documented soak-test procedure in `docs/perf/bevy_vs_gpui.md` (diagnostics-on, 30-minute runtime, per-platform targets).
   - [ ] Run 30-minute soak tests on Windows (D3D12 + Vulkan) and Linux (Vulkan) ensuring no panics or runaway memory growth.
   - [ ] Track auto-pause reasons and ensure SimulationCommand feedback loop remains consistent after long runs.
-- [ ] Coordination
+- [ ] [Currently In Progress – BrownSnow 2025-10-31] Coordination
   - [x] Confirm responsibilities with OrangeLake/RedSnow via Agent Mail before executing benchmarks.
-  - [ ] Publish findings + required follow-ups in `docs/rendering_reference/coordination.md`.
+  - [x] [Completed – OrangeCreek 2025-10-31 19:15 UTC] Capture lane split + review plan in coordination log after automation punch-list publication and reference BrownSnow’s Vulkan blocker notes in `docs/perf/bevy_vs_gpui.md`.
+  - [In Progress – WhiteCastle 2025-10-31 19:22 UTC] Ping BrownLake + BlueMountain for immediate Vulkan hardware slot; contact requests filed, awaiting approval before logging confirmed slot in `docs/perf/bevy_vs_gpui.md`.
+  - [x] [Completed – BrownSnow 2025-10-31 19:20 UTC] Draft soak-test execution commands/env vars in `docs/rendering_reference/coordination.md` while hardware access is pending.
+  - [x] [Completed – WhiteCastle 2025-10-31 19:27 UTC] Re-ran `cargo test -p scriptbots-bevy -- --nocapture`; suite is green, confirming the previously reported AgentVisual/VertexAttributeValues regression is resolved upstream.
+  - [x] [Completed – WhiteCastle 2025-10-31 19:31 UTC] Logged results + open follow-ups in `docs/rendering_reference/coordination.md` (see “Open follow-ups” list covering hardware booking, automation status, render polish kickoff).
+  - [x] [Completed – BrownSnow 2025-10-31 19:30 UTC] Circulated agenda + attendance check for 20:30 UTC coordination huddle via Agent Mail (“20:30 UTC Bevy check-in – agenda & roll call”).
+  - [x] [Completed – BrownSnow 2025-10-31 19:33 UTC] Pinged OrangeCreek privately to confirm availability for the 20:30 UTC huddle and offer prep support on automation/parity items.
+  - [x] [Completed – BrownSnow 2025-10-31 19:31 UTC] Verified `scripts/parse_perf_logs.py` output path (`python3 scripts/parse_perf_logs.py logs/perf/20251031_default_bevy.log`) so benchmark logs can be summarised immediately once GPU runs succeed.
+  - [x] [Completed – BrownSnow 2025-10-31 19:36 UTC] Ran `cargo check` (default features) to confirm workspace builds cleanly ahead of coordination huddle; only pre-existing unused helper warnings observed.
+  - [In Progress – OrangeCreek 2025-10-31 19:35 UTC] Requested WhiteCastle to get OrangeLake registered on Agent Mail; Phase 4 review coordination remains blocked until OrangeLake appears in `resource://agents/data-projects-rust-scriptbots`.
 
-#### Bevy 3D Agent Avatars [Currently In Progress – BrownLake 2025-10-31]
+#### Bevy 3D Agent Avatars [Currently In Progress – BlueMountain 2025-10-31]
 
-- [ ] Establish rich Bevy agent data plumbing
-  - [ ] Reconcile `TerrainChunkStats` changes blocking current build (add missing fields / adjust mesh pipeline).
-  - [ ] Extend Bevy snapshot conversion to include:
-    - [ ] Wheel velocities / boost / reproduction metrics.
-    - [ ] Trait modifiers (eye, smell, sound, blood) and sensor metadata (eye dirs/FOV, sound multiplier).
-    - [ ] Mouth/food delta, sound level/output, herbivore tendency, temperature preference.
-  - [ ] Ensure new fields are feature-flagged to avoid impacting GPUI/terminal builds.
-- [ ] 3D geometry + materials
-  - [ ] Model capsule body + dual wheels with instanced meshes (capsule + torus/lathed wheels).
-  - [ ] Add spike mesh with length/intensity tint driven from runtime data.
-  - [ ] Implement mouth slot, diet accent band, and boost exhaust using emissive/alpha quads.
-  - [ ] Attach sensor meshes (eyes/ears) scaled by trait modifiers; orient via eye directions.
-- [ ] Visual effects & state cues
-  - [ ] Encode herbivore vs carnivore tinting via material uniforms.
-  - [ ] Animate mouth aperture with food_delta/sound_output.
-  - [ ] Add temperature indicator, vocalization arcs, and selection/indicator halos using additive quads or decals.
+- [x] Establish rich Bevy agent data plumbing [Completed – BlueMountain 2025-10-31 @ 06:05 UTC]
+  - [x] Reconcile `TerrainChunkStats` changes blocking current build (add missing fields / adjust mesh pipeline). [Completed – BlueMountain 2025-10-31 @ 06:05 UTC]
+  - [x] Extend Bevy snapshot conversion to include:
+    - [x] Wheel velocities / boost / reproduction metrics.
+    - [x] Trait modifiers (eye, smell, sound, blood) and sensor metadata (eye dirs/FOV, sound multiplier).
+    - [x] Mouth/food delta, sound level/output, herbivore tendency, temperature preference.
+  - [x] Ensure new fields are feature-flagged to avoid impacting GPUI/terminal builds.
+- [x] 3D geometry + materials [Completed – BlueMountain 2025-10-31 @ 06:05 UTC]
+  - [x] Model capsule body + dual wheels with instanced meshes (capsule + torus/lathed wheels).
+  - [x] Add spike mesh with length/intensity tint driven from runtime data.
+  - [x] Implement mouth slot, diet accent band, and boost exhaust using emissive/alpha quads.
+  - [x] Attach sensor meshes (eyes/ears) scaled by trait modifiers; orient via eye directions.
+- [x] Visual effects & state cues [Completed – BlueMountain 2025-10-31 @ 06:34 UTC]
+  - [x] Encode herbivore vs carnivore tinting via material uniforms.
+  - [x] Animate mouth aperture with food_delta/sound_output.
+  - [x] [Completed – BlueMountain 2025-10-31 @ 06:32 UTC] Add vocalization arcs and directional audio decals.
+    - [x] Spawn dedicated additive quads/meshes for inner/outer sonic arcs aligned to heading.
+    - [x] Drive scale/opacity from `sound_output`, `sound_multiplier`, and `sound_level`.
+    - [x] Cull/hide arcs when amplitude falls below threshold.
+  - [x] Fold selection halos and boost flames into the visibility logic so inactive agents skip those draw calls.
 - [ ] Shader & pipeline updates
-  - [ ] Update Bevy material/shader to blend layers similar to CPU/WGPU renderers.
-  - [ ] Support palette overrides (natural vs accessibility palettes).
-  - [ ] Optimize for instancing / batching (limit per-agent draw calls).
+  - [x] [Completed – BlueMountain 2025-10-31 @ 06:34 UTC] Introduce Bevy-side accessibility palette support.
+    - [x] Mirror `ColorPaletteMode` enum + transforms.
+    - [x] Add renderer resource storing current palette (keyboard + HUD toggle).
+    - [x] Apply palette adjustments to agent materials and HUD swatches.
+  - [ ] Optimize agent draw calls / batching.
+    - [x] Add visibility toggles for zero-intensity overlays (boost, indicator, vocalization, selection).
+    - [ ] Evaluate grouping of add-on quads into shared gizmo/mesh batches and document follow-up for full instancing path.
 - [ ] Validation
   - [ ] Add snapshot capture of Bevy 3D avatars (headless `--dump-bevy-png`) and compare against CPU reference.
   - [ ] Document new assets/material workflow and update coordination log.
@@ -364,7 +393,7 @@ Once phases progress, update this document inline with `[In Progress – <Name>]
 
 ---
 
-## 11. Visual Polish Roadmap [Currently In Progress - GPT-5 Codex 2025-10-31]
+## 11. Visual Polish Roadmap [Currently In Progress – GPT-5 Codex • ChartreusePond 2025-10-31]
 
 1. **Lighting & Reflections**  
    - Spawn per-chunk `ReflectionProbeBundle` entities and rely on the 0.16 clustered renderer so probes update only when the terrain chunk actually changes; use the probe visualization pass to tune extents before baking cubemaps. citeturn6search0  
@@ -374,6 +403,7 @@ Once phases progress, update this document inline with `[In Progress – <Name>]
 2. **Tone Mapping & Post FX**  
    - Wire runtime toggles for ACES, AgX, and TonyMcMapface through the `Tonemapping` component and ship LUT assets alongside the renderer config so QA can validate output against the official example. citeturn9search3turn9search5  
    - Add the `AutoExposurePlugin` with per-camera speed and compensation overrides so storms and day/night transitions smoothly rebalance exposure instead of popping. citeturn16search0turn9search6turn9search0
+   - _[In Progress – ChartreusePond 2025-10-31]_ HUD now exposes ACES/AgX/Tony toggles driven by a shared `TonemappingState`, and the Bevy app registers `AutoExposurePlugin` so we can attach or remove `AutoExposure` per camera in response to UI events while we flesh out config + offscreen parity. citeturn0search4turn0search3turn1search0turn1search1
 
 3. **Atmosphere & Fog**  
    - Use the volumetric fog volumes added in 0.15 to author biome-specific haze profiles (valley mist, alpine thin air) with density/height curves driven by terrain metadata. citeturn15search0  
@@ -454,9 +484,31 @@ Once phases progress, update this document inline with `[In Progress – <Name>]
 
 ### Visual Polish Execution TODO [Currently In Progress - GPT-5 Codex 2025-10-31]
 
+#### Render Polish Breakdown (2025-10-31 – WhiteCastle)
+
+| Bucket | Deliverables | Owner | Acceptance Checks |
+| --- | --- | --- | --- |
+| Lighting presets | DLSS/FSR3 toggle prototype, ray-traced area light preset, reflection probe bake workflow update | WhiteCastle (primary), OrangeCreek (secondary) | Frame captures at 1080p/4K showing preset delta, perf trace with <10% frame-time regression, documented toggles in `render.config.toml`. |
+| Tone mapping & exposure | ACES/AgX/TonyMcMapface UI toggles, per-camera auto-exposure curves, config surface parity with GPUI | WhiteCastle (primary), OrangeCreek (secondary) | Snapshot harness diff within tolerance for default curve, QA checklist covering dark/bright scenes, config docs updated. |
+| Atmosphere & fog | Biome fog/sky profiles using volumetric volumes + time-of-day hooks | WhiteCastle (primary), BrownSnow (perf sanity) | 1080p/1440p captures across three biomes, perf counters stable (<5% frame-time delta), HUD readability unaffected. |
+| Terrain shading/materials | GPU-driven heightfield meshing port, slope/curvature/moisture texture bake, decal overlays | WhiteCastle (primary), BrownSnow (secondary) | Mesh rebuild latency under target, material screenshots before/after, automated test covering asset loading. |
+| Particles & FX | Hanabi library (ambient, weather, combat), tint sync with atmospheric data | WhiteCastle (primary), OrangeCreek (secondary) | Particle presets catalogued, toggle to disable for perf testing, snapshot comparisons logged. |
+| Camera rigs | Orbit/inspector/cinematic rigs, screenshot presets, QA checklist | WhiteCastle (primary), OrangeCreek (secondary) | `docs/rendering_reference/camera_checklist.md` updated, snapshot harness generates per-rig outputs, user shortcuts documented. |
+| Agent styling | Rigged glTF import, animation graph states, decal-driven vision cones | WhiteCastle (primary), BrownSnow (secondary for perf) | Animation coverage tests, GPU profiler capture verifying batching targets met, design review sign-off. |
+| Spike FX | Spline spike meshes, Hanabi impact bursts, decal scorch marks | WhiteCastle (primary), OrangeCreek (secondary) | Visual diff vs GPUI references, automated sanity test ensuring assets load, perf impact documented. |
+| Weather & hydrology | `WeatherState` resource, puddle decals, splash particles tied to hydrology | WhiteCastle (primary), BrownSnow (perf secondary) | Sim harness scenario logging weather transitions, screencaps across weather states, memory usage plotted over 30-minute soak. |
+| Debug tooling | Overlay extensions (weather, hydrology, behavior), HDR/PNG snapshot automation | WhiteCastle (primary), OrangeCreek (secondary) | Debug panels accessible via shortcut, CI job green with new HDR diff, documentation added to plan. |
+
+Reference: `docs/rendering_reference/bevy_polish_plan.md` for extended notes and meeting cadence.
+
+#### Coordination Notes – 2025-10-31 19:45 UTC Huddle [Pending – WhiteCastle]
+- Agenda: hardware access status, automation/parity progress, render-polish milestone sequencing, benchmark execution order.
+- Attendees: BrownSnow (confirm via Agent Mail #31), WhiteCastle (agenda owner), OrangeCreek (reminder sent via Agent Mail #31).
+- Action log: _to be populated post-huddle._
+
 - [x] Lighting: instantiate chunk-scoped reflection probes on the 0.16 clustered path and publish the bake/refresh playbook.  _[Completed – BrownCreek 2025-10-31: per-chunk `LightProbe` + `EnvironmentMapLight` spawning in `sync_terrain`, configurable via `ReflectionProbeAssets`]_  
 - [ ] Lighting: prototype 0.17 DLSS/FSR3 and ray-traced area lights for cinematic capture presets.  
-- [ ] Tone mapping: add ACES/AgX/TonyMcMapface toggles plus per-camera auto exposure curves wired to `render.config.toml`.  
+- [ ] Tone mapping: add ACES/AgX/TonyMcMapface toggles plus per-camera auto exposure curves wired to `render.config.toml`.  _[In Progress – ChartreusePond 2025-10-31: UI buttons + `TonemappingState` + `AutoExposurePlugin` landed in `scriptbots-bevy`; config surface + offscreen parity still pending]_
 - [ ] Atmosphere: author biome fog/sky profiles using 0.15 volumetric volumes and humidity/time-of-day hooks.  
 - [ ] Terrain shading: port heightfield meshing to the GPU-driven renderer and stage meshlet-based close-up refinement.  
 - [ ] Terrain materials: bake slope/curvature/moisture textures and integrate the 0.16 decal system for erosion/wetness overlays.  
