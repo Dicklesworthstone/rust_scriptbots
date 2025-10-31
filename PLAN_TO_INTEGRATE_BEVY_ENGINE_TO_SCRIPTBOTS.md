@@ -6,6 +6,18 @@ _Prepared by RedSnow — 2025-10-30_
 
 ---
 
+### Phase 4 Working TODO — OrangeLake (2025-10-31)
+
+- [x] Audit current GPUI follow controls and ensure Bevy follow buttons mirror behaviour/labels (🎯 parity check).
+- [x] Confirm Bevy selection radius matches GPUI fallback (`max(bot_radius * 3, 24)`).
+- [x] Add HUD action row with follow-mode buttons + clear selection wired to `ControlCommand::UpdateSelection`.
+- [ ] Guard button visuals (active/hover colours) with GPUI-like accents and icons.
+- [ ] Surface keyboard shortcut hints next to buttons (F / Ctrl+S / Ctrl+O / Esc).
+- [ ] Capture trace log showing command submissions when clicking follow buttons / clear selection.
+- [ ] Evaluate need for pause/resume controls and spec follow-up with RedSnow (pending contact ack).
+
+---
+
 ## 0. Guiding Principles
 
 1. **Feature-flag everything**  
@@ -148,7 +160,6 @@ _Prepared by RedSnow — 2025-10-30_
 
 - Progress (2025-10-30 – RedSnow): Scaffolded `scriptbots-bevy` crate, workspace feature flag, CLI `--renderer=bevy`, and stub window launcher [Phase 0 ✅].
 - Progress (2025-10-30 – RedSnow): Phase 1 baseline in place — Bevy renderer streams live `WorldState` snapshots, displays placeholder ground plane + agent spheres, and logs tick cadence every 120 frames; establishes plumbing for terrain/material upgrades.
-- Progress (2025-10-31 – GPT-5 Codex): WFC terrain snapshot export and chunked heightfield meshing landed; agents sample terrain elevation. Next: procedural material polish + histogram/feature checks for parity.
 - Progress (2025-10-30 – RedSnow): Minted `docs/rendering_reference/golden/bevy_default.png` via new `--dump-bevy-png` flag; checksum recorded in `docs/rendering_reference/checksums.txt`.
 - Progress (2025-10-30 – RedSnow): Added `crates/scriptbots-bevy/tests/snapshot.rs` comparing `render_png_offscreen` output against `golden/bevy_default.png`; diff tooling now fails tests on byte mismatches.
 - Progress (2025-10-30 – RedSnow): Camera controls underway — mouse orbit/scroll zoom/WASD pan implemented via `CameraRig`; `F` toggles follow mode, while Q/E yaw and PageUp/PageDown pitch mirror GPUI shortcuts.
