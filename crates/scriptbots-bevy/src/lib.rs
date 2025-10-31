@@ -2,16 +2,15 @@
 
 use anyhow::{Result, anyhow};
 use bevy::render::{
+    mesh::{Indices, Mesh, PrimitiveTopology},
     render_asset::RenderAssetUsages,
-    render_resource::{Extent3d, TextureDimension, TextureFormat},
-    texture::ImageSampler,
 };
 use bevy::{
     app::AppExit,
     ecs::schedule::IntoSystemConfigs,
     ecs::system::NonSendMut,
     input::mouse::{MouseMotion, MouseWheel},
-    math::primitives::{Plane3d, Sphere},
+    math::primitives::Sphere,
     prelude::*,
     window::{PresentMode, PrimaryWindow, WindowPlugin},
 };
@@ -120,9 +119,6 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
 }
 
 #[derive(Component)]
-struct GroundPlane;
-
-#[derive(Component)]
 struct PrimaryCamera;
 
 struct SnapshotInbox {
@@ -172,6 +168,8 @@ const CAMERA_MAX_DISTANCE: f32 = 6000.0;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
 const FIT_WORLD_FACTOR: f32 = 0.38;
 const FIT_SELECTION_FACTOR: f32 = 0.55;
+const TERRAIN_CHUNK_SIZE: u32 = 64;
+const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
 
 fn bounds_extent(bounds: (Vec2, Vec2)) -> Vec2 {
     let size = bounds.1 - bounds.0;
@@ -285,12 +283,6 @@ impl CameraRig {
 }
 
 #[derive(Resource)]
-struct TerrainResources {
-    texture: Handle<Image>,
-    dims: (u32, u32),
-}
-
-#[derive(Resource)]
 struct HudElements {
     tick: Entity,
     agents: Entity,
@@ -302,11 +294,122 @@ struct HudElements {
     world: Entity,
 }
 
+#[derive(Resource, Default)]
+struct FollowButtons {
+    buttons: Vec<(FollowMode, Entity)>,
+}
+
+#[derive(Component)]
+struct FollowButton {
+    mode: FollowMode,
+}
+
+#[derive(Component)]
+struct ClearSelectionButton;
+
 #[derive(Clone)]
-struct TerrainImage {
+struct TerrainColorMap {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct TerrainHeightSnapshot {
+    dims: UVec2,
+    cell_size: u32,
+    elevation: Vec<f32>,
+    moisture: Vec<f32>,
+    accent: Vec<f32>,
+    fertility: Vec<f32>,
+    temperature: Vec<f32>,
+    kinds: Vec<TerrainKind>,
+}
+
+impl TerrainHeightSnapshot {
+    fn new(layer: &scriptbots_core::TerrainLayer) -> Self {
+        let dims = UVec2::new(layer.width(), layer.height());
+        let total = (dims.x as usize) * (dims.y as usize);
+        let mut elevation = Vec::with_capacity(total);
+        let mut moisture = Vec::with_capacity(total);
+        let mut accent = Vec::with_capacity(total);
+        let mut fertility = Vec::with_capacity(total);
+        let mut temperature = Vec::with_capacity(total);
+        let mut kinds = Vec::with_capacity(total);
+        for tile in layer.tiles() {
+            elevation.push(tile.elevation);
+            moisture.push(tile.moisture);
+            accent.push(tile.accent);
+            fertility.push(tile.fertility_bias);
+            temperature.push(tile.temperature_bias);
+            kinds.push(tile.kind);
+        }
+        Self {
+            dims,
+            cell_size: layer.cell_size(),
+            elevation,
+            moisture,
+            accent,
+            fertility,
+            temperature,
+            kinds,
+        }
+    }
+
+    fn index(&self, x: u32, y: u32) -> usize {
+        (y as usize) * (self.dims.x as usize) + (x as usize)
+    }
+
+    fn sample_tile(&self, x: u32, y: u32) -> TerrainTileSample {
+        let clamped_x = x.min(self.dims.x.saturating_sub(1));
+        let clamped_y = y.min(self.dims.y.saturating_sub(1));
+        let idx = self.index(clamped_x, clamped_y);
+        TerrainTileSample {
+            kind: self.kinds[idx],
+            elevation: self.elevation[idx],
+            moisture: self.moisture[idx],
+            accent: self.accent[idx],
+            _fertility: self.fertility[idx],
+            _temperature: self.temperature[idx],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerrainTileSample {
+    kind: TerrainKind,
+    elevation: f32,
+    moisture: f32,
+    accent: f32,
+    _fertility: f32,
+    _temperature: f32,
+}
+
+#[derive(Default, Resource)]
+struct TerrainChunkRegistry {
+    chunks: HashMap<TerrainChunkKey, TerrainChunkRecord>,
+    chunk_size: u32,
+    height_scale: f32,
+    material: Option<Handle<StandardMaterial>>,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct TerrainChunkKey {
+    x: u32,
+    y: u32,
+}
+
+struct TerrainChunkRecord {
+    entity: Entity,
+    mesh: Handle<Mesh>,
+    bounds: TerrainChunkBounds,
+    last_tick: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TerrainChunkBounds {
+    origin: UVec2,
+    size: UVec2,
 }
 
 #[derive(Clone)]
@@ -314,7 +417,8 @@ struct WorldSnapshot {
     tick: u64,
     world_size: Vec2,
     agent_radius: f32,
-    terrain: TerrainImage,
+    terrain_color: TerrainColorMap,
+    terrain_height: TerrainHeightSnapshot,
     agents: Vec<AgentVisual>,
 }
 
@@ -340,6 +444,7 @@ impl WorldSnapshot {
         let terrain_layer = world.terrain();
         let terrain_w = terrain_layer.width();
         let terrain_h = terrain_layer.height();
+        let terrain_height = TerrainHeightSnapshot::new(terrain_layer);
 
         let arena = world.agents();
         let columns = arena.columns();
@@ -376,22 +481,18 @@ impl WorldSnapshot {
             tick: world.tick().0,
             world_size: Vec2::new(width, height),
             agent_radius: config.bot_radius.max(1.0),
-            terrain: TerrainImage {
+            terrain_color: TerrainColorMap {
                 width: terrain_w,
                 height: terrain_h,
                 pixels: terrain_pixels,
             },
+            terrain_height,
             agents,
         })
     }
 }
 
-fn setup_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-) {
+fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.spawn((
         Camera3dBundle {
             transform: Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -410,48 +511,15 @@ fn setup_scene(
         ..Default::default()
     });
 
-    let mut placeholder_image = Image::new_fill(
-        Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        &[24, 32, 44, 255],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
-    );
-    placeholder_image.sampler = ImageSampler::nearest();
-    let terrain_texture = images.add(placeholder_image);
-
-    let plane_mesh = meshes.add(Mesh::from(Plane3d::default()));
-    let plane_material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        base_color_texture: Some(terrain_texture.clone()),
-        perceptual_roughness: 0.92,
-        metallic: 0.02,
-        reflectance: 0.06,
-        ..Default::default()
-    });
-
-    commands.spawn((
-        PbrBundle {
-            mesh: plane_mesh,
-            material: plane_material.clone(),
-            transform: Transform::default(),
-            ..Default::default()
-        },
-        GroundPlane,
-    ));
-
     let agent_mesh = meshes.add(Mesh::from(Sphere::new(1.0)));
     commands.insert_resource(AgentMeshAsset {
         mesh: agent_mesh,
         base_radius: 1.0,
     });
-    commands.insert_resource(TerrainResources {
-        texture: terrain_texture,
-        dims: (1, 1),
+    commands.insert_resource(TerrainChunkRegistry {
+        chunk_size: TERRAIN_CHUNK_SIZE,
+        height_scale: TERRAIN_HEIGHT_SCALE,
+        ..Default::default()
     });
     commands.insert_resource(CameraRig::default());
 
@@ -552,11 +620,10 @@ fn sync_world(
     mut commands: Commands,
     mut state: ResMut<SnapshotState>,
     mut registry: ResMut<AgentRegistry>,
-    mut terrain: ResMut<TerrainResources>,
-    mut images: ResMut<Assets<Image>>,
+    mut terrain_registry: ResMut<TerrainChunkRegistry>,
     assets: Res<AgentMeshAsset>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut plane_query: Query<&mut Transform, With<GroundPlane>>,
 ) {
     let Some(snapshot) = state.latest.as_ref() else {
         return;
@@ -596,14 +663,19 @@ fn sync_world(
     let selection_center = selection_bounds.map(|(min, max)| (min + max) * 0.5);
     let focus_point = selection_center.or(first_agent).unwrap_or(world_center);
 
-    align_ground_plane(snapshot, &mut plane_query);
-    update_terrain_texture(snapshot, &mut terrain, &mut images);
+    sync_terrain(
+        snapshot,
+        &mut commands,
+        &mut terrain_registry,
+        meshes.as_mut(),
+        materials.as_mut(),
+    );
     sync_agents(
         snapshot,
         &mut commands,
         &mut registry,
         &assets,
-        &mut materials,
+        materials.as_mut(),
     );
 
     state.last_applied_tick = snapshot_tick;
@@ -797,10 +869,7 @@ fn handle_selection_input(
         return;
     }
 
-    let world_point = Vec2::new(
-        impact.x + world_size.x * 0.5,
-        world_size.y * 0.5 - impact.z,
-    );
+    let world_point = Vec2::new(impact.x + world_size.x * 0.5, world_size.y * 0.5 - impact.z);
 
     let selection_radius = (snapshot.agent_radius * 3.0).max(24.0);
     let radius_sq = selection_radius * selection_radius;
@@ -1048,38 +1117,470 @@ fn control_camera(
     transform.look_at(center, Vec3::Y);
 }
 
-fn align_ground_plane(
+fn sync_terrain(
     snapshot: &WorldSnapshot,
-    plane_query: &mut Query<&mut Transform, With<GroundPlane>>,
+    commands: &mut Commands,
+    registry: &mut TerrainChunkRegistry,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
 ) {
-    if let Ok(mut transform) = plane_query.get_single_mut() {
-        let width = snapshot.world_size.x.max(1.0);
-        let height = snapshot.world_size.y.max(1.0);
-        transform.scale = Vec3::new(width, 1.0, height);
+    let dims = snapshot.terrain_height.dims;
+    if dims.x == 0 || dims.y == 0 {
+        return;
+    }
+
+    let chunk_size = registry.chunk_size.max(1);
+    let chunks_x = (dims.x + chunk_size - 1) / chunk_size;
+    let chunks_y = (dims.y + chunk_size - 1) / chunk_size;
+
+    let material_handle = if let Some(handle) = registry.material.clone() {
+        handle
+    } else {
+        let handle = materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.82,
+            metallic: 0.02,
+            reflectance: 0.05,
+            ..Default::default()
+        });
+        registry.material = Some(handle.clone());
+        handle
+    };
+
+    let mut seen: HashSet<TerrainChunkKey> = HashSet::with_capacity((chunks_x * chunks_y) as usize);
+
+    for chunk_y in 0..chunks_y {
+        for chunk_x in 0..chunks_x {
+            let key = TerrainChunkKey {
+                x: chunk_x,
+                y: chunk_y,
+            };
+
+            let bounds = TerrainChunkBounds {
+                origin: UVec2::new(chunk_x * chunk_size, chunk_y * chunk_size),
+                size: UVec2::new(
+                    (chunk_size).min(dims.x.saturating_sub(chunk_x * chunk_size)),
+                    (chunk_size).min(dims.y.saturating_sub(chunk_y * chunk_size)),
+                ),
+            };
+
+            if bounds.size.x == 0 || bounds.size.y == 0 {
+                continue;
+            }
+
+            seen.insert(key);
+
+            let mesh = build_chunk_mesh(snapshot, bounds, registry.height_scale);
+
+            if let Some(record) = registry.chunks.get_mut(&key) {
+                if let Some(existing) = meshes.get_mut(&record.mesh) {
+                    *existing = mesh;
+                } else {
+                    let mesh_handle = meshes.add(mesh);
+                    record.mesh = mesh_handle.clone();
+                    commands.entity(record.entity).insert(mesh_handle);
+                }
+                record.bounds = bounds;
+                record.last_tick = snapshot.tick;
+            } else {
+                let mesh_handle = meshes.add(mesh);
+                let entity = commands
+                    .spawn(PbrBundle {
+                        mesh: mesh_handle.clone(),
+                        material: material_handle.clone(),
+                        transform: Transform::IDENTITY,
+                        ..Default::default()
+                    })
+                    .id();
+                registry.chunks.insert(
+                    key,
+                    TerrainChunkRecord {
+                        entity,
+                        mesh: mesh_handle,
+                        bounds,
+                        last_tick: snapshot.tick,
+                    },
+                );
+            }
+        }
+    }
+
+    let stale: Vec<_> = registry
+        .chunks
+        .keys()
+        .copied()
+        .filter(|key| !seen.contains(key))
+        .collect();
+
+    for key in stale {
+        if let Some(record) = registry.chunks.remove(&key) {
+            commands.entity(record.entity).despawn_recursive();
+            meshes.remove(&record.mesh);
+        }
     }
 }
 
-fn update_terrain_texture(
+fn build_chunk_mesh(
     snapshot: &WorldSnapshot,
-    terrain: &mut TerrainResources,
-    images: &mut Assets<Image>,
-) {
-    if let Some(image) = images.get_mut(&terrain.texture) {
-        let new_image = Image::new_fill(
-            Extent3d {
-                width: snapshot.terrain.width.max(1),
-                height: snapshot.terrain.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            TextureDimension::D2,
-            &snapshot.terrain.pixels,
-            TextureFormat::Rgba8UnormSrgb,
-            RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
-        );
-        *image = new_image;
-        image.sampler = ImageSampler::nearest();
+    bounds: TerrainChunkBounds,
+    height_scale: f32,
+) -> Mesh {
+    let terrain = &snapshot.terrain_height;
+    let cell_size = terrain.cell_size as f32;
+    let half = snapshot.world_size * 0.5;
+
+    let verts_x = bounds.size.x + 1;
+    let verts_z = bounds.size.y + 1;
+    let vertex_count = (verts_x * verts_z) as usize;
+
+    let mut positions = Vec::with_capacity(vertex_count);
+    let mut normals = vec![Vec3::ZERO; vertex_count];
+    let mut uvs = Vec::with_capacity(vertex_count);
+    let mut colors = Vec::with_capacity(vertex_count);
+
+    for vz in 0..verts_z {
+        for vx in 0..verts_x {
+            let global_x = bounds.origin.x + vx;
+            let global_z = bounds.origin.y + vz;
+            let height =
+                sample_height_linear(terrain, global_x as f32, global_z as f32, height_scale);
+            let world_x = global_x as f32 * cell_size - half.x;
+            let world_z = half.y - global_z as f32 * cell_size;
+            positions.push([world_x, height, world_z]);
+
+            let uv_x = global_x as f32 / terrain.dims.x.max(1) as f32;
+            let uv_z = global_z as f32 / terrain.dims.y.max(1) as f32;
+            uvs.push([uv_x, uv_z]);
+
+            let color = terrain_vertex_color(terrain, global_x, global_z);
+            colors.push(color);
+        }
     }
-    terrain.dims = (snapshot.terrain.width, snapshot.terrain.height);
+
+    let mut indices = Vec::with_capacity((bounds.size.x * bounds.size.y * 6) as usize);
+    let stride = verts_x;
+    for z in 0..bounds.size.y {
+        for x in 0..bounds.size.x {
+            let i0 = (z * stride + x) as u32;
+            let i1 = i0 + 1;
+            let i2 = i0 + stride as u32;
+            let i3 = i2 + 1;
+            indices.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+        }
+    }
+
+    for tri in indices.chunks_exact(3) {
+        let ia = tri[0] as usize;
+        let ib = tri[1] as usize;
+        let ic = tri[2] as usize;
+        let a = Vec3::from_array(positions[ia]);
+        let b = Vec3::from_array(positions[ib]);
+        let c = Vec3::from_array(positions[ic]);
+        let normal = (b - a).cross(c - a);
+        normals[ia] += normal;
+        normals[ib] += normal;
+        normals[ic] += normal;
+    }
+
+    let normals: Vec<[f32; 3]> = normals
+        .into_iter()
+        .map(|n| {
+            let n = if n.length_squared() > 1e-6 {
+                n.normalize()
+            } else {
+                Vec3::Y
+            };
+            [n.x, n.y, n.z]
+        })
+        .collect();
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+fn sample_height_linear(terrain: &TerrainHeightSnapshot, x: f32, z: f32, height_scale: f32) -> f32 {
+    if terrain.dims.x == 0 || terrain.dims.y == 0 {
+        return 0.0;
+    }
+    let max_x = (terrain.dims.x - 1) as f32;
+    let max_z = (terrain.dims.y - 1) as f32;
+    let fx = x.clamp(0.0, max_x);
+    let fz = z.clamp(0.0, max_z);
+    let x0 = fx.floor() as u32;
+    let x1 = (x0 + 1).min(terrain.dims.x - 1);
+    let z0 = fz.floor() as u32;
+    let z1 = (z0 + 1).min(terrain.dims.y - 1);
+    let tx = fx - x0 as f32;
+    let tz = fz - z0 as f32;
+
+    let h00 = terrain.elevation[terrain.index(x0, z0)];
+    let h10 = terrain.elevation[terrain.index(x1, z0)];
+    let h01 = terrain.elevation[terrain.index(x0, z1)];
+    let h11 = terrain.elevation[terrain.index(x1, z1)];
+
+    let h0 = h00 + (h10 - h00) * tx;
+    let h1 = h01 + (h11 - h01) * tx;
+    let h = h0 + (h1 - h0) * tz;
+    h * height_scale
+}
+
+fn sample_height_world(terrain: &TerrainHeightSnapshot, position: Vec2, height_scale: f32) -> f32 {
+    if terrain.dims.x == 0 || terrain.dims.y == 0 {
+        return 0.0;
+    }
+    let cell = terrain.cell_size.max(1) as f32;
+    let grid_x = (position.x / cell).clamp(0.0, (terrain.dims.x - 1) as f32);
+    let grid_z = (position.y / cell).clamp(0.0, (terrain.dims.y - 1) as f32);
+    sample_height_linear(terrain, grid_x, grid_z, height_scale)
+}
+
+fn terrain_vertex_color(terrain: &TerrainHeightSnapshot, x: u32, z: u32) -> [f32; 4] {
+    let sample = terrain.sample_tile(x, z);
+    let slope = compute_tile_slope(terrain, x, z);
+    let daylight = 0.65;
+    let mut rgb = terrain_kind_color(sample.kind);
+
+    let brightness = match sample.kind {
+        TerrainKind::DeepWater => {
+            (0.42 + daylight * 0.25 + sample.moisture * 0.2).clamp(0.25, 1.05)
+        }
+        TerrainKind::ShallowWater => {
+            (0.55 + daylight * 0.35 + sample.moisture * 0.3).clamp(0.4, 1.25)
+        }
+        TerrainKind::Sand => (0.72 + daylight * 0.18 + sample.elevation * 0.35).clamp(0.45, 1.35),
+        TerrainKind::Grass => (0.62 + daylight * 0.28 + sample.moisture * 0.4).clamp(0.4, 1.35),
+        TerrainKind::Bloom => (0.68 + daylight * 0.35 + sample.moisture * 0.5).clamp(0.45, 1.45),
+        TerrainKind::Rock => (0.60 + daylight * 0.22 + slope * 0.45).clamp(0.35, 1.25),
+    };
+
+    rgb[0] *= brightness;
+    rgb[1] *= brightness;
+    rgb[2] *= brightness;
+
+    match sample.kind {
+        TerrainKind::Bloom | TerrainKind::Grass => {
+            let factor = (0.9 + sample.moisture * 0.3 + sample.accent * 0.05).clamp(0.6, 1.4);
+            rgb[0] *= factor;
+            rgb[1] *= factor;
+            rgb[2] *= factor;
+        }
+        TerrainKind::Sand => {
+            let factor = (0.9 + sample.accent * 0.08).clamp(0.6, 1.3);
+            rgb[0] *= factor;
+            rgb[1] *= factor;
+            rgb[2] *= factor;
+        }
+        TerrainKind::Rock => {
+            let factor = (0.85 + slope * 0.3).clamp(0.6, 1.2);
+            rgb[0] *= factor;
+            rgb[1] *= factor;
+            rgb[2] *= factor;
+        }
+        _ => {}
+    }
+
+    let clamped = [
+        rgb[0].clamp(0.0, 1.0),
+        rgb[1].clamp(0.0, 1.0),
+        rgb[2].clamp(0.0, 1.0),
+    ];
+    let linear = srgb_to_linear_rgb(clamped);
+    [linear[0], linear[1], linear[2], 1.0]
+}
+
+fn srgb_to_linear_rgb(rgb: [f32; 3]) -> [f32; 3] {
+    [
+        srgb_to_linear_component(rgb[0]),
+        srgb_to_linear_component(rgb[1]),
+        srgb_to_linear_component(rgb[2]),
+    ]
+}
+
+fn srgb_to_linear_component(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod terrain_tests {
+    use super::*;
+    use bevy::render::mesh::VertexAttributeValues;
+    use scriptbots_core::{TerrainKind, TerrainLayer, TerrainTile};
+    use slotmap::KeyData;
+
+    fn sample_layer() -> TerrainLayer {
+        let tiles = vec![
+            TerrainTile {
+                kind: TerrainKind::Grass,
+                elevation: 0.0,
+                moisture: 0.3,
+                accent: 0.1,
+                fertility_bias: 0.0,
+                temperature_bias: 0.0,
+                palette_index: 0,
+            },
+            TerrainTile {
+                kind: TerrainKind::Sand,
+                elevation: 0.5,
+                moisture: 0.1,
+                accent: 0.2,
+                fertility_bias: 0.0,
+                temperature_bias: 0.0,
+                palette_index: 0,
+            },
+            TerrainTile {
+                kind: TerrainKind::Rock,
+                elevation: 1.0,
+                moisture: 0.05,
+                accent: 0.4,
+                fertility_bias: 0.0,
+                temperature_bias: 0.0,
+                palette_index: 0,
+            },
+            TerrainTile {
+                kind: TerrainKind::Bloom,
+                elevation: 0.25,
+                moisture: 0.8,
+                accent: 0.6,
+                fertility_bias: 0.0,
+                temperature_bias: 0.0,
+                palette_index: 0,
+            },
+        ];
+        TerrainLayer::from_tiles(2, 2, 50, tiles).expect("construct terrain layer")
+    }
+
+    fn sample_world_snapshot() -> WorldSnapshot {
+        let layer = sample_layer();
+        let height = TerrainHeightSnapshot::new(&layer);
+        let dims = height.dims;
+        let cell = layer.cell_size() as f32;
+        let world_size = Vec2::new(dims.x as f32 * cell, dims.y as f32 * cell);
+        let color = TerrainColorMap {
+            width: dims.x,
+            height: dims.y,
+            pixels: vec![255; (dims.x * dims.y * 4) as usize],
+        };
+        WorldSnapshot {
+            tick: 42,
+            world_size,
+            agent_radius: 12.0,
+            terrain_color: color,
+            terrain_height: height,
+            agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chunk_mesh_positions_match_heightfield() {
+        let snapshot = sample_world_snapshot();
+        let bounds = TerrainChunkBounds {
+            origin: UVec2::ZERO,
+            size: snapshot.terrain_height.dims,
+        };
+        let mesh = build_chunk_mesh(&snapshot, bounds, 100.0);
+
+        let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+            Some(VertexAttributeValues::Float32x3(values)) => values.clone(),
+            other => panic!("unexpected position attribute: {:?}", other),
+        };
+        assert_eq!(positions.len(), 9, "expected 3x3 vertex grid");
+
+        let world_half = snapshot.world_size * 0.5;
+        // Top-left vertex (0,0)
+        let p0 = Vec3::from_array(positions[0]);
+        assert!(
+            (p0.x + world_half.x).abs() < 1e-3,
+            "x mismatch for vertex 0"
+        );
+        assert!(
+            (p0.z - world_half.y).abs() < 1e-3,
+            "z mismatch for vertex 0"
+        );
+        assert!((p0.y - 0.0).abs() < 1e-3, "height mismatch for vertex 0");
+
+        // Center vertex (global 1,1) should match bilinear height sample
+        let center = Vec3::from_array(positions[4]);
+        let expected_center = sample_height_linear(&snapshot.terrain_height, 1.0, 1.0, 100.0);
+        assert!(
+            (center.y - expected_center).abs() < 1e-3,
+            "center height incorrect: {} vs {}",
+            center.y,
+            expected_center
+        );
+
+        // Bottom-right vertex corresponds to the far corner height sample
+        let last = Vec3::from_array(positions[8]);
+        let expected_last = sample_height_linear(
+            &snapshot.terrain_height,
+            snapshot.terrain_height.dims.x as f32,
+            snapshot.terrain_height.dims.y as f32,
+            100.0,
+        );
+        assert!(
+            (last.y - expected_last).abs() < 1e-3,
+            "bottom-right height incorrect: {} vs {}",
+            last.y,
+            expected_last
+        );
+
+        let indices = match mesh.indices() {
+            Some(Indices::U32(idx)) => idx.clone(),
+            other => panic!("unexpected index buffer: {:?}", other),
+        };
+        assert_eq!(
+            indices.len(),
+            24,
+            "expected 2x2 quads => 24 indices (two tris per cell)"
+        );
+    }
+
+    #[test]
+    fn agent_translation_respects_terrain_height() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.agents.push(AgentVisual {
+            id: AgentId::from(KeyData::from_ffi(1)),
+            position: Vec2::new(50.0, 50.0),
+            color: [0.5, 0.5, 0.5],
+            selection: SelectionState::Selected,
+            health: 80.0,
+            age: 10,
+        });
+
+        let translation = agent_translation(&snapshot, &snapshot.agents[0]);
+        let terrain_height = sample_height_world(
+            &snapshot.terrain_height,
+            snapshot.agents[0].position,
+            TERRAIN_HEIGHT_SCALE,
+        );
+        let expected = terrain_height + snapshot.agent_radius * 0.35;
+        assert!((translation.y - expected).abs() < 1e-3);
+    }
+}
+
+fn compute_tile_slope(terrain: &TerrainHeightSnapshot, x: u32, z: u32) -> f32 {
+    let center = terrain.sample_tile(x, z).elevation;
+    let left = terrain.sample_tile(x.saturating_sub(1), z).elevation;
+    let right = terrain
+        .sample_tile((x + 1).min(terrain.dims.x.saturating_sub(1)), z)
+        .elevation;
+    let up = terrain.sample_tile(x, z.saturating_sub(1)).elevation;
+    let down = terrain
+        .sample_tile(x, (z + 1).min(terrain.dims.y.saturating_sub(1)))
+        .elevation;
+    ((center - left).abs() + (center - right).abs() + (center - up).abs() + (center - down).abs())
+        * 0.25
 }
 
 fn sync_agents(
@@ -1117,7 +1618,7 @@ fn sync_agents(
     for id in stale {
         if let Some(record) = registry.records.remove(&id) {
             commands.entity(record.entity).despawn_recursive();
-            materials.remove(record.material.id());
+            materials.remove(&record.material);
         }
     }
 }
@@ -1175,9 +1676,14 @@ fn update_agent_entity(
 
 fn agent_translation(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Vec3 {
     let half = snapshot.world_size * 0.5;
+    let terrain_height = sample_height_world(
+        &snapshot.terrain_height,
+        agent.position,
+        TERRAIN_HEIGHT_SCALE,
+    );
     let x = agent.position.x - half.x;
     let z = half.y - agent.position.y;
-    Vec3::new(x, snapshot.agent_radius * 0.35, z)
+    Vec3::new(x, terrain_height + snapshot.agent_radius * 0.35, z)
 }
 
 fn agent_scale(agent_radius: f32, base_radius: f32) -> Vec3 {
@@ -1247,8 +1753,8 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Resu
 
     let mut image = ImageBuffer::<ImgRgba<u8>, Vec<u8>>::new(width, height);
 
-    let terrain_w = snapshot.terrain.width.max(1);
-    let terrain_h = snapshot.terrain.height.max(1);
+    let terrain_w = snapshot.terrain_color.width.max(1);
+    let terrain_h = snapshot.terrain_color.height.max(1);
 
     for y in 0..height {
         let tile_y = (terrain_h as u64 - 1)
@@ -1259,9 +1765,9 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Resu
                 ((x as u64) * terrain_w as u64 / width as u64).min((terrain_w - 1) as u64) as u32;
             let idx = ((tile_y * terrain_w) + tile_x) as usize * 4;
             let px = ImgRgba([
-                snapshot.terrain.pixels[idx],
-                snapshot.terrain.pixels[idx + 1],
-                snapshot.terrain.pixels[idx + 2],
+                snapshot.terrain_color.pixels[idx],
+                snapshot.terrain_color.pixels[idx + 1],
+                snapshot.terrain_color.pixels[idx + 2],
                 255,
             ]);
             image.put_pixel(x, y, px);
