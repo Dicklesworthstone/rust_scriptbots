@@ -8,7 +8,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::light::{EnvironmentMapLight, LightProbe};
-use bevy::math::primitives::Sphere;
+use bevy::math::primitives::{Capsule3d, Cone, Cylinder, Rectangle, Sphere, Torus};
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
@@ -20,8 +20,8 @@ use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use bevy::render::view::{ColorGrading, Hdr};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
-    TerrainKind, WorldState,
+    AgentId, ControlCommand, IndicatorState, SelectionMode, SelectionState, SelectionUpdate,
+    SimulationCommand, TerrainKind, TraitModifiers, WorldState, NUM_EYES,
 };
 use slotmap::Key;
 use std::{
@@ -111,6 +111,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_non_send_resource(SnapshotInbox { receiver: rx })
     .insert_resource(SnapshotState::default())
     .insert_resource(AgentRegistry::default())
+    .insert_resource(TonemappingState::default())
     .add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "ScriptBots • Bevy Renderer".to_string(),
@@ -119,6 +120,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         }),
         ..Default::default()
     }))
+    .add_plugins(AutoExposurePlugin)
     .add_systems(Startup, setup_scene)
     .add_systems(
         Update,
@@ -203,15 +205,76 @@ struct ReflectionProbeAssets {
     specular: Handle<Image>,
 }
 
-struct AgentRecord {
+struct PartRef {
     entity: Entity,
-    material: Handle<StandardMaterial>,
+    material: Option<Handle<StandardMaterial>>,
+}
+
+struct EyePart {
+    sclera: PartRef,
+    pupil: PartRef,
+}
+
+struct AgentRecord {
+    root: Entity,
+    body: PartRef,
+    stripe: PartRef,
+    wheel_left: PartRef,
+    wheel_right: PartRef,
+    mouth: PartRef,
+    nose: PartRef,
+    spike: PartRef,
+    boost: PartRef,
+    temp: PartRef,
+    sound_inner: PartRef,
+    sound_outer: PartRef,
+    ear_left: PartRef,
+    ear_right: PartRef,
+    selection: PartRef,
+    indicator: PartRef,
+    eyes: Vec<EyePart>,
+}
+
+impl AgentRecord {
+    fn materials(&self) -> impl Iterator<Item = &Handle<StandardMaterial>> {
+        let mut handles: Vec<&Handle<StandardMaterial>> = Vec::new();
+        let mut push_part = |part: &PartRef, store: &mut Vec<&Handle<StandardMaterial>>| {
+            if let Some(handle) = part.material.as_ref() {
+                store.push(handle);
+            }
+        };
+        push_part(&self.body, &mut handles);
+        push_part(&self.stripe, &mut handles);
+        push_part(&self.wheel_left, &mut handles);
+        push_part(&self.wheel_right, &mut handles);
+        push_part(&self.mouth, &mut handles);
+        push_part(&self.nose, &mut handles);
+        push_part(&self.spike, &mut handles);
+        push_part(&self.boost, &mut handles);
+        push_part(&self.temp, &mut handles);
+        push_part(&self.sound_inner, &mut handles);
+        push_part(&self.sound_outer, &mut handles);
+        push_part(&self.ear_left, &mut handles);
+        push_part(&self.ear_right, &mut handles);
+        push_part(&self.selection, &mut handles);
+        push_part(&self.indicator, &mut handles);
+        for eye in &self.eyes {
+            push_part(&eye.sclera, &mut handles);
+            push_part(&eye.pupil, &mut handles);
+        }
+        handles.into_iter()
+    }
 }
 
 #[derive(Resource)]
-struct AgentMeshAsset {
-    mesh: Handle<Mesh>,
+struct AgentMeshes {
     base_radius: f32,
+    body: Handle<Mesh>,
+    wheel: Handle<Mesh>,
+    spike: Handle<Mesh>,
+    sphere: Handle<Mesh>,
+    quad: Handle<Mesh>,
+    ring: Handle<Mesh>,
 }
 
 #[derive(Resource, Clone)]
@@ -804,6 +867,9 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         GlobalTransform::default(),
         Visibility::default(),
         InheritedVisibility::default(),
+        Tonemapping::AcesFitted,
+        ColorGrading::default(),
+        Hdr::default(),
         PrimaryCamera,
     ));
 
@@ -891,6 +957,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut playback = Entity::PLACEHOLDER;
     let mut fps = Entity::PLACEHOLDER;
     let mut world = Entity::PLACEHOLDER;
+    let mut tonemap = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
         tick = parent
@@ -945,6 +1012,13 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         world = parent
             .spawn((
                 Text::new("World: --"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        tonemap = parent
+            .spawn((
+                Text::new("Tone: ACES • AutoExp Off • Bias +0.0"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -1023,6 +1097,86 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                     ));
                 });
             });
+
+        let tonemap_modes = [
+            TonemappingMode::Aces,
+            TonemappingMode::Agx,
+            TonemappingMode::Tony,
+        ];
+
+        parent
+            .spawn((button_row_node.clone(),))
+            .with_children(|row| {
+                for mode in tonemap_modes {
+                    row.spawn((
+                        Button,
+                        button_node.clone(),
+                        BackgroundColor(follow_idle_color()),
+                        BorderRadius::all(Val::Px(6.0)),
+                        BorderColor::all(button_border_color),
+                        TonemapButton { mode },
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            Text::new(mode.label()),
+                            secondary_font.clone(),
+                            TextColor(secondary_text_color),
+                        ));
+                    });
+                }
+            });
+
+        parent
+            .spawn((button_row_node.clone(),))
+            .with_children(|row| {
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    AutoExposureToggleButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Auto Exposure"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    ExposureAdjustButton { delta: -0.5 },
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Exposure –"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    ExposureAdjustButton { delta: 0.5 },
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Exposure +"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+            });
     });
 
     commands.insert_resource(HudElements {
@@ -1034,6 +1188,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         playback,
         fps,
         world,
+        tonemap,
     });
 }
 
@@ -1124,6 +1279,7 @@ fn update_hud(
     hud: Option<Res<HudElements>>,
     time: Res<Time>,
     controls: Res<SimulationControl>,
+    tonemap_state: Res<TonemappingState>,
     mut texts: Query<&mut Text>,
 ) {
     let Some(_) = state.latest.as_ref() else {
@@ -1247,6 +1403,20 @@ fn update_hud(
             **text = format!(
                 "World: {:>4}×{:>4} • r {:>4.1}",
                 world_size.x as i32, world_size.y as i32, agent_radius
+            );
+        }
+        if let Ok(mut text) = texts.get_mut(hud_elements.tonemap) {
+            let mode_label = tonemap_state.mode.label();
+            let auto_label = if tonemap_state.auto_exposure_enabled {
+                "AutoExp On"
+            } else {
+                "AutoExp Off"
+            };
+            **text = format!(
+                "Tone: {} • {} • Bias {:+.1}",
+                mode_label,
+                auto_label,
+                tonemap_state.exposure_bias
             );
         }
     }
@@ -1600,6 +1770,123 @@ fn handle_clear_selection_button(
             rig.recenter_now = true;
         }
     }
+}
+
+fn handle_tonemap_mode_buttons(
+    mut state: ResMut<TonemappingState>,
+    mut query: Query<(&TonemapButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+) {
+    for (button, interaction) in &mut query {
+        if *interaction == Interaction::Pressed && state.mode != button.mode {
+            state.mode = button.mode;
+            state.dirty = true;
+        }
+    }
+}
+
+fn handle_auto_exposure_toggle(
+    mut state: ResMut<TonemappingState>,
+    mut query: Query<&Interaction, (Changed<Interaction>, With<AutoExposureToggleButton>)>,
+) {
+    for interaction in &mut query {
+        if *interaction == Interaction::Pressed {
+            state.auto_exposure_enabled = !state.auto_exposure_enabled;
+            state.dirty = true;
+        }
+    }
+}
+
+fn handle_exposure_adjust_buttons(
+    mut state: ResMut<TonemappingState>,
+    mut query: Query<(&ExposureAdjustButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+) {
+    for (button, interaction) in &mut query {
+        if *interaction == Interaction::Pressed {
+            state.exposure_bias = (state.exposure_bias + button.delta).clamp(-5.0, 5.0);
+            state.dirty = true;
+        }
+    }
+}
+
+fn update_tonemap_button_colors(
+    state: Res<TonemappingState>,
+    mut query: Query<(&TonemapButton, &Interaction, &mut BackgroundColor)>,
+) {
+    for (button, interaction, mut color) in &mut query {
+        let target = if state.mode == button.mode {
+            follow_active_color()
+        } else if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        *color = target.into();
+    }
+}
+
+fn update_auto_exposure_button_colors(
+    state: Res<TonemappingState>,
+    mut query: Query<(&Interaction, &mut BackgroundColor), With<AutoExposureToggleButton>>,
+) {
+    for (interaction, mut color) in &mut query {
+        let target = if state.auto_exposure_enabled {
+            follow_active_color()
+        } else if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        *color = target.into();
+    }
+}
+
+fn update_exposure_button_colors(
+    mut query: Query<(&Interaction, &mut BackgroundColor), With<ExposureAdjustButton>>,
+) {
+    for (interaction, mut color) in &mut query {
+        let target = if matches!(interaction, Interaction::Pressed) {
+            follow_active_color()
+        } else if matches!(interaction, Interaction::Hovered) {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        *color = target.into();
+    }
+}
+
+fn sync_camera_tonemapping(
+    mut commands: Commands,
+    mut state: ResMut<TonemappingState>,
+    mut cameras: Query<
+        (Entity, &mut Tonemapping, &mut ColorGrading, Option<&mut AutoExposure>),
+        With<PrimaryCamera>,
+    >,
+) {
+    if !state.dirty {
+        return;
+    }
+
+    if let Ok((entity, mut tonemap, mut grading, auto_exposure)) = cameras.get_single_mut() {
+        *tonemap = state.mode.to_component();
+        grading.global.exposure = state.exposure_bias;
+
+        match (state.auto_exposure_enabled, auto_exposure) {
+            (true, None) => {
+                commands.entity(entity).insert(AutoExposure::default());
+            }
+            (true, Some(mut existing)) => {
+                existing.speed_brighten = 3.0;
+                existing.speed_darken = 1.0;
+            }
+            (false, Some(_)) => {
+                commands.entity(entity).remove::<AutoExposure>();
+            }
+            (false, None) => {}
+        }
+    }
+
+    state.dirty = false;
 }
 
 fn update_follow_button_colors(

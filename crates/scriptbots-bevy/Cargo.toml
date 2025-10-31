@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = { workspace = true }
 bevy = { version = "0.17" }
 bevy_mesh = { version = "0.17" }
+bevy_post_process = { version = "0.17" }
 scriptbots-core = { path = "../scriptbots-core" }
 tracing = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
