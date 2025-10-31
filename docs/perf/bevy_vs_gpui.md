@@ -37,6 +37,8 @@ This document tracks the methodology and captured measurements for Phase 5 of 
    ```
    Adjust `--config` to swap scenarios and `--threads` to match target hardware (default 8 for parity with helper scripts).
    Capture logs under `logs/perf/<scenario>_<renderer>.log`; the helper commands in this doc assume that directory exists.
+
+Shortcut: `scripts/run_perf_benchmarks.sh --renderer bevy --scenario dense_agents --threads 16 --duration 900`
 5. **Sampling window**
    - Allow at least 5 minutes of runtime per scenario.
    - Record the console metrics every ~300 frames (default ticker) and compute percentiles offline.

@@ -64,5 +64,6 @@ Please append brief updates (date, handle, bullet) so collaborators can see whoâ
 - BrownLake (2025-10-31 04:52 UTC): Bevy run likewise aborted with \"Unable to find a GPU\"; same hardware constraint applies.
 - BrownLake (2025-10-31 04:55 UTC): No material/lighting changes landed in this passâ€”golden regeneration deferred until visual polish work resumes.
 - BrownLake (2025-10-31 04:58 UTC): Soak tests queued for hardware run; headless container cannot create GPU devices (documented in perf checklist).
+- BrownLake (2025-10-31 05:06 UTC): Added `scripts/run_perf_benchmarks.sh` helper and documented usage in `docs/perf/bevy_vs_gpui.md` for teammates with GPU access.
 - BrownCreek (2025-10-31 03:29 UTC): Sent Agent Mail to BrownLake & OrangeLake requesting alignment on Bevy version target and outstanding renderer work before starting the upgrade.
 - BrownCreek (2025-10-31 04:58 UTC): Upgraded `scriptbots-bevy` to Bevy 0.17.2, ported renderer/UI/tests to the typed camera/mesh/message APIs, refreshed diagnostics logging, and verified `cargo check -p scriptbots-bevy`; full workspace check currently blocked by `scriptbots-world-gfx` lacking a `scriptbots-core` dependency.

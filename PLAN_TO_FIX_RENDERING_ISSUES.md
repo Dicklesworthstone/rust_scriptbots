@@ -87,6 +87,8 @@
         - [x] Update WGSL shader to render capsule + wheels + spike + mouth.
         - [x] Ensure boost/reproduction effects match CPU path.
     - [x] Snapshot/offscreen helper updates and golden refresh (once visuals approved) [Completed – BlueMountain 2025-10-31]
+        - [x] Compare refreshed `golden/rust_default.png` against previous commit to confirm expected deltas. *(No prior tracked PNG in git history; documented via checksum update and manual inspection of geometry/format.)*
+        - [x] Audit remaining goldens/configs for stale visuals and note follow-up if required. *(Legacy PNG set unchanged; Bevy golden remains current.)*
     - [x] Remove temporary CPU fallback rect logic after verifying layout stability.
 
 ### 3.3 Modern UI Polish [Completed – RedCastle 2025-10-30]

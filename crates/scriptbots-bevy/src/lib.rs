@@ -10,7 +10,10 @@ use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::math::primitives::Sphere;
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
-use bevy::render::render_resource::PrimitiveTopology;
+use bevy::render::{
+    render_resource::PrimitiveTopology,
+    texture::{Extent3d, TextureDimension, TextureFormat},
+};
 use bevy::ui::{BorderColor, BorderRadius};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use bevy_mesh::{Indices, Mesh};
@@ -191,6 +194,12 @@ struct SnapshotState {
 #[derive(Default, Resource)]
 struct AgentRegistry {
     records: HashMap<AgentId, AgentRecord>,
+}
+
+#[derive(Resource, Clone)]
+struct ReflectionProbeAssets {
+    diffuse: Handle<Image>,
+    specular: Handle<Image>,
 }
 
 struct AgentRecord {
@@ -608,6 +617,8 @@ struct TerrainChunkRecord {
     bounds: TerrainChunkBounds,
     signature: TerrainChunkSignature,
     last_tick: u64,
+    probe: Option<Entity>,
+    stats: TerrainChunkStats,
 }
 
 #[derive(Clone, Copy)]

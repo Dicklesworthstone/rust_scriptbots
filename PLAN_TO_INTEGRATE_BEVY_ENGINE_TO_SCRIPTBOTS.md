@@ -206,10 +206,19 @@ _Prepared by RedSnow — 2025-10-30_
 
 #### Phase 5 QA & Performance Checklist [Currently In Progress – BrownLake 2025-10-31]
 
-- [ ] [Currently In Progress – BrownLake 2025-10-31] Establish benchmark scenarios
+- [ ] [Currently In Progress – BlueMountain 2025-10-31] Establish benchmark scenarios
   - [x] Drafted measurement procedure + data template (`docs/perf/bevy_vs_gpui.md`) and recorded outstanding config TODOs.
   - [x] Added scenario configs (`docs/rendering_reference/configs/{dense_agents,storm_event}.toml`) aligned with measurement plan.
-  - [ ] Capture CPU/GPU timings for three canonical seeds (`default`, `dense_agents`, `storm_event`) across GPUI vs Bevy (Linux + Windows).
+  - [x] Prepare turnkey benchmarking script for GPU-capable hosts and circulate instructions.
+  - [ ] Capture CPU/GPU timings for three canonical seeds across GPUI vs Bevy.
+    - [ ] Linux • GPUI • `default`  — _Blocked (requires Vulkan-capable workstation)._
+    - [ ] Linux • Bevy  • `default`  — _Blocked (requires Vulkan-capable workstation)._
+    - [ ] Linux • GPUI • `dense_agents`  — _Blocked (requires Vulkan-capable workstation)._
+    - [ ] Linux • Bevy  • `dense_agents`  — _Blocked (requires Vulkan-capable workstation)._
+    - [ ] Linux • GPUI • `storm_event`  — _Blocked (requires Vulkan-capable workstation)._
+    - [ ] Linux • Bevy  • `storm_event`  — _Blocked (requires Vulkan-capable workstation)._
+    - [ ] Windows • GPUI • all scenarios  — _Pending hardware scheduling._
+    - [ ] Windows • Bevy • all scenarios  — _Pending hardware scheduling._
   - [ ] Record baseline FPS, frame time percentiles, and simulation ticks/sec; log results to `docs/perf/bevy_vs_gpui.md` once vetted.
   - [x] Derived initial golden diff metrics (MAE/RMSE) between `rust_default.png` and `bevy_default.png` as a reference point.
 - [x] [Completed – BrownLake 2025-10-31] Instrument diagnostics
