@@ -66,26 +66,26 @@
 - Added soft drop shadows, warmer selection glows, and health-aware body shading so agents read clearly at default zoom.
 - GPU pipeline now consumes the same colour grades to avoid mismatch between rendering backends.
 - Follow-up parity: replace CPU quad body rendering with circle paths + heading cues [Currently In Progress – BlueMountain 2025-10-31]
-    - [ ] Inventory runtime data needed for rich agent avatars (wheels, outputs, sensors, diet, audio).
-    - [ ] Extend `AgentRenderData` + snapshot extraction with:
-        - [ ] Left/right wheel outputs or derived speeds.
-        - [ ] Boost flag intensity and reproduction counters.
-        - [ ] Trait modifiers (eye, smell, sound, blood).
-        - [ ] Sensor metadata (eye directions/FOV, sound multiplier).
-        - [ ] Sound output, food delta, herbivore tendency, temperature preference.
-    - [ ] CPU renderer:
-        - [ ] Replace circular body with oriented capsule shell.
-        - [ ] Draw dual wheel assemblies with velocity streaks.
-        - [ ] Render spike spear with length/intensity tint.
-        - [ ] Add mouth aperture that animates with food intake/sound output.
-        - [ ] Encode herbivore vs carnivore banding.
-        - [ ] Paint sensor accessories (eyes/ears) scaled by trait modifiers.
-        - [ ] Maintain selection/indicator/boost halos.
-        - [ ] Keep debug overlays working with new geometry.
-    - [ ] WGPU renderer parity:
-        - [ ] Expand `AgentInstance` payload with new fields.
-        - [ ] Update WGSL shader to render capsule + wheels + spike + mouth.
-        - [ ] Ensure boost/reproduction effects match CPU path.
+    - [x] Inventory runtime data needed for rich agent avatars (wheels, outputs, sensors, diet, audio).
+    - [x] Extend `AgentRenderData` + snapshot extraction with:
+        - [x] Left/right wheel outputs or derived speeds.
+        - [x] Boost flag intensity and reproduction counters.
+        - [x] Trait modifiers (eye, smell, sound, blood).
+        - [x] Sensor metadata (eye directions/FOV, sound multiplier).
+        - [x] Sound output, food delta, herbivore tendency, temperature preference.
+    - [x] CPU renderer:
+        - [x] Replace circular body with oriented capsule shell.
+        - [x] Draw dual wheel assemblies with velocity streaks.
+        - [x] Render spike spear with length/intensity tint.
+        - [x] Add mouth aperture that animates with food intake/sound output.
+        - [x] Encode herbivore vs carnivore banding.
+        - [x] Paint sensor accessories (eyes/ears) scaled by trait modifiers.
+        - [x] Maintain selection/indicator/boost halos.
+        - [x] Keep debug overlays working with new geometry.
+    - [x] WGPU renderer parity:
+        - [x] Expand `AgentInstance` payload with new fields.
+        - [x] Update WGSL shader to render capsule + wheels + spike + mouth.
+        - [x] Ensure boost/reproduction effects match CPU path.
     - [ ] Snapshot/offscreen helper updates and golden refresh (once visuals approved).
     - [ ] Remove temporary CPU fallback rect logic after verifying layout stability.
 

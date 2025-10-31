@@ -1,0 +1,30 @@
+# High-density population stress test for performance benchmarking.
+
+# Deterministic seed distinct from the default baseline.
+rng_seed = 13371337
+
+# Keep the world size canonical with existing goldens.
+world_width = 6000
+world_height = 3000
+
+# Ensure the simulation quickly fills the world with agents.
+population_minimum = 400
+population_spawn_interval = 30
+population_spawn_count = 20
+population_crossover_chance = 0.75
+
+# Keep food available so agents continue moving and reproducing.
+food_respawn_interval = 12
+food_respawn_amount = 0.8
+food_max = 0.8
+food_growth_rate = 0.08
+food_diffusion_rate = 0.22
+
+# Shorten reproduction cycle to keep the agent pool saturated.
+reproduction_energy_threshold = 0.55
+reproduction_attempt_interval = 10
+reproduction_attempt_chance = 0.25
+
+# Slightly tighter metabolism to avoid runaway energy inflation.
+metabolism_drain = 0.003
+movement_drain = 0.006

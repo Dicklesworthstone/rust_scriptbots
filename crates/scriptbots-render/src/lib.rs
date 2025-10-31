@@ -40,7 +40,7 @@ use tracing::{error, info, warn};
 #[cfg(feature = "world_wgpu")]
 pub mod world_compositor {
     use super::*;
-    use scriptbots_core::{SelectionState, TerrainKind, WorldState};
+    use scriptbots_core::{TerrainKind, WorldState};
     use scriptbots_world_gfx::{ReadbackView, WorldRenderer, WorldSnapshot as GfxSnapshot};
 
     pub struct GpuiImage {
@@ -729,26 +729,11 @@ pub mod world_compositor {
             })
             .collect();
         let elevation: Vec<f32> = frame.terrain.tiles.iter().map(|t| t.elevation).collect();
+        let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);
         let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = frame
             .agents
             .iter()
-            .map(|a| {
-                let sel = match a.selection {
-                    SelectionState::Hovered => 1u32,
-                    SelectionState::Selected => 2u32,
-                    SelectionState::None => 0u32,
-                };
-                let dyn_radius = (frame.agent_base_radius + a.spike_length * 0.25).max(6.0);
-                let glow = (a.indicator.intensity * 0.35).clamp(0.0, 1.0);
-                scriptbots_world_gfx::AgentInstance {
-                    position: [a.position.x, a.position.y],
-                    size: dyn_radius,
-                    color: [a.color[0], a.color[1], a.color[2], 1.0],
-                    selection: sel,
-                    glow,
-                    boost: a.boost.clamp(0.0, 1.0),
-                }
-            })
+            .map(|a| build_gpu_agent_instance(&frame, a, frame.palette, palette_is_natural))
             .collect();
 
         let snapshot = GfxSnapshot {
@@ -1101,39 +1086,12 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         .iter()
         .map(|t| t.elevation)
         .collect();
+    let palette_is_natural = matches!(state.frame.palette, ColorPaletteMode::Natural);
     let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = state
         .frame
         .agents
         .iter()
-        .map(|a| {
-            let sel = match a.selection {
-                SelectionState::Hovered => 1u32,
-                SelectionState::Selected => 2u32,
-                SelectionState::None => 0u32,
-            };
-            let dyn_radius = (state.frame.agent_base_radius + a.spike_length * 0.25).max(8.0);
-            let glow_from_indicator = (a.indicator.intensity * 0.35).clamp(0.0, 1.0);
-            let glow_from_spike = if a.spiked { 0.45 } else { 0.0 };
-            let glow_from_repro = (a.reproduction_intent * 0.25).clamp(0.0, 0.6);
-            let glow = glow_from_indicator
-                .max(glow_from_spike)
-                .max(glow_from_repro);
-            let shade_wave =
-                ((a.position.x + a.position.y) * 0.04 + state.frame.tick as f32 * 0.00025).cos();
-            let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
-            let mut body = agent_color(a, agent_shade);
-            if !matches!(state.frame.palette, ColorPaletteMode::Natural) {
-                body = apply_palette(body, state.frame.palette);
-            }
-            scriptbots_world_gfx::AgentInstance {
-                position: [a.position.x, a.position.y],
-                size: dyn_radius,
-                color: [body.r, body.g, body.b, body.a],
-                selection: sel,
-                glow,
-                boost: if a.spiked { 1.0 } else { 0.0 },
-            }
-        })
+        .map(|a| build_gpu_agent_instance(&state.frame, a, state.frame.palette, palette_is_natural))
         .collect();
 
     let terrain_view = scriptbots_world_gfx::TerrainView {
@@ -12538,6 +12496,92 @@ fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
     }
 
     color
+}
+
+fn build_gpu_agent_instance(
+    frame: &RenderFrame,
+    agent: &AgentRenderData,
+    palette: ColorPaletteMode,
+    palette_is_natural: bool,
+) -> scriptbots_world_gfx::AgentInstance {
+    let day_phase = (frame.tick as f32 * 0.00025).sin() * 0.5 + 0.5;
+    let dynamic_radius = (frame.agent_base_radius + agent.spike_length * 0.25).max(8.0);
+    let half_world = dynamic_radius * 0.5;
+    let mut body_radius = half_world * 0.72;
+    if body_radius < 3.0 {
+        body_radius = 3.0;
+    }
+    let mut body_half_length = half_world * 1.35;
+    if body_half_length < body_radius + 2.0 {
+        body_half_length = body_radius + 2.0;
+    }
+    let mut wheel_radius = body_radius * 0.38;
+    if wheel_radius < 2.0 {
+        wheel_radius = 2.0;
+    }
+    let wheel_offset = body_radius + wheel_radius * 0.55;
+    let spike_extension = body_radius * 0.7 + agent.spike_length * 0.85 + 2.0;
+    let flame_length = if agent.boost > 0.05 {
+        body_radius * (1.2 + agent.boost * 1.6) + agent.sound_multiplier.max(1.0) * 4.0
+    } else {
+        0.0
+    };
+    let half_width = wheel_offset + wheel_radius + 3.0;
+    let half_height = body_half_length + spike_extension.max(flame_length) + 3.0;
+    let eating_level = agent.food_delta.abs().min(1.5);
+    let yelling_level = agent.sound_output.abs().min(1.5);
+    let mouth_open = (0.35 + eating_level * 0.4 + yelling_level * 0.55).clamp(0.35, 1.6);
+
+    let shade_wave = ((agent.position.x + agent.position.y) * 0.04 + day_phase).cos();
+    let agent_shade = (0.85 + 0.15 * shade_wave).clamp(0.65, 1.1);
+    let mut body_color = agent_color(agent, agent_shade);
+    if !palette_is_natural {
+        body_color = apply_palette(body_color, palette);
+    }
+
+    let (sin_h, cos_h) = agent.heading.sin_cos();
+    let selection = match agent.selection {
+        SelectionState::Hovered => 1.0,
+        SelectionState::Selected => 2.0,
+        SelectionState::None => 0.0,
+    };
+    let glow_indicator = (agent.indicator.intensity * 0.35).clamp(0.0, 1.0);
+    let glow_spike = if agent.spiked { 0.45 } else { 0.0 };
+    let glow_repro = (agent.reproduction_intent * 0.25).clamp(0.0, 0.6);
+    let glow = glow_indicator.max(glow_spike).max(glow_repro);
+    let boost = agent.boost.clamp(0.0, 1.0);
+    let spiked = if agent.spiked { 1.0 } else { 0.0 };
+
+    scriptbots_world_gfx::AgentInstance {
+        position: [agent.position.x, agent.position.y],
+        quad_extent: [half_width, half_height],
+        heading: [cos_h, sin_h],
+        body_radius,
+        body_half_length,
+        wheel_offset,
+        wheel_radius,
+        mouth_open,
+        herbivore_tendency: agent.herbivore_tendency.clamp(0.0, 1.0),
+        temperature_preference: agent.temperature_preference.clamp(0.0, 1.0),
+        food_delta: agent.food_delta,
+        sound_level: agent.sound_level,
+        sound_output: agent.sound_output,
+        wheel_left: agent.wheel_left,
+        wheel_right: agent.wheel_right,
+        spike_length: agent.spike_length,
+        trait_smell: agent.trait_smell,
+        trait_sound: agent.trait_sound,
+        trait_hearing: agent.trait_hearing,
+        trait_eye: agent.trait_eye,
+        trait_blood: agent.trait_blood,
+        selection,
+        color: [body_color.r, body_color.g, body_color.b, body_color.a],
+        glow,
+        boost,
+        spiked,
+        eye_dirs: agent.eye_dirs,
+        eye_fov: agent.eye_fov,
+    }
 }
 
 fn apply_palette(color: Rgba, palette: ColorPaletteMode) -> Rgba {

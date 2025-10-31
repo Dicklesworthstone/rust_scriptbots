@@ -40,6 +40,7 @@ pub struct AgentInstance {
     pub sound_output: f32,
     pub wheel_left: f32,
     pub wheel_right: f32,
+    pub spike_length: f32,
     pub trait_smell: f32,
     pub trait_sound: f32,
     pub trait_hearing: f32,
@@ -49,6 +50,7 @@ pub struct AgentInstance {
     pub color: [f32; 4],
     pub glow: f32,  // 0..1 extra glow (e.g., reproduction/spike)
     pub boost: f32, // 0..1 boost intensity
+    pub spiked: f32,
     pub eye_dirs: [f32; NUM_EYES],
     pub eye_fov: [f32; NUM_EYES],
 }
@@ -1097,8 +1099,20 @@ impl AgentPipeline {
                     ],
                 }],
             },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
@@ -1166,9 +1180,24 @@ impl AgentPipeline {
                 continue;
             }
             staging.push(AgentInstanceGpu {
-                data0: [a.position[0], a.position[1], a.quad_extent[0], a.quad_extent[1]],
-                data1: [a.heading[0], a.heading[1], a.body_radius, a.body_half_length],
-                data2: [a.wheel_offset, a.wheel_radius, a.mouth_open, a.herbivore_tendency],
+                data0: [
+                    a.position[0],
+                    a.position[1],
+                    a.quad_extent[0],
+                    a.quad_extent[1],
+                ],
+                data1: [
+                    a.heading[0],
+                    a.heading[1],
+                    a.body_radius,
+                    a.body_half_length,
+                ],
+                data2: [
+                    a.wheel_offset,
+                    a.wheel_radius,
+                    a.mouth_open,
+                    a.herbivore_tendency,
+                ],
                 data3: [
                     a.temperature_preference,
                     a.food_delta,
@@ -1178,7 +1207,7 @@ impl AgentPipeline {
                 data4: [a.wheel_left, a.wheel_right, a.trait_smell, a.trait_sound],
                 data5: [a.trait_hearing, a.trait_eye, a.trait_blood, a.selection],
                 data6: a.color,
-                data7: [a.glow, a.boost, 0.0, 0.0],
+                data7: [a.glow, a.boost, a.spiked, a.spike_length],
                 data8: a.eye_dirs,
                 data9: a.eye_fov,
             });
@@ -1213,64 +1242,268 @@ impl AgentPipeline {
 
 const AGENTS_WGSL: &str = r#"
 struct InInst {
-  @location(0) pos: vec2<f32>,
-  @location(1) size: f32,
-  @location(2) _pad: f32,
-  @location(3) color: vec4<f32>,
-  @location(4) selection: u32,
-  @location(5) glow: f32,
-  @location(6) boost: f32,
+  @location(0) data0: vec4<f32>,
+  @location(1) data1: vec4<f32>,
+  @location(2) data2: vec4<f32>,
+  @location(3) data3: vec4<f32>,
+  @location(4) data4: vec4<f32>,
+  @location(5) data5: vec4<f32>,
+  @location(6) data6: vec4<f32>,
+  @location(7) data7: vec4<f32>,
+  @location(8) data8: vec4<f32>,
+  @location(9) data9: vec4<f32>,
 };
 
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
-  @location(0) color: vec4<f32>,
-  @location(1) local: vec2<f32>,
-  @location(2) radius: f32,
-  @location(3) selection: u32,
-  @location(4) glow: f32,
-  @location(5) boost: f32,
+  @location(0) local: vec2<f32>,
+  @location(1) extent: vec2<f32>,
+  @location(2) heading: vec2<f32>,
+  @location(3) body_params: vec4<f32>,
+  @location(4) behavior: vec4<f32>,
+  @location(5) audio: vec4<f32>,
+  @location(6) traits_a: vec4<f32>,
+  @location(7) traits_b: vec4<f32>,
+  @location(8) color: vec4<f32>,
+  @location(9) eye_dirs: vec4<f32>,
+  @location(10) eye_fov: vec4<f32>,
+  @location(11) extras: vec2<f32>,
 };
 
 struct View { v0: vec4<f32>, v1: vec4<f32> }; // v0=(viewport.x,viewport.y,time,scale) v1=(offset_x,offset_y,_,_)
 @group(0) @binding(0) var<uniform> view: View;
 
+fn capsule_distance(p: vec2<f32>, half_length: f32, radius: f32) -> f32 {
+  let clamped = clamp(p.y, -half_length + radius, half_length - radius);
+  return length(vec2<f32>(p.x, p.y - clamped)) - radius;
+}
+
+fn circle_distance(p: vec2<f32>, radius: f32) -> f32 {
+  return length(p) - radius;
+}
+
+fn smooth_mask(dist: f32) -> f32 {
+  let aa = max(fwidth(dist), 1e-3);
+  return smoothstep(aa, -aa, dist);
+}
+
+fn layer(base_rgb: ptr<function, vec3<f32>>, base_alpha: ptr<function, f32>, color: vec3<f32>, alpha: f32) {
+  let a = clamp(alpha, 0.0, 1.0);
+  if (a <= 0.0001) {
+    return;
+  }
+  let current = *base_alpha;
+  let new_alpha = current + a * (1.0 - current);
+  if (new_alpha <= 0.0001) {
+    *base_rgb = color;
+    *base_alpha = a;
+    return;
+  }
+  let weight = a * (1.0 - current) / new_alpha;
+  *base_rgb = mix(*base_rgb, color, weight);
+  *base_alpha = new_alpha;
+}
+
 @vertex
 fn vs_main(inst: InInst, @builtin(vertex_index) vid: u32) -> VsOut {
   var o: VsOut;
-  var quad = array<vec2<f32>, 4>(vec2<f32>(-0.5,-0.5), vec2<f32>(0.5,-0.5), vec2<f32>(-0.5,0.5), vec2<f32>(0.5,0.5));
+  let quad = array<vec2<f32>, 4>(vec2<f32>(-0.5,-0.5), vec2<f32>(0.5,-0.5), vec2<f32>(-0.5,0.5), vec2<f32>(0.5,0.5));
   let l = quad[vid];
+  let extent = inst.data0.zw;
+  let local = vec2<f32>(l.x * extent.x * 2.0, l.y * extent.y * 2.0);
   let viewport = view.v0.xy;
   let scale = view.v0.w;
   let offset = view.v1.xy;
-  let world = (inst.pos + l * inst.size) * scale + offset;
+  let center = inst.data0.xy;
+  let world = (center + local) * scale + offset;
   let ndc = vec2<f32>(world.x / viewport.x * 2.0 - 1.0, 1.0 - (world.y / viewport.y * 2.0));
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
-  o.color = inst.color;
-  o.local = l;          // range [-0.5, 0.5]
-  o.radius = inst.size; // pixel radius
-  o.selection = inst.selection;
-  o.glow = inst.glow;
-  o.boost = inst.boost;
+  o.local = local;
+  o.extent = extent;
+  o.heading = inst.data1.xy;
+  o.body_params = vec4<f32>(inst.data1.z, inst.data1.w, inst.data2.x, inst.data2.y);
+  o.behavior = vec4<f32>(inst.data2.z, inst.data2.w, inst.data3.x, inst.data3.y);
+  o.audio = vec4<f32>(inst.data3.z, inst.data3.w, inst.data4.x, inst.data4.y);
+  o.traits_a = vec4<f32>(inst.data4.z, inst.data4.w, inst.data5.x, inst.data5.y);
+  o.traits_b = vec4<f32>(inst.data5.z, inst.data5.w, inst.data7.x, inst.data7.y);
+  o.color = inst.data6;
+  o.eye_dirs = inst.data8;
+  o.eye_fov = inst.data9;
+  o.extras = vec2<f32>(inst.data7.z, inst.data7.w);
   return o;
 }
 
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
-  // Signed distance circle (soft edge) with thin rim highlight for a premium look
-  let d = length(v.local * 2.0);         // 0 at center, ~1 at edge
-  let edge = smoothstep(1.05, 0.95, 1.0 - d);
-  let rim = smoothstep(1.02, 0.98, d);   // thin rim near edge
-  var base = v.color;
-  var rgb = base.rgb;
-  let a = base.a * edge;
-  let sel_glow = select(0.0, 0.25, v.selection == 1u) + select(0.0, 0.45, v.selection == 2u);
-  let boost_tint = v.boost * 0.35;
-  // apply subtle boost tint towards warm color when boosting
-  rgb = clamp(rgb + vec3<f32>(boost_tint * 0.6, boost_tint * 0.2, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
-  let glow = max(sel_glow, v.glow);
-  let rim_col = vec4<f32>(1.0, 1.0, 1.0, glow + v.boost * 0.2) * rim;
-  return clamp(vec4<f32>(rgb, a) + rim_col, vec4<f32>(0.0), vec4<f32>(1.0));
+  let heading = normalize(v.heading);
+  let right = vec2<f32>(-heading.y, heading.x);
+  let local = vec2<f32>(dot(v.local, right), dot(v.local, heading));
+
+  let body_radius = max(v.body_params.x, 0.5);
+  let body_half_length = max(v.body_params.y, body_radius);
+  let wheel_offset = v.body_params.z;
+  let wheel_radius = v.body_params.w;
+  let mouth_open = v.behavior.x;
+  let herbivore = clamp(v.behavior.y, 0.0, 1.0);
+  let temperature = clamp(v.behavior.z, 0.0, 1.0);
+  let food_delta = v.behavior.w;
+  let sound_level = clamp(abs(v.audio.x), 0.0, 1.0);
+  let sound_output = clamp(abs(v.audio.y), 0.0, 1.0);
+  let wheel_left = clamp(v.audio.z, 0.0, 1.0);
+  let wheel_right = clamp(v.audio.w, 0.0, 1.0);
+  let trait_smell = v.traits_a.x;
+  let trait_sound = v.traits_a.y;
+  let trait_hearing = v.traits_a.z;
+  let trait_eye = v.traits_a.w;
+  let trait_blood = v.traits_b.x;
+  let selection = v.traits_b.y;
+  let glow = v.traits_b.z;
+  let boost = v.traits_b.w;
+  let spiked = v.extras.x;
+  let spike_length = v.extras.y;
+
+  let body_dist = capsule_distance(local, body_half_length, body_radius);
+  let body_mask = smooth_mask(body_dist);
+
+  var accum_rgb = vec3<f32>(0.0);
+  var accum_alpha = 0.0;
+
+  // Wheels
+  let wheel_half_length = body_half_length * 0.96;
+  let wheel_base_color = vec3<f32>(0.14, 0.16, 0.21);
+  let wheel_high_color = vec3<f32>(0.38, 0.42, 0.48);
+  let left_dist = capsule_distance(vec2<f32>(local.x + wheel_offset, local.y), wheel_half_length, wheel_radius);
+  let right_dist = capsule_distance(vec2<f32>(local.x - wheel_offset, local.y), wheel_half_length, wheel_radius);
+  let left_color = mix(wheel_base_color, wheel_high_color, wheel_left);
+  let right_color = mix(wheel_base_color, wheel_high_color, wheel_right);
+  layer(&accum_rgb, &accum_alpha, left_color, smooth_mask(left_dist));
+  layer(&accum_rgb, &accum_alpha, right_color, smooth_mask(right_dist));
+
+  // Body shell
+  let body_color = clamp(v.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+  layer(&accum_rgb, &accum_alpha, body_color, body_mask);
+
+  // Diet stripe
+  let herb_color = vec3<f32>(0.24, 0.78, 0.36);
+  let carn_color = vec3<f32>(0.88, 0.26, 0.21);
+  let mut stripe = mix(carn_color, herb_color, herbivore);
+  let blood_tint = clamp(0.7 + trait_blood * 0.2, 0.8, 1.35);
+  stripe = clamp(stripe * blood_tint, vec3<f32>(0.0), vec3<f32>(1.2));
+  let stripe_dist = capsule_distance(local, body_half_length * 0.82, body_radius * 0.45);
+  layer(&accum_rgb, &accum_alpha, stripe, smooth_mask(stripe_dist) * body_mask * 0.9);
+
+  // Flame (boost)
+  if (boost > 0.05) {
+    let flame_half = body_radius * (0.45 + boost * 0.5);
+    let flame_radius = body_radius * (0.18 + boost * 0.4);
+    let flame_center = vec2<f32>(0.0, -body_half_length - flame_half * 0.6);
+    let flame_dist = capsule_distance(local - flame_center, flame_half, flame_radius);
+    let flame_color = mix(vec3<f32>(1.0, 0.62, 0.22), vec3<f32>(1.0, 0.8, 0.3), sound_output);
+    layer(&accum_rgb, &accum_alpha, flame_color, smooth_mask(flame_dist) * 0.8);
+  }
+
+  // Spike approximation
+  let spike_half = body_radius * 0.7 + spike_length * 0.6;
+  let spike_radius = body_radius * 0.32;
+  let spike_center = vec2<f32>(0.0, body_half_length + spike_radius);
+  let spike_dist = capsule_distance(local - spike_center, spike_half, spike_radius);
+  let spike_color = mix(vec3<f32>(0.96, 0.44, 0.24), vec3<f32>(0.98, 0.58, 0.32), clamp(spiked, 0.0, 1.0));
+  layer(&accum_rgb, &accum_alpha, spike_color, smooth_mask(spike_dist));
+
+  // Mouth
+  let mouth_half_length = body_radius * 0.62;
+  let mouth_radius = max(body_radius * 0.14, 1.2) * mouth_open;
+  let mouth_center = vec2<f32>(0.0, body_half_length - body_radius * 0.35);
+  let mouth_local = local - mouth_center;
+  let mouth_swapped = vec2<f32>(mouth_local.y, mouth_local.x);
+  let mouth_dist = capsule_distance(mouth_swapped, mouth_half_length, mouth_radius);
+  let eat_level = clamp(abs(food_delta), 0.0, 1.5);
+  let yell_level = max(sound_output, sound_level);
+  let mut mouth_color = vec3<f32>(
+      0.85 + eat_level * 0.08,
+      0.28 + eat_level * 0.3,
+      0.32 + yell_level * 0.12
+  );
+  layer(&accum_rgb, &accum_alpha, clamp(mouth_color, vec3<f32>(0.0), vec3<f32>(1.0)), smooth_mask(mouth_dist));
+
+  // Nose
+  let nose_radius = max(body_radius * 0.12, 1.0) * (0.6 + trait_smell * 0.8);
+  let nose_center = vec2<f32>(0.0, body_half_length - body_radius * 0.2);
+  let nose_dist = circle_distance(local - nose_center, nose_radius);
+  layer(&accum_rgb, &accum_alpha, vec3<f32>(0.92, 0.6, 0.28), smooth_mask(nose_dist));
+
+  // Ears (sound/hearing)
+  let ear_scale = clamp(0.6 + trait_hearing * 0.45, 0.6, 1.6);
+  let ear_radius = max(body_radius * 0.28, 1.5) * ear_scale;
+  let ear_offset = body_half_length * 0.15;
+  let ear_color_base = vec3<f32>(0.32, 0.62, 0.92) * (0.9 + trait_sound * 0.45);
+  let ear_left_center = vec2<f32>(-(body_radius + ear_radius * 0.45), -ear_offset);
+  let ear_right_center = vec2<f32>(body_radius + ear_radius * 0.45, -ear_offset);
+  let ear_left_dist = circle_distance(local - ear_left_center, ear_radius);
+  let ear_right_dist = circle_distance(local - ear_right_center, ear_radius);
+  layer(&accum_rgb, &accum_alpha, clamp(ear_color_base, vec3<f32>(0.0), vec3<f32>(1.0)), smooth_mask(ear_left_dist) * 0.9);
+  layer(&accum_rgb, &accum_alpha, clamp(ear_color_base, vec3<f32>(0.0), vec3<f32>(1.0)), smooth_mask(ear_right_dist) * 0.9);
+
+  // Eyes
+  let eye_dirs = vec4<f32>(v.eye_dirs.x, v.eye_dirs.y, v.eye_dirs.z, v.eye_dirs.w);
+  let eye_fov = vec4<f32>(v.eye_fov.x, v.eye_fov.y, v.eye_fov.z, v.eye_fov.w);
+  let base_eye_radius = max(body_radius * 0.14, 1.2);
+  let sclera_color = vec3<f32>(0.97, 0.98, 1.0);
+  let pupil_color = vec3<f32>(0.08, 0.11, 0.18);
+  for (var i: i32 = 0; i < 4; i = i + 1) {
+    let angle = eye_dirs[i];
+    let dir = vec2<f32>(sin(angle), cos(angle));
+    let distance = body_radius * (0.4 + 0.35 * f32(i) / 4.0 + 0.25);
+    let eye_center = dir * distance;
+    var eye_radius = base_eye_radius * (0.65 + trait_eye * 0.35);
+    eye_radius = clamp(eye_radius, 1.6, body_radius * 0.38);
+    let eye_dist = circle_distance(local - eye_center, eye_radius);
+    let eye_mask = smooth_mask(eye_dist);
+    layer(&accum_rgb, &accum_alpha, sclera_color, eye_mask);
+
+    let pupil_radius = eye_radius * (0.35 + clamp(eye_fov[i], 0.3, 3.0) * 0.12);
+    let pupil_dist = circle_distance(local - eye_center, pupil_radius);
+    layer(&accum_rgb, &accum_alpha, pupil_color, smooth_mask(pupil_dist));
+  }
+
+  // Temperature marker
+  let temp_color = mix(vec3<f32>(0.20, 0.52, 0.96), vec3<f32>(0.98, 0.42, 0.18), temperature);
+  let temp_center = vec2<f32>(0.0, -body_half_length * 0.25);
+  let temp_radius = body_radius * 0.22;
+  let temp_ring_dist = circle_distance(local - temp_center, temp_radius);
+  let temp_ring = smooth_mask(temp_ring_dist) * 0.6;
+  layer(&accum_rgb, &accum_alpha, temp_color, temp_ring * 0.6);
+
+  // Sound arcs
+  let vocal = max(sound_output, sound_level);
+  if (vocal > 0.12) {
+    let arc_origin = vec2<f32>(0.0, body_half_length + body_radius * 0.4);
+    let arc_r1 = body_radius * (0.55 + vocal * 0.6);
+    let arc_r2 = arc_r1 + body_radius * 0.35;
+    let arc_color = vec3<f32>(0.95, 0.68, 0.32) * (0.6 + vocal * 0.6);
+    let arc1 = circle_distance(local - arc_origin, arc_r1);
+    let arc2 = circle_distance(local - arc_origin, arc_r2);
+    layer(&accum_rgb, &accum_alpha, arc_color, smooth_mask(arc1) * 0.35);
+    layer(&accum_rgb, &accum_alpha, arc_color, smooth_mask(arc2) * 0.25);
+  }
+
+  // Selection + indicator rim
+  let sel_hover = step(0.5, selection) * (1.0 - step(1.5, selection));
+  let sel_selected = step(1.5, selection);
+  let selection_glow = sel_hover * 0.25 + sel_selected * 0.45;
+  let rim = smoothstep(0.0, -max(fwidth(body_dist), 0.001) * 1.5, body_dist + body_radius * 0.15);
+  let rim_color = vec3<f32>(1.0, 1.0, 1.0) * (selection_glow + glow);
+  layer(&accum_rgb, &accum_alpha, rim_color, rim);
+
+  // Boost tint overlay
+  if (boost > 0.05) {
+    let boost_tint = vec3<f32>(0.98, 0.62, 0.32);
+    layer(&accum_rgb, &accum_alpha, boost_tint, body_mask * boost * 0.2);
+  }
+
+  let alpha = clamp(accum_alpha, 0.0, 1.0);
+  let rgb = clamp(accum_rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+  return vec4<f32>(rgb, alpha);
 }
 "#;
 

@@ -36,6 +36,7 @@ _Prepared by RedSnow — 2025-10-30_
 - HUD copy now exposes playback multiplier and optional `auto_pause_reason`, which is kept in sync across renderers via the shared `SimulationControl` snapshot.
 - Root HUD card uses a translucent navy backdrop (`Color::srgba(0.07, 0.11, 0.18, 0.72)`) with 12 px offsets and 10 px padding, matching the terrain relief theme introduced earlier in Phase 3.
 - [x] Run `cargo check` for workspace & targeted tests (`scriptbots-bevy`, `scriptbots-core`).
+    - [x] 2025-10-31 – BrownCreek: `cargo check -p scriptbots-bevy` clean under Bevy 0.17.2; full workspace check currently blocked by `crates/scriptbots-world-gfx` missing an explicit `scriptbots-core` dependency (pre-existing TODO).
 
 ---
 
@@ -70,6 +71,13 @@ _Prepared by RedSnow — 2025-10-30_
 1.3 **Engine configuration**
    - Extend `rust-toolchain.toml` if Bevy requires nightly components (e.g., `rustfmt`, `clippy` compatibility).  
    - Record any OS-level dependencies (Vulkan/Metal, X11) in README + onboarding docs.
+
+1.4 **Bevy 0.17 migration — BrownCreek (2025-10-31)**  
+   - Bump Bevy crates to `0.17.2` and add explicit `bevy_mesh` dependency for typed mesh/indices access.  
+   - Replace legacy bundles with typed components: `Mesh3d`/`MeshMaterial3d`, `Camera3d` + `Camera`, `Button`, `Node`, and `Text` stacks now drive the renderer and HUD.  
+   - Swap deprecated `EventReader`/`EventWriter` usage for `MessageReader`/`MessageWriter`, and migrate timing helpers to `delta_secs()`/`elapsed_secs_f64()`.  
+   - Configure clear color per camera via `Camera::clear_color`; global resource insertion is no longer required.  
+   - Rebuild the HUD UI using typed nodes/text, adjust integration tests, and confirm `cargo check -p scriptbots-bevy` passes on 2025-10-31.
 
 ---
 
@@ -198,23 +206,27 @@ _Prepared by RedSnow — 2025-10-30_
 
 #### Phase 5 QA & Performance Checklist [Currently In Progress – BrownLake 2025-10-31]
 
-- [ ] Establish benchmark scenarios
+- [ ] [Currently In Progress – BrownLake 2025-10-31] Establish benchmark scenarios
+  - [x] Drafted measurement procedure + data template (`docs/perf/bevy_vs_gpui.md`) and recorded outstanding config TODOs.
+  - [x] Added scenario configs (`docs/rendering_reference/configs/{dense_agents,storm_event}.toml`) aligned with measurement plan.
   - [ ] Capture CPU/GPU timings for three canonical seeds (`default`, `dense_agents`, `storm_event`) across GPUI vs Bevy (Linux + Windows).
   - [ ] Record baseline FPS, frame time percentiles, and simulation ticks/sec; log results to `docs/perf/bevy_vs_gpui.md` once vetted.
-- [ ] [Currently In Progress – BrownLake 2025-10-31] Instrument diagnostics
-  - [ ] Enable Bevy `FrameTimeDiagnosticsPlugin` + custom tracing spans gated by `SB_DIAGNOSTICS`.
-  - [ ] Surface summarized stats in console output (colorized) every 300 frames without flooding logs.
+  - [x] Derived initial golden diff metrics (MAE/RMSE) between `rust_default.png` and `bevy_default.png` as a reference point.
+- [x] [Completed – BrownLake 2025-10-31] Instrument diagnostics
+  - [x] Enable Bevy `FrameTimeDiagnosticsPlugin` + custom tracing spans gated by `SB_DIAGNOSTICS`.
+  - [x] Surface summarized stats in console output (colorized) every 300 frames without flooding logs.
 - [ ] Regression automation
-  - [ ] Extend `render_regression` workflow to run Bevy snapshot/camera tests on Linux headless GPU (reuse existing path filters).
-  - [ ] Add opt-in `cargo test -p scriptbots-bevy -- --include-ignored` job for exhaustive runs before releases.
+  - [x] Extend `render_regression` workflow to run Bevy snapshot/camera tests on Linux headless GPU (reuse existing path filters).
+  - [x] Add opt-in `cargo test -p scriptbots-bevy -- --include-ignored` job for exhaustive runs before releases.
 - [ ] Visual parity spot-checks
   - [ ] Rebuild Bevy golden PNG after lighting polish; diff against GPUI using histogram/feature checks documented in §6.1.
   - [ ] Validate HUD overlays (selection/playback/follow) for readability at 1080p, 1440p, and 4K.
 - [ ] Stability sweeps
+  - [x] Documented soak-test procedure in `docs/perf/bevy_vs_gpui.md` (diagnostics-on, 30-minute runtime, per-platform targets).
   - [ ] Run 30-minute soak tests on Windows (D3D12 + Vulkan) and Linux (Vulkan) ensuring no panics or runaway memory growth.
   - [ ] Track auto-pause reasons and ensure SimulationCommand feedback loop remains consistent after long runs.
 - [ ] Coordination
-  - [ ] Confirm responsibilities with OrangeLake/RedSnow via Agent Mail before executing benchmarks.
+  - [x] Confirm responsibilities with OrangeLake/RedSnow via Agent Mail before executing benchmarks.
   - [ ] Publish findings + required follow-ups in `docs/rendering_reference/coordination.md`.
 
 ---

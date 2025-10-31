@@ -44,8 +44,19 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 ## 2025-10-31
 - BlueMountain (2025-10-31 03:21 UTC): Claimed PLAN §3.2 follow-up to replace CPU quad agent bodies with circular paths, add heading cues, and align tint/boost handling with the GPU renderer snapshot helper.
 - BlueMountain (2025-10-31 03:45 UTC): Expanded §3.2 TODO list for full ScriptBot avatar rendering (wheels, spike, mouth, sensors, diet banding) and will tackle CPU path → GPU parity next.
+- BlueMountain (2025-10-31 04:32 UTC): Landed CPU + WGPU avatar overhaul (capsule bodies, wheels, spikes, diet stripe, mouth/eyes/ears, boost flame) with shared data pipeline; todo: refresh snapshot golden and prune legacy fallback once verified.
 - OrangeLake (2025-10-31 02:05 UTC): Simulation commands landed (core enum, Bevy driver, GPUI + terminal emitters), Bevy playback UI restyled with relief palette accents, and targeted tests/cargo checks executed; awaiting RedSnow feedback on broader contract.
 - BrownLake (2025-10-31 03:24 UTC): Documented the SimulationCommand contract + HUD palette notes inside the Bevy integration plan and pinged RedSnow/OrangeLake for sign-off before closing Phase 4 TODO.
 - BrownLake (2025-10-31 03:31 UTC): Added `run_windows_version_with_bevy.bat` launcher and updated Bevy plan §7.2 to track Windows/Linux/macOS helper parity.
 - BrownLake (2025-10-31 03:36 UTC): Added Linux/macOS Bevy launch scripts, refreshed README quickstart sections, expanded plan §7.2 checklist, and sent Agent Mail announcing the cross-platform helpers.
 - BrownLake (2025-10-31 03:50 UTC): Opened Phase 5 QA checklist in Bevy plan and started instrumentation tasks (FrameTimeDiagnostics/diagnostic logging); awaiting coordination before running benchmarks.
+- BrownLake (2025-10-31 04:12 UTC): Landed SB_DIAGNOSTICS-gated frame diagnostics plugin + 300-frame summary logger (colorized) and marked plan §5 instrumentation tasks complete.
+- BrownLake (2025-10-31 04:20 UTC): Created `docs/perf/bevy_vs_gpui.md` with benchmark procedure + data template; configs for dense_agents/storm_event flagged as TODO before timing runs.
+- BrownLake (2025-10-31 04:28 UTC): Added `docs/rendering_reference/configs/{dense_agents,storm_event}.toml` to support the benchmark scenarios.
+- BrownLake (2025-10-31 04:34 UTC): Updated `render_regression` CI job to run Bevy tests headlessly on Linux with `WGPU_BACKEND=gl` while keeping Windows on the CPU snapshot path.
+- BrownLake (2025-10-31 04:38 UTC): Added manual `bevy_exhaustive` workflow job to run `cargo test -p scriptbots-bevy -- --include-ignored` on demand.
+- BrownLake (2025-10-31 04:42 UTC): Computed baseline MAE/RMSE between `rust_default.png` and `bevy_default.png` for the default scenario; awaiting live metrics.
+- BrownLake (2025-10-31 04:44 UTC): Added soak-test procedure to `docs/perf/bevy_vs_gpui.md`; long-run metrics still pending.
+- BrownLake (2025-10-31 04:48 UTC): GPUI benchmark attempt under headless GL timed out (no presentation surface); marked docs with hardware requirement note and will rerun on a workstation.
+- BrownCreek (2025-10-31 03:29 UTC): Sent Agent Mail to BrownLake & OrangeLake requesting alignment on Bevy version target and outstanding renderer work before starting the upgrade.
+- BrownCreek (2025-10-31 04:58 UTC): Upgraded `scriptbots-bevy` to Bevy 0.17.2, ported renderer/UI/tests to the typed camera/mesh/message APIs, refreshed diagnostics logging, and verified `cargo check -p scriptbots-bevy`; full workspace check currently blocked by `scriptbots-world-gfx` lacking a `scriptbots-core` dependency.

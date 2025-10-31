@@ -1,0 +1,31 @@
+# Weather / fog stress scenario for renderer parity checks.
+
+# Distinct seed emphasising moisture-heavy terrain.
+rng_seed = 86753090
+
+# Enable terrain topography and make slopes meaningful for motion costs.
+topography_enabled = true
+topography_speed_gain = 0.5
+topography_energy_penalty = 0.0045
+
+# Increase moisture dynamics to keep fog/atmosphere active.
+food_respawn_interval = 8
+food_respawn_amount = 1.0
+food_max = 1.0
+food_growth_rate = 0.12
+food_diffusion_rate = 0.3
+
+# Encourage bursts of reproduction during the storm.
+reproduction_energy_threshold = 0.6
+reproduction_attempt_interval = 8
+reproduction_attempt_chance = 0.3
+
+# Maintain a healthy population without fully saturating the map.
+population_minimum = 280
+population_spawn_interval = 40
+population_spawn_count = 12
+population_crossover_chance = 0.6
+
+# Slightly lower bot speed to highlight camera easing and particle FX.
+bot_speed = 0.26
+boost_multiplier = 2.2

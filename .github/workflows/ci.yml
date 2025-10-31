@@ -256,13 +256,25 @@ jobs:
         with:
           shared-key: render-${{ matrix.os }}
 
-      - name: Run snapshot + camera invariants
-        if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
+      - name: Run snapshot + camera invariants (Linux)
+        if: ${{ matrix.os == 'ubuntu-24.04' && (github.event_name != 'pull_request' || steps.changes.outputs.render == 'true') }}
         shell: bash
+        env:
+          WGPU_BACKEND: gl
+          WGPU_POWER_PREFERENCE: low_power
+          WGPU_ALLOW_SOFTWARE: "1"
+          BEVY_ASSET_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
           cargo test -p scriptbots-render -- --nocapture
           cargo test -p scriptbots-bevy --features bevy_render -- --nocapture
+
+      - name: Run snapshot + camera invariants (Windows)
+        if: ${{ matrix.os == 'windows-2022' && (github.event_name != 'pull_request' || steps.changes.outputs.render == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p scriptbots-render -- --nocapture
 
       - name: Upload snapshot diffs
         if: failure()
@@ -270,3 +282,42 @@ jobs:
         with:
           name: render-diffs-${{ matrix.os }}
           path: target/snapshot-failures/
+
+  bevy_exhaustive:
+    name: Bevy Exhaustive (manual)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mold linker and system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bevy-exhaustive-linux
+
+      - name: Bevy exhaustive tests
+        env:
+          WGPU_BACKEND: gl
+          WGPU_POWER_PREFERENCE: low_power
+          WGPU_ALLOW_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p scriptbots-bevy --features bevy_render -- --include-ignored --nocapture

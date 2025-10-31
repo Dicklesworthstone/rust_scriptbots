@@ -1,6 +1,6 @@
 //! Bevy renderer integration for ScriptBots.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::prelude::*;
@@ -11,11 +11,9 @@ use bevy::math::primitives::Sphere;
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
-use bevy::ui::prelude::*;
 use bevy::ui::{BorderColor, BorderRadius};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use bevy_mesh::{Indices, Mesh};
-use owo_colors::OwoColorize;
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
     AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
@@ -24,8 +22,8 @@ use scriptbots_core::{
 use slotmap::Key;
 use std::{
     collections::{HashMap, HashSet},
-    io::Cursor,
     env,
+    io::Cursor,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -100,42 +98,42 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let mut app = App::new();
     let diagnostics_enabled = diagnostics_enabled();
     app.insert_resource(AmbientLight {
-            color: Color::srgb(0.45, 0.52, 0.65),
-            brightness: 800.0,
-            affects_lightmapped_meshes: true,
-        })
-        .insert_resource(submitter_resource)
-        .insert_resource(controls_resource)
-        .insert_non_send_resource(SnapshotInbox { receiver: rx })
-        .insert_resource(SnapshotState::default())
-        .insert_resource(AgentRegistry::default())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "ScriptBots • Bevy Renderer".to_string(),
-                present_mode: PresentMode::AutoVsync,
-                ..Default::default()
-            }),
+        color: Color::srgb(0.45, 0.52, 0.65),
+        brightness: 800.0,
+        affects_lightmapped_meshes: true,
+    })
+    .insert_resource(submitter_resource)
+    .insert_resource(controls_resource)
+    .insert_non_send_resource(SnapshotInbox { receiver: rx })
+    .insert_resource(SnapshotState::default())
+    .insert_resource(AgentRegistry::default())
+    .add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "ScriptBots • Bevy Renderer".to_string(),
+            present_mode: PresentMode::AutoVsync,
             ..Default::default()
-        }))
-        .add_systems(Startup, setup_scene)
-        .add_systems(
-            Update,
-            (
-                poll_snapshots,
-                sync_world,
-                handle_playback_shortcuts,
-                handle_playback_buttons,
-                handle_selection_input,
-                handle_follow_button_interactions,
-                handle_clear_selection_button,
-                update_playback_button_colors,
-                update_follow_button_colors,
-                control_camera,
-                update_hud,
-            )
-                .chain(),
+        }),
+        ..Default::default()
+    }))
+    .add_systems(Startup, setup_scene)
+    .add_systems(
+        Update,
+        (
+            poll_snapshots,
+            sync_world,
+            handle_playback_shortcuts,
+            handle_playback_buttons,
+            handle_selection_input,
+            handle_follow_button_interactions,
+            handle_clear_selection_button,
+            update_playback_button_colors,
+            update_follow_button_colors,
+            control_camera,
+            update_hud,
         )
-        .add_systems(Update, close_on_esc);
+            .chain(),
+    )
+    .add_systems(Update, close_on_esc);
 
     if diagnostics_enabled {
         app.insert_resource(DiagnosticsTicker::new(DIAGNOSTIC_REPORT_INTERVAL))
@@ -331,6 +329,26 @@ impl DiagnosticsTicker {
             false
         }
     }
+}
+
+fn report_frame_metrics(mut ticker: ResMut<DiagnosticsTicker>, diagnostics: Res<DiagnosticsStore>) {
+    if !ticker.tick() {
+        return;
+    }
+
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|diag| diag.smoothed())
+        .unwrap_or_default();
+    let frame_time_ms = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|diag| diag.smoothed())
+        .unwrap_or_default();
+
+    info!(
+        "Frame metrics: {:>6.1} fps • {:>6.3} ms per frame",
+        fps, frame_time_ms
+    );
 }
 
 fn follow_idle_color() -> Color {
@@ -705,23 +723,30 @@ impl WorldSnapshot {
 }
 
 fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
+    let camera_transform = Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y);
     commands.spawn((
         Camera3d::default(),
         Camera {
             clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
             ..default()
         },
-        Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y),
+        TransformBundle::from_transform(camera_transform),
+        Visibility::default(),
+        InheritedVisibility::default(),
         PrimaryCamera,
     ));
 
+    let light_transform =
+        Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y);
     commands.spawn((
         DirectionalLight {
             illuminance: 9000.0,
             shadows_enabled: true,
             ..default()
         },
-        Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y),
+        TransformBundle::from_transform(light_transform),
+        Visibility::default(),
+        InheritedVisibility::default(),
     ));
 
     let agent_mesh = meshes.add(Mesh::from(Sphere::new(1.0)));
@@ -736,7 +761,12 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     });
     commands.insert_resource(CameraRig::default());
 
-    commands.spawn((Camera2d,));
+    commands.spawn((
+        Camera2d::default(),
+        TransformBundle::default(),
+        Visibility::default(),
+        InheritedVisibility::default(),
+    ));
 
     let primary_text_color = Color::WHITE;
     let secondary_text_color = Color::srgb(0.74, 0.82, 0.94);
@@ -744,18 +774,18 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let secondary_font = TextFont::from_font_size(15.0);
 
     let button_node = Node {
-        padding: UiRect::axes(px(12.0), px(8.0)),
-        border: UiRect::all(px(1.0)),
+        padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+        border: UiRect::all(Val::Px(1.0)),
         align_items: AlignItems::Center,
         justify_content: JustifyContent::Center,
-        min_width: px(120.0),
+        min_width: Val::Px(120.0),
         ..default()
     };
     let button_row_node = Node {
         flex_direction: FlexDirection::Row,
-        column_gap: px(8.0),
-        row_gap: px(8.0),
-        margin: UiRect::axes(px(0.0), px(8.0)),
+        column_gap: Val::Px(8.0),
+        row_gap: Val::Px(8.0),
+        margin: UiRect::axes(Val::Px(0.0), Val::Px(8.0)),
         ..default()
     };
     let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
@@ -764,11 +794,11 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                top: px(12.0),
-                left: px(12.0),
-                padding: UiRect::all(px(10.0)),
+                top: Val::Px(12.0),
+                left: Val::Px(12.0),
+                padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
-                row_gap: px(6.0),
+                row_gap: Val::Px(6.0),
                 ..default()
             },
             BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.72)),
@@ -858,7 +888,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                         Button,
                         button_node.clone(),
                         BackgroundColor(follow_idle_color()),
-                        BorderRadius::all(px(6.0)),
+                        BorderRadius::all(Val::Px(6.0)),
                         BorderColor::all(button_border_color),
                         PlaybackButton { action },
                     ))
@@ -886,7 +916,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                         Button,
                         button_node.clone(),
                         BackgroundColor(follow_idle_color()),
-                        BorderRadius::all(px(6.0)),
+                        BorderRadius::all(Val::Px(6.0)),
                         BorderColor::all(button_border_color),
                         FollowButton { mode },
                     ))
@@ -903,7 +933,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                     Button,
                     button_node.clone(),
                     BackgroundColor(follow_idle_color()),
-                    BorderRadius::all(px(6.0)),
+                    BorderRadius::all(Val::Px(6.0)),
                     BorderColor::all(button_border_color),
                     ClearSelectionButton,
                 ))
@@ -1136,9 +1166,7 @@ fn update_hud(
         if let Ok(mut text) = texts.get_mut(hud_elements.world) {
             **text = format!(
                 "World: {:>4}×{:>4} • r {:>4.1}",
-                world_size.x as i32,
-                world_size.y as i32,
-                agent_radius
+                world_size.x as i32, world_size.y as i32, agent_radius
             );
         }
     }
@@ -1458,7 +1486,6 @@ fn update_playback_button_colors(
         *color = target.into();
     }
 }
-
 fn handle_follow_button_interactions(
     mut rig: ResMut<CameraRig>,
     mut query: Query<(&FollowButton, &Interaction), (Changed<Interaction>, With<Button>)>,
@@ -1747,7 +1774,7 @@ fn sync_terrain(
                             record.mesh = mesh_handle.clone();
                             commands
                                 .entity(record.entity)
-                                .insert((Mesh3d(mesh_handle.clone()),));
+                                .insert(Mesh3d(mesh_handle.clone()));
                         }
                         update_chunk_material(materials, &record.material, &built.stats);
                         record.signature = built.stats.signature;
@@ -1762,6 +1789,9 @@ fn sync_terrain(
                         .spawn((
                             Mesh3d(mesh_handle.clone()),
                             MeshMaterial3d(material_handle.clone()),
+                            TransformBundle::default(),
+                            Visibility::default(),
+                            InheritedVisibility::default(),
                         ))
                         .id();
                     registry.chunks.insert(
@@ -2302,7 +2332,9 @@ fn spawn_agent_entity(
         .spawn((
             Mesh3d(assets.mesh.clone()),
             MeshMaterial3d(material.clone()),
-            transform,
+            TransformBundle::from_transform(transform),
+            Visibility::default(),
+            InheritedVisibility::default(),
         ))
         .id();
 
@@ -2319,7 +2351,7 @@ fn update_agent_entity(
 ) {
     let mut transform = Transform::from_translation(agent_translation(snapshot, agent));
     transform.scale = agent_scale(snapshot.agent_radius, base_radius);
-    commands.entity(record.entity).insert((transform,));
+    commands.entity(record.entity).insert(transform);
 
     if let Some(material) = materials.get_mut(&record.material) {
         let (base_color, emissive) = agent_colors(agent);
