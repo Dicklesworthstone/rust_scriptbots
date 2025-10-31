@@ -223,7 +223,7 @@ _Prepared by RedSnow — 2025-10-30_
     - [ ] Windows • Bevy • all scenarios  — _Pending hardware scheduling._
   - [ ] Record baseline FPS, frame time percentiles, and simulation ticks/sec; log results to `docs/perf/bevy_vs_gpui.md` once vetted.
     - [x] Added `scripts/parse_perf_logs.py` to summarise SB_DIAGNOSTICS output (CSV/CLI).
-  - [x] Derived initial golden diff metrics (MAE/RMSE) between `rust_default.png` and `bevy_default.png` as a reference point.
+- [x] Derived initial golden diff metrics (MAE/RMSE) between `rust_default.png` and `bevy_default.png` as a reference point.
 - [x] [Completed – BrownLake 2025-10-31] Instrument diagnostics
   - [x] Enable Bevy `FrameTimeDiagnosticsPlugin` + custom tracing spans gated by `SB_DIAGNOSTICS`.
   - [x] Surface summarized stats in console output (colorized) every 300 frames without flooding logs.
@@ -241,6 +241,32 @@ _Prepared by RedSnow — 2025-10-30_
 - [ ] Coordination
   - [x] Confirm responsibilities with OrangeLake/RedSnow via Agent Mail before executing benchmarks.
   - [ ] Publish findings + required follow-ups in `docs/rendering_reference/coordination.md`.
+
+#### Bevy 3D Agent Avatars [Currently In Progress – BrownLake 2025-10-31]
+
+- [ ] Establish rich Bevy agent data plumbing
+  - [ ] Reconcile `TerrainChunkStats` changes blocking current build (add missing fields / adjust mesh pipeline).
+  - [ ] Extend Bevy snapshot conversion to include:
+    - [ ] Wheel velocities / boost / reproduction metrics.
+    - [ ] Trait modifiers (eye, smell, sound, blood) and sensor metadata (eye dirs/FOV, sound multiplier).
+    - [ ] Mouth/food delta, sound level/output, herbivore tendency, temperature preference.
+  - [ ] Ensure new fields are feature-flagged to avoid impacting GPUI/terminal builds.
+- [ ] 3D geometry + materials
+  - [ ] Model capsule body + dual wheels with instanced meshes (capsule + torus/lathed wheels).
+  - [ ] Add spike mesh with length/intensity tint driven from runtime data.
+  - [ ] Implement mouth slot, diet accent band, and boost exhaust using emissive/alpha quads.
+  - [ ] Attach sensor meshes (eyes/ears) scaled by trait modifiers; orient via eye directions.
+- [ ] Visual effects & state cues
+  - [ ] Encode herbivore vs carnivore tinting via material uniforms.
+  - [ ] Animate mouth aperture with food_delta/sound_output.
+  - [ ] Add temperature indicator, vocalization arcs, and selection/indicator halos using additive quads or decals.
+- [ ] Shader & pipeline updates
+  - [ ] Update Bevy material/shader to blend layers similar to CPU/WGPU renderers.
+  - [ ] Support palette overrides (natural vs accessibility palettes).
+  - [ ] Optimize for instancing / batching (limit per-agent draw calls).
+- [ ] Validation
+  - [ ] Add snapshot capture of Bevy 3D avatars (headless `--dump-bevy-png`) and compare against CPU reference.
+  - [ ] Document new assets/material workflow and update coordination log.
 
 ---
 

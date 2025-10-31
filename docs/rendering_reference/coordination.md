@@ -49,6 +49,7 @@ Please append brief updates (date, handle, bullet) so collaborators can see whoâ
 - BlueMountain (2025-10-31 05:02 UTC): Removed the legacy CPU canvas fallback offset now that the flex row stretch fix holds; renderer logs confirm sane viewport sizes.
 - BlueMountain (2025-10-31 05:20 UTC): Regenerated `golden/rust_default.png` with new avatars and updated SHA256 in `docs/rendering_reference/checksums.txt`; ready for CI snapshot comparison.
 - BlueMountain (2025-10-31 05:48 UTC): Benchmarking blocked on GPU workstation; GPUI run stalled (see `logs/perf/20251031_default_gui.log`), Bevy build currently failing on `TerrainChunkStats` field changes (`logs/perf/20251031_default_bevy.log`). Scheduling follow-up once hardware + fixes land.
+- BlueMountain (2025-10-31 05:55 UTC): Fixed Bevy shader eye placement bug (sin/cos swap) so GPU avatars match CPU orientation (`crates/scriptbots-world-gfx/src/lib.rs`).
 - OrangeLake (2025-10-31 02:05 UTC): Simulation commands landed (core enum, Bevy driver, GPUI + terminal emitters), Bevy playback UI restyled with relief palette accents, and targeted tests/cargo checks executed; awaiting RedSnow feedback on broader contract.
 - BrownLake (2025-10-31 03:24 UTC): Documented the SimulationCommand contract + HUD palette notes inside the Bevy integration plan and pinged RedSnow/OrangeLake for sign-off before closing Phase 4 TODO.
 - BrownLake (2025-10-31 03:31 UTC): Added `run_windows_version_with_bevy.bat` launcher and updated Bevy plan Â§7.2 to track Windows/Linux/macOS helper parity.

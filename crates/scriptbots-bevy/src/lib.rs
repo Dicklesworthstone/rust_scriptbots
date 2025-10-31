@@ -15,6 +15,9 @@ use bevy::render::render_resource::PrimitiveTopology;
 use bevy::ui::{BorderColor, BorderRadius};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use bevy_mesh::{Indices, Mesh};
+use bevy_core_pipeline::tonemapping::Tonemapping;
+use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
+use bevy::render::view::{ColorGrading, Hdr};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
     AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
@@ -493,6 +496,7 @@ struct HudElements {
     playback: Entity,
     fps: Entity,
     world: Entity,
+    tonemap: Entity,
 }
 
 #[derive(Component)]
@@ -516,6 +520,63 @@ enum PlaybackAction {
 
 #[derive(Component)]
 struct ClearSelectionButton;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TonemappingMode {
+    Aces,
+    Agx,
+    Tony,
+}
+
+impl TonemappingMode {
+    fn label(self) -> &'static str {
+        match self {
+            TonemappingMode::Aces => "ACES",
+            TonemappingMode::Agx => "AgX",
+            TonemappingMode::Tony => "TonyMcMapface",
+        }
+    }
+
+    fn to_component(self) -> Tonemapping {
+        match self {
+            TonemappingMode::Aces => Tonemapping::AcesFitted,
+            TonemappingMode::Agx => Tonemapping::AgX,
+            TonemappingMode::Tony => Tonemapping::TonyMcMapface,
+        }
+    }
+}
+
+#[derive(Resource)]
+struct TonemappingState {
+    mode: TonemappingMode,
+    auto_exposure_enabled: bool,
+    exposure_bias: f32,
+    dirty: bool,
+}
+
+impl Default for TonemappingState {
+    fn default() -> Self {
+        Self {
+            mode: TonemappingMode::Aces,
+            auto_exposure_enabled: false,
+            exposure_bias: 0.0,
+            dirty: true,
+        }
+    }
+}
+
+#[derive(Component)]
+struct TonemapButton {
+    mode: TonemappingMode,
+}
+
+#[derive(Component)]
+struct AutoExposureToggleButton;
+
+#[derive(Component)]
+struct ExposureAdjustButton {
+    delta: f32,
+}
 
 #[derive(Clone)]
 struct TerrainColorMap {
