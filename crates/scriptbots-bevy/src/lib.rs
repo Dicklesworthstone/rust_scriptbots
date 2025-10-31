@@ -901,8 +901,8 @@ impl Default for TonemappingState {
             mode: TonemappingMode::Aces,
             auto_exposure_enabled: false,
             exposure_bias: 0.0,
-             auto_exposure_speed_brighten: DEFAULT_AUTO_EXPOSURE_BRIGHTEN,
-             auto_exposure_speed_darken: DEFAULT_AUTO_EXPOSURE_DARKEN,
+            auto_exposure_speed_brighten: DEFAULT_AUTO_EXPOSURE_BRIGHTEN,
+            auto_exposure_speed_darken: DEFAULT_AUTO_EXPOSURE_DARKEN,
             dirty: true,
         }
     }
@@ -2329,14 +2329,14 @@ fn sync_camera_tonemapping(
         match (state.auto_exposure_enabled, auto_exposure) {
             (true, None) => {
                 commands.entity(entity).insert(AutoExposure {
-                    speed_brighten: 3.0,
-                    speed_darken: 1.0,
+                    speed_brighten: state.auto_exposure_speed_brighten,
+                    speed_darken: state.auto_exposure_speed_darken,
                     ..Default::default()
                 });
             }
             (true, Some(mut existing)) => {
-                existing.speed_brighten = 3.0;
-                existing.speed_darken = 1.0;
+                existing.speed_brighten = state.auto_exposure_speed_brighten;
+                existing.speed_darken = state.auto_exposure_speed_darken;
             }
             (false, Some(_)) => {
                 commands.entity(entity).remove::<AutoExposure>();
