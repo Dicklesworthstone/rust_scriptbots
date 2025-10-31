@@ -587,8 +587,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         margin: UiRect::axes(Val::Px(0.0), Val::Px(8.0)),
         ..Default::default()
     };
-let button_idle_color = Color::srgba(0.16, 0.22, 0.33, 0.92);
-let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
+    let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
 
     let hud_root = commands
         .spawn(NodeBundle {
@@ -1374,7 +1373,8 @@ fn sync_terrain(
 fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
     let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
     let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
-    let emissive_intensity = (stats.mean_moisture * 0.12).clamp(0.0, 0.3);
+    let emissive_intensity =
+        (stats.mean_moisture * 0.12 + stats.height_factor * 0.05).clamp(0.0, 0.35);
     let emissive = Color::linear_rgb(
         emissive_intensity * 0.6,
         emissive_intensity,
@@ -1384,8 +1384,8 @@ fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
         base_color: Color::WHITE,
         perceptual_roughness: roughness,
         metallic,
-        reflectance: 0.04,
-        emissive,
+        reflectance: (0.04 + stats.height_factor * 0.02).clamp(0.02, 0.08),
+        emissive: emissive.into(),
         ..Default::default()
     }
 }
@@ -1398,15 +1398,17 @@ fn update_chunk_material(
     if let Some(material) = materials.get_mut(handle) {
         let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
         let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
-        let emissive_intensity = (stats.mean_moisture * 0.12).clamp(0.0, 0.3);
+        let emissive_intensity =
+            (stats.mean_moisture * 0.12 + stats.height_factor * 0.05).clamp(0.0, 0.35);
         material.perceptual_roughness = roughness;
         material.metallic = metallic;
-        material.reflectance = 0.04;
+        material.reflectance = (0.04 + stats.height_factor * 0.02).clamp(0.02, 0.08);
         material.emissive = Color::linear_rgb(
             emissive_intensity * 0.6,
             emissive_intensity,
             emissive_intensity * 0.8,
-        );
+        )
+        .into();
     }
 }
 
@@ -1418,7 +1420,7 @@ struct BuiltChunk {
 struct TerrainChunkStats {
     mean_moisture: f32,
     mean_slope: f32,
-    max_height: f32,
+    height_factor: f32,
     signature: TerrainChunkSignature,
 }
 
@@ -1523,13 +1525,8 @@ fn build_chunk_mesh(
     let stats = TerrainChunkStats {
         mean_moisture: (sum_moisture / vertex_total) as f32,
         mean_slope: (sum_slope / vertex_total) as f32,
-        max_height,
-        signature: TerrainChunkSignature::new(
-            sum_height,
-            sum_moisture,
-            sum_accent,
-            max_height,
-        ),
+        height_factor: (max_height / height_scale).clamp(0.0, 1.0),
+        signature: TerrainChunkSignature::new(sum_height, sum_moisture, sum_accent, max_height),
     };
 
     BuiltChunk { mesh, stats }
@@ -1718,9 +1715,9 @@ mod terrain_tests {
             origin: UVec2::ZERO,
             size: snapshot.terrain_height.dims,
         };
-        let mesh = build_chunk_mesh(&snapshot, bounds, 100.0);
+        let built = build_chunk_mesh(&snapshot, bounds, 100.0);
 
-        let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+        let positions = match built.mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
             Some(VertexAttributeValues::Float32x3(values)) => values.clone(),
             other => panic!("unexpected position attribute: {:?}", other),
         };
@@ -1764,7 +1761,7 @@ mod terrain_tests {
             expected_last
         );
 
-        let indices = match mesh.indices() {
+        let indices = match built.mesh.indices() {
             Some(Indices::U32(idx)) => idx.clone(),
             other => panic!("unexpected index buffer: {:?}", other),
         };
@@ -1773,6 +1770,9 @@ mod terrain_tests {
             24,
             "expected 2x2 quads => 24 indices (two tris per cell)"
         );
+
+        assert!(built.stats.mean_moisture > 0.0);
+        assert!(built.stats.signature.max_height > 0.0);
     }
 
     #[test]
@@ -2056,8 +2056,8 @@ fn color_to_rgba(color: Color) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use scriptbots_core::ScriptBotsConfig;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn bevy_offscreen_renderer_produces_png() -> Result<()> {
@@ -2075,12 +2075,18 @@ mod tests {
     #[test]
     fn follow_button_toggles_mode() {
         let mut app = App::new();
-        app.add_systems(Update, (handle_follow_button_interactions, update_follow_button_colors));
+        app.add_systems(
+            Update,
+            (
+                handle_follow_button_interactions,
+                update_follow_button_colors,
+            ),
+        );
         app.insert_resource(CameraRig::default());
-        app.world.resource_mut::<CameraRig>().follow_mode = FollowMode::Off;
+        app.world_mut().resource_mut::<CameraRig>().follow_mode = FollowMode::Off;
 
         let button = app
-            .world
+            .world_mut()
             .spawn(ButtonBundle::default())
             .insert(FollowButton {
                 mode: FollowMode::Selected,
@@ -2090,10 +2096,10 @@ mod tests {
 
         app.update();
 
-        let rig = app.world.resource::<CameraRig>();
+        let rig = app.world().resource::<CameraRig>();
         assert_eq!(rig.follow_mode, FollowMode::Selected);
 
-        app.world.entity_mut(button).insert(Interaction::None);
+        app.world_mut().entity_mut(button).insert(Interaction::None);
         app.update();
     }
 
@@ -2114,7 +2120,7 @@ mod tests {
         });
         app.insert_resource(CameraRig::default());
 
-        app.world
+        app.world_mut()
             .spawn(ButtonBundle::default())
             .insert(ClearSelectionButton)
             .insert(Interaction::Pressed);

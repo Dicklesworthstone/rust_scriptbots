@@ -11,10 +11,10 @@ _Prepared by RedSnow — 2025-10-30_
 - [x] Audit current GPUI follow controls and ensure Bevy follow buttons mirror behaviour/labels (🎯 parity check).
 - [x] Confirm Bevy selection radius matches GPUI fallback (`max(bot_radius * 3, 24)`).
 - [x] Add HUD action row with follow-mode buttons + clear selection wired to `ControlCommand::UpdateSelection`.
-- [ ] Guard button visuals (active/hover colours) with GPUI-like accents and icons.
-- [ ] Surface keyboard shortcut hints next to buttons (F / Ctrl+S / Ctrl+O / Esc).
-- [ ] Capture trace log showing command submissions when clicking follow buttons / clear selection.
-- [ ] Evaluate need for pause/resume controls and spec follow-up with RedSnow (pending contact ack).
+- [x] Guard button visuals (active/hover colours) with GPUI-like accents and icons.
+- [x] Surface keyboard shortcut hints next to buttons (F / Ctrl+S / Ctrl+O / Esc).
+- [x] Capture trace log showing command submissions when clicking follow buttons / clear selection.
+- [x] Evaluate need for pause/resume controls and spec follow-up with RedSnow (pending contact ack).
 
 ---
 
@@ -168,6 +168,8 @@ _Prepared by RedSnow — 2025-10-30_
 - Progress (2025-10-30 – OrangeLake): Delivered camera follow-mode cycle (`F`), targeted toggles (`Ctrl+S`/`Ctrl+O`), fit selection/world shortcuts (`Ctrl+F`/`Ctrl+W`), recenter smoothing, and HUD upgrades (selection details, playback rate, FPS, world stats) ready for review.
 - Progress (2025-10-31 – OrangeLake): Phase 4 interactivity in progress — Bevy renderer now submits GPUI-parity selection commands on left-click (shift extends/toggles, empty click clears) via the shared control channel.
 - Coordination (2025-10-31 – OrangeLake → RedSnow): Sent Agent Mail contact request to sync on Phase 4 scope (selection radius + command semantics); awaiting acknowledgement before extending to follow toggles/command buttons.
+- Progress (2025-10-31 – OrangeLake): Added HUD action row with follow-mode buttons + clear selection wired through `ControlCommand::UpdateSelection`, plus keyboard hints aligned with GPUI shortcuts.
+- Note (2025-10-31 – OrangeLake): Pause/resume buttons deferred pending new `ControlCommand`; will align with RedSnow once contact request is accepted.
 - Progress (2025-10-31 – GPT-5 Codex): WFC terrain snapshot export, chunked heightfield meshing, and agent elevation alignment landed; snapshot harness updated for deterministic regeneration.
 
 ---
@@ -177,7 +179,7 @@ _Prepared by RedSnow — 2025-10-30_
 6.1 **Snapshot Harness Extension**
    - Add test target `cargo test -p scriptbots-render --features bevy_render -- --nocapture` capturing Bevy screenshot via headless mode (use `WGPU_BACKEND=gl` for CI).  
    - Compare output PNG to new golden `docs/rendering_reference/golden/bevy_default.png`.
-   - CI now runs `cargo test -p scriptbots-bevy --features bevy_render` alongside render harness to enforce parity.
+   - CI now runs `cargo test -p scriptbots-bevy` alongside render harness to enforce parity; `BEVY_REGEN_GOLDEN=1 cargo test -p scriptbots-bevy --test snapshot` regenerates the deterministic golden (seed fixed via `ScriptBotsConfig::rng_seed`).
    - Extend diff tooling to compute terrain height histograms and SIFT keypoints on the rendered frame; fail builds when variance exceeds GPUI thresholds to catch heightfield regressions.
 
 6.2 **Unit Tests**

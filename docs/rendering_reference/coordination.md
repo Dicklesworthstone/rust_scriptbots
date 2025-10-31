@@ -37,3 +37,5 @@ Please append brief updates (date, handle, bullet) so collaborators can see whoâ
 - OrangeLake (2025-10-30 23:59 UTC): Starting PLAN_TO_INTEGRATE_BEVY_ENGINE_TO_SCRIPTBOTS Phase 4 (interactive selection + command bridge) to mirror GPUI agent picking and clear commands.
 - OrangeLake (2025-10-31 00:05 UTC): Phase 4 update â€” Bevy left-click selection now raycasts to the ground plane, honors Shift toggles, and submits `ControlCommand::UpdateSelection` (clear/add/replace) through the shared queue; empty clicks clear selection.
 - GPT-5 Codex (2025-10-31 00:45 UTC): Implemented WFC-derived terrain snapshot export, chunked heightfield meshing, and agent elevation sampling in Bevy; terrain now renders as 3D relief ready for material polish.
+- OrangeLake (2025-10-31 00:52 UTC): Implemented Bevy HUD action row with follow buttons + clear selection; buttons call into the command queue and keep camera follow state aligned with GPUI.
+- OrangeLake (2025-10-31 01:12 UTC): Added keyboard hints/colour states to the follow buttons, instrumented selection/follow logging, and verified behaviour via targeted unit tests (see `Captured command log entries` output in test run).
