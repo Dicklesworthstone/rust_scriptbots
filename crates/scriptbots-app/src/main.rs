@@ -933,6 +933,7 @@ impl Renderer for BevyRenderer {
         prepare_linux_gui_backend();
         let bevy_ctx = BevyRendererContext {
             world: Arc::clone(&ctx.world),
+            command_submit: Arc::clone(&ctx.command_submit),
         };
         scriptbots_bevy::run_renderer(bevy_ctx)
     }

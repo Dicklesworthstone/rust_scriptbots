@@ -155,6 +155,7 @@ _Prepared by RedSnow — 2025-10-30_
 - Progress (2025-10-30 – RedSnow): HUD parity underway — Bevy UI overlay replicates tick, agent counts, follow mode, and camera state.
 - Progress (2025-10-30 – OrangeLake): Continuing Phase 2 camera polish (fit selection shortcut, follow parity smoothing, easing) and Phase 3 HUD parity expansion toward GPUI completeness.
 - Progress (2025-10-30 – OrangeLake): Delivered camera follow-mode cycle (`F`), targeted toggles (`Ctrl+S`/`Ctrl+O`), fit selection/world shortcuts (`Ctrl+F`/`Ctrl+W`), recenter smoothing, and HUD upgrades (selection details, playback rate, FPS, world stats) ready for review.
+- Progress (2025-10-31 – OrangeLake): Phase 4 interactivity in progress — Bevy renderer now submits GPUI-parity selection commands on left-click (shift extends/toggles, empty click clears) via the shared control channel.
 
 ---
 

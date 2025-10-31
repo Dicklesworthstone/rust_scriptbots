@@ -9,3 +9,4 @@ bevy = { version = "0.14" }
 scriptbots-core = { path = "../scriptbots-core" }
 tracing = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
+slotmap = { workspace = true }
