@@ -172,6 +172,17 @@ const CAMERA_MAX_DISTANCE: f32 = 6000.0;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
 const FIT_WORLD_FACTOR: f32 = 0.38;
 const FIT_SELECTION_FACTOR: f32 = 0.55;
+fn follow_idle_color() -> Color {
+    Color::srgba(0.16, 0.22, 0.33, 0.92)
+}
+
+fn follow_hover_color() -> Color {
+    Color::srgba(0.22, 0.30, 0.46, 0.95)
+}
+
+fn follow_active_color() -> Color {
+    Color::srgba(0.34, 0.26, 0.64, 0.95)
+}
 const TERRAIN_CHUNK_SIZE: u32 = 64;
 const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
 
@@ -389,7 +400,6 @@ struct TerrainChunkRegistry {
     chunks: HashMap<TerrainChunkKey, TerrainChunkRecord>,
     chunk_size: u32,
     height_scale: f32,
-    material: Option<Handle<StandardMaterial>>,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -401,7 +411,9 @@ struct TerrainChunkKey {
 struct TerrainChunkRecord {
     entity: Entity,
     mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
     bounds: TerrainChunkBounds,
+    signature: TerrainChunkSignature,
     last_tick: u64,
 }
 
@@ -409,6 +421,32 @@ struct TerrainChunkRecord {
 struct TerrainChunkBounds {
     origin: UVec2,
     size: UVec2,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerrainChunkSignature {
+    sum_height: f64,
+    sum_moisture: f64,
+    sum_accent: f64,
+    max_height: f32,
+}
+
+impl TerrainChunkSignature {
+    fn new(sum_height: f64, sum_moisture: f64, sum_accent: f64, max_height: f32) -> Self {
+        Self {
+            sum_height,
+            sum_moisture,
+            sum_accent,
+            max_height,
+        }
+    }
+
+    fn is_close(&self, other: &Self) -> bool {
+        (self.sum_height - other.sum_height).abs() < 1e-3
+            && (self.sum_moisture - other.sum_moisture).abs() < 1e-3
+            && (self.sum_accent - other.sum_accent).abs() < 1e-3
+            && (self.max_height - other.max_height).abs() < 0.5
+    }
 }
 
 #[derive(Clone)]
@@ -549,8 +587,8 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         margin: UiRect::axes(Val::Px(0.0), Val::Px(8.0)),
         ..Default::default()
     };
-    let button_base_color = Color::srgba(0.16, 0.22, 0.33, 0.92);
-    let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
+let button_idle_color = Color::srgba(0.16, 0.22, 0.33, 0.92);
+let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
 
     let hud_root = commands
         .spawn(NodeBundle {
@@ -622,7 +660,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                         row.spawn((
                             ButtonBundle {
                                 style: button_style.clone(),
-                                background_color: button_base_color.into(),
+                                background_color: follow_idle_color().into(),
                                 border_radius: BorderRadius::all(Val::Px(6.0)),
                                 border_color: BorderColor(button_border_color),
                                 ..Default::default()
@@ -634,14 +672,14 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                         });
                     };
 
-                spawn_follow_button(row, FollowMode::Off, "Follow Off");
-                spawn_follow_button(row, FollowMode::Selected, "Follow Selected");
-                spawn_follow_button(row, FollowMode::Oldest, "Follow Oldest");
+                spawn_follow_button(row, FollowMode::Off, "🛑 Follow off (F)");
+                spawn_follow_button(row, FollowMode::Selected, "🎯 Follow selected (Ctrl+S)");
+                spawn_follow_button(row, FollowMode::Oldest, "📜 Follow oldest (Ctrl+O)");
 
                 row.spawn((
                     ButtonBundle {
                         style: button_style.clone(),
-                        background_color: button_base_color.into(),
+                        background_color: follow_idle_color().into(),
                         border_radius: BorderRadius::all(Val::Px(6.0)),
                         border_color: BorderColor(button_border_color),
                         ..Default::default()
@@ -650,7 +688,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                 ))
                 .with_children(|btn| {
                     btn.spawn(TextBundle::from_section(
-                        "Clear Selection",
+                        "✖ Clear selection (Esc)",
                         secondary_style.clone(),
                     ));
                 });
@@ -953,12 +991,14 @@ fn handle_selection_input(
         let agent_id = encode_agent_id(agent.id);
         let command = if extend {
             if matches!(agent.selection, SelectionState::Selected) {
+                info!(agent_id, "Bevy selection toggle -> clear");
                 ControlCommand::UpdateSelection(SelectionUpdate {
                     mode: SelectionMode::Clear,
                     agent_ids: vec![agent_id],
                     state: SelectionState::Selected,
                 })
             } else {
+                info!(agent_id, "Bevy selection toggle -> add");
                 ControlCommand::UpdateSelection(SelectionUpdate {
                     mode: SelectionMode::Add,
                     agent_ids: vec![agent_id],
@@ -966,6 +1006,7 @@ fn handle_selection_input(
                 })
             }
         } else {
+            info!(agent_id, "Bevy selection replace");
             ControlCommand::UpdateSelection(SelectionUpdate {
                 mode: SelectionMode::Replace,
                 agent_ids: vec![agent_id],
@@ -985,6 +1026,7 @@ fn handle_selection_input(
             state: SelectionState::Selected,
         });
         if (submitter.submit)(command) {
+            info!("Bevy selection cleared via empty click");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -998,6 +1040,7 @@ fn handle_follow_button_interactions(
 ) {
     for (button, interaction) in query.iter_mut() {
         if *interaction == Interaction::Pressed {
+            info!(mode = ?button.mode, "Bevy follow button pressed");
             rig.toggle_follow_mode(button.mode);
         }
     }
@@ -1019,6 +1062,7 @@ fn handle_clear_selection_button(
                 state: SelectionState::Selected,
             });
             (submitter.submit)(command);
+            info!("Bevy clear selection button pressed");
             rig.follow_mode = FollowMode::Off;
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
@@ -1030,17 +1074,13 @@ fn update_follow_button_colors(
     rig: Res<CameraRig>,
     mut query: Query<(&FollowButton, &Interaction, &mut BackgroundColor)>,
 ) {
-    let active_color = Color::srgba(0.34, 0.26, 0.64, 0.95);
-    let hover_color = Color::srgba(0.22, 0.30, 0.46, 0.95);
-    let idle_color = Color::srgba(0.16, 0.22, 0.33, 0.92);
-
     for (button, interaction, mut color) in query.iter_mut() {
         let target = if rig.follow_mode == button.mode {
-            active_color
+            follow_active_color()
         } else if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
-            hover_color
+            follow_hover_color()
         } else {
-            idle_color
+            follow_idle_color()
         };
         *color = target.into();
     }
@@ -1247,20 +1287,6 @@ fn sync_terrain(
     let chunks_x = (dims.x + chunk_size - 1) / chunk_size;
     let chunks_y = (dims.y + chunk_size - 1) / chunk_size;
 
-    let material_handle = if let Some(handle) = registry.material.clone() {
-        handle
-    } else {
-        let handle = materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 0.82,
-            metallic: 0.02,
-            reflectance: 0.05,
-            ..Default::default()
-        });
-        registry.material = Some(handle.clone());
-        handle
-    };
-
     let mut seen: HashSet<TerrainChunkKey> = HashSet::with_capacity((chunks_x * chunks_y) as usize);
 
     for chunk_y in 0..chunks_y {
@@ -1284,37 +1310,47 @@ fn sync_terrain(
 
             seen.insert(key);
 
-            let mesh = build_chunk_mesh(snapshot, bounds, registry.height_scale);
+            let built = build_chunk_mesh(snapshot, bounds, registry.height_scale);
 
-            if let Some(record) = registry.chunks.get_mut(&key) {
-                if let Some(existing) = meshes.get_mut(&record.mesh) {
-                    *existing = mesh;
-                } else {
-                    let mesh_handle = meshes.add(mesh);
-                    record.mesh = mesh_handle.clone();
-                    commands.entity(record.entity).insert(mesh_handle);
+            match registry.chunks.get_mut(&key) {
+                Some(record) => {
+                    if !record.signature.is_close(&built.stats.signature) {
+                        if let Some(existing) = meshes.get_mut(&record.mesh) {
+                            *existing = built.mesh;
+                        } else {
+                            let mesh_handle = meshes.add(built.mesh);
+                            record.mesh = mesh_handle.clone();
+                            commands.entity(record.entity).insert(mesh_handle);
+                        }
+                        update_chunk_material(materials, &record.material, &built.stats);
+                        record.signature = built.stats.signature;
+                        record.bounds = bounds;
+                    }
+                    record.last_tick = snapshot.tick;
                 }
-                record.bounds = bounds;
-                record.last_tick = snapshot.tick;
-            } else {
-                let mesh_handle = meshes.add(mesh);
-                let entity = commands
-                    .spawn(PbrBundle {
-                        mesh: mesh_handle.clone(),
-                        material: material_handle.clone(),
-                        transform: Transform::IDENTITY,
-                        ..Default::default()
-                    })
-                    .id();
-                registry.chunks.insert(
-                    key,
-                    TerrainChunkRecord {
-                        entity,
-                        mesh: mesh_handle,
-                        bounds,
-                        last_tick: snapshot.tick,
-                    },
-                );
+                None => {
+                    let mesh_handle = meshes.add(built.mesh);
+                    let material_handle = materials.add(create_chunk_material(&built.stats));
+                    let entity = commands
+                        .spawn(PbrBundle {
+                            mesh: mesh_handle.clone(),
+                            material: material_handle.clone(),
+                            transform: Transform::IDENTITY,
+                            ..Default::default()
+                        })
+                        .id();
+                    registry.chunks.insert(
+                        key,
+                        TerrainChunkRecord {
+                            entity,
+                            mesh: mesh_handle,
+                            material: material_handle,
+                            bounds,
+                            signature: built.stats.signature,
+                            last_tick: snapshot.tick,
+                        },
+                    );
+                }
             }
         }
     }
@@ -1330,15 +1366,67 @@ fn sync_terrain(
         if let Some(record) = registry.chunks.remove(&key) {
             commands.entity(record.entity).despawn_recursive();
             meshes.remove(&record.mesh);
+            materials.remove(&record.material);
         }
     }
+}
+
+fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
+    let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
+    let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
+    let emissive_intensity = (stats.mean_moisture * 0.12).clamp(0.0, 0.3);
+    let emissive = Color::linear_rgb(
+        emissive_intensity * 0.6,
+        emissive_intensity,
+        emissive_intensity * 0.8,
+    );
+    StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: roughness,
+        metallic,
+        reflectance: 0.04,
+        emissive,
+        ..Default::default()
+    }
+}
+
+fn update_chunk_material(
+    materials: &mut Assets<StandardMaterial>,
+    handle: &Handle<StandardMaterial>,
+    stats: &TerrainChunkStats,
+) {
+    if let Some(material) = materials.get_mut(handle) {
+        let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
+        let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
+        let emissive_intensity = (stats.mean_moisture * 0.12).clamp(0.0, 0.3);
+        material.perceptual_roughness = roughness;
+        material.metallic = metallic;
+        material.reflectance = 0.04;
+        material.emissive = Color::linear_rgb(
+            emissive_intensity * 0.6,
+            emissive_intensity,
+            emissive_intensity * 0.8,
+        );
+    }
+}
+
+struct BuiltChunk {
+    mesh: Mesh,
+    stats: TerrainChunkStats,
+}
+
+struct TerrainChunkStats {
+    mean_moisture: f32,
+    mean_slope: f32,
+    max_height: f32,
+    signature: TerrainChunkSignature,
 }
 
 fn build_chunk_mesh(
     snapshot: &WorldSnapshot,
     bounds: TerrainChunkBounds,
     height_scale: f32,
-) -> Mesh {
+) -> BuiltChunk {
     let terrain = &snapshot.terrain_height;
     let cell_size = terrain.cell_size as f32;
     let half = snapshot.world_size * 0.5;
@@ -1351,6 +1439,11 @@ fn build_chunk_mesh(
     let mut normals = vec![Vec3::ZERO; vertex_count];
     let mut uvs = Vec::with_capacity(vertex_count);
     let mut colors = Vec::with_capacity(vertex_count);
+    let mut sum_moisture = 0.0f64;
+    let mut sum_slope = 0.0f64;
+    let mut sum_height = 0.0f64;
+    let mut sum_accent = 0.0f64;
+    let mut max_height = f32::MIN;
 
     for vz in 0..verts_z {
         for vx in 0..verts_x {
@@ -1361,6 +1454,8 @@ fn build_chunk_mesh(
             let world_x = global_x as f32 * cell_size - half.x;
             let world_z = half.y - global_z as f32 * cell_size;
             positions.push([world_x, height, world_z]);
+            sum_height += height as f64;
+            max_height = max_height.max(height);
 
             let uv_x = global_x as f32 / terrain.dims.x.max(1) as f32;
             let uv_z = global_z as f32 / terrain.dims.y.max(1) as f32;
@@ -1368,6 +1463,12 @@ fn build_chunk_mesh(
 
             let color = terrain_vertex_color(terrain, global_x, global_z);
             colors.push(color);
+
+            let sample = terrain.sample_tile(global_x, global_z);
+            sum_moisture += sample.moisture as f64;
+            let slope = compute_tile_slope(terrain, global_x, global_z);
+            sum_slope += slope as f64;
+            sum_accent += sample.accent as f64;
         }
     }
 
@@ -1417,7 +1518,21 @@ fn build_chunk_mesh(
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
-    mesh
+
+    let vertex_total = vertex_count as f64;
+    let stats = TerrainChunkStats {
+        mean_moisture: (sum_moisture / vertex_total) as f32,
+        mean_slope: (sum_slope / vertex_total) as f32,
+        max_height,
+        signature: TerrainChunkSignature::new(
+            sum_height,
+            sum_moisture,
+            sum_accent,
+            max_height,
+        ),
+    };
+
+    BuiltChunk { mesh, stats }
 }
 
 fn sample_height_linear(terrain: &TerrainHeightSnapshot, x: f32, z: f32, height_scale: f32) -> f32 {
@@ -1941,6 +2056,7 @@ fn color_to_rgba(color: Color) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use scriptbots_core::ScriptBotsConfig;
 
     #[test]
@@ -1954,5 +2070,61 @@ mod tests {
         assert!(png.len() > 4096, "expected non-trivial PNG output");
         assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "invalid PNG header");
         Ok(())
+    }
+
+    #[test]
+    fn follow_button_toggles_mode() {
+        let mut app = App::new();
+        app.add_systems(Update, (handle_follow_button_interactions, update_follow_button_colors));
+        app.insert_resource(CameraRig::default());
+        app.world.resource_mut::<CameraRig>().follow_mode = FollowMode::Off;
+
+        let button = app
+            .world
+            .spawn(ButtonBundle::default())
+            .insert(FollowButton {
+                mode: FollowMode::Selected,
+            })
+            .insert(Interaction::Pressed)
+            .id();
+
+        app.update();
+
+        let rig = app.world.resource::<CameraRig>();
+        assert_eq!(rig.follow_mode, FollowMode::Selected);
+
+        app.world.entity_mut(button).insert(Interaction::None);
+        app.update();
+    }
+
+    #[test]
+    fn clear_selection_button_submits_command() {
+        let mut app = App::new();
+        app.add_systems(Update, handle_clear_selection_button);
+
+        let logs: Arc<Mutex<Vec<SelectionMode>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = logs.clone();
+        app.insert_resource(CommandSubmitter {
+            submit: Arc::new(move |command| {
+                if let ControlCommand::UpdateSelection(update) = command {
+                    sink.lock().unwrap().push(update.mode);
+                }
+                true
+            }),
+        });
+        app.insert_resource(CameraRig::default());
+
+        app.world
+            .spawn(ButtonBundle::default())
+            .insert(ClearSelectionButton)
+            .insert(Interaction::Pressed);
+
+        app.update();
+
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], SelectionMode::Clear);
+
+        println!("Captured command log entries: {:?}", *entries);
     }
 }
