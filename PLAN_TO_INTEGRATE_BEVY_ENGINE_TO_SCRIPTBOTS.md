@@ -56,6 +56,14 @@ _Prepared by RedSnow — 2025-10-30_
    - Agents: use instanced meshes (billboarded quads or low-poly models) matching existing palette.  
    - HUD: plan for Bevy UI overlay (2D camera) or egui integration for textual metrics.
 
+2.4 **Wave Function Collapse Terrain Heightfield**
+   - Snapshot payload must expose WFC-derived fields from `TerrainLayer` (width, height, `cell_size`, per-tile `elevation`, `moisture`, `accent`, `TerrainKind`, and fertility/temperature biases).  
+   - Encode topography as a contiguous f32 grid in world units; apply `WorldScale` so 1 terrain cell aligns with Bevy meters.  
+   - Define `TerrainSnapshot` struct (`heights: Vec<f32>`, `palette: Vec<TerrainKind>`, `biome_metrics: Vec<BiomeSample>`) to keep renderer-agnostic semantics.  
+   - Introduce chunk metadata (`TerrainChunkId`, extent, dirty flag) so Bevy can rebuild meshes incrementally when simulation mutates tiles.  
+   - Persist palette-to-material lookup table that maps `TerrainKind` + moisture bands to albedo/tint/roughness/emissive parameters; reuse existing GPUI palette constants for parity.  
+   - Document how WFC seed / deterministic replay guarantees identical terrain between renderers; ensure snapshot hash includes the heightfield so CI catches divergence.
+
 ---
 
 ## 3. Architectural Components (Bevy Side)
@@ -87,6 +95,14 @@ _Prepared by RedSnow — 2025-10-30_
    - Use Bevy’s PBR for 3D path; fallback to 2D if we keep flat world.  
    - Define `EnvironmentSettings` resource controlling lighting, skybox, bloom toggles.  
    - Hook up screenshot capture (use `bevy::render::texture::Image` exports) for parity with snapshot harness.
+
+3.6 **Terrain Mesh & Material Pipeline**
+   - `TerrainChunkMap` owns a pool of `TerrainChunk` components (configurable chunk size, default 64×64 tiles) with attached `Handle<Mesh>` + `Handle<StandardMaterial>`.  
+   - Mesh generation: sample height grid per chunk, emit vertices in XZ plane with Y = height, compute normals via Sobel kernel or cross-product of adjacent triangles, and populate tangents for future normal maps.  
+   - UV strategy: `u = x / terrain_width`, `v = z / terrain_height` to support procedural texture sampling; add secondary UV set for tri-planar shaders if needed.  
+   - Material authoring: use Bevy `StandardMaterial` with palette-derived base color + roughness/metallic values; pack biome accents into emissive/clear coat channels for stylised highlights.  
+   - Procedural texturing hooks: expose `TerrainMaterialParams` resource (height thresholds, moisture tints, shoreline foam intensity) so shader graph or WGSL material can blend snow/sand/moss overlays without new asset pipelines.  
+   - LOD considerations: provide optional decimation pass (skip every other vertex beyond configurable distance) and frustum-aligned chunk culling; defer to future perf work but keep interfaces ready.
 
 ---
 
@@ -124,14 +140,15 @@ _Prepared by RedSnow — 2025-10-30_
 | Phase | Objective | Deliverables | Exit Criteria |
 | --- | --- | --- | --- |
 | 0 [Completed – RedSnow 2025-10-30] | Scaffolding | New crate, feature flag, minimal Bevy app that opens window and clears background. | `cargo run --features bevy_render --renderer=bevy` opens blank window. |
-| 1 [Completed – RedSnow 2025-10-30] | Static world visuals | Render terrain, agents as instanced meshes/quads, static camera. | Snapshot harness for Bevy path produces comparable frame to GPUI. |
+| 1 [Currently In Progress – GPT-5 Codex 2025-10-30] | Static world visuals | Stream WFC terrain snapshot into chunked heightfield meshes with palette-driven PBR materials, render agents as instanced meshes under static camera. | Snapshot harness captures Bevy terrain/agent frame that matches GPUI reference histogram + feature checks within tolerance. |
 | 2 [Ready for Review – OrangeLake 2025-10-30 (prev: RedSnow 2025-10-30)] | Camera controls | Orbit + follow modes mapped, input parity with GPUI (mouse, keyboard). | QA sign-off that camera UX matches spec. |
 | 3 [Ready for Review – OrangeLake 2025-10-30 (prev: RedSnow 2025-10-30)] | HUD parity | Overlay tick stats, controls, selection info. | HUD shows same metrics as GPUI reference screenshot. |
-| 4 | Interactivity | Agent selection, follow toggles, command buttons. | Round-trip commands (select agent) confirmed via simulation logs. |
+| 4 [Currently In Progress – OrangeLake 2025-10-30] | Interactivity | Agent selection, follow toggles, command buttons. | Round-trip commands (select agent) confirmed via simulation logs. |
 | 5 | Polish + QA | Performance tuning, lighting, debug overlays, CI integration. | Bevy path passes `render_regression` job + manual smoke checklist. |
 
 - Progress (2025-10-30 – RedSnow): Scaffolded `scriptbots-bevy` crate, workspace feature flag, CLI `--renderer=bevy`, and stub window launcher [Phase 0 ✅].
-- Progress (2025-10-30 – RedSnow): Phase 1 wiring complete — Bevy renderer streams live `WorldState` snapshots, renders palette-aware terrain + agent spheres, and logs tick cadence every 120 frames; snapshot harness guards regressions.
+- Progress (2025-10-30 – RedSnow): Phase 1 baseline in place — Bevy renderer streams live `WorldState` snapshots, displays placeholder ground plane + agent spheres, and logs tick cadence every 120 frames; establishes plumbing for terrain/material upgrades.
+- In Progress (2025-10-30 – GPT-5 Codex): Implementing WFC-driven terrain heightfield (snapshot payloads, chunk meshing, procedural materials, chunk dirty tracking) to fulfill Phase 1 deliverables; will extend snapshot harness with histogram/feature checks for terrain parity.
 - Progress (2025-10-30 – RedSnow): Minted `docs/rendering_reference/golden/bevy_default.png` via new `--dump-bevy-png` flag; checksum recorded in `docs/rendering_reference/checksums.txt`.
 - Progress (2025-10-30 – RedSnow): Added `crates/scriptbots-bevy/tests/snapshot.rs` comparing `render_png_offscreen` output against `golden/bevy_default.png`; diff tooling now fails tests on byte mismatches.
 - Progress (2025-10-30 – RedSnow): Camera controls underway — mouse orbit/scroll zoom/WASD pan implemented via `CameraRig`; `F` toggles follow mode, while Q/E yaw and PageUp/PageDown pitch mirror GPUI shortcuts.
@@ -147,10 +164,12 @@ _Prepared by RedSnow — 2025-10-30_
    - Add test target `cargo test -p scriptbots-render --features bevy_render -- --nocapture` capturing Bevy screenshot via headless mode (use `WGPU_BACKEND=gl` for CI).  
    - Compare output PNG to new golden `docs/rendering_reference/golden/bevy_default.png`.
    - CI now runs `cargo test -p scriptbots-bevy --features bevy_render` alongside render harness to enforce parity.
+   - Extend diff tooling to compute terrain height histograms and SIFT keypoints on the rendered frame; fail builds when variance exceeds GPUI thresholds to catch heightfield regressions.
 
 6.2 **Unit Tests**
    - `scriptbots-bevy` crate: test conversion helpers (`RenderFrame` → `BevyAgentBundle`).  
    - Camera controller: property tests ensuring orbit/follow maintains agent in frame.
+   - Terrain mesh builder: deterministic fixture asserting chunk vertex positions, normals, material selection, and dirty-rectangle rebuild logic.
 
 6.3 **CI Matrix**
    - Linux GPU (WGPU) + Windows builds.  

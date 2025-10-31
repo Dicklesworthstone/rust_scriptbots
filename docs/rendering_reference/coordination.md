@@ -17,6 +17,7 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - PinkMountain: Owning Stage 2 camera wiring (GPUI + terminal/offscreen integration) per PLAN §2.3/§2.4 updates.
 - PinkMountain: Stage 2 progress — GPUI + WGPU paths now rely on `Camera::layout`; terminal/offscreen parity and HUD overlays remain.
 - PinkMountain: Extended `render_png_offscreen` to share `Camera::layout` + `world_to_screen`, keeping REST exports aligned with the live renderer; HUD/inspector overlays now surface screen coordinates via `world_to_screen`.
+- PinkMountain: Added camera layout logging safeguards (`camera_layout_pre_follow`, `auto_fit_world_due_to_extreme_zoom`, etc.) to diagnose blank viewport cases.
 - RedCastle: Regenerated all legacy reference PNGs (`legacy_default.png`, `legacy_selected_agent.png`, `legacy_food_peak.png`, `legacy_food_off.png`, `legacy_zoomed_hud.png`), refreshed SHA256s in `checksums.txt`, and published capture helper `capture_legacy_render.sh`.
 - RedCastle: Added SVG overlays (`legacy_*_overlay.svg`) aligned with ROI tables and updated spec/plan to mark PLAN §1.2 complete.
 - RedCastle: Drafted `visual_polish_plan.md` outlining palette/legibility work and claimed PLAN §3.1–§3.2 pending Stage 2 stability.
@@ -33,3 +34,4 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - RedSnow (2025-10-30 21:50 UTC): Added Bevy HUD overlay (tick, agents, follow state, camera metrics) driven by live snapshots.
 - OrangeLake (2025-10-30 23:35 UTC): Picking up PLAN_TO_INTEGRATE_BEVY_ENGINE_TO_SCRIPTBOTS Phase 2 camera polish (fit selection, follow parity, easing) and Phase 3 HUD parity expansion (selection/FPS/playback metrics).
 - OrangeLake (2025-10-30 23:58 UTC): Landed Bevy camera polish (`F` cycle, Ctrl+S/O follow, Ctrl+F/W fits, easing) plus HUD parity metrics (selection details, playback rate, FPS, world stats); PLAN phases 2–3 marked ready for review.
+- OrangeLake (2025-10-30 23:59 UTC): Starting PLAN_TO_INTEGRATE_BEVY_ENGINE_TO_SCRIPTBOTS Phase 4 (interactive selection + command bridge) to mirror GPUI agent picking and clear commands.

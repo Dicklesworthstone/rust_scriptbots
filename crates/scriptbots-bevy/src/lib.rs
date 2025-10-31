@@ -13,10 +13,14 @@ use bevy::{
     input::mouse::{MouseMotion, MouseWheel},
     math::primitives::{Plane3d, Sphere},
     prelude::*,
-    window::{PresentMode, WindowPlugin},
+    window::{PresentMode, PrimaryWindow, WindowPlugin},
 };
 use image::{ImageBuffer, Rgba as ImgRgba};
-use scriptbots_core::{AgentId, SelectionState, TerrainKind, WorldState};
+use scriptbots_core::{
+    AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, TerrainKind,
+    WorldState,
+};
+use slotmap::Key;
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
@@ -31,24 +35,35 @@ use std::{
 use tracing::info;
 
 /// Launch context supplied by the ScriptBots application shell.
+pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
+
 pub struct BevyRendererContext {
     pub world: Arc<Mutex<WorldState>>,
+    pub command_submit: CommandSubmitFn,
 }
 
 /// Entry point for the Bevy renderer; blocks until the window closes.
 pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     info!("Launching Bevy renderer (Phase 1: static world visuals)");
 
+    let BevyRendererContext {
+        world,
+        command_submit,
+    } = ctx;
+
     let (tx, rx) = mpsc::channel::<WorldSnapshot>();
     let running = Arc::new(AtomicBool::new(true));
     let worker_flag = Arc::clone(&running);
-    let world = Arc::clone(&ctx.world);
+    let world_for_worker = Arc::clone(&world);
+    let submitter_resource = CommandSubmitter {
+        submit: command_submit.clone(),
+    };
 
     let worker = thread::spawn(move || {
         let mut last_tick = 0u64;
         while worker_flag.load(Ordering::Relaxed) {
             let snapshot = {
-                let guard = world.lock().expect("world mutex poisoned");
+                let guard = world_for_worker.lock().expect("world mutex poisoned");
                 WorldSnapshot::from_world(&guard)
             };
 
@@ -71,6 +86,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             color: Color::srgb(0.45, 0.52, 0.65),
             brightness: 800.0,
         })
+        .insert_resource(submitter_resource)
         .insert_non_send_resource(SnapshotInbox { receiver: rx })
         .insert_resource(SnapshotState::default())
         .insert_resource(AgentRegistry::default())
@@ -85,7 +101,14 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         .add_systems(Startup, setup_scene)
         .add_systems(
             Update,
-            (poll_snapshots, sync_world, control_camera, update_hud).chain(),
+            (
+                poll_snapshots,
+                sync_world,
+                handle_selection_input,
+                control_camera,
+                update_hud,
+            )
+                .chain(),
         )
         .add_systems(Update, close_on_esc);
 
@@ -139,6 +162,11 @@ struct AgentMeshAsset {
     base_radius: f32,
 }
 
+#[derive(Resource, Clone)]
+struct CommandSubmitter {
+    submit: CommandSubmitFn,
+}
+
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
@@ -153,6 +181,21 @@ fn bounds_extent(bounds: (Vec2, Vec2)) -> Vec2 {
 fn fit_distance_for_extent(extent: Vec2, factor: f32) -> f32 {
     let max_extent = extent.max_element().max(200.0);
     (max_extent * factor).clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
+}
+
+fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
+    let mut delta = target - origin;
+    let half = extent * 0.5;
+    if delta > half {
+        delta -= extent;
+    } else if delta < -half {
+        delta += extent;
+    }
+    delta
+}
+
+fn encode_agent_id(id: AgentId) -> u64 {
+    id.data().as_ffi()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,10 +519,7 @@ fn setup_scene(
             ))
             .id();
         fps = parent
-            .spawn(TextBundle::from_section(
-                "FPS: --",
-                secondary_style.clone(),
-            ))
+            .spawn(TextBundle::from_section("FPS: --", secondary_style.clone()))
             .id();
         world = parent
             .spawn(TextBundle::from_section(
@@ -554,9 +594,7 @@ fn sync_world(
 
     let selection_bounds = has_selection.then_some((selection_min, selection_max));
     let selection_center = selection_bounds.map(|(min, max)| (min + max) * 0.5);
-    let focus_point = selection_center
-        .or(first_agent)
-        .unwrap_or(world_center);
+    let focus_point = selection_center.or(first_agent).unwrap_or(world_center);
 
     align_ground_plane(snapshot, &mut plane_query);
     update_terrain_texture(snapshot, &mut terrain, &mut images);
@@ -605,15 +643,18 @@ fn update_hud(
                 }
             }
         }
-        (tick, agent_count, world_size, agent_radius, selected_count, primary)
+        (
+            tick,
+            agent_count,
+            world_size,
+            agent_radius,
+            selected_count,
+            primary,
+        )
     };
 
     if tick != state.last_reported_tick && tick % 120 == 0 {
-        info!(
-            tick,
-            agents = agent_count,
-            "Bevy world snapshot applied"
-        );
+        info!(tick, agents = agent_count, "Bevy world snapshot applied");
     }
     state.last_reported_tick = tick;
 
@@ -672,11 +713,9 @@ fn update_hud(
             let yaw_deg = rig.yaw.to_degrees();
             let pitch_deg = rig.pitch.to_degrees();
             text.sections[0].value = format!(
-                    "Camera: dist {:>5.0} yaw {:>6.1}° pitch {:>5.1}° • Ctrl+F fit selection • Ctrl+W fit world",
-                    rig.distance,
-                    yaw_deg,
-                    pitch_deg
-                );
+                "Camera: dist {:>5.0} yaw {:>6.1}° pitch {:>5.1}° • Ctrl+F fit selection • Ctrl+W fit world",
+                rig.distance, yaw_deg, pitch_deg
+            );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.playback) {
             if state.sim_rate.is_finite() && state.sim_rate > 0.0 {
@@ -707,6 +746,123 @@ fn update_hud(
     }
 }
 
+fn handle_selection_input(
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<PrimaryCamera>>,
+    state: Res<SnapshotState>,
+    submitter: Option<Res<CommandSubmitter>>,
+    mut rig: ResMut<CameraRig>,
+) {
+    let Some(submitter) = submitter else {
+        return;
+    };
+
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let snapshot = match state.latest.as_ref() {
+        Some(snapshot) => snapshot,
+        None => return,
+    };
+
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Some(cursor_pos) = window.cursor_position() else {
+        return;
+    };
+
+    let Ok((camera, transform)) = camera_query.get_single() else {
+        return;
+    };
+    let Some(ray) = camera.viewport_to_world(transform, cursor_pos) else {
+        return;
+    };
+
+    let dir_y = ray.direction.y;
+    if dir_y.abs() <= f32::EPSILON {
+        return;
+    }
+    let distance = -ray.origin.y / dir_y;
+    if distance <= 0.0 {
+        return;
+    }
+    let impact = ray.origin + ray.direction * distance;
+
+    let world_size = state.world_size;
+    if world_size.x <= 0.0 || world_size.y <= 0.0 {
+        return;
+    }
+
+    let world_point = Vec2::new(
+        impact.x + world_size.x * 0.5,
+        world_size.y * 0.5 - impact.z,
+    );
+
+    let selection_radius = (snapshot.agent_radius * 3.0).max(24.0);
+    let radius_sq = selection_radius * selection_radius;
+
+    let mut best: Option<&AgentVisual> = None;
+    let mut best_dist = f32::MAX;
+
+    for agent in &snapshot.agents {
+        let dx = toroidal_delta(world_point.x, agent.position.x, world_size.x);
+        let dy = toroidal_delta(world_point.y, agent.position.y, world_size.y);
+        let dist_sq = dx.mul_add(dx, dy * dy);
+        if dist_sq <= radius_sq && dist_sq < best_dist {
+            best_dist = dist_sq;
+            best = Some(agent);
+        }
+    }
+
+    let extend = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+    if let Some(agent) = best {
+        let agent_id = encode_agent_id(agent.id);
+        let command = if extend {
+            if matches!(agent.selection, SelectionState::Selected) {
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: vec![agent_id],
+                    state: SelectionState::Selected,
+                })
+            } else {
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Add,
+                    agent_ids: vec![agent_id],
+                    state: SelectionState::Selected,
+                })
+            }
+        } else {
+            ControlCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Replace,
+                agent_ids: vec![agent_id],
+                state: SelectionState::Selected,
+            })
+        };
+
+        if (submitter.submit)(command) && !extend {
+            rig.follow_mode = FollowMode::Selected;
+            rig.pan = Vec2::ZERO;
+            rig.recenter_now = true;
+        }
+    } else if !extend {
+        let command = ControlCommand::UpdateSelection(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::Selected,
+        });
+        if (submitter.submit)(command) {
+            rig.follow_mode = FollowMode::Off;
+            rig.pan = Vec2::ZERO;
+            rig.recenter_now = true;
+        }
+    }
+}
+
 fn control_camera(
     time: Res<Time>,
     mut rig: ResMut<CameraRig>,
@@ -730,9 +886,7 @@ fn control_camera(
     for wheel in mouse_wheel.read() {
         rig.distance *= (1.0 - wheel.y * 0.1).clamp(0.2, 5.0);
     }
-    rig.distance = rig
-        .distance
-        .clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
+    rig.distance = rig.distance.clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
 
     if keys.just_pressed(KeyCode::KeyF) {
         if ctrl_held {
@@ -807,8 +961,7 @@ fn control_camera(
             match command {
                 FitCommand::World => {
                     focus_override = Some(state.world_center);
-                    let distance =
-                        fit_distance_for_extent(state.world_size, FIT_WORLD_FACTOR);
+                    let distance = fit_distance_for_extent(state.world_size, FIT_WORLD_FACTOR);
                     rig.distance = distance;
                     rig.distance_smoothed = distance;
                 }
@@ -819,16 +972,13 @@ fn control_camera(
                             .unwrap_or_else(|| (bounds.0 + bounds.1) * 0.5);
                         focus_override = Some(center);
                         let extent = bounds_extent(bounds);
-                        let distance =
-                            fit_distance_for_extent(extent, FIT_SELECTION_FACTOR);
+                        let distance = fit_distance_for_extent(extent, FIT_SELECTION_FACTOR);
                         rig.distance = distance;
                         rig.distance_smoothed = distance;
                     } else if let Some(selected) = state.first_agent_position {
                         focus_override = Some(selected);
-                        let distance = fit_distance_for_extent(
-                            Vec2::splat(400.0),
-                            FIT_SELECTION_FACTOR,
-                        );
+                        let distance =
+                            fit_distance_for_extent(Vec2::splat(400.0), FIT_SELECTION_FACTOR);
                         rig.distance = distance;
                         rig.distance_smoothed = distance;
                     } else {

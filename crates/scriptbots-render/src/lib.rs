@@ -997,6 +997,16 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     {
         camera_guard.center_on(target);
         layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+        tracing::debug!(
+            follow_mode = ?state.controls.follow_mode,
+            target_x = target.x,
+            target_y = target.y,
+            render_width = layout.render_size.0,
+            render_height = layout.render_size.1,
+            offset_x = layout.offset.0,
+            offset_y = layout.offset.1,
+            "camera_layout_follow"
+        );
 
         let follow_coverage_small =
             layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
@@ -1005,6 +1015,14 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         if follow_coverage_small || follow_coverage_large {
             camera_guard.fit_world();
             layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
+            tracing::warn!(
+                follow_mode = ?state.controls.follow_mode,
+                render_width = layout.render_size.0,
+                render_height = layout.render_size.1,
+                viewport_width = width_px,
+                viewport_height = height_px,
+                "follow_mode_auto_fit_world"
+            );
         }
     }
     drop(camera_guard);
@@ -11211,6 +11229,20 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         frame.world_size,
     );
 
+    tracing::debug!(
+        viewport_width = width_px,
+        viewport_height = height_px,
+        render_width = layout.render_size.0,
+        render_height = layout.render_size.1,
+        pad_x = layout.pad.0,
+        pad_y = layout.pad.1,
+        offset_x = layout.offset.0,
+        offset_y = layout.offset.1,
+        base_scale = layout.base_scale,
+        zoom = camera_guard.zoom(),
+        "camera_layout_pre_follow"
+    );
+
     let coverage_too_small =
         layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
     let coverage_too_large =
@@ -11222,6 +11254,13 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             (origin_x, origin_y),
             (width_px, height_px),
             frame.world_size,
+        );
+        tracing::warn!(
+            render_width = layout.render_size.0,
+            render_height = layout.render_size.1,
+            viewport_width = width_px,
+            viewport_height = height_px,
+            "auto_fit_world_due_to_extreme_zoom"
         );
     }
 
