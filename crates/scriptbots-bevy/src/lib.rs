@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::prelude::*;
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::math::primitives::Sphere;
@@ -14,6 +15,7 @@ use bevy::ui::prelude::*;
 use bevy::ui::{BorderColor, BorderRadius};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use bevy_mesh::{Indices, Mesh};
+use owo_colors::OwoColorize;
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
     AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
@@ -23,6 +25,7 @@ use slotmap::Key;
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
+    env,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -95,6 +98,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     );
 
     let mut app = App::new();
+    let diagnostics_enabled = diagnostics_enabled();
     app.insert_resource(AmbientLight {
             color: Color::srgb(0.45, 0.52, 0.65),
             brightness: 800.0,
@@ -133,12 +137,33 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         )
         .add_systems(Update, close_on_esc);
 
+    if diagnostics_enabled {
+        app.insert_resource(DiagnosticsTicker::new(DIAGNOSTIC_REPORT_INTERVAL))
+            .add_plugins(FrameTimeDiagnosticsPlugin::default())
+            .add_systems(Update, report_frame_metrics);
+    }
+
     app.run();
 
     running.store(false, Ordering::Relaxed);
     let _ = simulation_thread.join();
     let _ = worker.join();
     Ok(())
+}
+
+fn diagnostics_enabled() -> bool {
+    env::var("SB_DIAGNOSTICS")
+        .ok()
+        .and_then(|value| parse_env_flag(&value))
+        .unwrap_or(false)
+}
+
+fn parse_env_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[derive(Component)]
@@ -276,11 +301,38 @@ fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCo
     }
 }
 
+const DIAGNOSTIC_REPORT_INTERVAL: u32 = 300;
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
 const FIT_WORLD_FACTOR: f32 = 0.38;
 const FIT_SELECTION_FACTOR: f32 = 0.55;
+
+#[derive(Resource, Debug)]
+struct DiagnosticsTicker {
+    interval: u32,
+    frames_since_report: u32,
+}
+
+impl DiagnosticsTicker {
+    fn new(interval: u32) -> Self {
+        Self {
+            interval,
+            frames_since_report: 0,
+        }
+    }
+
+    fn tick(&mut self) -> bool {
+        self.frames_since_report = self.frames_since_report.saturating_add(1);
+        if self.frames_since_report >= self.interval {
+            self.frames_since_report = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn follow_idle_color() -> Color {
     Color::srgba(0.16, 0.22, 0.33, 0.92)
 }
@@ -733,86 +785,119 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     let mut world = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
-        let mut spawn_text =
-            |parent: &mut _, label: &str, font: &TextFont, color: Color| {
-                parent
-                    .spawn((Text::new(label), font.clone(), TextColor(color)))
-                    .id()
-            };
+        tick = parent
+            .spawn((
+                Text::new("Tick: --"),
+                primary_font.clone(),
+                TextColor(primary_text_color),
+            ))
+            .id();
+        agents = parent
+            .spawn((
+                Text::new("Agents: --"),
+                primary_font.clone(),
+                TextColor(primary_text_color),
+            ))
+            .id();
+        selection = parent
+            .spawn((
+                Text::new("Selection: --"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        follow = parent
+            .spawn((
+                Text::new("Follow: --"),
+                primary_font.clone(),
+                TextColor(primary_text_color),
+            ))
+            .id();
+        camera = parent
+            .spawn((
+                Text::new("Camera: --"),
+                primary_font.clone(),
+                TextColor(primary_text_color),
+            ))
+            .id();
+        playback = parent
+            .spawn((
+                Text::new("Playback: --"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        fps = parent
+            .spawn((
+                Text::new("FPS: --"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
+        world = parent
+            .spawn((
+                Text::new("World: --"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+            ))
+            .id();
 
-        tick = spawn_text(parent, "Tick: --", &primary_font, primary_text_color);
-        agents = spawn_text(parent, "Agents: --", &primary_font, primary_text_color);
-        selection = spawn_text(
-            parent,
-            "Selection: --",
-            &secondary_font,
-            secondary_text_color,
-        );
-        follow = spawn_text(parent, "Follow: --", &primary_font, primary_text_color);
-        camera = spawn_text(parent, "Camera: --", &primary_font, primary_text_color);
-        playback = spawn_text(
-            parent,
-            "Playback: --",
-            &secondary_font,
-            secondary_text_color,
-        );
-        fps = spawn_text(parent, "FPS: --", &secondary_font, secondary_text_color);
-        world = spawn_text(parent, "World: --", &secondary_font, secondary_text_color);
+        let playback_buttons = [
+            (PlaybackAction::Play, "▶ Run (Space)"),
+            (PlaybackAction::Pause, "⏸ Pause"),
+            (PlaybackAction::Step, "⏭ Step (N)"),
+            (PlaybackAction::SpeedDown, "➖ Speed (−)"),
+            (PlaybackAction::SpeedUp, "➕ Speed (+)"),
+        ];
 
         parent
             .spawn((button_row_node.clone(),))
             .with_children(|row| {
-                let mut spawn_playback =
-                    |row: &mut _, action: PlaybackAction, label: &str| {
-                        row.spawn((
-                            Button,
-                            button_node.clone(),
-                            BackgroundColor(follow_idle_color()),
-                            BorderRadius::all(px(6.0)),
-                            BorderColor::all(button_border_color),
-                            PlaybackButton { action },
-                        ))
-                        .with_children(|btn: &mut _| {
-                            btn.spawn((
-                                Text::new(label),
-                                secondary_font.clone(),
-                                TextColor(secondary_text_color),
-                            ));
-                        });
-                    };
-
-                spawn_playback(row, PlaybackAction::Play, "▶ Run (Space)");
-                spawn_playback(row, PlaybackAction::Pause, "⏸ Pause");
-                spawn_playback(row, PlaybackAction::Step, "⏭ Step (N)");
-                spawn_playback(row, PlaybackAction::SpeedDown, "➖ Speed (−)");
-                spawn_playback(row, PlaybackAction::SpeedUp, "➕ Speed (+)");
+                for (action, label) in playback_buttons {
+                    row.spawn((
+                        Button,
+                        button_node.clone(),
+                        BackgroundColor(follow_idle_color()),
+                        BorderRadius::all(px(6.0)),
+                        BorderColor::all(button_border_color),
+                        PlaybackButton { action },
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            Text::new(label),
+                            secondary_font.clone(),
+                            TextColor(secondary_text_color),
+                        ));
+                    });
+                }
             });
 
+        let follow_buttons = [
+            (FollowMode::Off, "🛑 Follow off (F)"),
+            (FollowMode::Selected, "🎯 Follow selected (Ctrl+S)"),
+            (FollowMode::Oldest, "📜 Follow oldest (Ctrl+O)"),
+        ];
+
         parent
             .spawn((button_row_node.clone(),))
             .with_children(|row| {
-                let mut spawn_follow_button =
-                    |row: &mut _, mode: FollowMode, label: &str| {
-                        row.spawn((
-                            Button,
-                            button_node.clone(),
-                            BackgroundColor(follow_idle_color()),
-                            BorderRadius::all(px(6.0)),
-                            BorderColor::all(button_border_color),
-                            FollowButton { mode },
-                        ))
-                        .with_children(|btn: &mut _| {
-                            btn.spawn((
-                                Text::new(label),
-                                secondary_font.clone(),
-                                TextColor(secondary_text_color),
-                            ));
-                        });
-                    };
-
-                spawn_follow_button(row, FollowMode::Off, "🛑 Follow off (F)");
-                spawn_follow_button(row, FollowMode::Selected, "🎯 Follow selected (Ctrl+S)");
-                spawn_follow_button(row, FollowMode::Oldest, "📜 Follow oldest (Ctrl+O)");
+                for (mode, label) in follow_buttons {
+                    row.spawn((
+                        Button,
+                        button_node.clone(),
+                        BackgroundColor(follow_idle_color()),
+                        BorderRadius::all(px(6.0)),
+                        BorderColor::all(button_border_color),
+                        FollowButton { mode },
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            Text::new(label),
+                            secondary_font.clone(),
+                            TextColor(secondary_text_color),
+                        ));
+                    });
+                }
 
                 row.spawn((
                     Button,
@@ -966,7 +1051,7 @@ fn update_hud(
     }
     state.last_reported_tick = tick;
 
-    let now = time.elapsed_seconds_f64();
+    let now = time.elapsed_secs_f64();
     if state.hud_prev_tick == 0 {
         state.hud_prev_tick = tick;
         state.hud_prev_time = now;
@@ -1106,7 +1191,7 @@ fn handle_selection_input(
     let Ok((camera, transform)) = camera_query.single() else {
         return;
     };
-    let Some(ray) = camera.viewport_to_world(transform, cursor_pos) else {
+    let Ok(ray) = camera.viewport_to_world(transform, cursor_pos) else {
         return;
     };
 

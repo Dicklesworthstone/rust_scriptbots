@@ -1050,14 +1050,16 @@ struct AgentPipeline {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct AgentInstanceGpu {
-    pos: [f32; 2],
-    size: f32,
-    _pad: f32,
-    color: [f32; 4],
-    selection: u32,
-    glow: f32,
-    boost: f32,
-    _pad2: [f32; 1],
+    data0: [f32; 4],
+    data1: [f32; 4],
+    data2: [f32; 4],
+    data3: [f32; 4],
+    data4: [f32; 4],
+    data5: [f32; 4],
+    data6: [f32; 4],
+    data7: [f32; 4],
+    data8: [f32; 4],
+    data9: [f32; 4],
 }
 
 impl AgentPipeline {
@@ -1074,7 +1076,27 @@ impl AgentPipeline {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("agents.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x4, 4 => Uint32, 5 => Float32, 6 => Float32] }] },
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x4,
+                        1 => Float32x4,
+                        2 => Float32x4,
+                        3 => Float32x4,
+                        4 => Float32x4,
+                        5 => Float32x4,
+                        6 => Float32x4,
+                        7 => Float32x4,
+                        8 => Float32x4,
+                        9 => Float32x4
+                    ],
+                }],
+            },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: None,
@@ -1131,27 +1153,34 @@ impl AgentPipeline {
         let disable_cull = matches!(std::env::var("SB_WGPU_DISABLE_CULL").ok().map(|s| s.to_ascii_lowercase()), Some(ref v) if v == "1" || v == "true" || v == "yes" || v == "on");
         for a in snapshot.agents {
             // CPU frustum culling (pixel-space); assumes positions/sizes are pixels in this pass
-            let half = a.size * 0.5;
             let cx = a.position[0] * scale + offset.0;
             let cy = a.position[1] * scale + offset.1;
-            let radius = half * scale;
+            let radius_x = a.quad_extent[0] * scale;
+            let radius_y = a.quad_extent[1] * scale;
             if !disable_cull
-                && (cx + radius < 0.0
-                    || cx - radius > vp_w
-                    || cy + radius < 0.0
-                    || cy - radius > vp_h)
+                && (cx + radius_x < 0.0
+                    || cx - radius_x > vp_w
+                    || cy + radius_y < 0.0
+                    || cy - radius_y > vp_h)
             {
                 continue;
             }
             staging.push(AgentInstanceGpu {
-                pos: a.position,
-                size: a.size,
-                _pad: 0.0,
-                color: a.color,
-                selection: a.selection,
-                glow: a.glow,
-                boost: a.boost,
-                _pad2: [0.0],
+                data0: [a.position[0], a.position[1], a.quad_extent[0], a.quad_extent[1]],
+                data1: [a.heading[0], a.heading[1], a.body_radius, a.body_half_length],
+                data2: [a.wheel_offset, a.wheel_radius, a.mouth_open, a.herbivore_tendency],
+                data3: [
+                    a.temperature_preference,
+                    a.food_delta,
+                    a.sound_level,
+                    a.sound_output,
+                ],
+                data4: [a.wheel_left, a.wheel_right, a.trait_smell, a.trait_sound],
+                data5: [a.trait_hearing, a.trait_eye, a.trait_blood, a.selection],
+                data6: a.color,
+                data7: [a.glow, a.boost, 0.0, 0.0],
+                data8: a.eye_dirs,
+                data9: a.eye_fov,
             });
         }
         if !staging.is_empty() {
