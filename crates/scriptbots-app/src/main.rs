@@ -934,6 +934,7 @@ impl Renderer for BevyRenderer {
         let bevy_ctx = BevyRendererContext {
             world: Arc::clone(&ctx.world),
             command_submit: Arc::clone(&ctx.command_submit),
+            command_drain: Arc::clone(&ctx.command_drain),
         };
         scriptbots_bevy::run_renderer(bevy_ctx)
     }

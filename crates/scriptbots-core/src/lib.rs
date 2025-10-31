@@ -203,6 +203,14 @@ fn dot2(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 pub enum ControlCommand {
     UpdateConfig(Box<ScriptBotsConfig>),
     UpdateSelection(SelectionUpdate),
+    UpdateSimulation(SimulationCommand),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SimulationCommand {
+    pub paused: Option<bool>,
+    pub speed_multiplier: Option<f32>,
+    pub step_once: bool,
 }
 
 /// Apply a control command to the world state.
@@ -214,6 +222,10 @@ pub fn apply_control_command(
         ControlCommand::UpdateConfig(config) => world.apply_config_update(*config),
         ControlCommand::UpdateSelection(update) => {
             world.apply_selection_update(update);
+            Ok(())
+        }
+        ControlCommand::UpdateSimulation(update) => {
+            world.enqueue_simulation_command(update);
             Ok(())
         }
     }
@@ -4137,6 +4149,7 @@ pub struct WorldState {
     combat_spike_attempts: u32,
     combat_spike_hits: u32,
     config_audit: Vec<ConfigAuditEntry>,
+    simulation_commands: Vec<SimulationCommand>,
 }
 
 impl fmt::Debug for WorldState {
@@ -4242,6 +4255,7 @@ impl WorldState {
             combat_spike_attempts: 0,
             combat_spike_hits: 0,
             config_audit: Vec::with_capacity(32),
+            simulation_commands: Vec::new(),
         })
     }
 
@@ -8053,6 +8067,28 @@ impl WorldState {
         &self.config
     }
 
+    /// Queue a simulation control request for external renderers.
+    pub fn enqueue_simulation_command(&mut self, mut command: SimulationCommand) {
+        if let Some(speed) = command.speed_multiplier.as_mut() {
+            if speed.is_finite() {
+                *speed = speed.clamp(0.0, 32.0);
+            } else {
+                *speed = 1.0;
+            }
+        }
+        self.simulation_commands.push(command);
+    }
+
+    /// Drain pending simulation control requests (clearing the queue).
+    #[must_use]
+    pub fn drain_simulation_commands(&mut self) -> Vec<SimulationCommand> {
+        if self.simulation_commands.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.simulation_commands)
+        }
+    }
+
     /// Mutable access to the configuration (for hot edits).
     #[must_use]
     pub fn config_mut(&mut self) -> &mut ScriptBotsConfig {
@@ -10541,5 +10577,28 @@ mod tests {
         assert_eq!(world.agent_count(), 2);
         assert!(world.pending_deaths.is_empty());
         assert_eq!(world.last_deaths, 2);
+    }
+
+    #[test]
+    fn simulation_commands_queue_and_drain() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        assert!(world.drain_simulation_commands().is_empty());
+
+        apply_control_command(
+            &mut world,
+            ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: Some(0.0),
+                step_once: false,
+            }),
+        )
+        .expect("apply control command");
+
+        let pending = world.drain_simulation_commands();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].paused, Some(true));
+        assert_eq!(pending[0].speed_multiplier, Some(0.0));
+        assert!(!pending[0].step_once);
+        assert!(world.drain_simulation_commands().is_empty());
     }
 }

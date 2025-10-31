@@ -39,3 +39,4 @@ Please append brief updates (date, handle, bullet) so collaborators can see whoâ
 - GPT-5 Codex (2025-10-31 00:45 UTC): Implemented WFC-derived terrain snapshot export, chunked heightfield meshing, and agent elevation sampling in Bevy; terrain now renders as 3D relief ready for material polish.
 - OrangeLake (2025-10-31 00:52 UTC): Implemented Bevy HUD action row with follow buttons + clear selection; buttons call into the command queue and keep camera follow state aligned with GPUI.
 - OrangeLake (2025-10-31 01:12 UTC): Added keyboard hints/colour states to the follow buttons, instrumented selection/follow logging, and verified behaviour via targeted unit tests (see `Captured command log entries` output in test run).
+- OrangeLake (2025-10-31 01:30 UTC): Kicking off SimulationCommand pipeline + playback styling refresh per Phase 4 TODO checklist; aligning control contract with GPUI/terminal surfaces.

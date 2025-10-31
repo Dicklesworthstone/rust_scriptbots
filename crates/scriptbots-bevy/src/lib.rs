@@ -17,8 +17,8 @@ use bevy::{
 };
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, TerrainKind,
-    WorldState,
+    AgentId, ControlCommand, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
+    TerrainKind, WorldState,
 };
 use slotmap::Key;
 use std::{
@@ -30,16 +30,18 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Launch context supplied by the ScriptBots application shell.
 pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
+pub type CommandDrainFn = Arc<dyn Fn(&mut WorldState) + Send + Sync>;
 
 pub struct BevyRendererContext {
     pub world: Arc<Mutex<WorldState>>,
     pub command_submit: CommandSubmitFn,
+    pub command_drain: CommandDrainFn,
 }
 
 /// Entry point for the Bevy renderer; blocks until the window closes.
@@ -49,6 +51,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let BevyRendererContext {
         world,
         command_submit,
+        command_drain,
     } = ctx;
 
     let (tx, rx) = mpsc::channel::<WorldSnapshot>();
@@ -58,6 +61,11 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let submitter_resource = CommandSubmitter {
         submit: command_submit.clone(),
     };
+    let controls_resource = SimulationControl::new();
+    let controls_for_thread = controls_resource.clone();
+    let drain_for_thread = Arc::clone(&command_drain);
+    let world_for_sim = Arc::clone(&world);
+    let running_sim = Arc::clone(&running);
 
     let worker = thread::spawn(move || {
         let mut last_tick = 0u64;
@@ -80,6 +88,13 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         }
     });
 
+    let simulation_thread = spawn_simulation_driver(
+        world_for_sim,
+        drain_for_thread,
+        controls_for_thread.clone(),
+        Arc::clone(&running_sim),
+    );
+
     let mut app = App::new();
     app.insert_resource(ClearColor(Color::srgb(0.03, 0.05, 0.09)))
         .insert_resource(AmbientLight {
@@ -87,6 +102,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             brightness: 800.0,
         })
         .insert_resource(submitter_resource)
+        .insert_resource(controls_resource)
         .insert_non_send_resource(SnapshotInbox { receiver: rx })
         .insert_resource(SnapshotState::default())
         .insert_resource(AgentRegistry::default())
@@ -104,9 +120,12 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             (
                 poll_snapshots,
                 sync_world,
+                handle_playback_shortcuts,
+                handle_playback_buttons,
                 handle_selection_input,
                 handle_follow_button_interactions,
                 handle_clear_selection_button,
+                update_playback_button_colors,
                 update_follow_button_colors,
                 control_camera,
                 update_hud,
@@ -118,6 +137,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     app.run();
 
     running.store(false, Ordering::Relaxed);
+    let _ = simulation_thread.join();
     let _ = worker.join();
     Ok(())
 }
@@ -165,6 +185,71 @@ struct AgentMeshAsset {
 #[derive(Resource, Clone)]
 struct CommandSubmitter {
     submit: CommandSubmitFn,
+}
+
+const SIM_TICK_INTERVAL: f32 = 1.0 / 60.0;
+const MAX_SIM_STEPS_PER_FRAME: usize = 8;
+const SPEED_STEP: f32 = 0.5;
+const MIN_SPEED: f32 = 0.0;
+const MAX_SPEED: f32 = 8.0;
+
+#[derive(Clone, Debug)]
+struct SimControlData {
+    paused: bool,
+    speed_multiplier: f32,
+    step_requested: bool,
+    auto_pause_reason: Option<String>,
+}
+
+impl Default for SimControlData {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            speed_multiplier: 1.0,
+            step_requested: false,
+            auto_pause_reason: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SimControlSnapshot {
+    paused: bool,
+    speed_multiplier: f32,
+    auto_pause_reason: Option<String>,
+}
+
+#[derive(Resource, Clone)]
+struct SimulationControl(Arc<Mutex<SimControlData>>);
+
+impl SimulationControl {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(SimControlData::default())))
+    }
+
+    fn snapshot(&self) -> SimControlSnapshot {
+        let data = self.0.lock().expect("simulation control poisoned").clone();
+        SimControlSnapshot {
+            paused: data.paused,
+            speed_multiplier: data.speed_multiplier,
+            auto_pause_reason: data.auto_pause_reason.clone(),
+        }
+    }
+
+    fn update<F>(&self, f: F)
+    where
+        F: FnOnce(&mut SimControlData),
+    {
+        if let Ok(mut data) = self.0.lock() {
+            f(&mut data);
+        }
+    }
+}
+
+impl Default for SimulationControl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
@@ -312,6 +397,20 @@ struct HudElements {
 #[derive(Component)]
 struct FollowButton {
     mode: FollowMode,
+}
+
+#[derive(Component)]
+struct PlaybackButton {
+    action: PlaybackAction,
+}
+
+#[derive(Clone, Copy)]
+enum PlaybackAction {
+    Play,
+    Pause,
+    Step,
+    SpeedDown,
+    SpeedUp,
 }
 
 #[derive(Component)]
@@ -648,6 +747,37 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
                 secondary_style.clone(),
             ))
             .id();
+        // Playback controls row
+        parent
+            .spawn(NodeBundle {
+                style: button_row_style.clone(),
+                ..Default::default()
+            })
+            .with_children(|row| {
+                let spawn_playback =
+                    |row: &mut ChildBuilder, action: PlaybackAction, label: &str| {
+                        row.spawn((
+                            ButtonBundle {
+                                style: button_style.clone(),
+                                background_color: follow_idle_color().into(),
+                                border_radius: BorderRadius::all(Val::Px(6.0)),
+                                border_color: BorderColor(button_border_color),
+                                ..Default::default()
+                            },
+                            PlaybackButton { action },
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn(TextBundle::from_section(label, secondary_style.clone()));
+                        });
+                    };
+
+                spawn_playback(row, PlaybackAction::Play, "▶ Run (Space)");
+                spawn_playback(row, PlaybackAction::Pause, "⏸ Pause");
+                spawn_playback(row, PlaybackAction::Step, "⏭ Step (N)");
+                spawn_playback(row, PlaybackAction::SpeedDown, "➖ Speed (−)");
+                spawn_playback(row, PlaybackAction::SpeedUp, "➕ Speed (+)");
+            });
+
         parent
             .spawn(NodeBundle {
                 style: button_row_style.clone(),
@@ -790,6 +920,7 @@ fn update_hud(
     rig: Res<CameraRig>,
     hud: Option<Res<HudElements>>,
     time: Res<Time>,
+    controls: Res<SimulationControl>,
     mut texts: Query<&mut Text>,
 ) {
     let Some(_) = state.latest.as_ref() else {
@@ -839,7 +970,8 @@ fn update_hud(
         state.hud_prev_tick = tick;
         state.hud_prev_time = now;
     }
-    let playback_status = if now - state.hud_prev_time > 0.75 {
+    let control_snapshot = controls.snapshot();
+    let playback_status = if control_snapshot.paused {
         "Paused"
     } else {
         "Running"
@@ -887,15 +1019,17 @@ fn update_hud(
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.playback) {
-            if state.sim_rate.is_finite() && state.sim_rate > 0.0 {
-                text.sections[0].value = format!(
-                    "Playback: {} • {:>4.1} t/s",
-                    playback_status,
-                    state.sim_rate.clamp(0.0, 999.9)
-                );
+            let speed = control_snapshot.speed_multiplier.clamp(0.0, 999.9);
+            let mut message = if speed > 0.0 {
+                format!("Playback: {} • x{speed:>4.1}", playback_status)
             } else {
-                text.sections[0].value = format!("Playback: {}", playback_status);
+                format!("Playback: {} • x0.0", playback_status)
+            };
+            if let Some(reason) = control_snapshot.auto_pause_reason {
+                message.push_str(" • ");
+                message.push_str(&reason);
             }
+            text.sections[0].value = message;
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
             let delta_seconds = time.delta_seconds();
@@ -927,6 +1061,21 @@ fn handle_selection_input(
     let Some(submitter) = submitter else {
         return;
     };
+
+    if keys.just_pressed(KeyCode::Escape) {
+        let command = ControlCommand::UpdateSelection(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::Selected,
+        });
+        if (submitter.submit)(command) {
+            info!("Bevy selection cleared via Escape");
+            rig.follow_mode = FollowMode::Off;
+            rig.pan = Vec2::ZERO;
+            rig.recenter_now = true;
+        }
+        return;
+    }
 
     if !buttons.just_pressed(MouseButton::Left) {
         return;
@@ -1030,6 +1179,140 @@ fn handle_selection_input(
             rig.pan = Vec2::ZERO;
             rig.recenter_now = true;
         }
+    }
+}
+
+fn handle_playback_buttons(
+    controls: Res<SimulationControl>,
+    mut query: Query<(&PlaybackButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+) {
+    for (button, interaction) in query.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        controls.update(|state| match button.action {
+            PlaybackAction::Play => {
+                state.paused = false;
+                if state.speed_multiplier <= MIN_SPEED {
+                    state.speed_multiplier = 1.0;
+                }
+                state.step_requested = false;
+                state.auto_pause_reason = None;
+                info!("Bevy playback: resume");
+            }
+            PlaybackAction::Pause => {
+                state.paused = true;
+                state.step_requested = false;
+                info!("Bevy playback: pause");
+            }
+            PlaybackAction::Step => {
+                state.step_requested = true;
+                state.auto_pause_reason = None;
+                info!("Bevy playback: step once");
+            }
+            PlaybackAction::SpeedDown => {
+                state.speed_multiplier = (state.speed_multiplier - SPEED_STEP).max(MIN_SPEED);
+                if state.speed_multiplier <= MIN_SPEED {
+                    state.speed_multiplier = 0.0;
+                    state.paused = true;
+                    info!("Bevy playback: speed set to 0.0 (paused)");
+                } else {
+                    state.paused = false;
+                    info!(
+                        "Bevy playback: speed decreased to {:.1}",
+                        state.speed_multiplier
+                    );
+                }
+                state.auto_pause_reason = None;
+            }
+            PlaybackAction::SpeedUp => {
+                state.speed_multiplier =
+                    (state.speed_multiplier + SPEED_STEP).clamp(SPEED_STEP, MAX_SPEED);
+                state.paused = false;
+                state.auto_pause_reason = None;
+                info!(
+                    "Bevy playback: speed increased to {:.1}",
+                    state.speed_multiplier
+                );
+            }
+        });
+    }
+}
+
+fn handle_playback_shortcuts(keys: Res<ButtonInput<KeyCode>>, controls: Res<SimulationControl>) {
+    if keys.just_pressed(KeyCode::Space) {
+        controls.update(|state| {
+            state.paused = !state.paused;
+            if !state.paused && state.speed_multiplier <= MIN_SPEED {
+                state.speed_multiplier = 1.0;
+            }
+            state.step_requested = false;
+            state.auto_pause_reason = None;
+            info!(paused = state.paused, "Bevy playback toggled via Space");
+        });
+    }
+
+    if keys.just_pressed(KeyCode::KeyN) {
+        controls.update(|state| {
+            state.step_requested = true;
+            state.paused = true;
+            state.auto_pause_reason = None;
+            info!("Bevy playback: step requested via keyboard");
+        });
+    }
+
+    if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
+        controls.update(|state| {
+            state.speed_multiplier =
+                (state.speed_multiplier + SPEED_STEP).clamp(SPEED_STEP, MAX_SPEED);
+            state.paused = false;
+            state.auto_pause_reason = None;
+            info!(
+                "Bevy playback: speed increased to {:.1} via keyboard",
+                state.speed_multiplier
+            );
+        });
+    }
+
+    if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
+        controls.update(|state| {
+            state.speed_multiplier = (state.speed_multiplier - SPEED_STEP).max(MIN_SPEED);
+            if state.speed_multiplier <= MIN_SPEED {
+                state.speed_multiplier = 0.0;
+                state.paused = true;
+                info!("Bevy playback: speed decreased to 0.0 (paused) via keyboard");
+            } else {
+                state.paused = false;
+                info!(
+                    "Bevy playback: speed decreased to {:.1} via keyboard",
+                    state.speed_multiplier
+                );
+            }
+            state.auto_pause_reason = None;
+        });
+    }
+}
+
+fn update_playback_button_colors(
+    controls: Res<SimulationControl>,
+    mut query: Query<(&PlaybackButton, &Interaction, &mut BackgroundColor)>,
+) {
+    let snapshot = controls.snapshot();
+    for (button, interaction, mut color) in query.iter_mut() {
+        let highlight = match button.action {
+            PlaybackAction::Play => !snapshot.paused,
+            PlaybackAction::Pause => snapshot.paused,
+            _ => false,
+        };
+
+        let target = if highlight {
+            follow_active_color()
+        } else if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        *color = target.into();
     }
 }
 
@@ -2043,6 +2326,123 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Resu
     Ok(bytes)
 }
 
+fn spawn_simulation_driver(
+    world: Arc<Mutex<WorldState>>,
+    command_drain: CommandDrainFn,
+    controls: SimulationControl,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last = Instant::now();
+        let mut accumulator = 0.0f32;
+
+        while running.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let mut dt = (now - last).as_secs_f32();
+            last = now;
+            if !dt.is_finite() || dt > 0.25 {
+                dt = 0.25;
+            }
+
+            let (paused, speed, step_once) = {
+                let mut paused = false;
+                let mut speed = 1.0;
+                let mut step_once = false;
+                controls.update(|state| {
+                    paused = state.paused;
+                    speed = state.speed_multiplier.clamp(MIN_SPEED, MAX_SPEED);
+                    if state.step_requested {
+                        step_once = true;
+                        state.step_requested = false;
+                        state.paused = true;
+                        state.auto_pause_reason = None;
+                    }
+                });
+                (paused, speed, step_once)
+            };
+
+            if paused && !step_once {
+                if let Ok(mut world_guard) = world.lock() {
+                    (command_drain.as_ref())(&mut world_guard);
+                }
+                thread::sleep(Duration::from_millis(4));
+                continue;
+            }
+
+            if !step_once {
+                accumulator += dt * speed.max(0.0);
+                let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
+                accumulator = accumulator.min(max_accumulator);
+            }
+
+            let mut steps = if step_once {
+                accumulator = 0.0;
+                1
+            } else {
+                let mut queued = 0usize;
+                while accumulator >= SIM_TICK_INTERVAL && queued < MAX_SIM_STEPS_PER_FRAME {
+                    accumulator -= SIM_TICK_INTERVAL;
+                    queued += 1;
+                }
+                queued
+            };
+
+            if let Ok(mut world_guard) = world.lock() {
+                (command_drain.as_ref())(&mut world_guard);
+                if steps == 0 && !step_once && speed <= MIN_SPEED {
+                    drop(world_guard);
+                    thread::sleep(Duration::from_millis(4));
+                    continue;
+                }
+
+                if steps == 0 && step_once {
+                    steps = 1;
+                }
+
+                for _ in 0..steps {
+                    world_guard.step();
+                }
+
+                let control = world_guard.config().control.clone();
+                let agent_count = world_guard.agent_count();
+                let max_age = world_guard.last_max_age();
+                let spike_hits = world_guard.last_spike_hits();
+                drop(world_guard);
+
+                let mut reason: Option<String> = None;
+                if control.auto_pause_on_spike_hit && spike_hits > 0 {
+                    reason = Some(format!("Spike hits detected ({spike_hits})"));
+                } else if let Some(age_limit) = control.auto_pause_age_above {
+                    if max_age >= age_limit {
+                        reason = Some(format!("Max age {max_age} ≥ {age_limit}"));
+                    }
+                } else if let Some(limit) = control.auto_pause_population_below {
+                    if agent_count as u32 <= limit {
+                        reason = Some(format!("Population {agent_count} ≤ {limit}"));
+                    }
+                }
+
+                if let Some(reason) = reason {
+                    controls.update(|state| {
+                        state.paused = true;
+                        state.auto_pause_reason = Some(reason.clone());
+                        state.step_requested = false;
+                    });
+                    info!(%reason, "Bevy simulation auto-paused");
+                } else if steps > 0 {
+                    controls.update(|state| {
+                        state.auto_pause_reason = None;
+                    });
+                }
+            }
+
+            if steps == 0 {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    })
+}
+
 fn color_to_rgba(color: Color) -> [u8; 4] {
     let srgba = color.to_srgba();
     [
@@ -2132,5 +2532,60 @@ mod tests {
         assert_eq!(entries[0], SelectionMode::Clear);
 
         println!("Captured command log entries: {:?}", *entries);
+    }
+
+    #[test]
+    fn playback_button_updates_controls() {
+        let mut app = App::new();
+        app.add_systems(Update, handle_playback_buttons);
+        let controls = SimulationControl::new();
+        app.insert_resource(controls.clone());
+
+        let button = app
+            .world_mut()
+            .spawn(ButtonBundle::default())
+            .insert(PlaybackButton {
+                action: PlaybackAction::SpeedUp,
+            })
+            .insert(Interaction::Pressed)
+            .id();
+
+        app.update();
+
+        let snapshot = controls.snapshot();
+        assert!(
+            snapshot.speed_multiplier > 1.0,
+            "speed should accelerate after speed-up button"
+        );
+
+        app.world_mut().entity_mut(button).insert(Interaction::None);
+        app.update();
+    }
+
+    #[test]
+    fn playback_shortcuts_toggle_pause() {
+        let mut app = App::new();
+        app.add_systems(Update, handle_playback_shortcuts);
+        let controls = SimulationControl::new();
+        app.insert_resource(controls.clone());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::Space);
+        }
+
+        app.update();
+
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::Space);
+        }
+
+        let snapshot = controls.snapshot();
+        assert!(
+            snapshot.paused,
+            "spacebar shortcut should toggle pause state to true"
+        );
     }
 }

@@ -8,13 +8,16 @@ _Prepared by RedSnow — 2025-10-30_
 
 ### Phase 4 Working TODO — OrangeLake (2025-10-31)
 
-- [x] Audit current GPUI follow controls and ensure Bevy follow buttons mirror behaviour/labels (🎯 parity check).
-- [x] Confirm Bevy selection radius matches GPUI fallback (`max(bot_radius * 3, 24)`).
-- [x] Add HUD action row with follow-mode buttons + clear selection wired to `ControlCommand::UpdateSelection`.
-- [x] Guard button visuals (active/hover colours) with GPUI-like accents and icons.
-- [x] Surface keyboard shortcut hints next to buttons (F / Ctrl+S / Ctrl+O / Esc).
-- [x] Capture trace log showing command submissions when clicking follow buttons / clear selection.
-- [x] Evaluate need for pause/resume controls and spec follow-up with RedSnow (pending contact ack).
+- [ ] Add `ControlCommand::UpdateSimulation` + `SimulationCommand` plumbing in `scriptbots-core`.
+    - [ ] Extend `WorldState` with pending simulation control requests + helpers.
+    - [ ] Update `apply_control_command` and add regression test.
+- [ ] Wire GPUI renderer (`scriptbots-render`) to emit simulation commands for play/pause/step/speed.
+- [ ] Teach terminal renderer to honour queued simulation commands before stepping.
+- [ ] Update Bevy playback handlers to submit `SimulationCommand` and sync with queued requests.
+- [ ] Enhance Bevy simulation driver to merge queued commands into live control and respect auto-pause reason.
+- [ ] Refresh Bevy HUD styling to reflect terrain relief palette (drop shadow, accent borders).
+- [ ] Document command contract + styling adjustments in phase plan & coordination log and notify RedSnow.
+- [ ] Run `cargo check` for workspace & targeted tests (`scriptbots-bevy`, `scriptbots-core`).
 
 ---
 
@@ -170,6 +173,7 @@ _Prepared by RedSnow — 2025-10-30_
 - Coordination (2025-10-31 – OrangeLake → RedSnow): Sent Agent Mail contact request to sync on Phase 4 scope (selection radius + command semantics); awaiting acknowledgement before extending to follow toggles/command buttons.
 - Progress (2025-10-31 – OrangeLake): Added HUD action row with follow-mode buttons + clear selection wired through `ControlCommand::UpdateSelection`, plus keyboard hints aligned with GPUI shortcuts.
 - Note (2025-10-31 – OrangeLake): Pause/resume buttons deferred pending new `ControlCommand`; will align with RedSnow once contact request is accepted.
+- TODO (2025-10-31 – OrangeLake): Build SimulationCommand pipeline + UI styling refresh per phase checklist.
 - Progress (2025-10-31 – GPT-5 Codex): WFC terrain snapshot export, chunked heightfield meshing, and agent elevation alignment landed; snapshot harness updated for deterministic regeneration.
 
 ---
@@ -244,3 +248,107 @@ _Prepared by RedSnow — 2025-10-30_
 - [ ] Establish visual parity acceptance criteria with design/QA.
 
 Once phases progress, update this document inline with `[In Progress – <Name>]` markers to prevent duplicate work.
+
+---
+
+## 11. Visual Polish Roadmap
+
+1. **Lighting & Reflections**  
+   - Add reflection probes per zone (spawned from terrain chunks), bake environment maps, and iterate with probe debug draws before locking values. citeturn0search1  
+   - Adopt the forward+ pipeline and HDR backdrop improvements landing in Bevy 0.15, keeping exposure and white-point tunable in config. citeturn0search0
+
+2. **Tone Mapping & Post FX**  
+   - Enable the new auto-exposure + ACES tone mapper; surface toggles for bloom, chromatic aberration, motion blur, and film grain in `render.config.toml`. citeturn0search4turn0search8  
+   - Document HDR workflow (fall back to SDR paths for CI) and add color grading LUT slots for cinematic presets.
+
+3. **Atmosphere & Fog**  
+   - Integrate Bevy’s physical sky plugin for sun/sky scattering, hook into biome metadata (humidity, time-of-day), and layer height fog to reinforce depth. citeturn0search2turn0search9
+
+4. **Terrain Shading**  
+   - Extend chunk materials with triplanar detail maps, parallax occlusion, and layered noise LUTs to differentiate rock, sand, and moss; drive accents via GPU-computed slope/curvature masks. citeturn0search0  
+   - Pre-warm sampler states so terrain responds to dynamic daylight/sky color changes without shimmer.
+
+5. **Particles & Ambient FX**  
+   - Use Hanabi GPU particles for biome ambience (pollen, dust motes, fireflies) with emission budgets tied to chunk visibility. citeturn0search6  
+   - Feed particle color/alpha from the sky’s sun disk for cohesive lighting.
+
+6. **Camera Polish**  
+   - Add per-mode camera LUTs, depth-of-field targets, and screenshot presets (wider FOV, eased motion).  
+   - Track TAA/FXAA upstream and plan integration once Bevy exposes official graph nodes (reduces terrain shimmer in distant shots). citeturn0search8
+
+7. **Roadmap & CI Hooks**  
+   - Monitor upcoming material nodegraph & global illumination work; schedule an upgrade pass post 0.15 once tools stabilize. citeturn0search8  
+   - Extend snapshot harness: capture HDR EXR outputs, compute histogram/contrast deltas, and gate merges on acceptable drift.
+
+### Terrain Realism Enhancements
+
+1. **Procedural Base Geometry**  
+   - Layer multi-octave Perlin/FastNoise height fields (continental, ridge, fine detail) with domain warping to break repetition; expose noise seeds per biome for WFC compatibility.  
+   - Run GPU-friendly hydraulic erosion passes (thermal creep + river carving) on height buffers, following techniques from erosion-focused terrain articles, then bake results into chunk signatures. citeturn0search2turn0search3
+
+2. **Adaptive Tessellation & LOD**  
+   - Evaluate tessellated terrain (compute-driven or meshlet LOD) to smooth silhouettes when the camera dives low; keep chunk meshes coarse for distance, dense near focus. citeturn0search4
+
+3. **Biome-aware Materials**  
+   - Drive diffuse/roughness/normal blends from procedural masks: slope (rock), concavity (soil accumulation), moisture/erosion (mud), altitude (snow).  
+   - Use precomputed moisture and erosion maps to feed moss and shoreline foam shaders; optionally generate AO/curvature maps offline for static chunks. citeturn0search2
+
+4. **Runtime Detail**  
+   - Scatter procedural props (stones, shrubs) via noise-based placement tied to chunk signatures; leverage instancing to stay GPU-bound.  
+   - Integrate surface-aware decals (wet patches, trails) anchored to agent interactions or scripted events. citeturn0search7
+
+5. **Tooling & Validation**  
+   - Build a terrain debug overlay showing noise layers, erosion strength, and biome weights to iterate quickly.  
+   - Capture before/after snapshots (PNG + heightmap diff) in CI to prevent accidental regressions in terrain quality.
+
+### Agent & Effect Styling
+
+1. **Agent Mesh & Animation**  
+   - Replace sphere proxies with rigged glTF characters and drive idle/walk/attack blends through Bevy’s skinned mesh animation graph for expressive motion. citeturn0search9  
+   - Layer toon/outline passes (`bevy_toon_shader`, `bevy_outline`) so selected agents pop with stylized rims and team hues. citeturn0search12  
+   - Add emissive pulses or armor streaks keyed to energy/selection via `LinearRgba` color transitions (Bevy 0.14+). citeturn0search13
+
+2. **Vision Cones & Sensors**  
+   - Render vision arcs as translucent volumetric wedges with gradient falloff and animated scan lines; fade to wireframe on occlusion. citeturn0search10  
+   - Use clustered decals to project warning textures where cones touch terrain and trigger ripple particles on detection events. citeturn0search10
+
+3. **Spike Attacks**  
+   - Model spikes as skinned meshes or spline ribbons that extend/retract with anticipation/recoil clips; add motion blur trails via post-processing. citeturn0search11  
+   - Trigger Hanabi sparks, biofluid particles, and scorch/blood decals on impact to leave readable footprints. citeturn0search6turn0search11
+
+4. **Agent Trails & Interaction FX**  
+   - Lay down decal footprints/tracks via `bevy_decal` or custom instanced quads, fading over time.  
+   - Spawn soft-ground deformation by blending parallax detail textures where agents linger.  
+   - Hook up audio-reactive VFX (waveform-driven shader parameters) for spikes or vision lock-ons.
+
+5. **Tooling & Iteration**  
+   - Create an agent styling playground scene to tweak materials, animations, and FX live; integrate with the snapshot harness for regression coverage.  
+   - Document the import pipeline (glTF authoring, animation naming, shader param conventions) so new meshes drop in without code changes.
+
+### Weather, Hydrology & Behavioral FX
+
+1. **Dynamic Weather System**  
+   - Implement a `WeatherState` resource with variants (Clear, Overcast, Rain, Snow, Sandstorm). Each tick, lerp ambient light, directional-light color/intensity, skybox, and fog using `DistanceFog`/`VolumetricFog` components on the active cameras (supports exponential/linear falloffs and volumetric shafts). citeturn0search0turn0search1  
+   - Attach Hanabi particle effect graphs per state (rain streaks via cylinder spawn + velocity, snowflakes via plane spawn drift, sand via cone spawn) and toggle them by activating/deactivating effect assets. Track precipitation intensity with a scalar that also influences fog density and cloud opacity. citeturn0search5turn1search7  
+   - Maintain `SurfaceWetness` per terrain chunk: when precipitation starts, increment toward 1; when dry, decay toward 0. Use this to modify material roughness/metallic and to enable clustered decals for puddles or snow accumulation textures. citeturn0search0turn1search1  
+   - Capture HDR frame sets for weather regression (storm vs clear) and compare histograms, ensuring tone mapping still lands in the intended range.
+
+2. **Hydrology-Driven Visuals**  
+   - Integrate the `bevy_water` material for large bodies of water; feed it the simulation wave spectrum and call `get_wave_point` so boats/agents ride the surface height. Extend the shader with shoreline foam, depth-based coloration, and projected caustics textures sampled through clustered decals. citeturn1search0turn1search3turn1search1  
+   - When the hydrology system raises/lowers water tables, adjust terrain chunk materials (darken, add specular highlights) and spawn edge decals for waterlines. Use `bevy_water` mask support to remove water tiles in drained regions. citeturn1search0  
+   - Trigger ripple Hanabi effects at contact points (agent feet, spike hits) using plane emitters with radial velocity; synchronize with splash audio and temporary refractive screen-space shaders for impact moments. citeturn0search5  
+   - Color vegetation shaders with flow/erosion metrics so plants near fast water appear saturated and lowlands pick up silt tones.
+
+3. **Altitude Feedback**  
+   - Blend snowcaps, moss, or desaturated palettes above configurable altitude bands; modulate atmospheric scattering and fog height for valleys vs peaks. citeturn0search2turn0search7  
+   - Expose altitude thresholds in config so biome designers can retune visuals without code.
+
+4. **Behavioral Cues**  
+   - Altruism: emit soft bilateral beams using Hanabi cone emitters between participants, pulse emissive armor rims via `LinearRgba` tweening, and project icon decals on the ground for readability. citeturn1search2turn0search5turn1search1  
+   - Hunting: swap vision cones to red volumetric wedges with time-based scan-line shaders; when lock-on triggers, spawn dust Hanabi trails and, on impact, place scorch/blood decals plus spike spark effects. citeturn0search10turn0search6turn1search1  
+   - Herbivory: animate vegetation bending through morph targets, spawn pollen clouds (Hanabi sphere spawn with slow upward drift), and run a green energy ring shader around the agent; tie regrowth animation to the simulation timer. citeturn0search5turn1search1  
+   - Expose hooks for audio-reactive shader parameters so dramatic cues (spikes, focus) can sync with soundtrack amplitude.
+
+5. **Tooling & Validation**  
+   - Extend the debug overlay with weather/hydrology layers (humidity, rainfall timers, flow vectors) plus live behavior markers.  
+   - Add snapshot sequences for each weather state and major behavior (altruism, hunting, eating) to CI, comparing histogram/contrast drift across episodes.
