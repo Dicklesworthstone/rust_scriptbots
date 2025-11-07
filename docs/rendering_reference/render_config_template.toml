@@ -1,0 +1,14 @@
+# Example render configuration values for ScriptBots.
+# Copy this file to `render.config.toml` and pass via
+#   cargo run -- --config render.config.toml
+
+[render]
+# Accepted values: "aces", "agx", "tony"
+tonemap_mode = "agx"
+tonemap_exposure_bias = 0.75
+
+[render.auto_exposure]
+enabled = true
+# Optional; omit to use renderer defaults.
+speed_brighten = 3.0
+speed_darken = 1.2

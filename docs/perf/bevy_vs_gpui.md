@@ -83,11 +83,13 @@ These values provide a pre-flight baseline before collecting live runtime number
 
 Copy/paste the table below into `docs/perf/bevy_vs_gpui.md` as each scenario finishes; attach the corresponding log path so others can validate numbers quickly.
 
-| Date (UTC) | Platform | Renderer | Scenario | Threads | FPS Mean | FPS P95 | Frame ms Mean | Frame ms P95 | Sim tick/sec | Log Path |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2025-10-31 | _TBD_ | _TBD_ | _TBD_ |  |  |  |  |  |  |  |
+| Date (UTC) | Platform | Renderer | Scenario | Threads | FPS Mean | FPS P95 | Frame ms Mean | Frame ms P95 | Sim tick/sec | Log Path | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2025-10-31 | Linux (Vulkan pending) | Bevy | `default` | 0 (headless snapshot) | n/a | n/a | n/a | n/a | n/a | logs/perf/20251031_tonemap_config.json | Render config template dry run; tonemap AgX + bias 0.75 for lighting preview. |
 
 For every run also record:
 - `SB_DIAGNOSTICS` summary slice (copy the 300-frame report)
 - Peak GPU usage (if available) and any anomalies (e.g., auto-pause triggers)
 - Relevant environment overrides (`WGPU_BACKEND`, `SCRIPTBOTS_MAX_THREADS`, etc.)
+
+> 2025-10-31 note: Bevy AgX output with 0.75 exposure bias is significantly brighter than the existing GPUI snapshot pipeline. `logs/perf/20251031_tonemap_config.json` contains env overrides and artifact hashes for the captured PNGs; use this run as the starting point for offscreen tonemap parity work.

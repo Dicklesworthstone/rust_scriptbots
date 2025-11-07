@@ -20,7 +20,7 @@ use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, IndicatorState, RenderSettings, RenderTonemapMode, NUM_EYES,
+    AgentId, ControlCommand, IndicatorState, NUM_EYES, RenderSettings, RenderTonemapMode,
     SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TraitModifiers,
     WorldState,
 };
@@ -4575,8 +4575,7 @@ mod tests {
             world.step();
         }
         let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
-        let selection_center =
-            Vec2::new(snapshot.world_size.x * 0.4, snapshot.world_size.y * 0.6);
+        let selection_center = Vec2::new(snapshot.world_size.x * 0.4, snapshot.world_size.y * 0.6);
         let selection_bounds = (
             selection_center - Vec2::splat(32.0),
             selection_center + Vec2::splat(32.0),
@@ -4588,10 +4587,7 @@ mod tests {
             last_reported_tick: snapshot.tick,
             focus_point: selection_center,
             world_size: snapshot.world_size,
-            world_center: Vec2::new(
-                snapshot.world_size.x * 0.5,
-                snapshot.world_size.y * 0.5,
-            ),
+            world_center: Vec2::new(snapshot.world_size.x * 0.5, snapshot.world_size.y * 0.5),
             selection_center: Some(selection_center),
             selection_bounds: Some(selection_bounds),
             oldest_position: Some(selection_center),
@@ -4619,10 +4615,7 @@ mod tests {
 
         let rig = app.world().resource::<CameraRig>();
         let focus_delta = rig.focus_smoothed.distance(selection_center);
-        let tolerance = selection_center
-            .length()
-            .max(snapshot.world_size.length())
-            * 0.03;
+        let tolerance = selection_center.length().max(snapshot.world_size.length()) * 0.03;
         assert!(
             focus_delta <= tolerance,
             "follow mode should keep focus within tolerance (delta {focus_delta}, limit {tolerance})"
@@ -4650,8 +4643,7 @@ mod tests {
         );
 
         let forward = transform.forward().normalize_or_zero();
-        let toward_center = (expected_center - transform.translation)
-            .normalize_or_zero();
+        let toward_center = (expected_center - transform.translation).normalize_or_zero();
         assert!(
             forward.dot(toward_center) > 0.99,
             "camera should look at focus center (dot {})",

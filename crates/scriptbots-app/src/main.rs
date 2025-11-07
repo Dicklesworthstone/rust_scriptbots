@@ -11,8 +11,9 @@ use scriptbots_app::{
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
-    AgentData, NeuroflowActivationKind, ReplayEventKind, ScriptBotsConfig, TickSummary,
-    WorldPersistence, WorldState,
+    AgentData, NeuroflowActivationKind, RenderAutoExposureSettings, RenderSettings,
+    RenderTonemapMode, ReplayEventKind, ScriptBotsConfig, TickSummary, WorldPersistence,
+    WorldState,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
@@ -1835,6 +1836,63 @@ fn apply_env_overrides(config: &mut ScriptBotsConfig) {
             }
         }
     }
+
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_TONEMAP") {
+        match parse_tonemap(&value) {
+            Some(mode) => config.render.tonemap_mode = Some(mode),
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_TONEMAP value; expected aces|agx|tony")
+            }
+        }
+    }
+
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_TONEMAP_BIAS") {
+        match value.trim().parse::<f32>() {
+            Ok(bias) if bias.is_finite() => config.render.tonemap_exposure_bias = Some(bias),
+            _ => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_TONEMAP_BIAS value; expected finite f32")
+            }
+        }
+    }
+
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE") {
+        match parse_bool(&value) {
+            Some(enabled) => {
+                let mut settings = take_or_init_auto_exposure(&mut config.render, enabled);
+                settings.enabled = enabled;
+                config.render.auto_exposure = Some(settings);
+            }
+            None => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE value; expected true/false")
+            }
+        }
+    }
+
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_BRIGHTEN") {
+        match value.trim().parse::<f32>() {
+            Ok(speed) if speed.is_finite() && speed >= 0.0 => {
+                let mut settings = take_or_init_auto_exposure(&mut config.render, true);
+                settings.speed_brighten = Some(speed);
+                config.render.auto_exposure = Some(settings);
+            }
+            _ => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_BRIGHTEN value; expected non-negative f32")
+            }
+        }
+    }
+
+    if let Ok(value) = env::var("SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_DARKEN") {
+        match value.trim().parse::<f32>() {
+            Ok(speed) if speed.is_finite() && speed >= 0.0 => {
+                let mut settings = take_or_init_auto_exposure(&mut config.render, true);
+                settings.speed_darken = Some(speed);
+                config.render.auto_exposure = Some(settings);
+            }
+            _ => {
+                warn!(value = %value, "Invalid SCRIPTBOTS_RENDER_AUTO_EXPOSURE_SPEED_DARKEN value; expected non-negative f32")
+            }
+        }
+    }
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -1867,6 +1925,29 @@ fn parse_activation(raw: &str) -> Option<NeuroflowActivationKind> {
         "relu" => Some(NeuroflowActivationKind::Relu),
         _ => None,
     }
+}
+
+fn parse_tonemap(raw: &str) -> Option<RenderTonemapMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "aces" => Some(RenderTonemapMode::Aces),
+        "agx" => Some(RenderTonemapMode::Agx),
+        "tony" | "tonymcmapface" => Some(RenderTonemapMode::Tony),
+        _ => None,
+    }
+}
+
+fn take_or_init_auto_exposure(
+    settings: &mut RenderSettings,
+    default_enabled: bool,
+) -> RenderAutoExposureSettings {
+    settings
+        .auto_exposure
+        .take()
+        .unwrap_or(RenderAutoExposureSettings {
+            enabled: default_enabled,
+            speed_brighten: None,
+            speed_darken: None,
+        })
 }
 
 #[cfg(any(feature = "gui", feature = "bevy_render"))]

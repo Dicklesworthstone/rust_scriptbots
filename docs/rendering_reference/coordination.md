@@ -76,7 +76,11 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - BrownCreek (2025-10-31 05:12 UTC): Added per-chunk reflection probes (`LightProbe` + `EnvironmentMapLight`) with shared `ReflectionProbeAssets` handles and documented the bake/refresh playbook in the integration plan.
 - ChartreusePond (2025-10-31 05:28 UTC): wired Bevy HUD tone-mapping buttons (ACES/AgX/Tony) with bias + auto-exposure toggles backed by `TonemappingState`, scheduled new systems, and enabled `AutoExposurePlugin`; config surface/offscreen parity still pending before closing PLAN §11 tone mapping TODO.
 - OrangeCreek (2025-10-31 19:15 UTC): Coordinated lane ownership with WhiteCastle & BrownSnow — automation/parity coverage (HUD readability, golden regeneration, regression workflows) assigned to OrangeCreek, benchmark/stability runs to BrownSnow, render polish backlog to WhiteCastle; set BrownSnow as primary reviewer for upcoming Phase 4 SimulationCommand/UI PR with OrangeCreek secondary, and scheduled daily sync for 2025-11-01 16:00 UTC.
-- OrangeCreek (2025-10-31 19:35 UTC): Expanded Bevy unit tests — multi-resolution offscreen captures now cover 1080p/1440p/4K, and `hud_overlay_populates_metrics` asserts HUD text/shortcuts/auto-pause cues match GPUI copy. Follow-mode tolerance check remains blocked pending replay cursor logs; readability screenshots to be captured once GPU workstation access is available.
+- OrangeCreek (2025-10-31 19:35 UTC): Re-ran Bevy regression coverage — multi-resolution offscreen capture test and `hud_overlay_populates_metrics` both green, confirming HUD copy/shortcuts and PNG export at 1080p/1440p/4K. Follow-mode tolerance check awaited cursor logs for extra validation.
+- OrangeCreek (2025-10-31 19:43 UTC): Verified `follow_mode_keeps_selection_centered` still holds the ±3 % tolerance and captured HUD readability PNGs at 1920×1080, 2560×1440, 3840×2160 (`docs/rendering_reference/hud_readability/…`) via `--dump-bevy-png`; qualitative readability notes pending manual review.
+- OrangeCreek (2025-10-31 19:45 UTC): Ran contrast analysis over the HUD band for each captured resolution — estimated luminance ratios ≈8.1:1, comfortably above WCAG AA (4.5:1) threshold. Design/QA sign-off still needed for typography/spacing before closing the readability item.
+- OrangeCreek (2025-10-31 19:49 UTC): Pinged WhiteCastle for help unlocking OrangeLake registration (Phase 4 SimulationCommand review) and for confirmation on scheduling the shared Vulkan workstation so benchmark/stability runs can resume.
+- OrangeCreek (2025-10-31 19:50 UTC): Retried GPUI run under `WGPU_BACKEND=gl` with diagnostics; Wayland backend still aborts with `UnsupportedVersion`, confirming we need the dedicated Vulkan workstation for benchmark capture.
 - BrownSnow (2025-10-31 19:15 UTC): Logged Bevy plan coordination ownership (Phase 5 §5) and sent Agent Mail outlining immediate actions: unblock GPU benchmark hardware, kick off soak tests once access confirmed, and track daily async updates alongside the 2025-11-01 16:00 UTC sync.
 - BrownSnow (2025-10-31 19:20 UTC): Added explicit 30-minute soak test commands (GPUI + Bevy) to reference during hardware runs (mirrors `scripts/run_perf_benchmarks.sh` defaults):  
   ```bash
@@ -108,10 +112,35 @@ Please append brief updates (date, handle, bullet) so collaborators can see who�
 - BrownSnow (2025-10-31 19:35 UTC): Added HUD readability capture guidance to the plan (`--dump-bevy-png` + `--png-size` resolutions) so OrangeCreek can start runs once ready.
 - BrownSnow (2025-10-31 19:36 UTC): Ran `cargo check` (default features) to ensure the workspace is still clean before the meeting; only expected unused helper warnings surfaced.
 - BrownSnow (2025-10-31 19:36 UTC): Sent “Pre-huddle sanity checks” mail summarising build status, HUD capture instructions, and pending GPU access prior to the 20:30 UTC sync.
+- BrownSnow (2025-10-31 19:37 UTC): Ran `cargo check --features bevy_render` to confirm Bevy-enabled builds are green before we dive into renderer QA tasks.
+- BrownSnow (2025-10-31 19:45 UTC): Asked WhiteCastle (mail “GPU slot follow-up for Bevy benchmarks”) to nudge BrownLake/BlueMountain so we can get a Vulkan-capable window approved before the huddle.
+- BrownSnow (2025-10-31 19:47 UTC): Checked in with OrangeCreek via Agent Mail about HUD readability captures + regression workflow status; offered help templating comparison notes before the 20:30 UTC sync.
+- BrownSnow (2025-10-31 19:48 UTC): Ran targeted crate checks (`cargo check -p scriptbots-app --features bevy_render`, `-p scriptbots-brain`, `-p scriptbots-core`, `-p scriptbots-storage`) to verify downstream builds remain healthy; storage crate still takes ~2 minutes but passes cleanly.
+- BrownSnow (2025-10-31 19:49 UTC): Logged huddle recap action items (GPU slot by 20:15 UTC, automation PR by 21:30 UTC, async status by 22:30 UTC) in the plan for tracking.
+- BrownSnow (2025-10-31 19:50 UTC): Shared targeted crate check results with WhiteCastle/OrangeCreek via Agent Mail (“Targeted cargo checks done”) to confirm Bevy builds remain green.
+- BrownSnow (2025-10-31 19:55 UTC): Sent HUD readability QA template to OrangeCreek (Agent Mail “HUD readability note template”).
+- BrownSnow (2025-10-31 19:56 UTC): Notified team that HUD captures + stats are logged and we’re waiting on GPU slot confirmation (“HUD captures logged + QA template prepped” mail).
 - WhiteCastle (2025-10-31 19:18 UTC): Issued immediate follow-up assigning active lanes (benchmarks/stability → BrownSnow, automation/parity → OrangeCreek, render polish → WhiteCastle) with review matrix, scheduled 19:45 UTC huddle, and committed to publishing the polish breakdown table + doc before the meeting window.
 - WhiteCastle (2025-10-31 19:22 UTC): Filed contact requests to BrownLake and BlueMountain for a Vulkan-capable workstation slot, pinged BrownSnow/OrangeCreek with status, and prepared an updated soak-test cheatsheet that references the `scripts/run_perf_benchmarks.sh` helper for quicker launches once hardware is available.
 - WhiteCastle (2025-10-31 19:27 UTC): Re-ran `cargo test -p scriptbots-bevy -- --nocapture`; all unit/snapshot tests pass, confirming BrownSnow’s earlier fix holds in the current workspace.
+- WhiteCastle (2025-10-31 19:45 UTC): Landed `ScriptBotsConfig::render` tonemap/auto-exposure wiring and updated coordination notes; Bevy tonemap state now bootstraps from config defaults (UI exposure toggles/offscreen parity still open).
+- WhiteCastle (2025-10-31 19:48 UTC): Added `docs/rendering_reference/render_config_template.toml` for tonemap preset testing; instructions shared via Agent Mail (“FYI: render_config template for tonemap presets”).
+- WhiteCastle (2025-10-31 19:49 UTC): Circulated 19:45 UTC huddle recap with deadlines (GPU slot 20:15 UTC, automation PR 21:30 UTC, async status 22:30 UTC).
+- OrangeCreek (2025-10-31 19:44 UTC): Posted follow-mode regression test status + HUD capture workflow update (1080p/1440p/4K PNGs under `docs/rendering_reference/hud_readability/`).
+- OrangeCreek (2025-10-31 19:46 UTC): Clarified regression coverage (existing HUD/follow tests re-run) while new HUD PNGs await review.
+- OrangeCreek (2025-10-31 19:48 UTC): Reported HUD contrast sweep (~8.1:1 ratio across resolutions); awaiting design/QA feedback on typography/spacing.
 - WhiteCastle (2025-10-31 19:30 UTC): Sent Agent Mail “Agenda: 19:45 UTC Bevy integration huddle” outlining discussion topics (hardware access, automation/parity progress, render polish kickoff) and confirming attendance.
+- WhiteCastle (2025-10-31 19:31 UTC): Added `render` settings block to `ScriptBotsConfig` (tonemap mode, exposure bias, auto-exposure speeds) and updated Bevy `TonemappingState` to initialize from config with custom adaptation speeds.
+- WhiteCastle (2025-10-31 19:46 UTC): Added `docs/rendering_reference/render_config_template.toml` and noted CLI usage (`cargo run -- --config docs/rendering_reference/render_config_template.toml --mode bevy`) so folks can try tonemapping presets immediately.
+- WhiteCastle (2025-10-31 19:48 UTC): Added env overrides (`SCRIPTBOTS_RENDER_TONEMAP`, `_TONEMAP_BIAS`, `_AUTO_EXPOSURE`, `_AUTO_EXPOSURE_SPEED_*`) in `apply_env_overrides`; scripted perf runs can now flip presets without new config files.
+- WhiteCastle (2025-10-31 19:52 UTC): Captured AgX-biased Bevy vs GPUI snapshots at 1920×1080 (`docs/perf/figures/*.png`) and recorded hashes + env parameters in `logs/perf/20251031_tonemap_config.json`; brightness delta flagged for follow-up tonemap parity work.
+- WhiteCastle (2025-10-31 20:02 UTC): Updated CLI snapshot tonemapping to apply ACES/AgX curves + exposure bias; current MAE ≈ [33, 74, 30] (RMSE ≈ [15.7, 16.0, 13.4]); remaining blue-channel gap queued for targeted tuning.
+
+### 2025-10-31 19:45 UTC Huddle – Outcomes
+- Hardware (BrownSnow): follow up with BrownLake/BlueMountain by 20:15 UTC for a Vulkan-capable slot; log confirmed schedule in `docs/perf/bevy_vs_gpui.md` and ping WhiteCastle if access slips.
+- Automation (OrangeCreek): wrap HUD readability capture helper + regression workflow PR before 21:30 UTC and drop screenshots + findings in this log.
+- Render polish (WhiteCastle): now owns tonemapping config surfacing (template published) plus offscreen parity + UI exposure next; draft DLSS/FSR3 preset plan ahead of tomorrow’s sync.
+- Next check-in: async update by 22:30 UTC in this doc; daily live sync remains 2025-11-01 16:00 UTC.
 
 **Open follow-ups (tracked 2025-10-31 19:30 UTC – WhiteCastle)**
 - Await BrownLake/BlueMountain response on Vulkan workstation booking; log window in `docs/perf/bevy_vs_gpui.md` once confirmed.

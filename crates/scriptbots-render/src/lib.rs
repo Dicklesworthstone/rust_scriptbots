@@ -14,8 +14,8 @@ use scriptbots_core::PresetKind;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
     BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, NUM_EYES,
-    Position, ScriptBotsConfig, SelectionState, SimulationCommand, TerrainKind, TerrainLayer,
-    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
+    Position, RenderTonemapMode, ScriptBotsConfig, SelectionState, SimulationCommand, TerrainKind,
+    TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
 };
 use scriptbots_storage::{MetricReading, Storage};
 use std::{
@@ -7753,6 +7753,14 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
     let mut img: ImageBuffer<ImgRgba<u8>, Vec<u8>> = ImageBuffer::new(width, height);
 
     let config = world.config();
+    let tonemap_settings = &config.render;
+    let tonemap_mode = tonemap_settings
+        .tonemap_mode
+        .unwrap_or(RenderTonemapMode::Aces);
+    let exposure_factor = tonemap_settings
+        .tonemap_exposure_bias
+        .map(|bias| 2f32.powf(bias))
+        .unwrap_or(1.0);
     let world_size = (config.world_width as f32, config.world_height as f32);
     let cell_size = config.food_cell_size as f32;
 
@@ -7801,17 +7809,39 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
                         TerrainKind::Rock => (169, 177, 186),
                     };
                     let food_shade = (food_val.clamp(0.0, 1.0) * 90.0) as u8;
-                    ImgRgba([
-                        base.0.saturating_add(food_shade),
-                        base.1.saturating_add(food_shade / 2),
-                        base.2,
-                        255,
-                    ])
+                    let mapped = tonemap_rgb(
+                        ColorVec3 {
+                            r: base.0.saturating_add(food_shade),
+                            g: base.1.saturating_add(food_shade / 2),
+                            b: base.2,
+                        },
+                        exposure_factor,
+                        tonemap_mode,
+                    );
+                    ImgRgba([mapped.r, mapped.g, mapped.b, 255])
                 } else {
-                    ImgRgba([10, 16, 24, 255])
+                    let mapped = tonemap_rgb(
+                        ColorVec3 {
+                            r: 10,
+                            g: 16,
+                            b: 24,
+                        },
+                        exposure_factor,
+                        tonemap_mode,
+                    );
+                    ImgRgba([mapped.r, mapped.g, mapped.b, 255])
                 }
             } else {
-                ImgRgba([10, 16, 24, 255])
+                let mapped = tonemap_rgb(
+                    ColorVec3 {
+                        r: 10,
+                        g: 16,
+                        b: 24,
+                    },
+                    exposure_factor,
+                    tonemap_mode,
+                );
+                ImgRgba([mapped.r, mapped.g, mapped.b, 255])
             };
 
             img.put_pixel(x, y, rgba);
@@ -7841,12 +7871,25 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
             .map(|rt| rt.herbivore_tendency)
             .unwrap_or(0.5);
         let color = if tendency <= 0.33 {
-            (120, 200, 120)
+            ColorVec3 {
+                r: 120,
+                g: 200,
+                b: 120,
+            }
         } else if tendency >= 0.66 {
-            (220, 80, 80)
+            ColorVec3 {
+                r: 220,
+                g: 80,
+                b: 80,
+            }
         } else {
-            (200, 180, 90)
+            ColorVec3 {
+                r: 200,
+                g: 180,
+                b: 90,
+            }
         };
+        let color = tonemap_rgb(color, exposure_factor, tonemap_mode);
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 if dx * dx + dy * dy <= radius * radius {
@@ -7856,7 +7899,7 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
                         img.put_pixel(
                             px as u32,
                             py as u32,
-                            ImgRgba([color.0, color.1, color.2, 255]),
+                            ImgRgba([color.r, color.g, color.b, 255]),
                         );
                     }
                 }
@@ -7870,6 +7913,60 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<
         let _ = img.write_to(&mut cursor, image::ImageFormat::Png);
     }
     bytes
+}
+
+#[derive(Clone, Copy)]
+struct ColorVec3 {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+fn tonemap_rgb(color: ColorVec3, exposure: f32, mode: RenderTonemapMode) -> ColorVec3 {
+    let mut linear = [
+        (color.r as f32 / 255.0) * exposure,
+        (color.g as f32 / 255.0) * exposure,
+        (color.b as f32 / 255.0) * exposure,
+    ];
+
+    match mode {
+        RenderTonemapMode::Aces | RenderTonemapMode::Tony => {
+            for c in linear.iter_mut() {
+                *c = aces_fitted((*c).max(0.0));
+            }
+        }
+        RenderTonemapMode::Agx => {
+            for c in linear.iter_mut() {
+                let x = (*c).max(0.0);
+                let compressed = x / (x + 0.3);
+                *c = aces_fitted(compressed);
+            }
+        }
+    }
+
+    ColorVec3 {
+        r: linear_to_srgb_byte(linear[0]),
+        g: linear_to_srgb_byte(linear[1]),
+        b: linear_to_srgb_byte(linear[2]),
+    }
+}
+
+fn aces_fitted(x: f32) -> f32 {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+}
+
+fn linear_to_srgb_byte(x: f32) -> u8 {
+    let srgb = if x <= 0.003_130_8 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 impl Render for SimulationView {
