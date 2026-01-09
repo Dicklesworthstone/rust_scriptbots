@@ -1,0 +1,17 @@
+# Build artifacts (not code)
+/target
+*.rs.bk
+
+# Databases and logs (not code)
+*.db
+*.db-*
+*.log
+*.log.gz
+.beads/daemon-*.log.gz
+
+# Generated/vendor files (not code to scan)
+vendor/
+toolchains/
+
+# Binary outputs
+*.png
