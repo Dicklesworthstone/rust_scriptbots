@@ -20,3 +20,6 @@ bd.db
 
 # Compressed daemon logs (timestamped)
 daemon-*.log.gz
+
+# Local version tracking
+.local_version
