@@ -10,29 +10,37 @@ on:
     tags:
       - "v*"
 
+# Only allow one release build at a time
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
+    name: Build (${{ matrix.target }})
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
-            target: linux
+            target: linux-x86_64
             dist-args: "--target x86_64-unknown-linux-gnu"
             extra-targets: ""
             build_target: x86_64-unknown-linux-gnu
           - os: macos-14
-            target: mac-universal
+            target: macos-universal
             dist-args: "--target aarch64-apple-darwin --target x86_64-apple-darwin"
             extra-targets: "x86_64-apple-darwin"
             apple: true
             build_target: aarch64-apple-darwin
           - os: windows-2022
-            target: windows
+            target: windows-x86_64
             dist-args: "--target x86_64-pc-windows-msvc"
             extra-targets: ""
             build_target: x86_64-pc-windows-msvc
@@ -154,8 +162,77 @@ jobs:
           security delete-keychain "$KEYCHAIN"
           rm -f "$CERT_P12"
 
+      - name: Generate checksums (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd dist
+          for f in *; do
+            if [[ -f "$f" ]]; then
+              shasum -a 256 "$f" > "$f.sha256"
+              shasum -a 512 "$f" > "$f.sha512"
+            fi
+          done
+          # Create combined checksum files
+          cat *.sha256 > checksums-sha256.txt 2>/dev/null || true
+          cat *.sha512 > checksums-sha512.txt 2>/dev/null || true
+
+      - name: Generate checksums (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd dist
+          Get-ChildItem -File | ForEach-Object {
+            $hash256 = (Get-FileHash -Algorithm SHA256 $_.Name).Hash.ToLower()
+            $hash512 = (Get-FileHash -Algorithm SHA512 $_.Name).Hash.ToLower()
+            "$hash256  $($_.Name)" | Out-File -Encoding ASCII "$($_.Name).sha256"
+            "$hash512  $($_.Name)" | Out-File -Encoding ASCII "$($_.Name).sha512"
+          }
+          # Create combined checksum files
+          Get-Content *.sha256 | Out-File -Encoding ASCII checksums-sha256.txt
+          Get-Content *.sha512 | Out-File -Encoding ASCII checksums-sha512.txt
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
+          retention-days: 30
+
+  # Aggregate all artifacts and create combined checksums
+  finalize:
+    name: Finalize Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Generate combined checksums
+        run: |
+          cd all-artifacts
+          # Remove per-platform combined files if they exist
+          rm -f checksums-sha256.txt checksums-sha512.txt
+          # Generate fresh combined checksums for all archives
+          for f in *.tar.* *.zip; do
+            if [[ -f "$f" ]]; then
+              sha256sum "$f" >> SHA256SUMS.txt
+              sha512sum "$f" >> SHA512SUMS.txt
+            fi
+          done
+
+      - name: Upload combined release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-all
+          path: |
+            all-artifacts/*.tar.*
+            all-artifacts/*.zip
+            all-artifacts/SHA256SUMS.txt
+            all-artifacts/SHA512SUMS.txt
+          retention-days: 90

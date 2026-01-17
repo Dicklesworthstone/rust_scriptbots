@@ -7,37 +7,58 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Avoid cargo home pollution across jobs
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  checks:
-    name: Checks (${{ matrix.os }})
+  # Fast format check runs first to fail early
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # Clippy runs on all platforms to catch platform-specific lint issues
+  clippy:
+    name: Clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
-            run_fmt: true
-            run_clippy: true
             cargo_target: x86_64-unknown-linux-gnu
           - os: macos-14
-            run_fmt: false
-            run_clippy: false
             cargo_target: aarch64-apple-darwin
           - os: windows-2022
-            run_fmt: false
-            run_clippy: false
             cargo_target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install mold linker and system deps
-        if: ${{ matrix.os == 'ubuntu-24.04' }}
+      - name: Install mold linker and system deps (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -53,40 +74,96 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          components: clippy,rustfmt
+          components: clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: checks-${{ matrix.os }}-${{ matrix.cargo_target }}
+          shared-key: clippy-${{ matrix.os }}-${{ matrix.cargo_target }}
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
-      - name: Format check
-        if: ${{ matrix.run_fmt }}
-        run: cargo fmt --all --check
+      - name: Run Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
-      - name: Clippy
-        if: ${{ matrix.run_clippy }}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+  # Build and test on all platforms
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            cargo_target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            cargo_target: aarch64-apple-darwin
+          - os: windows-2022
+            cargo_target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mold linker and system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}-${{ matrix.cargo_target }}
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
-      - name: Tests
+      - name: Run tests
         run: cargo test --workspace
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
-      - name: Scriptbots-app unit tests (terminal HUD)
+      - name: Run scriptbots-app unit tests (terminal HUD)
         run: cargo test -p scriptbots-app --lib -- --nocapture
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
+  # Security audit for dependencies
+  security:
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run security audit
+        run: cargo audit --deny warnings
+
   wasm:
     name: Wasm (ubuntu)
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -145,6 +222,7 @@ jobs:
   replay:
     name: Replay Determinism (ubuntu)
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -204,8 +282,9 @@ jobs:
 
   render_regression:
     name: Render Regression (${{ matrix.os }})
-    needs: checks
+    needs: [clippy, test]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -278,15 +357,17 @@ jobs:
 
       - name: Upload snapshot diffs
         if: failure()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: render-diffs-${{ matrix.os }}
           path: target/snapshot-failures/
+          retention-days: 14
 
   bevy_exhaustive:
     name: Bevy Exhaustive (manual)
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
