@@ -122,7 +122,7 @@ fn wrap_unsigned_angle(mut angle: f32) -> f32 {
     angle
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 fn configure_parallelism() {
     use std::cmp::max;
 
@@ -156,7 +156,12 @@ fn configure_parallelism() {
     });
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+fn configure_parallelism() {
+    // No-op on WASM: cannot set environment variables or configure rayon
+}
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 fn default_thread_budget(cpu_count: usize) -> usize {
     match cpu_count {
         0..=2 => 1,
