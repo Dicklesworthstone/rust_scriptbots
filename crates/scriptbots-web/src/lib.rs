@@ -644,6 +644,8 @@ mod tests {
             let mut config = ScriptBotsConfig::default();
             config.world_width = width;
             config.world_height = height;
+            // Ensure food_cell_size divides world dimensions evenly
+            config.food_cell_size = 20;
             config.rng_seed = Some(seed);
 
             // Native world execution

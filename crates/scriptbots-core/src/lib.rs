@@ -2024,7 +2024,7 @@ pub struct ControlSettings {
 }
 
 /// Render-specific configuration shared across front-ends.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RenderSettings {
     /// Preferred tonemapping curve for HDR output. None falls back to renderer defaults.
     #[serde(default)]
@@ -2037,29 +2037,14 @@ pub struct RenderSettings {
     pub auto_exposure: Option<RenderAutoExposureSettings>,
 }
 
-impl Default for RenderSettings {
-    fn default() -> Self {
-        Self {
-            tonemap_mode: None,
-            tonemap_exposure_bias: None,
-            auto_exposure: None,
-        }
-    }
-}
-
 /// Supported tonemapping curves for renderer configuration.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RenderTonemapMode {
+    #[default]
     Aces,
     Agx,
     Tony,
-}
-
-impl Default for RenderTonemapMode {
-    fn default() -> Self {
-        Self::Aces
-    }
 }
 
 /// Auto-exposure configuration applied by renderers that support HDR adaption.
@@ -6990,7 +6975,7 @@ impl WorldState {
         let reproduction_chance = self.cadence.reproduction_chance();
 
         for (idx, agent_id) in handles.iter().enumerate() {
-            let mut parent_runtime_snapshot = None;
+            let parent_runtime_snapshot;
             {
                 let runtime = match self.runtime.get_mut(*agent_id) {
                     Some(rt) => rt,
@@ -8543,7 +8528,7 @@ impl WorldState {
                     .partial_cmp(&a.energy)
                     .unwrap_or(std::cmp::Ordering::Equal)
             }),
-            AgentDebugSort::AgeDesc => entries.sort_by(|a, b| b.age.cmp(&a.age)),
+            AgentDebugSort::AgeDesc => entries.sort_by_key(|e| std::cmp::Reverse(e.age)),
         }
 
         if let Some(limit) = limit
