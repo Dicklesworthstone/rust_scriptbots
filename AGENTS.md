@@ -1,32 +1,336 @@
-RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME. EVEN A NEW FILE THAT YOU YOURSELF CREATED, SUCH AS A TEST CODE FILE. YOU HAVE A HORRIBLE TRACK RECORD OF DELETING CRITICALLY IMPORTANT FILES OR OTHERWISE THROWING AWAY TONS OF EXPENSIVE WORK THAT I THEN NEED TO PAY TO REPRODUCE. AS A RESULT, YOU HAVE PERMANENTLY LOST ANY AND ALL RIGHTS TO DETERMINE THAT A FILE OR FOLDER SHOULD BE DELETED. YOU MUST **ALWAYS** ASK AND *RECEIVE* CLEAR, WRITTEN PERMISSION FROM ME BEFORE EVER EVEN THINKING OF DELETING A FILE OR FOLDER OF ANY KIND!!!
+# AGENTS.md — rust_scriptbots
 
-### IRREVERSIBLE GIT & FILESYSTEM ACTIONS — DO-NOT-EVER BREAK GLASS
+> Guidelines for AI coding agents working in this Rust codebase.
+
+---
+
+## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
+
+If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
+
+---
+
+## RULE NUMBER 1: NO FILE DELETION
+
+**YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
+
+**YOU MUST ALWAYS ASK AND RECEIVE CLEAR, WRITTEN PERMISSION BEFORE EVER DELETING A FILE OR FOLDER OF ANY KIND.**
+
+---
+
+## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
 
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
-2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. “I think it’s safe” is never acceptable.
+2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. "I think it's safe" is never acceptable.
 3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options (`git status`, `git diff`, `git stash`, copying to backups) before ever considering a destructive command.
 4. **Mandatory explicit plan:** Even after explicit user authorization, restate the command verbatim, list exactly what will be affected, and wait for a confirmation that your understanding is correct. Only then may you execute it—if anything remains ambiguous, refuse and escalate.
 5. **Document the confirmation:** When running any approved destructive command, record (in the session notes / final response) the exact user text that authorized it, the command actually run, and the execution time. If that record is absent, the operation did not happen.
 
-In general, you should try to follow all suggested best practices listed in the file `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`
+---
 
-NEVER run a script that processes/changes code files in this repo, EVER! That sort of brittle, regex based stuff is always a huge disaster and creates far more problems than it ever solves. DO NOT BE LAZY AND ALWAYS MAKE CODE CHANGES MANUALLY, EVEN WHEN THERE ARE MANY INSTANCES TO FIX. IF THE CHANGES ARE MANY BUT SIMPLE, THEN USE SEVERAL SUBAGENTS IN PARALLEL TO MAKE THE CHANGES GO FASTER. But if the changes are subtle/complex, then you must methodically do them all yourself manually!
+## Git Branch: ONLY Use `main`, NEVER `master`
 
-We do not care at all about backwards compatibility since we are still in early development with no users-- we just want to do things the RIGHT way in a clean, organized manner with NO TECH DEBT. That means, never create "compatibility shims" or any other nonsense like that.
+**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
 
-We need to AVOID uncontrolled proliferation of code files. If you want to change something or add a feature, then you MUST revise the existing code file in place. You may NEVER, *EVER* take an existing code file, say, "document_processor.rs" and then create a new file called "document_processorV2.rs", or "document_processor_improved.rs", or "document_processor_enhanced.rs", or "document_processor_unified.rs", or ANYTHING ELSE REMOTELY LIKE THAT! New code files are reserved for GENUINELY NEW FUNCTIONALITY THAT MAKES ZERO SENSE AT ALL TO INCLUDE IN ANY EXISTING CODE FILE. It should be an *INCREDIBLY* high bar for you to EVER create a new code file!
+- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
+- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
+- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
+  ```bash
+  git push origin main:master
+  ```
 
-We want all console output to be informative, detailed, stylish, colorful, etc. by fully leveraging the relevant Rust libraries wherever possible.
+**If you see `master` referenced anywhere:**
+1. Update it to `main`
+2. Ensure `master` is synchronized: `git push origin main:master`
 
-If you aren't 100% sure about how to use a third party library, then you must SEARCH ONLINE to find the latest documentation website for the library to understand how it is supposed to work and the latest (late-2025) suggested best practices and usage.
+---
 
-**CRITICAL:** Whenever you make any substantive changes or additions to the code, you MUST check that you didn't introduce any type errors or lint errors. You can do this in the usual way for a Rust project.
+## Toolchain: Rust & Cargo
 
-If you do see the errors, then I want you to very carefully and intelligently/thoughtfully understand and then resolve each of the issues, making sure to read sufficient context for each one to truly understand the RIGHT way to fix them.
+We only use **Cargo** in this project, NEVER any other package manager.
 
-Note: The primary guide for this project is the planning document, `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`. This is the basic "bible" for our development in the project, the purpose of which is to create a transformative port of the old C++ scriptbots project, the code to which can be found in `original_scriptbots_code_for_reference`.
+- **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
+- **Dependency versions:** Explicit versions for stability
+- **Configuration:** Cargo.toml workspace with `workspace = true` pattern
+- **Unsafe code:** Warned (`#![warn(unsafe_code)]`)
 
-Whenever you decide to work on a task from the `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` document, you should immediately notate "in line" (in place) in the document in a bracketed notation, such as [Currently In Progress]; note that multiple coding agents might be working on this project at the same time, so we want to avoid stepping on each other's toes. With that in mind, if you notice any unexpected changes to code files, do not panic and reflexively try to restore or undo the changes just because YOU didn't make them; that is liable to wipe out useful work from another agent! If you notice that a code file you are trying to work on keeps changing in substantive ways, you should probably just pick another task or code file to work on to avoid further issues or problems.
+### Key Dependencies
+
+| Crate | Purpose |
+|-------|---------|
+| `gpui` | Zed's GPU-accelerated UI framework (native rendering backend) |
+| `bevy` | ECS game engine (alternative rendering backend) |
+| `wgpu` | Low-level GPU abstraction for custom world rendering |
+| `tokio` | Async runtime for server/API/MCP endpoints |
+| `axum` | HTTP API server framework |
+| `ratatui` | Terminal UI framework for console mode |
+| `duckdb` | Embedded analytics database for simulation metrics |
+| `rayon` | Data parallelism for simulation tick processing |
+| `rand` | RNG with `SmallRng` for agent behavior |
+| `slotmap` | Generational arena for agent handles (`AgentId`) |
+| `candle-core` + `candle-nn` | ML inference for neural network brains |
+| `tract-onnx` | ONNX model loading for brain inference |
+| `tch` | PyTorch bindings for brain training/inference |
+| `neuroflow` | Lightweight neural network library for agent brains |
+| `serde` + `serde_json` | Serialization |
+| `thiserror` | Ergonomic error type derivation |
+| `tracing` | Structured logging and diagnostics |
+| `wasm-bindgen` | WebAssembly bindings for browser target |
+| `clap` | CLI argument parsing |
+| `mcp-protocol-sdk` | MCP server integration |
+| `kira` | Audio engine (optional) |
+| `wide` | Portable SIMD for vectorized simulation math |
+
+### Release Profile
+
+The release build optimizes for performance:
+
+```toml
+[profile.release]
+opt-level = 3       # Maximum performance optimization
+lto = "thin"        # Thin link-time optimization
+codegen-units = 1   # Single codegen unit for better optimization
+strip = true        # Remove debug symbols
+panic = "abort"     # Abort on panic (smaller binary)
+incremental = false # Disable incremental for release
+```
+
+---
+
+## Code Editing Discipline
+
+### No Script-Based Changes
+
+**NEVER** run a script that processes/changes code files in this repo. Brittle regex-based transformations create far more problems than they solve.
+
+- **Always make code changes manually**, even when there are many instances
+- For many simple changes: use parallel subagents
+- For subtle/complex changes: do them methodically yourself
+
+### No File Proliferation
+
+If you want to change something or add a feature, **revise existing code files in place**.
+
+**NEVER** create variations like:
+- `mainV2.rs`
+- `main_improved.rs`
+- `main_enhanced.rs`
+
+New files are reserved for **genuinely new functionality** that makes zero sense to include in any existing file. The bar for creating new files is **incredibly high**.
+
+---
+
+## Backwards Compatibility
+
+We do not care about backwards compatibility—we're in early development with no users. We want to do things the **RIGHT** way with **NO TECH DEBT**.
+
+- Never create "compatibility shims"
+- Never create wrapper functions for deprecated APIs
+- Just fix the code directly
+
+---
+
+## Compiler Checks (CRITICAL)
+
+**After any substantive code changes, you MUST verify no errors were introduced:**
+
+```bash
+# Check for compiler errors and warnings (workspace-wide)
+cargo check --workspace --all-targets
+
+# Check for clippy lints (pedantic + nursery are enabled)
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Verify formatting
+cargo fmt --check
+```
+
+If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
+
+---
+
+## Testing
+
+### Testing Policy
+
+Every component crate includes inline `#[cfg(test)]` unit tests alongside the implementation. Tests must cover:
+- Happy path
+- Edge cases (empty input, max values, boundary conditions)
+- Error conditions
+
+Integration tests live in per-crate `tests/` directories (e.g., `crates/scriptbots-core/tests/`).
+
+### Unit Tests
+
+```bash
+# Run all tests across the workspace
+cargo test --workspace
+
+# Run with output
+cargo test --workspace -- --nocapture
+
+# Run tests for a specific crate
+cargo test -p scriptbots-core
+cargo test -p scriptbots-brain
+cargo test -p scriptbots-brain-ml
+cargo test -p scriptbots-brain-neuro
+cargo test -p scriptbots-storage
+cargo test -p scriptbots-render
+cargo test -p scriptbots-app
+cargo test -p scriptbots-index
+cargo test -p scriptbots-world-gfx
+cargo test -p scriptbots-bevy
+cargo test -p scriptbots-web
+
+# Run tests with all features enabled
+cargo test --workspace --all-features
+```
+
+### Test Categories
+
+| Crate | Focus Areas |
+|-------|-------------|
+| `scriptbots-core` | World simulation, agent lifecycle, tick processing, spatial indexing, food/terrain systems, evolution, genome serialization |
+| `scriptbots-brain` | Brain trait contracts, MLP forward pass, DWRAON network, Assembly brain, mutation/crossover |
+| `scriptbots-brain-ml` | Candle/Tract/Tch inference backends, model loading, brain adapter integration |
+| `scriptbots-brain-neuro` | Neuroflow brain wrapper, training, serialization |
+| `scriptbots-index` | Spatial indexing (uniform grid, R-tree, k-d tree), neighbor queries, boundary conditions |
+| `scriptbots-storage` | DuckDB persistence, metric recording, replay events, pipeline flush/sync |
+| `scriptbots-render` | GPUI rendering, camera controls, world visualization, audio integration |
+| `scriptbots-world-gfx` | wgpu pipeline, shader compilation, offscreen readback, compute binning |
+| `scriptbots-bevy` | Bevy ECS integration, entity spawning, system scheduling |
+| `scriptbots-app` | CLI parsing, server startup, TUI mode, MCP endpoints, control commands |
+| `scriptbots-web` | WASM bindings, browser interop, postcard serialization |
+
+---
+
+## Third-Party Library Usage
+
+If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and current best practices.
+
+---
+
+## rust_scriptbots — This Project
+
+**This is the project you're working on.** rust_scriptbots is a transformative port of the original C++ ScriptBots evolutionary agent simulation into modern, idiomatic Rust. The original C++ code is preserved in `original_scriptbots_code_for_reference/` for reference.
+
+### What It Does
+
+Simulates a 2D world populated by autonomous agents with neural network brains that evolve over generations. Agents perceive their environment through eyes, make decisions via pluggable brain architectures (MLP, DWRAON, Assembly, Neuroflow, ML backends), and compete for food/survival. The simulation supports real-time visualization (GPUI, Bevy, wgpu, TUI), web deployment (WASM), an HTTP API with Swagger docs, and MCP server integration.
+
+### Planning Document
+
+The primary guide for this project is `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`. This is the "bible" for development. Whenever you decide to work on a task from this document, you should immediately notate "in line" (in place) in the document in a bracketed notation, such as `[Currently In Progress]`, to avoid conflicts with other concurrent agents.
+
+In general, you should also try to follow all suggested best practices listed in `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`.
+
+### Architecture
+
+```
+User Input → CLI/API/MCP → ┬─ Control Commands ──→ WorldState (tick loop)
+                           └─ Config Changes ────→ ScriptBotsConfig
+                                                        │
+WorldState::tick() ────→ ┬─ Sensor Collection (eyes, proximity, blood)
+                         ├─ Brain Evaluation (pluggable: MLP/DWRAON/Assembly/ML/Neuro)
+                         ├─ Agent Actions (movement, eating, reproduction, combat)
+                         ├─ Food/Terrain/Hydrology Updates
+                         ├─ Evolution (selection, crossover, mutation)
+                         └─ Analytics (DuckDB storage pipeline)
+                                    │
+Render Layer ──────────→ ┬─ GPUI (native GPU-accelerated UI)
+                         ├─ Bevy (ECS game engine)
+                         ├─ wgpu (custom world renderer)
+                         ├─ Ratatui (terminal TUI)
+                         └─ WASM (browser via wasm-bindgen)
+```
+
+### Workspace Structure
+
+```
+rust_scriptbots/
+├── Cargo.toml                              # Workspace root
+├── crates/
+│   ├── scriptbots-core/                    # World simulation, agents, evolution, spatial indexing
+│   ├── scriptbots-brain/                   # Brain trait + impls (MLP, DWRAON, Assembly)
+│   ├── scriptbots-brain-ml/                # ML backends (Candle, Tract, Tch)
+│   ├── scriptbots-brain-neuro/             # Neuroflow brain backend
+│   ├── scriptbots-index/                   # Spatial indexing (uniform grid, R-tree, k-d tree)
+│   ├── scriptbots-storage/                 # DuckDB analytics persistence pipeline
+│   ├── scriptbots-render/                  # GPUI rendering + audio (kira)
+│   ├── scriptbots-world-gfx/              # wgpu custom world renderer
+│   ├── scriptbots-bevy/                    # Bevy ECS rendering backend
+│   ├── scriptbots-app/                     # CLI, HTTP API, TUI, MCP server, main binary
+│   └── scriptbots-web/                     # WASM/browser target
+├── original_scriptbots_code_for_reference/ # Original C++ source
+├── docs/                                   # Performance data, rendering references, WASM docs
+├── scripts/                                # Build/run helper scripts
+└── ci/                                     # CI configuration
+```
+
+### Key Files by Crate
+
+| Crate | Key Files | Purpose |
+|-------|-----------|---------|
+| `scriptbots-core` | `src/lib.rs` | `WorldState`, `AgentData`, `AgentArena`, `AgentId`, `FoodGrid`, `TerrainLayer`, `ScriptBotsConfig`, `BrainRegistry`, evolution, tick loop |
+| `scriptbots-core` | `tests/world_integration.rs` | World simulation integration tests |
+| `scriptbots-core` | `benches/world_bench.rs` | Tick performance benchmarks |
+| `scriptbots-brain` | `src/lib.rs` | `Brain` trait, `BrainKind`, `BrainTelemetry` |
+| `scriptbots-brain` | `src/mlp.rs` | `MlpBrain` — multi-layer perceptron implementation |
+| `scriptbots-brain` | `src/dwraon.rs` | `DwraonBrain` — DWRAON network implementation |
+| `scriptbots-brain` | `src/assembly.rs` | `AssemblyBrain` — assembly-style brain with instruction set |
+| `scriptbots-brain-ml` | `src/lib.rs` | ML backend adapters (Candle, Tract, Tch) |
+| `scriptbots-brain-neuro` | `src/lib.rs` | Neuroflow neural network brain adapter |
+| `scriptbots-index` | `src/lib.rs` | `NeighborhoodIndex` trait, `UniformGridIndex`, R-tree/k-d tree spatial queries |
+| `scriptbots-storage` | `src/lib.rs` | `Storage`, `StoragePipeline`, DuckDB schema, metric recording, replay persistence |
+| `scriptbots-render` | `src/lib.rs` | GPUI rendering, camera system, world visualization, agent drawing |
+| `scriptbots-world-gfx` | `src/lib.rs` | wgpu pipeline, WGSL shaders, offscreen readback for GPUI composition |
+| `scriptbots-bevy` | `src/lib.rs` | Bevy ECS plugin, entity management, system scheduling |
+| `scriptbots-app` | `src/main.rs` | CLI entry point, mode dispatch (GUI/TUI/headless/server) |
+| `scriptbots-app` | `src/servers.rs` | Axum HTTP API, MCP server, Swagger/OpenAPI |
+| `scriptbots-app` | `src/control.rs` | Simulation control commands, config management |
+| `scriptbots-app` | `src/terminal/` | Ratatui TUI implementation |
+| `scriptbots-web` | `src/lib.rs` | WASM bindings, browser-side simulation interface |
+
+### Core Types Quick Reference
+
+| Type | Purpose |
+|------|---------|
+| `WorldState` | Central simulation state — agents, food, terrain, hydrology, tick loop |
+| `AgentData` | Per-agent state: position, velocity, health, energy, genome, brain binding |
+| `AgentArena` | `SlotMap<AgentId, AgentData>` generational arena for all agents |
+| `AgentId` | Stable generational handle for agents (`slotmap::new_key_type!`) |
+| `Brain` | Core trait — `tick(inputs) -> outputs`, `mutate()`, `crossover()`, `snapshot_activations()` |
+| `BrainRunner` | Batch brain evaluation trait for the tick loop |
+| `BrainRegistry` | Registry of brain families and their factories |
+| `BrainGenome` | Serializable genome with layer specs, hyperparams, provenance |
+| `ScriptBotsConfig` | All simulation tuning knobs (mutation rates, food, terrain, rendering) |
+| `FoodGrid` | Spatial grid of food cells with growth/decay dynamics |
+| `TerrainLayer` | Terrain types (land, water, hazard) with procedural generation |
+| `Storage` | DuckDB-backed analytics persistence |
+| `StoragePipeline` | Async batch writer for metrics and replay events |
+| `NeighborhoodIndex` | Trait for spatial queries (uniform grid, R-tree, k-d tree) |
+| `Tick` | Newtype wrapper for simulation time step (`u64`) |
+| `ControlCommand` | Enum of simulation control actions |
+| `MutationRates` | Per-genome mutation rate parameters |
+| `DeathCause` | Enum: starvation, old age, combat, etc. |
+| `SelectionMode` | Evolution selection strategy enum |
+
+### Console Output Style
+
+We want all console output to be informative, detailed, stylish, colorful, etc. by fully leveraging the relevant Rust libraries (`owo-colors`, `ratatui`, `supports-color`) wherever possible.
+
+### Key Design Decisions
+
+- **Pluggable brain architecture** — `Brain` trait allows MLP, DWRAON, Assembly, ML, and Neuroflow backends to coexist and compete
+- **Generational slot map (`slotmap`)** for agent handles — O(1) lookup, safe reuse, no dangling references
+- **DuckDB for analytics** — columnar storage for efficient time-series queries on simulation metrics
+- **Multiple rendering backends** — GPUI (native), Bevy (ECS), wgpu (custom), Ratatui (terminal), WASM (browser)
+- **Rayon for data parallelism** — agent tick processing parallelized with configurable thread budgets
+- **SIMD via `wide`** — vectorized math for simulation hot paths
+- **Feature-gated backends** — ML/Neuro/GUI/Bevy/audio are all optional features to minimize compile times
+- **WASM target** — `scriptbots-web` compiles to WebAssembly for browser deployment via `wasm-pack`
+- **MCP server integration** — agents can interact with the simulation via MCP protocol
+- **Workspace-level lint config** — clippy pedantic + nursery enabled, consistent across all crates
 
 ---
 
@@ -60,6 +364,12 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
    acknowledge_message(project_key, agent_name, message_id)
    ```
 
+4. **Quick reads:**
+   ```
+   resource://inbox/{Agent}?project=<abs-path>&limit=20
+   resource://thread/{id}?project=<abs-path>&include_bodies=true
+   ```
+
 ### Macros vs Granular Tools
 
 - **Prefer macros for speed:** `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`
@@ -69,16 +379,15 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 
 - `"from_agent not registered"`: Always `register_agent` in the correct `project_key` first
 - `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
+- **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
 
 ---
 
 ## Beads (br) — Dependency-Aware Issue Tracking
 
-Beads provides a lightweight, dependency-aware issue database and CLI (`br` / beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
+Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
-**Note:** `br` is non-invasive and never executes git commands. You must manually add, commit, and push `.beads/` changes.
-
-**SQLite/WAL Caution:** br uses SQLite with WAL mode. Always run `br sync --flush-only` before git operations to ensure `.beads/` files are consistent.
+**Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
 
 ### Conventions
 
@@ -107,9 +416,8 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` / be
 
 5. **Complete and release:**
    ```bash
-   br close br-123 --reason "Completed"
-   br sync --flush-only
-   git add .beads/ && git commit -m "Sync beads" && git push
+   br close 123 --reason "Completed"
+   br sync --flush-only  # Export to JSONL (no git operations)
    ```
    ```
    release_file_reservations(project_key, agent_name, paths=["src/**"])
@@ -163,7 +471,46 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 |---------|---------|
 | `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core, articulation points, slack |
 | `--robot-label-health` | Per-label health: `health_level`, `velocity_score`, `staleness`, `blocked_count` |
+| `--robot-label-flow` | Cross-label dependency: `flow_matrix`, `dependencies`, `bottleneck_labels` |
+| `--robot-label-attention [--attention-limit=N]` | Attention-ranked labels |
+
+**History & Change Tracking:**
+| Command | Returns |
+|---------|---------|
+| `--robot-history` | Bead-to-commit correlations |
 | `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues, cycles |
+
+**Other:**
+| Command | Returns |
+|---------|---------|
+| `--robot-burndown <sprint>` | Sprint burndown, scope changes, at-risk items |
+| `--robot-forecast <id\|all>` | ETA predictions with dependency-aware scheduling |
+| `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
+| `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions |
+| `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
+| `--export-graph <file.html>` | Interactive HTML visualization |
+
+### Scoping & Filtering
+
+```bash
+bv --robot-plan --label backend              # Scope to label's subgraph
+bv --robot-insights --as-of HEAD~30          # Historical point-in-time
+bv --recipe actionable --robot-plan          # Pre-filter: ready to work
+bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank
+bv --robot-triage --robot-triage-by-track    # Group by parallel work streams
+bv --robot-triage --robot-triage-by-label    # Group by domain
+```
+
+### Understanding Robot Output
+
+**All robot JSON includes:**
+- `data_hash` — Fingerprint of source beads.jsonl
+- `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
+- `as_of` / `as_of_commit` — Present when using `--as-of`
+
+**Two-phase analysis:**
+- **Phase 1 (instant):** degree, topo sort, density
+- **Phase 2 (async, 500ms timeout):** PageRank, betweenness, HITS, eigenvector, cycles
 
 ### jq Quick Reference
 
@@ -194,21 +541,21 @@ ubs .                                   # Whole project (ignores target/, Cargo.
 ### Output Format
 
 ```
-⚠️  Category (N errors)
-    file.rs:42:5 – Issue description
-    💡 Suggested fix
+  Category (N errors)
+    file.rs:42:5 - Issue description
+    Suggested fix
 Exit code: 1
 ```
 
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
+Parse: `file:line:col` -> location | fix hint -> how to fix | Exit 0/1 -> pass/fail
 
 ### Fix Workflow
 
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
+1. Read finding -> category + fix suggestion
+2. Navigate `file:line:col` -> view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
+5. Re-run `ubs <file>` -> exit 0
 6. Commit
 
 ### Bug Severity
@@ -216,6 +563,33 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - **Critical (always fix):** Memory safety, use-after-free, data races, SQL injection
 - **Important (production):** Unwrap panics, resource leaks, overflow checks
 - **Contextual (judgment):** TODO/FIXME, println! debugging
+
+---
+
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor                    # Health check
+rch workers probe --all       # Test connectivity to all 8 workers
+rch status                    # Overview of current state
+rch queue                     # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
 
@@ -234,8 +608,8 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ### Rule of Thumb
 
-- Need correctness or **applying changes** → `ast-grep`
-- Need raw speed or **hunting text** → `rg`
+- Need correctness or **applying changes** -> `ast-grep`
+- Need raw speed or **hunting text** -> `rg`
 - Often combine: `rg` to shortlist files, then `ast-grep` to match/modify
 
 ### Rust Examples
@@ -278,7 +652,7 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 ```
 mcp__morph-mcp__warp_grep(
-  repoPath: "/path/to/rust_scriptbots",
+  repoPath: "/data/projects/rust_scriptbots",
   query: "How does the bot brain neural network work?"
 )
 ```
@@ -287,9 +661,9 @@ Returns structured results with file paths, line ranges, and extracted code snip
 
 ### Anti-Patterns
 
-- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
-- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
-- **Don't** use `ripgrep` for codemods → risks collateral edits
+- **Don't** use `warp_grep` to find a specific function name -> use `ripgrep`
+- **Don't** use `ripgrep` to understand "how does X work" -> wastes time with manual reads
+- **Don't** use `ripgrep` for codemods -> risks collateral edits
 
 ---
 
@@ -365,24 +739,25 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
-**Note:** `br` is non-invasive and never executes git commands. You must manually add, commit, and push `.beads/` changes.
-
-**SQLite/WAL Caution:** br uses SQLite with WAL mode. Always run `br sync --flush-only` before git operations to ensure `.beads/` files are consistent.
+**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
 
 ### Essential Commands
 
 ```bash
-# CLI commands for agents
+# View issues (launches TUI - avoid in automated sessions)
+bv
+
+# CLI commands for agents (use these instead)
 br ready              # Show issues ready to work (no blockers)
 br list --status=open # All open issues
 br show <id>          # Full issue details with dependencies
 br create --title="..." --type=task --priority=2
 br update <id> --status=in_progress
-br close <id> --reason="Completed"
+br close <id> --reason "Completed"
 br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export to JSONL (then manually git add/commit/push)
+br sync --flush-only  # Export to JSONL (NO git operations)
 ```
 
 ### Workflow Pattern
@@ -391,13 +766,7 @@ br sync --flush-only  # Export to JSONL (then manually git add/commit/push)
 2. **Claim**: Use `br update <id> --status=in_progress`
 3. **Work**: Implement the task
 4. **Complete**: Use `br close <id>`
-5. **Sync**: Always run sync workflow at session end:
-   ```bash
-   br sync --flush-only
-   git add .beads/
-   git commit -m "Sync beads"
-   git push
-   ```
+5. **Sync**: Run `br sync --flush-only` then manually commit
 
 ### Key Concepts
 
@@ -406,36 +775,41 @@ br sync --flush-only  # Export to JSONL (then manually git add/commit/push)
 - **Types**: task, bug, feature, epic, question, docs
 - **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
 
-<!-- end-bv-agent-instructions -->
+### Session Protocol
 
----
+**Before ending any session, run this checklist:**
+
+```bash
+git status              # Check what changed
+git add <files>         # Stage code changes
+br sync --flush-only    # Export beads to JSONL
+git add .beads/         # Stage beads changes
+git commit -m "..."     # Commit everything together
+git push                # Push to remote
+```
+
+### Best Practices
+
+- Check `br ready` at session start to find available work
+- Update status as you work (in_progress -> closed)
+- Create new issues with `br create` when you discover tasks
+- Use descriptive titles and set appropriate priority/type
+- Always `br sync --flush-only && git add .beads/` before ending session
+
+<!-- end-bv-agent-instructions -->
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below.
 
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only
-   git add .beads/
-   git commit -m "Sync beads"
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Verify** - All changes committed AND pushed
-6. **Hand off** - Provide context for next session
+4. **Sync beads** - `br sync --flush-only` to export to JSONL
+5. **Hand off** - Provide context for next session
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
 
 ---
 
@@ -455,4 +829,10 @@ Next steps (pick one)
 3. If you want a full suite run later, fix conformance/clippy blockers and re-run cargo test --all.
 ```
 
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into think YOU made the changes and simply don't recall it for some reason.
+NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
+
+---
+
+## Note on Built-in TODO Functionality
+
+Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
