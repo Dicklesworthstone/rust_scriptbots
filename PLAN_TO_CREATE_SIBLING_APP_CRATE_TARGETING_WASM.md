@@ -29,7 +29,8 @@
 - Issue tracker: create labeled issues per milestone (`wasm-phase1`, `wasm-rendering`, etc.).
 
 ### 0.3 Toolchain Baseline
-- Rust toolchain remains 1.85 (per workspace).
+- Rust toolchain follows the workspace pin (`nightly-2026-07-09`) and declared
+  minimum Rust version (1.88).
 - Add `wasm32-unknown-unknown` and `wasm32-wasip1-preview1` targets via `rustup target add` (documented only; actual install deferred).
 - Introduce `wasm-bindgen-cli` and `wasm-pack` as optional developer tools (no enforced dependency yet).
 - Confirm node.js ≥ 20 for bundling scripts; document installation instructions.

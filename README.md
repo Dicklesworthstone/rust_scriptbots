@@ -32,7 +32,7 @@ The workspace is organized for clear boundaries and fast incremental builds:
 ```
 rust_scriptbots/
 ├── Cargo.toml                # Workspace manifest, shared deps/lints/profiles
-├── rust-toolchain.toml       # Pinned toolchain (Rust 1.85)
+├── rust-toolchain.toml       # Pinned nightly-2026-07-09 toolchain (MSRV 1.88)
 ├── crates/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
@@ -130,7 +130,9 @@ See the migration roadmap in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_U
 ## Getting started
 
 ### Prerequisites
-- Rust toolchain: pinned in `rust-toolchain.toml` (Rust 1.85). Install via `rustup`.
+- Rust toolchain: `nightly-2026-07-09`, pinned in `rust-toolchain.toml`; the
+  workspace and locked dependency graph declare a minimum Rust version of 1.88.
+  Install through `rustup`.
 - OS: Linux, macOS, or Windows 11 (native or WSL2). GPU drivers should be up to date for best GPUI performance (wgpu backends: Metal/macOS, Vulkan/Linux, D3D12 or Vulkan/Windows).
 
 ### Build

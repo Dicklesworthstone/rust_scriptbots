@@ -64,3 +64,40 @@ the rearchitecture plan.
 - **Rollback:** manually restore only the prior `gpui` declaration and the 16
   reviewed Zed source lines from this patch. Do not use checkout, reset, clean,
   or any operation that could overwrite unrelated work.
+
+## 2026-07-11 — Pin the dated nightly and correct the MSRV claim
+
+- **Bead:** `bd-2z0.1.8`
+- **Change class:** toolchain reproducibility; no dependency update
+- **Before toolchain:** floating `nightly`, observed as `rustc
+  1.99.0-nightly (375b1431b 2026-07-10)` during the baseline
+- **Target toolchain:** `nightly-2026-07-09`, installed locally as `rustc
+  1.99.0-nightly (14cae6813 2026-07-08)` with `cargo 1.99.0-nightly
+  (59800466c 2026-07-07)`
+- **MSRV declaration:** correct the stale workspace claim from 1.85 to 1.88,
+  the minimum required by already-locked production dependencies; nightly
+  remains project policy
+- **Allowed files:** `rust-toolchain.toml`, the workspace `rust-version`, CI and
+  release toolchain inputs, and the two live documentation claims
+- **Out of scope:** action-revision pinning, dependency changes, CI feature
+  repair, renderer repair, and historical examples that are not project policy
+- **Pre-edit proof:** locked metadata and formatting passed; a clean external
+  target-dir check of default `scriptbots-app` passed with its pre-existing
+  macOS helper warning; `terminal_smoke` passed 2/2; core tests reproduced the
+  same 41-pass/1-stale-grid failure as the floating-nightly baseline
+- **Post-edit proof:** the repository selects the target commit with bare
+  `rustc -Vv`; locked metadata, formatting, and the default application check
+  pass; `terminal_smoke` passes 2/2; the full locked workspace/all-targets check
+  reaches `scriptbots-render` and reproduces the known GPUI/test-initializer
+  errors without an MSRV or language failure; `Cargo.lock` remains unchanged.
+- **Clippy baseline:** the dated toolchain deterministically stops first on the
+  existing collapsible nested `if` in `scriptbots-index`. The floating nightly
+  had instead stopped on newer `chunks_exact_to_as_chunks` findings in core,
+  demonstrating why the lint toolchain must be pinned. Neither pre-existing lint
+  is repaired in this mutation.
+- **CI alignment:** all eight CI/release toolchain inputs name
+  `nightly-2026-07-09`; their action-revision pins remain a separate CI bead.
+- **Result:** accepted; toolchain, manifest MSRV, CI inputs, and live docs now
+  state one reproducible contract
+- **Rollback:** manually restore only the dated channel, `rust-version`, CI
+  toolchain inputs, and live documentation lines from this reviewed patch.

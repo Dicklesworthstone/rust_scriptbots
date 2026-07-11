@@ -31,7 +31,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-09
           components: rustfmt
 
       - name: Check formatting
@@ -75,7 +75,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-09
           components: clippy
 
       - name: Cache cargo artifacts
@@ -130,7 +130,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-09
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -201,7 +201,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-09
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
@@ -253,7 +253,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-09
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -347,7 +347,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-09
 
       - name: Cache cargo artifacts
         if: ${{ github.event_name != 'pull_request' || steps.changes.outputs.render == 'true' }}
@@ -409,7 +409,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-09
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
