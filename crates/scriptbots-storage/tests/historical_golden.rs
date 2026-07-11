@@ -1,3 +1,4 @@
+use fsqlite::{Connection, FrankenError, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
     PersistenceEventKind, Position, Tick, TickSummary,
@@ -16,7 +17,7 @@ fn temp_db_path(prefix: &str) -> PathBuf {
         .expect("clock")
         .as_nanos();
     path.push(format!(
-        "{prefix}-{}-{}.duckdb",
+        "{prefix}-{}-{}.sqlite",
         std::process::id(),
         timestamp
     ));
@@ -143,45 +144,51 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
 
     drop(storage);
 
-    let connection = duckdb::Connection::open(&path_str)?;
+    let connection = Connection::open(&path_str)?;
 
-    let mut tick_stmt = connection.prepare(
+    let tick_rows = connection.query(
         "select tick, agent_count, births, deaths
          from ticks
          order by tick asc",
     )?;
-    let mut tick_rows = tick_stmt.query([])?;
     let expected_ticks = vec![(1_i64, 3_i64, 1_i64, 0_i64), (2, 4, 2, 1), (3, 5, 1, 0)];
-    for expected in expected_ticks {
-        let row = tick_rows.next()?.expect("expected tick row");
-        assert_eq!(row.get::<_, i64>(0)?, expected.0);
-        assert_eq!(row.get::<_, i64>(1)?, expected.1);
-        assert_eq!(row.get::<_, i64>(2)?, expected.2);
-        assert_eq!(row.get::<_, i64>(3)?, expected.3);
-    }
-    assert!(tick_rows.next()?.is_none(), "unexpected extra tick rows");
+    let actual_ticks = tick_rows
+        .iter()
+        .map(|row| -> Result<_, FrankenError> {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<i64>(1)?,
+                row.get_typed::<i64>(2)?,
+                row.get_typed::<i64>(3)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(actual_ticks, expected_ticks);
 
-    let mut event_stmt = connection.prepare(
+    let event_rows = connection.query(
         "select tick, kind, count
          from events
          order by tick asc, kind asc",
     )?;
-    let mut event_rows = event_stmt.query([])?;
     let expected_events = vec![
         (1_i64, "births".to_string(), 1_i64),
         (2, "births".to_string(), 2_i64),
         (2, "deaths".to_string(), 1_i64),
         (3, "births".to_string(), 1_i64),
     ];
-    for expected in expected_events {
-        let row = event_rows.next()?.expect("expected event row");
-        assert_eq!(row.get::<_, i64>(0)?, expected.0);
-        assert_eq!(row.get::<_, String>(1)?, expected.1);
-        assert_eq!(row.get::<_, i64>(2)?, expected.2);
-    }
-    assert!(event_rows.next()?.is_none(), "unexpected extra event rows");
+    let actual_events = event_rows
+        .iter()
+        .map(|row| -> Result<_, FrankenError> {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<String>(1)?,
+                row.get_typed::<i64>(2)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(actual_events, expected_events);
 
-    drop(connection);
+    connection.close()?;
     let _ = fs::remove_file(path);
     Ok(())
 }

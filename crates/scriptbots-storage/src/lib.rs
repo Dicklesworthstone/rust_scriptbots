@@ -1,24 +1,28 @@
-//! DuckDB-backed persistence layer for ScriptBots.
+//! FrankenSQLite-backed persistence layer for ScriptBots.
 
-#[cfg(target_os = "windows")]
-#[link(name = "rstrtmgr")]
-unsafe extern "system" {}
-
+use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
-use duckdb::{Connection, Transaction, params};
+use fsqlite::{
+    Connection, FrankenError, Row, SqliteValue,
+    compat::{FromSqliteValue, OpenFlags, RowExt, Transaction, TransactionExt, open_with_flags},
+    migrate::MigrationRunner,
+};
 use scriptbots_core::{
-    AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord, PersistenceBatch,
-    PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope,
-    WorldPersistence,
+    AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord,
+    PersistenceAdmissionError, PersistenceBatch, PersistenceEventKind, ReplayAgentPhase,
+    ReplayEvent, ReplayEventKind, ReplayRngScope, WorldPersistence,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
 use slotmap::{Key, KeyData};
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock},
     thread,
+    time::Duration,
 };
 use thiserror::Error;
+use tracing::{info, warn};
 
 const DEFAULT_TICK_BUFFER: usize = 32;
 const DEFAULT_AGENT_BUFFER: usize = 1024;
@@ -26,6 +30,119 @@ const DEFAULT_EVENT_BUFFER: usize = 256;
 const DEFAULT_METRIC_BUFFER: usize = 256;
 const DEFAULT_LIFECYCLE_BUFFER: usize = 512;
 const DEFAULT_REPLAY_BUFFER: usize = 1024;
+const DEFAULT_COMMAND_CAPACITY: usize = 8;
+const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
+
+const SCRIPTBOTS_SCHEMA_V1: &str = "
+    CREATE TABLE ticks (
+        tick INTEGER PRIMARY KEY,
+        epoch INTEGER NOT NULL,
+        closed INTEGER NOT NULL CHECK (closed IN (0, 1)),
+        agent_count INTEGER NOT NULL,
+        births INTEGER NOT NULL,
+        deaths INTEGER NOT NULL,
+        total_energy REAL NOT NULL,
+        average_energy REAL NOT NULL,
+        average_health REAL NOT NULL
+    );
+    CREATE TABLE metrics (
+        tick INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        value REAL NOT NULL,
+        PRIMARY KEY (tick, name)
+    );
+    CREATE TABLE events (
+        tick INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        PRIMARY KEY (tick, kind)
+    );
+    CREATE TABLE replay_events (
+        tick INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        agent_id INTEGER,
+        scope TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (tick, seq)
+    );
+    CREATE TABLE agents (
+        tick INTEGER NOT NULL,
+        agent_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        age INTEGER NOT NULL,
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        velocity_x REAL NOT NULL,
+        velocity_y REAL NOT NULL,
+        heading REAL NOT NULL,
+        health REAL NOT NULL,
+        energy REAL NOT NULL,
+        color_r REAL NOT NULL,
+        color_g REAL NOT NULL,
+        color_b REAL NOT NULL,
+        spike_length REAL NOT NULL,
+        boost INTEGER NOT NULL CHECK (boost IN (0, 1)),
+        herbivore_tendency REAL NOT NULL,
+        sound_multiplier REAL NOT NULL,
+        reproduction_counter REAL NOT NULL,
+        mutation_rate_primary REAL NOT NULL,
+        mutation_rate_secondary REAL NOT NULL,
+        trait_smell REAL NOT NULL,
+        trait_sound REAL NOT NULL,
+        trait_hearing REAL NOT NULL,
+        trait_eye REAL NOT NULL,
+        trait_blood REAL NOT NULL,
+        give_intent REAL NOT NULL,
+        brain_binding TEXT NOT NULL,
+        brain_key INTEGER,
+        food_delta REAL NOT NULL,
+        spiked INTEGER NOT NULL CHECK (spiked IN (0, 1)),
+        hybrid INTEGER NOT NULL CHECK (hybrid IN (0, 1)),
+        sound_output REAL NOT NULL,
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        PRIMARY KEY (tick, agent_id)
+    );
+    CREATE TABLE births (
+        tick INTEGER NOT NULL,
+        agent_id INTEGER NOT NULL,
+        parent_a INTEGER,
+        parent_b INTEGER,
+        brain_kind TEXT,
+        brain_key INTEGER,
+        herbivore_tendency REAL NOT NULL,
+        generation INTEGER NOT NULL,
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
+        PRIMARY KEY (tick, agent_id)
+    );
+    CREATE TABLE deaths (
+        tick INTEGER NOT NULL,
+        agent_id INTEGER NOT NULL,
+        age INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        herbivore_tendency REAL NOT NULL,
+        brain_kind TEXT,
+        brain_key INTEGER,
+        energy REAL NOT NULL,
+        food_balance_total REAL NOT NULL,
+        cause TEXT NOT NULL,
+        was_hybrid INTEGER NOT NULL CHECK (was_hybrid IN (0, 1)),
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        PRIMARY KEY (tick, agent_id)
+    );
+";
 
 const AGENT_COLUMNS: &[&str] = &[
     "tick",
@@ -72,12 +189,211 @@ const AGENT_COLUMNS: &[&str] = &[
 /// Storage error wrapper.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("duckdb error: {0}")]
-    DuckDb(#[from] duckdb::Error),
-    #[error("storage worker error: {0}")]
-    Worker(String),
+    #[error("FrankenSQLite error: {0}")]
+    Database(#[from] FrankenError),
+    #[error(
+        "FrankenSQLite transaction failed after {attempts} attempt(s) (transient={transient}, commit_state={commit_state:?}): {source}"
+    )]
+    Transaction {
+        attempts: u8,
+        transient: bool,
+        commit_state: FailureCommitState,
+        #[source]
+        source: FrankenError,
+    },
+    #[error("storage is already closed")]
+    Closed,
+    #[error("storage transaction is terminally failed; buffered rows will not be replayed")]
+    TerminallyFailed,
+    #[error("invalid storage data in {context}: {reason}")]
+    InvalidData {
+        context: &'static str,
+        reason: String,
+    },
+    #[error(transparent)]
+    Worker(#[from] StorageWorkerError),
     #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
     ReplayParse { tick: i64, seq: i64, reason: String },
+}
+
+/// Worker operation associated with a structured persistence failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOperation {
+    Startup,
+    Admit,
+    Persist,
+    Flush,
+    Shutdown,
+    Close,
+    Join,
+}
+
+/// What is known about the affected batch when a worker operation fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCommitState {
+    NotAdmitted,
+    RolledBack,
+    Indeterminate,
+    Committed,
+}
+
+/// Structured error crossing the storage worker boundary.
+#[derive(Debug, Error)]
+pub enum StorageWorkerError {
+    #[error(
+        "storage {operation:?} failed at {path} (tick={tick:?}, attempt={attempt}, transient={transient}, commit_state={commit_state:?}): {source}"
+    )]
+    Database {
+        operation: StorageOperation,
+        path: String,
+        tick: Option<u64>,
+        attempt: u8,
+        transient: bool,
+        commit_state: FailureCommitState,
+        #[source]
+        source: FrankenError,
+    },
+    #[error(
+        "storage {operation:?} channel failed at {path} (tick={tick:?}, commit_state={commit_state:?}): {detail}"
+    )]
+    Channel {
+        operation: StorageOperation,
+        path: String,
+        tick: Option<u64>,
+        commit_state: FailureCommitState,
+        detail: String,
+    },
+    #[error(
+        "storage {operation:?} failed at {path} (tick={tick:?}, commit_state={commit_state:?}): {detail}"
+    )]
+    Internal {
+        operation: StorageOperation,
+        path: String,
+        tick: Option<u64>,
+        commit_state: FailureCommitState,
+        detail: String,
+    },
+}
+
+/// Cloneable structured failure state published to frontends and host supervision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageFailureStatus {
+    pub kind: StorageFailureKind,
+    pub operation: StorageOperation,
+    pub path: Option<String>,
+    pub tick: Option<u64>,
+    pub attempt: u8,
+    pub transient: bool,
+    pub commit_state: FailureCommitState,
+    pub detail: String,
+}
+
+/// Stable failure category used to preserve the most informative terminal cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StorageFailureKind {
+    Channel,
+    Internal,
+    Database,
+}
+
+impl StorageWorkerError {
+    #[must_use]
+    pub fn status(&self) -> StorageFailureStatus {
+        match self {
+            Self::Database {
+                operation,
+                path,
+                tick,
+                attempt,
+                transient,
+                commit_state,
+                source,
+            } => StorageFailureStatus {
+                kind: StorageFailureKind::Database,
+                operation: *operation,
+                path: Some(path.clone()),
+                tick: *tick,
+                attempt: *attempt,
+                transient: *transient,
+                commit_state: *commit_state,
+                detail: source.to_string(),
+            },
+            Self::Channel {
+                operation,
+                path,
+                tick,
+                commit_state,
+                detail,
+            } => StorageFailureStatus {
+                kind: StorageFailureKind::Channel,
+                operation: *operation,
+                path: Some(path.clone()),
+                tick: *tick,
+                attempt: 0,
+                transient: false,
+                commit_state: *commit_state,
+                detail: detail.clone(),
+            },
+            Self::Internal {
+                operation,
+                path,
+                tick,
+                commit_state,
+                detail,
+            } => StorageFailureStatus {
+                kind: StorageFailureKind::Internal,
+                operation: *operation,
+                path: Some(path.clone()),
+                tick: *tick,
+                attempt: 0,
+                transient: false,
+                commit_state: *commit_state,
+                detail: detail.clone(),
+            },
+        }
+    }
+}
+
+fn worker_error_from_storage(
+    operation: StorageOperation,
+    path: &str,
+    tick: Option<u64>,
+    default_commit_state: FailureCommitState,
+    error: StorageError,
+) -> StorageWorkerError {
+    match error {
+        StorageError::Database(source) => StorageWorkerError::Database {
+            operation,
+            path: path.to_owned(),
+            tick,
+            attempt: 1,
+            transient: source.is_transient(),
+            commit_state: default_commit_state,
+            source,
+        },
+        StorageError::Transaction {
+            attempts,
+            transient,
+            commit_state,
+            source,
+        } => StorageWorkerError::Database {
+            operation,
+            path: path.to_owned(),
+            tick,
+            attempt: attempts,
+            transient,
+            commit_state,
+            source,
+        },
+        StorageError::Worker(error) => error,
+        other => StorageWorkerError::Internal {
+            operation,
+            path: path.to_owned(),
+            tick,
+            commit_state: default_commit_state,
+            detail: other.to_string(),
+        },
+    }
 }
 
 /// Summary row written to the `ticks` table.
@@ -111,11 +427,195 @@ struct EventRow {
 }
 
 /// Latest metric reading fetched for analytics displays.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricReading {
     pub tick: i64,
     pub name: String,
     pub value: f64,
+}
+
+/// Historical metric row returned by the read-only storage API.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedMetric {
+    pub tick: u64,
+    pub name: String,
+    pub value: f64,
+}
+
+/// Tick ledger row exposed to storage consumers without leaking SQL details.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedTick {
+    pub tick: u64,
+    pub epoch: u64,
+    pub closed: bool,
+    pub agent_count: usize,
+    pub births: usize,
+    pub deaths: usize,
+    pub total_energy: f64,
+    pub average_energy: f64,
+    pub average_health: f64,
+}
+
+/// Cross-table lifecycle totals for validating and summarizing a completed run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunLedgerSummary {
+    pub tick_count: u64,
+    pub latest_tick: Option<PersistedTick>,
+    pub birth_records: u64,
+    pub death_records: u64,
+    pub birth_events: u64,
+    pub death_events: u64,
+}
+
+/// Immutable, lock-free read model published after successful storage commits.
+#[derive(Debug, Clone)]
+pub struct AnalyticsSnapshot {
+    pub revision: u64,
+    pub committed_tick: Option<u64>,
+    pub committed_agent_count: Option<usize>,
+    pub readings: Arc<[MetricReading]>,
+    pub last_error: Option<Arc<str>>,
+    pub last_failure: Option<Arc<StorageFailureStatus>>,
+    pub stopped: bool,
+}
+
+impl Default for AnalyticsSnapshot {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            committed_tick: None,
+            committed_agent_count: None,
+            readings: Arc::from([]),
+            last_error: None,
+            last_failure: None,
+            stopped: false,
+        }
+    }
+}
+
+/// Cloneable read-only handle for the latest committed analytics state.
+#[derive(Clone)]
+pub struct AnalyticsSnapshotProvider {
+    inner: Arc<ArcSwap<AnalyticsSnapshot>>,
+}
+
+impl AnalyticsSnapshotProvider {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(AnalyticsSnapshot::default())),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<AnalyticsSnapshot> {
+        self.inner.load_full()
+    }
+
+    fn publish_committed(&self, pending: PendingAnalytics) {
+        self.inner.rcu(|current| {
+            if current.stopped {
+                return Arc::clone(current);
+            }
+            Arc::new(AnalyticsSnapshot {
+                revision: current.revision.saturating_add(1),
+                committed_tick: Some(pending.tick),
+                committed_agent_count: Some(pending.agent_count),
+                readings: Arc::clone(&pending.readings),
+                last_error: None,
+                last_failure: None,
+                stopped: false,
+            })
+        });
+    }
+
+    fn publish_worker_error(&self, error: &StorageWorkerError, stopped: bool) {
+        let incoming = Arc::new(error.status());
+        let error_text: Arc<str> = Arc::from(error.to_string());
+        self.inner.rcu(|current| {
+            let preserve_existing = current.stopped
+                && current
+                    .last_failure
+                    .as_ref()
+                    .is_some_and(|existing| existing.kind >= incoming.kind);
+            if preserve_existing {
+                return Arc::clone(current);
+            }
+            Arc::new(AnalyticsSnapshot {
+                revision: current.revision.saturating_add(1),
+                committed_tick: current.committed_tick,
+                committed_agent_count: current.committed_agent_count,
+                readings: Arc::clone(&current.readings),
+                last_error: Some(Arc::clone(&error_text)),
+                last_failure: Some(Arc::clone(&incoming)),
+                stopped,
+            })
+        });
+    }
+
+    fn publish_stopped(&self) {
+        self.inner.rcu(|current| {
+            if current.stopped {
+                return Arc::clone(current);
+            }
+            Arc::new(AnalyticsSnapshot {
+                revision: current.revision.saturating_add(1),
+                committed_tick: current.committed_tick,
+                committed_agent_count: current.committed_agent_count,
+                readings: Arc::clone(&current.readings),
+                last_error: current.last_error.clone(),
+                last_failure: current.last_failure.clone(),
+                stopped: true,
+            })
+        });
+    }
+}
+
+#[derive(Debug)]
+struct PendingAnalytics {
+    tick: u64,
+    agent_count: usize,
+    readings: Arc<[MetricReading]>,
+}
+
+impl PendingAnalytics {
+    fn from_batch(batch: &PersistenceBatch) -> Self {
+        let tick = batch.summary.tick.0;
+        let mut values = BTreeMap::new();
+        for metric in &batch.metrics {
+            values.insert(metric.name.to_string(), metric.value);
+        }
+        let readings = values
+            .into_iter()
+            .map(|(name, value)| MetricReading {
+                tick: tick as i64,
+                name,
+                value,
+            })
+            .collect::<Vec<_>>();
+        Self {
+            tick,
+            agent_count: batch.summary.agent_count,
+            readings: Arc::from(readings),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedPersistenceBatch {
+    tick: u64,
+    storage: StorageBuffer,
+    analytics: PendingAnalytics,
+}
+
+impl PreparedPersistenceBatch {
+    fn from_batch(batch: &PersistenceBatch) -> Result<Self, StorageError> {
+        Ok(Self {
+            tick: batch.summary.tick.0,
+            storage: Storage::prepare_batch(batch)?,
+            analytics: PendingAnalytics::from_batch(batch),
+        })
+    }
 }
 
 /// Agent snapshot row.
@@ -223,7 +723,7 @@ pub struct PersistedReplayEvent {
     pub event: ReplayEvent,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct StorageBuffer {
     ticks: Vec<TickRow>,
     metrics: Vec<MetricRow>,
@@ -232,6 +732,18 @@ struct StorageBuffer {
     births: Vec<BirthRow>,
     deaths: Vec<DeathRow>,
     replay_events: Vec<ReplayEventRow>,
+}
+
+#[derive(Debug)]
+struct FlushAttemptError {
+    source: FrankenError,
+    commit_state: FailureCommitState,
+}
+
+fn should_retry_transaction(error: &FlushAttemptError, attempt: u8) -> bool {
+    error.source.is_transient()
+        && error.commit_state == FailureCommitState::RolledBack
+        && attempt < MAX_TRANSACTION_ATTEMPTS
 }
 
 impl StorageBuffer {
@@ -254,11 +766,309 @@ impl StorageBuffer {
         self.deaths.clear();
         self.replay_events.clear();
     }
+
+    fn append(&mut self, mut other: Self) {
+        self.ticks.append(&mut other.ticks);
+        self.metrics.append(&mut other.metrics);
+        self.events.append(&mut other.events);
+        self.agents.append(&mut other.agents);
+        self.births.append(&mut other.births);
+        self.deaths.append(&mut other.deaths);
+        self.replay_events.append(&mut other.replay_events);
+    }
 }
 
-/// DuckDB-backed persistence sink with buffered writes.
+fn sqlite_bool(value: bool) -> SqliteValue {
+    SqliteValue::Integer(i64::from(value))
+}
+
+fn sqlite_optional_i64(value: Option<i64>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, SqliteValue::Integer)
+}
+
+fn sqlite_optional_text(value: Option<&str>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, SqliteValue::from)
+}
+
+fn checked_u64(context: &'static str, value: i64) -> Result<u64, StorageError> {
+    u64::try_from(value).map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+fn checked_usize(context: &'static str, value: i64) -> Result<usize, StorageError> {
+    usize::try_from(value).map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+fn checked_i64(context: &'static str, value: usize) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+fn decode<T: FromSqliteValue>(
+    row: &Row,
+    index: usize,
+    context: &'static str,
+) -> Result<T, StorageError> {
+    row.get_typed(index)
+        .map_err(|error| StorageError::InvalidData {
+            context,
+            reason: error.to_string(),
+        })
+}
+
+/// Read-only view over an existing ScriptBots database.
+pub struct StorageReader {
+    conn: Option<Connection>,
+}
+
+impl StorageReader {
+    /// Open an existing FrankenSQLite database without creating or migrating it.
+    pub fn open(path: &str) -> Result<Self, StorageError> {
+        let conn = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn: Some(conn) })
+    }
+
+    fn connection(&self) -> Result<&Connection, StorageError> {
+        self.conn.as_ref().ok_or(StorageError::Closed)
+    }
+
+    /// Close the read-only connection without attempting a WAL checkpoint.
+    pub fn close(mut self) -> Result<(), StorageError> {
+        let connection = self.conn.take().ok_or(StorageError::Closed)?;
+        connection.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    /// Return the maximum durable tick, if the database contains tick rows.
+    pub fn max_tick(&self) -> Result<Option<u64>, StorageError> {
+        let row = self
+            .connection()?
+            .query_row("SELECT MAX(tick) FROM ticks")?;
+        decode::<Option<i64>>(&row, 0, "ticks.max_tick")?
+            .map(|tick| checked_u64("ticks.max_tick", tick))
+            .transpose()
+    }
+
+    /// Load replay events in deterministic tick/sequence order.
+    pub fn load_replay_events(&self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
+        let rows = self.connection()?.query(
+            "SELECT tick, seq, agent_id, scope, event_type, payload
+             FROM replay_events
+             ORDER BY tick ASC, seq ASC",
+        )?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let replay_row = ReplayEventRow {
+                tick: decode(&row, 0, "replay_events.tick")?,
+                seq: decode(&row, 1, "replay_events.seq")?,
+                agent_id: decode(&row, 2, "replay_events.agent_id")?,
+                scope: decode(&row, 3, "replay_events.scope")?,
+                event_type: decode(&row, 4, "replay_events.event_type")?,
+                payload: decode(&row, 5, "replay_events.payload")?,
+            };
+            let event = replay_event_from_row(&replay_row)?;
+            events.push(PersistedReplayEvent {
+                tick: checked_u64("replay_events.tick", replay_row.tick)?,
+                seq: checked_u64("replay_events.seq", replay_row.seq)?,
+                event,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Return replay-event counts grouped by stable event type.
+    pub fn replay_event_counts(&self) -> Result<Vec<ReplayEventCount>, StorageError> {
+        let rows = self.connection()?.query(
+            "SELECT event_type, COUNT(*) AS total
+             FROM replay_events
+             GROUP BY event_type
+             ORDER BY event_type",
+        )?;
+        let mut counts = Vec::with_capacity(rows.len());
+        for row in rows {
+            counts.push(ReplayEventCount {
+                event_type: decode(&row, 0, "replay_events.event_type")?,
+                count: checked_u64(
+                    "replay_events.count",
+                    decode(&row, 1, "replay_events.count")?,
+                )?,
+            });
+        }
+        Ok(counts)
+    }
+
+    /// Load metric history in chronological order, optionally keeping only the newest rows.
+    pub fn recent_metrics(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<PersistedMetric>, StorageError> {
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+
+        let rows = if let Some(limit) = limit {
+            let bound = checked_i64("recent_metrics.limit", limit)?;
+            self.connection()?.query_with_params(
+                "SELECT tick, name, value
+                 FROM metrics
+                 ORDER BY tick DESC, name DESC
+                 LIMIT ?1",
+                &[bound.into()],
+            )?
+        } else {
+            self.connection()?.query(
+                "SELECT tick, name, value
+                 FROM metrics
+                 ORDER BY tick DESC, name DESC",
+            )?
+        };
+
+        let mut readings = Vec::with_capacity(rows.len());
+        for row in rows {
+            readings.push(PersistedMetric {
+                tick: checked_u64("metrics.tick", decode(&row, 0, "metrics.tick")?)?,
+                name: decode(&row, 1, "metrics.name")?,
+                value: decode(&row, 2, "metrics.value")?,
+            });
+        }
+        readings.reverse();
+        Ok(readings)
+    }
+
+    /// Load tick history in chronological order, optionally keeping only the newest rows.
+    pub fn recent_ticks(&self, limit: Option<usize>) -> Result<Vec<PersistedTick>, StorageError> {
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+
+        let rows = if let Some(limit) = limit {
+            let bound = checked_i64("recent_ticks.limit", limit)?;
+            self.connection()?.query_with_params(
+                "SELECT tick, epoch, closed, agent_count, births, deaths,
+                        total_energy, average_energy, average_health
+                 FROM ticks
+                 ORDER BY tick DESC
+                 LIMIT ?1",
+                &[bound.into()],
+            )?
+        } else {
+            self.connection()?.query(
+                "SELECT tick, epoch, closed, agent_count, births, deaths,
+                        total_energy, average_energy, average_health
+                 FROM ticks
+                 ORDER BY tick DESC",
+            )?
+        };
+
+        let mut ticks = Vec::with_capacity(rows.len());
+        for row in rows {
+            ticks.push(PersistedTick {
+                tick: checked_u64("ticks.tick", decode(&row, 0, "ticks.tick")?)?,
+                epoch: checked_u64("ticks.epoch", decode(&row, 1, "ticks.epoch")?)?,
+                closed: decode(&row, 2, "ticks.closed")?,
+                agent_count: checked_usize(
+                    "ticks.agent_count",
+                    decode(&row, 3, "ticks.agent_count")?,
+                )?,
+                births: checked_usize("ticks.births", decode(&row, 4, "ticks.births")?)?,
+                deaths: checked_usize("ticks.deaths", decode(&row, 5, "ticks.deaths")?)?,
+                total_energy: decode(&row, 6, "ticks.total_energy")?,
+                average_energy: decode(&row, 7, "ticks.average_energy")?,
+                average_health: decode(&row, 8, "ticks.average_health")?,
+            });
+        }
+        ticks.reverse();
+        Ok(ticks)
+    }
+
+    /// Summarize the durable tick and lifecycle ledgers for a completed run.
+    pub fn run_ledger_summary(&self) -> Result<RunLedgerSummary, StorageError> {
+        let mut tx = self.connection()?.transaction()?;
+        let query_result = (|| -> Result<RunLedgerSummary, StorageError> {
+            let tick_count_row = tx.query_row("SELECT COUNT(*) FROM ticks")?;
+            let tick_count =
+                checked_u64("ticks.count", decode(&tick_count_row, 0, "ticks.count")?)?;
+            let birth_count_row = tx.query_row("SELECT COUNT(*) FROM births")?;
+            let birth_records =
+                checked_u64("births.count", decode(&birth_count_row, 0, "births.count")?)?;
+            let death_count_row = tx.query_row("SELECT COUNT(*) FROM deaths")?;
+            let death_records =
+                checked_u64("deaths.count", decode(&death_count_row, 0, "deaths.count")?)?;
+            let birth_event_row =
+                tx.query_row("SELECT COALESCE(SUM(count), 0) FROM events WHERE kind = 'births'")?;
+            let birth_events = checked_u64(
+                "events.births",
+                decode(&birth_event_row, 0, "events.births")?,
+            )?;
+            let death_event_row =
+                tx.query_row("SELECT COALESCE(SUM(count), 0) FROM events WHERE kind = 'deaths'")?;
+            let death_events = checked_u64(
+                "events.deaths",
+                decode(&death_event_row, 0, "events.deaths")?,
+            )?;
+            let rows = tx.query(
+                "SELECT tick, epoch, closed, agent_count, births, deaths,
+                        total_energy, average_energy, average_health
+                 FROM ticks
+                 ORDER BY tick DESC
+                 LIMIT 1",
+            )?;
+            let latest_tick = rows
+                .first()
+                .map(|row| -> Result<PersistedTick, StorageError> {
+                    Ok(PersistedTick {
+                        tick: checked_u64("ticks.tick", decode(row, 0, "ticks.tick")?)?,
+                        epoch: checked_u64("ticks.epoch", decode(row, 1, "ticks.epoch")?)?,
+                        closed: decode(row, 2, "ticks.closed")?,
+                        agent_count: checked_usize(
+                            "ticks.agent_count",
+                            decode(row, 3, "ticks.agent_count")?,
+                        )?,
+                        births: checked_usize("ticks.births", decode(row, 4, "ticks.births")?)?,
+                        deaths: checked_usize("ticks.deaths", decode(row, 5, "ticks.deaths")?)?,
+                        total_energy: decode(row, 6, "ticks.total_energy")?,
+                        average_energy: decode(row, 7, "ticks.average_energy")?,
+                        average_health: decode(row, 8, "ticks.average_health")?,
+                    })
+                })
+                .transpose()?;
+
+            Ok(RunLedgerSummary {
+                tick_count,
+                latest_tick,
+                birth_records,
+                death_records,
+                birth_events,
+                death_events,
+            })
+        })();
+        let rollback_result = tx.rollback().map_err(StorageError::from);
+        let summary = query_result?;
+        rollback_result?;
+        Ok(summary)
+    }
+}
+
+impl Drop for StorageReader {
+    fn drop(&mut self) {
+        if let Some(mut connection) = self.conn.take() {
+            connection.close_best_effort_in_place();
+        }
+    }
+}
+
+/// FrankenSQLite-backed persistence sink with buffered writes.
 pub struct Storage {
-    conn: Connection,
+    path: String,
+    conn: Option<Connection>,
+    terminally_failed: bool,
     buffer: StorageBuffer,
     tick_flush_threshold: usize,
     agent_flush_threshold: usize,
@@ -270,26 +1080,15 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Open or create a DuckDB database at the provided path with default buffering thresholds.
+    /// Open or create a FrankenSQLite database with default buffering thresholds.
     pub fn open(path: &str) -> Result<Self, StorageError> {
-        let conn = Connection::open(path)?;
-        // Configure DuckDB execution settings
-        let threads = num_cpus::get() as i64;
-        let _ = conn.execute(&format!("SET threads = {threads}"), []);
-        let _ = conn.execute("SET enable_progress_bar = false", []);
-        let mut storage = Self {
-            conn,
-            buffer: StorageBuffer::default(),
-            tick_flush_threshold: DEFAULT_TICK_BUFFER,
-            agent_flush_threshold: DEFAULT_AGENT_BUFFER,
-            event_flush_threshold: DEFAULT_EVENT_BUFFER,
-            metric_flush_threshold: DEFAULT_METRIC_BUFFER,
-            birth_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
-            death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
-            replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
-        };
-        storage.initialize_schema()?;
-        Ok(storage)
+        Self::with_thresholds(
+            path,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+        )
     }
 
     /// Override flush thresholds for ticks, agents, events, and metrics respectively.
@@ -302,11 +1101,11 @@ impl Storage {
         metric: usize,
     ) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
-        let threads = num_cpus::get() as i64;
-        let _ = conn.execute(&format!("SET threads = {threads}"), []);
-        let _ = conn.execute("SET enable_progress_bar = false", []);
+        conn.execute("PRAGMA synchronous = FULL;")?;
         let mut storage = Self {
-            conn,
+            path: path.to_owned(),
+            conn: Some(conn),
+            terminally_failed: false,
             buffer: StorageBuffer::default(),
             tick_flush_threshold: tick,
             agent_flush_threshold: agent,
@@ -321,174 +1120,22 @@ impl Storage {
     }
 
     fn initialize_schema(&mut self) -> Result<(), StorageError> {
-        self.conn.execute(
-            "create table if not exists ticks (
-                tick bigint primary key,
-                epoch bigint,
-                closed boolean,
-                agent_count integer,
-                births integer,
-                deaths integer,
-                total_energy double,
-                average_energy double,
-                average_health double
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "create table if not exists metrics (
-                tick bigint,
-                name text,
-                value double,
-                primary key (tick, name)
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "create table if not exists events (
-                tick bigint,
-                kind text,
-                count integer,
-                primary key (tick, kind)
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "create table if not exists replay_events (
-                tick bigint,
-                seq bigint,
-                agent_id bigint,
-                scope text,
-                event_type text,
-                payload json,
-                primary key (tick, seq)
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "create table if not exists agents (
-                tick bigint,
-                agent_id bigint,
-                generation integer,
-                age integer,
-                position_x double,
-                position_y double,
-                velocity_x double,
-                velocity_y double,
-                heading double,
-                health double,
-                energy double,
-                color_r double,
-                color_g double,
-                color_b double,
-                spike_length double,
-                boost boolean,
-                herbivore_tendency double,
-                sound_multiplier double,
-                reproduction_counter double,
-                mutation_rate_primary double,
-                mutation_rate_secondary double,
-                trait_smell double,
-                trait_sound double,
-                trait_hearing double,
-                trait_eye double,
-                trait_blood double,
-                give_intent double,
-                brain_binding text,
-                brain_key bigint,
-                food_delta double,
-                spiked boolean,
-                hybrid boolean,
-                sound_output double,
-                spike_attacker boolean,
-                spike_victim boolean,
-                hit_carnivore boolean,
-                hit_herbivore boolean,
-                hit_by_carnivore boolean,
-                hit_by_herbivore boolean,
-                primary key (tick, agent_id)
-            )",
-            [],
-        )?;
-        let _ = self
-            .conn
-            .execute("alter table agents add column brain_key bigint", []);
-        self.conn.execute(
-            "create table if not exists births (
-                tick bigint,
-                agent_id bigint,
-                parent_a bigint,
-                parent_b bigint,
-                brain_kind text,
-                brain_key bigint,
-                herbivore_tendency double,
-                generation integer,
-                position_x double,
-                position_y double,
-                is_hybrid boolean,
-                primary key (tick, agent_id)
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "create table if not exists deaths (
-                tick bigint,
-                agent_id bigint,
-                age integer,
-                generation integer,
-                herbivore_tendency double,
-                brain_kind text,
-                brain_key bigint,
-                energy double,
-                food_balance_total double,
-                cause text,
-                was_hybrid boolean,
-                spike_attacker boolean,
-                spike_victim boolean,
-                hit_carnivore boolean,
-                hit_herbivore boolean,
-                hit_by_carnivore boolean,
-                hit_by_herbivore boolean,
-                primary key (tick, agent_id)
-            )",
-            [],
-        )?;
-        let _ = self
-            .conn
-            .execute("alter table births add column brain_key bigint", []);
-        let _ = self
-            .conn
-            .execute("alter table births add column is_hybrid boolean", []);
-        let _ = self.conn.execute(
-            "alter table deaths add column food_balance_total double",
-            [],
-        );
-        let _ = self
-            .conn
-            .execute("alter table deaths add column spike_attacker boolean", []);
-        let _ = self
-            .conn
-            .execute("alter table deaths add column spike_victim boolean", []);
-        let _ = self
-            .conn
-            .execute("alter table deaths add column hit_carnivore boolean", []);
-        let _ = self
-            .conn
-            .execute("alter table deaths add column hit_herbivore boolean", []);
-        let _ = self
-            .conn
-            .execute("alter table deaths add column hit_by_carnivore boolean", []);
-        let _ = self
-            .conn
-            .execute("alter table deaths add column hit_by_herbivore boolean", []);
+        MigrationRunner::new()
+            .add(1, "create_scriptbots_schema", SCRIPTBOTS_SCHEMA_V1)
+            .run(self.connection()?)?;
         Ok(())
     }
 
-    fn enqueue(&mut self, payload: &PersistenceBatch) -> Result<(), StorageError> {
+    fn connection(&self) -> Result<&Connection, StorageError> {
+        self.conn.as_ref().ok_or(StorageError::Closed)
+    }
+
+    fn prepare_batch(payload: &PersistenceBatch) -> Result<StorageBuffer, StorageError> {
         let summary = &payload.summary;
         let tick = summary.tick.0 as i64;
+        let mut prepared = StorageBuffer::default();
 
-        self.buffer.ticks.push(TickRow {
+        prepared.ticks.push(TickRow {
             tick,
             epoch: payload.epoch as i64,
             closed: payload.closed,
@@ -501,7 +1148,7 @@ impl Storage {
         });
 
         for metric in &payload.metrics {
-            self.buffer.metrics.push(MetricRow {
+            prepared.metrics.push(MetricRow {
                 tick,
                 name: metric.name.to_string(),
                 value: metric.value,
@@ -509,7 +1156,7 @@ impl Storage {
         }
 
         for event in &payload.events {
-            self.buffer.events.push(EventRow {
+            prepared.events.push(EventRow {
                 tick,
                 kind: match &event.kind {
                     PersistenceEventKind::Births => "births".to_string(),
@@ -521,35 +1168,45 @@ impl Storage {
         }
 
         for agent in &payload.agents {
-            self.buffer
-                .agents
-                .push(agent_row_from_snapshot(tick, agent));
+            prepared.agents.push(agent_row_from_snapshot(tick, agent));
         }
 
         for birth in &payload.births {
-            self.buffer.births.push(birth_row_from_record(birth));
+            prepared.births.push(birth_row_from_record(birth));
         }
 
         for death in &payload.deaths {
-            self.buffer.deaths.push(death_row_from_record(death));
+            prepared.deaths.push(death_row_from_record(death));
         }
 
         for (seq, event) in payload.replay_events.iter().enumerate() {
-            self.buffer
+            prepared
                 .replay_events
-                .push(replay_row_from_event(event, tick, seq));
+                .push(replay_row_from_event(event, tick, seq)?);
         }
 
-        self.maybe_flush()?;
-        Ok(())
+        Ok(prepared)
+    }
+
+    fn enqueue_prepared(&mut self, prepared: StorageBuffer) -> Result<bool, StorageError> {
+        if self.terminally_failed {
+            return Err(StorageError::TerminallyFailed);
+        }
+        self.buffer.append(prepared);
+        self.maybe_flush()
+    }
+
+    fn enqueue(&mut self, payload: &PersistenceBatch) -> Result<bool, StorageError> {
+        let prepared = Self::prepare_batch(payload)?;
+        self.enqueue_prepared(prepared)
     }
 
     /// Persist a simulation payload, buffering until thresholds are met.
     pub fn persist(&mut self, payload: &PersistenceBatch) -> Result<(), StorageError> {
-        self.enqueue(payload)
+        self.enqueue(payload).map(|_| ())
     }
 
-    fn maybe_flush(&mut self) -> Result<(), StorageError> {
+    fn maybe_flush(&mut self) -> Result<bool, StorageError> {
         if self.buffer.ticks.len() >= self.tick_flush_threshold
             || self.buffer.metrics.len() >= self.metric_flush_threshold
             || self.buffer.events.len() >= self.event_flush_threshold
@@ -559,107 +1216,115 @@ impl Storage {
             || self.buffer.replay_events.len() >= self.replay_flush_threshold
         {
             self.flush()?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
-    fn insert_ticks(tx: &Transaction<'_>, rows: &[TickRow]) -> Result<(), duckdb::Error> {
+    fn insert_ticks(tx: &Transaction<'_>, rows: &[TickRow]) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt = tx.prepare(
-            "insert or replace into ticks (
+        let sql = "insert or replace into ticks (
                 tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )?;
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
         for row in rows {
-            stmt.execute(params![
-                row.tick,
-                row.epoch,
-                row.closed,
-                row.agent_count,
-                row.births,
-                row.deaths,
-                row.total_energy,
-                row.average_energy,
-                row.average_health,
-            ])?;
+            tx.execute_with_params(
+                sql,
+                &[
+                    row.tick.into(),
+                    row.epoch.into(),
+                    sqlite_bool(row.closed),
+                    row.agent_count.into(),
+                    row.births.into(),
+                    row.deaths.into(),
+                    row.total_energy.into(),
+                    row.average_energy.into(),
+                    row.average_health.into(),
+                ],
+            )?;
         }
         Ok(())
     }
 
-    fn insert_metrics(tx: &Transaction<'_>, rows: &[MetricRow]) -> Result<(), duckdb::Error> {
+    fn insert_metrics(tx: &Transaction<'_>, rows: &[MetricRow]) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt =
-            tx.prepare("insert or replace into metrics (tick, name, value) values (?, ?, ?)")?;
+        let sql = "insert or replace into metrics (tick, name, value) values (?1, ?2, ?3)";
         for row in rows {
-            stmt.execute(params![row.tick, row.name, row.value])?;
+            tx.execute_with_params(
+                sql,
+                &[row.tick.into(), row.name.as_str().into(), row.value.into()],
+            )?;
         }
         Ok(())
     }
 
-    fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<(), duckdb::Error> {
+    fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt =
-            tx.prepare("insert or replace into events (tick, kind, count) values (?, ?, ?)")?;
+        let sql = "insert or replace into events (tick, kind, count) values (?1, ?2, ?3)";
         for row in rows {
-            stmt.execute(params![row.tick, row.kind, row.count])?;
+            tx.execute_with_params(
+                sql,
+                &[row.tick.into(), row.kind.as_str().into(), row.count.into()],
+            )?;
         }
         Ok(())
     }
 
-    fn insert_agents(tx: &Transaction<'_>, rows: &[AgentRow]) -> Result<(), duckdb::Error> {
+    fn insert_agents(tx: &Transaction<'_>, rows: &[AgentRow]) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt = tx.prepare(Self::agent_insert_sql())?;
         for row in rows {
-            stmt.execute(params![
-                row.tick,
-                row.agent_id,
-                row.generation,
-                row.age,
-                row.position_x,
-                row.position_y,
-                row.velocity_x,
-                row.velocity_y,
-                row.heading,
-                row.health,
-                row.energy,
-                row.color_r,
-                row.color_g,
-                row.color_b,
-                row.spike_length,
-                row.boost,
-                row.herbivore_tendency,
-                row.sound_multiplier,
-                row.reproduction_counter,
-                row.mutation_rate_primary,
-                row.mutation_rate_secondary,
-                row.trait_smell,
-                row.trait_sound,
-                row.trait_hearing,
-                row.trait_eye,
-                row.trait_blood,
-                row.give_intent,
-                row.brain_binding,
-                row.brain_key,
-                row.food_delta,
-                row.spiked,
-                row.hybrid,
-                row.sound_output,
-                row.spike_attacker,
-                row.spike_victim,
-                row.hit_carnivore,
-                row.hit_herbivore,
-                row.hit_by_carnivore,
-                row.hit_by_herbivore,
-            ])?;
+            tx.execute_with_params(
+                Self::agent_insert_sql(),
+                &[
+                    row.tick.into(),
+                    row.agent_id.into(),
+                    row.generation.into(),
+                    row.age.into(),
+                    row.position_x.into(),
+                    row.position_y.into(),
+                    row.velocity_x.into(),
+                    row.velocity_y.into(),
+                    row.heading.into(),
+                    row.health.into(),
+                    row.energy.into(),
+                    row.color_r.into(),
+                    row.color_g.into(),
+                    row.color_b.into(),
+                    row.spike_length.into(),
+                    sqlite_bool(row.boost),
+                    row.herbivore_tendency.into(),
+                    row.sound_multiplier.into(),
+                    row.reproduction_counter.into(),
+                    row.mutation_rate_primary.into(),
+                    row.mutation_rate_secondary.into(),
+                    row.trait_smell.into(),
+                    row.trait_sound.into(),
+                    row.trait_hearing.into(),
+                    row.trait_eye.into(),
+                    row.trait_blood.into(),
+                    row.give_intent.into(),
+                    row.brain_binding.as_str().into(),
+                    sqlite_optional_i64(row.brain_key),
+                    row.food_delta.into(),
+                    sqlite_bool(row.spiked),
+                    sqlite_bool(row.hybrid),
+                    row.sound_output.into(),
+                    sqlite_bool(row.spike_attacker),
+                    sqlite_bool(row.spike_victim),
+                    sqlite_bool(row.hit_carnivore),
+                    sqlite_bool(row.hit_herbivore),
+                    sqlite_bool(row.hit_by_carnivore),
+                    sqlite_bool(row.hit_by_herbivore),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -668,75 +1333,78 @@ impl Storage {
         static SQL: OnceLock<String> = OnceLock::new();
         SQL.get_or_init(|| {
             let columns = AGENT_COLUMNS.join(", ");
-            let placeholders = std::iter::repeat_n("?", AGENT_COLUMNS.len())
-                .collect::<Vec<_>>()
+            let placeholders = (1..=AGENT_COLUMNS.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<String>>()
                 .join(", ");
             format!("insert or replace into agents ({columns}) values ({placeholders})")
         })
     }
 
-    fn insert_births(tx: &Transaction<'_>, rows: &[BirthRow]) -> Result<(), duckdb::Error> {
+    fn insert_births(tx: &Transaction<'_>, rows: &[BirthRow]) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt = tx.prepare(
-            "insert or replace into births (
+        let sql = "insert or replace into births (
                 tick, agent_id, parent_a, parent_b,
                 brain_kind, brain_key, herbivore_tendency,
                 generation, position_x, position_y, is_hybrid
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )?;
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
         for row in rows {
-            stmt.execute(params![
-                row.tick,
-                row.agent_id,
-                row.parent_a,
-                row.parent_b,
-                row.brain_kind.as_deref(),
-                row.brain_key,
-                row.herbivore_tendency,
-                row.generation,
-                row.position_x,
-                row.position_y,
-                row.is_hybrid,
-            ])?;
+            tx.execute_with_params(
+                sql,
+                &[
+                    row.tick.into(),
+                    row.agent_id.into(),
+                    sqlite_optional_i64(row.parent_a),
+                    sqlite_optional_i64(row.parent_b),
+                    sqlite_optional_text(row.brain_kind.as_deref()),
+                    sqlite_optional_i64(row.brain_key),
+                    row.herbivore_tendency.into(),
+                    row.generation.into(),
+                    row.position_x.into(),
+                    row.position_y.into(),
+                    sqlite_bool(row.is_hybrid),
+                ],
+            )?;
         }
         Ok(())
     }
 
-    fn insert_deaths(tx: &Transaction<'_>, rows: &[DeathRow]) -> Result<(), duckdb::Error> {
+    fn insert_deaths(tx: &Transaction<'_>, rows: &[DeathRow]) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt = tx.prepare(
-            "insert or replace into deaths (
+        let sql = "insert or replace into deaths (
                 tick, agent_id, age, generation,
                 herbivore_tendency, brain_kind, brain_key,
                 energy, food_balance_total, cause, was_hybrid,
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
                 hit_by_carnivore, hit_by_herbivore
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )?;
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
         for row in rows {
-            stmt.execute(params![
-                row.tick,
-                row.agent_id,
-                row.age,
-                row.generation,
-                row.herbivore_tendency,
-                row.brain_kind.as_deref(),
-                row.brain_key,
-                row.energy,
-                row.food_balance_total,
-                &row.cause,
-                row.was_hybrid,
-                row.spike_attacker,
-                row.spike_victim,
-                row.hit_carnivore,
-                row.hit_herbivore,
-                row.hit_by_carnivore,
-                row.hit_by_herbivore,
-            ])?;
+            tx.execute_with_params(
+                sql,
+                &[
+                    row.tick.into(),
+                    row.agent_id.into(),
+                    row.age.into(),
+                    row.generation.into(),
+                    row.herbivore_tendency.into(),
+                    sqlite_optional_text(row.brain_kind.as_deref()),
+                    sqlite_optional_i64(row.brain_key),
+                    row.energy.into(),
+                    row.food_balance_total.into(),
+                    row.cause.as_str().into(),
+                    sqlite_bool(row.was_hybrid),
+                    sqlite_bool(row.spike_attacker),
+                    sqlite_bool(row.spike_victim),
+                    sqlite_bool(row.hit_carnivore),
+                    sqlite_bool(row.hit_herbivore),
+                    sqlite_bool(row.hit_by_carnivore),
+                    sqlite_bool(row.hit_by_herbivore),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -744,90 +1412,175 @@ impl Storage {
     fn insert_replay_events(
         tx: &Transaction<'_>,
         rows: &[ReplayEventRow],
-    ) -> Result<(), duckdb::Error> {
+    ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut stmt = tx.prepare(
-            "insert or replace into replay_events (
+        let sql = "insert or replace into replay_events (
                 tick, seq, agent_id, scope, event_type, payload
-            ) values (?, ?, ?, ?, ?, ?)",
-        )?;
+            ) values (?1, ?2, ?3, ?4, ?5, ?6)";
         for row in rows {
-            stmt.execute(params![
-                row.tick,
-                row.seq,
-                row.agent_id,
-                &row.scope,
-                &row.event_type,
-                &row.payload,
-            ])?;
+            tx.execute_with_params(
+                sql,
+                &[
+                    row.tick.into(),
+                    row.seq.into(),
+                    sqlite_optional_i64(row.agent_id),
+                    row.scope.as_str().into(),
+                    row.event_type.as_str().into(),
+                    row.payload.as_str().into(),
+                ],
+            )?;
         }
         Ok(())
     }
 
-    /// Force flush buffered records to disk.
+    fn flush_attempt(
+        connection: &Connection,
+        buffer: &StorageBuffer,
+    ) -> Result<(), FlushAttemptError> {
+        let mut tx = connection
+            .transaction()
+            .map_err(|source| FlushAttemptError {
+                source,
+                commit_state: FailureCommitState::RolledBack,
+            })?;
+        let transaction_result = (|| -> Result<(), FrankenError> {
+            Self::insert_ticks(&tx, &buffer.ticks)?;
+            Self::insert_metrics(&tx, &buffer.metrics)?;
+            Self::insert_events(&tx, &buffer.events)?;
+            Self::insert_agents(&tx, &buffer.agents)?;
+            Self::insert_births(&tx, &buffer.births)?;
+            Self::insert_deaths(&tx, &buffer.deaths)?;
+            Self::insert_replay_events(&tx, &buffer.replay_events)?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        if let Err(source) = transaction_result {
+            return match tx.rollback() {
+                Ok(()) => Err(FlushAttemptError {
+                    source,
+                    commit_state: FailureCommitState::RolledBack,
+                }),
+                Err(rollback_error) => Err(FlushAttemptError {
+                    source: FrankenError::Internal(format!(
+                        "transaction failed ({source}); rollback also failed ({rollback_error})"
+                    )),
+                    commit_state: FailureCommitState::Indeterminate,
+                }),
+            };
+        }
+
+        Ok(())
+    }
+
+    /// Force flush buffered records, retrying only fully rolled-back transient transactions.
     pub fn flush(&mut self) -> Result<(), StorageError> {
+        if self.terminally_failed {
+            return Err(StorageError::TerminallyFailed);
+        }
         if self.buffer.is_empty() {
             return Ok(());
         }
 
-        let tx = self.conn.transaction()?;
-        Self::insert_ticks(&tx, &self.buffer.ticks)?;
-        Self::insert_metrics(&tx, &self.buffer.metrics)?;
-        Self::insert_events(&tx, &self.buffer.events)?;
-        Self::insert_agents(&tx, &self.buffer.agents)?;
-        Self::insert_births(&tx, &self.buffer.births)?;
-        Self::insert_deaths(&tx, &self.buffer.deaths)?;
-        Self::insert_replay_events(&tx, &self.buffer.replay_events)?;
-        tx.commit()?;
-        self.buffer.clear();
+        let connection = self.connection()?;
+        let mut attempt = 1_u8;
+        loop {
+            match Self::flush_attempt(connection, &self.buffer) {
+                Ok(()) => {
+                    info!(
+                        path = %self.path,
+                        attempt,
+                        rows = self.buffer.ticks.len(),
+                        "FrankenSQLite storage transaction committed"
+                    );
+                    self.buffer.clear();
+                    return Ok(());
+                }
+                Err(error) if should_retry_transaction(&error, attempt) => {
+                    warn!(
+                        path = %self.path,
+                        attempt,
+                        transient = true,
+                        commit_state = ?error.commit_state,
+                        error = %error.source,
+                        "retrying fully rolled-back FrankenSQLite transaction"
+                    );
+                    thread::sleep(Duration::from_millis(1_u64 << attempt));
+                    attempt += 1;
+                }
+                Err(error) => {
+                    let transient = error.source.is_transient();
+                    self.terminally_failed = true;
+                    return Err(StorageError::Transaction {
+                        attempts: attempt,
+                        transient,
+                        commit_state: error.commit_state,
+                        source: error.source,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Compact storage after first durably flushing every buffered row.
+    pub fn optimize(&mut self) -> Result<(), StorageError> {
+        self.flush()?;
+        self.connection()?.execute("VACUUM;")?;
         Ok(())
     }
 
-    /// Run database maintenance to optimize and compact storage.
-    pub fn optimize(&mut self) -> Result<(), StorageError> {
+    /// Flush, checkpoint, and explicitly close the FrankenSQLite connection.
+    pub fn close(mut self) -> Result<(), StorageError> {
         self.flush()?;
-        self.conn.execute("PRAGMA optimize;", [])?;
-        self.conn.execute("VACUUM;", [])?;
+        let connection = self.conn.take().ok_or(StorageError::Closed)?;
+        connection.close()?;
         Ok(())
+    }
+
+    /// Dispose of a terminally failed worker without replaying its buffered transaction in Drop.
+    fn abandon_after_error(mut self) {
+        self.buffer.clear();
+        if let Some(mut connection) = self.conn.take() {
+            connection.close_best_effort_in_place();
+        }
     }
 
     /// Return the maximum tick recorded in the `ticks` table, if any.
     pub fn max_tick(&mut self) -> Result<Option<u64>, StorageError> {
         self.flush()?;
-        let mut stmt = self.conn.prepare("select max(tick) from ticks")?;
-        let mut rows = stmt.query([])?;
-        let value = match rows.next()? {
-            Some(row) => row.get::<_, Option<i64>>(0)?,
-            None => None,
-        };
-        Ok(value.map(|tick| tick as u64))
+        let row = self
+            .connection()?
+            .query_row("SELECT MAX(tick) FROM ticks")?;
+        let value = decode::<Option<i64>>(&row, 0, "ticks.max_tick")?;
+        value
+            .map(|tick| checked_u64("ticks.max_tick", tick))
+            .transpose()
     }
 
     /// Load all replay events ordered by tick/sequence and reconstruct their payloads.
     pub fn load_replay_events(&mut self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
         self.flush()?;
-        let mut stmt = self.conn.prepare(
-            "select tick, seq, agent_id, scope, event_type, payload
+        let rows = self.connection()?.query(
+            "SELECT tick, seq, agent_id, scope, event_type, payload
              from replay_events
-             order by tick asc, seq asc",
+             ORDER BY tick ASC, seq ASC",
         )?;
-        let mut rows = stmt.query([])?;
-        let mut events = Vec::new();
-        while let Some(row) = rows.next()? {
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
             let replay_row = ReplayEventRow {
-                tick: row.get(0)?,
-                seq: row.get(1)?,
-                agent_id: row.get(2)?,
-                scope: row.get(3)?,
-                event_type: row.get(4)?,
-                payload: row.get(5)?,
+                tick: decode(&row, 0, "replay_events.tick")?,
+                seq: decode(&row, 1, "replay_events.seq")?,
+                agent_id: decode(&row, 2, "replay_events.agent_id")?,
+                scope: decode(&row, 3, "replay_events.scope")?,
+                event_type: decode(&row, 4, "replay_events.event_type")?,
+                payload: decode(&row, 5, "replay_events.payload")?,
             };
             let event = replay_event_from_row(&replay_row)?;
             events.push(PersistedReplayEvent {
-                tick: replay_row.tick as u64,
-                seq: replay_row.seq as u64,
+                tick: checked_u64("replay_events.tick", replay_row.tick)?,
+                seq: checked_u64("replay_events.seq", replay_row.seq)?,
                 event,
             });
         }
@@ -837,18 +1590,18 @@ impl Storage {
     /// Return counts of replay events grouped by event type.
     pub fn replay_event_counts(&mut self) -> Result<Vec<ReplayEventCount>, StorageError> {
         self.flush()?;
-        let mut stmt = self.conn.prepare(
-            "select event_type, count(*) as total
-             from replay_events
-             group by event_type
-             order by event_type",
+        let rows = self.connection()?.query(
+            "SELECT event_type, COUNT(*) AS total
+             FROM replay_events
+             GROUP BY event_type
+             ORDER BY event_type",
         )?;
-        let mut rows = stmt.query([])?;
-        let mut counts = Vec::new();
-        while let Some(row) = rows.next()? {
+        let mut counts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let count = decode::<i64>(&row, 1, "replay_events.count")?;
             counts.push(ReplayEventCount {
-                event_type: row.get(0)?,
-                count: row.get::<_, i64>(1)? as u64,
+                event_type: decode(&row, 0, "replay_events.event_type")?,
+                count: checked_u64("replay_events.count", count)?,
             });
         }
         Ok(counts)
@@ -856,25 +1609,30 @@ impl Storage {
 
     /// Return agents ranked by average energy across all recorded ticks.
     pub fn top_predators(&mut self, limit: usize) -> Result<Vec<PredatorStats>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         self.flush()?;
-        let mut stmt = self.conn.prepare(
-            "select agent_id,
-                    avg(energy) as avg_energy,
-                    max(spike_length) as max_spike_length,
-                    max(tick) as last_tick
-             from agents
-             group by agent_id
-             order by avg_energy desc
-             limit ?",
+        let bound = checked_i64("top_predators.limit", limit)?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT agent_id,
+                    AVG(energy) AS avg_energy,
+                    MAX(spike_length) AS max_spike_length,
+                    MAX(tick) AS last_tick
+             FROM agents
+             GROUP BY agent_id
+             ORDER BY avg_energy DESC
+             LIMIT ?1",
+            &[bound.into()],
         )?;
-        let mut rows = stmt.query(params![limit as i64])?;
         let mut stats = Vec::with_capacity(limit.min(16));
-        while let Some(row) = rows.next()? {
+        for row in rows {
+            let agent_id = decode::<i64>(&row, 0, "agents.agent_id")?;
             stats.push(PredatorStats {
-                agent_id: row.get::<_, i64>(0)? as u64,
-                avg_energy: row.get::<_, f64>(1)?,
-                max_spike_length: row.get::<_, f64>(2)?,
-                last_tick: row.get::<_, i64>(3)?,
+                agent_id: checked_u64("agents.agent_id", agent_id)?,
+                avg_energy: decode(&row, 1, "agents.avg_energy")?,
+                max_spike_length: decode(&row, 2, "agents.max_spike_length")?,
+                last_tick: decode(&row, 3, "agents.last_tick")?,
             });
         }
         Ok(stats)
@@ -887,32 +1645,30 @@ impl Storage {
         }
 
         self.flush()?;
-        let mut stmt = self.conn.prepare("select max(tick) from metrics")?;
-        let mut rows = stmt.query([])?;
-        let latest_tick = match rows.next()? {
-            Some(row) => row.get::<_, Option<i64>>(0)?,
-            None => None,
-        };
-        drop(rows);
+        let row = self
+            .connection()?
+            .query_row("SELECT MAX(tick) FROM metrics")?;
+        let latest_tick = decode::<Option<i64>>(&row, 0, "metrics.latest_tick")?;
 
         let Some(tick) = latest_tick else {
             return Ok(Vec::new());
         };
 
-        let mut metrics_stmt = self.conn.prepare(
-            "select name, value
-             from metrics
-             where tick = ?
-             order by name asc
-             limit ?",
+        let bound = checked_i64("latest_metrics.limit", limit)?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT name, value
+             FROM metrics
+             WHERE tick = ?1
+             ORDER BY name ASC
+             LIMIT ?2",
+            &[tick.into(), bound.into()],
         )?;
-        let mut metrics_rows = metrics_stmt.query(params![tick, limit as i64])?;
-        let mut readings = Vec::new();
-        while let Some(row) = metrics_rows.next()? {
+        let mut readings = Vec::with_capacity(rows.len());
+        for row in rows {
             readings.push(MetricReading {
                 tick,
-                name: row.get(0)?,
-                value: row.get(1)?,
+                name: decode(&row, 0, "metrics.name")?,
+                value: decode(&row, 1, "metrics.value")?,
             });
         }
         Ok(readings)
@@ -921,19 +1677,16 @@ impl Storage {
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        if let Err(err) = self.flush() {
+        if self.conn.is_none() {
+            return;
+        }
+        if self.terminally_failed {
+            self.buffer.clear();
+        } else if let Err(err) = self.flush() {
             eprintln!("failed to flush persistence buffer on drop: {err}");
         }
-    }
-}
-
-impl WorldPersistence for Storage {
-    fn on_tick(&mut self, payload: &PersistenceBatch) {
-        if let Err(err) = self.persist(payload) {
-            eprintln!(
-                "failed to enqueue persistence data for tick {}: {err}",
-                payload.summary.tick.0
-            );
+        if let Some(mut connection) = self.conn.take() {
+            connection.close_best_effort_in_place();
         }
     }
 }
@@ -949,15 +1702,146 @@ pub struct PredatorStats {
 
 #[derive(Debug)]
 enum StorageCommand {
-    Persist(Box<PersistenceBatch>),
-    Flush,
-    Shutdown,
+    Persist(Box<PreparedPersistenceBatch>),
+    Flush {
+        reply: xchan::Sender<Result<FlushReceipt, StorageWorkerError>>,
+    },
+    Shutdown {
+        reply: xchan::Sender<Result<ShutdownReceipt, StorageWorkerError>>,
+    },
+    #[cfg(test)]
+    PauseForAdmissionRace {
+        entered: xchan::Sender<()>,
+        release: xchan::Receiver<()>,
+    },
 }
 
-pub struct StoragePipeline {
+/// Persistence strength associated with an acknowledged commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceGuarantee {
+    /// Transaction committed in an in-memory database and will not survive close or process exit.
+    CommittedVolatile,
+    /// Transaction committed to a file-backed database under the configured durability policy.
+    Durable,
+}
+
+impl Default for PersistenceGuarantee {
+    fn default() -> Self {
+        Self::CommittedVolatile
+    }
+}
+
+/// Proof that every persistence command admitted before a flush has committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushReceipt {
+    pub committed_tick: Option<u64>,
+    pub guarantee: PersistenceGuarantee,
+    pub analytics_revision: u64,
+}
+
+/// Proof that the worker flushed, closed, and joined with an explicit persistence guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownReceipt {
+    pub committed_tick: Option<u64>,
+    pub guarantee: PersistenceGuarantee,
+    pub analytics_revision: u64,
+}
+
+#[derive(Default)]
+struct WorkerState {
+    admitted_tick: Option<u64>,
+    committed_tick: Option<u64>,
+    guarantee: PersistenceGuarantee,
+    pending_analytics: Option<PendingAnalytics>,
+}
+
+#[derive(Clone, Copy)]
+struct StorageThresholds {
+    tick: usize,
+    agent: usize,
+    event: usize,
+    metric: usize,
+}
+
+#[derive(Debug)]
+struct AdmissionState {
+    open: bool,
+}
+
+/// Cloneable persistence sink that never owns or transports a database connection.
+#[derive(Clone)]
+pub struct StorageSink {
     tx: xchan::Sender<StorageCommand>,
-    storage: Arc<Mutex<Storage>>,
-    handle: Option<thread::JoinHandle<()>>,
+    analytics: AnalyticsSnapshotProvider,
+    admission: Arc<Mutex<AdmissionState>>,
+    path: Arc<str>,
+}
+
+impl StorageSink {
+    /// Admit a persistence batch to the bounded, lossless worker queue.
+    pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
+        let prepared = PreparedPersistenceBatch::from_batch(payload).map_err(|error| {
+            let worker_error = StorageWorkerError::Internal {
+                operation: StorageOperation::Admit,
+                path: self.path.to_string(),
+                tick: Some(payload.summary.tick.0),
+                commit_state: FailureCommitState::NotAdmitted,
+                detail: error.to_string(),
+            };
+            self.analytics.publish_worker_error(&worker_error, false);
+            error
+        })?;
+        let admission = self.admission.lock().map_err(|error| {
+            let worker_error = StorageWorkerError::Internal {
+                operation: StorageOperation::Admit,
+                path: self.path.to_string(),
+                tick: Some(payload.summary.tick.0),
+                commit_state: FailureCommitState::NotAdmitted,
+                detail: format!("storage admission gate is poisoned: {error}"),
+            };
+            self.analytics.publish_worker_error(&worker_error, true);
+            StorageError::Worker(worker_error)
+        })?;
+        if !admission.open {
+            let worker_error = StorageWorkerError::Channel {
+                operation: StorageOperation::Admit,
+                path: self.path.to_string(),
+                tick: Some(payload.summary.tick.0),
+                commit_state: FailureCommitState::NotAdmitted,
+                detail: "storage pipeline is closing or closed".to_owned(),
+            };
+            self.analytics.publish_worker_error(&worker_error, true);
+            return Err(StorageError::Worker(worker_error));
+        }
+
+        let send_result = self.tx.send(StorageCommand::Persist(Box::new(prepared)));
+        drop(admission);
+        send_result.map_err(|error| {
+            let worker_error = StorageWorkerError::Channel {
+                operation: StorageOperation::Admit,
+                path: self.path.to_string(),
+                tick: Some(payload.summary.tick.0),
+                commit_state: FailureCommitState::NotAdmitted,
+                detail: error.to_string(),
+            };
+            self.analytics.publish_worker_error(&worker_error, true);
+            StorageError::Worker(worker_error)
+        })
+    }
+}
+
+impl WorldPersistence for StorageSink {
+    fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
+        self.submit(payload).map_err(|error| {
+            PersistenceAdmissionError::new(payload.summary.tick.0, error.to_string())
+        })
+    }
+}
+
+/// Host-owned controller for flush receipts, shutdown acknowledgement, and worker join.
+pub struct StoragePipeline {
+    sink: StorageSink,
+    handle: Option<thread::JoinHandle<Option<StorageWorkerError>>>,
 }
 
 impl StoragePipeline {
@@ -980,104 +1864,390 @@ impl StoragePipeline {
         event: usize,
         metric: usize,
     ) -> Result<Self, StorageError> {
-        let storage = Storage::with_thresholds(path, tick, agent, event, metric)?;
-        Self::from_storage(storage)
-    }
-
-    fn from_storage(storage: Storage) -> Result<Self, StorageError> {
-        let shared = Arc::new(Mutex::new(storage));
-        let (tx, rx) = xchan::unbounded::<StorageCommand>();
-        let worker_storage = Arc::clone(&shared);
+        let (tx, rx) = xchan::bounded::<StorageCommand>(DEFAULT_COMMAND_CAPACITY);
+        let (startup_tx, startup_rx) = xchan::bounded::<Result<(), StorageWorkerError>>(1);
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
+        let storage_path: Arc<str> = Arc::from(path);
+        let worker_analytics = analytics.clone();
+        let worker_path = storage_path.to_string();
+        let thresholds = StorageThresholds {
+            tick,
+            agent,
+            event,
+            metric,
+        };
         let handle = thread::Builder::new()
             .name("scriptbots-storage-worker".into())
             .spawn(move || {
-                while let Ok(command) = rx.recv() {
-                    match command {
-                        StorageCommand::Persist(batch) => match worker_storage.lock() {
-                            Ok(mut storage) => {
-                                let tick = batch.summary.tick.0;
-                                if let Err(err) = storage.persist(&batch) {
-                                    eprintln!(
-                                        "failed to persist tick {} asynchronously: {err}",
-                                        tick
-                                    );
-                                }
-                            }
-                            Err(poisoned) => {
-                                let tick = batch.summary.tick.0;
-                                eprintln!("storage mutex poisoned while persisting tick {}", tick);
-                                let mut storage = poisoned.into_inner();
-                                if let Err(err) = storage.persist(&batch) {
-                                    eprintln!(
-                                        "failed to persist tick {} after poison: {err}",
-                                        tick
-                                    );
-                                }
-                            }
-                        },
-                        StorageCommand::Flush => {
-                            if let Ok(mut storage) = worker_storage.lock()
-                                && let Err(err) = storage.flush()
-                            {
-                                eprintln!("failed to flush storage: {err}");
-                            }
-                        }
-                        StorageCommand::Shutdown => {
-                            if let Ok(mut storage) = worker_storage.lock() {
-                                let _ = storage.flush();
-                            }
-                            break;
-                        }
-                    }
-                }
+                storage_worker(worker_path, thresholds, rx, startup_tx, worker_analytics)
             })
             .map_err(|err| {
-                StorageError::Worker(format!("failed to spawn storage worker thread: {err}"))
+                StorageError::Worker(StorageWorkerError::Internal {
+                    operation: StorageOperation::Startup,
+                    path: storage_path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::NotAdmitted,
+                    detail: format!("failed to spawn storage worker thread: {err}"),
+                })
             })?;
 
-        Ok(Self {
-            tx,
-            storage: shared,
-            handle: Some(handle),
-        })
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sink: StorageSink {
+                    tx,
+                    analytics,
+                    admission,
+                    path: storage_path.clone(),
+                },
+                handle: Some(handle),
+            }),
+            Ok(Err(error)) => match handle.join() {
+                Ok(Some(terminal_error)) => Err(StorageError::Worker(terminal_error)),
+                Ok(None) => Err(StorageError::Worker(error)),
+                Err(panic) => Err(StorageError::Worker(StorageWorkerError::Internal {
+                    operation: StorageOperation::Join,
+                    path: storage_path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: format!("storage worker panicked during startup: {panic:?}"),
+                })),
+            },
+            Err(error) => match handle.join() {
+                Ok(Some(terminal_error)) => Err(StorageError::Worker(terminal_error)),
+                Ok(None) => Err(StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Startup,
+                    path: storage_path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::NotAdmitted,
+                    detail: format!(
+                        "storage worker exited before startup acknowledgement: {error}"
+                    ),
+                })),
+                Err(panic) => Err(StorageError::Worker(StorageWorkerError::Internal {
+                    operation: StorageOperation::Join,
+                    path: storage_path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: format!("storage worker panicked during startup: {panic:?}"),
+                })),
+            },
+        }
     }
 
-    /// Exposes shared access to the underlying storage for analytics queries.
+    /// Return a lock-free read handle containing only committed analytics data.
     #[must_use]
-    pub fn storage(&self) -> Arc<Mutex<Storage>> {
-        Arc::clone(&self.storage)
+    pub fn analytics_provider(&self) -> AnalyticsSnapshotProvider {
+        self.sink.analytics.clone()
     }
 
-    /// Request an immediate flush of buffered records.
-    pub fn flush(&self) {
-        let _ = self.tx.send(StorageCommand::Flush);
+    /// Return a clonable sink for `WorldState` while retaining host control of the worker.
+    #[must_use]
+    pub fn sink(&self) -> StorageSink {
+        self.sink.clone()
     }
-}
 
-impl WorldPersistence for StoragePipeline {
-    fn on_tick(&mut self, payload: &PersistenceBatch) {
-        if self
+    /// Admit a persistence batch to the bounded, lossless worker queue.
+    pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
+        self.sink.submit(payload)
+    }
+
+    /// Flush all previously admitted batches and wait for a durability receipt.
+    pub fn flush_and_wait(&self) -> Result<FlushReceipt, StorageError> {
+        let (reply_tx, reply_rx) = xchan::bounded(1);
+        let admission = self.sink.admission.lock().map_err(|error| {
+            StorageError::Worker(StorageWorkerError::Internal {
+                operation: StorageOperation::Flush,
+                path: self.sink.path.to_string(),
+                tick: None,
+                commit_state: FailureCommitState::Indeterminate,
+                detail: format!("storage admission gate is poisoned: {error}"),
+            })
+        })?;
+        if !admission.open {
+            return Err(StorageError::Worker(StorageWorkerError::Channel {
+                operation: StorageOperation::Flush,
+                path: self.sink.path.to_string(),
+                tick: None,
+                commit_state: FailureCommitState::Indeterminate,
+                detail: "storage pipeline is closing or closed".to_owned(),
+            }));
+        }
+        let send_result = self.sink.tx.send(StorageCommand::Flush { reply: reply_tx });
+        drop(admission);
+        send_result.map_err(|error| {
+            StorageError::Worker(StorageWorkerError::Channel {
+                operation: StorageOperation::Flush,
+                path: self.sink.path.to_string(),
+                tick: None,
+                commit_state: FailureCommitState::Indeterminate,
+                detail: format!("failed to request storage flush: {error}"),
+            })
+        })?;
+        reply_rx
+            .recv()
+            .map_err(|error| {
+                StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Flush,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: format!("storage worker exited before flush acknowledgement: {error}"),
+                })
+            })?
+            .map_err(StorageError::Worker)
+    }
+
+    /// Flush, close, and join the worker, returning an explicit shutdown receipt.
+    pub fn shutdown(&mut self) -> Result<ShutdownReceipt, StorageError> {
+        let Some(handle) = self.handle.take() else {
+            return Err(StorageError::Worker(StorageWorkerError::Internal {
+                operation: StorageOperation::Shutdown,
+                path: self.sink.path.to_string(),
+                tick: None,
+                commit_state: FailureCommitState::Committed,
+                detail: "storage worker has already been shut down".to_owned(),
+            }));
+        };
+
+        let (reply_tx, reply_rx) = xchan::bounded(1);
+        let mut admission = match self.sink.admission.lock() {
+            Ok(admission) => admission,
+            Err(poisoned) => {
+                warn!("recovering poisoned storage admission gate during shutdown");
+                poisoned.into_inner()
+            }
+        };
+        admission.open = false;
+        let send_result = self
+            .sink
             .tx
-            .send(StorageCommand::Persist(Box::new(payload.clone())))
-            .is_err()
-        {
-            eprintln!(
-                "storage worker channel closed; tick {} dropped",
-                payload.summary.tick.0
-            );
+            .send(StorageCommand::Shutdown { reply: reply_tx })
+            .map_err(|error| {
+                StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Shutdown,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: format!("failed to request storage shutdown: {error}"),
+                })
+            });
+        drop(admission);
+        let response = send_result.and_then(|()| {
+            reply_rx
+                .recv()
+                .map_err(|error| {
+                    StorageError::Worker(StorageWorkerError::Channel {
+                        operation: StorageOperation::Shutdown,
+                        path: self.sink.path.to_string(),
+                        tick: None,
+                        commit_state: FailureCommitState::Indeterminate,
+                        detail: format!(
+                            "storage worker exited before shutdown acknowledgement: {error}"
+                        ),
+                    })
+                })?
+                .map_err(StorageError::Worker)
+        });
+
+        let joined = handle.join().map_err(|panic| {
+            StorageError::Worker(StorageWorkerError::Internal {
+                operation: StorageOperation::Join,
+                path: self.sink.path.to_string(),
+                tick: None,
+                commit_state: FailureCommitState::Indeterminate,
+                detail: format!("storage worker thread panicked: {panic:?}"),
+            })
+        });
+        match joined {
+            Err(error) => Err(error),
+            Ok(Some(terminal_error)) => Err(StorageError::Worker(terminal_error)),
+            Ok(None) => response,
         }
     }
 }
 
 impl Drop for StoragePipeline {
     fn drop(&mut self) {
-        let _ = self.tx.send(StorageCommand::Shutdown);
-        if let Some(handle) = self.handle.take()
-            && let Err(err) = handle.join()
+        if self.handle.is_some()
+            && let Err(error) = self.shutdown()
         {
-            eprintln!("storage worker thread panicked: {err:?}");
+            eprintln!("failed to shut down storage worker cleanly: {error}");
         }
     }
+}
+
+fn storage_worker(
+    path: String,
+    thresholds: StorageThresholds,
+    rx: xchan::Receiver<StorageCommand>,
+    startup: xchan::Sender<Result<(), StorageWorkerError>>,
+    analytics: AnalyticsSnapshotProvider,
+) -> Option<StorageWorkerError> {
+    let mut storage = match Storage::with_thresholds(
+        &path,
+        thresholds.tick,
+        thresholds.agent,
+        thresholds.event,
+        thresholds.metric,
+    ) {
+        Ok(storage) => storage,
+        Err(error) => {
+            let worker_error = worker_error_from_storage(
+                StorageOperation::Startup,
+                &path,
+                None,
+                FailureCommitState::NotAdmitted,
+                error,
+            );
+            analytics.publish_worker_error(&worker_error, true);
+            let _ = startup.send(Err(worker_error));
+            return None;
+        }
+    };
+    if startup.send(Ok(())).is_err() {
+        let _ = storage.close();
+        let error = StorageWorkerError::Channel {
+            operation: StorageOperation::Startup,
+            path: path.clone(),
+            tick: None,
+            commit_state: FailureCommitState::NotAdmitted,
+            detail: "startup receiver disconnected".to_owned(),
+        };
+        analytics.publish_worker_error(&error, true);
+        return Some(error);
+    }
+
+    let mut state = WorkerState {
+        guarantee: if path == ":memory:" {
+            PersistenceGuarantee::CommittedVolatile
+        } else {
+            PersistenceGuarantee::Durable
+        },
+        ..WorkerState::default()
+    };
+    while let Ok(command) = rx.recv() {
+        match command {
+            StorageCommand::Persist(batch) => {
+                let PreparedPersistenceBatch {
+                    tick,
+                    storage: prepared,
+                    analytics: pending,
+                } = *batch;
+                match storage.enqueue_prepared(prepared) {
+                    Ok(flushed) => {
+                        state.admitted_tick = Some(tick);
+                        state.pending_analytics = Some(pending);
+                        if flushed {
+                            publish_committed_state(&mut state, &analytics);
+                        }
+                    }
+                    Err(error) => {
+                        let worker_error = worker_error_from_storage(
+                            StorageOperation::Persist,
+                            &path,
+                            Some(tick),
+                            FailureCommitState::Indeterminate,
+                            error,
+                        );
+                        analytics.publish_worker_error(&worker_error, true);
+                        storage.abandon_after_error();
+                        return Some(worker_error);
+                    }
+                }
+            }
+            StorageCommand::Flush { reply } => {
+                match flush_worker_storage(&mut storage, &mut state, &analytics) {
+                    Ok(receipt) => {
+                        let _ = reply.send(Ok(receipt));
+                    }
+                    Err(error) => {
+                        analytics.publish_worker_error(&error, true);
+                        storage.abandon_after_error();
+                        let _ = reply.send(Err(error));
+                        return None;
+                    }
+                }
+            }
+            StorageCommand::Shutdown { reply } => {
+                let result = shutdown_worker_storage(storage, &mut state, &analytics);
+                if let Err(error) = &result {
+                    analytics.publish_worker_error(error, true);
+                }
+                let _ = reply.send(result);
+                return None;
+            }
+            #[cfg(test)]
+            StorageCommand::PauseForAdmissionRace { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
+    }
+
+    match shutdown_worker_storage(storage, &mut state, &analytics) {
+        Ok(_) => None,
+        Err(error) => {
+            analytics.publish_worker_error(&error, true);
+            Some(error)
+        }
+    }
+}
+
+fn publish_committed_state(state: &mut WorkerState, analytics: &AnalyticsSnapshotProvider) {
+    state.committed_tick = state.admitted_tick;
+    if let Some(pending) = state.pending_analytics.take() {
+        analytics.publish_committed(pending);
+    }
+}
+
+fn flush_worker_storage(
+    storage: &mut Storage,
+    state: &mut WorkerState,
+    analytics: &AnalyticsSnapshotProvider,
+) -> Result<FlushReceipt, StorageWorkerError> {
+    storage.flush().map_err(|error| {
+        worker_error_from_storage(
+            StorageOperation::Flush,
+            &storage.path,
+            state.admitted_tick,
+            FailureCommitState::Indeterminate,
+            error,
+        )
+    })?;
+    publish_committed_state(state, analytics);
+    Ok(FlushReceipt {
+        committed_tick: state.committed_tick,
+        guarantee: state.guarantee,
+        analytics_revision: analytics.snapshot().revision,
+    })
+}
+
+fn shutdown_worker_storage(
+    mut storage: Storage,
+    state: &mut WorkerState,
+    analytics: &AnalyticsSnapshotProvider,
+) -> Result<ShutdownReceipt, StorageWorkerError> {
+    if let Err(error) = flush_worker_storage(&mut storage, state, analytics) {
+        storage.abandon_after_error();
+        return Err(error);
+    }
+    let path = storage.path.clone();
+    storage.close().map_err(|error| {
+        worker_error_from_storage(
+            StorageOperation::Close,
+            &path,
+            state.committed_tick,
+            FailureCommitState::Committed,
+            error,
+        )
+    })?;
+    analytics.publish_stopped();
+    Ok(ShutdownReceipt {
+        committed_tick: state.committed_tick,
+        guarantee: state.guarantee,
+        analytics_revision: analytics.snapshot().revision,
+    })
 }
 
 fn brain_binding_to_string(binding: &BrainBinding) -> String {
@@ -1155,18 +2325,31 @@ fn scope_label(scope: ReplayRngScope) -> String {
     }
 }
 
-fn replay_row_from_event(event: &ReplayEvent, tick: i64, seq: usize) -> ReplayEventRow {
+fn replay_row_from_event(
+    event: &ReplayEvent,
+    tick: i64,
+    seq: usize,
+) -> Result<ReplayEventRow, StorageError> {
+    let invalid_non_finite = |context: &'static str| StorageError::InvalidData {
+        context,
+        reason: format!("non-finite replay value at tick {tick}, seq {seq}"),
+    };
     let (scope, event_type, payload_value): (String, String, Value) = match &event.kind {
-        ReplayEventKind::BrainOutputs { outputs } => (
-            if event.agent_id.is_some() {
-                "agent:brain"
-            } else {
-                "world:brain"
+        ReplayEventKind::BrainOutputs { outputs } => {
+            if outputs.iter().any(|value| !value.is_finite()) {
+                return Err(invalid_non_finite("replay_events.brain_outputs"));
             }
-            .to_string(),
-            "brain_outputs".to_string(),
-            json!({ "outputs": outputs }),
-        ),
+            (
+                if event.agent_id.is_some() {
+                    "agent:brain"
+                } else {
+                    "world:brain"
+                }
+                .to_string(),
+                "brain_outputs".to_string(),
+                json!({ "outputs": outputs }),
+            )
+        }
         ReplayEventKind::Action {
             left_wheel,
             right_wheel,
@@ -1174,47 +2357,69 @@ fn replay_row_from_event(event: &ReplayEvent, tick: i64, seq: usize) -> ReplayEv
             spike_target,
             sound_level,
             give_intent,
-        } => (
-            if event.agent_id.is_some() {
-                "agent:action"
-            } else {
-                "world:action"
+        } => {
+            if [*left_wheel, *right_wheel, *sound_level, *give_intent]
+                .iter()
+                .any(|value| !value.is_finite())
+            {
+                return Err(invalid_non_finite("replay_events.action"));
             }
-            .to_string(),
-            "action".to_string(),
-            json!({
-                "left_wheel": left_wheel,
-                "right_wheel": right_wheel,
-                "boost": boost,
-                "spike_target": spike_target,
-                "sound_level": sound_level,
-                "give_intent": give_intent,
-            }),
-        ),
+            (
+                if event.agent_id.is_some() {
+                    "agent:action"
+                } else {
+                    "world:action"
+                }
+                .to_string(),
+                "action".to_string(),
+                json!({
+                    "left_wheel": left_wheel,
+                    "right_wheel": right_wheel,
+                    "boost": boost,
+                    "spike_target": spike_target,
+                    "sound_level": sound_level,
+                    "give_intent": give_intent,
+                }),
+            )
+        }
         ReplayEventKind::RngSample {
             scope,
             range_min,
             range_max,
             value,
-        } => (
-            scope_label(*scope),
-            "rng_sample".to_string(),
-            json!({
-                "range_min": range_min,
-                "range_max": range_max,
-                "value": value,
-            }),
-        ),
+        } => {
+            if [*range_min, *range_max, *value]
+                .iter()
+                .any(|sample| !sample.is_finite())
+            {
+                return Err(invalid_non_finite("replay_events.rng_sample"));
+            }
+            (
+                scope_label(*scope),
+                "rng_sample".to_string(),
+                json!({
+                    "scope_agent_id": match scope {
+                        ReplayRngScope::World => None,
+                        ReplayRngScope::Agent { agent_id, .. } => {
+                            Some(agent_id.data().as_ffi())
+                        }
+                    },
+                    "range_min": range_min,
+                    "range_max": range_max,
+                    "value": value,
+                }),
+            )
+        }
     };
 
-    ReplayEventRow {
+    Ok(ReplayEventRow {
         tick,
         seq: seq as i64,
         agent_id: optional_agent_id(event.agent_id),
         scope,
         event_type,
         payload: payload_value.to_string(),
-    }
+    })
 }
 
 fn decode_agent_id(raw: Option<i64>, tick: i64, seq: i64) -> Result<Option<AgentId>, StorageError> {
@@ -1313,6 +2518,7 @@ struct ActionPayload {
 
 #[derive(Debug, Deserialize)]
 struct RngSamplePayload {
+    scope_agent_id: Option<u64>,
     range_min: f32,
     range_max: f32,
     value: f32,
@@ -1358,7 +2564,11 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
         }
         "rng_sample" => {
             let payload: RngSamplePayload = parse_payload(row)?;
-            let scope = parse_rng_scope(&row.scope, agent_id, row)?;
+            let scope_agent_id = payload
+                .scope_agent_id
+                .map(|raw| agent_id_from_u64(raw, row.tick, row.seq))
+                .transpose()?;
+            let scope = parse_rng_scope(&row.scope, scope_agent_id, row)?;
             ReplayEventKind::RngSample {
                 scope,
                 range_min: payload.range_min,
@@ -1436,7 +2646,8 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::TryLockError,
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
     fn temp_db_path(prefix: &str) -> PathBuf {
@@ -1446,7 +2657,7 @@ mod tests {
             .expect("time")
             .as_nanos();
         path.push(format!(
-            "{}-{}-{}.duckdb",
+            "{}-{}-{}.sqlite",
             prefix,
             std::process::id(),
             timestamp
@@ -1512,33 +2723,158 @@ mod tests {
         storage.flush()?;
 
         let tick_count: i64 = storage
-            .conn
-            .query_row("select count(*) from ticks", [], |row| row.get(0))?;
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
         assert_eq!(tick_count, 1);
 
-        let metric_count: i64 =
-            storage
-                .conn
-                .query_row("select count(*) from metrics", [], |row| row.get(0))?;
+        let metric_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM metrics")?
+            .get_typed(0)?;
         assert_eq!(metric_count, batch.metrics.len() as i64);
 
-        let event_count: i64 =
-            storage
-                .conn
-                .query_row("select count(*) from events", [], |row| row.get(0))?;
+        let event_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM events")?
+            .get_typed(0)?;
         assert_eq!(event_count, batch.events.len() as i64);
 
-        let agent_count: i64 =
-            storage
-                .conn
-                .query_row("select count(*) from agents", [], |row| row.get(0))?;
+        let agent_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM agents")?
+            .get_typed(0)?;
         assert_eq!(agent_count, batch.agents.len() as i64);
 
         let latest = storage.latest_metrics(8)?;
         assert_eq!(latest.len(), batch.metrics.len());
         assert!(latest.iter().all(|m| m.tick == 42));
 
-        drop(storage);
+        storage.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_rng_scope_preserves_inner_and_outer_agent_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-replay-rng-agent-ids");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let outer_agent = AgentId::from(KeyData::from_ffi(0x0000_0001_0000_0001));
+        let scope_agent = AgentId::from(KeyData::from_ffi(0x0000_0002_0000_0001));
+        let mut batch = sample_batch(5, 1.0);
+        batch.replay_events.push(ReplayEvent {
+            agent_id: Some(outer_agent),
+            kind: ReplayEventKind::RngSample {
+                scope: ReplayRngScope::Agent {
+                    agent_id: scope_agent,
+                    phase: ReplayAgentPhase::Mutation,
+                },
+                range_min: -1.0,
+                range_max: 1.0,
+                value: 0.25,
+            },
+        });
+        storage.persist(&batch)?;
+        storage.flush()?;
+
+        let replay = storage.load_replay_events()?;
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event, batch.replay_events[0]);
+        storage.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_replay_batch_leaves_direct_storage_buffers_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-invalid-replay-atomic");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let mut invalid = sample_batch(1, 1.0);
+        invalid.replay_events.push(ReplayEvent {
+            agent_id: None,
+            kind: ReplayEventKind::BrainOutputs {
+                outputs: vec![f32::NAN],
+            },
+        });
+
+        let error = storage
+            .persist(&invalid)
+            .expect_err("non-finite replay payload must be rejected");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "replay_events.brain_outputs",
+                ..
+            }
+        ));
+        assert!(storage.buffer.is_empty());
+
+        storage.persist(&sample_batch(2, 2.0))?;
+        storage.flush()?;
+        let ticks = storage
+            .connection()?
+            .query("SELECT tick FROM ticks ORDER BY tick")?;
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(decode::<i64>(&ticks[0], 0, "ticks.tick")?, 2);
+        storage.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_replay_is_rejected_before_worker_admission() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = temp_db_path("storage-invalid-replay-admission");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        pipeline.submit(&sample_batch(1, 1.0))?;
+        let mut invalid = sample_batch(2, 2.0);
+        invalid.replay_events.push(ReplayEvent {
+            agent_id: None,
+            kind: ReplayEventKind::RngSample {
+                scope: ReplayRngScope::World,
+                range_min: 0.0,
+                range_max: 1.0,
+                value: f32::INFINITY,
+            },
+        });
+        assert!(matches!(
+            pipeline.submit(&invalid),
+            Err(StorageError::InvalidData {
+                context: "replay_events.rng_sample",
+                ..
+            })
+        ));
+        let validation_failure = pipeline.analytics_provider().snapshot();
+        assert!(!validation_failure.stopped);
+        assert!(
+            validation_failure
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("non-finite replay value"))
+        );
+        assert_eq!(
+            validation_failure
+                .last_failure
+                .as_ref()
+                .and_then(|failure| failure.path.as_deref()),
+            Some(path_string.as_str())
+        );
+        pipeline.submit(&sample_batch(3, 3.0))?;
+        let receipt = pipeline.shutdown()?;
+        assert_eq!(receipt.committed_tick, Some(3));
+
+        let reader = StorageReader::open(&path_string)?;
+        let ticks = reader.recent_ticks(None)?;
+        assert_eq!(
+            ticks.iter().map(|tick| tick.tick).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        reader.close()?;
         let _ = fs::remove_file(path);
         Ok(())
     }
@@ -1570,8 +2906,330 @@ mod tests {
         assert!((leader.avg_energy - 2.0).abs() < 1e-6);
         assert_eq!(leader.last_tick, 2);
 
-        drop(storage);
+        storage.close()?;
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn production_schema_constraints_and_type_errors_are_observable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-production-schema");
+        let path_string = path.to_string_lossy().to_string();
+        let storage = Storage::open(&path_string)?;
+
+        let invalid_bool = storage.connection()?.execute(
+            "INSERT INTO ticks (
+                tick, epoch, closed, agent_count, births, deaths,
+                total_energy, average_energy, average_health
+             ) VALUES (1, 0, 2, 0, 0, 0, 0.0, 0.0, 0.0)",
+        );
+        assert!(
+            invalid_bool.is_err(),
+            "closed CHECK must reject values outside 0/1"
+        );
+
+        let invalid_null = storage.connection()?.execute(
+            "INSERT INTO ticks (
+                tick, epoch, closed, agent_count, births, deaths,
+                total_energy, average_energy, average_health
+             ) VALUES (2, 0, 0, 0, 0, 0, NULL, 0.0, 0.0)",
+        );
+        assert!(invalid_null.is_err(), "NOT NULL columns must reject NULL");
+
+        storage.connection()?.execute(
+            "INSERT INTO ticks (
+                tick, epoch, closed, agent_count, births, deaths,
+                total_energy, average_energy, average_health
+             ) VALUES (3, 'invalid-epoch', 0, 0, 0, 0, 0.0, 0.0, 0.0)",
+        )?;
+        storage.close()?;
+
+        Storage::open(&path_string)?.close()?;
+        let reader = StorageReader::open(&path_string)?;
+        let decode_error = reader
+            .recent_ticks(None)
+            .expect_err("typed reader must reject a TEXT epoch in an INTEGER domain field");
+        assert!(matches!(
+            decode_error,
+            StorageError::InvalidData {
+                context: "ticks.epoch",
+                ..
+            }
+        ));
+        reader.close()?;
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_production_flush_rolls_back_and_is_never_replayed_from_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-production-rollback");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        storage.connection()?.execute("DROP TABLE metrics")?;
+        storage.persist(&sample_batch(42, 5.5))?;
+
+        let error = storage
+            .flush()
+            .expect_err("missing production table must fail the whole transaction");
+        assert!(matches!(
+            error,
+            StorageError::Transaction {
+                attempts: 1,
+                transient: false,
+                commit_state: FailureCommitState::RolledBack,
+                ..
+            }
+        ));
+        let tick_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 0, "partial tick insert escaped rollback");
+        assert!(matches!(
+            storage.flush(),
+            Err(StorageError::TerminallyFailed)
+        ));
+        let buffered_lengths = (
+            storage.buffer.ticks.len(),
+            storage.buffer.metrics.len(),
+            storage.buffer.events.len(),
+            storage.buffer.agents.len(),
+            storage.buffer.births.len(),
+            storage.buffer.deaths.len(),
+            storage.buffer.replay_events.len(),
+        );
+        assert!(matches!(
+            storage.persist(&sample_batch(43, 6.0)),
+            Err(StorageError::TerminallyFailed)
+        ));
+        assert_eq!(
+            (
+                storage.buffer.ticks.len(),
+                storage.buffer.metrics.len(),
+                storage.buffer.events.len(),
+                storage.buffer.agents.len(),
+                storage.buffer.births.len(),
+                storage.buffer.deaths.len(),
+                storage.buffer.replay_events.len(),
+            ),
+            buffered_lengths,
+            "terminal storage must reject before mutating any buffer"
+        );
+        storage.abandon_after_error();
+
+        let reader = StorageReader::open(&path_string)?;
+        assert!(reader.recent_ticks(None)?.is_empty());
+        reader.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_policy_is_transient_rollback_only_and_bounded() {
+        let transient = FlushAttemptError {
+            source: FrankenError::Busy,
+            commit_state: FailureCommitState::RolledBack,
+        };
+        assert!(should_retry_transaction(&transient, 1));
+        assert!(!should_retry_transaction(
+            &transient,
+            MAX_TRANSACTION_ATTEMPTS
+        ));
+
+        let indeterminate = FlushAttemptError {
+            source: FrankenError::Busy,
+            commit_state: FailureCommitState::Indeterminate,
+        };
+        assert!(!should_retry_transaction(&indeterminate, 1));
+
+        let permanent = FlushAttemptError {
+            source: FrankenError::DatabaseFull,
+            commit_state: FailureCommitState::RolledBack,
+        };
+        assert!(!should_retry_transaction(&permanent, 1));
+    }
+
+    #[test]
+    fn file_pipeline_receipt_is_visible_and_shutdown_closes_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-file-receipt");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let sink = pipeline.sink();
+        let reader = StorageReader::open(&path_string)?;
+
+        sink.submit(&sample_batch(7, 2.5))?;
+        assert_eq!(reader.run_ledger_summary()?.tick_count, 0);
+
+        let flush = pipeline.flush_and_wait()?;
+        assert_eq!(flush.committed_tick, Some(7));
+        assert_eq!(flush.guarantee, PersistenceGuarantee::Durable);
+        assert_eq!(reader.run_ledger_summary()?.tick_count, 1);
+
+        let shutdown = pipeline.shutdown()?;
+        assert_eq!(shutdown.committed_tick, Some(7));
+        assert_eq!(shutdown.guarantee, PersistenceGuarantee::Durable);
+        let submit_error = sink
+            .submit(&sample_batch(8, 3.0))
+            .expect_err("closed admission gate must reject later batches");
+        assert!(matches!(
+            submit_error,
+            StorageError::Worker(StorageWorkerError::Channel {
+                operation: StorageOperation::Admit,
+                commit_state: FailureCommitState::NotAdmitted,
+                ..
+            })
+        ));
+
+        reader.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_barrier_preserves_every_successful_racing_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-admission-race");
+        let path_string = path.to_string_lossy().to_string();
+        let pipeline = StoragePipeline::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let retained_sink = pipeline.sink();
+
+        let (entered_tx, entered_rx) = xchan::bounded(1);
+        let (release_tx, release_rx) = xchan::bounded(1);
+        pipeline
+            .sink
+            .tx
+            .send(StorageCommand::PauseForAdmissionRace {
+                entered: entered_tx,
+                release: release_rx,
+            })?;
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+
+        for tick in 1..=DEFAULT_COMMAND_CAPACITY as u64 {
+            pipeline.submit(&sample_batch(tick, tick as f32))?;
+        }
+
+        let racing_sink = pipeline.sink();
+        let (submit_started_tx, submit_started_rx) = xchan::bounded(1);
+        let submit_handle = thread::spawn(move || {
+            let _ = submit_started_tx.send(());
+            let result =
+                racing_sink.submit(&sample_batch(DEFAULT_COMMAND_CAPACITY as u64 + 1, 99.0));
+            (racing_sink, result)
+        });
+        submit_started_rx.recv_timeout(Duration::from_secs(2))?;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match pipeline.sink.admission.try_lock() {
+                Err(TryLockError::WouldBlock) => break,
+                Err(TryLockError::Poisoned(error)) => {
+                    panic!("admission gate poisoned before race: {error}")
+                }
+                Ok(guard) => drop(guard),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "racing submit never blocked while holding the admission gate"
+            );
+            thread::yield_now();
+        }
+
+        let shutdown_handle = thread::spawn(move || {
+            let mut pipeline = pipeline;
+            pipeline.shutdown()
+        });
+        release_tx.send(())?;
+
+        let (racing_sink, submit_result) = submit_handle
+            .join()
+            .expect("racing submit thread must not panic");
+        submit_result.expect("submit ordered before shutdown must be admitted");
+        let receipt = shutdown_handle
+            .join()
+            .expect("shutdown thread must not panic")?;
+        assert_eq!(
+            receipt.committed_tick,
+            Some(DEFAULT_COMMAND_CAPACITY as u64 + 1)
+        );
+        assert_eq!(receipt.guarantee, PersistenceGuarantee::Durable);
+
+        for sink in [&retained_sink, &racing_sink] {
+            let error = sink
+                .submit(&sample_batch(DEFAULT_COMMAND_CAPACITY as u64 + 2, 100.0))
+                .expect_err("post-shutdown submit must be rejected");
+            assert!(matches!(
+                error,
+                StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Admit,
+                    commit_state: FailureCommitState::NotAdmitted,
+                    ..
+                })
+            ));
+        }
+
+        let reader = StorageReader::open(&path_string)?;
+        let ledger = reader.run_ledger_summary()?;
+        assert_eq!(
+            ledger.tick_count,
+            DEFAULT_COMMAND_CAPACITY as u64 + 1,
+            "every admission returning Ok must survive worker shutdown"
+        );
+        reader.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_acknowledges_startup_flush_and_shutdown() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut pipeline = StoragePipeline::with_thresholds(":memory:", 1, 1, 1, 1)?;
+        pipeline.submit(&sample_batch(7, 2.5))?;
+
+        let flush = pipeline.flush_and_wait()?;
+        assert_eq!(flush.committed_tick, Some(7));
+        assert_eq!(flush.guarantee, PersistenceGuarantee::CommittedVolatile);
+        let committed = pipeline.analytics_provider().snapshot();
+        assert_eq!(committed.committed_tick, Some(7));
+        assert!(!committed.readings.is_empty());
+        assert!(!committed.stopped);
+
+        let shutdown = pipeline.shutdown()?;
+        assert_eq!(shutdown.committed_tick, Some(7));
+        assert_eq!(shutdown.guarantee, PersistenceGuarantee::CommittedVolatile);
+        let stopped = pipeline.analytics_provider().snapshot();
+        assert!(stopped.stopped);
+        assert!(shutdown.analytics_revision >= flush.analytics_revision);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_metric_batch_still_advances_committed_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut pipeline = StoragePipeline::with_thresholds(":memory:", 64, 4096, 1024, 1024)?;
+        let mut batch = sample_batch(11, 4.0);
+        batch.metrics.clear();
+        pipeline.submit(&batch)?;
+
+        let receipt = pipeline.flush_and_wait()?;
+        let snapshot = pipeline.analytics_provider().snapshot();
+        assert_eq!(receipt.committed_tick, Some(11));
+        assert_eq!(snapshot.committed_tick, receipt.committed_tick);
+        assert_eq!(snapshot.committed_agent_count, Some(1));
+        assert!(snapshot.readings.is_empty());
+        pipeline.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_reports_worker_initialization_failure() {
+        let error = StoragePipeline::new("")
+            .err()
+            .expect("empty storage paths must fail during the startup handshake");
+        assert!(matches!(error, StorageError::Worker(_)));
     }
 }
