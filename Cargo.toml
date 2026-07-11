@@ -24,8 +24,6 @@ description = "Evolutionary agent simulation rebuilt in modern Rust with GPUI re
 
 [workspace.dependencies]
 anyhow = "1.0.93"
-derive_more = "1.0.0"
-fastrand = "2.1.0"
 rayon = "1.10.0"
 rand = { version = "0.9.0", features = ["small_rng"] }
 serde = { version = "1.0.210", features = ["derive"] }
@@ -46,18 +44,11 @@ rand08 = { package = "rand", version = "0.8.5" }
 duckdb = { version = "1.4.1", default-features = false, features = ["bundled"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", rev = "5f8a7413a31769e0882357f90dc424b3962ac72d" }
 kira = "0.10.1"
-candle-core = "0.4.1"
-candle-nn = "0.4.1"
-tract-onnx = "0.21.6"
-tch = "0.18.0"
 rstar = "0.12.2"
 kiddo = "4.2.0"
 neuroflow = "0.2.0"
 serde-wasm-bindgen = "0.6.5"
 wasm-bindgen = { version = "0.2.104", features = ["serde-serialize"] }
-
-[patch.crates-io]
-num-bigint-dig = { git = "https://github.com/dignifiedquire/num-bigint", rev = "d94efb24354fe56dc799d9979c279a542d2ce195" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

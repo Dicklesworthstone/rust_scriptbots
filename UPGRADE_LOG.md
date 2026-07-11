@@ -318,3 +318,37 @@ manifest slices. For every slice:
 5. record the exact lock subtree removed before starting the next slice.
 
 No version migration in this ledger is authorized merely by being newer.
+
+## 2026-07-11 — Remove unused root policies and crates.io patch
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** root-manifest hygiene; no resolved dependency version change
+- **Before manifest SHA-256:**
+  `2c5b23b852ed6492d69b1df35f894bb57ac0f86dfe36241a79dde8f8072ded12`
+- **After manifest SHA-256:**
+  `594c59c2c4adb4033613d9539dd1b9f193f57c5273beb8b5e8d2615762d48fd2`
+- **Removed unused policies:** `derive_more`, `fastrand`, and the root
+  `candle-core`, `candle-nn`, `tract-onnx`, and `tch` entries. No
+  workspace package inherited any of these six policies. Transitive
+  `derive_more`/`fastrand` packages and the literal optional ML backend
+  dependencies intentionally remain.
+- **Removed patch:** exact-revision `num-bigint-dig 0.8.4`, which Cargo
+  reported as unused and represented only as `[[patch.unused]]`.
+- **Allowed lock delta:** delete exactly that five-line unused-patch record.
+  Lock SHA-256 changed from
+  `c09eb8cb5b51d77ce1a5ae1e27c68ab31265d97cf43d04332d686cfbf4104337`
+  to
+  `025f88732b8ea47df52a3b4ffcf65f1c063b0c7f0b51d9588976adba5a03cfad`.
+- **Circuit breaker exercised:** a targeted Cargo cleanup also proposed
+  collapsing WGPU/GPUI's `ordered-float 5.0.0` line onto 4.6.0. That
+  semver-valid renderer-family change was outside this slice and was preserved;
+  no ordered-float package or dependency reference changed.
+- **Verification:** locked/offline metadata, a locked core tree, and a fresh
+  host-target locked/offline `scriptbots-core` check pass; the post-edit
+  offline dry run locks zero packages and proposes no write; `cargo fmt
+  --all --check` and `git diff --check` pass.
+- **Result:** accepted; root policy surface is truthful and the lock contains no
+  unused patch record.
+- **Rollback:** manually restore only the nine root-manifest lines and the
+  five-line lock record shown by this commit. Do not restore any unrelated
+  working-tree path.
