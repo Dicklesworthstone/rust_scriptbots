@@ -8,7 +8,6 @@ duckdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
 slotmap = { workspace = true }
 crossbeam-channel = "0.5"

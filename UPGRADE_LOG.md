@@ -421,6 +421,34 @@ No version migration in this ledger is authorized merely by being newer.
 - **Rollback:** manually restore only the two manifest edges and their two lock
   record entries.
 
+## 2026-07-11 — Remove storage's unused tracing edge
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-storage` manifest edge
+- **Before manifest SHA-256:**
+  `27b9adf433c95e5dc45b665afce0c519e27b97fe7e7d01d8ff978e4e1e25a1a7`
+- **After manifest SHA-256:**
+  `7bfae8a8e6a84dbc799af2c899094d66fed422056ff991c9b9fd30d326f93f16`
+- **Removed:** direct `tracing`; exact storage source/test search contains no
+  tracing import, macro, qualified path, or feature use.
+- **Allowed lock delta:** remove only the tracing edge from the
+  `scriptbots-storage` workspace record; tracing remains for four live owners.
+  Lock SHA-256 changed from
+  `53a41bea562addf5f683121b78a235cf5695e0e546f175944f603db5e97bc9bb`
+  to
+  `c6a77610919d6b7e4ae35eb881f545d48a89f9062d0f835fbb8dea927e4741ce`.
+- **Verification:** the all-target host lane compiles bundled DuckDB and all
+  storage test binaries. Both unit tests and the historical golden test pass.
+  The persistence integration test reaches only the recorded product defect:
+  `expected at least one replay event`; replay currently emits no events. No
+  tracing-related build or behavior failure appeared.
+- **Build-cost evidence:** the cold all-target lane spent roughly 2m38s
+  compiling/linking bundled DuckDB before tests, then about 108s executing four
+  database tests. This strengthens the existing optional-storage feature gate;
+  it is not attributed to this edge removal.
+- **Result:** accepted against the captured known-red replay baseline.
+- **Rollback:** restore only the one manifest and lock edge.
+
 ## 2026-07-11 — Remove core's explicitly unused ordered-float edge
 
 - **Bead:** `bd-2z0.8.2`
