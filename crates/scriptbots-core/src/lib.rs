@@ -1491,7 +1491,42 @@ pub struct PersistenceBatch {
 
 /// Persistence sink invoked after each tick.
 pub trait WorldPersistence: Send {
-    fn on_tick(&mut self, payload: &PersistenceBatch);
+    /// Admit a completed tick without silently discarding a rejected batch.
+    ///
+    /// An error guarantees that the batch was not admitted and is therefore safe for the world
+    /// host to retain and retry exactly once after the sink has been recovered or replaced.
+    fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError>;
+}
+
+/// Typed rejection at the lossless persistence admission boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("persistence rejected completed simulation tick {tick}: {detail}")]
+pub struct PersistenceAdmissionError {
+    tick: u64,
+    detail: String,
+}
+
+impl PersistenceAdmissionError {
+    /// Create an admission failure while preserving the backend's diagnostic text.
+    #[must_use]
+    pub fn new(tick: u64, detail: impl Into<String>) -> Self {
+        Self {
+            tick,
+            detail: detail.into(),
+        }
+    }
+
+    /// Completed tick that was definitely not admitted.
+    #[must_use]
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    /// Backend diagnostic suitable for structured host reporting.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 /// No-op persistence sink.
@@ -1499,7 +1534,9 @@ pub trait WorldPersistence: Send {
 pub struct NullPersistence;
 
 impl WorldPersistence for NullPersistence {
-    fn on_tick(&mut self, _payload: &PersistenceBatch) {}
+    fn on_tick(&mut self, _payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
+        Ok(())
+    }
 }
 
 /// Current on-disk schema version for serialized brain genomes.
@@ -4450,6 +4487,12 @@ pub struct WorldState {
     replay_tick: u64,
     replay_events: Vec<ReplayEvent>,
     persistence: Box<dyn WorldPersistence>,
+    pending_persistence_batch: Option<PersistenceBatch>,
+    persistence_fault: Option<PersistenceAdmissionError>,
+    pending_birth_events: usize,
+    pending_death_events: usize,
+    pending_spike_attempt_events: u32,
+    pending_spike_hit_events: u32,
     last_births: usize,
     last_deaths: usize,
     last_spike_hits: u32,
@@ -4558,6 +4601,12 @@ impl WorldState {
             replay_tick: 0,
             replay_events: Vec::new(),
             persistence,
+            pending_persistence_batch: None,
+            persistence_fault: None,
+            pending_birth_events: 0,
+            pending_death_events: 0,
+            pending_spike_attempt_events: 0,
+            pending_spike_hit_events: 0,
             last_births: 0,
             last_deaths: 0,
             last_spike_hits: 0,
@@ -7775,22 +7824,48 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
-    fn stage_persistence(&mut self, next_tick: Tick) {
-        if self.config.persistence_interval == 0
-            || !next_tick
-                .0
-                .is_multiple_of(self.config.persistence_interval as u64)
-        {
+    fn stage_persistence(&mut self, next_tick: Tick) -> Result<(), PersistenceAdmissionError> {
+        if self.config.persistence_interval == 0 {
             self.last_births = 0;
             self.last_deaths = 0;
             self.pending_birth_records.clear();
             self.pending_death_records.clear();
+            self.replay_events.clear();
+            self.pending_birth_events = 0;
+            self.pending_death_events = 0;
+            self.pending_spike_attempt_events = 0;
+            self.pending_spike_hit_events = 0;
             self.combat_spike_attempts = 0;
             self.combat_spike_hits = 0;
-            return;
+            return Ok(());
         }
 
+        self.last_spike_hits = self.combat_spike_hits;
+        self.pending_birth_events = self.pending_birth_events.saturating_add(self.last_births);
+        self.pending_death_events = self.pending_death_events.saturating_add(self.last_deaths);
+        self.pending_spike_attempt_events = self
+            .pending_spike_attempt_events
+            .saturating_add(self.combat_spike_attempts);
+        self.pending_spike_hit_events = self
+            .pending_spike_hit_events
+            .saturating_add(self.combat_spike_hits);
+
         let analytics = self.config.analytics_stride;
+        if !next_tick
+            .0
+            .is_multiple_of(self.config.persistence_interval as u64)
+        {
+            self.last_births = 0;
+            self.last_deaths = 0;
+            if analytics.lifecycle_events == 0 {
+                self.pending_birth_records.clear();
+                self.pending_death_records.clear();
+            }
+            self.combat_spike_attempts = 0;
+            self.combat_spike_hits = 0;
+            return Ok(());
+        }
+
         let macro_enabled = analytics.macro_metrics != 0
             && next_tick.0.is_multiple_of(analytics.macro_metrics as u64);
         let behavior_enabled = analytics.behavior_metrics != 0
@@ -7953,13 +8028,13 @@ impl WorldState {
         let summary = TickSummary {
             tick: next_tick,
             agent_count,
-            births: self.last_births,
-            deaths: self.last_deaths,
+            births: self.pending_birth_events,
+            deaths: self.pending_death_events,
             total_energy,
             average_energy,
             average_health,
             max_age: age_max,
-            spike_hits: self.combat_spike_hits,
+            spike_hits: self.pending_spike_hit_events,
         };
         let mut metrics = vec![
             MetricSample::from_f32("total_energy", summary.total_energy),
@@ -8185,28 +8260,28 @@ impl WorldState {
         }
 
         let mut events = Vec::with_capacity(4);
-        if self.last_births > 0 {
+        if summary.births > 0 {
             events.push(PersistenceEvent::new(
                 PersistenceEventKind::Births,
-                self.last_births,
+                summary.births,
             ));
         }
-        if self.last_deaths > 0 {
+        if summary.deaths > 0 {
             events.push(PersistenceEvent::new(
                 PersistenceEventKind::Deaths,
-                self.last_deaths,
+                summary.deaths,
             ));
         }
-        if self.combat_spike_attempts > 0 {
+        if self.pending_spike_attempt_events > 0 {
             events.push(PersistenceEvent::new(
                 PersistenceEventKind::Custom(Cow::Borrowed("spike_attempts")),
-                self.combat_spike_attempts as usize,
+                self.pending_spike_attempt_events as usize,
             ));
         }
-        if self.combat_spike_hits > 0 {
+        if self.pending_spike_hit_events > 0 {
             events.push(PersistenceEvent::new(
                 PersistenceEventKind::Custom(Cow::Borrowed("spike_hits")),
-                self.combat_spike_hits as usize,
+                self.pending_spike_hit_events as usize,
             ));
         }
 
@@ -8324,23 +8399,38 @@ impl WorldState {
             deaths,
             replay_events: std::mem::take(&mut self.replay_events),
         };
-        self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = age_max;
-        self.persistence.on_tick(&batch);
+        let persistence_result = match self.persistence.on_tick(&batch) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.persistence_fault = Some(error.clone());
+                self.pending_persistence_batch = Some(batch);
+                Err(error)
+            }
+        };
         if self.history.len() >= self.config.history_capacity {
             self.history.pop_front();
         }
         self.history.push_back(summary);
         self.last_births = 0;
         self.last_deaths = 0;
+        self.pending_birth_events = 0;
+        self.pending_death_events = 0;
+        self.pending_spike_attempt_events = 0;
+        self.pending_spike_hit_events = 0;
         self.carcass_health_distributed = 0.0;
         self.carcass_reproduction_bonus = 0.0;
         self.combat_spike_attempts = 0;
         self.combat_spike_hits = 0;
+        persistence_result
     }
 
     /// Execute one simulation tick pipeline returning emitted events.
-    pub fn step(&mut self) -> TickEvents {
+    pub fn step(&mut self) -> Result<TickEvents, PersistenceAdmissionError> {
+        if let Some(error) = &self.persistence_fault {
+            return Err(error.clone());
+        }
+
         let next_tick = self.tick.next();
         let previous_epoch = self.epoch;
 
@@ -8358,7 +8448,7 @@ impl WorldState {
         self.stage_reproduction();
         self.stage_population(next_tick);
         self.stage_spawn_commit(next_tick);
-        self.stage_persistence(next_tick);
+        let persistence_result = self.stage_persistence(next_tick);
 
         let mut events = TickEvents {
             tick: next_tick,
@@ -8371,7 +8461,8 @@ impl WorldState {
         self.advance_tick();
         events.tick = self.tick;
         events.epoch_rolled = self.epoch != previous_epoch;
-        events
+        persistence_result?;
+        Ok(events)
     }
 
     /// Returns an immutable reference to configuration.
@@ -8645,6 +8736,40 @@ impl WorldState {
     /// Replace the persistence sink.
     pub fn set_persistence(&mut self, persistence: Box<dyn WorldPersistence>) {
         self.persistence = persistence;
+    }
+
+    /// Retry the exact completed batch retained after a definite admission rejection.
+    ///
+    /// Returns `Ok(true)` after admitting a retained batch, `Ok(false)` when no retry was
+    /// pending, and leaves the world latched on the same batch after another rejection.
+    pub fn retry_pending_persistence(&mut self) -> Result<bool, PersistenceAdmissionError> {
+        let Some(batch) = self.pending_persistence_batch.take() else {
+            debug_assert!(self.persistence_fault.is_none());
+            return Ok(false);
+        };
+        match self.persistence.on_tick(&batch) {
+            Ok(()) => {
+                self.persistence_fault = None;
+                Ok(true)
+            }
+            Err(error) => {
+                self.persistence_fault = Some(error.clone());
+                self.pending_persistence_batch = Some(batch);
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether a completed tick is paused at the persistence admission boundary.
+    #[must_use]
+    pub const fn has_pending_persistence_batch(&self) -> bool {
+        self.pending_persistence_batch.is_some()
+    }
+
+    /// Latched admission error that prevents any later science tick from starting.
+    #[must_use]
+    pub const fn persistence_fault(&self) -> Option<&PersistenceAdmissionError> {
+        self.persistence_fault.as_ref()
     }
 
     /// Current simulation tick.
@@ -9291,7 +9416,7 @@ mod tests {
             runtime.give_intent = 0.2;
         }
 
-        let events = world.step();
+        let events = world.step().expect("first simulation step");
         assert_eq!(world.tick(), Tick(1));
         assert_eq!(events.tick, Tick(1));
         assert!(events.food_respawned.is_some());
@@ -9305,7 +9430,7 @@ mod tests {
         assert_eq!(runtime.give_intent, 0.0);
         assert!(runtime.sensors.iter().all(|value| value.is_finite()));
 
-        let events_second = world.step();
+        let events_second = world.step().expect("second simulation step");
         assert_eq!(world.tick(), Tick(2));
         assert!(events_second.charts_flushed);
         assert_eq!(events_second.tick, Tick(2));
@@ -9334,7 +9459,7 @@ mod tests {
 
         let mut ages = Vec::new();
         for _ in 0..10 {
-            world.step();
+            world.step().expect("aging cadence step");
             ages.push(world.agents().columns().ages()[0]);
         }
 
@@ -9368,7 +9493,7 @@ mod tests {
 
         let mut flushed = Vec::new();
         for _ in 0..6 {
-            let events = world.step();
+            let events = world.step().expect("chart cadence step");
             if events.charts_flushed {
                 flushed.push(events.tick.0);
             }
@@ -9434,7 +9559,7 @@ mod tests {
             .register("stub", |_rng| Box::new(StubBrain));
         assert!(world.bind_agent_brain(id, key));
 
-        let events = world.step();
+        let events = world.step().expect("registered brain step");
         assert_eq!(events.tick, Tick(1));
         let runtime = world.agent_runtime(id).expect("runtime");
         assert!((runtime.outputs[0] - 1.0).abs() < f32::EPSILON);
@@ -9455,7 +9580,7 @@ mod tests {
             world.spawn_agent(sample_agent(seed));
         }
         for _ in 0..steps {
-            world.step();
+            world.step().expect("seeded history step");
         }
         let history: Vec<_> = world.history().cloned().collect();
         let food: Vec<f32> = world.food().cells().to_vec();
@@ -9670,9 +9795,246 @@ mod tests {
     }
 
     impl WorldPersistence for SpyPersistence {
-        fn on_tick(&mut self, payload: &PersistenceBatch) {
+        fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
             self.logs.lock().unwrap().push(payload.clone());
+            Ok(())
         }
+    }
+
+    struct RejectOncePersistence {
+        logs: Arc<Mutex<Vec<PersistenceBatch>>>,
+        reject_next: bool,
+    }
+
+    impl WorldPersistence for RejectOncePersistence {
+        fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
+            self.logs.lock().unwrap().push(payload.clone());
+            if self.reject_next {
+                self.reject_next = false;
+                Err(PersistenceAdmissionError::new(
+                    payload.summary.tick.0,
+                    "injected definite non-admission",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn lifecycle_birth(tick: u64) -> BirthRecord {
+        BirthRecord {
+            tick: Tick(tick),
+            agent_id: AgentId::default(),
+            parent_a: None,
+            parent_b: None,
+            brain_kind: Some("test".to_owned()),
+            brain_key: Some(tick),
+            herbivore_tendency: 0.5,
+            generation: Generation(tick as u32),
+            position: Position::new(tick as f32, 1.0),
+            is_hybrid: false,
+        }
+    }
+
+    fn lifecycle_death(tick: u64) -> DeathRecord {
+        DeathRecord {
+            tick: Tick(tick),
+            agent_id: AgentId::default(),
+            age: tick as u32,
+            generation: Generation(tick as u32),
+            herbivore_tendency: 0.5,
+            brain_kind: Some("test".to_owned()),
+            brain_key: Some(tick),
+            energy: 0.0,
+            food_balance_total: -1.0,
+            cause: DeathCause::Starvation,
+            was_hybrid: false,
+            combat_flags: CombatEventFlags::default(),
+        }
+    }
+
+    fn replay_marker(value: f32) -> ReplayEvent {
+        ReplayEvent {
+            agent_id: None,
+            kind: ReplayEventKind::RngSample {
+                scope: ReplayRngScope::World,
+                range_min: 0.0,
+                range_max: 1.0,
+                value,
+            },
+        }
+    }
+
+    #[test]
+    fn rejected_persistence_latches_world_until_explicit_exact_batch_retry() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(77),
+            ..ScriptBotsConfig::default()
+        };
+        let rejected_logs = Arc::new(Mutex::new(Vec::new()));
+        let rejecting = RejectOncePersistence {
+            logs: Arc::clone(&rejected_logs),
+            reject_next: true,
+        };
+        let mut world =
+            WorldState::with_persistence(config, Box::new(rejecting)).expect("test world");
+        world.pending_birth_records.push(lifecycle_birth(1));
+        world.pending_death_records.push(lifecycle_death(1));
+        world.last_births = 1;
+        world.last_deaths = 1;
+        world.replay_events.push(replay_marker(0.25));
+
+        let first_error = world
+            .step()
+            .expect_err("definite persistence rejection must fail the completed tick");
+        assert_eq!(first_error.tick(), 1);
+        assert_eq!(world.tick(), Tick(1));
+        assert!(world.has_pending_persistence_batch());
+        assert_eq!(world.persistence_fault(), Some(&first_error));
+
+        let digest_after_failure = world
+            .characterization_digest_v0()
+            .expect("failed tick must end at a quiescent science boundary");
+        let rejected_call_count = rejected_logs.lock().unwrap().len();
+        let repeated_error = world
+            .step()
+            .expect_err("a latched failure must prevent tick two from starting");
+        assert_eq!(repeated_error, first_error);
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(rejected_logs.lock().unwrap().len(), rejected_call_count);
+        assert_eq!(
+            world.characterization_digest_v0().unwrap(),
+            digest_after_failure,
+            "latched step must not mutate science state"
+        );
+
+        let accepted = SpyPersistence::default();
+        let accepted_logs = Arc::clone(&accepted.logs);
+        world.set_persistence(Box::new(accepted));
+        assert!(
+            world
+                .retry_pending_persistence()
+                .expect("replacement sink must accept retained batch")
+        );
+        assert!(!world.has_pending_persistence_batch());
+        assert!(world.persistence_fault().is_none());
+
+        let rejected = rejected_logs.lock().unwrap();
+        let accepted = accepted_logs.lock().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].summary, rejected[0].summary);
+        assert_eq!(accepted[0].metrics, rejected[0].metrics);
+        assert_eq!(accepted[0].events, rejected[0].events);
+        assert_eq!(accepted[0].births, rejected[0].births);
+        assert_eq!(accepted[0].deaths, rejected[0].deaths);
+        assert_eq!(accepted[0].replay_events, rejected[0].replay_events);
+        assert_eq!(accepted[0].agents.len(), rejected[0].agents.len());
+        drop(accepted);
+        drop(rejected);
+
+        world
+            .step()
+            .expect("world may advance only after retained batch admission");
+        assert_eq!(world.tick(), Tick(2));
+        assert_eq!(accepted_logs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn skipped_persistence_ticks_retain_lifecycle_and_replay_rows() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(78),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+
+        world.pending_birth_records.push(lifecycle_birth(1));
+        world.last_births = 1;
+        world.replay_events.push(replay_marker(0.1));
+        world.step().expect("tick one");
+        assert!(logs.lock().unwrap().is_empty());
+
+        world.pending_death_records.push(lifecycle_death(2));
+        world.last_deaths = 1;
+        world.replay_events.push(replay_marker(0.2));
+        world.step().expect("tick two");
+        assert!(logs.lock().unwrap().is_empty());
+
+        world.step().expect("tick three persistence boundary");
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let batch = &entries[0];
+        assert_eq!(batch.summary.tick, Tick(3));
+        assert_eq!(batch.summary.births, 1);
+        assert_eq!(batch.summary.deaths, 1);
+        assert_eq!(batch.births, vec![lifecycle_birth(1)]);
+        assert_eq!(batch.deaths, vec![lifecycle_death(2)]);
+        assert_eq!(
+            batch.replay_events,
+            vec![replay_marker(0.1), replay_marker(0.2)]
+        );
+    }
+
+    #[test]
+    fn persistence_and_lifecycle_cadences_do_not_double_count_events() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            analytics_stride: AnalyticsStride {
+                lifecycle_events: 6,
+                ..AnalyticsStride::default()
+            },
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(79),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+
+        world.pending_birth_records.push(lifecycle_birth(1));
+        world.last_births = 1;
+        world.step().expect("tick one");
+        world.step().expect("tick two");
+        world.step().expect("tick three persistence boundary");
+
+        world.pending_birth_records.push(lifecycle_birth(4));
+        world.last_births = 1;
+        world.step().expect("tick four");
+        world.step().expect("tick five");
+        world
+            .step()
+            .expect("tick six persistence and lifecycle boundary");
+
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].summary.births, 1);
+        assert!(entries[0].births.is_empty());
+        assert_eq!(entries[1].summary.births, 1);
+        assert_eq!(entries[1].births.len(), 2);
+        let birth_event_total: usize = entries
+            .iter()
+            .flat_map(|batch| &batch.events)
+            .filter(|event| matches!(event.kind, PersistenceEventKind::Births))
+            .map(|event| event.count)
+            .sum();
+        assert_eq!(birth_event_total, entries[1].births.len());
+        assert_eq!(
+            entries[1]
+                .births
+                .iter()
+                .map(|record| record.tick)
+                .collect::<Vec<_>>(),
+            vec![Tick(1), Tick(4)]
+        );
     }
 
     #[test]
@@ -9712,7 +10074,7 @@ mod tests {
         let id = world.spawn_agent(sample_agent(0));
         world.agent_runtime_mut(id).unwrap().energy = 1.0;
 
-        world.step();
+        world.step().expect("persistence fixture step");
 
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
@@ -9774,7 +10136,7 @@ mod tests {
         }
 
         assert_eq!(world.agent_count(), 1);
-        world.step();
+        world.step().expect("reproduction step");
         assert_eq!(world.agent_count(), 2);
 
         let handles: Vec<_> = world.agents().iter_handles().collect();
@@ -9826,7 +10188,7 @@ mod tests {
 
         let mut counts = Vec::new();
         for _ in 0..6 {
-            world.step();
+            world.step().expect("reproduction cadence step");
             counts.push(world.agent_count());
         }
 
@@ -9841,7 +10203,7 @@ mod tests {
         let mut ticks = Vec::new();
         let mut last_count = world.agent_count();
         for _ in 0..steps {
-            let events = world.step();
+            let events = world.step().expect("reproduction sequence step");
             let count = world.agent_count();
             if count > last_count {
                 ticks.push(events.tick.0);
@@ -10045,7 +10407,7 @@ mod tests {
         world.agent_runtime_mut(parent).unwrap().energy = 1.0;
         world.agent_runtime_mut(partner).unwrap().energy = 0.2;
 
-        world.step();
+        world.step().expect("hybrid reproduction step");
 
         let child_id = world
             .agents()
@@ -10115,7 +10477,7 @@ mod tests {
             .register("test.idle", |_rng| Box::new(IdleBrain));
         assert!(world.bind_agent_brain(parent, idle_key));
 
-        world.step();
+        world.step().expect("child placement step");
 
         let child_id = world
             .agents()
@@ -10861,7 +11223,7 @@ mod tests {
         };
 
         let mut world = WorldState::new(config).expect("world");
-        world.step();
+        world.step().expect("open-world population seeding step");
         assert!(
             world.agent_count() >= 3,
             "expected minimum population seeding"
@@ -10884,7 +11246,7 @@ mod tests {
 
         let mut world = WorldState::new(config).expect("world");
         world.set_closed(true);
-        world.step();
+        world.step().expect("closed-world population step");
         assert_eq!(
             world.agent_count(),
             0,
@@ -10909,9 +11271,9 @@ mod tests {
         };
 
         let mut world = WorldState::new(config).expect("world");
-        world.step();
+        world.step().expect("first population interval step");
         assert_eq!(world.agent_count(), 0, "no spawn on first step");
-        world.step();
+        world.step().expect("second population interval step");
         assert_eq!(world.agent_count(), 1, "expected spawn on interval");
     }
 

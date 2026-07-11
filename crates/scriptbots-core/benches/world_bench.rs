@@ -114,7 +114,9 @@ fn bench_world_steps(c: &mut Criterion) {
                 },
                 |mut world| {
                     for _ in 0..steps {
-                        world.step();
+                        world
+                            .step()
+                            .expect("benchmark world should accept each simulation step");
                     }
                 },
                 BatchSize::LargeInput,

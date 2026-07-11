@@ -92,8 +92,12 @@ fn seeded_world_advances_deterministically() {
     let id_b = world_b.spawn_agent(agent);
 
     for _ in 0..8 {
-        world_a.step();
-        world_b.step();
+        world_a
+            .step()
+            .expect("first deterministic world should accept each simulation step");
+        world_b
+            .step()
+            .expect("second deterministic world should accept each simulation step");
     }
 
     assert_eq!(world_a.tick(), Tick(8));
@@ -147,7 +151,9 @@ fn registry_executes_custom_brain() {
     let agent_id = world.spawn_agent(AgentData::default());
     assert!(world.bind_agent_brain(agent_id, key));
 
-    world.step();
+    world
+        .step()
+        .expect("custom-brain world should accept its simulation step");
     let runtime = world.agent_runtime(agent_id).expect("runtime");
     assert!(
         runtime
@@ -215,7 +221,9 @@ fn combat_records_carnivore_event_flags() {
         runtime.herbivore_tendency = 0.9;
     }
 
-    world.step();
+    world
+        .step()
+        .expect("combat world should accept its simulation step");
 
     let attacker_runtime = world.agent_runtime(attacker_id).expect("attacker runtime");
     assert!(attacker_runtime.combat.spike_attacker);
@@ -293,7 +301,9 @@ fn sensory_pipeline_populates_expected_channels() {
         runtime.sound_multiplier = 0.9;
     }
 
-    world.step();
+    world
+        .step()
+        .expect("sensory world should accept its simulation step");
 
     let sensors = world
         .agent_runtime(subject)
@@ -350,7 +360,9 @@ fn food_growth_moves_toward_capacity() {
 
     let mut world = WorldState::new(config).expect("world");
     let before = world.food().cells().to_vec();
-    world.step();
+    world
+        .step()
+        .expect("food-growth world should accept its simulation step");
 
     let width = world.food().width() as usize;
     let height = world.food().height() as usize;
@@ -390,7 +402,9 @@ fn food_diffusion_spreads_across_neighbors() {
     }
 
     let before = world.food().cells().to_vec();
-    world.step();
+    world
+        .step()
+        .expect("food-diffusion world should accept its simulation step");
 
     let width = world.food().width() as usize;
     let cells = world.food().cells();
@@ -432,7 +446,9 @@ fn food_decay_reduces_cell_values() {
 
     let mut world = WorldState::new(config).expect("world");
     let before = world.food().cells().to_vec();
-    world.step();
+    world
+        .step()
+        .expect("food-decay world should accept its simulation step");
 
     let width = world.food().width() as usize;
     let height = world.food().height() as usize;
@@ -466,7 +482,9 @@ fn run_world_summary(seed: u64, ticks: u32) -> TickSummary {
     world.spawn_agent(AgentData::default());
 
     for _ in 0..ticks {
-        world.step();
+        world
+            .step()
+            .expect("regression world should accept each simulation step");
     }
 
     let summaries: Vec<_> = world.history().cloned().collect();
