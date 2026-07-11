@@ -23,9 +23,3 @@ daemon-*.log.gz
 
 # Local version tracking
 .local_version
-
-# Local history backups
-.br_history/
-
-# bv (beads viewer) lock file
-.bv.lock
