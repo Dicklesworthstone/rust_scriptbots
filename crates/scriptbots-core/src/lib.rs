@@ -736,6 +736,18 @@ impl BrainRegistry {
         self.entries.contains_key(&key)
     }
 
+    /// Return registered brain keys and kind labels in stable key order.
+    #[must_use]
+    pub fn descriptors(&self) -> Vec<(u64, String)> {
+        let mut descriptors: Vec<_> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (*key, entry.kind.to_string()))
+            .collect();
+        descriptors.sort_unstable_by_key(|(key, _)| *key);
+        descriptors
+    }
+
     /// Pick a random registered brain key, if any.
     pub fn random_key(&self, rng: &mut dyn RngCore) -> Option<u64> {
         if self.entries.is_empty() {
@@ -869,6 +881,263 @@ pub struct AgentState {
     pub id: AgentId,
     pub data: AgentData,
     pub runtime: AgentRuntime,
+}
+
+/// Schema identifier for the temporary pre-redesign world characterization digest.
+pub const CHARACTERIZATION_DIGEST_V0_SCHEMA: &str = "scriptbots.world.characterization.v0";
+
+/// Stable, non-cryptographic fingerprint of the deterministic world fields available today.
+///
+/// Version zero is intentionally a characterization aid rather than a replay guarantee. It
+/// captures boundary-visible world data and a non-mutating RNG probe, but the current architecture
+/// does not expose restorable RNG state, live brain-runner state, persistence sinks, or registered
+/// factory closures. [`WorldState::characterization_digest_v0`] documents the complete inclusion
+/// and exclusion contract. A future full-state digest must use a new schema version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CharacterizationDigestV0 {
+    pub schema: String,
+    pub algorithm: String,
+    pub tick: Tick,
+    pub overall: String,
+    pub agents: String,
+    pub food: String,
+    pub terrain: String,
+    pub hydrology: Option<String>,
+    pub rng_probe: String,
+    pub brain_registry: String,
+}
+
+/// Compile-lane identity needed to interpret a characterization digest honestly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreBuildIdentityV0 {
+    pub parallel: bool,
+    pub simd_wide: bool,
+    pub rayon_threads: usize,
+    pub target_arch: String,
+    pub target_os: String,
+    pub target_family: String,
+    pub target_endian: String,
+    pub pointer_width: u8,
+}
+
+impl CoreBuildIdentityV0 {
+    #[must_use]
+    pub fn current() -> Self {
+        #[cfg(feature = "parallel")]
+        let rayon_threads = rayon::current_num_threads();
+        #[cfg(not(feature = "parallel"))]
+        let rayon_threads = 1;
+
+        Self {
+            parallel: cfg!(feature = "parallel"),
+            simd_wide: cfg!(feature = "simd_wide"),
+            rayon_threads,
+            target_arch: std::env::consts::ARCH.to_owned(),
+            target_os: std::env::consts::OS.to_owned(),
+            target_family: std::env::consts::FAMILY.to_owned(),
+            target_endian: if cfg!(target_endian = "little") {
+                "little".to_owned()
+            } else {
+                "big".to_owned()
+            },
+            pointer_width: u8::try_from(usize::BITS).unwrap_or(u8::MAX),
+        }
+    }
+}
+
+/// Failures encountered while characterizing a world boundary.
+#[derive(Debug, Error)]
+pub enum CharacterizationError {
+    /// V0 is defined only between ticks, with no queued stage/control work.
+    #[error(
+        "world is not at a quiescent boundary (pending deaths: {pending_deaths}, pending spawns: {pending_spawns}, simulation commands: {simulation_commands})"
+    )]
+    NonQuiescent {
+        pending_deaths: usize,
+        pending_spawns: usize,
+        simulation_commands: usize,
+    },
+    /// An arena handle did not resolve to its dense scalar state.
+    #[error("agent {agent_id} is missing dense scalar state")]
+    MissingAgentData { agent_id: u64 },
+    /// An arena handle did not have matching runtime state.
+    #[error("agent {agent_id} is missing runtime state")]
+    MissingAgentRuntime { agent_id: u64 },
+}
+
+fn characterization_fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+struct CharacterizationEncoderV0 {
+    hash: u64,
+}
+
+impl CharacterizationEncoderV0 {
+    fn new(domain: &str) -> Self {
+        let mut encoder = Self {
+            hash: characterization_fnv1a64(&[]),
+        };
+        encoder.string(CHARACTERIZATION_DIGEST_V0_SCHEMA);
+        encoder.string(domain);
+        encoder
+    }
+
+    fn raw(&mut self, bytes: &[u8]) {
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        for &byte in bytes {
+            self.hash ^= u64::from(byte);
+            self.hash = self.hash.wrapping_mul(PRIME);
+        }
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.raw(&[value]);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.raw(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.raw(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.raw(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.u64(u64::try_from(value).unwrap_or(u64::MAX));
+    }
+
+    fn f32(&mut self, value: f32) {
+        self.u32(value.to_bits());
+    }
+
+    fn string(&mut self, value: &str) {
+        self.usize(value.len());
+        self.raw(value.as_bytes());
+    }
+
+    fn option_u64(&mut self, value: Option<u64>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.u64(value);
+        }
+    }
+
+    fn option_agent_id(&mut self, value: Option<AgentId>) {
+        self.option_u64(value.map(|id| id.data().as_ffi()));
+    }
+
+    fn option_string(&mut self, value: Option<&str>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.string(value);
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("{:016x}", self.hash)
+    }
+}
+
+fn encode_agent_data_v0(encoder: &mut CharacterizationEncoderV0, data: AgentData) {
+    encoder.f32(data.position.x);
+    encoder.f32(data.position.y);
+    encoder.f32(data.velocity.vx);
+    encoder.f32(data.velocity.vy);
+    encoder.f32(data.heading);
+    encoder.f32(data.health);
+    for value in data.color {
+        encoder.f32(value);
+    }
+    encoder.f32(data.spike_length);
+    encoder.bool(data.boost);
+    encoder.u32(data.age);
+    encoder.u32(data.generation.0);
+}
+
+fn encode_agent_runtime_v0(encoder: &mut CharacterizationEncoderV0, runtime: &AgentRuntime) {
+    encoder.f32(runtime.energy);
+    encoder.f32(runtime.reproduction_counter);
+    encoder.f32(runtime.herbivore_tendency);
+    encoder.f32(runtime.mutation_rates.primary);
+    encoder.f32(runtime.mutation_rates.secondary);
+    encoder.f32(runtime.trait_modifiers.smell);
+    encoder.f32(runtime.trait_modifiers.sound);
+    encoder.f32(runtime.trait_modifiers.hearing);
+    encoder.f32(runtime.trait_modifiers.eye);
+    encoder.f32(runtime.trait_modifiers.blood);
+    for value in runtime.clocks {
+        encoder.f32(value);
+    }
+    for value in runtime.eye_fov {
+        encoder.f32(value);
+    }
+    for value in runtime.eye_direction {
+        encoder.f32(value);
+    }
+    encoder.f32(runtime.sound_multiplier);
+    encoder.f32(runtime.give_intent);
+    for value in runtime.sensors {
+        encoder.f32(value);
+    }
+    for value in runtime.outputs {
+        encoder.f32(value);
+    }
+    encoder.f32(runtime.food_delta);
+    encoder.bool(runtime.spiked);
+    encoder.bool(runtime.hybrid);
+    encoder.f32(runtime.sound_output);
+    encoder.f32(runtime.temperature_preference);
+    for parent in runtime.lineage {
+        encoder.option_agent_id(parent);
+    }
+    encoder.option_u64(runtime.brain.registry_key());
+    encoder.option_string(runtime.brain.kind());
+    encoder.bool(runtime.brain.is_bound());
+    encoder.f32(runtime.food_balance_total);
+}
+
+const fn terrain_kind_tag_v0(kind: TerrainKind) -> u8 {
+    match kind {
+        TerrainKind::DeepWater => 0,
+        TerrainKind::ShallowWater => 1,
+        TerrainKind::Sand => 2,
+        TerrainKind::Grass => 3,
+        TerrainKind::Bloom => 4,
+        TerrainKind::Rock => 5,
+    }
+}
+
+const fn map_generator_tag_v0(generator: MapGeneratorKind) -> u8 {
+    match generator {
+        MapGeneratorKind::RuleBased => 0,
+    }
+}
+
+const fn hydrology_flow_tag_v0(direction: HydrologyFlowDirection) -> u8 {
+    match direction {
+        HydrologyFlowDirection::None => 0,
+        HydrologyFlowDirection::North => 1,
+        HydrologyFlowDirection::South => 2,
+        HydrologyFlowDirection::East => 3,
+        HydrologyFlowDirection::West => 4,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -8113,6 +8382,176 @@ impl WorldState {
         &self.config
     }
 
+    /// Fingerprint deterministic science state at a quiescent tick boundary.
+    ///
+    /// Version zero hashes explicit little-endian integers and `f32::to_bits()` values with
+    /// domain-separated FNV-1a 64. It includes time/closure state; agents sorted by raw `AgentId`;
+    /// scalar agent data; science-relevant runtime fields; food; terrain; deterministic map
+    /// metadata; hydrology; registered brain key/kind pairs; and four samples from a cloned RNG.
+    ///
+    /// UI-owned selection/indicator state, activation snapshots, mutation log strings, history,
+    /// configuration/audit state, analytics and persistence buffers, derived indexes, scratch
+    /// vectors, the map generation timestamp, factory closures, and opaque evaluator state are
+    /// excluded. The RNG probe does not expose restorable RNG state. Therefore this is a stable V0
+    /// regression oracle for one pinned build lane, not a checkpoint or replay guarantee.
+    pub fn characterization_digest_v0(
+        &self,
+    ) -> Result<CharacterizationDigestV0, CharacterizationError> {
+        if !self.pending_deaths.is_empty()
+            || !self.pending_spawns.is_empty()
+            || !self.simulation_commands.is_empty()
+        {
+            return Err(CharacterizationError::NonQuiescent {
+                pending_deaths: self.pending_deaths.len(),
+                pending_spawns: self.pending_spawns.len(),
+                simulation_commands: self.simulation_commands.len(),
+            });
+        }
+
+        let mut handles: Vec<_> = self.agents.iter_handles().collect();
+        handles.sort_unstable_by_key(|id| id.data().as_ffi());
+
+        let mut agents_encoder = CharacterizationEncoderV0::new("agents");
+        agents_encoder.usize(handles.len());
+        for id in handles {
+            let raw_id = id.data().as_ffi();
+            let data = self
+                .agents
+                .snapshot(id)
+                .ok_or(CharacterizationError::MissingAgentData { agent_id: raw_id })?;
+            let runtime = self
+                .runtime
+                .get(id)
+                .ok_or(CharacterizationError::MissingAgentRuntime { agent_id: raw_id })?;
+            agents_encoder.u64(raw_id);
+            encode_agent_data_v0(&mut agents_encoder, data);
+            encode_agent_runtime_v0(&mut agents_encoder, runtime);
+        }
+        let agents = agents_encoder.finish();
+
+        let mut food_encoder = CharacterizationEncoderV0::new("food");
+        food_encoder.u32(self.food.width());
+        food_encoder.u32(self.food.height());
+        food_encoder.usize(self.food.cells().len());
+        for &value in self.food.cells() {
+            food_encoder.f32(value);
+        }
+        let food = food_encoder.finish();
+
+        let mut terrain_encoder = CharacterizationEncoderV0::new("terrain");
+        terrain_encoder.u32(self.terrain.width());
+        terrain_encoder.u32(self.terrain.height());
+        terrain_encoder.u32(self.terrain.cell_size());
+        terrain_encoder.usize(self.terrain.tiles().len());
+        for tile in self.terrain.tiles() {
+            terrain_encoder.u8(terrain_kind_tag_v0(tile.kind));
+            terrain_encoder.f32(tile.elevation);
+            terrain_encoder.f32(tile.moisture);
+            terrain_encoder.f32(tile.accent);
+            terrain_encoder.f32(tile.fertility_bias);
+            terrain_encoder.f32(tile.temperature_bias);
+            terrain_encoder.u16(tile.palette_index);
+        }
+        terrain_encoder.bool(self.map_metadata.is_some());
+        if let Some(metadata) = &self.map_metadata {
+            terrain_encoder.u8(map_generator_tag_v0(metadata.generator));
+            terrain_encoder.string(&metadata.tileset_id);
+            terrain_encoder.u64(metadata.tileset_hash);
+            terrain_encoder.u64(metadata.seed);
+            terrain_encoder.u32(metadata.width);
+            terrain_encoder.u32(metadata.height);
+            terrain_encoder.usize(metadata.attempt_count);
+            terrain_encoder.usize(metadata.succeeded_on);
+        }
+        let terrain = terrain_encoder.finish();
+
+        let hydrology = self.hydrology.as_ref().map(|state| {
+            let mut encoder = CharacterizationEncoderV0::new("hydrology");
+            let tiles = state.tiles();
+            encoder.u32(tiles.width());
+            encoder.u32(tiles.height());
+            encoder.usize(tiles.tiles().len());
+            for tile in tiles.tiles() {
+                encoder.f32(tile.permeability);
+                encoder.f32(tile.runoff_bias);
+                encoder.f32(tile.basin_rank);
+                encoder.f32(tile.channel_priority);
+                encoder.f32(tile.swim_cost);
+            }
+            let field = state.field();
+            encoder.u32(field.width());
+            encoder.u32(field.height());
+            encoder.usize(field.flow_directions().len());
+            for &direction in field.flow_directions() {
+                encoder.u8(hydrology_flow_tag_v0(direction));
+            }
+            encoder.usize(field.accumulation().len());
+            for &value in field.accumulation() {
+                encoder.f32(value);
+            }
+            encoder.usize(field.spill_elevation().len());
+            for &value in field.spill_elevation() {
+                encoder.f32(value);
+            }
+            encoder.usize(field.basin_ids().len());
+            for &value in field.basin_ids() {
+                encoder.u32(value);
+            }
+            encoder.usize(field.initial_water_depth().len());
+            for &value in field.initial_water_depth() {
+                encoder.f32(value);
+            }
+            encoder.usize(state.water_depth().len());
+            for &value in state.water_depth() {
+                encoder.f32(value);
+            }
+            encoder.finish()
+        });
+
+        let mut rng = self.rng.clone();
+        let mut rng_encoder = CharacterizationEncoderV0::new("rng-probe");
+        for _ in 0..4 {
+            rng_encoder.u64(rng.next_u64());
+        }
+        let rng_probe = rng_encoder.finish();
+
+        let mut registrations: Vec<_> = self.brain_registry.entries.iter().collect();
+        registrations.sort_unstable_by_key(|(key, _)| **key);
+        let mut brain_encoder = CharacterizationEncoderV0::new("brain-registry");
+        brain_encoder.u64(self.brain_registry.next_key);
+        brain_encoder.usize(registrations.len());
+        for (key, entry) in registrations {
+            brain_encoder.u64(*key);
+            brain_encoder.string(entry.kind.as_ref());
+        }
+        let brain_registry = brain_encoder.finish();
+
+        let mut overall_encoder = CharacterizationEncoderV0::new("overall");
+        overall_encoder.u64(self.tick.0);
+        overall_encoder.u64(self.epoch);
+        overall_encoder.bool(self.closed);
+        overall_encoder.string(&agents);
+        overall_encoder.string(&food);
+        overall_encoder.string(&terrain);
+        overall_encoder.option_string(hydrology.as_deref());
+        overall_encoder.string(&rng_probe);
+        overall_encoder.string(&brain_registry);
+        let overall = overall_encoder.finish();
+
+        Ok(CharacterizationDigestV0 {
+            schema: CHARACTERIZATION_DIGEST_V0_SCHEMA.to_owned(),
+            algorithm: "fnv1a64-v0".to_owned(),
+            tick: self.tick,
+            overall,
+            agents,
+            food,
+            terrain,
+            hydrology,
+            rng_probe,
+            brain_registry,
+        })
+    }
+
     /// Queue a simulation control request for external renderers.
     pub fn enqueue_simulation_command(&mut self, mut command: SimulationCommand) {
         if let Some(speed) = command.speed_multiplier.as_mut() {
@@ -10623,6 +11062,159 @@ mod tests {
         assert_eq!(world.agent_count(), 2);
         assert!(world.pending_deaths.is_empty());
         assert_eq!(world.last_deaths, 2);
+    }
+
+    fn characterization_world(seed: u64) -> (WorldState, Vec<AgentId>) {
+        let config = ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            initial_food: 0.25,
+            food_respawn_interval: 0,
+            population_spawn_interval: 0,
+            population_minimum: 0,
+            rng_seed: Some(seed),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("characterization world");
+        let ids = vec![
+            world.spawn_agent(sample_agent(0)),
+            world.spawn_agent(sample_agent(1)),
+        ];
+        (world, ids)
+    }
+
+    #[test]
+    fn fnv1a64_v0_matches_reference_vectors_and_preserves_float_bits() {
+        assert_eq!(characterization_fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(characterization_fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+
+        let mut positive_zero = CharacterizationEncoderV0::new("float-reference");
+        positive_zero.f32(0.0);
+        let mut negative_zero = CharacterizationEncoderV0::new("float-reference");
+        negative_zero.f32(-0.0);
+        assert_ne!(positive_zero.finish(), negative_zero.finish());
+    }
+
+    #[test]
+    fn characterization_v0_is_repeatable_and_does_not_advance_rng() {
+        let (mut world_a, _) = characterization_world(0xC0FFEE);
+        let (mut world_b, _) = characterization_world(0xC0FFEE);
+
+        let first = world_a.characterization_digest_v0().expect("first digest");
+        let second = world_a.characterization_digest_v0().expect("second digest");
+        let peer = world_b.characterization_digest_v0().expect("peer digest");
+        assert_eq!(first, second);
+        assert_eq!(first, peer);
+        assert_eq!(world_a.rng().next_u64(), world_b.rng().next_u64());
+    }
+
+    #[test]
+    fn characterization_v0_components_detect_science_state_changes() {
+        let (baseline_world, _) = characterization_world(42);
+        let baseline = baseline_world
+            .characterization_digest_v0()
+            .expect("baseline digest");
+
+        let (mut food_world, _) = characterization_world(42);
+        food_world.food_mut().cells_mut()[0] = -0.0;
+        let changed = food_world
+            .characterization_digest_v0()
+            .expect("food digest");
+        assert_ne!(baseline.food, changed.food);
+        assert_eq!(baseline.agents, changed.agents);
+        assert_ne!(baseline.overall, changed.overall);
+
+        let (mut terrain_world, _) = characterization_world(42);
+        terrain_world.terrain.tiles[0].elevation = 0.123;
+        let changed = terrain_world
+            .characterization_digest_v0()
+            .expect("terrain digest");
+        assert_ne!(baseline.terrain, changed.terrain);
+        assert_ne!(baseline.overall, changed.overall);
+
+        let (mut agent_world, ids) = characterization_world(42);
+        let index = agent_world.agents.index_of(ids[0]).expect("agent index");
+        agent_world.agents.columns.health[index] = 0.75;
+        let changed = agent_world
+            .characterization_digest_v0()
+            .expect("agent digest");
+        assert_ne!(baseline.agents, changed.agents);
+        assert_ne!(baseline.overall, changed.overall);
+
+        let (mut runtime_world, ids) = characterization_world(42);
+        runtime_world
+            .agent_runtime_mut(ids[0])
+            .expect("runtime")
+            .energy = 0.125;
+        let changed = runtime_world
+            .characterization_digest_v0()
+            .expect("runtime digest");
+        assert_ne!(baseline.agents, changed.agents);
+        assert_ne!(baseline.overall, changed.overall);
+
+        let (mut closed_world, _) = characterization_world(42);
+        closed_world.set_closed(true);
+        let changed = closed_world
+            .characterization_digest_v0()
+            .expect("closed digest");
+        assert_eq!(baseline.agents, changed.agents);
+        assert_ne!(baseline.overall, changed.overall);
+
+        let (mut tick_world, _) = characterization_world(42);
+        tick_world.advance_tick();
+        let changed = tick_world
+            .characterization_digest_v0()
+            .expect("tick digest");
+        assert_ne!(baseline.overall, changed.overall);
+
+        let (mut rng_world, _) = characterization_world(42);
+        rng_world.rng().next_u64();
+        let changed = rng_world.characterization_digest_v0().expect("rng digest");
+        assert_ne!(baseline.rng_probe, changed.rng_probe);
+        assert_ne!(baseline.overall, changed.overall);
+
+        let (mut registry_world, _) = characterization_world(42);
+        registry_world
+            .brain_registry_mut()
+            .register("stub", |_rng| Box::new(StubBrain));
+        let changed = registry_world
+            .characterization_digest_v0()
+            .expect("brain registry digest");
+        assert_ne!(baseline.brain_registry, changed.brain_registry);
+        assert_ne!(baseline.overall, changed.overall);
+    }
+
+    #[test]
+    fn characterization_v0_excludes_selection_and_sorts_agent_handles() {
+        let (mut world, ids) = characterization_world(9);
+        let baseline = world.characterization_digest_v0().expect("baseline digest");
+        world.agent_runtime_mut(ids[0]).expect("runtime").selection = SelectionState::Selected;
+        let selected = world.characterization_digest_v0().expect("selected digest");
+        assert_eq!(baseline, selected);
+
+        world.agents.handles.swap(0, 1);
+        let reordered = world
+            .characterization_digest_v0()
+            .expect("reordered digest");
+        assert_eq!(selected, reordered);
+    }
+
+    #[test]
+    fn characterization_v0_rejects_queued_control_work() {
+        let (mut world, _) = characterization_world(7);
+        world.enqueue_simulation_command(SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: false,
+        });
+        assert!(matches!(
+            world.characterization_digest_v0(),
+            Err(CharacterizationError::NonQuiescent {
+                simulation_commands: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

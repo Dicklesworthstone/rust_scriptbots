@@ -3,7 +3,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    ControlRuntime, ControlServerConfig, SharedStorage, SharedWorld,
+    CharacterizationTraceV0, ControlRuntime, ControlServerConfig, ScenarioIdentityV0,
+    SharedStorage, SharedWorld,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -23,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::{
     collections::HashMap,
     env, fmt, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
@@ -48,6 +50,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let config = compose_config(&cli)?;
+
+    if let Some(ticks) = cli.characterize_v0 {
+        run_characterization_v0(&cli, config, ticks)?;
+        return Ok(());
+    }
+
     if let Some(outcome) = maybe_emit_config(&cli, &config)?
         && matches!(outcome, ConfigEmitOutcome::Exit)
     {
@@ -300,6 +308,60 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+}
+
+fn run_characterization_v0(cli: &AppCli, config: ScriptBotsConfig, ticks: u64) -> Result<()> {
+    let mut world = WorldState::new(config)?;
+    let brain_keys = install_brains(&mut world);
+    seed_agents(&mut world, &brain_keys);
+
+    let scenario_id = if cli.config_layers.is_empty() {
+        "legacy_app_default_v0"
+    } else {
+        "legacy_layered_config_v0"
+    };
+    let mut scenario = ScenarioIdentityV0::caller_seeded(scenario_id);
+    scenario.population_recipe = "legacy_4x4_grid_v0".to_owned();
+    scenario.bootstrap_ticks = 0;
+    for layer in &cli.config_layers {
+        let bytes = fs::read(layer).with_context(|| {
+            format!(
+                "failed to read configuration layer {} for characterization provenance",
+                layer.display()
+            )
+        })?;
+        scenario.record_config_layer(&bytes);
+    }
+
+    let trace = CharacterizationTraceV0::capture_with_scenario(scenario, &mut world, ticks)?;
+    let mut bytes = trace.canonical_json_bytes()?;
+    bytes.push(b'\n');
+
+    if let Some(path) = cli.characterization_out.as_ref() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create characterization output directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(path, bytes).with_context(|| {
+            format!(
+                "failed to write V0 characterization trace to {}",
+                path.display()
+            )
+        })?;
+    } else {
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        lock.write_all(&bytes)
+            .context("failed to write V0 characterization trace to stdout")?;
+        lock.flush()
+            .context("failed to flush V0 characterization trace to stdout")?;
+    }
+
+    Ok(())
 }
 
 fn run_det_child(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
@@ -692,6 +754,16 @@ struct AppCli {
     /// Exit immediately after emitting configuration output.
     #[arg(long = "config-only", action = ArgAction::SetTrue)]
     config_only: bool,
+    /// Capture a bounded V0 characterization trace from tick zero and exit (maximum 256 ticks).
+    #[arg(long = "characterize-v0", value_name = "TICKS")]
+    characterize_v0: Option<u64>,
+    /// Write the V0 characterization trace to this file instead of standard output.
+    #[arg(
+        long = "characterization-out",
+        value_name = "FILE",
+        requires = "characterize_v0"
+    )]
+    characterization_out: Option<PathBuf>,
     /// Run determinism self-check comparing 1-thread vs N-threads for the given number of ticks.
     #[arg(long = "det-check", value_name = "TICKS")]
     det_check: Option<u64>,
@@ -1992,6 +2064,30 @@ mod tests {
 
     fn default_cli() -> AppCli {
         AppCli::parse_from(["scriptbots-app"])
+    }
+
+    #[test]
+    fn characterization_cli_parses_ticks_and_output() {
+        let cli = AppCli::parse_from([
+            "scriptbots-app",
+            "--rng-seed",
+            "42",
+            "--characterize-v0",
+            "16",
+            "--characterization-out",
+            "trace.json",
+        ]);
+
+        assert_eq!(cli.rng_seed, Some(42));
+        assert_eq!(cli.characterize_v0, Some(16));
+        assert_eq!(cli.characterization_out, Some(PathBuf::from("trace.json")));
+    }
+
+    #[test]
+    fn characterization_output_requires_trace_mode() {
+        let result =
+            AppCli::try_parse_from(["scriptbots-app", "--characterization-out", "trace.json"]);
+        assert!(result.is_err());
     }
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
