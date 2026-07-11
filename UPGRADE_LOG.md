@@ -607,3 +607,25 @@ No version migration in this ledger is authorized merely by being newer.
 - **Result:** accepted from direct usage evidence and an exact one-edge lock
   delta; render behavior and public features are unchanged.
 - **Rollback:** restore only the manifest and lock edge.
+
+## 2026-07-11 — Scope render's brain dependency to tests
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one dependency-section correction in
+  `scriptbots-render`
+- **Before manifest SHA-256:**
+  `f53022aa3512d4d12f813c2f886c7e448a68f9700bee61de727ffe5ee64fcd89`
+- **After manifest SHA-256:**
+  `e25d1bc1e6611440caf91e7e4da7b3f74182deceb1404f119bc92612ff3e7e00`
+- **Change:** move `scriptbots-brain` from normal dependencies to
+  dev-dependencies. The only crate-local reference is
+  `tests/snapshot.rs`, while the shipped GPUI library has no brain-crate path.
+- **Lock delta:** byte-identical at
+  `23e2d9033ba87e30fb9692688daf0b4d5e64171a0bdefe9e21b3a29d17d1c69c`;
+  Cargo lock records do not distinguish normal and development edges.
+- **Verification:** workspace metadata resolves and places the dependency only
+  in the development kind. The snapshot test remains able to compile through
+  the same package edge; shipped render targets no longer claim it.
+- **Result:** accepted; production render closure is narrower with no source or
+  behavior change.
+- **Rollback:** move the existing path dependency back to `[dependencies]`.

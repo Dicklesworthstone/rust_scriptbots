@@ -7,7 +7,6 @@ edition = "2024"
 gpui = { workspace = true }
 tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
-scriptbots-brain = { path = "../scriptbots-brain" }
 scriptbots-storage = { path = "../scriptbots-storage" }
 kira = { workspace = true, optional = true }
 rand = { workspace = true }
@@ -15,6 +14,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 scriptbots-world-gfx = { path = "../scriptbots-world-gfx", optional = true }
 pollster = { version = "0.4", optional = true }
 naga = { version = "27", features = ["termcolor"] }
+
+[dev-dependencies]
+scriptbots-brain = { path = "../scriptbots-brain" }
 
 [features]
 default = ["world_wgpu"]
