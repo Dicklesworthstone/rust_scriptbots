@@ -12,7 +12,5 @@ experimental = ["assembly"]
 
 [dependencies]
 rand = { workspace = true }
-rayon = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }

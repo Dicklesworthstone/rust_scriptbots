@@ -395,3 +395,28 @@ No version migration in this ledger is authorized merely by being newer.
   on Linux and cannot compile the wrong OS helper dependency directly.
 - **Rollback:** manually restore only this app manifest slice and its reviewed
   Unicode-width lock delta.
+
+## 2026-07-11 — Remove unused brain-crate concurrency and error edges
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-brain` manifest slice
+- **Before manifest SHA-256:**
+  `92a04a3bbaa737ad2c4b8a2580a85a6f4c0fcc023b58baddda7c815b78d67707`
+- **After manifest SHA-256:**
+  `2241cf40d5adcc140eafda2b93f6a8ce7de5215555dacdb407fa9ef3494aa611`
+- **Removed:** direct `rayon` and `thiserror`. Exact source search finds no
+  import, path, derive, macro, or feature use in the brain crate.
+- **Allowed lock delta:** remove only the two edges from the
+  `scriptbots-brain` workspace package record. Both packages remain resolved
+  for live workspace owners. Lock SHA-256 changed from
+  `ea9f9ae75e99113f24ddc756b46f57e540c7800f1f36114b140ba29b8d716724`
+  to
+  `4d380fd9c54d018cfa8a152b2149b30ce106db758130cd2e54549c4028b4c2bd`.
+- **Verification:** all-feature host-target check passes; no-default/all-targets
+  check passes; all sixteen brain tests and doc tests pass. The targeted Clippy
+  lane reaches only the recorded index `collapsible_if` baseline before
+  checking this crate.
+- **Result:** accepted; brain behavior and feature surface are byte-for-byte
+  source-identical with two false dependency claims removed.
+- **Rollback:** manually restore only the two manifest edges and their two lock
+  record entries.
