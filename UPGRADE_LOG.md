@@ -648,3 +648,71 @@ No version migration in this ledger is authorized merely by being newer.
 - **Result:** accepted; Bevy no longer claims a terminal-color dependency it
   does not use.
 - **Rollback:** restore only the one manifest edge.
+
+## 2026-07-11 — Pin FrankenSQLite and prove the ScriptBots workload
+
+- **Beads:** `bd-2z0.8.9.1`, `bd-2z0.8.9.2`
+- **Change class:** exact-revision replacement candidate plus a real-engine
+  conformance gate; the production storage swap remains in the following
+  serialized beads
+- **Source:** `fsqlite = =0.1.16` from
+  `https://github.com/Dicklesworthstone/frankensqlite` at immutable revision
+  `cd9990bb16291d8c7c247b75b47faae8d7701adb`, with default features disabled
+  and `native` enabled
+- **Why this exact revision:** upstream `v0.1.15` is the latest tag and the
+  latest GitHub release is `v0.1.14`; `0.1.16` is release-prepared but not yet
+  tagged. The user explicitly selected the local project, and this revision
+  contains `3c388122`, the seek-cache invalidation for issue #123, plus the
+  current `INSERT OR REPLACE` structural-mutation fix used by ScriptBots.
+  Pinning the commit is safer than consuming the older published surface.
+- **License gate:** FrankenSQLite declares
+  `LicenseRef-MIT-OpenAI-Anthropic-Rider`. Local integration is authorized;
+  public distribution remains gated on honest downstream metadata and an
+  unmodified rider/notice decision. ScriptBots must not claim that the combined
+  distribution is only `MIT OR Apache-2.0`.
+- **API migration findings:** current source uses explicit `SqliteValue`
+  slices, vector/callback query results, `compat::RowExt`, and explicit or
+  `compat::TransactionExt` transactions. `Connection` is deliberately
+  `!Send + !Sync`, so it must be created and owned inside the storage worker;
+  the existing cross-thread `Arc<Mutex<Storage>>` design cannot be retained.
+  `PRAGMA optimize` is currently a silent no-op and will be removed rather
+  than reported as maintenance.
+- **Before SHA-256:** root manifest
+  `594c59c2c4adb4033613d9539dd1b9f193f57c5273beb8b5e8d2615762d48fd2`;
+  storage manifest
+  `7bfae8a8e6a84dbc799af2c899094d66fed422056ff991c9b9fd30d326f93f16`;
+  lock
+  `23e2d9033ba87e30fb9692688daf0b4d5e64171a0bdefe9e21b3a29d17d1c69c`.
+- **After SHA-256:** root manifest
+  `815dcb0614e3b6231f5c69b704e8435b14512de4bdc31530ce2afc5af5c7cf8d`;
+  storage manifest
+  `f41ca369eb65216ad3d05209ada2b28cd01bbff23c633b2f2b66bd308b2d0a69`;
+  lock
+  `8b4abff5f7f7109b58cb0b701043d4d5fb7de291501c4763a6e8cbbfb27a0ccc`;
+  conformance test
+  `fe536d0bfe1773dc92ae566a57ef1c70ee34455b93b1027721ae73de5039e9ca`.
+- **Lock review:** exactly 76 package tuples were added and zero removed.
+  Twenty are `fsqlite` workspace crates; the remainder are its current
+  crypto, MVCC, Asupersync, observability, platform, and serialization closure.
+  The upstream `native` feature also pulls FTS5, ICU, JSON, misc, R-tree, and
+  io-uring-related packages; `bd-2z0.8.9.10` owns a measured lean-feature
+  qualification. No pre-existing package tuple changed or disappeared.
+- **Verification:** direct FrankenSQLite source check under
+  `nightly-2026-07-09` passed in 13m44s. The downstream Git dependency then
+  compiled without dependency warnings. The new in-memory and file-backed
+  ScriptBots workload tests both pass: seven tables, a 39-column agent row,
+  nullable values, JSON-as-TEXT, numbered bindings, replacement writes,
+  `MAX`/`COUNT`/`SUM`/`AVG`/`GROUP BY`, bound limits, deliberate failure plus
+  rollback, close/reopen, and `PRAGMA integrity_check`. Targeted Clippy reaches
+  only the already-recorded `scriptbots-index` `collapsible_if` baseline before
+  this test target.
+- **Build-cost evidence:** the first downstream test build took 1m31s on the
+  existing external target, while still compiling the outgoing DuckDB/Arrow
+  graph. The full engine replacement should measure the net closure after that
+  graph is removed.
+- **Result:** accepted as the immutable source and executable conformance gate.
+  DuckDB is not an accepted coexisting backend; its production removal follows
+  in `bd-2z0.8.9.3` through `.9`.
+- **Rollback:** manually restore only the two manifest edges and reviewed lock
+  additions. The new test file may not be deleted without explicit user
+  permission.

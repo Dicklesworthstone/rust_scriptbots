@@ -42,6 +42,7 @@ direction = "0.18.0"
 rand08 = { package = "rand", version = "0.8.5" }
 
 duckdb = { version = "1.4.1", default-features = false, features = ["bundled"] }
+fsqlite = { version = "=0.1.16", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "cd9990bb16291d8c7c247b75b47faae8d7701adb", default-features = false, features = ["native"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", rev = "5f8a7413a31769e0882357f90dc424b3962ac72d" }
 kira = "0.10.1"
 rstar = "0.12.2"
