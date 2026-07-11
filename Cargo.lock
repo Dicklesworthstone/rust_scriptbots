@@ -8977,7 +8977,6 @@ dependencies = [
  "scriptbots-core",
  "scriptbots-storage",
  "scriptbots-world-gfx",
- "serde",
  "tracing",
  "wgpu 27.0.1",
 ]

@@ -581,3 +581,29 @@ No version migration in this ledger is authorized merely by being newer.
 - **Result:** accepted; only the dead async primitive package left the graph.
 - **Rollback:** restore only the manifest edge and reviewed package/owner lock
   records.
+
+## 2026-07-11 — Remove render's unused Serde edge
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-render` manifest edge
+- **Before manifest SHA-256:**
+  `f2c9f06b10f66364f7355bad5b9caf10f2608dbd4c428dc1b6542107a4535d52`
+- **After manifest SHA-256:**
+  `f53022aa3512d4d12f813c2f886c7e448a68f9700bee61de727ffe5ee64fcd89`
+- **Removed:** direct `serde`; exact source and test search finds no import,
+  derive, trait bound, qualified path, or feature use in the render crate.
+- **Allowed lock delta:** remove only the Serde edge from the
+  `scriptbots-render` workspace package record. Serde remains resolved for its
+  live workspace owners. Lock SHA-256 changed from
+  `e0f456bf8a9a9e93dc5cd24b87ea2c72d664a3286322d5c55ebb819025e39409`
+  to
+  `23e2d9033ba87e30fb9692688daf0b4d5e64171a0bdefe9e21b3a29d17d1c69c`.
+- **Verification:** workspace metadata resolves and formatting is unchanged.
+  The bounded host compile probe reached bundled DuckDB before project code,
+  then failed because the system `/tmp` volume was full; no render or Serde
+  diagnostic was emitted. That native dependency is now superseded by the
+  dedicated FrankenSQLite migration rather than retried as part of this
+  dependency-only removal.
+- **Result:** accepted from direct usage evidence and an exact one-edge lock
+  delta; render behavior and public features are unchanged.
+- **Rollback:** restore only the manifest and lock edge.

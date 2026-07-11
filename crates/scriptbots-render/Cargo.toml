@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 gpui = { workspace = true }
-serde = { workspace = true }
 tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-brain = { path = "../scriptbots-brain" }
