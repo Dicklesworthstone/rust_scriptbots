@@ -38,7 +38,9 @@
   - [ ] Surface observable toggles (velocity vectors, sensing cones)
 - [ ] Persistence & analytics prototype (Phase 4)
   - [ ] Implement in-browser snapshot ring buffer with download/export
-  - [ ] Evaluate DuckDB-wasm or IndexedDB fallback for analytics storage
+  - [ ] Run pinned `fsqlite-wasm` in a dedicated storage Worker with bounded batch acknowledgements
+  - [ ] Persist full SQLite-image checkpoints plus an idempotent IndexedDB batch journal
+  - [ ] Qualify the exact WASM feature matrix and real browser recovery path before claiming durability
 - [ ] Bundled developer workflow
   - [ ] Decide on Vite/esbuild/no-bundler approach and codify scripts
   - [ ] Provide npm/task runner commands for build + serve

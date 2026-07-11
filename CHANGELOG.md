@@ -23,6 +23,27 @@ Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
 | [7. Rendering Parity & Camera](#7-rendering-parity--camera-overhaul-2025-10-29--30) | 2025-10-29 -- 30 | C++ geometry parity, camera extraction, HUD theming, accessibility modes |
 | [8. Bevy 3D Renderer](#8-bevy-3d-renderer-2025-10-30--31) | 2025-10-30 -- 31 | Bevy 0.17 integration, 3D terrain heightfields, agent avatars, tonemapping |
 | [9. Maintenance & Licensing](#9-maintenance--licensing-2025-11--2026-03) | 2025-11 -- 2026-03 | CI hardening, WASM compat, MIT + AI rider license, documentation |
+| [10. Recovery Architecture](#10-recovery-architecture-2026-07) | 2026-07 | Evidence-led rearchitecture, FrankenSQLite migration, truthful GUI/TUI persistence |
+
+---
+
+## 10. Recovery Architecture (2026-07)
+
+The recovery program replaced the former DuckDB stack with exact-revision FrankenSQLite and made persistence a bounded, observable subsystem instead of renderer-owned shared state.
+
+### FrankenSQLite persistence replacement
+
+- Pinned `fsqlite` 0.1.16 to immutable revision `cd9990bb16291d8c7c247b75b47faae8d7701adb` and qualified the real ScriptBots schema/query/transaction workload.
+- Ported the seven-table run schema, explicit values, migrations, lifecycle rows, replay events, analytics queries, and CSV exports.
+- Moved the deliberately non-`Send`/non-`Sync` connection entirely inside one bounded worker thread with startup, flush, durability, failure, and shutdown acknowledgements.
+- Replaced GUI/TUI SQL and mutex access with revisioned immutable analytics snapshots; frontends now expose commit lag and storage health.
+- Added a read-only `StorageReader` boundary so the control CLI and E2E tests never import the database engine or mutate a database during export.
+- Changed application targets to `--storage {file|memory}`, fresh run paths to `.sqlite`, and CI replay artifacts to unique runner-temporary paths without destructive cleanup.
+- Removed the DuckDB, bundled C++ database, Arrow, and Parquet dependency closure from manifests and the lockfile.
+
+### Browser storage decision
+
+FrankenSQLite remains the only SQL engine in browsers. The current WASM build is honestly documented as memory-only; durable browser storage requires a dedicated Worker plus SQLite-image checkpoints and an idempotent IndexedDB journal until a native FrankenSQLite OPFS/IndexedDB VFS passes real browser recovery tests.
 
 ---
 
@@ -757,7 +778,7 @@ Updated multi-agent conventions and project documentation.
 | `scriptbots-brain-ml` | Optional ML backends (Candle, Tract, tch), feature-gated |
 | `scriptbots-brain-neuro` | Optional NeuroFlow brain, feature-gated |
 | `scriptbots-index` | Pluggable spatial indices (grid, rstar, kd-tree) |
-| `scriptbots-storage` | DuckDB persistence, buffered writes, analytics helpers |
+| `scriptbots-storage` | FrankenSQLite persistence, bounded worker, replay, read-only analytics |
 | `scriptbots-render` | GPUI UI layer: window shell, HUD, canvas renderer, inspector |
 | `scriptbots-app` | Binary orchestrator: CLI, REST/MCP servers, renderer selection |
 | `scriptbots-web` | WebAssembly harness (wasm-bindgen bindings) |

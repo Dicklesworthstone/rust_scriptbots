@@ -15,3 +15,10 @@ _Started: 2025-10-22 (UTC). Append new entries chronologically; include links an
 - **Canvas fallback spike:** Vite-based prototype (`/tmp/canvas-baseline`) draws 10k agents via Canvas2D with deterministic `seedrandom`; browser metrics will be logged once run on GUI workstation.
 - **WebGPU spike prep:** `wgpu`’s wasm examples (`cargo xtask run-wasm`), Learn WGPU tutorials, and Chrome’s WebGPU guide outline end-to-end browser setup and profiling strategies.citeturn0search0turn0search3turn0search8
 - **Canvas baseline prep:** MDN and Chrome performance docs plus OffscreenCanvas guidance inform batching strategies and worker handoff for Canvas-rendered agents.citeturn1search0turn1search1turn1search2turn1search3
+
+## 2026-07-11
+- **Database decision:** The earlier DuckDB WebAssembly option is rejected. FrankenSQLite is the only ScriptBots SQL/database engine on native and browser targets.
+- **Pinned FrankenSQLite WASM boundary:** At revision `cd9990bb16291d8c7c247b75b47faae8d7701adb`, `fsqlite-wasm` executes against `MemoryVfs`; non-memory paths are not implemented. The optional `backup` feature can import/export a complete standard-SQLite image.
+- **Durability architecture:** Run FrankenSQLite in a dedicated browser storage Worker. Use bounded, sequenced persistence batches; store opaque SQLite-image checkpoints plus an idempotent batch journal in IndexedDB until a native FrankenSQLite OPFS/IndexedDB VFS is implemented and qualified.
+- **Honest acknowledgement states:** An in-memory SQL transaction is `CommittedVolatile`. Only a successfully stored checkpoint or journal record is `Durable`.
+- **Integration gate:** The upstream TypeScript Worker/SDK assumes feature-gated APIs absent from the default WASM artifact, and upstream CI does not yet run the embedded browser tests. ScriptBots must build an explicit feature matrix and pass real browser recovery tests before advertising persistent browser storage.

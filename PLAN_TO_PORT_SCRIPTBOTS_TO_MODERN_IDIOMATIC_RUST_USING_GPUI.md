@@ -8,7 +8,7 @@
 - Exploit data-parallelism with Rayon to scale agent updates on modern multi-core CPUs.
 - Replace legacy GLUT rendering with a GPU-accelerated GPUI front-end, using declarative views plus imperative canvas drawing to render thousands of agents at 60+ FPS on macOS and Linux, the platforms GPUI currently targets.
 - Ship cross-platform binaries (macOS + Linux) with reproducible builds via Cargo, and include automated tests/benchmarks validating simulation invariants.
-- Provide high-fidelity telemetry: pause/resume, deterministic replay, and offline analytics pipelines backed by DuckDB snapshots.
+- Provide high-fidelity telemetry: pause/resume, deterministic replay, and offline analytics pipelines backed by FrankenSQLite snapshots.
 - Support hot-swapping of agent brain implementations—from simple heuristics to differentiable neural networks—without recompiling the simulation.
 
 ## Current C++ Baseline (Reference Snapshot)
@@ -23,7 +23,7 @@
 - `Cargo.toml` (workspace) with members:
   - `crates/scriptbots-core`: Pure simulation logic, no UI or platform dependencies.
   - `crates/scriptbots-brain`: Houses `Brain` trait + concrete implementations (`mlp`, `dwraon`, `assembly`). Depends on `scriptbots-core`.
-  - `crates/scriptbots-storage`: Abstraction over DuckDB for persistence, journaling, and analytics exports built atop the `duckdb` crate.
+  - `crates/scriptbots-storage`: FrankenSQLite-owned persistence, journaling, replay, and read-only analytics exports.
   - `crates/scriptbots-brain-neuro`: Optional crate that wraps NeuroFlow feed-forward networks for more advanced brains, kept isolated behind a Cargo feature for lean builds.
   - `crates/scriptbots-render`: GPUI views, canvas drawing, input handling, overlays.
   - `crates/scriptbots-app`: Binary crate wiring simulation loop, GPUI application, CLI/config loading.
@@ -47,7 +47,7 @@
   - History/event info (`indicator`, `sound_output`, `select_state`). [Backed by `IndicatorState`, `SelectionState`, and runtime fields]
   - `id: AgentId` generational slotmap handle to prevent stale references.
 - Configuration via `ScriptBotsConfig` (deserialized from `TOML`/`RON`) replacing `settings.h`; defaults compiled with `serde` + `once_cell` for global fallback. [Completed: validation + RNG seeding + defaults]
-- `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in DuckDB, mutated independently of runtime brain instances, and reproduced across brain backends. [Completed: schema + validation helpers]
+- `BrainGenome`: versioned specification of topology, activation mix, and hyperparameters that can be stored in FrankenSQLite, mutated independently of runtime brain instances, and reproduced across brain backends. [Completed: schema + validation helpers]
 
 ### Time-Step Pipeline
 1. **Aging and Periodic Tasks** [Completed: arena age increments + TickEvents flush flags]: Increment ages every 100 ticks, flush charts every 1000, roll epoch at 10,000.
@@ -61,7 +61,7 @@
 7. **Food Intake & Sharing** [Completed: cell intake + sharing baseline]: Process using `par_iter_mut` with atomic adds or gather stage followed by sequential commit to avoid floating-point race conditions (determinism).
 8. **Combat and Death** [Completed: spike collisions & removal queue]: Evaluate spike collisions using spatial index, queue health changes, then apply.
 9. **Reproduction & Spawning** [Completed: queued spawn orders + child mutations]: Collect reproduction events into `Vec<SpawnOrder>`, apply sequentially to maintain deterministic ordering, leveraging `rand_distr` for gaussian mutations.
-10. **Persistence Hooks** [Completed: tick summary + pluggable sink]: Stream agent snapshots, food deltas, and event logs into DuckDB tables using batched transactions (e.g., every N ticks or when buffers exceed threshold). Leverage Arrow/Parquet features for zero-copy exports when advanced analytics are enabled.
+10. **Persistence Hooks** [Completed: tick summary + pluggable sink]: Stream agent snapshots, food deltas, and event logs into FrankenSQLite through a bounded worker that owns its connection, batches transactions, and publishes durability acknowledgements plus immutable analytics snapshots.
 11. **Cleanup** [Completed - GPT-5 Codex 2025-10-22: deterministic death queue drains, stable arena retention, runtime cleanup + tests]: Remove dead agents using `Vec::retain` (single-threaded) or stable partition maintaining deterministic ordering; recycle IDs as needed.
 
 ## Brain System
@@ -87,8 +87,8 @@
   - Use `fastrand::Rng` per agent seeded by master seed + agent ID to keep reproducible across thread counts.
 - Metrics:
   - Expose `SimulationMetrics` (FPS, agent count, reproduction rate) updated atomically, consumed by UI overlays.
-- DuckDB integration threading:
-  - Maintain a dedicated async task that receives structured log batches over an MPSC channel, writes them via a pooled DuckDB `Connection`, and periodically checkpoints/optimizes storage. Use `duckdb`'s bundled feature in development to avoid external dependencies, and adopt `Connection::open_with_flags` variants for file-backed persistence in production.
+- FrankenSQLite integration threading:
+  - Maintain one bounded worker thread that creates, owns, flushes, and closes its non-`Send` FrankenSQLite `Connection`. Writers receive typed acknowledgements; renderers consume immutable snapshots; exporters use a separate read-only connection.
 - Accelerator hooks:
   - Keep sensor aggregation and brain inference behind pluggable traits so alternative implementations (SIMD-optimized, GPU-backed) can be introduced without touching higher-level logic. Prototype GPU execution by batching inference into wgpu compute shaders or other accelerators once profiling justifies the investment.
 
@@ -292,7 +292,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
   - Maintain double buffer (`SimulationSnapshot` with `Arc<[AgentRenderData]>` + `Arc<[FoodCell]>`). UI clones `Arc`s cheaply, ensuring zero-copy render pipeline.
   - Provide interpolation for camera smoothing if we add variable render rate.
 - Storage Sync:
-  - On snapshot publication, enqueue summary records (population counts, resource totals) for DuckDB ingestion, and optionally archive raw agent rows every configurable cadence for replay/debug. Employ DuckDB's Arrow integration for efficient bulk writes when analytics pipelines demand columnar exports. [Completed - GPT-5 Codex 2025-10-21]
+  - On snapshot publication, enqueue summary records (population counts, resource totals) for FrankenSQLite ingestion, and optionally archive raw agent rows every configurable cadence for replay/debug. [Completed - GPT-5 Codex 2025-10-21; storage engine replaced 2026-07-11]
   - [Completed - GPT-5 Codex 2025-10-23] Replay event logging persisted each tick (RNG scopes, brain outputs, actions) with CLI to verify and diff recorded vs. simulated streams.
 
 ## Visual Polish & Audio Enhancements
@@ -323,14 +323,14 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
 - Bench harness (`criterion`) measuring ticks/sec at various agent counts.
 - GPUI view tests using `#[gpui::test]` macro to ensure layout compiles and actions dispatch.
 - Storage tests:
-  - Integration suite writing simulated batches into DuckDB in-memory databases, asserting schema evolution, transaction durability, and query latency. [Completed - GPT-5 Codex 2025-10-21]
-  - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from DuckDB logs. [Completed - GPT-5 Codex 2025-10-22]
+  - Integration suite writing simulated batches into FrankenSQLite in-memory and file-backed databases, asserting schema evolution, transaction durability, and query behavior. [Completed - engine replacement 2026-07-11]
+  - Snapshot-based golden tests verifying historical queries (population trends, kill counts) match expected outputs when replayed from FrankenSQLite logs. [Completed - engine replacement 2026-07-11]
 - Continuous integration: GitHub Actions with matrix (macOS 14, Ubuntu 24.04), caching `cargo` artifacts, running tests + release build. [Completed - GPT-5 Codex 2025-10-22]
 - [Currently In Progress - 2025-10-29 WhiteCat] Audit failing CI runs (fmt, wasm-pack, cross-platform checks, replay determinism) and collect log excerpts for remediation plan.
 - [Currently In Progress - 2025-10-29 OrangeHill] CI hygiene sweep: rustfmt across workspace, wasm-pack compatibility fix (`--enable-nontrapping-float-to-int`), and portable `target-cpu=x86-64-v3` baseline so CI avoids SIGILL while retaining local `native` opt-in via `RUSTFLAGS`.
 - [Currently In Progress - 2025-10-29 LilacLake] Update `AppCli` test helpers to construct complete structs, unblocking Windows/macOS CI jobs after recent CLI flag additions.
 - [Completed - 2025-10-29 BlackMountain] Fix Windows test failure in `scriptbots-core` by capturing config fields before moving into `WorldState::new` (no clone required).
-- [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI: generate baseline/candidate DuckDB runs in headless terminal mode and diff event streams via CLI (`--replay-db`, `--compare-db`).
+- [Completed - GPT-5 Codex 2025-10-23] Replay determinism pipeline in CI originally generated DuckDB runs; the active pipeline now generates unique FrankenSQLite runs and diffs event streams via CLI (`--replay-db`, `--compare-db`).
 - [Completed - GPT-5 Codex 2025-10-23] Wasm CI job builds `scriptbots-web` via `wasm-pack` and runs headless Chrome tests (Playwright-provisioned Chromium).
 - [Completed - 2025-10-29 LilacLake] Adjusted GitHub Actions wasm job to pass `--headless --chrome` before the crate path so wasm-pack’s latest CLI recognizes the browser target.
 - [Currently In Progress - 2025-10-29 RedStone] Wayland compositor version fallback so Linux GUI no longer panics on wl_compositor v2 hosts.
@@ -353,13 +353,13 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
   - Delivered the `scriptbots-control` CLI (clap + reqwest + ratatui) offering scripted updates (`set`, `patch`) and a live dashboard (`watch`) that highlights config deltas while the GPUI shell runs.
 - [Completed - GPT-5 Codex 2025-10-22] Migrated configuration writes onto a crossfire-backed command bus drained inside the simulation loop and exposed an HTTP MCP server (default `127.0.0.1:8090`) so control surfaces enqueue consistent `ControlCommand`s rather than mutating `WorldState` directly.
 - Diagnostics:
-  - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in DuckDB for analytics and UI visualization.
+  - Persist brain metrics (loss curves, weight norms, training tick) alongside genomes in FrankenSQLite for analytics and UI visualization.
   - Provide debug tooling to render network topologies (layer shapes, activations) inside the inspector panel.
 
 ## Modularity & Extensibility Enhancements
 - Optional ECS: evaluate `hecs`/`legion` for certain subsystems (sensing, effects) after benchmarking; keep default architecture straightforward.
 - Scripting sandbox: offer a Wasm or Lua plug-in layer for experimental sensors/reward shaping, gated by capability lists to preserve determinism.
-- Deterministic replay & branching: treat every RNG draw and brain choice as an event stored in DuckDB, enabling branch-and-replay workflows and regression reproduction.
+- Deterministic replay & branching: treat every RNG draw and brain choice as an event stored in FrankenSQLite, enabling branch-and-replay workflows and regression reproduction.
 - Scenario layering: allow configs to be composed (base + biome + experiment) controlling constants, active sensors, brain registries, and UI themes.
 
 ## Parity Gaps vs. Original ScriptBots (Non-Rendering)
@@ -388,9 +388,9 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
   - [ ] Develop brain registry benchmarking (per-brain tick cost, cache hit rates).
 - **Analytics & Replay**
 - [Completed - GPT-5 Codex 2025-10-23: Storage exposes `load_replay_events`/`max_tick`/`replay_event_counts`; `scriptbots-app` ships headless replay CLI (`--replay-db`, `--compare-db`, `--tick-limit`) with colored divergence diagnostics] Extend persistence schema to store replay events (per-agent RNG draws, brain outputs, actions).
-  - [Completed - GPT-5 Codex 2025-10-23: Deterministic replay runner records per-tick events via `ReplayCollector` and verifies against DuckDB logs.]
+  - [Completed - GPT-5 Codex 2025-10-23: Deterministic replay runner records per-tick events via `ReplayCollector`; persistence was migrated from the former DuckDB logs to FrankenSQLite in 2026.]
   - [Currently In Progress - GPT-5 Codex 2025-10-23: Wire deterministic replay CLI into CI pipelines for baseline vs. candidate runs]
-  - [ ] Add DuckDB parity queries (population charts, kill ratios, energy histograms) vs. C++ scripts.
+  - [ ] Add FrankenSQLite parity queries (population charts, kill ratios, energy histograms) vs. C++ scripts.
   - [ ] Provide CLI tooling to diff runs (Rust vs. C++ baseline) and highlight divergences.
 - **Feature Toggles & UX Integration (Non-rendering)**
   - [Completed - GPT-5 Codex 2025-10-23: Added layered scenario configs (`--config` / `SCRIPTBOTS_CONFIG`) merging TOML/RON files ahead of env overrides] Surfacing runtime toggles: CLI/ENV for enabling brains, selecting indices, adjusting mechanics.
@@ -435,7 +435,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
    - Seed NeuroFlow weights using the world RNG for deterministic runs. [Completed - GPT-5 Codex 2025-10-21]
    - Add runtime configuration toggle to enable NeuroFlow brains without compile-time features. [Completed - GPT-5 Codex 2025-10-21]
 6. **Persistence Layer (Weeks 7-8)**
-   - Stand up `scriptbots-storage`, define DuckDB schema (agents, ticks, events, metrics). [Completed - GPT-5 Codex 2025-10-22]
+   - Stand up `scriptbots-storage`, define the persistence schema (agents, ticks, events, metrics). [Completed - GPT-5 Codex 2025-10-22 with DuckDB; migrated to FrankenSQLite 2026-07-11]
    - Implement buffered writers, compaction routines, and analytics helpers (e.g., top predators query). [Completed - GPT-5 Codex 2025-10-22]
 7. **Rendering Layer (Weeks 8-10)** [Completed - GPT-5 Codex 2025-10-22: GPUI stats overlay and controls polished; Terminal renderer MVP implemented with auto-fallback + headless CI]
 - Build GPUI window, canvas renderer, agent inspector UI. [Completed - GPT-5 Codex 2025-10-22: window shell, HUD, canvas renderer, and inspector panel shipped]
@@ -455,7 +455,7 @@ This section enumerates concrete SIMD opportunities beyond the already‑shipped
 - **Determinism under parallelism**: Floating-point reductions can diverge; solve via deterministic orderings and staged accumulations.
 - **Performance regressions**: Large agent counts may stress GPUI canvas; prototype rendering with 10k agents early, profile using Tracy/`wgpu-profiler`.
 - **Brain extensibility**: Trait object overhead; consider `enum BrainImpl` with static dispatch once stable.
-- **DuckDB durability/throughput**: Excessive per-tick writes could bottleneck; mitigate with batched transactions, asynchronous writers, and optional toggles for high-frequency logging. Evaluate Parquet exports for heavy analytics workloads.
+- **FrankenSQLite durability/throughput**: Excessive per-tick writes could bottleneck; mitigate with bounded admission, batched transactions, explicit durability receipts, and optional toggles for high-frequency logging.
 - **NeuroFlow maturity**: Crate targets CPU feed-forward networks; keep abstractions loose so alternative engines can slot in if requirements outgrow NeuroFlow.
 - **Team familiarity with GPUI**: Documentation is evolving; allocate ramp-up time exploring official docs, tutorials, and community component libraries such as `gpui-component`.
 
@@ -487,7 +487,7 @@ Keyboard/UX details: the preset micro-menu mirrors button styling, supports focu
 - Purpose: quick A/B within a run (population, births/deaths, avg energy).
 - MVP: "Set Baseline" button stores current summary; HUD/TUI shows Δ and %Δ.
 - Surfaces: HUD button + toggle (GPUI baseline button added in Simulation Controls); TUI key `b` to set/reset (implemented in Terminal HUD); CLI `control_cli baseline set/reset`.
-- Data/Perf: store one struct in memory; optional DuckDB event for audit.
+- Data/Perf: store one struct in memory; optional FrankenSQLite event for audit.
 - Testing: unit-test delta math; snapshot HUD/TUI lines.
 - Complexity: S.
 
@@ -522,7 +522,7 @@ Implementation notes [2025-10-23]:
 - Purpose: track cohorts across ticks for focus and stats.
 - MVP: add/remove string tags to selected agents; highlight + cohort counts.
 - Surfaces: HUD tag input; TUI command `:tag add foo`/`remove`.
-- Data/Perf: transient runtime map `AgentId -> SmallVec<Tag>`; optional DuckDB write on explicit export.
+- Data/Perf: transient runtime map `AgentId -> SmallVec<Tag>`; optional FrankenSQLite write on explicit export.
 - Testing: determinism (tags do not affect physics); UI smoke.
 - Complexity: S.
 
@@ -546,7 +546,7 @@ Implementation notes [2025-10-23]:
 - Purpose: quick glance at heredity and mutation flow.
 - MVP: 2-level ancestry (parents→child) with ages/traits; link to inspector.
 - Surfaces: HUD inspector subpanel; TUI detail pane.
-- Data/Perf: store parent ids at birth; optional DuckDB write.
+- Data/Perf: store parent ids at birth; optional FrankenSQLite write.
 - Testing: reproduction unit test ensures parent linkage; UI snapshot.
 - Complexity: S-M.
 
@@ -583,7 +583,7 @@ Implementation notes [2025-10-23]:
 - Complexity: S.
 
 ### 13) Quick CSV exports [Completed - 2025-10-23 Codex: added `scriptbots-control export` for ticks/metrics CSV dumps]
-- Purpose: spreadsheet-friendly metrics without opening DuckDB.
+- Purpose: spreadsheet-friendly metrics through the storage crate's read-only FrankenSQLite API.
 - MVP: CLI `export metrics --last 1000 --out metrics.csv`; similar for `ticks`.
 - Surfaces: CLI; REST `GET /api/export/metrics.csv` (optional).
 - Data/Perf: simple SELECT + CSV writer; small temp buffer.
@@ -594,7 +594,7 @@ Implementation notes [2025-10-23]:
 - Purpose: aggregate behavior across seeds quickly.
 - MVP: CLI `run-seeds --preset arctic --seeds 20 --ticks 500` → summary table (mean/p95 of key metrics).
 - Surfaces: CLI only; writes markdown/CSV summary.
-- Data/Perf: headless runs; optional DuckDB per run path.
+- Data/Perf: headless runs; optional FrankenSQLite path per run.
 - Testing: deterministic results per seed list; performance guard.
 - Complexity: M.
 
@@ -610,7 +610,7 @@ Implementation notes [2025-10-23]:
 - Purpose: transparency and quick undo during experiments.
 - MVP: bounded list of last K patches with timestamp; revert re-applies inverse patch.
 - Surfaces: HUD panel; TUI list; REST `GET /api/config/audit` (implemented: returns recent in-process config patches with tick).
-- Data/Perf: store patches in ring buffer; optional DuckDB audit table.
+- Data/Perf: store patches in ring buffer; optional FrankenSQLite audit table.
 - Testing: apply→revert round-trip yields identical config; determinism preserved.
 - Complexity: M.
 
@@ -1006,7 +1006,7 @@ Knobs gate work under `SB_WGPU_MAX_FPS` and reuse last‑ready frame when budget
 
 - **Persistence & Replay**
   - Extend `MapArtifactMetadata` with `hydrology_digest` (hash of hydrology field + rainfall seeds) and store rain events in the persistence log for deterministic replays.
-  - Add DuckDB tables `hydrology_basins`, `rain_events`, `flood_snapshots` for analytics.
+  - Add FrankenSQLite tables `hydrology_basins`, `rain_events`, `flood_snapshots` for analytics.
 
 - **Testing & Validation**
   - Unit tests for hydrology solver (e.g., synthetic bowl map with known outlet) verifying overflow order.

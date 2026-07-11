@@ -9,7 +9,7 @@ serde_json,1.0.132,ready,"Works in wasm; larger payloads possible",Evaluate `pos
 thiserror,2.0.17,ready,"Pure Rust error derive",None required,Web Crate Owner,Phase 2
 ordered-float,4.6.0,ready,"No OS bindings",None required,Web Crate Owner,Phase 2
 slotmap,1.0.7,ready,"Pure Rust data structure",None required,Web Crate Owner,Phase 2
-duckdb,1.4.1,native-only,"Links bundled C++ DuckDB; not wasm compatible","Disable for wasm crate; investigate duckdb-wasm bridge",Storage Lead,Phase 4
+fsqlite-wasm,0.1.16 (git cd9990bb),adapt,"Pinned WASM facade is memory-only; OPFS/IndexedDB VFS and the default TS worker contract are not production-ready","Use a dedicated storage Worker; qualify explicit backup/batch features; persist SQLite image checkpoints plus an IndexedDB journal until an upstream durable VFS passes browser E2E",Storage Lead,Phase 4
 gpui,0.2.1 (git),native-only,"Targets macOS/Linux via winit/metal/vulkan; no browser backend","Keep native crate untouched; implement separate web renderer",Rendering Lead,Phase 3
 kira,0.10.1,adapt,"Wasm build lacks streaming and gapless playback","Ship muted by default; fallback to Web Audio API",Rendering Lead,Phase 4
 candle-core,0.4.1,adapt,"Has wasm support but needs feature selection","Disable heavyweight backends initially; evaluate per feature",Brain Team,Phase 5

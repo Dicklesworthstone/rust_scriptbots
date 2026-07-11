@@ -20,7 +20,7 @@
 - **Architect** (initially: requesting user): approves scope decisions, accepts PRs altering core crates.
 - **Web Crate Owner**: responsible for `scriptbots-web` crate structure, wasm toolchain upgrades.
 - **Rendering Lead**: evaluates browser rendering stack, owns canvas/WebGPU integration.
-- **Storage Lead**: researches browser persistence (IndexedDB, `duckdb-wasm`).
+- **Storage Lead**: owns the FrankenSQLite WASM worker, checkpoint journal, and honest durability states.
 - **QA & Determinism Lead**: maintains regression suite comparing native vs wasm outputs.
 
 ### 0.2 Communication Primitives
@@ -48,7 +48,7 @@
 ### 1.2 Dependency Audit [Completed 2025-10-22 — see docs/wasm/dependency_audit.csv]
 - Inventory every crate transitively pulled into `scriptbots-web`; flag categories:
   - ✅ **Pure Rust / wasm-ready**: `serde`, `rand`, `slotmap`, etc.
-  - ⚠️ **Requires adaptation**: `rayon`, `tracing` (subscriber support in wasm), `duckdb`.
+  - ⚠️ **Requires adaptation**: `rayon`, `tracing` (subscriber support in wasm), `fsqlite-wasm` (currently memory-only).
   - ❌ **Native-only**: `tch`, `kira` advanced modes, GPUI.
 - Output `dependency_audit.csv` capturing crate name, version, wasm status, mitigation plan.
 
@@ -61,8 +61,8 @@
 - Produce decision record (`ADR-001-wasm-rendering.md`) with trade-offs and chosen path.
 
 ### 1.4 Storage Strategy Draft [Completed 2025-10-22 — see docs/wasm/adrs/ADR-002-browser-persistence.md]
-- Research `duckdb-wasm` integration patterns; outline JS glue requirements.
-- Explore IndexedDB or WebAssembly linear-memory journaling as interim solution.
+- Qualify the pinned `fsqlite-wasm` API and its memory-only browser boundary.
+- Define a dedicated storage Worker plus SQLite-image checkpoint and IndexedDB batch-journal recovery protocol.
 - Deliverable: `ADR-002-browser-persistence.md`.
 
 ### 1.5 Audio Strategy Draft [Completed 2025-10-22 — see docs/wasm/adrs/ADR-003-wasm-audio.md]
@@ -167,12 +167,14 @@
 
 ### 4.1 Short-Term Persistence
 - Implement in-memory ring buffer of snapshots for replay within single session.
-- Allow exporting snapshots as downloadable JSON/Parquet via browser download APIs.
+- Allow exporting snapshots as downloadable JSON and qualified standard-SQLite images via browser download APIs.
 
-### 4.2 DuckDB Integration Pilot
-- Connect to `duckdb-wasm` (bundled or CDN).
-- Bridge `record_tick` calls to the JS DuckDB instance; ensure deterministic ordering.
-- Prototype ingestion of limited schema (ticks table) before full parity.
+### 4.2 FrankenSQLite Worker and Recovery Pilot
+- Build a ScriptBots-owned `fsqlite-wasm` artifact with an explicit minimal feature matrix, including full-image backup/import when qualified.
+- Run `fsqlite-wasm` at `:memory:` inside a dedicated storage Worker; bridge ordered `PersistenceBatch` messages through a bounded `MessageChannel` with sequence/idempotency keys.
+- Report in-memory commits as `CommittedVolatile`. Persist an opaque SQLite-image checkpoint plus an IndexedDB batch journal before reporting `Durable`.
+- Restore the newest valid image, replay later journal batches, and verify sequence/digest state after Worker or tab restart.
+- Replace the checkpoint adapter with a real FrankenSQLite OPFS/IndexedDB VFS only after upstream implements it and ScriptBots browser E2E qualifies it.
 
 ### 4.3 Analytics UI
 - Optional: integrate browser-based charts (D3.js or Plotly) reading from exported data.
@@ -234,7 +236,7 @@
 | ---- | ------ | ---------- | ---------- |
 | GPUI parity gap | Medium | High | Decouple UI; reuse data models but acknowledge cosmetic divergence. |
 | Rayon on wasm blocking execution | High | Medium | Start single-threaded; introduce wasm thread pool after MVP; guard with compile-time features. |
-| DuckDB port complexity | Medium | Medium | Ship without persistence initially; stage `duckdb-wasm` integration as optional add-on. |
+| FrankenSQLite browser durability gap | High | High | Keep SQL in `fsqlite-wasm`; use explicit volatile/durable states and an application-managed SQLite-image checkpoint plus journal until a native browser VFS is qualified. |
 | Browser perf shortfalls | High | Medium | Profile early, optimize data transfer (shared memory, binary snapshots), and cap agent count if necessary. |
 | Feature drift between native & web | Medium | Medium | Maintain shared test suites and documentation; gate unsupported features to fail fast. |
 | Toolchain churn (wasm-bindgen breaking changes) | Low | Medium | Pin versions, monitor release notes, add coverage tests in CI. |
@@ -245,7 +247,7 @@
 - Should the wasm renderer aim for visual parity with GPUI or adopt a browser-native aesthetic?
 - Does the team want web builds to support multiplayer/remote observers out of the gate?
 - Are we comfortable relying on WebGPU (still guarded behind flags in some browsers) or do we need a Canvas2D fallback?
-- How should analytics data sync back to native storage (e.g., upload DuckDB snapshots)?
+- How should durable run bundles sync back to native storage while preserving SQLite image, journal watermark, schema version, and replay digest?
 
 ---
 

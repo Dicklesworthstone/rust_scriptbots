@@ -64,7 +64,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `tokio` | Async runtime for server/API/MCP endpoints |
 | `axum` | HTTP API server framework |
 | `ratatui` | Terminal UI framework for console mode |
-| `duckdb` | Embedded analytics database for simulation metrics |
+| `fsqlite` (`=0.1.16`, rev `cd9990bb16291d8c7c247b75b47faae8d7701adb`) | FrankenSQLite persistence for simulation metrics, replay, and run artifacts |
 | `rayon` | Data parallelism for simulation tick processing |
 | `rand` | RNG with `SmallRng` for agent behavior |
 | `slotmap` | Generational arena for agent handles (`AgentId`) |
@@ -195,7 +195,7 @@ cargo test --workspace --all-features
 | `scriptbots-brain-ml` | Candle/Tract/Tch inference backends, model loading, brain adapter integration |
 | `scriptbots-brain-neuro` | Neuroflow brain wrapper, training, serialization |
 | `scriptbots-index` | Spatial indexing (uniform grid, R-tree, k-d tree), neighbor queries, boundary conditions |
-| `scriptbots-storage` | DuckDB persistence, metric recording, replay events, pipeline flush/sync |
+| `scriptbots-storage` | FrankenSQLite persistence, metric recording, replay events, bounded pipeline acknowledgements, analytics snapshots |
 | `scriptbots-render` | GPUI rendering, camera controls, world visualization, audio integration |
 | `scriptbots-world-gfx` | wgpu pipeline, shader compilation, offscreen readback, compute binning |
 | `scriptbots-bevy` | Bevy ECS integration, entity spawning, system scheduling |
@@ -220,7 +220,7 @@ Simulates a 2D world populated by autonomous agents with neural network brains t
 
 ### Planning Document
 
-The primary guide for this project is `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`. This is the "bible" for development. Whenever you decide to work on a task from this document, you should immediately notate "in line" (in place) in the document in a bracketed notation, such as `[Currently In Progress]`, to avoid conflicts with other concurrent agents.
+The authoritative guide is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`. The older GPUI port plan is retained as historical evidence and must not override the recovery plan, current source, executable tests, or Beads. Whenever you start a task from the active plan, immediately mark it in place with a bracketed notation such as `[Currently In Progress]` to avoid conflicts with concurrent agents.
 
 In general, you should also try to follow all suggested best practices listed in `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`.
 
@@ -235,7 +235,7 @@ WorldState::tick() ────→ ┬─ Sensor Collection (eyes, proximity, bl
                          ├─ Agent Actions (movement, eating, reproduction, combat)
                          ├─ Food/Terrain/Hydrology Updates
                          ├─ Evolution (selection, crossover, mutation)
-                         └─ Analytics (DuckDB storage pipeline)
+                         └─ Analytics (bounded FrankenSQLite storage worker)
                                     │
 Render Layer ──────────→ ┬─ GPUI (native GPU-accelerated UI)
                          ├─ Bevy (ECS game engine)
@@ -255,7 +255,7 @@ rust_scriptbots/
 │   ├── scriptbots-brain-ml/                # ML backends (Candle, Tract, Tch)
 │   ├── scriptbots-brain-neuro/             # Neuroflow brain backend
 │   ├── scriptbots-index/                   # Spatial indexing (uniform grid, R-tree, k-d tree)
-│   ├── scriptbots-storage/                 # DuckDB analytics persistence pipeline
+│   ├── scriptbots-storage/                 # FrankenSQLite persistence worker + analytics snapshots
 │   ├── scriptbots-render/                  # GPUI rendering + audio (kira)
 │   ├── scriptbots-world-gfx/              # wgpu custom world renderer
 │   ├── scriptbots-bevy/                    # Bevy ECS rendering backend
@@ -281,7 +281,7 @@ rust_scriptbots/
 | `scriptbots-brain-ml` | `src/lib.rs` | ML backend adapters (Candle, Tract, Tch) |
 | `scriptbots-brain-neuro` | `src/lib.rs` | Neuroflow neural network brain adapter |
 | `scriptbots-index` | `src/lib.rs` | `NeighborhoodIndex` trait, `UniformGridIndex`, R-tree/k-d tree spatial queries |
-| `scriptbots-storage` | `src/lib.rs` | `Storage`, `StoragePipeline`, DuckDB schema, metric recording, replay persistence |
+| `scriptbots-storage` | `src/lib.rs` | `Storage`, `StoragePipeline`, FrankenSQLite schema, metric/replay persistence, immutable analytics snapshots |
 | `scriptbots-render` | `src/lib.rs` | GPUI rendering, camera system, world visualization, agent drawing |
 | `scriptbots-world-gfx` | `src/lib.rs` | wgpu pipeline, WGSL shaders, offscreen readback for GPUI composition |
 | `scriptbots-bevy` | `src/lib.rs` | Bevy ECS plugin, entity management, system scheduling |
@@ -306,8 +306,9 @@ rust_scriptbots/
 | `ScriptBotsConfig` | All simulation tuning knobs (mutation rates, food, terrain, rendering) |
 | `FoodGrid` | Spatial grid of food cells with growth/decay dynamics |
 | `TerrainLayer` | Terrain types (land, water, hazard) with procedural generation |
-| `Storage` | DuckDB-backed analytics persistence |
-| `StoragePipeline` | Async batch writer for metrics and replay events |
+| `Storage` | Same-thread FrankenSQLite persistence boundary; owns the connection and typed SQL conversions |
+| `StoragePipeline` | Bounded, acknowledged batch writer for metrics, replay events, flush, and shutdown |
+| `AnalyticsSnapshot` | Immutable latest-value read model published lock-free to GUI, TUI, and API consumers |
 | `NeighborhoodIndex` | Trait for spatial queries (uniform grid, R-tree, k-d tree) |
 | `Tick` | Newtype wrapper for simulation time step (`u64`) |
 | `ControlCommand` | Enum of simulation control actions |
@@ -323,7 +324,7 @@ We want all console output to be informative, detailed, stylish, colorful, etc. 
 
 - **Pluggable brain architecture** — `Brain` trait allows MLP, DWRAON, Assembly, ML, and Neuroflow backends to coexist and compete
 - **Generational slot map (`slotmap`)** for agent handles — O(1) lookup, safe reuse, no dangling references
-- **DuckDB for analytics** — columnar storage for efficient time-series queries on simulation metrics
+- **FrankenSQLite for persistence and analytics** — one SQLite-compatible run database, isolated behind a bounded worker and immutable read models
 - **Multiple rendering backends** — GPUI (native), Bevy (ECS), wgpu (custom), Ratatui (terminal), WASM (browser)
 - **Rayon for data parallelism** — agent tick processing parallelized with configurable thread budgets
 - **SIMD via `wide`** — vectorized math for simulation hot paths
@@ -331,6 +332,15 @@ We want all console output to be informative, detailed, stylish, colorful, etc. 
 - **WASM target** — `scriptbots-web` compiles to WebAssembly for browser deployment via `wasm-pack`
 - **MCP server integration** — agents can interact with the simulation via MCP protocol
 - **Workspace-level lint config** — clippy pedantic + nursery enabled, consistent across all crates
+
+### FrankenSQLite Storage Contract
+
+- **One engine:** use the public `fsqlite` facade at package version `0.1.16`, pinned to immutable revision `cd9990bb16291d8c7c247b75b47faae8d7701adb` from `https://github.com/Dicklesworthstone/frankensqlite`. The workspace declaration uses `version = "=0.1.16"`, `default-features = false`, and `features = ["native"]` until the lean native feature qualification is complete.
+- **Thread ownership:** `fsqlite::Connection` is deliberately `!Send + !Sync`. Construct, use, explicitly close, and drop it inside the storage worker thread. Never place a connection or connection-owning `Storage` inside cross-thread `Arc<Mutex<_>>` state.
+- **Bounded and acknowledged:** `StoragePipeline` carries bounded persistence commands. Lossless lifecycle, replay, and command-journal records apply backpressure rather than disappearing. Flush and shutdown have explicit acknowledgements; a command becomes `Durable` only after its transaction is committed and acknowledged.
+- **Lock-free reads:** the worker atomically publishes immutable `Arc<AnalyticsSnapshot>` latest values. GUI, TUI, and API consumers load them without a mutex; rendering and paint paths never acquire a database lock or issue SQL.
+- **Modes and files:** the application storage targets are `file` and `memory`. `file` opens `SCRIPTBOTS_STORAGE_PATH` or creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`; `memory` opens `:memory:` through the same FrankenSQLite implementation. Never reuse a single-run file for a new run.
+- **Maintenance:** checkpoint, integrity checking, and `VACUUM` are explicit storage-worker operations, never UI-path work. Do not claim unsupported pragmas performed maintenance.
 
 ---
 
