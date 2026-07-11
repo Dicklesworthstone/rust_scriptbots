@@ -629,3 +629,22 @@ No version migration in this ledger is authorized merely by being newer.
 - **Result:** accepted; production render closure is narrower with no source or
   behavior change.
 - **Rollback:** move the existing path dependency back to `[dependencies]`.
+
+## 2026-07-11 — Remove Bevy's unused color edge
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-bevy` manifest edge
+- **Before manifest SHA-256:**
+  `574abdc6068025a61ef7fb06782543278d299842c5ce5633367c6797cf4d728e`
+- **After manifest SHA-256:**
+  `2997b8a9e58d1136cba8db54bdebe1349f7bd51cef754f661101346e3375e1c9`
+- **Removed:** direct `owo-colors 4.0`; exact Bevy source and test search has
+  no import, trait use, macro, qualified path, or feature reference.
+- **Lock delta:** byte-identical at
+  `23e2d9033ba87e30fb9692688daf0b4d5e64171a0bdefe9e21b3a29d17d1c69c`;
+  the package remains a live `scriptbots-app` dependency.
+- **Verification:** workspace metadata resolves with the exact one-edge
+  manifest delta. No Bevy source or feature changed.
+- **Result:** accepted; Bevy no longer claims a terminal-color dependency it
+  does not use.
+- **Rollback:** restore only the one manifest edge.
