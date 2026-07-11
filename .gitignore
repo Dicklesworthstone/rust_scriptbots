@@ -13,10 +13,15 @@ vendor/
 scriptbots.db.wal
 scriptbots*.db
 scriptbots*.db.wal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 crates/scriptbots-render/frames_render_test/*.png
 *.png
 /tmp/
 /logs/
-
-# bv (beads viewer) local config and caches
-.bv/

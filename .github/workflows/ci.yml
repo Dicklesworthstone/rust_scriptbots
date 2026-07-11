@@ -241,6 +241,9 @@ jobs:
     name: Replay Determinism (ubuntu)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      SCRIPTBOTS_BASELINE_DB: ${{ runner.temp }}/scriptbots-${{ github.run_id }}-${{ github.run_attempt }}-baseline.sqlite
+      SCRIPTBOTS_CANDIDATE_DB: ${{ runner.temp }}/scriptbots-${{ github.run_id }}-${{ github.run_attempt }}-candidate.sqlite
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -268,34 +271,30 @@ jobs:
           SCRIPTBOTS_MODE: terminal
           SCRIPTBOTS_TERMINAL_HEADLESS: "1"
           SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES: "16"
-          SCRIPTBOTS_STORAGE_PATH: ${{ github.workspace }}/ci-baseline.duckdb
-        run: |
-          rm -f "$SCRIPTBOTS_STORAGE_PATH"
-          cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
+          SCRIPTBOTS_STORAGE_PATH: ${{ env.SCRIPTBOTS_BASELINE_DB }}
+        run: cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
 
       - name: Generate candidate replay database
         env:
           SCRIPTBOTS_MODE: terminal
           SCRIPTBOTS_TERMINAL_HEADLESS: "1"
           SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES: "16"
-          SCRIPTBOTS_STORAGE_PATH: ${{ github.workspace }}/ci-candidate.duckdb
-        run: |
-          rm -f "$SCRIPTBOTS_STORAGE_PATH"
-          cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
+          SCRIPTBOTS_STORAGE_PATH: ${{ env.SCRIPTBOTS_CANDIDATE_DB }}
+        run: cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
 
       - name: Verify baseline replay determinism
         run: |
           cargo run --release -p scriptbots-app --bin scriptbots-app -- \
             --config ci/configs/replay_ci.toml \
-            --replay-db ci-baseline.duckdb \
+            --replay-db "$SCRIPTBOTS_BASELINE_DB" \
             --tick-limit 128
 
       - name: Compare baseline and candidate event streams
         run: |
           cargo run --release -p scriptbots-app --bin scriptbots-app -- \
             --config ci/configs/replay_ci.toml \
-            --replay-db ci-baseline.duckdb \
-            --compare-db ci-candidate.duckdb \
+            --replay-db "$SCRIPTBOTS_BASELINE_DB" \
+            --compare-db "$SCRIPTBOTS_CANDIDATE_DB" \
             --tick-limit 128
 
   render_regression:
