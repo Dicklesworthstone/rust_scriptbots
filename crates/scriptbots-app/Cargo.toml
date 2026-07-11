@@ -25,7 +25,6 @@ smallvec = "1.13"
 futures-util = "0.3.31"
 tokio-stream = "0.1.16"
 slotmap = { workspace = true }
-duckdb = { workspace = true }
 supports-color = "3.0"
 thiserror = { workspace = true }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal"] }

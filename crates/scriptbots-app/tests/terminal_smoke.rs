@@ -16,7 +16,7 @@ fn headless_command() -> Command {
 #[test]
 fn terminal_headless_smoke() {
     let temp_dir = tempdir().expect("temp storage directory");
-    let storage_path = temp_dir.path().join("scriptbots_headless.duckdb");
+    let storage_path = temp_dir.path().join("scriptbots_headless.sqlite");
 
     let mut cmd = headless_command();
     cmd.env("SCRIPTBOTS_STORAGE_PATH", &storage_path);
@@ -27,7 +27,7 @@ fn terminal_headless_smoke() {
 #[test]
 fn terminal_headless_emits_bootstrap_metrics() {
     let temp_dir = tempdir().expect("temp storage directory");
-    let storage_path = temp_dir.path().join("scriptbots_headless_report.duckdb");
+    let storage_path = temp_dir.path().join("scriptbots_headless_report.sqlite");
 
     let mut cmd = headless_command();
     cmd.env("RUST_LOG", "info")

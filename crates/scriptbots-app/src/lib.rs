@@ -7,12 +7,12 @@ use scriptbots_core::{
     CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0, ScriptBotsConfig,
     TickEvents, WorldState,
 };
-use scriptbots_storage::Storage;
+use scriptbots_storage::AnalyticsSnapshotProvider;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub type SharedWorld = Arc<Mutex<WorldState>>;
-pub type SharedStorage = Arc<Mutex<Storage>>;
+pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
 /// Schema identifier for the temporary pre-redesign run manifest.
 pub const RUN_MANIFEST_V0_SCHEMA: &str = "scriptbots.run-manifest";
@@ -342,6 +342,8 @@ pub enum CharacterizationTraceErrorV0 {
     Manifest(#[from] RunManifestError),
     #[error(transparent)]
     Characterization(#[from] CharacterizationError),
+    #[error(transparent)]
+    Persistence(#[from] scriptbots_core::PersistenceAdmissionError),
     #[error("failed to encode characterization artifact: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -384,7 +386,7 @@ impl CharacterizationTraceV0 {
             tick_events: None,
         });
         for _ in 0..ticks {
-            let events = world.step();
+            let events = world.step()?;
             let digest = world.characterization_digest_v0()?;
             points.push(TracePointV0 {
                 tick: digest.tick.0,
@@ -703,12 +705,12 @@ pub mod terminal;
 pub mod renderer {
     use anyhow::Result;
 
-    use crate::{CommandDrain, CommandSubmit, ControlRuntime, SharedStorage, SharedWorld};
+    use crate::{CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld};
 
     /// Shared context passed to renderer implementations.
     pub struct RendererContext<'a> {
         pub world: SharedWorld,
-        pub storage: SharedStorage,
+        pub analytics: SharedAnalytics,
         pub control_runtime: &'a ControlRuntime,
         pub command_drain: CommandDrain,
         pub command_submit: CommandSubmit,

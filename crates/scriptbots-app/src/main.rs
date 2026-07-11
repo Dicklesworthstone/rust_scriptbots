@@ -4,7 +4,7 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     CharacterizationTraceV0, ControlRuntime, ControlServerConfig, ScenarioIdentityV0,
-    SharedStorage, SharedWorld,
+    SharedAnalytics, SharedWorld,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -18,7 +18,7 @@ use scriptbots_core::{
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
-use scriptbots_storage::{PersistedReplayEvent, Storage, StorageError, StoragePipeline};
+use scriptbots_storage::{PersistedReplayEvent, StoragePipeline, StorageReader};
 use serde_json::{self, Value as JsonValue};
 use std::process::{Command, Stdio};
 use std::{
@@ -27,7 +27,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, info, warn};
 
@@ -116,7 +116,7 @@ fn main() -> Result<()> {
                 "✔".green().bold(),
                 best.threads,
                 match cli.storage {
-                    StorageMode::DuckDb => "duckdb",
+                    StorageMode::File => "file",
                     StorageMode::Memory => "memory",
                 },
                 best.tick,
@@ -177,7 +177,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let (world, storage) = bootstrap_world(config, cli.storage, thresholds)?;
+    let (world, analytics, mut storage_pipeline) =
+        bootstrap_world(config, cli.storage, thresholds)?;
 
     // Optional: dump a PNG snapshot and exit (no UI launched).
     if let Some(path) = cli.dump_png.as_ref() {
@@ -213,12 +214,14 @@ fn main() -> Result<()> {
                 w,
                 h
             );
+            shutdown_storage(&mut storage_pipeline)?;
             return Ok(());
         }
         #[cfg(not(feature = "gui"))]
         {
             // Avoid unused-variable warning when GUI is not enabled
             let _ = path;
+            shutdown_storage(&mut storage_pipeline)?;
             bail!("--dump-png requires GUI feature; recompile with --features gui");
         }
     }
@@ -244,6 +247,7 @@ fn main() -> Result<()> {
             w,
             h
         );
+        shutdown_storage(&mut storage_pipeline)?;
         return Ok(());
     }
     let control_config = ControlServerConfig::from_env();
@@ -258,13 +262,44 @@ fn main() -> Result<()> {
     );
     let context = RendererContext {
         world: Arc::clone(&world),
-        storage: Arc::clone(&storage),
+        analytics: analytics.clone(),
         control_runtime: &control_runtime,
         command_drain,
         command_submit,
     };
-    renderer.run(context)?;
-    control_runtime.shutdown()?;
+    let render_result = renderer.run(context);
+    let control_result = control_runtime.shutdown();
+    let storage_result = shutdown_storage(&mut storage_pipeline);
+    if let Err(storage_error) = storage_result {
+        let mut concurrent = Vec::new();
+        if let Err(render_error) = &render_result {
+            concurrent.push(format!("renderer also failed: {render_error:#}"));
+        }
+        if let Err(control_error) = &control_result {
+            concurrent.push(format!("control runtime also failed: {control_error:#}"));
+        }
+        let context = if concurrent.is_empty() {
+            "storage shutdown was the terminal runtime failure".to_owned()
+        } else {
+            concurrent.join("; ")
+        };
+        return Err(storage_error).context(context);
+    }
+    render_result?;
+    control_result?;
+    Ok(())
+}
+
+fn shutdown_storage(pipeline: &mut StoragePipeline) -> Result<()> {
+    let receipt = pipeline
+        .shutdown()
+        .context("FrankenSQLite worker failed during acknowledged shutdown")?;
+    info!(
+        committed_tick = ?receipt.committed_tick,
+        guarantee = ?receipt.guarantee,
+        analytics_revision = receipt.analytics_revision,
+        "FrankenSQLite worker shut down with an explicit persistence receipt"
+    );
     Ok(())
 }
 
@@ -503,109 +538,125 @@ fn thresholds_from_cli(cli: &AppCli) -> ThresholdsOverride {
     ThresholdsOverride::default()
 }
 
+fn storage_path_from_env() -> String {
+    env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        format!("runs/scriptbots-{timestamp}-{}.sqlite", std::process::id())
+    })
+}
+
+fn prepare_storage_parent(path: &str) -> Result<()> {
+    if let Some(parent) = Path::new(path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create storage directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn storage_sidecar_paths(path: &Path) -> Vec<PathBuf> {
+    [
+        "-wal",
+        "-shm",
+        "-journal",
+        "-wal-fec",
+        "-lock-shared",
+        "-lock-reserved",
+        "-lock-pending",
+    ]
+    .into_iter()
+    .map(|suffix| {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    })
+    .collect()
+}
+
+fn reserve_new_run_storage(path: &str) -> Result<()> {
+    prepare_storage_parent(path)?;
+    let path = Path::new(path);
+    for sidecar in storage_sidecar_paths(path) {
+        if sidecar
+            .try_exists()
+            .with_context(|| format!("failed to inspect storage sidecar {}", sidecar.display()))?
+        {
+            bail!(
+                "refusing new run at {} because stale FrankenSQLite sidecar {} exists",
+                path.display(),
+                sidecar.display()
+            );
+        }
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "refusing to reuse existing single-run storage path {}; choose a new SCRIPTBOTS_STORAGE_PATH",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
 fn bootstrap_world(
     config: ScriptBotsConfig,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
-) -> Result<(SharedWorld, SharedStorage)> {
-    let storage_path =
-        env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
-    if let Some(parent) = Path::new(&storage_path)
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
+) -> Result<(SharedWorld, SharedAnalytics, StoragePipeline)> {
+    let storage_path = storage_path_from_env();
+    if matches!(storage_mode, StorageMode::File) {
+        reserve_new_run_storage(&storage_path)?;
     }
 
-    // Choose persistence strategy
-    let (storage, mut world) = match storage_mode {
-        StorageMode::DuckDb => {
-            // Helper to try opening a pipeline with current thresholds
-            let try_open = |path: &str| -> std::result::Result<StoragePipeline, StorageError> {
-                match (
-                    thresholds.tick,
-                    thresholds.agent,
-                    thresholds.event,
-                    thresholds.metric,
-                ) {
-                    (Some(t), Some(a), Some(e), Some(m)) => {
-                        StoragePipeline::with_thresholds(path, t, a, e, m)
-                    }
-                    _ => StoragePipeline::new(path),
-                }
-            };
-            // First attempt
-            let pipeline = match try_open(&storage_path) {
-                Ok(p) => p,
-                Err(err) => {
-                    let msg = err.to_string();
-                    let lock_error = msg.to_ascii_lowercase().contains("could not set lock")
-                        || msg.to_ascii_lowercase().contains("conflicting lock");
-                    if lock_error {
-                        // Generate a safe fallback path alongside the requested path
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let pid = std::process::id();
-                        let fallback_path = {
-                            let p = std::path::Path::new(&storage_path);
-                            let parent = p.parent();
-                            let (stem, ext) = (
-                                p.file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("scriptbots"),
-                                p.extension().and_then(|e| e.to_str()).unwrap_or("duckdb"),
-                            );
-                            let file = format!("{}.run-{}-{}.{}", stem, pid, ts, ext);
-                            if let Some(dir) = parent {
-                                dir.join(file)
-                            } else {
-                                std::path::PathBuf::from(file)
-                            }
-                        };
-                        if let Some(parent) =
-                            fallback_path.parent().filter(|d| !d.as_os_str().is_empty())
-                        {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        println!(
-                            "{} {} is locked ({}). Falling back to {}",
-                            "⚠".yellow().bold(),
-                            storage_path.cyan(),
-                            msg,
-                            fallback_path.display().to_string().magenta().bold()
-                        );
-                        try_open(&fallback_path.to_string_lossy())?
-                    } else {
-                        return Err(err.into());
-                    }
-                }
-            };
-            let storage: SharedStorage = pipeline.storage();
-            let world = WorldState::with_persistence(config, Box::new(pipeline))?;
-            (storage, world)
+    let pipeline = match storage_mode {
+        StorageMode::File => match (
+            thresholds.tick,
+            thresholds.agent,
+            thresholds.event,
+            thresholds.metric,
+        ) {
+            (Some(t), Some(a), Some(e), Some(m)) => {
+                StoragePipeline::with_thresholds(&storage_path, t, a, e, m)
+            }
+            _ => StoragePipeline::new(&storage_path),
+        }
+        .with_context(|| format!("failed to initialize FrankenSQLite storage at {storage_path}"))?,
+        StorageMode::Memory => StoragePipeline::with_thresholds(
+            ":memory:",
+            thresholds.tick.unwrap_or(64),
+            thresholds.agent.unwrap_or(2048),
+            thresholds.event.unwrap_or(512),
+            thresholds.metric.unwrap_or(512),
+        )?,
+    };
+    match storage_mode {
+        StorageMode::File => {
+            info!(path = %storage_path, "Selected unique FrankenSQLite run database");
+            println!(
+                "{} Run database: {}",
+                "◆".bright_blue().bold(),
+                storage_path.cyan()
+            );
         }
         StorageMode::Memory => {
-            // In-memory DuckDB for analytics, avoids disk I/O
-            let pipeline = StoragePipeline::with_thresholds(
-                ":memory:",
-                thresholds.tick.unwrap_or(64),
-                thresholds.agent.unwrap_or(2048),
-                thresholds.event.unwrap_or(512),
-                thresholds.metric.unwrap_or(512),
-            )?;
-            let storage: SharedStorage = pipeline.storage();
-            let world = WorldState::with_persistence(config, Box::new(pipeline))?;
-            (storage, world)
+            info!("Selected volatile in-memory FrankenSQLite storage");
         }
-    };
+    }
+    let analytics = pipeline.analytics_provider();
+    let mut world = WorldState::with_persistence(config, Box::new(pipeline.sink()))?;
     let brain_keys = install_brains(&mut world);
 
     seed_agents(&mut world, &brain_keys);
 
     for _ in 0..120 {
-        world.step();
+        world.step()?;
     }
 
     if let Some(summary) = world.history().last() {
@@ -621,7 +672,7 @@ fn bootstrap_world(
         warn!("World bootstrap completed without persistence summaries");
     }
 
-    Ok((Arc::new(Mutex::new(world)), storage))
+    Ok((Arc::new(Mutex::new(world)), analytics, pipeline))
 }
 
 fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
@@ -712,7 +763,7 @@ struct AppCli {
     /// RNG seed override for deterministic runs.
     #[arg(long = "rng-seed", value_name = "SEED", env = "SCRIPTBOTS_RNG_SEED")]
     rng_seed: Option<u64>,
-    /// Path to a DuckDB run to verify via headless deterministic replay.
+    /// Path to a FrankenSQLite run to verify via headless deterministic replay.
     #[arg(long = "replay-db", value_name = "FILE", env = "SCRIPTBOTS_REPLAY_DB")]
     replay_db: Option<PathBuf>,
     /// Optional comparison database for divergence analysis.
@@ -789,8 +840,8 @@ struct AppCli {
     /// Snapshot size for --dump-png, formatted as WIDTHxHEIGHT (e.g., 1280x720).
     #[arg(long = "png-size", value_name = "WxH")]
     png_size: Option<String>,
-    /// Storage mode: duckdb (default) or memory (disable persistence).
-    #[arg(long = "storage", value_enum, default_value_t = StorageMode::DuckDb)]
+    /// Storage target: file (default) or memory (same engine, no durable file).
+    #[arg(long = "storage", value_enum, default_value_t = StorageMode::File)]
     storage: StorageMode,
     /// Profile headless `world.step()` without persistence for N ticks, then exit.
     #[arg(long = "profile-steps", value_name = "TICKS")]
@@ -811,7 +862,7 @@ struct AppCli {
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum StorageMode {
-    DuckDb,
+    File,
     Memory,
 }
 
@@ -977,7 +1028,7 @@ impl Renderer for GuiRenderer {
             prepare_linux_gui_backend();
             run_demo(
                 Arc::clone(&ctx.world),
-                Some(Arc::clone(&ctx.storage)),
+                ctx.analytics.clone(),
                 Arc::clone(&ctx.command_drain),
                 Arc::clone(&ctx.command_submit),
             );
@@ -1131,12 +1182,12 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
         .expect("replay_db required to enter replay mode");
     let db_display = db_path.display().to_string();
 
-    let mut storage = Storage::open(&db_display)
+    let storage = StorageReader::open(&db_display)
         .with_context(|| format!("failed to open replay database {db_display}"))?;
     let recorded_max_tick = storage.max_tick()?.unwrap_or(0);
     let persisted_events = storage.load_replay_events()?;
     let recorded_counts = storage.replay_event_counts()?;
-    drop(storage);
+    storage.close()?;
 
     let events_max_tick = persisted_events.iter().map(|e| e.tick).max().unwrap_or(0);
     let tick_limit = cli
@@ -1204,11 +1255,11 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
 
     if let Some(compare_path) = cli.compare_db.as_ref() {
         let compare_display = compare_path.display().to_string();
-        let mut other = Storage::open(&compare_display)
+        let other = StorageReader::open(&compare_display)
             .with_context(|| format!("failed to open comparison database {compare_display}"))?;
         let other_events = other.load_replay_events()?;
         let other_counts = other.replay_event_counts()?;
-        drop(other);
+        other.close()?;
 
         println!(
             "{} Comparing {} against {}",
@@ -1259,14 +1310,22 @@ impl ReplayCollector {
 }
 
 impl WorldPersistence for ReplayCollector {
-    fn on_tick(&mut self, payload: &scriptbots_core::PersistenceBatch) {
-        if let Ok(mut guard) = self.ticks.lock() {
-            guard.push(ReplayTickRecord {
-                tick: payload.summary.tick.0,
-                events: payload.replay_events.clone(),
-                summary: payload.summary.clone(),
-            });
-        }
+    fn on_tick(
+        &mut self,
+        payload: &scriptbots_core::PersistenceBatch,
+    ) -> Result<(), scriptbots_core::PersistenceAdmissionError> {
+        let mut guard = self.ticks.lock().map_err(|error| {
+            scriptbots_core::PersistenceAdmissionError::new(
+                payload.summary.tick.0,
+                format!("replay collector lock poisoned: {error}"),
+            )
+        })?;
+        guard.push(ReplayTickRecord {
+            tick: payload.summary.tick.0,
+            events: payload.replay_events.clone(),
+            summary: payload.summary.clone(),
+        });
+        Ok(())
     }
 }
 
@@ -1288,7 +1347,7 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
     seed_agents(&mut world, &brain_keys);
 
     for _ in 0..tick_limit {
-        world.step();
+        world.step()?;
     }
 
     drop(world);
@@ -1322,7 +1381,7 @@ fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()>
 
     let start = Instant::now();
     for _ in 0..tick_limit {
-        world.step();
+        world.step()?;
     }
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
@@ -1343,70 +1402,23 @@ fn profile_world_steps_with_storage(
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
 ) -> Result<()> {
-    let storage_path =
-        env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| "scriptbots.db".to_string());
-    let pipeline = match storage_mode {
-        StorageMode::DuckDb => {
-            let try_open = |path: &str| -> std::result::Result<StoragePipeline, StorageError> {
-                match (
-                    thresholds.tick,
-                    thresholds.agent,
-                    thresholds.event,
-                    thresholds.metric,
-                ) {
-                    (Some(t), Some(a), Some(e), Some(m)) => {
-                        StoragePipeline::with_thresholds(path, t, a, e, m)
-                    }
-                    _ => StoragePipeline::new(path),
-                }
-            };
-            match try_open(&storage_path) {
-                Ok(p) => p,
-                Err(err) => {
-                    let msg = err.to_string();
-                    let lock_error = msg.to_ascii_lowercase().contains("could not set lock")
-                        || msg.to_ascii_lowercase().contains("conflicting lock");
-                    if lock_error {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let pid = std::process::id();
-                        let fallback_path = {
-                            let p = std::path::Path::new(&storage_path);
-                            let parent = p.parent();
-                            let (stem, ext) = (
-                                p.file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("scriptbots"),
-                                p.extension().and_then(|e| e.to_str()).unwrap_or("duckdb"),
-                            );
-                            let file = format!("{}.run-{}-{}.{}", stem, pid, ts, ext);
-                            if let Some(dir) = parent {
-                                dir.join(file)
-                            } else {
-                                std::path::PathBuf::from(file)
-                            }
-                        };
-                        if let Some(parent) =
-                            fallback_path.parent().filter(|d| !d.as_os_str().is_empty())
-                        {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        println!(
-                            "{} {} is locked ({}). Falling back to {}",
-                            "⚠".yellow().bold(),
-                            storage_path.cyan(),
-                            msg,
-                            fallback_path.display().to_string().magenta().bold()
-                        );
-                        try_open(&fallback_path.to_string_lossy())?
-                    } else {
-                        return Err(err.into());
-                    }
-                }
+    let storage_path = storage_path_from_env();
+    if matches!(storage_mode, StorageMode::File) {
+        reserve_new_run_storage(&storage_path)?;
+    }
+    let mut pipeline = match storage_mode {
+        StorageMode::File => match (
+            thresholds.tick,
+            thresholds.agent,
+            thresholds.event,
+            thresholds.metric,
+        ) {
+            (Some(t), Some(a), Some(e), Some(m)) => {
+                StoragePipeline::with_thresholds(&storage_path, t, a, e, m)
             }
+            _ => StoragePipeline::new(&storage_path),
         }
+        .with_context(|| format!("failed to initialize FrankenSQLite storage at {storage_path}"))?,
         StorageMode::Memory => StoragePipeline::with_thresholds(
             ":memory:",
             thresholds.tick.unwrap_or(64),
@@ -1416,14 +1428,15 @@ fn profile_world_steps_with_storage(
         )?,
     };
 
-    let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline))?;
+    let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
     let brain_keys = install_brains(&mut world);
     seed_agents(&mut world, &brain_keys);
 
     let start = Instant::now();
     for _ in 0..tick_limit {
-        world.step();
+        world.step()?;
     }
+    shutdown_storage(&mut pipeline)?;
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
     let tps = tick_limit as f64 / secs;
@@ -1431,7 +1444,7 @@ fn profile_world_steps_with_storage(
         "{} Headless with-storage({}): {} ticks in {:.3}s ({:.0} tps)",
         "✔".green().bold(),
         match storage_mode {
-            StorageMode::DuckDb => "duckdb",
+            StorageMode::File => "file",
             StorageMode::Memory => "memory",
         },
         tick_limit,
@@ -1465,7 +1478,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
     } else {
         vec![1, 2, 4, 8]
     };
-    let storage_candidates = [StorageMode::Memory, StorageMode::DuckDb];
+    let storage_candidates = [StorageMode::Memory, StorageMode::File];
     let threshold_candidates: Vec<&str> = vec![
         "64,2048,512,512",
         "128,4096,1024,1024",
@@ -1486,17 +1499,18 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
         for &storage in &storage_candidates {
             let threshold_list: Vec<&str> = match storage {
                 StorageMode::Memory => threshold_candidates.clone(),
-                StorageMode::DuckDb => threshold_candidates.clone(),
+                StorageMode::File => threshold_candidates.clone(),
             };
             for thresholds in threshold_list {
+                let storage_label = match storage {
+                    StorageMode::File => "file",
+                    StorageMode::Memory => "memory",
+                };
                 let mut cmd = Command::new(&exe);
                 cmd.env("SCRIPTBOTS_DET_RUN", "0");
                 cmd.env("RUST_LOG", "error");
                 cmd.arg("--profile-storage-steps").arg(ticks.to_string());
-                cmd.arg("--storage").arg(match storage {
-                    StorageMode::DuckDb => "duckdb",
-                    StorageMode::Memory => "memory",
-                });
+                cmd.arg("--storage").arg(storage_label);
                 cmd.arg("--storage-thresholds").arg(thresholds);
                 cmd.arg("--threads").arg(threads.to_string());
                 if cli.low_power {
@@ -1506,7 +1520,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
                 cmd.stderr(Stdio::null());
                 let out = cmd.output().with_context(|| {
                     format!(
-                        "sweep run failed (thr={threads}, storage={storage:?}, thres={thresholds})"
+                        "sweep run failed (thr={threads}, storage={storage_label}, thres={thresholds})"
                     )
                 })?;
                 if !out.status.success() {
@@ -1545,7 +1559,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
             "    threads={:<2} storage={:<6} thresholds={:<20} {:>8.0} tps",
             row.threads,
             match row.storage {
-                StorageMode::DuckDb => "duckdb",
+                StorageMode::File => "file",
                 StorageMode::Memory => "memory",
             },
             row.thresholds,
@@ -1559,7 +1573,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
             "✔".green().bold(),
             best.threads,
             match best.storage {
-                StorageMode::DuckDb => "duckdb",
+                StorageMode::File => "file",
                 StorageMode::Memory => "memory",
             },
             best.thresholds,
@@ -1608,7 +1622,7 @@ fn pick_best_for_storage(
             cmd.env("RUST_LOG", "error");
             cmd.arg("--profile-storage-steps").arg(ticks.to_string());
             cmd.arg("--storage").arg(match storage {
-                StorageMode::DuckDb => "duckdb",
+                StorageMode::File => "file",
                 StorageMode::Memory => "memory",
             });
             cmd.arg("--storage-thresholds").arg(thresholds);
@@ -2056,7 +2070,7 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_storage::{Storage, StoragePipeline};
+    use scriptbots_storage::{StoragePipeline, StorageReader};
     use serial_test::serial;
     use std::fs;
     use std::sync::{Mutex, OnceLock};
@@ -2064,6 +2078,33 @@ mod tests {
 
     fn default_cli() -> AppCli {
         AppCli::parse_from(["scriptbots-app"])
+    }
+
+    #[test]
+    fn new_run_reservation_refuses_existing_main_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("run.sqlite");
+        reserve_new_run_storage(path.to_str().expect("utf8 test path")).expect("first reservation");
+        fs::write(&path, b"existing-run").expect("mark reserved run");
+
+        let error = reserve_new_run_storage(path.to_str().expect("utf8 test path"))
+            .expect_err("existing run path must be rejected");
+        assert!(error.to_string().contains("refusing to reuse"));
+        assert_eq!(fs::read(&path).expect("read existing run"), b"existing-run");
+    }
+
+    #[test]
+    fn new_run_reservation_refuses_orphaned_wal_sidecar() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("run.sqlite");
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        fs::write(&wal, b"stale-wal").expect("write stale WAL fixture");
+
+        let error = reserve_new_run_storage(path.to_str().expect("utf8 test path"))
+            .expect_err("orphaned WAL must prevent run reuse");
+        assert!(error.to_string().contains("stale FrankenSQLite sidecar"));
+        assert!(!path.exists(), "reservation must not create the main file");
+        assert_eq!(fs::read(wal).expect("read stale WAL"), b"stale-wal");
     }
 
     #[test]
@@ -2156,7 +2197,7 @@ activation = "Sigmoid"
     #[serial]
     fn headless_replay_matches_storage() {
         let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("replay.duckdb");
+        let db_path = dir.path().join("replay.sqlite");
         let db_str = db_path.to_string_lossy().to_string();
 
         let config = ScriptBotsConfig {
@@ -2170,20 +2211,24 @@ activation = "Sigmoid"
         };
 
         {
-            let pipeline = StoragePipeline::with_thresholds(&db_str, 1, 1, 1, 1).expect("pipeline");
-            let mut world =
-                WorldState::with_persistence(config.clone(), Box::new(pipeline)).expect("world");
+            let mut pipeline =
+                StoragePipeline::with_thresholds(&db_str, 1, 1, 1, 1).expect("pipeline");
+            let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))
+                .expect("world");
             let keys = install_brains(&mut world);
             seed_agents(&mut world, &keys);
             for _ in 0..16 {
-                world.step();
+                world.step().expect("durable replay fixture step");
             }
+            pipeline
+                .shutdown()
+                .expect("durable replay fixture shutdown");
         }
 
-        let mut storage = Storage::open(&db_str).expect("open storage");
+        let storage = StorageReader::open(&db_str).expect("open storage read-only");
         let recorded_events = storage.load_replay_events().expect("load events");
         let max_tick = storage.max_tick().expect("max tick").unwrap_or(0);
-        drop(storage);
+        storage.close().expect("close storage reader");
 
         let replay = run_headless_simulation(&config, max_tick).expect("replay run");
         let diff = diff_event_stream(&recorded_events, &replay.events);
@@ -2313,7 +2358,9 @@ activation = "Sigmoid"
         let neuro_key = *keys_enabled.last().expect("neuro key");
         let agent_id = world_enabled.spawn_agent(AgentData::default());
         assert!(world_enabled.bind_agent_brain(agent_id, neuro_key));
-        world_enabled.step();
+        world_enabled
+            .step()
+            .expect("enabled NeuroFlow simulation step");
         let outputs_one = world_enabled.agent_runtime(agent_id).unwrap().outputs;
 
         let mut world_repeat = WorldState::new(config_enabled).expect("world");
@@ -2322,7 +2369,9 @@ activation = "Sigmoid"
         let neuro_repeat = *keys_repeat.last().unwrap();
         let agent_repeat = world_repeat.spawn_agent(AgentData::default());
         assert!(world_repeat.bind_agent_brain(agent_repeat, neuro_repeat));
-        world_repeat.step();
+        world_repeat
+            .step()
+            .expect("repeat NeuroFlow simulation step");
         let outputs_two = world_repeat.agent_runtime(agent_repeat).unwrap().outputs;
 
         assert_eq!(

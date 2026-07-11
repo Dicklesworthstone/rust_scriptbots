@@ -28,6 +28,8 @@ use scriptbots_core::{
     AgentId, BrainActivations, ControlCommand, ControlSettings, SimulationCommand, TerrainKind,
     TerrainLayer, TickSummary, WorldState,
 };
+#[cfg(test)]
+use scriptbots_storage::AnalyticsSnapshotProvider;
 use scriptbots_storage::MetricReading;
 use serde::Serialize;
 use slotmap::Key;
@@ -35,7 +37,7 @@ use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::{info, warn};
 
 use crate::{
-    CommandDrain, CommandSubmit, ControlRuntime, SharedStorage, SharedWorld,
+    CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld,
     renderer::{Renderer, RendererContext},
 };
 
@@ -188,7 +190,7 @@ enum FocusLockMode {
 
 struct TerminalApp<'a> {
     world: SharedWorld,
-    storage: SharedStorage,
+    analytics_provider: SharedAnalytics,
     _control: &'a ControlRuntime,
     command_drain: CommandDrain,
     command_submit: CommandSubmit,
@@ -210,7 +212,8 @@ struct TerminalApp<'a> {
     map_scratch: Vec<CellOccupancy>,
     map_stamp: u32,
     analytics: Option<TerminalAnalytics>,
-    analytics_tick: Option<u64>,
+    analytics_revision: Option<u64>,
+    analytics_status: AnalyticsStatus,
     expanded: bool,
     // When true, the user has explicitly toggled expanded panels; honor self.expanded
     // instead of auto-expanding on wide terminals.
@@ -234,7 +237,7 @@ impl<'a> TerminalApp<'a> {
         };
         let mut app = Self {
             world: Arc::clone(&ctx.world),
-            storage: Arc::clone(&ctx.storage),
+            analytics_provider: ctx.analytics.clone(),
             _control: ctx.control_runtime,
             command_drain: Arc::clone(&ctx.command_drain),
             command_submit: Arc::clone(&ctx.command_submit),
@@ -256,7 +259,8 @@ impl<'a> TerminalApp<'a> {
             map_scratch: Vec::new(),
             map_stamp: 1,
             analytics: None,
-            analytics_tick: None,
+            analytics_revision: None,
+            analytics_status: AnalyticsStatus::default(),
             expanded: false,
             expanded_user_override: false,
             focused_agent_cursor: 0,
@@ -299,20 +303,43 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn maybe_step_simulation(&mut self, now: Instant) {
+        self.advance_simulation(now, false);
+    }
+
+    fn advance_simulation(&mut self, now: Instant, single_step: bool) {
         let delta = now - self.last_tick;
         self.last_tick = now;
 
-        let mut force_step = false;
+        let mut force_step = single_step;
+        let mut persistence_fault = None;
         let pending_commands = if let Ok(mut world) = self.world.lock() {
-            (self.command_drain.as_ref())(&mut world);
-            Some(world.drain_simulation_commands())
+            if let Some(error) = world.persistence_fault() {
+                persistence_fault = Some(Arc::<str>::from(error.to_string()));
+                None
+            } else {
+                (self.command_drain.as_ref())(&mut world);
+                Some(world.drain_simulation_commands())
+            }
         } else {
             None
         };
+        if let Some(error) = persistence_fault {
+            self.paused = true;
+            self.sim_accumulator = 0.0;
+            self.analytics_status.last_error = Some(error);
+            self.analytics_status.stopped = true;
+            self.refresh_snapshot();
+            return;
+        }
         if let Some(pending) = pending_commands {
             if self.apply_simulation_commands(pending) {
                 force_step = true;
             }
+        }
+
+        if single_step {
+            self.paused = true;
+            self.sim_accumulator = 0.0;
         }
 
         let mut steps = 0usize;
@@ -344,25 +371,27 @@ impl<'a> TerminalApp<'a> {
             self.paused = true;
         }
 
+        let mut step_error = None;
         if let Ok(mut world) = self.world.lock() {
             for _ in 0..steps {
-                world.step();
+                if let Err(error) = world.step() {
+                    step_error = Some(Arc::<str>::from(error.to_string()));
+                    break;
+                }
             }
         }
 
         self.refresh_snapshot();
+        if let Some(error) = step_error {
+            self.paused = true;
+            self.sim_accumulator = 0.0;
+            self.analytics_status.last_error = Some(error);
+            self.analytics_status.stopped = true;
+        }
     }
 
     fn step_once(&mut self) {
-        self.submit_simulation_command(SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: Some(self.speed_multiplier),
-            step_once: true,
-        });
-        if let Ok(mut world) = self.world.lock() {
-            world.step();
-        }
-        self.refresh_snapshot();
+        self.advance_simulation(Instant::now(), true);
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -453,16 +482,33 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn maybe_refresh_analytics(&mut self) {
-        let tick = self.snapshot.tick;
-        if self.analytics_tick == Some(tick) {
+        let published = self.analytics_provider.snapshot();
+        let revision_changed = self.analytics_revision != Some(published.revision);
+        self.analytics_revision = Some(published.revision);
+
+        let committed_tick = published.committed_tick.unwrap_or(self.snapshot.tick);
+        self.analytics_status = AnalyticsStatus {
+            revision: published.revision,
+            committed_tick: published.committed_tick,
+            lag: published
+                .committed_tick
+                .map(|tick| self.snapshot.tick.saturating_sub(tick)),
+            last_error: published.last_error.clone(),
+            stopped: published.stopped,
+        };
+        if !revision_changed {
             return;
         }
-        if let Ok(mut guard) = self.storage.try_lock()
-            && let Ok(readings) = guard.latest_metrics(256)
-            && let Some(ana) = parse_terminal_analytics(tick, self.snapshot.agent_count, &readings)
-        {
+
+        let committed_agent_count = published
+            .committed_agent_count
+            .unwrap_or(self.snapshot.agent_count);
+        if let Some(ana) = parse_terminal_analytics(
+            committed_tick,
+            committed_agent_count,
+            published.readings.as_ref(),
+        ) {
             self.analytics = Some(ana);
-            self.analytics_tick = Some(tick);
         }
     }
 
@@ -868,6 +914,30 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
         let mut lines: Vec<Line> = Vec::new();
+        let committed = self
+            .analytics_status
+            .committed_tick
+            .map_or_else(|| "pending".to_owned(), |tick| format!("t{tick}"));
+        let (storage_state, storage_style) = if let Some(error) = &self.analytics_status.last_error
+        {
+            (format!("error: {error}"), Style::default().fg(Color::Red))
+        } else if self.analytics_status.stopped {
+            ("stopped".to_owned(), Style::default().fg(Color::Yellow))
+        } else {
+            ("active".to_owned(), Style::default().fg(Color::Green))
+        };
+        let lag = self
+            .analytics_status
+            .lag
+            .map_or_else(|| "unknown".to_owned(), |ticks| ticks.to_string());
+        lines.push(Line::from(vec![
+            Span::styled("Storage ", self.palette.header_style()),
+            Span::raw(format!(
+                "r{} · committed {} · lag {} · ",
+                self.analytics_status.revision, committed, lag
+            )),
+            Span::styled(storage_state, storage_style),
+        ]));
         if let Some(ana) = &self.analytics {
             lines.push(Line::from(vec![
                 Span::styled("Age ", self.palette.header_style()),
@@ -1617,6 +1687,15 @@ struct Baseline {
     agent_count: usize,
     avg_energy: f32,
     avg_health: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AnalyticsStatus {
+    revision: u64,
+    committed_tick: Option<u64>,
+    lag: Option<u64>,
+    last_error: Option<Arc<str>>,
+    stopped: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3152,14 +3231,12 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let storage = Arc::new(std::sync::Mutex::new(
-            scriptbots_storage::Storage::open(":memory:").expect("storage"),
-        ));
+        let analytics = AnalyticsSnapshotProvider::empty();
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
             world: Arc::clone(&world),
-            storage: Arc::clone(&storage),
+            analytics,
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
@@ -3179,14 +3256,12 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let storage = Arc::new(std::sync::Mutex::new(
-            scriptbots_storage::Storage::open(":memory:").expect("storage"),
-        ));
+        let analytics = AnalyticsSnapshotProvider::empty();
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
             world: Arc::clone(&world),
-            storage: Arc::clone(&storage),
+            analytics,
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
@@ -3211,14 +3286,12 @@ mod tests {
         }
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let storage = Arc::new(std::sync::Mutex::new(
-            scriptbots_storage::Storage::open(":memory:").expect("storage"),
-        ));
+        let analytics = AnalyticsSnapshotProvider::empty();
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
             world: Arc::clone(&world),
-            storage: Arc::clone(&storage),
+            analytics,
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
@@ -3240,14 +3313,12 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let storage = Arc::new(std::sync::Mutex::new(
-            scriptbots_storage::Storage::open(":memory:").expect("storage"),
-        ));
+        let analytics = AnalyticsSnapshotProvider::empty();
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
             world: Arc::clone(&world),
-            storage: Arc::clone(&storage),
+            analytics,
             control_runtime: &runtime,
             command_drain: drain,
             command_submit: submit,
