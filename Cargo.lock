@@ -8927,9 +8927,7 @@ dependencies = [
  "rand 0.9.5",
  "scriptbots-brain",
  "scriptbots-core",
- "serde",
  "tch",
- "thiserror 2.0.18",
  "tract-onnx",
 ]
 

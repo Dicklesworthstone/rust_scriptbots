@@ -420,3 +420,36 @@ No version migration in this ledger is authorized merely by being newer.
   source-identical with two false dependency claims removed.
 - **Rollback:** manually restore only the two manifest edges and their two lock
   record entries.
+
+## 2026-07-11 — Remove unused placeholder-ML support edges
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-brain-ml` manifest slice; backend features
+  retained unchanged for the dedicated honesty/migration bead
+- **Before manifest SHA-256:**
+  `8b577b53d9adb52003b233dcf95114eeb938665d39ce89da4818636e3e174289`
+- **After manifest SHA-256:**
+  `5ec53a4c34b9665780099cd90edcd781643acbb4ef9b3b9acae63535c8c41709`
+- **Removed:** unconditional `serde` and `thiserror`. The crate contains no
+  import, derive, macro, bound, or qualified path from either dependency under
+  any feature.
+- **Allowed lock delta:** remove only those two edges from the
+  `scriptbots-brain-ml` workspace package record. Both packages remain for
+  other owners. Lock SHA-256 changed from
+  `4d380fd9c54d018cfa8a152b2149b30ce106db758130cd2e54549c4028b4c2bd`
+  to
+  `bbfef9e5d5fd838db4f7b720ca95ac105a02ad656694547da927c62fdb7b3bf1`.
+- **Supported-lane proof:** locked/offline no-default all-target tests compile
+  and pass (zero tests). The public Candle/Tract/Tch feature declarations and
+  their optional dependency edges are byte-identical.
+- **Backend baseline discovered:** Candle 0.4.1 is independently code-red with
+  twenty half-precision sampling errors caused by incompatible rand/rand_distr
+  trait generations. Tract 0.21.10 reached its native ARM64 kernel build but
+  exceeded the bounded four-minute probe and was interrupted cleanly. Tch was
+  not invoked because its native LibTorch contract is unprovisioned. These are
+  pre-existing fake-backend failures owned by `bd-2z0.8.10`, not regressions
+  or reasons to restore unused Serde/error edges.
+- **Result:** accepted for the only currently supported placeholder lane;
+  backend-specific green claims remain explicitly forbidden.
+- **Rollback:** manually restore only the two manifest edges and their two lock
+  record entries.
