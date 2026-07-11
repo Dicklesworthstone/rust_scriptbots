@@ -25,7 +25,9 @@ fn bevy_renderer_matches_golden() {
     config.rng_seed = Some(0xBEEF_F00D);
     let mut world = WorldState::new(config).expect("world init");
     for _ in 0..120 {
-        world.step();
+        world
+            .step()
+            .expect("snapshot test world should accept each simulation step");
     }
     let produced = render_png_offscreen(&world, 1600, 900).expect("render bevy png");
 

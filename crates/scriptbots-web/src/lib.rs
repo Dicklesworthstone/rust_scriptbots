@@ -129,11 +129,16 @@ impl Simulation {
         Ok(())
     }
 
-    fn tick(&mut self, steps: u32) -> SimulationSnapshot {
-        for _ in 0..steps {
-            self.world.step();
+    fn tick(&mut self, steps: u32) -> Result<SimulationSnapshot> {
+        for step_index in 0..steps {
+            self.world.step().with_context(|| {
+                format!(
+                    "persistence rejected WASM simulation step {} of {steps}",
+                    step_index + 1
+                )
+            })?;
         }
-        SimulationSnapshot::from_world(&self.world)
+        Ok(SimulationSnapshot::from_world(&self.world))
     }
 
     fn snapshot(&self) -> SimulationSnapshot {
@@ -365,7 +370,7 @@ impl SimHandle {
     #[wasm_bindgen(js_name = tick)]
     pub fn tick_js(&self, steps: u32) -> Result<JsValue, JsValue> {
         let mut simulation = self.inner.borrow_mut();
-        let snapshot = simulation.tick(steps);
+        let snapshot = simulation.tick(steps).map_err(js_error)?;
         encode_snapshot(&snapshot, simulation.spec.snapshot_format)
     }
 
@@ -660,7 +665,9 @@ mod tests {
             )
             .expect("seed native world");
             for _ in 0..ticks {
-                native_world.step();
+                native_world
+                    .step()
+                    .expect("native conformance world should accept each simulation step");
             }
             let native_snapshot = SimulationSnapshot::from_world(&native_world);
 
@@ -674,7 +681,9 @@ mod tests {
                 default_brain,
             ))
             .expect("sim");
-            let wasm_snapshot = sim.tick(ticks);
+            let wasm_snapshot = sim
+                .tick(ticks)
+                .expect("WASM conformance simulation should accept each step");
 
             assert_eq!(native_snapshot.tick, wasm_snapshot.tick);
             assert_eq!(

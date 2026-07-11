@@ -4106,14 +4106,30 @@ fn spawn_simulation_driver(
                 dt = 0.25;
             }
 
+            let mut latched_persistence_failure = None;
             if let Ok(mut world_guard) = world.lock() {
-                (command_drain.as_ref())(&mut world_guard);
-                let pending = world_guard.drain_simulation_commands();
-                if !pending.is_empty() {
-                    for command in pending {
-                        controls.update(|state| apply_simulation_command_to_state(state, &command));
+                if let Some(error) = world_guard.persistence_fault() {
+                    latched_persistence_failure =
+                        Some(format!("Persistence stopped the simulation: {error}"));
+                } else {
+                    (command_drain.as_ref())(&mut world_guard);
+                    let pending = world_guard.drain_simulation_commands();
+                    if !pending.is_empty() {
+                        for command in pending {
+                            controls
+                                .update(|state| apply_simulation_command_to_state(state, &command));
+                        }
                     }
                 }
+            }
+            if let Some(reason) = latched_persistence_failure {
+                controls.update(|state| {
+                    state.paused = true;
+                    state.auto_pause_reason = Some(reason.clone());
+                });
+                accumulator = 0.0;
+                thread::sleep(Duration::from_millis(4));
+                continue;
             }
 
             let (paused, speed, step_once) = {
@@ -4167,8 +4183,13 @@ fn spawn_simulation_driver(
                     steps = 1;
                 }
 
+                let mut persistence_failure = None;
                 for _ in 0..steps {
-                    world_guard.step();
+                    if let Err(error) = world_guard.step() {
+                        persistence_failure =
+                            Some(format!("Persistence stopped the simulation: {error}"));
+                        break;
+                    }
                 }
 
                 let control = world_guard.config().control.clone();
@@ -4176,15 +4197,18 @@ fn spawn_simulation_driver(
                 let max_age = world_guard.last_max_age();
                 let spike_hits = world_guard.last_spike_hits();
 
-                let mut reason: Option<String> = None;
-                if control.auto_pause_on_spike_hit && spike_hits > 0 {
-                    reason = Some(format!("Spike hits detected ({spike_hits})"));
-                } else if let Some(age_limit) = control.auto_pause_age_above {
-                    if max_age >= age_limit {
-                        reason = Some(format!("Max age {max_age} ≥ {age_limit}"));
-                    }
-                } else if let Some(limit) = control.auto_pause_population_below {
-                    if agent_count as u32 <= limit {
+                let persistence_failed = persistence_failure.is_some();
+                let mut reason = persistence_failure;
+                if reason.is_none() {
+                    if control.auto_pause_on_spike_hit && spike_hits > 0 {
+                        reason = Some(format!("Spike hits detected ({spike_hits})"));
+                    } else if let Some(age_limit) = control.auto_pause_age_above {
+                        if max_age >= age_limit {
+                            reason = Some(format!("Max age {max_age} ≥ {age_limit}"));
+                        }
+                    } else if let Some(limit) = control.auto_pause_population_below
+                        && agent_count as u32 <= limit
+                    {
                         reason = Some(format!("Population {agent_count} ≤ {limit}"));
                     }
                 }
@@ -4200,7 +4224,11 @@ fn spawn_simulation_driver(
                         speed_multiplier: Some(0.0),
                         step_once: false,
                     });
-                    info!(%reason, "Bevy simulation auto-paused");
+                    if persistence_failed {
+                        warn!(%reason, "Bevy simulation paused after persistence failure");
+                    } else {
+                        info!(%reason, "Bevy simulation auto-paused");
+                    }
                 } else if steps > 0 {
                     controls.update(|state| {
                         state.auto_pause_reason = None;
@@ -4239,7 +4267,9 @@ mod tests {
         let config = ScriptBotsConfig::default();
         let mut world = WorldState::new(config).expect("world initialization");
         for _ in 0..32 {
-            world.step();
+            world
+                .step()
+                .expect("offscreen-render test world should accept each step");
         }
         for (width, height) in [(640, 360), (1920, 1080), (2560, 1440), (3840, 2160)] {
             let png = render_png_offscreen(&world, width, height)?;
@@ -4399,7 +4429,9 @@ mod tests {
         let config = ScriptBotsConfig::default();
         let mut world = WorldState::new(config).expect("world initialization");
         for _ in 0..48 {
-            world.step();
+            world
+                .step()
+                .expect("HUD test world should accept each simulation step");
         }
         let snapshot = WorldSnapshot::from_world(&world).expect("world snapshot");
 
@@ -4572,7 +4604,9 @@ mod tests {
 
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
         for _ in 0..48 {
-            world.step();
+            world
+                .step()
+                .expect("follow-mode test world should accept each simulation step");
         }
         let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
         let selection_center = Vec2::new(snapshot.world_size.x * 0.4, snapshot.world_size.y * 0.6);

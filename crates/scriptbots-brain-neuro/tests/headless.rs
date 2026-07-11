@@ -27,8 +27,12 @@ fn neuroflow_only_world_is_deterministic() {
     assert!(world_b.bind_agent_brain(agent_b, key_b));
 
     for _ in 0..6 {
-        world_a.step();
-        world_b.step();
+        world_a
+            .step()
+            .expect("first NeuroFlow world should accept each simulation step");
+        world_b
+            .step()
+            .expect("second NeuroFlow world should accept each simulation step");
     }
 
     let outputs_a = world_a.agent_runtime(agent_a).expect("runtime_a").outputs;

@@ -51,7 +51,7 @@ fn rust_renderer_matches_golden_snapshot() {
     let brain_key = register_brains(&mut world);
     seed_agents(&mut world, brain_key);
     for _ in 0..120 {
-        world.step();
+        world.step().expect("snapshot fixture simulation step");
     }
 
     let png = render_png_offscreen(&world, 1600, 900);

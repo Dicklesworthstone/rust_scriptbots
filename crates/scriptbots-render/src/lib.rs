@@ -4,11 +4,12 @@ mod camera;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
-    AlignItems, App, Application, Background, Bounds, Context, Div, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba,
-    ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds,
-    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    AlignItems, App, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
+    ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds, WindowOptions, canvas,
+    div, fill, point, prelude::*, px, rgb, size,
 };
+use gpui_platform::application;
 use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::{
@@ -17,7 +18,7 @@ use scriptbots_core::{
     Position, RenderTonemapMode, ScriptBotsConfig, SelectionState, SimulationCommand, TerrainKind,
     TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
 };
-use scriptbots_storage::{MetricReading, Storage};
+use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, VecDeque},
@@ -1169,7 +1170,7 @@ fn safe_mode_enabled() -> bool {
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
 pub fn run_demo(
     world: Arc<Mutex<WorldState>>,
-    storage: Option<Arc<Mutex<Storage>>>,
+    analytics: AnalyticsSnapshotProvider,
     command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
 ) {
@@ -1192,9 +1193,9 @@ pub fn run_demo(
     let world_for_view = Arc::clone(&world);
     let drain_for_view = Arc::clone(&command_drain);
     let submit_for_view = Arc::clone(&command_submit);
-    let storage_for_view = storage.clone();
+    let analytics_for_view = analytics.clone();
 
-    Application::new().run(move |app: &mut App| {
+    application().run(move |app: &mut App| {
         // Window A: HUD
         let hud_bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
         let mut hud_options = WindowOptions {
@@ -1209,12 +1210,12 @@ pub fn run_demo(
         let view_title = title_for_view.clone();
         let drain_for_hud = Arc::clone(&drain_for_view);
         let submit_for_hud = Arc::clone(&submit_for_view);
-        let storage_for_hud = storage_for_view.clone();
+        let analytics_for_hud = analytics_for_view.clone();
         if let Err(err) = app.open_window(hud_options, move |_window, cx| {
             cx.new(|_| {
                 SimulationView::new(
                     Arc::clone(&world_handle),
-                    storage_for_hud.clone(),
+                    analytics_for_hud.clone(),
                     view_title.clone(),
                     Arc::clone(&drain_for_hud),
                     Arc::clone(&submit_for_hud),
@@ -1236,7 +1237,7 @@ pub fn run_demo(
         }
 
         let world_for_canvas = Arc::clone(&world_for_view);
-        let storage_for_canvas = storage_for_view.clone();
+        let analytics_for_canvas = analytics_for_view.clone();
         let drain_for_canvas = Arc::clone(&drain_for_view);
         let submit_for_canvas = Arc::clone(&submit_for_view);
         if let Err(err) = app.open_window(sim_options, move |_window, cx| {
@@ -1244,7 +1245,7 @@ pub fn run_demo(
                 // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
                 let mut view = SimulationView::new(
                     Arc::clone(&world_for_canvas),
-                    storage_for_canvas.clone(),
+                    analytics_for_canvas.clone(),
                     "World".into(),
                     Arc::clone(&drain_for_canvas),
                     Arc::clone(&submit_for_canvas),
@@ -1267,7 +1268,7 @@ const MAX_SIM_STEPS_PER_FRAME: usize = 240;
 
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
-    storage: Option<Arc<Mutex<Storage>>>,
+    analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
     command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
@@ -1287,7 +1288,8 @@ struct SimulationView {
     key_capture: Option<CommandAction>,
     settings_panel: SettingsPanelState,
     analytics_cache: Option<HudAnalytics>,
-    analytics_tick: Option<u64>,
+    analytics_revision: Option<u64>,
+    analytics_status: StorageUiStatus,
     #[cfg(feature = "audio")]
     audio: Option<AudioState>,
     // When true, render a minimal canvas-focused layout (used in the dedicated world window).
@@ -1298,7 +1300,7 @@ struct SimulationView {
 impl SimulationView {
     fn new(
         world: Arc<Mutex<WorldState>>,
-        storage: Option<Arc<Mutex<Storage>>>,
+        analytics_provider: AnalyticsSnapshotProvider,
         title: SharedString,
         command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
         command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
@@ -1313,7 +1315,7 @@ impl SimulationView {
 
         Self {
             world,
-            storage,
+            analytics_provider,
             title,
             command_drain,
             command_submit,
@@ -1333,7 +1335,8 @@ impl SimulationView {
             settings_panel: SettingsPanelState::default(),
             key_capture: None,
             analytics_cache: None,
-            analytics_tick: None,
+            analytics_revision: None,
+            analytics_status: StorageUiStatus::default(),
             #[cfg(feature = "audio")]
             audio: AudioState::new()
                 .map_err(|err| {
@@ -1363,11 +1366,29 @@ impl SimulationView {
             .unwrap_or_default()
     }
 
+    fn pause_for_persistence_failure(&mut self, detail: String) {
+        self.controls.paused = true;
+        self.sim_accumulator = 0.0;
+        self.analytics_status.last_error = Some(detail.clone());
+        self.analytics_status.stopped = true;
+        warn!(error = %detail, "Simulation paused at persistence admission boundary");
+    }
+
     #[allow(clippy::collapsible_if)]
     fn pump_simulation(&mut self) {
         let now = Instant::now();
         let last = self.last_sim_instant.unwrap_or(now);
         self.last_sim_instant = Some(now);
+
+        let latched_fault = self.world.lock().ok().and_then(|world| {
+            world
+                .persistence_fault()
+                .map(std::string::ToString::to_string)
+        });
+        if let Some(error) = latched_fault {
+            self.pause_for_persistence_failure(error);
+            return;
+        }
 
         // Auto-pause: honor control config thresholds without mutating world state directly.
         if !self.controls.paused {
@@ -1434,11 +1455,27 @@ impl SimulationView {
 
         self.sim_accumulator -= step_interval * steps as f32;
 
+        let mut persistence_error = None;
         if let Ok(mut world) = self.world.lock() {
-            (self.command_drain.as_ref())(&mut world);
-            for _ in 0..steps {
-                world.step();
+            if world.persistence_fault().is_some() {
+                persistence_error = world
+                    .persistence_fault()
+                    .map(std::string::ToString::to_string);
+            } else {
+                (self.command_drain.as_ref())(&mut world);
             }
+            for _ in 0..steps {
+                if persistence_error.is_some() {
+                    break;
+                }
+                if let Err(error) = world.step() {
+                    persistence_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(error) = persistence_error {
+            self.pause_for_persistence_failure(error);
         }
     }
 
@@ -1623,7 +1660,7 @@ impl SimulationView {
 
         let mut selection_changed = false;
         let mut candidate_id = None;
-        let mut selected_after: Vec<AgentId> = Vec::new();
+        let selected_after: Vec<AgentId>;
 
         let mut world = match self.world.lock() {
             Ok(world) => world,
@@ -1825,9 +1862,7 @@ impl SimulationView {
                 snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
                 snapshot.inspector = InspectorSnapshot::from_world(&world, &inspector_state);
 
-                if let Some(metrics) = snapshot.summary.as_ref() {
-                    trigger = Some((metrics.tick, metrics.agent_count));
-                }
+                trigger = Some((snapshot.tick, snapshot.agent_count));
             }
             trigger
         };
@@ -1836,9 +1871,8 @@ impl SimulationView {
             self.maybe_refresh_analytics(tick, count);
         }
 
-        if self.storage.is_some() {
-            snapshot.analytics = self.analytics_cache.clone();
-        }
+        snapshot.analytics = self.analytics_cache.clone();
+        snapshot.storage = self.analytics_status.clone();
 
         snapshot.perf = self.last_perf;
         snapshot.controls = self.controls.snapshot();
@@ -1848,28 +1882,32 @@ impl SimulationView {
         snapshot
     }
 
-    fn maybe_refresh_analytics(&mut self, tick: u64, agent_count: usize) {
-        let Some(storage) = &self.storage else {
-            return;
+    fn maybe_refresh_analytics(&mut self, live_tick: u64, live_agent_count: usize) {
+        let published = self.analytics_provider.snapshot();
+        let revision_changed = self.analytics_revision != Some(published.revision);
+        self.analytics_revision = Some(published.revision);
+
+        let committed_tick = published.committed_tick.unwrap_or(live_tick);
+        self.analytics_status = StorageUiStatus {
+            revision: published.revision,
+            committed_tick: published.committed_tick,
+            lag: published
+                .committed_tick
+                .map(|tick| live_tick.saturating_sub(tick)),
+            last_error: published.last_error.as_deref().map(str::to_owned),
+            stopped: published.stopped,
         };
-        if self.analytics_tick == Some(tick) {
+        if !revision_changed {
             return;
         }
-        match storage.try_lock() {
-            Ok(mut guard) => match guard.latest_metrics(256) {
-                Ok(readings) => {
-                    if let Some(analytics) = parse_analytics(tick, agent_count, &readings) {
-                        self.analytics_tick = Some(tick);
-                        self.analytics_cache = Some(analytics);
-                    }
-                }
-                Err(err) => {
-                    error!(?err, "failed to fetch latest metrics for analytics");
-                }
-            },
-            Err(_) => {
-                // Avoid blocking the UI when storage is busy; we'll try again next frame.
-            }
+
+        let committed_agent_count = published.committed_agent_count.unwrap_or(live_agent_count);
+        if let Some(analytics) = parse_analytics(
+            committed_tick,
+            committed_agent_count,
+            published.readings.as_ref(),
+        ) {
+            self.analytics_cache = Some(analytics);
         }
     }
 
@@ -2173,11 +2211,40 @@ impl SimulationView {
         div().grid().grid_cols(3).gap_4().children(cards)
     }
     fn render_analytics_panel(&self, snapshot: &HudSnapshot) -> Div {
+        let theme = hud_theme(self.accessibility.palette);
+        let committed = snapshot
+            .storage
+            .committed_tick
+            .map_or_else(|| "pending".to_owned(), |tick| format!("t{tick}"));
+        let (storage_state, storage_color) = if let Some(error) = &snapshot.storage.last_error {
+            (format!("error: {error}"), 0xf87171)
+        } else if snapshot.storage.stopped {
+            ("stopped".to_owned(), 0xfbbf24)
+        } else {
+            ("active".to_owned(), 0x4ade80)
+        };
+        let lag = snapshot
+            .storage
+            .lag
+            .map_or_else(|| "unknown".to_owned(), |ticks| ticks.to_string());
+        let status_text = format!(
+            "FrankenSQLite r{} · committed {} · lag {} · {}",
+            snapshot.storage.revision, committed, lag, storage_state
+        );
+        let storage_bar = div()
+            .text_xs()
+            .text_color(rgb(storage_color))
+            .child(status_text);
+
         let Some(analytics) = snapshot.analytics.as_ref() else {
-            return div();
+            return div().flex().flex_col().gap_2().child(storage_bar).child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme.text_subtle))
+                    .child("Analytics warming up; waiting for the first durable commit."),
+            );
         };
 
-        let theme = hud_theme(self.accessibility.palette);
         let total_agents = snapshot
             .summary
             .as_ref()
@@ -2507,6 +2574,7 @@ impl SimulationView {
             .flex()
             .flex_col()
             .gap_4()
+            .child(storage_bar)
             .child(meta_bar)
             .child(trophic_row)
             .child(insights_row)
@@ -2684,7 +2752,7 @@ impl SimulationView {
             .flex_1()
             .h_full()
             .min_h(px(400.0))
-            .flex_grow()
+            .flex_grow(1.0)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -3040,9 +3108,14 @@ impl SimulationView {
         delta_secondary: f32,
         cx: &mut Context<Self>,
     ) {
-        if let Ok(mut world) = self.world.lock()
-            && let Some(runtime) = world.runtime_mut().get_mut(agent_id)
-        {
+        if let Ok(mut world) = self.world.lock() {
+            if let Some(error) = world.persistence_fault() {
+                warn!(error = %error, "Mutation-rate edit blocked by persistence failure");
+                return;
+            }
+            let Some(runtime) = world.runtime_mut().get_mut(agent_id) else {
+                return;
+            };
             runtime.mutation_rates.primary =
                 (runtime.mutation_rates.primary + delta_primary).max(0.0001);
             runtime.mutation_rates.secondary =
@@ -3832,6 +3905,10 @@ impl SimulationView {
         }
     }
     fn spawn_agent_with_bias_internal(&self, world: &mut WorldState, herbivore_bias: f32) -> bool {
+        if let Some(error) = world.persistence_fault() {
+            warn!(error = %error, "Agent spawn blocked by persistence failure");
+            return false;
+        }
         let width = world.config().world_width as f32;
         let height = world.config().world_height as f32;
         if width <= 0.0 || height <= 0.0 {
@@ -3868,6 +3945,10 @@ impl SimulationView {
     fn spawn_crossover_agent(&mut self, cx: &mut Context<Self>) {
         let mut spawned = false;
         if let Ok(mut world) = self.world.lock() {
+            if let Some(error) = world.persistence_fault() {
+                warn!(error = %error, "Crossover spawn blocked by persistence failure");
+                return;
+            }
             let selected: Vec<AgentId> = {
                 let runtime = world.runtime();
                 runtime
@@ -3931,6 +4012,10 @@ impl SimulationView {
 
     fn toggle_closed_environment(&mut self, cx: &mut Context<Self>) {
         let next = if let Ok(world) = self.world.lock() {
+            if let Some(error) = world.persistence_fault() {
+                warn!(error = %error, "Environment mutation blocked by persistence failure");
+                return;
+            }
             !world.is_closed()
         } else {
             return;
@@ -4961,13 +5046,21 @@ impl SimulationView {
         });
         let open_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             if let Ok(mut world) = this.world.lock() {
-                world.set_closed(false);
+                if world.persistence_fault().is_none() {
+                    world.set_closed(false);
+                } else {
+                    warn!("Open-world action blocked by persistence failure");
+                }
             }
             cx.notify();
         });
         let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             if let Ok(mut world) = this.world.lock() {
-                world.set_closed(true);
+                if world.persistence_fault().is_none() {
+                    world.set_closed(true);
+                } else {
+                    warn!("Close-world action blocked by persistence failure");
+                }
             }
             cx.notify();
         });
@@ -8009,7 +8102,7 @@ impl Render for SimulationView {
                         .gap_4()
                         .flex_1()
                         .h_full()
-                        .flex_grow()
+                        .flex_grow(1.0)
                         .child(self.render_history(&snapshot))
                         .child(self.render_canvas(&snapshot, cx))
                         .child(self.render_inspector(&snapshot, cx));
@@ -8252,12 +8345,23 @@ struct HudSnapshot {
     agent_count: usize,
     summary: Option<HudMetrics>,
     analytics: Option<HudAnalytics>,
+    storage: StorageUiStatus,
     recent_history: Vec<HudHistoryEntry>,
     render_frame: Option<RenderFrame>,
     inspector: InspectorSnapshot,
     controls: ControlsSnapshot,
     perf: PerfSnapshot,
 }
+
+#[derive(Default, Clone)]
+struct StorageUiStatus {
+    revision: u64,
+    committed_tick: Option<u64>,
+    lag: Option<u64>,
+    last_error: Option<String>,
+    stopped: bool,
+}
+
 #[derive(Clone)]
 struct HudAnalytics {
     tick: u64,
