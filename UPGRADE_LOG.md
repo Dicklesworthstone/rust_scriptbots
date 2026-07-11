@@ -421,6 +421,26 @@ No version migration in this ledger is authorized merely by being newer.
 - **Rollback:** manually restore only the two manifest edges and their two lock
   record entries.
 
+## 2026-07-11 — Remove world-gfx's unused glam edge
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-world-gfx` manifest edge
+- **Before manifest SHA-256:**
+  `15e468e9d1316e609008aaf2398ab726aa48bee5d4a9308aa669c7b55c485f42`
+- **After manifest SHA-256:**
+  `b2af309a140acc2e0101ad758c89211cb00d1665295cc1d6a19af56ec82d1fd1`
+- **Removed:** direct `glam 0.30`; world-gfx source and both smoke binaries
+  have no glam import or qualified path.
+- **Allowed lock delta:** remove only the world-gfx edge. Glam 0.30.10 remains
+  resolved for Bevy and its live consumers. Lock SHA-256 changed from
+  `c6a77610919d6b7e4ae35eb881f545d48a89f9062d0f835fbb8dea927e4741ce`
+  to
+  `d4a5aa34bf7d59911a34be85ae7dcc22dc08ee7d23617dda5c334a96e584788a`.
+- **Verification:** all-feature host-target world-gfx library check passes
+  through WGPU 27/Naga 27.
+- **Result:** accepted; GPU buffer and shader code are unchanged.
+- **Rollback:** restore only the one manifest and lock edge.
+
 ## 2026-07-11 — Remove storage's unused tracing edge
 
 - **Bead:** `bd-2z0.8.2`

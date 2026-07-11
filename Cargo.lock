@@ -9031,7 +9031,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "futures-intrusive",
- "glam",
  "image",
  "pollster 0.4.0",
  "scriptbots-core",
