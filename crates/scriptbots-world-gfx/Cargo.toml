@@ -13,7 +13,6 @@ path = "src/lib.rs"
 wgpu = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
 bytemuck = { version = "1.16", features = ["derive"] }
 tracing = { version = "0.1" }
-futures-intrusive = "0.5"
 pollster = "0.4"
 scriptbots-core = { path = "../scriptbots-core" }
 

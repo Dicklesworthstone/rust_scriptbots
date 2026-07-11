@@ -554,3 +554,30 @@ No version migration in this ledger is authorized merely by being newer.
   backend-specific green claims remain explicitly forbidden.
 - **Rollback:** manually restore only the two manifest edges and their two lock
   record entries.
+
+## 2026-07-11 — Remove world-gfx's unused futures-intrusive edge
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** second serialized `scriptbots-world-gfx` edge
+- **Before manifest SHA-256:**
+  `b2af309a140acc2e0101ad758c89211cb00d1665295cc1d6a19af56ec82d1fd1`
+- **After manifest SHA-256:**
+  `89b3120be4344ee1ab15ae38e4fa12df60cf73277df7e95d7e334a5042a86338`
+- **Removed:** direct `futures-intrusive 0.5.0`; no world-gfx source, smoke
+  binary, or test references its API.
+- **Allowed lock delta:** delete the world-gfx edge and the now-unreachable
+  futures-intrusive package record. Its futures-core/lock_api/parking_lot
+  dependencies remain shared. Lock SHA-256 changed from
+  `d4a5aa34bf7d59911a34be85ae7dcc22dc08ee7d23617dda5c334a96e584788a`
+  to
+  `e0f456bf8a9a9e93dc5cd24b87ea2c72d664a3286322d5c55ebb819025e39409`.
+- **Circuit breaker exercised:** Cargo also tried to retarget an unrelated
+  Windows consumer from windows-link 0.2.1 to 0.1.3. That change was rejected;
+  the prior Windows resolution is byte-identical.
+- **Verification:** all-target/all-feature host check passes; both deterministic
+  non-GPU library tests pass. The live `capture_smoke` test is listed but
+  intentionally excluded from a dependency-only lane because it requires the
+  separately controlled GPU/live-capture gate.
+- **Result:** accepted; only the dead async primitive package left the graph.
+- **Rollback:** restore only the manifest edge and reviewed package/owner lock
+  records.
