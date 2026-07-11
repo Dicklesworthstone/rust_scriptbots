@@ -1,7 +1,5 @@
 //! Core types shared across the ScriptBots workspace.
 
-#[allow(unused_imports)]
-use ordered_float::OrderedFloat;
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;

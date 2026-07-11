@@ -421,6 +421,39 @@ No version migration in this ledger is authorized merely by being newer.
 - **Rollback:** manually restore only the two manifest edges and their two lock
   record entries.
 
+## 2026-07-11 — Remove core's explicitly unused ordered-float edge
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-core` dependency and its suppressed unused
+  import
+- **Before manifest/source SHA-256:** manifest
+  `8c4f75e168e4d65053036cd500799c95901253fa7301ed6b5188597f9ec34587`;
+  source
+  `0a664df7b9e0b5eef1169a9c2b95ca5e4fe346cf88f2d1a9118fdbbf5225f071`
+- **After manifest/source SHA-256:** manifest
+  `a8d547b4bd91444df467463fc0f292bac0622aaec93fa7c391cb8029541edfea`;
+  source
+  `4be7760773723c67534cd07f43b5fd7eac97ff256149b164863e91a058c1d548`
+- **Removed:** the core `ordered-float` edge and the only source occurrence,
+  an `#[allow(unused_imports)] use ordered_float::OrderedFloat`. The spatial
+  index retains its real 4.6.0 use.
+- **Allowed lock delta:** remove only `ordered-float 4.6.0` from the
+  `scriptbots-core` workspace record; both 4.6.0 and renderer-family 5.0.0
+  packages remain. Lock SHA-256 changed from
+  `bbfef9e5d5fd838db4f7b720ca95ac105a02ad656694547da927c62fdb7b3bf1`
+  to
+  `53a41bea562addf5f683121b78a235cf5695e0e546f175944f603db5e97bc9bb`.
+- **Feature proof:** no-default, parallel-only, and SIMD-only host checks pass.
+  Serial scalar/parallel-only expose the same five pre-existing cfg-dependent
+  unused-variable warnings; SIMD-only is clean.
+- **Behavior proof:** all five characterization/FNV tests pass. The full core
+  lane remains 46 pass/1 fail at the recorded stale
+  `world_state_initialises_from_config` 120-versus-100 grid assertion; no new
+  failure appeared.
+- **Result:** accepted; no runtime type or expression changed.
+- **Rollback:** restore only the manifest edge, suppressed import, and one lock
+  edge.
+
 ## 2026-07-11 — Deduplicate NeuroFlow's inherited Serde feature
 
 - **Bead:** `bd-2z0.8.2`
