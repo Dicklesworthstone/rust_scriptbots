@@ -1,5 +1,7 @@
 # Plan to Port ScriptBots to Modern Idiomatic Rust with GPUI
 
+> **Status [Superseded for execution — 2026-07-11]:** This document is retained as historical design context. Current source inspection and executable baselines contradict several completion claims below. The authoritative recovery architecture, acceptance gates, dependency program, and Beads roadmap are in [`PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`](PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md).
+
 ## Vision and Success Criteria
 - Deliver a faithful, deterministic port of ScriptBots' agent-based ecosystem in Rust, preserving simulation behaviors (sensing, decision-making, reproduction, food dynamics, carnivore/herbivore specialization) while removing undefined behavior and manual memory management found in the original GLUT/C++ codebase (`World.cpp`, `Agent.cpp`).
 - Embrace Rust idioms: error handling via `Result`, trait-based abstraction for brains, `Arc`/`RwLock` only where unavoidable, and zero `unsafe` in the first release.
