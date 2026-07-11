@@ -44,7 +44,7 @@ direction = "0.18.0"
 rand08 = { package = "rand", version = "0.8.5" }
 
 duckdb = { version = "1.4.1", default-features = false, features = ["bundled"] }
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", branch = "main" }
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", rev = "5f8a7413a31769e0882357f90dc424b3962ac72d" }
 kira = "0.10.1"
 candle-core = "0.4.1"
 candle-nn = "0.4.1"
