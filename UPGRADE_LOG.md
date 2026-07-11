@@ -421,6 +421,26 @@ No version migration in this ledger is authorized merely by being newer.
 - **Rollback:** manually restore only the two manifest edges and their two lock
   record entries.
 
+## 2026-07-11 — Deduplicate NeuroFlow's inherited Serde feature
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-brain-neuro` manifest declaration
+- **Before manifest SHA-256:**
+  `e6747738a39f0c23565e8ef9447d6b95e9416b048f57be10ac597904ea79b576`
+- **After manifest SHA-256:**
+  `a49134b6778ef09eaa1b216205289d673f06fd062497a1521b802118cc432f2e`
+- **Change:** remove the local `features = ["derive"]` repeat from the
+  workspace-inherited Serde dependency. The root policy already enables
+  `derive`; pre-edit metadata exposed `["derive", "derive"]`.
+- **Lock delta:** byte-identical at
+  `bbfef9e5d5fd838db4f7b720ca95ac105a02ad656694547da927c62fdb7b3bf1`.
+- **Verification:** metadata exposes exactly one derive feature; all-target
+  host tests pass (two unit tests and the deterministic headless integration
+  test).
+- **Result:** accepted; feature resolution is unchanged but no longer makes a
+  duplicate declaration.
+- **Rollback:** restore only the redundant local feature list.
+
 ## 2026-07-11 — Remove unused placeholder-ML support edges
 
 - **Bead:** `bd-2z0.8.2`
