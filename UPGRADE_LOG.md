@@ -352,3 +352,46 @@ No version migration in this ledger is authorized merely by being newer.
 - **Rollback:** manually restore only the nine root-manifest lines and the
   five-line lock record shown by this commit. Do not restore any unrelated
   working-tree path.
+
+## 2026-07-11 — Prune and target-scope application-only dependencies
+
+- **Bead:** `bd-2z0.8.2`
+- **Change class:** one `scriptbots-app` manifest slice; production behavior
+  preserved
+- **Before manifest SHA-256:**
+  `4ef25431ce1a29b7764f3bf8cd965b5a16501266c328cecc01a505797045d726`
+- **After manifest SHA-256:**
+  `3f5530bbd3c5b364fb759b99a769d3987fd0c009f4572e76d0f1c23668e0430d`
+- **Removed:** direct `image 0.25` and `unicode-width 0.1`. App source has
+  no API reference to either crate; image remains available to the three
+  renderer/test owners and Unicode width 0.2 remains in the terminal/data
+  graph.
+- **Relocated:** app `rand 0.9` to dev dependencies because only
+  `tests/terminal_end_to_end.rs` imports it; `libc` to `cfg(unix)`; and
+  `windows-sys` to `cfg(windows)`. The exact OS-gated source imports remain
+  unchanged.
+- **Allowed lock delta:** remove image and unicode-width 0.1 from the
+  `scriptbots-app` package edge list, delete the now-unreachable
+  `unicode-width 0.1.14` package, and normalize surviving 0.2.2 references
+  from version-qualified to unqualified. No remaining version, checksum, or
+  source changed. Lock SHA-256 changed from
+  `025f88732b8ea47df52a3b4ffcf65f1c063b0c7f0b51d9588976adba5a03cfad`
+  to
+  `ea9f9ae75e99113f24ddc756b46f57e540c7800f1f36114b140ba29b8d716724`.
+- **Measured graph effect:** the unique normal macOS no-default app closure
+  falls from 325 to 311 package-version nodes; Linux falls from 332 to 317.
+- **Target proof:** metadata classifies rand as dev, libc as `cfg(unix)`, and
+  windows-sys as `cfg(windows)`; direct macOS trees contain libc only and
+  direct Linux trees contain libc plus Wayland, with neither dead crate.
+- **Build/test proof:** fresh host-target locked/offline no-default app library
+  check passes; all 14 app library tests pass; the previously runaway
+  `terminal_end_to_end` suite is compile-only and succeeds, proving dev rand
+  resolution without executing it. Its existing non-Linux helper warning is
+  unchanged.
+- **Clippy:** the targeted app lane stops at the recorded
+  `scriptbots-index::collapsible_if` baseline before reaching app code; no new
+  lint precedes it.
+- **Result:** accepted; the headless product graph is fifteen packages smaller
+  on Linux and cannot compile the wrong OS helper dependency directly.
+- **Rollback:** manually restore only this app manifest slice and its reviewed
+  Unicode-width lock delta.
