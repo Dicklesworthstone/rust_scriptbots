@@ -863,3 +863,130 @@ fn regression_seed_42_matches_baseline() {
         summary.average_health
     );
 }
+
+/// The false-positive budget for the narrated timeline (`bd-16g.2.3`), measured
+/// against REAL runs rather than synthetic fixtures.
+///
+/// Unit tests on hand-built series prove the maths; only a real run proves the
+/// *calibration*, and the first version of this gate proved the calibration was
+/// wrong. A purely statistical stream produced **853 events per 10,000 ticks**
+/// on a 3,000-tick run — "population fell 3% (23 -> 22)", "mean energy collapsed
+/// (0.99 -> 0.98)". Every one of those was statistically impeccable (a nearly
+/// flat baseline makes a one-agent change significant) and every one was
+/// worthless. That is static, not story, and a timeline of static is one users
+/// learn to ignore.
+///
+/// The fix was a materiality floor plus a cooldown (`NarrativePolicy`), which
+/// took the same run to **26.7 events per 10k ticks** — all of them real: a
+/// combat surge, genuine energy collapses and recoveries, and persistent regime
+/// shifts. Measurement also corrected a second mistaken assumption: there is no
+/// "quiet" seed to compare against, because this simulation's dynamics ARE
+/// eventful (populations boom, crash, and oscillate by design).
+///
+/// So this gate asserts what actually protects the reader:
+///   1. every emitted event is MATERIAL (the policy is really enforced),
+///   2. the rate stays under a measured ceiling,
+///   3. a world where nothing happens narrates nothing,
+///   4. a world that is actually wiped out says so, and
+///   5. the same seed tells the same story.
+#[test]
+fn narrated_timeline_respects_its_false_positive_budget_on_real_runs() {
+    fn run(config: ScriptBotsConfig, agents: usize, ticks: usize) -> Vec<(u64, String, f64, f64)> {
+        let mut world = WorldState::new(config).expect("world");
+        for seed in 0..agents {
+            world.spawn_agent(AgentData {
+                position: Position::new((seed * 37 % 190) as f32, (seed * 53 % 190) as f32),
+                health: 1.0,
+                ..AgentData::default()
+            });
+        }
+        for _ in 0..ticks {
+            world.step().expect("step");
+        }
+        world
+            .narrative_events()
+            .iter()
+            .map(|event| {
+                (
+                    event.tick.0,
+                    event.human_text.clone(),
+                    event.before,
+                    event.after,
+                )
+            })
+            .collect()
+    }
+
+    let base = ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        food_cell_size: 20,
+        rng_seed: Some(0xCA1F),
+        ..ScriptBotsConfig::default()
+    };
+
+    // A normal, eventful run.
+    let events = run(base.clone(), 24, 3_000);
+    let per_10k = (events.len() as f64) * 10_000.0 / 3_000.0;
+    assert!(
+        per_10k <= 40.0,
+        "narrated {per_10k:.1} events per 10k ticks (ceiling 40): {events:?}"
+    );
+
+    // Every single event must clear the materiality floor. This is the real
+    // guard: it is what stops "population fell 3% (23 -> 22)" from coming back.
+    for (tick, text, before, after) in &events {
+        let delta = (after - before).abs();
+        if text.starts_with("population fell") || text.starts_with("population rose") {
+            assert!(
+                delta >= 5.0 && delta / before.abs().max(1.0) >= 0.20,
+                "trivial population event at t={tick}: {text} (delta {delta})"
+            );
+        }
+        if text.starts_with("mean energy") {
+            assert!(
+                delta >= 0.15,
+                "trivial energy event at t={tick}: {text} (delta {delta})"
+            );
+        }
+    }
+
+    // A world where nothing happens narrates nothing.
+    let empty = run(
+        ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..base.clone()
+        },
+        0,
+        1_000,
+    );
+    assert!(empty.is_empty(), "an empty world has no story: {empty:?}");
+
+    // A world that starves to death must SAY SO. A detector that never fires is
+    // as useless as one that always does, so the gate binds in both directions.
+    let doomed = run(
+        ScriptBotsConfig {
+            metabolism_drain: 0.05,
+            food_intake_rate: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..base.clone()
+        },
+        40,
+        3_000,
+    );
+    assert!(
+        doomed
+            .iter()
+            .any(|(_, text, _, _)| text.contains("fell") || text.contains("zero")),
+        "a total population collapse must be narrated: {doomed:?}"
+    );
+
+    // And the story must be reproducible.
+    assert_eq!(
+        events,
+        run(base, 24, 3_000),
+        "same seed must tell the same story"
+    );
+}

@@ -3947,15 +3947,56 @@ pub mod narrative {
         pub human_text: String,
     }
 
+    /// What counts as *worth telling a human about*.
+    ///
+    /// A detection can be statistically impeccable and narratively worthless.
+    /// In a world of 23 agents, losing one is a 4% drop against a nearly flat
+    /// baseline — a textbook significant change, and nobody cares. Measured on
+    /// a real 3,000-tick run, a purely statistical stream produced **853 events
+    /// per 10k ticks** ("population fell 3% (23 -> 22)", "mean energy collapsed
+    /// (0.99 -> 0.98)"), which is not a story, it is static.
+    ///
+    /// So significance is necessary and not sufficient: an event must ALSO be
+    /// material (a big change, in both relative and absolute terms) and it must
+    /// not repeat. These floors are the difference between a timeline people
+    /// read and one they learn to ignore.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct NarrativePolicy {
+        /// Minimum fractional population change (e.g. `0.20` = 20%).
+        pub min_population_fraction: f64,
+        /// Minimum absolute population change, so tiny worlds do not narrate
+        /// every individual birth and death.
+        pub min_population_absolute: f64,
+        /// Minimum absolute change in mean energy (energy lives in `[0, 2]`).
+        pub min_energy_absolute: f64,
+        /// Minimum spike-hit rate for a combat surge to be worth reporting.
+        pub min_combat_absolute: f64,
+        /// Minimum ticks between two events of the same kind.
+        pub cooldown_ticks: u64,
+    }
+
+    impl Default for NarrativePolicy {
+        fn default() -> Self {
+            Self {
+                min_population_fraction: 0.20,
+                min_population_absolute: 5.0,
+                min_energy_absolute: 0.15,
+                min_combat_absolute: 3.0,
+                cooldown_ticks: 200,
+            }
+        }
+    }
+
     /// Bounded, deduplicated stream of a run's narrative events.
     #[derive(Debug, Default)]
     pub struct RunNarrative {
         events: VecDeque<EventRecord>,
-        /// Last tick emitted per event kind, so a sliding window cannot
-        /// re-emit the same underlying change on every pass. Without this the
-        /// timeline degenerates into a stutter of duplicates and stops being
-        /// read.
+        /// Last tick emitted per event kind. This serves two purposes: a
+        /// sliding window re-detects the same change on every pass (dedupe),
+        /// and a genuinely churning metric would otherwise emit a new event
+        /// every pass (cooldown).
         last_emitted: Vec<(EventKind, u64)>,
+        policy: NarrativePolicy,
     }
 
     impl RunNarrative {
@@ -4043,9 +4084,15 @@ pub mod narrative {
             }
 
             if let Ok(windows) = regimes(&population, RegimeParams::default()) {
-                for pair in windows.windows(2) {
-                    let (previous, current) = (pair[0], pair[1]);
-                    if previous.regime == current.regime {
+                // A regime label that flips every window is noise, not news.
+                // Only report a shift that (a) actually lands somewhere
+                // dramatic, and (b) PERSISTS into the following window.
+                for triple in windows.windows(3) {
+                    let (previous, current, next) = (triple[0], triple[1], triple[2]);
+                    if previous.regime == current.regime || current.regime != next.regime {
+                        continue;
+                    }
+                    if !matches!(current.regime, Regime::Collapse | Regime::Growth) {
                         continue;
                     }
                     let record = EventRecord {
@@ -4067,6 +4114,30 @@ pub mod narrative {
             }
         }
 
+        /// Is this change big enough that a human would want to hear about it?
+        fn is_material(&self, kind: EventKind, before: f64, after: f64) -> bool {
+            let delta = (after - before).abs();
+            match kind {
+                EventKind::PopulationCrash | EventKind::PopulationBoom => {
+                    let fraction = if before.abs() > f64::EPSILON {
+                        delta / before.abs()
+                    } else {
+                        1.0
+                    };
+                    fraction >= self.policy.min_population_fraction
+                        && delta >= self.policy.min_population_absolute
+                }
+                EventKind::EnergyCollapse | EventKind::EnergyRecovery => {
+                    delta >= self.policy.min_energy_absolute
+                }
+                EventKind::CombatSurge => {
+                    after >= self.policy.min_combat_absolute && after > before
+                }
+                // Extinction and regime shifts carry their own gates.
+                EventKind::Extinction | EventKind::RegimeChange => true,
+            }
+        }
+
         fn emit_changes<F>(
             &mut self,
             series: &[Sample],
@@ -4084,6 +4155,10 @@ pub mod narrative {
                 let kind = classify(change);
                 let before = change.baseline_mean;
                 let after = change.baseline_mean + change.magnitude;
+                // Statistical significance is necessary, not sufficient.
+                if !self.is_material(kind, before, after) {
+                    continue;
+                }
                 let record = EventRecord {
                     tick: Tick(change.tick),
                     kind,
@@ -4099,14 +4174,16 @@ pub mod narrative {
         }
 
         fn push(&mut self, record: EventRecord, capacity: usize) {
-            // Dedupe: the same underlying change re-detects on every pass as the
-            // window slides. Only strictly newer detections of a kind count.
+            // Dedupe + cooldown. The sliding window re-detects the same change
+            // on every pass, and a churning metric would otherwise emit a fresh
+            // event each pass; both produce a stutter that makes the timeline
+            // unreadable. One event of a kind per cooldown window.
             if let Some(entry) = self
                 .last_emitted
                 .iter_mut()
                 .find(|(kind, _)| *kind == record.kind)
             {
-                if record.tick.0 <= entry.1 {
+                if record.tick.0 <= entry.1.saturating_add(self.policy.cooldown_ticks) {
                     return;
                 }
                 entry.1 = record.tick.0;
@@ -11539,6 +11616,40 @@ mod tests {
     }
 
     #[test]
+    fn narrative_ignores_statistically_real_but_trivial_changes() {
+        // The bug this pins: against a nearly flat baseline, losing ONE agent
+        // out of 23 is a statistically impeccable change — and narrating it is
+        // static, not story. A real 3k-tick run produced 853 events per 10k
+        // ticks before the materiality floor existed ("population fell 3%
+        // (23 -> 22)", "mean energy collapsed (0.99 -> 0.98)").
+        let mut values = vec![23usize; 120];
+        values.extend(std::iter::repeat_n(22usize, 120));
+        let history = narrative_history(&values);
+
+        let mut narrative = narrative::RunNarrative::default();
+        narrative.observe(history.iter(), 256);
+        assert!(
+            narrative.events().is_empty(),
+            "losing one agent out of 23 is not news: {:?}",
+            narrative.events()
+        );
+
+        // ...but a real collapse of the same small population still is.
+        let mut values = vec![23usize; 120];
+        values.extend(std::iter::repeat_n(3usize, 120));
+        let history = narrative_history(&values);
+        let mut narrative = narrative::RunNarrative::default();
+        narrative.observe(history.iter(), 256);
+        assert!(
+            narrative
+                .events()
+                .iter()
+                .any(|e| e.kind == narrative::EventKind::PopulationCrash),
+            "losing 87% of the population IS news"
+        );
+    }
+
+    #[test]
     fn narrative_is_quiet_on_a_flat_run() {
         let history = narrative_history(&[500usize; 200]);
         let mut narrative = narrative::RunNarrative::default();
@@ -11553,10 +11664,11 @@ mod tests {
     #[test]
     fn narrative_ring_is_bounded() {
         let mut narrative = narrative::RunNarrative::default();
-        // Feed many distinct crashes; only the newest `capacity` may survive.
+        // Feed many distinct, MATERIAL crashes far enough apart to clear the
+        // cooldown; only the newest `capacity` may survive.
         for round in 1..=50u64 {
             let mut values = vec![1000usize; 40];
-            values.extend(std::iter::repeat_n(1000 - (round as usize * 10), 40));
+            values.extend(std::iter::repeat_n(200usize, 40));
             let history: Vec<TickSummary> = narrative_history(&values)
                 .into_iter()
                 .map(|mut s| {
