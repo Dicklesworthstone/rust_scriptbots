@@ -650,6 +650,27 @@ JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. 
 - **Tests**: `cargo test --workspace` (simulation and GPUI tests will be added as systems land)
 - **Profiles**: Release uses LTO, single codegen unit, and abort-on-panic for optimal binaries.
 
+### Authoritative tracker triage
+
+`br sync --flush-only` exports the tracked source of truth to
+`.beads/issues.jsonl`. Do not invoke BV directly in this repository: BV can
+silently prefer the separate `.beads/beads.jsonl` snapshot. Run every
+data-bearing robot command through the fail-closed integration instead:
+
+```bash
+scripts/bv_authoritative.sh --robot-triage
+scripts/bv_authoritative.sh --robot-plan
+scripts/bv_authoritative.sh --robot-insights | jq '.status'
+scripts/test_bv_authoritative.sh
+```
+
+The wrapper creates a unique external read-only view, forces JSON robot mode,
+and emits a result only after BR all/ready counts and BV issue, status, blocking
+edge, actionable, and `data_hash` evidence agree. It refuses caller-selected
+databases/workspaces, missing or empty exports, non-JSON graph output, and a
+source export that changes during analysis. Neither repository snapshot is
+overwritten or deleted.
+
 ## Testing & CI
 - **Core tests**: unit and property tests for reproduction math, spike damage, food sharing/consumption; determinism tests run seeded scenarios and assert stable summaries.
 - **Render tests**: GPUI compile-time view tests; terminal HUD headless smoke tests (`SCRIPTBOTS_TERMINAL_HEADLESS=1`).

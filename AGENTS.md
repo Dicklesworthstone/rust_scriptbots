@@ -447,15 +447,20 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 ## bv — Graph-Aware Triage Engine
 
-bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
+bv is a graph-aware triage engine for Beads projects. In this repository,
+`.beads/issues.jsonl` is the authoritative tracked export; the similarly named
+`.beads/beads.jsonl` is not an authority. Always invoke BV through
+`scripts/bv_authoritative.sh`, which builds an isolated read-only view and
+cross-checks BR/BV issue, status, dependency, actionable, and hash state before
+emitting JSON.
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
 
-**CRITICAL: Use ONLY `--robot-*` flags. Bare `bv` launches an interactive TUI that blocks your session.**
+**CRITICAL: Use ONLY `scripts/bv_authoritative.sh --robot-*`. Bare `bv` launches an interactive TUI, and direct robot invocations can silently select a stale alternate snapshot.**
 
 ### The Workflow: Start With Triage
 
-**`bv --robot-triage` is your single entry point.** It returns:
+**`scripts/bv_authoritative.sh --robot-triage` is your single entry point.** It returns:
 - `quick_ref`: at-a-glance counts + top 3 picks
 - `recommendations`: ranked actionable items with scores, reasons, unblock info
 - `quick_wins`: low-effort high-impact items
@@ -464,8 +469,8 @@ bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It 
 - `commands`: copy-paste shell commands for next steps
 
 ```bash
-bv --robot-triage        # THE MEGA-COMMAND: start here
-bv --robot-next          # Minimal: just the single top pick + claim command
+scripts/bv_authoritative.sh --robot-triage  # THE MEGA-COMMAND: start here
+scripts/bv_authoritative.sh --robot-next    # Minimal: just the single top pick + claim command
 ```
 
 ### Command Reference
@@ -497,24 +502,23 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 | `--robot-forecast <id\|all>` | ETA predictions with dependency-aware scheduling |
 | `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
 | `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions |
-| `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
-| `--export-graph <file.html>` | Interactive HTML visualization |
+| `--robot-graph --graph-format=json` | Dependency graph JSON; non-JSON graph output is refused by the wrapper |
 
 ### Scoping & Filtering
 
 ```bash
-bv --robot-plan --label backend              # Scope to label's subgraph
-bv --robot-insights --as-of HEAD~30          # Historical point-in-time
-bv --recipe actionable --robot-plan          # Pre-filter: ready to work
-bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank
-bv --robot-triage --robot-triage-by-track    # Group by parallel work streams
-bv --robot-triage --robot-triage-by-label    # Group by domain
+scripts/bv_authoritative.sh --robot-plan --label backend            # Scope to label's subgraph
+scripts/bv_authoritative.sh --robot-insights --label backend        # Inspect one label's subgraph
+scripts/bv_authoritative.sh --recipe actionable --robot-plan        # Pre-filter: ready to work
+scripts/bv_authoritative.sh --recipe high-impact --robot-triage     # Pre-filter: top PageRank
+scripts/bv_authoritative.sh --robot-triage --robot-triage-by-track  # Group by parallel work streams
+scripts/bv_authoritative.sh --robot-triage --robot-triage-by-label  # Group by domain
 ```
 
 ### Understanding Robot Output
 
 **All robot JSON includes:**
-- `data_hash` — Fingerprint of source beads.jsonl
+- `data_hash` — Fingerprint of the isolated authoritative `issues.jsonl` view
 - `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
 - `as_of` / `as_of_commit` — Present when using `--as-of`
 
@@ -525,11 +529,11 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 ### jq Quick Reference
 
 ```bash
-bv --robot-triage | jq '.quick_ref'                        # At-a-glance summary
-bv --robot-triage | jq '.recommendations[0]'               # Top recommendation
-bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
-bv --robot-insights | jq '.status'                         # Check metric readiness
-bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
+scripts/bv_authoritative.sh --robot-triage | jq '.triage.quick_ref'           # At-a-glance summary
+scripts/bv_authoritative.sh --robot-triage | jq '.triage.recommendations[0]'  # Top recommendation
+scripts/bv_authoritative.sh --robot-plan | jq '.plan.summary.highest_impact'  # Best unblock target
+scripts/bv_authoritative.sh --robot-insights | jq '.status'                   # Check metric readiness
+scripts/bv_authoritative.sh --robot-insights | jq '.Cycles'                   # Circular deps (must fix!)
 ```
 
 ---
@@ -756,8 +760,8 @@ This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) 
 ### Essential Commands
 
 ```bash
-# View issues (launches TUI - avoid in automated sessions)
-bv
+# Graph-aware robot triage over the authoritative tracked export
+scripts/bv_authoritative.sh --robot-triage
 
 # CLI commands for agents (use these instead)
 br ready              # Show issues ready to work (no blockers)

@@ -1182,7 +1182,7 @@ For each upgrade:
 8. Record code changes, feature changes, binary/build-time impact, vulnerabilities, and evidence.
 9. Stop and reverse only the dependency’s own reviewed patch if the upgrade fails; never use checkout, stash, reset, or another operation that could overwrite shared changes.
 
-Research may run in parallel, but dependency mutations are serialized through one exclusive lane because every change shares `Cargo.lock`. Reserve the relevant manifests and lockfile for the active bead; `bv --robot-plan` does not authorize concurrent lock mutations.
+Research may run in parallel, but dependency mutations are serialized through one exclusive lane because every change shares `Cargo.lock`. Reserve the relevant manifests and lockfile for the active bead; `scripts/bv_authoritative.sh --robot-plan` does not authorize concurrent lock mutations.
 
 ### 10.5 circuit breakers
 
@@ -2504,10 +2504,12 @@ The tracker should contain one top-level epic and focused child epics. Beads car
 The validated tracker snapshot contains 103 issues: 14 epic containers and 89
 focused executable leaves. The 184 blocking edges are leaf-to-leaf prerequisites;
 the remaining dependency records are hierarchy. `br dep cycles --json` reported
-zero cycles. All expensive `bv --robot-insights` metrics reported `computed`.
+zero cycles. All expensive metrics from the isolated authoritative BV view
+reported `computed`.
 Because `bv 0.16.0` currently treats `parent-child` hierarchy as a blocker in
 `--robot-next`, execution uses `br ready --json` as the actionability authority
-and `bv` for centrality, critical-path, parallel-track, and priority analysis.
+and the authoritative BV wrapper for centrality, critical-path, parallel-track,
+and priority analysis.
 Unfinished epics are not falsely closed merely to work around that viewer bug.
 
 ### 17.2 critical path
@@ -2541,11 +2543,11 @@ The first implementation slice should be small enough to prove the workflow and 
 
 1. Create/validate the bead graph.
 2. Complete the reproducibility prerequisite: baseline, tracked lock, dated toolchain, and exact current GPUI revision. Preserve the unrelated existing `.gitignore` change through explicit coordination/minimal hunk editing.
-3. Claim the highest ready P0 correctness bead selected by `bv --robot-triage`.
+3. Claim the highest ready P0 correctness bead selected by `scripts/bv_authoritative.sh --robot-triage`.
 4. Prefer the default SIMD eyesight oracle/fix if graph ranking agrees, because it is a contained scientific defect that makes agents effectively blind and has a crisp red test.
 5. Run focused default and no-SIMD tests, workspace check, clippy, format, and UBS on changed files.
 6. Close only with evidence attached to the bead.
-7. Re-run `bv --robot-triage` for the next ready foundation bead.
+7. Re-run `scripts/bv_authoritative.sh --robot-triage` for the next ready foundation bead.
 
 The large `SimulationHost` work begins with characterization/contract tests, not a giant replacement commit.
 
@@ -2566,17 +2568,29 @@ Every implementation bead includes:
 
 Roadmap headings are not automatically one bead. Split any change likely to exceed ten files into research/decision, characterization, protocol, individual adapter, migration, and E2E beads. Use `--parent` only for hierarchy; never make children depend on an open epic. Dependency mutation beads reserve their manifests plus `Cargo.lock`, declare the exact old/target package and expected lock delta, and stop on unrelated changes.
 
-### 17.5 graph validation
+### 17.5 graph validation [Implemented — `bd-2z0.1.9`]
 
 After creation:
 
 - `br dep cycles` must report none;
 - `br ready --json` must show sensible first work;
-- `bv --robot-triage` must identify P0 foundations rather than polish;
-- `bv --robot-plan` must expose parallel tracks;
-- `bv --robot-insights` status fields must be checked for computed versus timed-out metrics;
+- `scripts/bv_authoritative.sh --robot-triage` must identify P0 foundations rather than polish;
+- `scripts/bv_authoritative.sh --robot-plan` must expose parallel tracks;
+- `scripts/bv_authoritative.sh --robot-insights` status fields must be checked for computed versus timed-out metrics;
 - priority misalignments and missing dependencies are corrected;
 - tracker JSONL is flushed and reviewed.
+
+The fail-closed `scripts/bv_authoritative.sh` integration now makes the tracked
+`.beads/issues.jsonl` export the only documented BV source. It uses a unique
+external symlink view, forces JSON robot mode, rejects source overrides, and
+cross-checks BR all/ready state against BV issue, status, blocking-edge,
+actionable, and `data_hash` evidence before emitting a result. The live
+239-issue snapshot proves 28 closed, 22 in progress, 189 open, 326 blocking
+edges, 58 actionable issues, and authoritative BV hash `5d1d45dfe541f203`.
+The automated mutation fixture also proves that a stale sibling snapshot gets a
+different hash, all three stored relationship types survive export, only the
+blocking relationship enters BV's dependency graph, and missing/empty/overridden
+sources fail closed without modifying either repository snapshot.
 
 ---
 
@@ -2642,7 +2656,7 @@ The revival is complete only when all of the following are true.
 2. **Done:** review this plan in four adversarial passes: correctness, dependency/sequence, test honesty, and product usefulness.
 3. **Done:** add a supersession pointer to the older primary port plan.
 4. **Done:** convert the roadmap into 14 epics and 89 focused executable Beads through `br`.
-5. **Done:** validate 184 blocking edges with `br` and robot-only `bv`; zero cycles and all graph metrics computed.
+5. **Done:** validate 184 blocking edges with `br` and authoritative robot-only BV; zero cycles and all graph metrics computed.
 6. **Done:** freeze the existing lock/GPUI source in `37bca1f`, then prove and pin `nightly-2026-07-09` with MSRV 1.88 in its own bead.
 7. **Done:** implement the bounded `RunManifestV0`/component-digest/trace foundation with two reviewed fixed-seed sequences and a real CLI probe.
 8. **In progress:** the across-board dependency/feature ledger is complete;
@@ -2792,7 +2806,7 @@ repaired.
 - `br sync --flush-only` exported 103 issues and 286 total dependency records;
 - 184 records are explicit blocking edges and the remainder are hierarchy;
 - `br dep cycles --json` returned `count: 0`;
-- `bv --robot-insights` reported PageRank, betweenness, eigenvector, HITS,
+- the isolated authoritative BV view reported PageRank, betweenness, eigenvector, HITS,
   critical path, cycles, k-core, articulation, and slack as `computed`;
 - the critical path begins `bd-2z0.1.1` (baseline), `bd-2z0.1.2` (lock/Git
   pins), `bd-2z0.1.8` (dated toolchain), and `bd-2z0.1.6` (manifest/digest);
