@@ -2786,6 +2786,17 @@ pub struct ScriptBotsConfig {
     pub carnivore_threshold: f32,
     /// Maximum number of recent tick summaries retained in-memory.
     pub history_capacity: usize,
+    /// Ticks between narrative-detector passes over the tick history. 0 disables
+    /// narration.
+    ///
+    /// The pass is a bounded scan of the history ring, so running it every tick
+    /// would be pure waste at 60+ ticks per second; a cadence costs nothing in
+    /// fidelity because the detectors are sequential and the ring is retained.
+    #[serde(default = "default_narrative_interval")]
+    pub narrative_interval: u32,
+    /// Maximum number of narrative events retained in-memory.
+    #[serde(default = "default_narrative_capacity")]
+    pub narrative_capacity: usize,
     /// Interval (ticks) between persistence flushes. 0 disables persistence.
     pub persistence_interval: u32,
     /// Sampling cadence for analytics families.
@@ -2889,6 +2900,8 @@ impl Default for ScriptBotsConfig {
             spike_length_damage_bonus: 0.75,
             carnivore_threshold: 0.5,
             history_capacity: 256,
+            narrative_interval: default_narrative_interval(),
+            narrative_capacity: default_narrative_capacity(),
             persistence_interval: 0,
             analytics_stride: AnalyticsStride::default(),
             neuroflow: NeuroflowSettings {
@@ -3849,6 +3862,319 @@ pub struct TerrainTile {
     #[serde(default)]
     pub palette_index: u16,
 }
+
+const fn default_narrative_interval() -> u32 {
+    30
+}
+
+const fn default_narrative_capacity() -> usize {
+    256
+}
+
+/// Turns detector output into the run's *story*: a bounded, deterministic
+/// stream of typed events with human-readable prose.
+///
+/// This layer reads [`TickSummary`] history and nothing else. It never observes
+/// or mutates simulation state, so narrating a run cannot change it — the
+/// storyteller must not be able to alter the story.
+///
+/// The prose is **templated and deterministic**, never LLM-authored: the stream
+/// has to be diffable across runs and builds, and an LLM reading these events
+/// must not be reading its own prose fed back to it.
+pub mod narrative {
+    use super::{Tick, TickSummary};
+    use crate::detect::{
+        ChangePoint, CrossDirection, CusumParams, Direction, Regime, RegimeParams, Sample,
+        Threshold, change_points_cusum, regimes, threshold_crossings,
+    };
+    use serde::{Deserialize, Serialize};
+    use std::collections::VecDeque;
+
+    /// What kind of thing happened.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum EventKind {
+        /// The population fell sharply.
+        PopulationCrash,
+        /// The population rose sharply.
+        PopulationBoom,
+        /// The population reached zero.
+        Extinction,
+        /// Mean energy fell sharply.
+        EnergyCollapse,
+        /// Mean energy recovered sharply.
+        EnergyRecovery,
+        /// Combat activity rose sharply.
+        CombatSurge,
+        /// The population dynamics changed character.
+        RegimeChange,
+    }
+
+    impl EventKind {
+        /// Stable machine-readable identifier.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::PopulationCrash => "population_crash",
+                Self::PopulationBoom => "population_boom",
+                Self::Extinction => "extinction",
+                Self::EnergyCollapse => "energy_collapse",
+                Self::EnergyRecovery => "energy_recovery",
+                Self::CombatSurge => "combat_surge",
+                Self::RegimeChange => "regime_change",
+            }
+        }
+    }
+
+    /// One thing that happened, with the evidence that says so.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct EventRecord {
+        /// Tick the detector fired at.
+        pub tick: Tick,
+        /// What happened.
+        pub kind: EventKind,
+        /// Rough importance in `[0, 1]`, for ranking and for highlight reels.
+        pub severity: f32,
+        /// Which series this was detected on.
+        pub metric: &'static str,
+        /// Representative value before the change.
+        pub before: f64,
+        /// Representative value after the change.
+        pub after: f64,
+        /// Detector statistic that fired.
+        pub score: f64,
+        /// Deterministic, templated prose. Never model-generated.
+        pub human_text: String,
+    }
+
+    /// Bounded, deduplicated stream of a run's narrative events.
+    #[derive(Debug, Default)]
+    pub struct RunNarrative {
+        events: VecDeque<EventRecord>,
+        /// Last tick emitted per event kind, so a sliding window cannot
+        /// re-emit the same underlying change on every pass. Without this the
+        /// timeline degenerates into a stutter of duplicates and stops being
+        /// read.
+        last_emitted: Vec<(EventKind, u64)>,
+    }
+
+    impl RunNarrative {
+        /// Recently detected events, oldest first.
+        #[must_use]
+        pub const fn events(&self) -> &VecDeque<EventRecord> {
+            &self.events
+        }
+
+        /// Run the detectors over the tick history and append anything new.
+        pub fn observe<'a, I>(&mut self, history: I, capacity: usize)
+        where
+            I: Iterator<Item = &'a TickSummary>,
+        {
+            let summaries: Vec<&TickSummary> = history.collect();
+            if summaries.len() < 8 || capacity == 0 {
+                return;
+            }
+
+            let population: Vec<Sample> = summaries
+                .iter()
+                .map(|s| Sample::new(s.tick.0, s.agent_count as f64))
+                .collect();
+            let energy: Vec<Sample> = summaries
+                .iter()
+                .map(|s| Sample::new(s.tick.0, f64::from(s.average_energy)))
+                .collect();
+            let combat: Vec<Sample> = summaries
+                .iter()
+                .map(|s| Sample::new(s.tick.0, f64::from(s.spike_hits)))
+                .collect();
+
+            // A warmup longer than the ring would silently detect nothing, so
+            // scale it to the available history rather than trusting a default
+            // that assumes a long series.
+            let warmup = (summaries.len() / 4).clamp(4, 64);
+            let params = CusumParams {
+                warmup,
+                ..CusumParams::default()
+            };
+
+            self.emit_changes(&population, &params, "population", capacity, |cp| {
+                if cp.direction == Direction::Down {
+                    EventKind::PopulationCrash
+                } else {
+                    EventKind::PopulationBoom
+                }
+            });
+            self.emit_changes(&energy, &params, "average_energy", capacity, |cp| {
+                if cp.direction == Direction::Down {
+                    EventKind::EnergyCollapse
+                } else {
+                    EventKind::EnergyRecovery
+                }
+            });
+            self.emit_changes(&combat, &params, "spike_hits", capacity, |cp| {
+                if cp.direction == Direction::Up {
+                    EventKind::CombatSurge
+                } else {
+                    // A lull in combat is not a story worth telling; only the
+                    // surge is. Reuse the surge kind and let the dedupe drop it.
+                    EventKind::CombatSurge
+                }
+            });
+
+            let extinction = Threshold {
+                name: "extinction",
+                level: 0.5,
+                direction: CrossDirection::Falling,
+            };
+            if let Ok(crossings) = threshold_crossings(&population, &[extinction]) {
+                for crossing in crossings {
+                    let record = EventRecord {
+                        tick: Tick(crossing.tick),
+                        kind: EventKind::Extinction,
+                        severity: 1.0,
+                        metric: "population",
+                        before: crossing.from,
+                        after: crossing.to,
+                        score: f64::INFINITY.min(f64::MAX),
+                        human_text: "population reached zero".to_owned(),
+                    };
+                    self.push(record, capacity);
+                }
+            }
+
+            if let Ok(windows) = regimes(&population, RegimeParams::default()) {
+                for pair in windows.windows(2) {
+                    let (previous, current) = (pair[0], pair[1]);
+                    if previous.regime == current.regime {
+                        continue;
+                    }
+                    let record = EventRecord {
+                        tick: Tick(current.start_tick),
+                        kind: EventKind::RegimeChange,
+                        severity: 0.4,
+                        metric: "population",
+                        before: previous.relative_slope,
+                        after: current.relative_slope,
+                        score: current.autocorrelation,
+                        human_text: format!(
+                            "population dynamics shifted from {} to {}",
+                            regime_word(previous.regime),
+                            regime_word(current.regime)
+                        ),
+                    };
+                    self.push(record, capacity);
+                }
+            }
+        }
+
+        fn emit_changes<F>(
+            &mut self,
+            series: &[Sample],
+            params: &CusumParams,
+            metric: &'static str,
+            capacity: usize,
+            classify: F,
+        ) where
+            F: Fn(&ChangePoint) -> EventKind,
+        {
+            let Ok(changes) = change_points_cusum(series, *params) else {
+                return;
+            };
+            for change in &changes {
+                let kind = classify(change);
+                let before = change.baseline_mean;
+                let after = change.baseline_mean + change.magnitude;
+                let record = EventRecord {
+                    tick: Tick(change.tick),
+                    kind,
+                    severity: severity_from(change.score),
+                    metric,
+                    before,
+                    after,
+                    score: change.score,
+                    human_text: describe(kind, metric, before, after),
+                };
+                self.push(record, capacity);
+            }
+        }
+
+        fn push(&mut self, record: EventRecord, capacity: usize) {
+            // Dedupe: the same underlying change re-detects on every pass as the
+            // window slides. Only strictly newer detections of a kind count.
+            if let Some(entry) = self
+                .last_emitted
+                .iter_mut()
+                .find(|(kind, _)| *kind == record.kind)
+            {
+                if record.tick.0 <= entry.1 {
+                    return;
+                }
+                entry.1 = record.tick.0;
+            } else {
+                self.last_emitted.push((record.kind, record.tick.0));
+            }
+
+            if self.events.len() >= capacity {
+                self.events.pop_front();
+            }
+            self.events.push_back(record);
+        }
+    }
+
+    const fn regime_word(regime: Regime) -> &'static str {
+        match regime {
+            Regime::Growth => "growth",
+            Regime::Equilibrium => "equilibrium",
+            Regime::Oscillation => "oscillation",
+            Regime::Collapse => "collapse",
+        }
+    }
+
+    fn severity_from(score: f64) -> f32 {
+        // The CUSUM statistic is unbounded; squash it into [0,1] so severities
+        // are comparable across metrics and rankable by a highlight reel.
+        let normalized = (score / 32.0).clamp(0.0, 1.0);
+        normalized as f32
+    }
+
+    /// Render deterministic prose. Fixed precision, no locale-dependent
+    /// formatting, so the text is byte-stable across runs and platforms.
+    fn describe(kind: EventKind, metric: &str, before: f64, after: f64) -> String {
+        let delta = after - before;
+        let percent = if before.abs() > f64::EPSILON {
+            (delta / before) * 100.0
+        } else {
+            0.0
+        };
+        match kind {
+            EventKind::PopulationCrash => format!(
+                "population fell {:.0}% ({:.0} -> {:.0})",
+                percent.abs(),
+                before,
+                after
+            ),
+            EventKind::PopulationBoom => format!(
+                "population rose {:.0}% ({:.0} -> {:.0})",
+                percent.abs(),
+                before,
+                after
+            ),
+            EventKind::EnergyCollapse => {
+                format!("mean energy collapsed ({before:.2} -> {after:.2})")
+            }
+            EventKind::EnergyRecovery => {
+                format!("mean energy recovered ({before:.2} -> {after:.2})")
+            }
+            EventKind::CombatSurge => format!(
+                "combat surged ({:.0} -> {:.0} spike hits per tick)",
+                before, after
+            ),
+            EventKind::Extinction => "population reached zero".to_owned(),
+            EventKind::RegimeChange => format!("{metric} dynamics changed"),
+        }
+    }
+}
+
 mod map_sandbox {
     use super::{
         TerrainKind, TerrainLayer, TerrainTile, default_tile_fertility_bias,
@@ -5156,6 +5482,7 @@ pub struct WorldState {
     last_spike_hits: u32,
     last_max_age: u32,
     history: VecDeque<TickSummary>,
+    narrative: narrative::RunNarrative,
     #[allow(dead_code)]
     carcass_health_distributed: f32,
     #[allow(dead_code)]
@@ -5278,6 +5605,7 @@ impl WorldState {
             last_spike_hits: 0,
             last_max_age: 0,
             history: VecDeque::with_capacity(history_capacity),
+            narrative: narrative::RunNarrative::default(),
             carcass_health_distributed: 0.0,
             carcass_reproduction_bonus: 0.0,
             combat_spike_attempts: 0,
@@ -6881,6 +7209,27 @@ impl WorldState {
         self.history.push_back(summary);
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = max_age;
+    }
+
+    /// Run the narrative detectors over the tick history and append any newly
+    /// detected events to the bounded run narrative.
+    ///
+    /// This stage is a pure *reader* of [`TickSummary`] history: it never
+    /// observes or mutates simulation state, so enabling it cannot perturb a
+    /// run (proved by `narrative_layer_does_not_perturb_the_simulation`).
+    fn stage_narrative(&mut self, next_tick: Tick) {
+        let interval = self.config.narrative_interval;
+        if interval == 0 || !next_tick.0.is_multiple_of(interval as u64) {
+            return;
+        }
+        self.narrative
+            .observe(self.history.iter(), self.config.narrative_capacity);
+    }
+
+    /// Recently detected narrative events, oldest first.
+    #[must_use]
+    pub fn narrative_events(&self) -> &VecDeque<narrative::EventRecord> {
+        self.narrative.events()
     }
 
     fn stage_food(&mut self) {
@@ -9304,6 +9653,7 @@ impl WorldState {
         self.stage_accumulate_food_balance();
         self.stage_accumulate_tick_events();
         self.stage_record_history(next_tick);
+        self.stage_narrative(next_tick);
         let preserve_persistence_tail = self.config.persistence_interval != 0
             && !next_tick
                 .0
@@ -11125,6 +11475,165 @@ mod tests {
         let position = world.agents().columns().positions()[0];
         assert!(position.x != 0.0 || position.y != 0.0);
         assert!(runtime.energy < 1.0);
+    }
+
+    /// Build a synthetic history so the narrative layer can be exercised
+    /// without running thousands of ticks.
+    fn narrative_history(values: &[usize]) -> Vec<TickSummary> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, count)| TickSummary {
+                tick: Tick(i as u64 + 1),
+                agent_count: *count,
+                births: 0,
+                deaths: 0,
+                total_energy: *count as f32,
+                average_energy: 1.0,
+                average_health: 1.0,
+                max_age: 0,
+                spike_hits: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn narrative_detects_a_crash_and_names_it_in_deterministic_prose() {
+        let mut values = vec![1000usize; 120];
+        values.extend(std::iter::repeat_n(300usize, 120));
+        let history = narrative_history(&values);
+
+        let mut narrative = narrative::RunNarrative::default();
+        narrative.observe(history.iter(), 256);
+
+        let crash = narrative
+            .events()
+            .iter()
+            .find(|e| e.kind == narrative::EventKind::PopulationCrash)
+            .expect("a 70% population drop is a crash");
+        assert!(crash.tick.0 >= 120, "must not fire before the crash");
+        assert_eq!(crash.metric, "population");
+        assert_eq!(crash.human_text, "population fell 70% (1000 -> 300)");
+        assert!(crash.severity > 0.0 && crash.severity <= 1.0);
+    }
+
+    #[test]
+    fn narrative_deduplicates_a_sustained_change_across_passes() {
+        // As the window slides, the same crash re-detects on every pass. If the
+        // stream emitted it each time, the timeline would be a stutter of
+        // duplicates and users would stop reading it.
+        let mut values = vec![800usize; 100];
+        values.extend(std::iter::repeat_n(200usize, 100));
+        let history = narrative_history(&values);
+
+        let mut narrative = narrative::RunNarrative::default();
+        for _ in 0..10 {
+            narrative.observe(history.iter(), 256);
+        }
+        let crashes = narrative
+            .events()
+            .iter()
+            .filter(|e| e.kind == narrative::EventKind::PopulationCrash)
+            .count();
+        assert_eq!(crashes, 1, "ten passes over one crash is still one crash");
+    }
+
+    #[test]
+    fn narrative_is_quiet_on_a_flat_run() {
+        let history = narrative_history(&[500usize; 200]);
+        let mut narrative = narrative::RunNarrative::default();
+        narrative.observe(history.iter(), 256);
+        assert!(
+            narrative.events().is_empty(),
+            "a flat run has no story: {:?}",
+            narrative.events()
+        );
+    }
+
+    #[test]
+    fn narrative_ring_is_bounded() {
+        let mut narrative = narrative::RunNarrative::default();
+        // Feed many distinct crashes; only the newest `capacity` may survive.
+        for round in 1..=50u64 {
+            let mut values = vec![1000usize; 40];
+            values.extend(std::iter::repeat_n(1000 - (round as usize * 10), 40));
+            let history: Vec<TickSummary> = narrative_history(&values)
+                .into_iter()
+                .map(|mut s| {
+                    s.tick = Tick(s.tick.0 + round * 1000);
+                    s
+                })
+                .collect();
+            narrative.observe(history.iter(), 4);
+        }
+        assert!(
+            narrative.events().len() <= 4,
+            "ring must stay bounded, got {}",
+            narrative.events().len()
+        );
+    }
+
+    #[test]
+    fn narrative_layer_does_not_perturb_the_simulation() {
+        // The storyteller must not be able to change the story: enabling
+        // narration must leave the science digest bit-identical.
+        let base = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(0x5EED),
+            ..ScriptBotsConfig::default()
+        };
+
+        let digest_for = |interval: u32| {
+            let config = ScriptBotsConfig {
+                narrative_interval: interval,
+                ..base.clone()
+            };
+            let mut world = WorldState::new(config).expect("world");
+            for seed in 0..8 {
+                world.spawn_agent(sample_agent(seed));
+            }
+            for _ in 0..120 {
+                world.step().expect("step");
+            }
+            world
+                .characterization_digest_v0()
+                .expect("quiescent digest")
+                .overall
+        };
+
+        assert_eq!(
+            digest_for(0),
+            digest_for(30),
+            "narration must not perturb the simulation"
+        );
+    }
+
+    #[test]
+    fn narrative_events_are_deterministic_for_a_seed() {
+        let run = || {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 20,
+                rng_seed: Some(4242),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("world");
+            for seed in 0..12 {
+                world.spawn_agent(sample_agent(seed));
+            }
+            for _ in 0..300 {
+                world.step().expect("step");
+            }
+            world
+                .narrative_events()
+                .iter()
+                .map(|e| (e.tick.0, e.kind, e.human_text.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run(), "same seed must yield the same story");
     }
 
     #[test]
