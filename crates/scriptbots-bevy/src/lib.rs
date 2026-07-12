@@ -20,9 +20,9 @@ use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, IndicatorState, NUM_EYES, RenderSettings, RenderTonemapMode,
-    SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TraitModifiers,
-    WorldState,
+    AgentId, ControlCommand, IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderSettings,
+    RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
+    TerrainKind, TraitModifiers, WorldState,
 };
 use slotmap::Key;
 use std::{
@@ -1414,12 +1414,12 @@ impl WorldSnapshot {
                     eye_fov.copy_from_slice(&rt.eye_fov);
                     (
                         rt.selection,
-                        rt.outputs.first().copied().unwrap_or(0.0),
-                        rt.outputs.get(1).copied().unwrap_or(0.0),
+                        rt.outputs.channel(OutputChannel::WheelLeft),
+                        rt.outputs.channel(OutputChannel::WheelRight),
                         rt.herbivore_tendency,
                         rt.temperature_preference,
                         rt.food_delta,
-                        rt.outputs.get(7).copied().unwrap_or(0.0),
+                        rt.outputs.channel(OutputChannel::SoundLevel),
                         rt.sound_output,
                         rt.sound_multiplier,
                         TraitModifiers {

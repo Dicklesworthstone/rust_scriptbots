@@ -15,8 +15,9 @@ use scriptbots_core::PresetKind;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
     BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, NUM_EYES,
-    Position, RenderTonemapMode, ScriptBotsConfig, SelectionState, SimulationCommand, TerrainKind,
-    TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
+    OutputChannel, OutputsExt, Position, RenderTonemapMode, ScriptBotsConfig, SelectionState,
+    SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers,
+    Velocity, WorldState,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -10479,12 +10480,12 @@ impl RenderFrame {
                     eye_dirs.copy_from_slice(&rt.eye_direction);
                     eye_fov.copy_from_slice(&rt.eye_fov);
                     (
-                        rt.outputs[0],
-                        rt.outputs[1],
+                        rt.outputs.channel(OutputChannel::WheelLeft),
+                        rt.outputs.channel(OutputChannel::WheelRight),
                         rt.herbivore_tendency.clamp(0.0, 1.0),
                         rt.temperature_preference.clamp(0.0, 1.0),
                         rt.food_delta,
-                        rt.outputs.get(7).copied().unwrap_or(0.0),
+                        rt.outputs.channel(OutputChannel::SoundLevel),
                         rt.sound_output,
                         rt.sound_multiplier,
                         rt.trait_modifiers.smell,
