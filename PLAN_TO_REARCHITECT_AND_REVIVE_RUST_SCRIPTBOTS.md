@@ -1836,6 +1836,8 @@ This is a protocol bead. Separate child beads implement each family and integrat
 
 #### 3.2 FrankenTUI source/license decision
 
+**Status:** [Completed — exact Git revision `fccff2a7e51d39a927bced882877a45aef5c8d39`, minimal feature graph, rider-preserving distribution boundary, remote check/test spike, and lifecycle conformance blocker recorded, Codex, 2026-07-12]
+
 - verify published-crate versus exact-Git source availability;
 - complete licensing/distribution review;
 - select and pin one immutable source;

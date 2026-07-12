@@ -888,3 +888,64 @@ No version migration in this ledger is authorized merely by being newer.
   lines. Do not remove files or use destructive Git commands. Keep the security
   bead open until the compatible stable Wayland and W3C WebDriver releases let
   both temporary compatibility pins disappear.
+
+## 2026-07-12 — Approve exact-revision FrankenTUI integration
+
+- **Beads:** `bd-2z0.6.2` decides the source and license boundary;
+  `bd-2z0.8.8` owns the later serialized product-manifest/lock integration.
+- **Decision:** use the Git source at immutable revision
+  `fccff2a7e51d39a927bced882877a45aef5c8d39` from
+  `https://github.com/Dicklesworthstone/frankentui`, with every direct crate
+  constrained to `version = "=0.5.0"`. The sibling checkout's `HEAD` and
+  `origin/main` both resolve to that revision (`v0.5.0-83-gfccff2a7`). Mutable
+  branches, mutable local paths, and the older `v0.5.0` tag are rejected; the
+  selected revision contains later partial-setup, panic-path, and terminal
+  teardown repairs.
+- **Planned product graph:** `ftui` uses `default-features = false` with only
+  `crossterm`; that feature already activates the runtime. `ftui-extras` uses
+  `default-features = false` with only `charts` and `theme` (`charts` activates
+  `canvas`). `ftui-a11y` is direct because its preferences/tree surface is not
+  fully re-exported. Test-only `ftui-harness` disables defaults and `ftui-pty`
+  uses the same revision. The facade's misleading `extras` feature is not
+  enabled, and neither are `asupersync-executor`, `native-backend`,
+  `render-thread`, `state-persistence`, `event-trace`, `visual-fx`, or
+  `fx-gpu`.
+- **License/distribution boundary:** every selected crate declares
+  `LicenseRef-MIT-OpenAI-Anthropic-Rider`. The user's explicit direction to
+  build the ScriptBots TUI with FrankenTUI authorizes this integration. Any
+  distributed binary, hosted artifact, test tool, SBOM, or third-party notice
+  must preserve the complete unmodified FrankenTUI rider and exact source
+  provenance; the combined distribution must not be described as only
+  `MIT OR Apache-2.0`. This is an engineering/distribution record, not legal
+  advice.
+- **Isolated source spike:** repository
+  `/Users/jemanuel/projects/rust_scriptbots__frankentui_spike` at commit
+  `98c2e0e` compiles the exact product APIs and links both test-support crates
+  under ScriptBots' pinned `nightly-2026-07-09`. On remote worker
+  `vmi1152480`, `cargo check --all-targets` passed and `cargo test` passed 1/1.
+  The resolved graph has 70 unique normal-tree lines, 124 normal-plus-dev
+  lines, and 159 lock packages; its normal graph has zero WGPU, Asupersync,
+  native-backend, or render-thread hits. The pinned family resolves its
+  internal `ftui-layout` crate at 0.5.1 as declared upstream.
+- **RCH evidence:** RCH selected and synchronized `vmi1152480`, but its
+  generated remote wrapper failed before Cargo with `mkdir: Permission
+  denied`. The same synchronized tree passed when Cargo was invoked directly
+  on that selected worker with isolated `HOME`, `TMPDIR`, and target paths.
+  This is an RCH wrapper defect, not a FrankenTUI build failure.
+- **Runtime caveats:** the selected `Model::on_error` hook is declared but not
+  called; error-path `?` exits can bypass `on_shutdown`; `ProgramSimulator`
+  does not drive subscriptions, time, or shutdown and exposes no public
+  arbitrary command executor; subscription delivery uses an unbounded
+  standard channel. ScriptBots must use a coalesced single-flight wake over
+  bounded HostClient cursors, and the lifecycle/simulator gaps receive a
+  blocking conformance bead before the new shell is accepted.
+- **Serialization boundary:** no ScriptBots product manifest or lockfile is
+  changed by this decision. `bd-2z0.8.8` performs that one-family delta after
+  its declared transport/runtime prerequisites, then aligns legacy Crossterm
+  0.27 to 0.29 and Ratatui's declaration to the already resolved 0.30.2 during
+  coexistence. Removing legacy Ratatui waits for the main TUI and
+  `control_cli watch` migrations.
+- **Rollback:** before cutover, remove only the reviewed exact-revision
+  manifest/lock entries and retain the legacy adapter. Never substitute a
+  mutable source or delete the old frontend without separate explicit file
+  deletion permission.
