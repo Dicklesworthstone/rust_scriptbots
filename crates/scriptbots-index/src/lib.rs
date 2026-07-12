@@ -389,6 +389,7 @@ impl NeighborhoodIndex for UniformGridIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashSet};
 
     fn build_index(
         cell_size: f32,
@@ -399,6 +400,359 @@ mod tests {
         let mut index = UniformGridIndex::new(cell_size, width, height);
         index.rebuild(positions).expect("rebuild should succeed");
         index
+    }
+
+    fn minimum_image_delta(a: f32, b: f32, extent: f32) -> f32 {
+        let direct = (a - b).abs().rem_euclid(extent);
+        direct.min(extent - direct)
+    }
+
+    fn brute_force_neighbors(
+        positions: &[(f32, f32)],
+        agent_idx: usize,
+        width: f32,
+        height: f32,
+        radius_sq: f32,
+    ) -> BTreeMap<usize, f32> {
+        let (ax, ay) = positions[agent_idx];
+        positions
+            .iter()
+            .enumerate()
+            .filter_map(|(other_idx, &(ox, oy))| {
+                if other_idx == agent_idx {
+                    return None;
+                }
+                let dx = minimum_image_delta(ox, ax, width);
+                let dy = minimum_image_delta(oy, ay, height);
+                let distance_sq = dx.mul_add(dx, dy * dy);
+                (distance_sq <= radius_sq).then_some((other_idx, distance_sq))
+            })
+            .collect()
+    }
+
+    fn queried_neighbors(
+        index: &UniformGridIndex,
+        agent_idx: usize,
+        radius_sq: f32,
+    ) -> BTreeMap<usize, f32> {
+        let mut delivered = HashSet::new();
+        let mut neighbors = BTreeMap::new();
+        index.neighbors_within(agent_idx, radius_sq, &mut |other_idx, distance_sq| {
+            assert!(
+                delivered.insert(other_idx),
+                "query delivered agent {other_idx} more than once"
+            );
+            neighbors.insert(other_idx, distance_sq.into_inner());
+        });
+        neighbors
+    }
+
+    fn bucket_candidates(
+        index: &UniformGridIndex,
+        agent_idx: usize,
+        radius: f32,
+    ) -> HashSet<usize> {
+        let mut candidates = HashSet::new();
+        index.visit_neighbor_buckets(agent_idx, radius, &mut |indices| {
+            for &other_idx in indices {
+                assert!(
+                    candidates.insert(other_idx),
+                    "bucket visitor delivered agent {other_idx} more than once"
+                );
+            }
+        });
+        candidates
+    }
+
+    fn scratch_bucket_candidates(
+        index: &UniformGridIndex,
+        positions: &[(f32, f32)],
+        agent_idx: usize,
+        radius: f32,
+    ) -> HashSet<usize> {
+        let mut scratch_x = Vec::new();
+        let mut scratch_y = Vec::new();
+        let mut candidates = HashSet::new();
+        index.visit_neighbor_bucket_positions_with_scratch(
+            agent_idx,
+            radius,
+            &mut scratch_x,
+            &mut scratch_y,
+            &mut |xs, ys, indices| {
+                assert_eq!(xs.len(), indices.len());
+                assert_eq!(ys.len(), indices.len());
+                for ((&x, &y), &other_idx) in xs.iter().zip(ys).zip(indices) {
+                    let expected = positions[other_idx];
+                    assert_eq!(
+                        (x.to_bits(), y.to_bits()),
+                        (expected.0.to_bits(), expected.1.to_bits())
+                    );
+                    assert!(
+                        candidates.insert(other_idx),
+                        "scratch visitor delivered agent {other_idx} more than once"
+                    );
+                }
+            },
+        );
+        candidates
+    }
+
+    fn filter_candidates(
+        candidates: &HashSet<usize>,
+        positions: &[(f32, f32)],
+        agent_idx: usize,
+        width: f32,
+        height: f32,
+        radius_sq: f32,
+    ) -> BTreeMap<usize, f32> {
+        let (ax, ay) = positions[agent_idx];
+        candidates
+            .iter()
+            .filter_map(|&other_idx| {
+                if other_idx == agent_idx {
+                    return None;
+                }
+                let (ox, oy) = positions[other_idx];
+                let dx = minimum_image_delta(ox, ax, width);
+                let dy = minimum_image_delta(oy, ay, height);
+                let distance_sq = dx.mul_add(dx, dy * dy);
+                (distance_sq <= radius_sq).then_some((other_idx, distance_sq))
+            })
+            .collect()
+    }
+
+    fn assert_neighbor_maps_close(
+        context: &str,
+        expected: &BTreeMap<usize, f32>,
+        actual: &BTreeMap<usize, f32>,
+    ) {
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            actual.keys().collect::<Vec<_>>(),
+            "neighbor IDs disagree for {context}"
+        );
+        for (&other_idx, &expected_distance_sq) in expected {
+            let actual_distance_sq = actual[&other_idx];
+            let tolerance = expected_distance_sq.abs().max(1.0) * 1.0e-5;
+            assert!(
+                (expected_distance_sq - actual_distance_sq).abs() <= tolerance,
+                "distance for neighbor {other_idx} disagrees in {context}: expected {expected_distance_sq}, got {actual_distance_sq}"
+            );
+        }
+    }
+
+    fn assert_all_query_surfaces_match_oracle(
+        cell_size: f32,
+        width: f32,
+        height: f32,
+        positions: &[(f32, f32)],
+        radii: &[f32],
+    ) {
+        let index = build_index(cell_size, width, height, positions);
+        for agent_idx in 0..positions.len() {
+            for &radius in radii {
+                let radius_sq = radius * radius;
+                let context = format!(
+                    "cell={cell_size} world={width}x{height} agent={agent_idx} radius={radius}"
+                );
+                let expected =
+                    brute_force_neighbors(positions, agent_idx, width, height, radius_sq);
+                let queried = queried_neighbors(&index, agent_idx, radius_sq);
+                assert_neighbor_maps_close(&context, &expected, &queried);
+
+                let candidates = bucket_candidates(&index, agent_idx, radius);
+                let scratch_candidates =
+                    scratch_bucket_candidates(&index, positions, agent_idx, radius);
+                assert_eq!(
+                    candidates, scratch_candidates,
+                    "bucket visitor surfaces disagree for {context}"
+                );
+                let filtered =
+                    filter_candidates(&candidates, positions, agent_idx, width, height, radius_sq);
+                assert_neighbor_maps_close(&context, &expected, &filtered);
+                assert_eq!(
+                    expected.len(),
+                    queried.len(),
+                    "query count disagrees with the oracle for {context}"
+                );
+                assert_eq!(
+                    queried.len(),
+                    filtered.len(),
+                    "query and filtered visitor counts disagree for {context}"
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn deterministic_cell_positions(
+        cell_size: f32,
+        width: f32,
+        height: f32,
+        cells_x: usize,
+        cells_y: usize,
+    ) -> Vec<(f32, f32)> {
+        let mut positions = Vec::with_capacity(cells_x * cells_y);
+        for cell_y in 0..cells_y {
+            for cell_x in 0..cells_x {
+                let x_start = cell_x as f32 * cell_size;
+                let y_start = cell_y as f32 * cell_size;
+                let x_end = ((cell_x + 1) as f32 * cell_size).min(width);
+                let y_end = ((cell_y + 1) as f32 * cell_size).min(height);
+                let x_fraction = if (cell_x + cell_y) % 2 == 0 {
+                    0.17
+                } else {
+                    0.83
+                };
+                let y_fraction = if (cell_x * 3 + cell_y) % 2 == 0 {
+                    0.79
+                } else {
+                    0.23
+                };
+                positions.push((
+                    (x_end - x_start)
+                        .mul_add(x_fraction, x_start)
+                        .rem_euclid(width),
+                    (y_end - y_start)
+                        .mul_add(y_fraction, y_start)
+                        .rem_euclid(height),
+                ));
+            }
+        }
+        positions
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn deterministic_grid_sweep_matches_minimum_image_oracle_and_api_counts() {
+        for &cell_size in &[0.75_f32, 3.25] {
+            for cells_x in 1_usize..=6 {
+                for cells_y in 1_usize..=5 {
+                    let width_trim = if cells_x % 2 == 0 { 0.37 } else { 0.0 };
+                    let height_trim = if cells_y % 2 == 0 { 0.23 } else { 0.0 };
+                    let width = cell_size * (cells_x as f32 - width_trim);
+                    let height = cell_size * (cells_y as f32 - height_trim);
+                    let positions =
+                        deterministic_cell_positions(cell_size, width, height, cells_x, cells_y);
+                    let maximum_minimum_image_distance = (width * 0.5).hypot(height * 0.5);
+                    let radii = [
+                        0.0,
+                        cell_size * 0.49,
+                        cell_size,
+                        cell_size * 1.01,
+                        width.min(height) * 0.5,
+                        maximum_minimum_image_distance,
+                        width.max(height) * 4.0,
+                    ];
+                    assert_all_query_surfaces_match_oracle(
+                        cell_size, width, height, &positions, &radii,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_grid_query_and_bucket_surfaces_match_the_toroidal_oracle() {
+        let cell_size = 0.5;
+        let width = 600.0;
+        let height = 600.0;
+        let positions = [
+            (0.1, 0.1),
+            (599.9, 0.2),
+            (300.0, 300.0),
+            (1.0, 599.8),
+            (598.5, 598.7),
+            (20.0, 20.0),
+        ];
+        let index = build_index(cell_size, width, height, &positions);
+        assert!(matches!(&index.buckets, Buckets::Sparse(_)));
+
+        assert_all_query_surfaces_match_oracle(
+            cell_size,
+            width,
+            height,
+            &positions,
+            &[0.0, 0.75, 3.0, 25.0],
+        );
+    }
+
+    #[test]
+    fn wrapped_translation_preserves_neighbor_ids_distances_and_counts() {
+        let cell_size = 2.5;
+        let width = 12.5;
+        let height = 10.0;
+        let positions = [
+            (0.1, 0.2),
+            (12.3, 9.8),
+            (6.25, 5.0),
+            (2.4, 7.6),
+            (10.1, 1.7),
+            (4.8, 9.9),
+        ];
+        let radii = [0.3_f32, 2.0, 4.25, 8.0];
+        let original = build_index(cell_size, width, height, &positions);
+
+        for &(offset_x, offset_y) in &[(3.75_f32, 6.25), (12.5, 10.0), (-4.5, 2.75)] {
+            let translated = positions.map(|(x, y)| {
+                (
+                    (x + offset_x).rem_euclid(width),
+                    (y + offset_y).rem_euclid(height),
+                )
+            });
+            let shifted = build_index(cell_size, width, height, &translated);
+            for agent_idx in 0..positions.len() {
+                for radius in radii {
+                    let radius_sq = radius * radius;
+                    let baseline = queried_neighbors(&original, agent_idx, radius_sq);
+                    let actual = queried_neighbors(&shifted, agent_idx, radius_sq);
+                    let context = format!(
+                        "translation=({offset_x},{offset_y}) agent={agent_idx} radius={radius}"
+                    );
+                    assert_neighbor_maps_close(&context, &baseline, &actual);
+
+                    let candidates = bucket_candidates(&shifted, agent_idx, radius);
+                    let filtered = filter_candidates(
+                        &candidates,
+                        &translated,
+                        agent_idx,
+                        width,
+                        height,
+                        radius_sq,
+                    );
+                    assert_neighbor_maps_close(&context, &actual, &filtered);
+                    assert_eq!(
+                        baseline.len(),
+                        filtered.len(),
+                        "count changed for {context}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn oversized_radius_terminates_and_delivers_each_entry_once_in_tiny_worlds() {
+        for cells_x in 1_usize..=4 {
+            for cells_y in 1_usize..=4 {
+                let cell_size = 1.0;
+                let width = cells_x as f32;
+                let height = cells_y as f32;
+                let positions =
+                    deterministic_cell_positions(cell_size, width, height, cells_x, cells_y);
+                let index = build_index(cell_size, width, height, &positions);
+                for agent_idx in 0..positions.len() {
+                    let queried = queried_neighbors(&index, agent_idx, f32::MAX);
+                    let candidates = bucket_candidates(&index, agent_idx, f32::MAX);
+                    let scratch_candidates =
+                        scratch_bucket_candidates(&index, &positions, agent_idx, f32::MAX);
+                    assert_eq!(queried.len(), positions.len() - 1);
+                    assert_eq!(candidates.len(), positions.len());
+                    assert_eq!(candidates, scratch_candidates);
+                }
+            }
+        }
     }
 
     #[test]

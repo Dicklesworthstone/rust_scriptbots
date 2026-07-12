@@ -1682,7 +1682,11 @@ Phase 0.4 therefore remains in progress. This slice hardens renderer selection, 
   and default SIMD/Rayon lanes;
 - [Implemented — `bd-2z0.2.2`] blood half-FOV policy, strict just-inside/on/outside boundary
   tests, wounded-target falloff, and fixed-seed determinism;
-- toroidal index duplicate/distance tests;
+- [Completed — `bd-2z0.2.3`] dense 1x1 through 6x5 exact/partial-cell sweeps and a
+  forced sparse grid agree with an independent minimum-image oracle across query, bucket,
+  scratch, and count surfaces; wrapped translations preserve IDs and distances; `f32::MAX`
+  radii terminate with duplicate-free delivery in every 1x1 through 4x4 tiny world;
+- scalar/SIMD and serial/parallel comparisons;
 - fix implementation only after oracle fails correctly.
 
 **Exit:** sensor digests agree across supported feature paths.
