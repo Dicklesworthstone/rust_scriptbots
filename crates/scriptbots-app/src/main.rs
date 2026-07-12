@@ -288,8 +288,9 @@ fn main() -> Result<()> {
             )),
         }
     })();
-    let storage_result = finalize_and_shutdown_storage(&world, &mut storage_pipeline);
-    prefer_storage_failure(runtime_result, storage_result, "runtime")
+    finish_with_storage(runtime_result, "runtime", || {
+        finalize_and_shutdown_storage(&world, &mut storage_pipeline)
+    })
 }
 
 fn prefer_storage_failure<T>(
@@ -305,6 +306,17 @@ fn prefer_storage_failure<T>(
             Err(storage_error).context(format!("{operation_name} also failed: {operation_error:#}"))
         }
     }
+}
+
+fn finish_with_storage<T>(
+    operation: Result<T>,
+    operation_name: &str,
+    finish: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    // Invoke cleanup unconditionally before inspecting the operation result.
+    // This is the ordinary-error boundary for every storage-owning host path.
+    let storage = finish();
+    prefer_storage_failure(operation, storage, operation_name)
 }
 
 fn shutdown_storage(pipeline: &mut StoragePipeline) -> Result<scriptbots_storage::ShutdownReceipt> {
@@ -752,8 +764,9 @@ fn bootstrap_world(
     let mut world = match WorldState::with_persistence(config, Box::new(pipeline.sink())) {
         Ok(world) => world,
         Err(error) => {
-            let shutdown = shutdown_storage(&mut pipeline).map(|_| ());
-            return prefer_storage_failure(Err(error.into()), shutdown, "world construction");
+            return finish_with_storage(Err(error.into()), "world construction", || {
+                shutdown_storage(&mut pipeline).map(|_| ())
+            });
         }
     };
     let bootstrap_result = (|| -> Result<()> {
@@ -779,9 +792,10 @@ fn bootstrap_world(
         Ok(())
     })();
     if let Err(error) = bootstrap_result {
-        let finalization = finalize_world_persistence(&mut world);
-        let storage = finalize_then_shutdown_storage(finalization, &mut pipeline);
-        return prefer_storage_failure(Err(error), storage, "world bootstrap");
+        return finish_with_storage(Err(error), "world bootstrap", || {
+            let finalization = finalize_world_persistence(&mut world);
+            finalize_then_shutdown_storage(finalization, &mut pipeline)
+        });
     }
 
     Ok((Arc::new(Mutex::new(world)), analytics, pipeline))
@@ -1583,12 +1597,9 @@ fn profile_world_steps_with_storage(
     let mut world = match WorldState::with_persistence(config.clone(), Box::new(pipeline.sink())) {
         Ok(world) => world,
         Err(error) => {
-            let shutdown = shutdown_storage(&mut pipeline).map(|_| ());
-            return prefer_storage_failure(
-                Err(error.into()),
-                shutdown,
-                "profile world construction",
-            );
+            return finish_with_storage(Err(error.into()), "profile world construction", || {
+                shutdown_storage(&mut pipeline).map(|_| ())
+            });
         }
     };
     let start = Instant::now();
@@ -1600,9 +1611,10 @@ fn profile_world_steps_with_storage(
         }
         Ok(())
     })();
-    let finalization = finalize_world_persistence(&mut world);
-    let storage = finalize_then_shutdown_storage(finalization, &mut pipeline);
-    prefer_storage_failure(profile_result, storage, "storage profiling")?;
+    finish_with_storage(profile_result, "storage profiling", || {
+        let finalization = finalize_world_persistence(&mut world);
+        finalize_then_shutdown_storage(finalization, &mut pipeline)
+    })?;
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
     let tps = tick_limit as f64 / secs;
@@ -2568,6 +2580,39 @@ activation = "Sigmoid"
     }
 
     #[test]
+    fn runtime_error_still_commits_exact_partial_tail() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime-error.sqlite");
+        let db_str = db_path.to_string_lossy().to_string();
+        let mut pipeline =
+            StoragePipeline::create_new_file_with_thresholds(&db_str, 64, 4096, 1024, 1024)
+                .expect("pipeline");
+        let config = ScriptBotsConfig {
+            persistence_interval: 5,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xC105_E0A1),
+            ..ScriptBotsConfig::default()
+        };
+        let mut initial_world =
+            WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
+        initial_world.step().expect("non-boundary tick");
+        let world = Arc::new(Mutex::new(initial_world));
+
+        let operation: Result<()> = Err(anyhow::anyhow!("injected renderer failure"));
+        let error = finish_with_storage(operation, "runtime", || {
+            finalize_and_shutdown_storage(&world, &mut pipeline)
+        })
+        .expect_err("runtime error must survive acknowledged storage cleanup");
+        assert!(format!("{error:#}").contains("injected renderer failure"));
+
+        drop(world);
+        let reader = StorageReader::open(&db_str).expect("open finalized database");
+        assert_eq!(reader.max_tick().expect("read final tick"), Some(1));
+        reader.close().expect("close reader");
+    }
+
+    #[test]
     fn shutdown_finalization_retries_a_newly_rejected_exact_tail() {
         struct RejectingPersistence {
             remaining_rejections: Arc<std::sync::atomic::AtomicUsize>,
@@ -2628,25 +2673,46 @@ activation = "Sigmoid"
         assert!(accepted.persistence_fault().is_none());
         let batches = accepted_batches.lock().expect("accepted batch log");
         assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].epoch, batches[1].epoch);
+        assert_eq!(batches[0].closed, batches[1].closed);
         assert_eq!(batches[0].summary, batches[1].summary);
         assert_eq!(batches[0].metrics, batches[1].metrics);
         assert_eq!(batches[0].events, batches[1].events);
+        assert!(batches.iter().all(|batch| batch.agents.is_empty()));
+        assert_eq!(batches[0].births, batches[1].births);
+        assert_eq!(batches[0].deaths, batches[1].deaths);
         assert_eq!(batches[0].replay_events, batches[1].replay_events);
         drop(batches);
 
         let rejected_batches = Arc::new(Mutex::new(Vec::new()));
         let mut rejected = make_world(2, Arc::clone(&rejected_batches));
         rejected.step().expect("non-boundary tick");
-        let error = finalize_world_persistence(&mut rejected)
-            .expect_err("second rejection must be terminal and honest");
-        assert!(error.to_string().contains("failed to re-admit"));
+        let mut pipeline = StoragePipeline::memory().expect("cleanup pipeline");
+        let operation: Result<()> = Err(anyhow::anyhow!("injected runtime failure"));
+        let error = finish_with_storage(operation, "runtime", || {
+            let finalization = finalize_world_persistence(&mut rejected);
+            finalize_then_shutdown_storage(finalization, &mut pipeline)
+        })
+        .expect_err("second rejection and runtime error must both remain observable");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("failed to re-admit"));
+        assert!(rendered.contains("injected runtime failure"));
+        assert!(
+            pipeline.shutdown().is_err(),
+            "failed finalization must still close the storage worker"
+        );
         assert!(rejected.has_pending_persistence_batch());
         assert!(rejected.persistence_fault().is_some());
         let batches = rejected_batches.lock().expect("rejected batch log");
         assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].epoch, batches[1].epoch);
+        assert_eq!(batches[0].closed, batches[1].closed);
         assert_eq!(batches[0].summary, batches[1].summary);
         assert_eq!(batches[0].metrics, batches[1].metrics);
         assert_eq!(batches[0].events, batches[1].events);
+        assert!(batches.iter().all(|batch| batch.agents.is_empty()));
+        assert_eq!(batches[0].births, batches[1].births);
+        assert_eq!(batches[0].deaths, batches[1].deaths);
         assert_eq!(batches[0].replay_events, batches[1].replay_events);
     }
 
