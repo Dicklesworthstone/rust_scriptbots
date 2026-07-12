@@ -612,6 +612,34 @@ mod characterization_tests {
     }
 
     #[test]
+    fn manifest_and_audit_observe_closed_world_boundary_transitions() {
+        let mut world = test_world(Some(34));
+        world.step().expect("tick before policy transition");
+        let build = complete_test_build();
+        let scenario = ScenarioIdentityV0::caller_seeded("closed-policy-test");
+        let open_manifest =
+            RunManifestV0::from_world_with_provenance(scenario.clone(), &world, build.clone())
+                .expect("open manifest");
+        assert_eq!(open_manifest.normalized_config["closed"], false);
+
+        world.set_closed(true);
+        let closed_manifest = RunManifestV0::from_world_with_provenance(scenario, &world, build)
+            .expect("closed manifest");
+
+        assert!(world.is_closed());
+        assert_eq!(world.config_revision(), 1);
+        assert_eq!(closed_manifest.normalized_config["closed"], true);
+        assert_ne!(open_manifest.config_digest, closed_manifest.config_digest);
+        assert_eq!(
+            world.config_audit(),
+            [scriptbots_core::ConfigAuditEntry {
+                tick: 1,
+                patch: serde_json::json!({ "closed": true }),
+            }]
+        );
+    }
+
+    #[test]
     fn manifest_rejects_entropy_seed_and_marks_provenance_gaps() {
         let entropy_world = test_world(None);
         assert!(matches!(

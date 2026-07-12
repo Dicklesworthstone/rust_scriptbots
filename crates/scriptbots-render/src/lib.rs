@@ -1704,22 +1704,7 @@ impl SimulationView {
     }
 
     fn apply_preset(&mut self, preset: PresetKind, _cx: &mut Context<Self>) {
-        self.submit_config_update(|config| match preset {
-            PresetKind::Arctic => {
-                config.temperature_gradient_exponent = 1.6;
-                config.food_max = 0.35;
-                config.food_growth_rate = 0.03;
-            }
-            PresetKind::BoomBust => {
-                config.food_growth_rate = 0.12;
-                config.food_decay_rate = 0.01;
-                config.population_spawn_interval = 60;
-            }
-            PresetKind::ClosedWorld => {
-                config.population_minimum = 0;
-                config.population_spawn_interval = 0;
-            }
-        });
+        self.submit_config_update(|config| preset.apply_to_config(config));
     }
 
     fn canvas_to_world(&self, position: Point<Pixels>) -> Option<(f32, f32)> {

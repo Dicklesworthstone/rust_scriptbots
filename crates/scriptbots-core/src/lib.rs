@@ -1618,8 +1618,7 @@ impl PresetKind {
                 config.population_spawn_interval = 60;
             }
             PresetKind::ClosedWorld => {
-                config.population_minimum = 0;
-                config.population_spawn_interval = 0;
+                config.closed = true;
             }
         }
     }
@@ -1637,8 +1636,7 @@ impl PresetKind {
                 "population_spawn_interval": 60
             }),
             PresetKind::ClosedWorld => serde_json::json!({
-                "population_minimum": 0,
-                "population_spawn_interval": 0
+                "closed": true
             }),
         }
     }
@@ -2900,6 +2898,9 @@ pub struct ScriptBotsConfig {
     pub topography_speed_gain: f32,
     /// Additional metabolism drain incurred per unit uphill slope.
     pub topography_energy_penalty: f32,
+    /// Whether automatic population-floor and scheduled injection are disabled.
+    #[serde(default)]
+    pub closed: bool,
     /// Minimum population size maintained via automatic seeding.
     pub population_minimum: usize,
     /// Interval (in ticks) for injecting new agents when the world is open.
@@ -3027,6 +3028,7 @@ impl Default for ScriptBotsConfig {
             topography_enabled: false,
             topography_speed_gain: 0.35,
             topography_energy_penalty: 0.002,
+            closed: false,
             population_minimum: 0,
             population_spawn_interval: 100,
             population_spawn_count: 1,
@@ -5641,7 +5643,6 @@ pub struct WorldState {
     config: ScriptBotsConfig,
     tick: Tick,
     epoch: u64,
-    closed: bool,
     rng: SmallRng,
     agents: AgentArena,
     food: FoodGrid,
@@ -5718,7 +5719,7 @@ impl fmt::Debug for WorldState {
             .field("config", &self.config)
             .field("tick", &self.tick)
             .field("epoch", &self.epoch)
-            .field("closed", &self.closed)
+            .field("closed", &self.config.closed)
             .field("agent_count", &self.agents.len())
             .field("food_profiles", &self.food_profiles.len())
             .field(
@@ -5771,7 +5772,6 @@ impl WorldState {
             config,
             tick: Tick::zero(),
             epoch: 0,
-            closed: false,
             rng,
             agents: AgentArena::new(),
             runtime: AgentMap::new(),
@@ -8011,7 +8011,7 @@ impl WorldState {
         &mut self,
         next_tick: Tick,
     ) -> Result<Option<PopulationSpawnReceipt>, BrainSpawnError> {
-        if self.closed {
+        if self.config.closed {
             return Ok(None);
         }
 
@@ -10002,7 +10002,7 @@ impl WorldState {
         let batch = PersistenceBatch {
             summary: summary.clone(),
             epoch: self.epoch,
-            closed: self.closed,
+            closed: self.config.closed,
             metrics,
             events,
             agents,
@@ -10264,7 +10264,7 @@ impl WorldState {
         let mut overall_encoder = CharacterizationEncoderV0::new("overall");
         overall_encoder.u64(self.tick.0);
         overall_encoder.u64(self.epoch);
-        overall_encoder.bool(self.closed);
+        overall_encoder.bool(self.config.closed);
         overall_encoder.string(&agents);
         overall_encoder.string(&food);
         overall_encoder.string(&terrain);
@@ -10307,6 +10307,17 @@ impl WorldState {
             Vec::new()
         } else {
             std::mem::take(&mut self.simulation_commands)
+        }
+    }
+
+    fn record_config_audit(&mut self, patch: serde_json::Value) {
+        self.config_audit.push(ConfigAuditEntry {
+            tick: self.tick.0,
+            patch,
+        });
+        if self.config_audit.len() > 64 {
+            let drop_count = self.config_audit.len() - 64;
+            self.config_audit.drain(0..drop_count);
         }
     }
 
@@ -10362,15 +10373,8 @@ impl WorldState {
             new_config.world_height as f32,
         );
 
-        // Record audit entry
-        let tick = self.tick.0;
         if let Ok(value) = serde_json::to_value(&new_config) {
-            self.config_audit
-                .push(ConfigAuditEntry { tick, patch: value });
-            if self.config_audit.len() > 64 {
-                let drop_count = self.config_audit.len() - 64;
-                self.config_audit.drain(0..drop_count);
-            }
+            self.record_config_audit(value);
         }
 
         self.config = new_config;
@@ -10492,16 +10496,25 @@ impl WorldState {
     /// Returns whether the environment is closed to random spawning.
     #[must_use]
     pub const fn is_closed(&self) -> bool {
-        self.closed
+        self.config.closed
     }
 
     pub fn config_audit(&self) -> &[ConfigAuditEntry] {
         &self.config_audit
     }
 
-    /// Toggle the closed-environment flag.
+    /// Apply the closed-world population policy at the current completed tick boundary.
+    ///
+    /// Closing disables both floor enforcement and scheduled injection without altering their
+    /// configured values. Scheduled opportunities while closed are skipped, not deferred. A later
+    /// open transition makes the existing floor and cadence effective for subsequent ticks.
     pub fn set_closed(&mut self, closed: bool) {
-        self.closed = closed;
+        if self.config.closed == closed {
+            return;
+        }
+        self.config.closed = closed;
+        self.config_revision = self.config_revision.saturating_add(1);
+        self.record_config_audit(serde_json::json!({ "closed": closed }));
     }
 
     /// Iterate over retained tick summaries.
@@ -15247,26 +15260,134 @@ mod tests {
     }
 
     #[test]
-    fn population_seeding_respects_closed_flag() {
+    fn closed_world_construction_preserves_floor_for_a_later_open_boundary() {
         let config = ScriptBotsConfig {
             world_width: 200,
             world_height: 200,
             food_cell_size: 10,
             initial_food: 0.0,
             food_respawn_interval: 0,
+            closed: true,
             population_minimum: 3,
-            population_spawn_interval: 10,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 10.0,
             rng_seed: Some(222),
             ..ScriptBotsConfig::default()
         };
 
         let mut world = WorldState::new(config).expect("world");
-        world.set_closed(true);
+        assert!(world.is_closed());
+        assert!(world.config().closed);
+        assert_eq!(world.config().population_minimum, 3);
         world.step().expect("closed-world population step");
         assert_eq!(
             world.agent_count(),
             0,
             "closed world should not seed agents"
+        );
+
+        world.set_closed(false);
+        assert!(!world.is_closed());
+        assert_eq!(world.config_revision(), 1);
+        assert_eq!(
+            world.config_audit(),
+            [ConfigAuditEntry {
+                tick: 1,
+                patch: serde_json::json!({ "closed": false }),
+            }]
+        );
+        world.step().expect("reopened population-floor step");
+        assert_eq!(
+            world.agent_count(),
+            3,
+            "reopening should restore the configured floor"
+        );
+    }
+
+    #[test]
+    fn closed_boundaries_skip_scheduled_injection_instead_of_queueing_it() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            closed: false,
+            population_minimum: 0,
+            population_spawn_interval: 2,
+            population_spawn_count: 1,
+            population_crossover_chance: 0.0,
+            reproduction_energy_threshold: 10.0,
+            rng_seed: Some(223),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        world.step().expect("open tick one");
+        assert_eq!(world.agent_count(), 0);
+
+        world.set_closed(true);
+        world.set_closed(true);
+        assert_eq!(
+            world.config_revision(),
+            1,
+            "idempotent close must not create a transition"
+        );
+        world.step().expect("closed scheduled tick two");
+        assert_eq!(
+            world.agent_count(),
+            0,
+            "closed scheduled opportunity must be skipped"
+        );
+
+        world.set_closed(false);
+        assert_eq!(world.config_revision(), 2);
+        world.step().expect("open nonscheduled tick three");
+        assert_eq!(
+            world.agent_count(),
+            0,
+            "missed injection must not be queued for reopening"
+        );
+        world.step().expect("open scheduled tick four");
+        assert_eq!(
+            world.agent_count(),
+            1,
+            "next matching open cadence should inject once"
+        );
+        assert_eq!(
+            world.config_audit(),
+            [
+                ConfigAuditEntry {
+                    tick: 1,
+                    patch: serde_json::json!({ "closed": true }),
+                },
+                ConfigAuditEntry {
+                    tick: 2,
+                    patch: serde_json::json!({ "closed": false }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn closed_world_preset_preserves_the_configured_open_world_policy() {
+        let mut config = ScriptBotsConfig {
+            closed: false,
+            population_minimum: 7,
+            population_spawn_interval: 13,
+            population_spawn_count: 2,
+            ..ScriptBotsConfig::default()
+        };
+
+        PresetKind::ClosedWorld.apply_to_config(&mut config);
+
+        assert!(config.closed);
+        assert_eq!(config.population_minimum, 7);
+        assert_eq!(config.population_spawn_interval, 13);
+        assert_eq!(config.population_spawn_count, 2);
+        assert_eq!(
+            PresetKind::ClosedWorld.patch(),
+            serde_json::json!({ "closed": true })
         );
     }
 

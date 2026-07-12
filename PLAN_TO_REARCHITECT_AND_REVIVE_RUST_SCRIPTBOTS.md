@@ -553,6 +553,17 @@ The exact storage may remain `[f32; OUTPUT_SIZE]` in hot paths, but accessors/co
 
 ### 6.4 resource ledger and viable ecology
 
+**Closed-world/population-floor policy:** [Completed — closed-world/population-floor
+semantics, `bd-2z0.2.7`, Codex, 2026-07-12]
+
+`ScriptBotsConfig.closed` is the single scientific policy bit. An open world enforces its
+configured population floor on the next tick and performs scheduled injection only when that
+tick matches `population_spawn_interval`. A closed world performs neither kind of injection;
+scheduled opportunities that occur while closed are skipped rather than accumulated for reopening.
+Open/closed changes apply at a completed tick boundary, advance the configuration revision, and
+record that boundary in the configuration audit. The `closed_world` preset closes the world without
+destroying the floor/cadence configuration that becomes active again if a later boundary reopens it.
+
 Current defaults mix health and energy drains in a way that makes the tiny seeded population fade. The redesign needs an explicit ledger:
 
 - sources: ground food, carcass intake, population injection, scenario intervention;
