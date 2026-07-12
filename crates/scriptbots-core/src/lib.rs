@@ -28,6 +28,13 @@ pub struct BrainActivations {
     pub layers: Vec<ActivationLayer>,
     #[serde(default)]
     pub connections: Vec<ActivationEdge>,
+    /// Set when the snapshot was clipped to fit [`ACTIVATION_VALUE_BUDGET`].
+    ///
+    /// An inspector showing a truncated view must say so. Silently dropping
+    /// layers would let a user conclude a brain has no deep structure when in
+    /// fact we simply refused to copy it.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +116,42 @@ pub const NUM_EYES: usize = 4;
 /// time; a small budget covers every real use while keeping the cost
 /// population-independent.
 pub const ACTIVATION_CAPTURE_BUDGET: usize = 8;
+
+/// Maximum number of activation values copied out of a single brain per tick.
+///
+/// Bounding *how many* agents are captured is not enough: one agent's snapshot
+/// must also be bounded in size. Brain topology is configuration (a Neuroflow
+/// net can be declared with arbitrarily wide hidden layers), so without a cap a
+/// single inspected agent could copy megabytes out of the simulation every tick.
+/// Snapshots past this budget are clipped and marked
+/// [`BrainActivations::truncated`] — never silently shortened.
+pub const ACTIVATION_VALUE_BUDGET: usize = 4_096;
+
+/// Clip an activation snapshot to [`ACTIVATION_VALUE_BUDGET`] values.
+///
+/// Whole layers are kept or dropped rather than partially copied: half a layer
+/// is a lie about the shape of the network.
+fn clamp_activations(mut activations: BrainActivations) -> BrainActivations {
+    let mut budget = ACTIVATION_VALUE_BUDGET;
+    let mut kept = Vec::with_capacity(activations.layers.len());
+    let mut truncated = false;
+    for layer in activations.layers {
+        if layer.values.len() <= budget {
+            budget -= layer.values.len();
+            kept.push(layer);
+        } else {
+            truncated = true;
+        }
+    }
+    activations.layers = kept;
+    activations.truncated = truncated;
+    if truncated {
+        // Edges index into layers we may have dropped; a dangling edge would
+        // paint a connection to a node the viewer cannot see.
+        activations.connections.clear();
+    }
+    activations
+}
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
 const HALF_TURN: f32 = std::f32::consts::PI;
@@ -6609,7 +6652,7 @@ impl WorldState {
                 // them for every agent allocates layer buffers across the
                 // whole population every tick.
                 if job.capture {
-                    job.activations = runner.snapshot_activations();
+                    job.activations = runner.snapshot_activations().map(clamp_activations);
                 }
             } else {
                 job.outputs = Self::default_outputs(&job.sensors);
@@ -11811,6 +11854,68 @@ mod tests {
     }
 
     #[test]
+    fn a_single_activation_snapshot_is_size_bounded_and_says_when_it_was_clipped() {
+        // Bounding how MANY agents are captured is not enough: brain topology is
+        // configuration (a Neuroflow net can declare arbitrarily wide hidden
+        // layers), so one inspected agent could otherwise copy megabytes out of
+        // the simulation every single tick.
+        let huge = BrainActivations {
+            layers: vec![
+                ActivationLayer {
+                    name: "small".to_owned(),
+                    width: 4,
+                    height: 4,
+                    values: vec![0.1; 16],
+                },
+                ActivationLayer {
+                    name: "enormous".to_owned(),
+                    width: 1_000,
+                    height: 1_000,
+                    values: vec![0.2; 1_000_000],
+                },
+            ],
+            connections: vec![ActivationEdge {
+                from: 0,
+                to: 1,
+                weight: 1.0,
+            }],
+            truncated: false,
+        };
+
+        let clipped = clamp_activations(huge);
+        let total: usize = clipped.layers.iter().map(|l| l.values.len()).sum();
+        assert!(
+            total <= ACTIVATION_VALUE_BUDGET,
+            "snapshot kept {total} values, budget is {ACTIVATION_VALUE_BUDGET}"
+        );
+        assert!(
+            clipped.truncated,
+            "a clipped snapshot must SAY it was clipped; silently dropping layers \
+             would let a user conclude the brain has no deep structure"
+        );
+        // Whole layers survive or are dropped — half a layer is a lie about the
+        // shape of the network — and dangling edges are removed.
+        assert_eq!(clipped.layers.len(), 1);
+        assert_eq!(clipped.layers[0].name, "small");
+        assert!(clipped.connections.is_empty());
+
+        // A snapshot that fits is passed through untouched and unflagged.
+        let small = BrainActivations {
+            layers: vec![ActivationLayer {
+                name: "fits".to_owned(),
+                width: 2,
+                height: 2,
+                values: vec![0.5; 4],
+            }],
+            connections: Vec::new(),
+            truncated: false,
+        };
+        let kept = clamp_activations(small);
+        assert!(!kept.truncated);
+        assert_eq!(kept.layers.len(), 1);
+    }
+
+    #[test]
     fn activation_capture_is_bounded_even_when_every_agent_is_selected() {
         // Regression guard: a frontend "select all" must not reinstate
         // population-wide activation capture. Capture is demand-driven AND
@@ -11834,6 +11939,7 @@ mod tests {
                         values: vec![0.5],
                     }],
                     connections: Vec::new(),
+                    truncated: false,
                 })
             }
         }
