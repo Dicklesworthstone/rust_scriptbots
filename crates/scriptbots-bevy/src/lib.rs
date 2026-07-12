@@ -3998,7 +3998,7 @@ fn agent_colors(agent: &AgentVisual, palette: ColorPaletteMode) -> (Color, Color
     rgb.y = rgb.y.clamp(0.0, 1.0);
     rgb.z = rgb.z.clamp(0.0, 1.0);
 
-    let health_factor = (agent.health / 100.0).clamp(0.45, 1.0);
+    let health_factor = (agent.health / 2.0).clamp(0.45, 1.0);
     let base_rgb = Vec3::new(
         rgb.x * health_factor,
         rgb.y * health_factor,
@@ -4020,8 +4020,17 @@ fn agent_colors(agent: &AgentVisual, palette: ColorPaletteMode) -> (Color, Color
     (base, emissive)
 }
 
-fn close_on_esc(mut exit_events: MessageWriter<AppExit>, keyboard: Res<ButtonInput<KeyCode>>) {
+fn close_on_esc(
+    mut exit_events: MessageWriter<AppExit>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    state: Res<SnapshotState>,
+) {
     if keyboard.just_pressed(KeyCode::Escape) {
+        // Escape first clears an active selection (handled by
+        // `handle_selection_input`); only exit when nothing is selected.
+        if state.selection_center.is_some() {
+            return;
+        }
         exit_events.write(AppExit::Success);
     }
 }

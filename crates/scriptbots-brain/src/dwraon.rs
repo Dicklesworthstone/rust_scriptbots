@@ -106,8 +106,16 @@ impl DwraonBrain {
     #[must_use]
     pub fn random(rng: &mut dyn RngCore) -> Self {
         let mut nodes = Vec::with_capacity(BRAIN_SIZE);
-        for _ in 0..BRAIN_SIZE {
-            nodes.push(NodeParams::random(rng));
+        for idx in 0..BRAIN_SIZE {
+            let mut params = NodeParams::random(rng);
+            // legacy DWRAONBrain: the first half of the brain reads sensors
+            // directly, guaranteeing a large reactive (non-recurrent) core.
+            if idx < BRAIN_SIZE / 2 {
+                for source in &mut params.sources {
+                    *source = rng.random_range(0..INPUT_SIZE);
+                }
+            }
+            nodes.push(params);
         }
 
         let mut brain = Self {
@@ -238,16 +246,39 @@ impl Brain for DwraonBrain {
         }
         let other = other.as_any().downcast_ref::<Self>()?;
 
+        // legacy DWRAONBrain recombines per FIELD, not per node: bias, kind,
+        // damping, and every connection's weight/source/inversion each flip
+        // an independent coin, so co-adapted fields can recombine within a box.
         let mut child = self.clone();
         for (child_params, other_params) in child.nodes.iter_mut().zip(&other.nodes) {
             if rng.random::<f32>() < 0.5 {
-                continue;
+                child_params.bias = other_params.bias;
             }
-            *child_params = other_params.clone();
+            if rng.random::<f32>() < 0.5 {
+                child_params.kind = other_params.kind;
+            }
+            if rng.random::<f32>() < 0.5 {
+                child_params.damping = other_params.damping;
+            }
+            for conn in 0..CONNECTIONS {
+                if rng.random::<f32>() < 0.5 {
+                    child_params.weights[conn] = other_params.weights[conn];
+                }
+                if rng.random::<f32>() < 0.5 {
+                    child_params.sources[conn] = other_params.sources[conn];
+                }
+                if rng.random::<f32>() < 0.5 {
+                    child_params.inverted[conn] = other_params.inverted[conn];
+                }
+            }
         }
 
         child.reset_state();
         Some(Box::new(child))
+    }
+
+    fn clone_box(&self) -> Box<dyn Brain> {
+        Box::new(self.clone())
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {

@@ -95,6 +95,7 @@ fn main() -> Result<()> {
 
     // Auto-tune: run a quick sweep for the chosen storage mode, apply best settings, then continue.
     let mut thresholds = thresholds;
+    let mut threads_set_by_auto_tune = false;
     if let Some(ticks) = cli.auto_tune
         && let Some(best) =
             pick_best_for_storage(&config, ticks, cli.storage, cli.threads, cli.low_power)?
@@ -104,6 +105,7 @@ fn main() -> Result<()> {
             unsafe {
                 std::env::set_var("SCRIPTBOTS_MAX_THREADS", best.threads.to_string());
             }
+            threads_set_by_auto_tune = true;
         }
         // Apply thresholds if not provided via CLI
         if cli.storage_thresholds.is_none() {
@@ -135,8 +137,8 @@ fn main() -> Result<()> {
         unsafe {
             std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
         }
-    } else if cli.low_power {
-        // Conservative default: 2 worker threads unless explicitly overridden by --threads
+    } else if cli.low_power && !threads_set_by_auto_tune {
+        // Conservative default: 2 worker threads unless --threads or auto-tune decided already
         unsafe {
             std::env::set_var("SCRIPTBOTS_MAX_THREADS", "2");
         }
@@ -313,6 +315,21 @@ fn finalize_and_shutdown_storage(
         let mut world = world
             .lock()
             .map_err(|error| anyhow::anyhow!("world mutex poisoned during shutdown: {error}"))?;
+        // A latched NotAdmitted fault retains the exact rejected batch so it
+        // can be re-admitted; without this retry the retained batch would be
+        // dropped with the world and that tick's data silently lost.
+        if world.persistence_fault().is_some() {
+            match world.retry_pending_persistence() {
+                Ok(readmitted) => {
+                    if readmitted {
+                        info!("Re-admitted the retained persistence batch during shutdown");
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "retained persistence batch could not be re-admitted at shutdown");
+                }
+            }
+        }
         world
             .finalize_persistence()
             .context("failed to admit the final partial persistence batch")
@@ -458,31 +475,63 @@ fn run_det_child(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
     Ok(())
 }
 
-fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
+fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
     let exe = std::env::current_exe().context("failed to get current exe path")?;
-    // Child 1: single-thread (force RAYON_NUM_THREADS=1)
-    let mut child1 = Command::new(&exe);
-    child1.arg("--config-only"); // avoid launching UI
-    child1.env("SCRIPTBOTS_DET_RUN", "1");
-    child1.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
-    child1.env("RAYON_NUM_THREADS", "1");
-    child1.env("RUST_LOG", "error");
-    if let Ok(seed) = std::env::var("SCRIPTBOTS_DET_SEED") {
-        child1.env("SCRIPTBOTS_RNG_SEED", seed);
-    }
-    child1.stdout(Stdio::piped());
-    child1.stderr(Stdio::null());
-    let handle1 = child1.spawn().context("failed to spawn det child 1")?;
 
-    // Child N: default thread budget
-    let mut childn = Command::new(&exe);
-    childn.arg("--config-only");
-    childn.env("SCRIPTBOTS_DET_RUN", "1");
-    childn.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
-    childn.env("RUST_LOG", "error");
-    childn.stdout(Stdio::piped());
-    childn.stderr(Stdio::null());
-    let handlen = childn.spawn().context("failed to spawn det child N")?;
+    // Both children must replay the identical scenario: compose the parent's
+    // effective config, pin a shared seed, and hand the whole thing over as a
+    // config layer (env-only forwarding loses `--config`/`--rng-seed` flags).
+    let mut config = compose_config(cli)?;
+    if let Ok(seed) = std::env::var("SCRIPTBOTS_DET_SEED") {
+        let parsed = seed
+            .trim()
+            .parse::<u64>()
+            .context("SCRIPTBOTS_DET_SEED must be a u64")?;
+        config.rng_seed = Some(parsed);
+    }
+    let seed = match config.rng_seed {
+        Some(seed) => seed,
+        None => {
+            let generated = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x0D57_C0FF_EE00);
+            config.rng_seed = Some(generated);
+            generated
+        }
+    };
+    let layer = toml::to_string_pretty(&config).context("failed to serialize det-check config")?;
+    let layer_path = std::env::temp_dir().join(format!(
+        "scriptbots-det-check-{}-{seed}.toml",
+        std::process::id()
+    ));
+    fs::write(&layer_path, layer).with_context(|| {
+        format!(
+            "failed to write det-check config layer {}",
+            layer_path.display()
+        )
+    })?;
+
+    let spawn_child = |threads: Option<&str>| -> Result<std::process::Child> {
+        let mut child = Command::new(&exe);
+        child.arg("--config-only"); // avoid launching UI
+        child.arg("--config");
+        child.arg(&layer_path);
+        child.env("SCRIPTBOTS_DET_RUN", "1");
+        child.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
+        child.env("SCRIPTBOTS_RNG_SEED", seed.to_string());
+        child.env("RUST_LOG", "error");
+        if let Some(threads) = threads {
+            child.env("RAYON_NUM_THREADS", threads);
+        }
+        child.stdout(Stdio::piped());
+        child.stderr(Stdio::null());
+        child.spawn().context("failed to spawn det child")
+    };
+
+    // Child 1: single-thread; child N: default thread budget.
+    let handle1 = spawn_child(Some("1"))?;
+    let handlen = spawn_child(None)?;
 
     // Wait for both to complete (they run concurrently)
     let out1 = handle1
@@ -541,10 +590,19 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
             bail!("determinism self-check failed");
         }
     }
+    if left.events != right.events {
+        bail!(
+            "event count mismatch: 1t={} vs Nt={}",
+            left.events,
+            right.events
+        );
+    }
+    let _ = fs::remove_file(&layer_path);
     println!(
-        "{} Determinism self-check passed for {} ticks (events: 1t={}, Nt={})",
+        "{} Determinism self-check passed for {} ticks (seed {}, events: 1t={}, Nt={})",
         "✔".green().bold(),
         ticks,
+        seed,
         left.events,
         right.events
     );
@@ -607,9 +665,31 @@ fn storage_sidecar_paths(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn reserve_new_run_storage(path: &str) -> Result<()> {
-    prepare_storage_parent(path)?;
-    let path = Path::new(path);
+/// Reject path shapes that FrankenSQLite treats as volatile or non-file engines.
+/// File mode must never "reserve" these: `:memory:` selects the in-memory
+/// engine (a literal file named `:memory:` would be created but never used),
+/// and `file:` URIs bypass plain filesystem path semantics.
+fn ensure_durable_storage_path(path: &str) -> Result<()> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "SCRIPTBOTS_STORAGE_PATH is empty; set it to a durable file path, or use --storage memory for a volatile run"
+        );
+    }
+    if trimmed == ":memory:" {
+        bail!(
+            "SCRIPTBOTS_STORAGE_PATH=\":memory:\" selects the volatile in-memory engine and cannot back a durable file run; use --storage memory instead"
+        );
+    }
+    if trimmed.starts_with("file:") {
+        bail!(
+            "SCRIPTBOTS_STORAGE_PATH {path:?} uses the file: URI form, which is not supported for durable file runs; set a plain filesystem path, or use --storage memory"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_no_stale_sidecars(path: &Path) -> Result<()> {
     for sidecar in storage_sidecar_paths(path) {
         if sidecar
             .try_exists()
@@ -622,6 +702,14 @@ fn reserve_new_run_storage(path: &str) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn reserve_new_run_storage(path: &str) -> Result<()> {
+    ensure_durable_storage_path(path)?;
+    prepare_storage_parent(path)?;
+    let path = Path::new(path);
+    ensure_no_stale_sidecars(path)?;
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -632,6 +720,16 @@ fn reserve_new_run_storage(path: &str) -> Result<()> {
                 path.display()
             )
         })?;
+    // Re-check after the atomic reservation: a sidecar that appeared between
+    // the sweep above and create_new means another process is racing us on
+    // this path. Undo our just-created empty reservation file and fail.
+    if let Err(error) = ensure_no_stale_sidecars(path) {
+        let _ = fs::remove_file(path);
+        return Err(error.context(format!(
+            "storage sidecar appeared while reserving {}; removed the empty reservation file",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -2198,6 +2296,28 @@ mod tests {
         assert!(error.to_string().contains("stale FrankenSQLite sidecar"));
         assert!(!path.exists(), "reservation must not create the main file");
         assert_eq!(fs::read(wal).expect("read stale WAL"), b"stale-wal");
+    }
+
+    #[test]
+    fn new_run_reservation_rejects_volatile_and_uri_path_shapes() {
+        let error = reserve_new_run_storage(":memory:")
+            .expect_err("file mode must reject the in-memory engine path");
+        assert!(error.to_string().contains("--storage memory"));
+        assert!(
+            !Path::new(":memory:").exists(),
+            "reservation must not create a literal :memory: file"
+        );
+
+        let error = reserve_new_run_storage("").expect_err("file mode must reject an empty path");
+        assert!(error.to_string().contains("--storage memory"));
+
+        let error = reserve_new_run_storage("   \t")
+            .expect_err("file mode must reject a whitespace-only path");
+        assert!(error.to_string().contains("--storage memory"));
+
+        let error = reserve_new_run_storage("file:run.sqlite?mode=memory")
+            .expect_err("file mode must reject file: URI paths");
+        assert!(error.to_string().contains("--storage memory"));
     }
 
     #[test]

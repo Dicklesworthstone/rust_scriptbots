@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -94,6 +94,18 @@ impl Renderer for TerminalRenderer {
         enable_raw_mode().context("failed to enable raw mode")?;
         execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
 
+        // A panic inside the event loop must not leave the user's shell in raw
+        // mode inside the alternate screen; restore before the message prints.
+        struct RawModeGuard;
+        impl Drop for RawModeGuard {
+            fn drop(&mut self) {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = execute!(io::stdout(), crossterm::cursor::Show);
+            }
+        }
+        let guard = RawModeGuard;
+
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("failed to build terminal backend")?;
         terminal.hide_cursor().ok();
@@ -101,12 +113,7 @@ impl Renderer for TerminalRenderer {
         let result = run_event_loop(self, &mut terminal, ctx);
 
         terminal.show_cursor().ok();
-        if let Err(err) = disable_raw_mode() {
-            tracing::error!(?err, "failed to disable raw mode");
-        }
-        if let Err(err) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
-            tracing::error!(?err, "failed to leave alternate screen");
-        }
+        drop(guard);
 
         result
     }
@@ -137,6 +144,7 @@ fn run_event_loop(
 
         if event::poll(sleep_for)?
             && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
             && app.handle_key(key)?
         {
             break;
@@ -1272,11 +1280,17 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" Narrow:  width-1 symbols: ≈ ~ · \" * ^; agents h/H, o/O, c/C; groups @"),
         ];
 
-        // Compute a suitable height based on content and available space
+        // Compute a suitable height based on content and available space.
+        // Every dimension must stay within the frame: on tiny terminals the
+        // old `.max(8)` floor exceeded size.height and the centering math
+        // underflowed u16, producing a Rect far outside the buffer.
         let desired_height = (help_lines.len() as u16).saturating_add(2);
-        let help_height = desired_height.min(size.height.saturating_sub(2).max(8));
-        let help_x = size.x + (size.width - help_width) / 2;
-        let help_y = size.y + (size.height - help_height) / 2;
+        let help_height = desired_height
+            .min(size.height.saturating_sub(2))
+            .clamp(1, size.height.max(1));
+        let help_width = help_width.clamp(1, size.width.max(1));
+        let help_x = size.x + size.width.saturating_sub(help_width) / 2;
+        let help_y = size.y + size.height.saturating_sub(help_height) / 2;
         let area = Rect::new(help_x, help_y, help_width, help_height);
 
         // Ensure the help area fully clears underlying content so background doesn't bleed
@@ -1543,7 +1557,7 @@ impl<'a> TerminalApp<'a> {
 
     fn refresh_snapshot(&mut self) {
         let new_snapshot = match self.world.lock() {
-            Ok(world) => {
+            Ok(mut world) => {
                 let mut snap = Snapshot::from_world(&world);
                 // Determine focused agent id
                 let agent_id_opt = match self.focus_lock {
@@ -1570,6 +1584,9 @@ impl<'a> TerminalApp<'a> {
                             .find(|h| h.data().as_ffi() == e.label)
                     }),
                 };
+                // Activations are captured lazily: tell the world which agent
+                // the console heatmap follows so the next ticks snapshot it.
+                world.set_activation_probe(agent_id_opt);
                 if let Some(agent_id) = agent_id_opt
                     && let Some(rt) = world.runtime().get(agent_id)
                     && let Some(act) = rt.brain_activations.as_ref()

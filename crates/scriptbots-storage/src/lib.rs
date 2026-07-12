@@ -396,6 +396,60 @@ fn worker_error_from_storage(
     }
 }
 
+/// Rebuild an equivalent structured worker error so the terminal failure can be
+/// both replied to the requester and returned from the worker thread join.
+///
+/// `FrankenError` is not `Clone`, so the `Database` variant carries the source's
+/// rendered message instead of the original source value; every other field is
+/// preserved verbatim.
+fn duplicate_worker_error(error: &StorageWorkerError) -> StorageWorkerError {
+    match error {
+        StorageWorkerError::Database {
+            operation,
+            path,
+            tick,
+            attempt,
+            transient,
+            commit_state,
+            source,
+        } => StorageWorkerError::Database {
+            operation: *operation,
+            path: path.clone(),
+            tick: *tick,
+            attempt: *attempt,
+            transient: *transient,
+            commit_state: *commit_state,
+            source: FrankenError::Internal(source.to_string()),
+        },
+        StorageWorkerError::Channel {
+            operation,
+            path,
+            tick,
+            commit_state,
+            detail,
+        } => StorageWorkerError::Channel {
+            operation: *operation,
+            path: path.clone(),
+            tick: *tick,
+            commit_state: *commit_state,
+            detail: detail.clone(),
+        },
+        StorageWorkerError::Internal {
+            operation,
+            path,
+            tick,
+            commit_state,
+            detail,
+        } => StorageWorkerError::Internal {
+            operation: *operation,
+            path: path.clone(),
+            tick: *tick,
+            commit_state: *commit_state,
+            detail: detail.clone(),
+        },
+    }
+}
+
 /// Summary row written to the `ticks` table.
 #[derive(Debug, Clone)]
 struct TickRow {
@@ -579,8 +633,9 @@ struct PendingAnalytics {
 }
 
 impl PendingAnalytics {
-    fn from_batch(batch: &PersistenceBatch) -> Self {
+    fn from_batch(batch: &PersistenceBatch) -> Result<Self, StorageError> {
         let tick = batch.summary.tick.0;
+        let tick_column = encode_u64("metrics.tick", tick)?;
         let mut values = BTreeMap::new();
         for metric in &batch.metrics {
             values.insert(metric.name.to_string(), metric.value);
@@ -588,16 +643,16 @@ impl PendingAnalytics {
         let readings = values
             .into_iter()
             .map(|(name, value)| MetricReading {
-                tick: tick as i64,
+                tick: tick_column,
                 name,
                 value,
             })
             .collect::<Vec<_>>();
-        Self {
+        Ok(Self {
             tick,
             agent_count: batch.summary.agent_count,
             readings: Arc::from(readings),
-        }
+        })
     }
 }
 
@@ -613,7 +668,7 @@ impl PreparedPersistenceBatch {
         Ok(Self {
             tick: batch.summary.tick.0,
             storage: Storage::prepare_batch(batch)?,
-            analytics: PendingAnalytics::from_batch(batch),
+            analytics: PendingAnalytics::from_batch(batch)?,
         })
     }
 }
@@ -808,6 +863,17 @@ fn checked_i64(context: &'static str, value: usize) -> Result<i64, StorageError>
     i64::try_from(value).map_err(|error| StorageError::InvalidData {
         context,
         reason: error.to_string(),
+    })
+}
+
+/// Checked `u64` -> `i64` conversion for values headed into SQLite INTEGER
+/// columns. Values above `i64::MAX` would otherwise wrap negative on write
+/// while the read side rejects negatives, so out-of-range input must fail
+/// batch preparation (admission) instead of poisoning the durable file.
+fn encode_u64(context: &'static str, value: u64) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|_| StorageError::InvalidData {
+        context,
+        reason: format!("value {value} exceeds the i64 range supported by storage"),
     })
 }
 
@@ -1132,12 +1198,12 @@ impl Storage {
 
     fn prepare_batch(payload: &PersistenceBatch) -> Result<StorageBuffer, StorageError> {
         let summary = &payload.summary;
-        let tick = summary.tick.0 as i64;
+        let tick = encode_u64("ticks.tick", summary.tick.0)?;
         let mut prepared = StorageBuffer::default();
 
         prepared.ticks.push(TickRow {
             tick,
-            epoch: payload.epoch as i64,
+            epoch: encode_u64("ticks.epoch", payload.epoch)?,
             closed: payload.closed,
             agent_count: summary.agent_count as i64,
             births: summary.births as i64,
@@ -1168,15 +1234,15 @@ impl Storage {
         }
 
         for agent in &payload.agents {
-            prepared.agents.push(agent_row_from_snapshot(tick, agent));
+            prepared.agents.push(agent_row_from_snapshot(tick, agent)?);
         }
 
         for birth in &payload.births {
-            prepared.births.push(birth_row_from_record(birth));
+            prepared.births.push(birth_row_from_record(birth)?);
         }
 
         for death in &payload.deaths {
-            prepared.deaths.push(death_row_from_record(death));
+            prepared.deaths.push(death_row_from_record(death)?);
         }
 
         for (seq, event) in payload.replay_events.iter().enumerate() {
@@ -2158,8 +2224,12 @@ fn storage_worker(
                     Err(error) => {
                         analytics.publish_worker_error(&error, true);
                         storage.abandon_after_error();
+                        // Preserve the structured root cause for the worker join
+                        // (StoragePipeline::shutdown prefers it) while still
+                        // acknowledging the flush requester with the original.
+                        let worker_error = duplicate_worker_error(&error);
                         let _ = reply.send(Err(error));
-                        return None;
+                        return Some(worker_error);
                     }
                 }
             }
@@ -2248,11 +2318,11 @@ fn brain_binding_to_string(binding: &BrainBinding) -> String {
     binding.describe().into_owned()
 }
 
-fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {
-    let id = agent.id.data().as_ffi() as i64;
+fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> Result<AgentRow, StorageError> {
+    let id = encode_u64("agents.agent_id", agent.id.data().as_ffi())?;
     let data = &agent.data;
     let runtime = &agent.runtime;
-    AgentRow {
+    Ok(AgentRow {
         tick,
         agent_id: id,
         generation: data.generation.0 as i64,
@@ -2281,7 +2351,11 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {
         trait_blood: f64::from(runtime.trait_modifiers.blood),
         give_intent: f64::from(runtime.give_intent),
         brain_binding: brain_binding_to_string(&runtime.brain),
-        brain_key: runtime.brain.registry_key().map(|key| key as i64),
+        brain_key: runtime
+            .brain
+            .registry_key()
+            .map(|key| encode_u64("agents.brain_key", key))
+            .transpose()?,
         food_delta: f64::from(runtime.food_delta),
         spiked: runtime.spiked,
         hybrid: runtime.hybrid,
@@ -2292,11 +2366,15 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> AgentRow {
         hit_herbivore: runtime.combat.hit_herbivore,
         hit_by_carnivore: runtime.combat.was_spiked_by_carnivore,
         hit_by_herbivore: runtime.combat.was_spiked_by_herbivore,
-    }
+    })
 }
 
-fn optional_agent_id(id: Option<AgentId>) -> Option<i64> {
-    id.map(|agent_id| agent_id.data().as_ffi() as i64)
+fn optional_agent_id(
+    context: &'static str,
+    id: Option<AgentId>,
+) -> Result<Option<i64>, StorageError> {
+    id.map(|agent_id| encode_u64(context, agent_id.data().as_ffi()))
+        .transpose()
 }
 
 fn phase_label(phase: ReplayAgentPhase) -> &'static str {
@@ -2409,7 +2487,7 @@ fn replay_row_from_event(
     Ok(ReplayEventRow {
         tick,
         seq: seq as i64,
-        agent_id: optional_agent_id(event.agent_id),
+        agent_id: optional_agent_id("replay_events.agent_id", event.agent_id)?,
         scope,
         event_type,
         payload: payload_value.to_string(),
@@ -2582,20 +2660,23 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
     Ok(ReplayEvent { agent_id, kind })
 }
 
-fn birth_row_from_record(record: &BirthRecord) -> BirthRow {
-    BirthRow {
-        tick: record.tick.0 as i64,
-        agent_id: record.agent_id.data().as_ffi() as i64,
-        parent_a: optional_agent_id(record.parent_a),
-        parent_b: optional_agent_id(record.parent_b),
+fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError> {
+    Ok(BirthRow {
+        tick: encode_u64("births.tick", record.tick.0)?,
+        agent_id: encode_u64("births.agent_id", record.agent_id.data().as_ffi())?,
+        parent_a: optional_agent_id("births.parent_a", record.parent_a)?,
+        parent_b: optional_agent_id("births.parent_b", record.parent_b)?,
         brain_kind: record.brain_kind.clone(),
-        brain_key: record.brain_key.map(|key| key as i64),
+        brain_key: record
+            .brain_key
+            .map(|key| encode_u64("births.brain_key", key))
+            .transpose()?,
         herbivore_tendency: f64::from(record.herbivore_tendency),
         generation: record.generation.0 as i64,
         position_x: f64::from(record.position.x),
         position_y: f64::from(record.position.y),
         is_hybrid: record.is_hybrid,
-    }
+    })
 }
 
 fn death_cause_to_string(cause: DeathCause) -> &'static str {
@@ -2608,15 +2689,18 @@ fn death_cause_to_string(cause: DeathCause) -> &'static str {
     }
 }
 
-fn death_row_from_record(record: &DeathRecord) -> DeathRow {
-    DeathRow {
-        tick: record.tick.0 as i64,
-        agent_id: record.agent_id.data().as_ffi() as i64,
+fn death_row_from_record(record: &DeathRecord) -> Result<DeathRow, StorageError> {
+    Ok(DeathRow {
+        tick: encode_u64("deaths.tick", record.tick.0)?,
+        agent_id: encode_u64("deaths.agent_id", record.agent_id.data().as_ffi())?,
         age: record.age as i64,
         generation: record.generation.0 as i64,
         herbivore_tendency: f64::from(record.herbivore_tendency),
         brain_kind: record.brain_kind.clone(),
-        brain_key: record.brain_key.map(|key| key as i64),
+        brain_key: record
+            .brain_key
+            .map(|key| encode_u64("deaths.brain_key", key))
+            .transpose()?,
         energy: f64::from(record.energy),
         food_balance_total: f64::from(record.food_balance_total),
         cause: death_cause_to_string(record.cause).to_string(),
@@ -2627,7 +2711,7 @@ fn death_row_from_record(record: &DeathRecord) -> DeathRow {
         hit_herbivore: record.combat_flags.hit_herbivore,
         hit_by_carnivore: record.combat_flags.was_spiked_by_carnivore,
         hit_by_herbivore: record.combat_flags.was_spiked_by_herbivore,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3255,5 +3339,101 @@ mod tests {
             .err()
             .expect("empty storage paths must fail during the startup handshake");
         assert!(matches!(error, StorageError::Worker(_)));
+    }
+
+    #[test]
+    fn prepare_batch_rejects_out_of_range_tick() {
+        let error = Storage::prepare_batch(&sample_batch(u64::MAX, 1.0))
+            .expect_err("tick above i64::MAX must fail batch preparation");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "ticks.tick",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prepare_batch_rejects_out_of_range_agent_id() {
+        let mut batch = sample_batch(9, 1.0);
+        batch.agents[0].id = AgentId::from(KeyData::from_ffi(u64::MAX));
+        let error = Storage::prepare_batch(&batch)
+            .expect_err("agent id above i64::MAX must fail batch preparation");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "agents.agent_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn out_of_range_batch_fails_admission_without_poisoning_pipeline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut pipeline = StoragePipeline::with_thresholds(":memory:", 64, 4096, 1024, 1024)?;
+        let mut bad = sample_batch(7, 1.0);
+        bad.agents[0].id = AgentId::from(KeyData::from_ffi(u64::MAX));
+
+        let error = pipeline
+            .submit(&bad)
+            .expect_err("out-of-range agent id must be rejected at admission");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "agents.agent_id",
+                ..
+            }
+        ));
+
+        pipeline.submit(&sample_batch(8, 2.0))?;
+        let receipt = pipeline.flush_and_wait()?;
+        assert_eq!(receipt.committed_tick, Some(8));
+        pipeline.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_flush_failure_root_cause_survives_worker_join()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-flush-terminal-join");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        pipeline.submit(&sample_batch(11, 1.5))?;
+
+        // Sabotage a production table out-of-band so the worker's explicit
+        // flush fails terminally (non-transient, rolled back).
+        let saboteur = Connection::open(&path_string)?;
+        saboteur.execute("DROP TABLE metrics")?;
+        drop(saboteur);
+
+        let flush_error = pipeline
+            .flush_and_wait()
+            .expect_err("flush against a dropped table must fail");
+        let StorageError::Worker(reply_error) = flush_error else {
+            panic!("flush must surface a structured worker error");
+        };
+        let reply_status = reply_error.status();
+        assert_eq!(reply_status.kind, StorageFailureKind::Database);
+        assert_eq!(reply_status.operation, StorageOperation::Flush);
+
+        let shutdown_error = pipeline
+            .shutdown()
+            .expect_err("shutdown after a terminal flush failure must report the root cause");
+        let StorageError::Worker(join_error) = shutdown_error else {
+            panic!("shutdown must surface a structured worker error");
+        };
+        let join_status = join_error.status();
+        assert_eq!(join_status.kind, StorageFailureKind::Database);
+        assert_eq!(join_status.operation, StorageOperation::Flush);
+        assert!(
+            join_status.detail.contains("metrics"),
+            "join error must preserve the flush root cause, got: {}",
+            join_status.detail
+        );
+
+        let _ = fs::remove_file(path);
+        Ok(())
     }
 }

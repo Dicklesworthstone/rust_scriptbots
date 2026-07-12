@@ -155,6 +155,10 @@ impl Brain for AssemblyBrain {
         Some(Box::new(child))
     }
 
+    fn clone_box(&self) -> Box<dyn Brain> {
+        Box::new(self.clone())
+    }
+
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
         self
     }

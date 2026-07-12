@@ -222,7 +222,10 @@ impl Brain for MlpBrain {
             let params = &self.nodes[idx];
             if let Some(node) = self.state.get_mut(idx) {
                 let delta = node.target - node.output;
-                node.output += delta * params.damping.clamp(0.01, 1.0);
+                // damping is applied raw: legacy kp ranges up to 1.1, and the
+                // resulting overshoot is a real dynamical feature. Bounds are
+                // enforced at init/mutation time instead.
+                node.output += delta * params.damping;
             }
         }
 
@@ -255,12 +258,8 @@ impl Brain for MlpBrain {
             }
             if rng.random::<f32>() < rate {
                 let idx = rng.random_range(0..CONNECTIONS);
-                let target = if rng.random::<f32>() < 0.2 {
-                    rng.random_range(0..INPUT_SIZE)
-                } else {
-                    rng.random_range(0..BRAIN_SIZE)
-                };
-                params.targets[idx] = target;
+                // legacy retargets uniformly over the whole brain
+                params.targets[idx] = rng.random_range(0..BRAIN_SIZE);
             }
         }
     }
@@ -279,6 +278,10 @@ impl Brain for MlpBrain {
         }
         child.reset_state();
         Some(Box::new(child))
+    }
+
+    fn clone_box(&self) -> Box<dyn Brain> {
+        Box::new(self.clone())
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {

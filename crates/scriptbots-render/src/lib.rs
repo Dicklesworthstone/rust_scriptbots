@@ -789,25 +789,32 @@ pub mod world_compositor {
 
         comp.render_snapshot(&snapshot, (width, height));
 
-        // Extract mapped frame
+        // Extract mapped frame. Geometry must come from the readback view:
+        // render_snapshot may render at a reduced resolution (SB_WGPU_RES_SCALE),
+        // so the actual view size can differ from the requested width/height.
         let mut png: Vec<u8> = Vec::new();
         if let Some(view) = comp.renderer.as_mut().and_then(|r| r.mapped_rgba()) {
+            let view_width = view.width;
+            let view_height = view.height;
             let stride = view.bytes_per_row as usize;
-            let row_bytes = width as usize * 4;
+            let row_bytes = (view_width as usize) * 4;
             let src = view.bytes();
-            let mut tight = vec![0u8; row_bytes * height as usize];
-            for y in 0..(height as usize) {
+            let mut tight = vec![0u8; row_bytes * view_height as usize];
+            for y in 0..(view_height as usize) {
                 let s = y * stride;
                 let d = y * row_bytes;
-                tight[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+                let end = s + row_bytes;
+                if end <= src.len() {
+                    tight[d..d + row_bytes].copy_from_slice(&src[s..end]);
+                }
             }
             let mut cursor = std::io::Cursor::new(&mut png);
             let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
             let _ = image::ImageEncoder::write_image(
                 encoder,
                 &tight,
-                width,
-                height,
+                view_width,
+                view_height,
                 image::ExtendedColorType::Rgba8,
             );
         }
@@ -1017,7 +1024,14 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     if vw_u32 == 0 || vh_u32 == 0 {
         return;
     }
-    let viewport = (vw_u32, vh_u32);
+    // GPUI bounds are in logical pixels; render the offscreen target at
+    // physical resolution so HiDPI displays don't get an upscaled
+    // quarter-resolution image. Camera params are scaled to match below.
+    let scale_factor = window.scale_factor().max(0.1);
+    let viewport = (
+        (((vw_u32 as f32) * scale_factor).round() as u32).max(1),
+        (((vh_u32 as f32) * scale_factor).round() as u32).max(1),
+    );
 
     // Calculate camera scale/offset to map world pixels -> viewport pixels exactly as GPUI would
     // Reuse the same mapping used in paint_frame
@@ -1182,8 +1196,12 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         "wgpu camera mapping"
     );
 
-    // Render using current camera mapping
-    comp.set_camera_params(scale, cam_offset);
+    // Render using current camera mapping. The camera layout was computed in
+    // logical pixels; scale it to the physical-resolution render target.
+    comp.set_camera_params(
+        scale * scale_factor,
+        (cam_offset.0 * scale_factor, cam_offset.1 * scale_factor),
+    );
     comp.render_snapshot(&snapshot, viewport);
     if !comp.paint_world(bounds, window) {
         // If the wgpu image isn't ready, draw the CPU canvas frame this turn to avoid a blank window.
@@ -8122,7 +8140,7 @@ fn linear_to_srgb_byte(x: f32) -> u8 {
 }
 
 impl Render for SimulationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.perf.begin_frame();
 
         let live_snapshot = self.snapshot();
@@ -8188,6 +8206,11 @@ impl Render for SimulationView {
         if self.settings_panel.open {
             content = content.child(self.render_settings_panel(cx));
         }
+
+        // Keep the simulation advancing: GPUI only redraws on notify/input,
+        // and `pump_simulation()` runs inside render, so without scheduling
+        // the next animation frame the world freezes when the user is idle.
+        window.request_animation_frame();
 
         content
     }

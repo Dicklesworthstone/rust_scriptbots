@@ -200,6 +200,12 @@ impl NeuroflowBrain {
             .momentum(config.momentum);
         network
     }
+
+    fn gaussian(rng: &mut dyn RngCore) -> f64 {
+        let u1 = rng.random::<f64>().clamp(f64::MIN_POSITIVE, 1.0);
+        let u2 = rng.random::<f64>();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
 }
 
 impl Brain for NeuroflowBrain {
@@ -219,13 +225,59 @@ impl Brain for NeuroflowBrain {
         result
     }
 
-    fn mutate(&mut self, rng: &mut dyn RngCore, rate: f32, _scale: f32) {
+    fn mutate(&mut self, rng: &mut dyn RngCore, rate: f32, scale: f32) {
         if rate <= 0.0 {
             return;
         }
-        if rng.random::<f32>() <= rate {
-            self.network = Self::build_network(&self.config, rng);
+        // Perturb existing weights in place (per-weight coin at `rate`,
+        // Gaussian step scaled by `scale`). Regenerating the whole network
+        // would erase all inherited structure in one event.
+        let sigma = f64::from(scale.max(1e-5));
+        let Ok(mut value) = serde_json::to_value(&self.network) else {
+            return;
+        };
+        let mut changed = false;
+        if let Some(layers) = value.get_mut("layers").and_then(|v| v.as_array_mut()) {
+            for layer in layers {
+                if let Some(neurons) = layer.get_mut("w").and_then(|v| v.as_array_mut()) {
+                    for weights in neurons.iter_mut().filter_map(|n| n.as_array_mut()) {
+                        for weight in weights.iter_mut() {
+                            if rng.random::<f32>() < rate
+                                && let Some(current) = weight.as_f64()
+                            {
+                                let next = current + Self::gaussian(rng) * sigma;
+                                if let Some(number) = serde_json::Number::from_f64(next) {
+                                    *weight = serde_json::Value::Number(number);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+        if changed && let Ok(mut network) = serde_json::from_value::<FeedForward>(value) {
+            network
+                .activation(self.config.activation.to_type())
+                .learning_rate(self.config.learning_rate)
+                .momentum(self.config.momentum);
+            self.network = network;
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Brain> {
+        let value = serde_json::to_value(&self.network).expect("serialize neuroflow network");
+        let mut network: FeedForward =
+            serde_json::from_value(value).expect("round-trip neuroflow network");
+        network
+            .activation(self.config.activation.to_type())
+            .learning_rate(self.config.learning_rate)
+            .momentum(self.config.momentum);
+        Box::new(Self {
+            network,
+            config: self.config.clone(),
+            inputs: vec![0.0; INPUT_SIZE],
+        })
     }
 
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {

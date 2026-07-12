@@ -682,21 +682,21 @@ mod characterization_tests {
         assert_eq!(
             sequence(&trace_a),
             [
-                "38f7452ccda6bcba",
-                "34b0a76c99269b47",
-                "7d0464f81092c907",
-                "5538f487ce073b93",
-                "7f09761b265ce657",
+                "5ba6a5eadd4b4fc5",
+                "498bf488d51b63b6",
+                "9c17ee4a19ae4c5d",
+                "3f02366b10d3c780",
+                "e43612606fad2b22",
             ]
         );
         assert_eq!(
             sequence(&trace_c),
             [
-                "f024060ee12a9fd0",
-                "9dbc3883e0bf1973",
-                "fda69e3aa36a88c4",
-                "9f536f95875cfac5",
-                "4b004298efa2cafa",
+                "537688c799f28323",
+                "0b4098ed1b6c5564",
+                "4ec3d74ab87eae19",
+                "84ece2db7832e08a",
+                "eee7a03d6554dce1",
             ]
         );
 

@@ -58,6 +58,10 @@ pub trait Brain: Send + Sync + Any {
         None
     }
 
+    /// Duplicate this brain including all evolved parameters. Heredity relies
+    /// on this: offspring receive the parent's weights, not a fresh network.
+    fn clone_box(&self) -> Box<dyn Brain>;
+
     /// Downcast support for concrete brain logic.
     fn as_any(&self) -> &(dyn Any + Send + Sync);
 
@@ -84,6 +88,7 @@ pub struct BrainTelemetry {
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
     struct EchoBrain;
 
     impl Brain for EchoBrain {
@@ -99,6 +104,10 @@ mod tests {
         }
 
         fn mutate(&mut self, _rng: &mut dyn RngCore, _rate: f32, _scale: f32) {}
+
+        fn clone_box(&self) -> Box<dyn Brain> {
+            Box::new(self.clone())
+        }
 
         fn as_any(&self) -> &(dyn Any + Send + Sync) {
             self
@@ -122,23 +131,33 @@ mod tests {
 }
 
 /// Adapter bridging a [`Brain`] implementation into the simulation registry.
-pub struct BrainRunnerAdapter<B: Brain> {
-    brain: B,
+///
+/// Holds the brain as a trait object so that crossover offspring (which are
+/// produced as `Box<dyn Brain>`) stay heritable across generations.
+pub struct BrainRunnerAdapter {
+    brain: Box<dyn Brain>,
 }
 
-impl<B: Brain> BrainRunnerAdapter<B> {
+impl BrainRunnerAdapter {
     #[must_use]
-    pub fn new(brain: B) -> Self {
+    pub fn new<B: Brain + 'static>(brain: B) -> Self {
+        Self {
+            brain: Box::new(brain),
+        }
+    }
+
+    #[must_use]
+    pub fn from_boxed(brain: Box<dyn Brain>) -> Self {
         Self { brain }
     }
 
     #[must_use]
-    pub fn into_inner(self) -> B {
+    pub fn into_inner(self) -> Box<dyn Brain> {
         self.brain
     }
 }
 
-impl<B: Brain> BrainRunner for BrainRunnerAdapter<B> {
+impl BrainRunner for BrainRunnerAdapter {
     fn kind(&self) -> &'static str {
         self.brain.kind().as_str()
     }
@@ -149,6 +168,30 @@ impl<B: Brain> BrainRunner for BrainRunnerAdapter<B> {
 
     fn snapshot_activations(&self) -> Option<BrainActivations> {
         self.brain.snapshot_activations()
+    }
+
+    fn clone_runner(&self) -> Option<Box<dyn BrainRunner>> {
+        Some(Box::new(Self {
+            brain: self.brain.clone_box(),
+        }))
+    }
+
+    fn mutate(&mut self, rng: &mut dyn RngCore, rate: f32, scale: f32) {
+        self.brain.mutate(rng, rate, scale);
+    }
+
+    fn crossover(
+        &self,
+        partner: &dyn BrainRunner,
+        rng: &mut dyn RngCore,
+    ) -> Option<Box<dyn BrainRunner>> {
+        let partner = partner.as_any()?.downcast_ref::<Self>()?;
+        let child = self.brain.crossover(&*partner.brain, rng)?;
+        Some(Box::new(Self { brain: child }))
+    }
+
+    fn as_any(&self) -> Option<&(dyn Any + Send + Sync)> {
+        Some(self)
     }
 }
 

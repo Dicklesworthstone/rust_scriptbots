@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{Key, KeyData, SecondaryMap, SlotMap, new_key_type};
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -92,7 +93,7 @@ pub const NUM_EYES: usize = 4;
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
 const HALF_TURN: f32 = std::f32::consts::PI;
-const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.375; // 3π/8
+const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.1875; // 3π/16, PI38 in legacy World.cpp
 
 fn wrap_signed_angle(mut angle: f32) -> f32 {
     if angle.is_nan() {
@@ -631,6 +632,24 @@ impl BrainBinding {
         })
     }
 
+    /// Attach an inherited runner while preserving the family registry key,
+    /// so later generations can still fall back to the registry factory.
+    #[must_use]
+    pub fn inherited(runner: Box<dyn BrainRunner>, registry_key: Option<u64>) -> Self {
+        let kind = Some(runner.kind().to_string());
+        Self {
+            runner: Some(runner),
+            registry_key,
+            kind,
+        }
+    }
+
+    /// Borrow the live runner, if any.
+    #[must_use]
+    pub fn runner(&self) -> Option<&dyn BrainRunner> {
+        self.runner.as_deref()
+    }
+
     /// Return the registry key, if any, associated with this binding.
     #[must_use]
     pub const fn registry_key(&self) -> Option<u64> {
@@ -685,6 +704,32 @@ pub trait BrainRunner: Send + Sync {
     /// Optional snapshot of internal activation state for visualization.
     /// Defaults to `None` when the runner does not support introspection.
     fn snapshot_activations(&self) -> Option<BrainActivations> {
+        None
+    }
+
+    /// Duplicate this runner including all evolved parameters.
+    ///
+    /// `None` marks the family as non-heritable; reproduction then falls back
+    /// to spawning a fresh runner from the registry.
+    fn clone_runner(&self) -> Option<Box<dyn BrainRunner>> {
+        None
+    }
+
+    /// Perturb parameters in place using the agent's mutation rates.
+    fn mutate(&mut self, _rng: &mut dyn RngCore, _rate: f32, _scale: f32) {}
+
+    /// Produce an offspring runner by recombining with a same-kind partner.
+    fn crossover(
+        &self,
+        _partner: &dyn BrainRunner,
+        _rng: &mut dyn RngCore,
+    ) -> Option<Box<dyn BrainRunner>> {
+        None
+    }
+
+    /// Downcast hook so cross-crate `crossover` implementations can identify
+    /// same-family partners behind the trait object.
+    fn as_any(&self) -> Option<&(dyn Any + Send + Sync)> {
         None
     }
 }
@@ -1177,7 +1222,15 @@ struct ActuationResult {
     spike_length: f32,
     sound_level: f32,
     give_intent: f32,
-    spiked: bool,
+}
+
+/// Compact per-agent copy of the only runtime fields combat reads; cloning
+/// whole `AgentRuntime`s (logs, sensor arrays) per tick dwarfed the stage.
+#[derive(Debug, Clone, Copy, Default)]
+struct CombatAgentView {
+    herbivore_tendency: f32,
+    energy: f32,
+    outputs: [f32; OUTPUT_SIZE],
 }
 
 #[derive(Debug, Default)]
@@ -2605,7 +2658,7 @@ impl Default for ScriptBotsConfig {
             bot_radius: 10.0,
             boost_multiplier: 2.0,
             spike_growth_rate: 0.005,
-            metabolism_drain: 0.002,
+            metabolism_drain: 0.0002,
             movement_drain: 0.005,
             metabolism_ramp_floor: 1.0,
             metabolism_ramp_rate: 0.0,
@@ -3452,7 +3505,7 @@ impl TerrainLayer {
                 };
 
                 let fertility_bias = default_tile_fertility_bias(kind, elevation, moisture);
-                let temperature_bias = default_tile_temperature_bias(fy);
+                let temperature_bias = default_tile_temperature_bias(fx);
                 let palette_index = default_tile_palette_index(kind);
 
                 tiles.push(TerrainTile {
@@ -3592,8 +3645,10 @@ fn default_tile_fertility_bias(kind: TerrainKind, elevation: f32, moisture: f32)
     (kind_bonus + 0.5 + moisture_term - elevation_term).clamp(0.0, 1.0)
 }
 
-fn default_tile_temperature_bias(normalized_y: f32) -> f32 {
-    (1.0 - normalized_y).clamp(0.0, 1.0)
+fn default_tile_temperature_bias(normalized_x: f32) -> f32 {
+    // Must track sample_temperature's west→east gradient (distance from the
+    // vertical equator), or temperature overlays contradict what agents feel.
+    ((normalized_x - 0.5).abs() * 2.0).clamp(0.0, 1.0)
 }
 
 fn default_tile_palette_index(kind: TerrainKind) -> u16 {
@@ -4528,14 +4583,36 @@ mod map_sandbox {
         if visited[idx] {
             return accumulation[idx];
         }
+        // Iterative post-order: upstream chains can span the whole map, and
+        // one recursion frame per cell overflows the stack on large maps.
+        // Frames are (cell, next-child cursor, running total); a node's
+        // accumulation stays at 1.0 until its subtree completes, matching the
+        // recursive cycle-guard behavior for back-edges.
+        let mut stack: Vec<(usize, usize, f32)> = Vec::new();
         visited[idx] = true;
-        let mut total = 1.0f32;
-        accumulation[idx] = total;
-        for &child in &incoming[idx] {
-            total += accumulate_flow(child, incoming, accumulation, visited);
+        accumulation[idx] = 1.0;
+        stack.push((idx, 0, 1.0));
+        while let Some(&(node, child_pos, _)) = stack.last() {
+            if let Some(&child) = incoming[node].get(child_pos) {
+                if let Some(frame) = stack.last_mut() {
+                    frame.1 += 1;
+                    if visited[child] {
+                        frame.2 += accumulation[child];
+                    }
+                }
+                if !visited[child] {
+                    visited[child] = true;
+                    accumulation[child] = 1.0;
+                    stack.push((child, 0, 1.0));
+                }
+            } else if let Some((finished, _, total)) = stack.pop() {
+                accumulation[finished] = total;
+                if let Some(parent) = stack.last_mut() {
+                    parent.2 += total;
+                }
+            }
         }
-        accumulation[idx] = total;
-        total
+        accumulation[idx]
     }
 
     fn current_epoch_ms() -> u128 {
@@ -4880,7 +4957,6 @@ pub struct WorldState {
     work_eye_fov: Vec<[f32; NUM_EYES]>,
     work_eye_view_dirs: Vec<[f32; NUM_EYES]>,
     work_eye_fov_clamped: Vec<[f32; NUM_EYES]>,
-    work_eye_fov_cos: Vec<[f32; NUM_EYES]>,
     work_clocks: Vec<[f32; 2]>,
     work_temperature_preferences: Vec<f32>,
     work_sound_emitters: Vec<f32>,
@@ -4891,7 +4967,7 @@ pub struct WorldState {
     work_spike_lengths: Vec<f32>,
     work_velocities: Vec<Velocity>,
     work_speed_norm: Vec<f32>,
-    work_runtime_snapshot: Vec<AgentRuntime>,
+    work_combat_views: Vec<CombatAgentView>,
     work_penalties: Vec<f32>,
     pending_deaths: Vec<AgentId>,
     #[allow(dead_code)]
@@ -4924,6 +5000,8 @@ pub struct WorldState {
     combat_spike_attempts: u32,
     combat_spike_hits: u32,
     config_audit: Vec<ConfigAuditEntry>,
+    config_revision: u64,
+    activation_probe: Option<AgentId>,
     simulation_commands: Vec<SimulationCommand>,
 }
 
@@ -4963,8 +5041,10 @@ impl WorldState {
     ) -> Result<Self, WorldStateError> {
         configure_parallelism();
         let (food_w, food_h) = config.food_dimensions()?;
-        let rng = config.seeded_rng();
-        let mut terrain_rng = rng.clone();
+        let mut rng = config.seeded_rng();
+        // Decorrelate terrain noise from the world RNG stream: a plain clone
+        // replays identical draws for terrain and the first agent spawns.
+        let mut terrain_rng = SmallRng::seed_from_u64(rng.next_u64());
         let terrain =
             TerrainLayer::generate(food_w, food_h, config.food_cell_size, &mut terrain_rng)?;
         let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
@@ -5000,7 +5080,6 @@ impl WorldState {
             work_eye_fov: Vec::new(),
             work_eye_view_dirs: Vec::new(),
             work_eye_fov_clamped: Vec::new(),
-            work_eye_fov_cos: Vec::new(),
             work_clocks: Vec::new(),
             work_temperature_preferences: Vec::new(),
             work_sound_emitters: Vec::new(),
@@ -5011,7 +5090,7 @@ impl WorldState {
             work_spike_lengths: Vec::new(),
             work_velocities: Vec::new(),
             work_speed_norm: Vec::new(),
-            work_runtime_snapshot: Vec::new(),
+            work_combat_views: Vec::new(),
             work_penalties: Vec::new(),
             pending_deaths: Vec::new(),
             pending_spawns: Vec::new(),
@@ -5040,6 +5119,8 @@ impl WorldState {
             combat_spike_attempts: 0,
             combat_spike_hits: 0,
             config_audit: Vec::with_capacity(32),
+            config_revision: 0,
+            activation_probe: None,
             simulation_commands: Vec::new(),
         })
     }
@@ -5250,45 +5331,18 @@ impl WorldState {
                                 let neigh = (left_v + right_v + up_v + down_v) * f32x4::splat(0.25);
                                 val_v += f32x4::splat(diffusion) * (neigh - prev_v);
                             }
-                            let cap_arr = idxs.map(|i| {
-                                profiles
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(FoodCellProfile {
-                                        capacity: food_max,
-                                        growth_multiplier: 1.0,
-                                        decay_multiplier: 1.0,
-                                        fertility: 0.0,
-                                        nutrient_density: 0.3,
-                                    })
-                                    .capacity
+                            let lane_profiles = idxs.map(|i| {
+                                profiles.get(i).copied().unwrap_or(FoodCellProfile {
+                                    capacity: food_max,
+                                    growth_multiplier: 1.0,
+                                    decay_multiplier: 1.0,
+                                    fertility: 0.0,
+                                    nutrient_density: 0.3,
+                                })
                             });
-                            let grow_arr = idxs.map(|i| {
-                                profiles
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(FoodCellProfile {
-                                        capacity: food_max,
-                                        growth_multiplier: 1.0,
-                                        decay_multiplier: 1.0,
-                                        fertility: 0.0,
-                                        nutrient_density: 0.3,
-                                    })
-                                    .growth_multiplier
-                            });
-                            let decay_arr = idxs.map(|i| {
-                                profiles
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(FoodCellProfile {
-                                        capacity: food_max,
-                                        growth_multiplier: 1.0,
-                                        decay_multiplier: 1.0,
-                                        fertility: 0.0,
-                                        nutrient_density: 0.3,
-                                    })
-                                    .decay_multiplier
-                            });
+                            let cap_arr = lane_profiles.map(|p| p.capacity);
+                            let grow_arr = lane_profiles.map(|p| p.growth_multiplier);
+                            let decay_arr = lane_profiles.map(|p| p.decay_multiplier);
                             let cap_v = f32x4::new(cap_arr);
                             let grow_v = f32x4::new(grow_arr);
                             let decay_v = f32x4::new(decay_arr);
@@ -5487,7 +5541,6 @@ impl WorldState {
         self.work_eye_view_dirs.resize(agent_count, [0.0; NUM_EYES]);
         self.work_eye_fov_clamped
             .resize(agent_count, [1.0; NUM_EYES]);
-        self.work_eye_fov_cos.resize(agent_count, [0.0; NUM_EYES]);
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
         self.work_temperature_preferences.resize(agent_count, 0.5);
         self.work_sound_emitters.resize(agent_count, 0.0);
@@ -5500,16 +5553,13 @@ impl WorldState {
                 // Precompute per-eye view directions and clamped FOV once per agent
                 let mut views = [0.0; NUM_EYES];
                 let mut fovc = [1.0; NUM_EYES];
-                let mut fovcos = [0.0; NUM_EYES];
                 let base_heading = headings[idx];
                 for e in 0..NUM_EYES {
                     views[e] = wrap_signed_angle(base_heading + rt.eye_direction[e]);
                     fovc[e] = rt.eye_fov[e].max(0.01);
-                    fovcos[e] = fovc[e].cos();
                 }
                 self.work_eye_view_dirs[idx] = views;
                 self.work_eye_fov_clamped[idx] = fovc;
-                self.work_eye_fov_cos[idx] = fovcos;
                 self.work_clocks[idx] = rt.clocks;
                 self.work_temperature_preferences[idx] = rt.temperature_preference;
                 self.work_sound_emitters[idx] = rt.sound_multiplier;
@@ -5593,7 +5643,6 @@ impl WorldState {
             let traits = trait_modifiers[idx];
             let eyes_dir = &self.work_eye_view_dirs[idx];
             let eyes_fov = &self.work_eye_fov_clamped[idx];
-            let eyes_fov_cos = &self.work_eye_fov_cos[idx];
 
             index.visit_neighbor_buckets(idx, radius, &mut |indices| {
                 #[cfg(feature = "simd_wide")]
@@ -5661,52 +5710,33 @@ impl WorldState {
                             // Neighbor unit dir
                             let nx = dx / dist;
                             let ny = dy / dist;
-                            #[cfg(feature = "simd_wide")]
                             {
-                                // Dot against per-eye view directions; threshold by cos(FOV)
-                                let eye_dirs_x = [
-                                    eyes_dir[0].cos(),
-                                    eyes_dir[1].cos(),
-                                    eyes_dir[2].cos(),
-                                    eyes_dir[3].cos(),
-                                ];
-                                let eye_dirs_y = [
-                                    eyes_dir[0].sin(),
-                                    eyes_dir[1].sin(),
-                                    eyes_dir[2].sin(),
-                                    eyes_dir[3].sin(),
-                                ];
-                                let dot_v = f32x4::new([
-                                    eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
-                                    eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
-                                    eye_dirs_x[2] * nx + eye_dirs_y[2] * ny,
-                                    eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
+                                // Same falloff as the scalar path and legacy C++:
+                                // (fov - diff)/fov * (radius - dist)/radius.
+                                let ang = angle_to(dx, dy);
+                                let diff_v = f32x4::new([
+                                    angle_difference(eyes_dir[0], ang),
+                                    angle_difference(eyes_dir[1], ang),
+                                    angle_difference(eyes_dir[2], ang),
+                                    angle_difference(eyes_dir[3], ang),
                                 ]);
-                                let cos_fov_v = f32x4::new([
-                                    eyes_fov_cos[0],
-                                    eyes_fov_cos[1],
-                                    eyes_fov_cos[2],
-                                    eyes_fov_cos[3],
+                                let fov_v = f32x4::new([
+                                    eyes_fov[0],
+                                    eyes_fov[1],
+                                    eyes_fov[2],
+                                    eyes_fov[3],
                                 ]);
-                                let mask_v = f32x4::new([
-                                    (dot_v.to_array()[0] >= cos_fov_v.to_array()[0]) as i32 as f32,
-                                    (dot_v.to_array()[1] >= cos_fov_v.to_array()[1]) as i32 as f32,
-                                    (dot_v.to_array()[2] >= cos_fov_v.to_array()[2]) as i32 as f32,
-                                    (dot_v.to_array()[3] >= cos_fov_v.to_array()[3]) as i32 as f32,
-                                ]);
-                                // fov_factor ~ (cos_fov - dot)/cos_fov, clamped to [0,1]
-                                let fov_factor =
-                                    ((cos_fov_v - dot_v) / cos_fov_v).max(f32x4::splat(0.0));
-                                let intensity_v = fov_factor
-                                    * f32x4::splat(traits.eye * dist_factor * (dist / radius))
-                                    * mask_v;
+                                let fov_factor = ((fov_v - diff_v) / fov_v).max(f32x4::splat(0.0));
+                                let intensity_v =
+                                    fov_factor * f32x4::splat(traits.eye * dist_factor);
                                 let color = colors[other_idx];
                                 let mut dens =
                                     f32x4::new([density[0], density[1], density[2], density[3]]);
                                 let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
                                 let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
                                 let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                                dens += intensity_v;
+                                // legacy C++: proximity channel carries an extra d/DIST
+                                dens += intensity_v * f32x4::splat(dist / radius);
                                 r += intensity_v * f32x4::splat(color[0]);
                                 g += intensity_v * f32x4::splat(color[1]);
                                 b += intensity_v * f32x4::splat(color[2]);
@@ -5730,29 +5760,6 @@ impl WorldState {
                                 eye_b[1] = out_b[1];
                                 eye_b[2] = out_b[2];
                                 eye_b[3] = out_b[3];
-                            }
-                            #[cfg(not(feature = "simd_wide"))]
-                            {
-                                for eye in 0..NUM_EYES {
-                                    // Dot mask vs. cos(FOV)
-                                    let vx = eyes_dir[eye].cos();
-                                    let vy = eyes_dir[eye].sin();
-                                    let dot = vx * nx + vy * ny;
-                                    if dot >= eyes_fov_cos[eye] {
-                                        // approximate fov_factor via dot/cos_fov
-                                        let fov = eyes_fov[eye];
-                                        let diff =
-                                            angle_difference(eyes_dir[eye], angle_to(dx, dy));
-                                        let fov_factor = ((fov - diff) / fov).max(0.0);
-                                        let intensity =
-                                            traits.eye * fov_factor * dist_factor * (dist / radius);
-                                        density[eye] += intensity;
-                                        let color = colors[other_idx];
-                                        eye_r[eye] += intensity * color[0];
-                                        eye_g[eye] += intensity * color[1];
-                                        eye_b[eye] += intensity * color[2];
-                                    }
-                                }
                             }
                             // Blood via dot threshold to prune; magnitude via angle diff
                             let align = hx * nx + hy * ny;
@@ -5800,7 +5807,7 @@ impl WorldState {
                             let fov_v = f32x4::new(fov);
                             let mut fov_factor = (fov_v - diff_v) / fov_v;
                             fov_factor = fov_factor.max(f32x4::splat(0.0));
-                            let scalar = traits.eye * dist_factor * (dist / radius);
+                            let scalar = traits.eye * dist_factor;
                             let intensity_v = fov_factor * f32x4::splat(scalar);
                             let color = colors[other_idx];
                             let mut dens =
@@ -5808,7 +5815,8 @@ impl WorldState {
                             let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
                             let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
                             let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                            dens += intensity_v;
+                            // legacy C++: proximity channel carries an extra d/DIST
+                            dens += intensity_v * f32x4::splat(dist / radius);
                             r += intensity_v * f32x4::splat(color[0]);
                             g += intensity_v * f32x4::splat(color[1]);
                             b += intensity_v * f32x4::splat(color[2]);
@@ -5832,23 +5840,6 @@ impl WorldState {
                             eye_b[1] = out_b[1];
                             eye_b[2] = out_b[2];
                             eye_b[3] = out_b[3];
-                        }
-                        #[cfg(not(feature = "simd_wide"))]
-                        {
-                            for eye in 0..NUM_EYES {
-                                let diff = angle_difference(eyes_dir[eye], ang);
-                                let fov = eyes_fov[eye];
-                                if diff < fov {
-                                    let fov_factor = ((fov - diff) / fov).max(0.0);
-                                    let intensity =
-                                        traits.eye * fov_factor * dist_factor * (dist / radius);
-                                    density[eye] += intensity;
-                                    let color = colors[other_idx];
-                                    eye_r[eye] += intensity * color[0];
-                                    eye_g[eye] += intensity * color[1];
-                                    eye_b[eye] += intensity * color[2];
-                                }
-                            }
                         }
                         let forward_diff = angle_difference(heading, ang);
                         if forward_diff < BLOOD_HALF_FOV {
@@ -5880,110 +5871,29 @@ impl WorldState {
                         continue;
                     }
 
-                    #[cfg(feature = "simd_wide")]
-                    {
-                        // Compute neighbor unit direction
-                        let nx = dx / dist;
-                        let ny = dy / dist;
-                        // Precompute eye unit vectors from view angles
-                        let eye_dirs_x = [
-                            eyes_dir[0].cos(),
-                            eyes_dir[1].cos(),
-                            eyes_dir[2].cos(),
-                            eyes_dir[3].cos(),
-                        ];
-                        let eye_dirs_y = [
-                            eyes_dir[0].sin(),
-                            eyes_dir[1].sin(),
-                            eyes_dir[2].sin(),
-                            eyes_dir[3].sin(),
-                        ];
-                        let dot_v = f32x4::new([
-                            eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
-                            eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
-                            eye_dirs_x[2] * nx + eye_dirs_y[2] * ny,
-                            eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
-                        ]);
-                        let cos_fov_v = f32x4::new([
-                            eyes_fov_cos[0],
-                            eyes_fov_cos[1],
-                            eyes_fov_cos[2],
-                            eyes_fov_cos[3],
-                        ]);
-                        // mask = dot >= cos(fov)
-                        let mask = [
-                            (dot_v.to_array()[0] >= cos_fov_v.to_array()[0]) as i32 as f32,
-                            (dot_v.to_array()[1] >= cos_fov_v.to_array()[1]) as i32 as f32,
-                            (dot_v.to_array()[2] >= cos_fov_v.to_array()[2]) as i32 as f32,
-                            (dot_v.to_array()[3] >= cos_fov_v.to_array()[3]) as i32 as f32,
-                        ];
-                        let mask_v = f32x4::new(mask);
-                        // intensity = traits.eye * dist_factor * (dist/radius) * ((cos_fov - dot)/cos_fov) approximated by mask * (cos_fov - dot)/cos_fov
-                        let fov_factor = (cos_fov_v - dot_v) / cos_fov_v;
-                        let fov_factor = fov_factor.max(f32x4::splat(0.0));
-                        let intensity_v = fov_factor
-                            * f32x4::splat(traits.eye * dist_factor * (dist / radius))
-                            * mask_v;
-                        let color = colors[other_idx];
-                        let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
-                        let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
-                        let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
-                        let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                        dens = dens + intensity_v;
-                        r = r + intensity_v * f32x4::splat(color[0]);
-                        g = g + intensity_v * f32x4::splat(color[1]);
-                        b = b + intensity_v * f32x4::splat(color[2]);
-                        let out_d = dens.to_array();
-                        let out_r = r.to_array();
-                        let out_g = g.to_array();
-                        let out_b = b.to_array();
-                        density[0] = out_d[0];
-                        density[1] = out_d[1];
-                        density[2] = out_d[2];
-                        density[3] = out_d[3];
-                        eye_r[0] = out_r[0];
-                        eye_r[1] = out_r[1];
-                        eye_r[2] = out_r[2];
-                        eye_r[3] = out_r[3];
-                        eye_g[0] = out_g[0];
-                        eye_g[1] = out_g[1];
-                        eye_g[2] = out_g[2];
-                        eye_g[3] = out_g[3];
-                        eye_b[0] = out_b[0];
-                        eye_b[1] = out_b[1];
-                        eye_b[2] = out_b[2];
-                        eye_b[3] = out_b[3];
-                    }
-                    #[cfg(not(feature = "simd_wide"))]
-                    {
-                        for eye in 0..NUM_EYES {
-                            let view_dir = wrap_signed_angle(heading + eyes_dir[eye]);
-                            let diff = angle_difference(view_dir, ang);
-                            let fov = eyes_fov[eye].max(0.01);
-                            if diff < fov {
-                                let fov_factor = ((fov - diff) / fov).max(0.0);
-                                let intensity =
-                                    traits.eye * fov_factor * dist_factor * (dist / radius);
-                                density[eye] += intensity;
-                                let color = colors[other_idx];
-                                eye_r[eye] += intensity * color[0];
-                                eye_g[eye] += intensity * color[1];
-                                eye_b[eye] += intensity * color[2];
-                            }
+                    for eye in 0..NUM_EYES {
+                        // eyes_dir already includes the agent heading (see work_eye_view_dirs)
+                        let diff = angle_difference(eyes_dir[eye], ang);
+                        let fov = eyes_fov[eye];
+                        if diff < fov {
+                            let fov_factor = ((fov - diff) / fov).max(0.0);
+                            let intensity = traits.eye * fov_factor * dist_factor;
+                            // legacy C++: proximity channel carries an extra d/DIST
+                            density[eye] += intensity * (dist / radius);
+                            let color = colors[other_idx];
+                            eye_r[eye] += intensity * color[0];
+                            eye_g[eye] += intensity * color[1];
+                            eye_b[eye] += intensity * color[2];
                         }
                     }
 
                     smell += dist_factor;
 
-                    let velocity = velocities[other_idx];
                     sound += dist_factor * self.work_speed_norm[other_idx];
                     hearing += dist_factor * sound_emitters[other_idx];
 
                     // Blood via dot(heading_dir, n) >= cos(BLOOD_HALF_FOV)
-                    let hx = heading.cos();
-                    let hy = heading.sin();
                     let align = hx * (dx / dist) + hy * (dy / dist);
-                    let cos_bhf = (BLOOD_HALF_FOV).cos();
                     if align >= cos_bhf {
                         let forward_diff = angle_difference(heading, ang);
                         let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
@@ -6051,16 +5961,57 @@ impl WorldState {
     }
 
     fn stage_brains(&mut self) {
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
-        for agent_id in handles {
+        struct BrainJob {
+            agent_id: AgentId,
+            runner: Option<Box<dyn BrainRunner>>,
+            sensors: [f32; INPUT_SIZE],
+            capture: bool,
+            outputs: [f32; OUTPUT_SIZE],
+            activations: Option<BrainActivations>,
+        }
+
+        let probe = self.activation_probe;
+        // Pull each runner out of its binding so evaluation can run
+        // data-parallel (independent networks, no RNG); results are written
+        // back serially in handle order, keeping the stage deterministic.
+        let mut jobs: Vec<BrainJob> = Vec::with_capacity(self.agents.len());
+        for agent_id in self.agents.iter_handles() {
             if let Some(runtime) = self.runtime.get_mut(agent_id) {
-                let outputs = runtime
-                    .brain
-                    .tick(&runtime.sensors)
-                    .unwrap_or_else(|| Self::default_outputs(&runtime.sensors));
-                runtime.outputs = outputs;
-                // Capture activations if available
-                runtime.brain_activations = runtime.brain.snapshot_activations();
+                let capture = probe == Some(agent_id) || runtime.selection != SelectionState::None;
+                jobs.push(BrainJob {
+                    agent_id,
+                    runner: runtime.brain.runner.take(),
+                    sensors: runtime.sensors,
+                    capture,
+                    outputs: [0.0; OUTPUT_SIZE],
+                    activations: None,
+                });
+            }
+        }
+
+        let evaluate = |job: &mut BrainJob| {
+            if let Some(runner) = job.runner.as_mut() {
+                job.outputs = runner.tick(&job.sensors);
+                // Activation snapshots feed inspector UIs only; capturing
+                // them for every agent allocates layer buffers across the
+                // whole population every tick.
+                if job.capture {
+                    job.activations = runner.snapshot_activations();
+                }
+            } else {
+                job.outputs = Self::default_outputs(&job.sensors);
+            }
+        };
+        #[cfg(feature = "parallel")]
+        jobs.par_iter_mut().for_each(evaluate);
+        #[cfg(not(feature = "parallel"))]
+        jobs.iter_mut().for_each(evaluate);
+
+        for job in jobs {
+            if let Some(runtime) = self.runtime.get_mut(job.agent_id) {
+                runtime.brain.runner = job.runner;
+                runtime.outputs = job.outputs;
+                runtime.brain_activations = job.activations;
             }
         }
     }
@@ -6261,8 +6212,6 @@ impl WorldState {
                     } else if spike_length > decoded.spike_target {
                         spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                     }
-                    let spiked = spike_length > 0.5;
-
                     results[idx] = ActuationResult {
                         delta: Some(ActuationDelta {
                             heading,
@@ -6275,7 +6224,6 @@ impl WorldState {
                         spike_length,
                         sound_level: decoded.sound_level,
                         give_intent: decoded.give_intent,
-                        spiked,
                     };
                 }
 
@@ -6355,7 +6303,6 @@ impl WorldState {
                 } else if spike_length > decoded.spike_target {
                     spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                 }
-                let spiked = spike_length > 0.5;
                 results[idx] = ActuationResult {
                     delta: Some(ActuationDelta {
                         heading,
@@ -6368,7 +6315,6 @@ impl WorldState {
                     spike_length,
                     sound_level: decoded.sound_level,
                     give_intent: decoded.give_intent,
-                    spiked,
                 };
             }
         }
@@ -6448,8 +6394,6 @@ impl WorldState {
                 } else if spike_length > decoded.spike_target {
                     spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                 }
-                let spiked = spike_length > 0.5;
-
                 ActuationResult {
                     delta: Some(ActuationDelta {
                         heading,
@@ -6462,7 +6406,6 @@ impl WorldState {
                     spike_length,
                     sound_level: decoded.sound_level,
                     give_intent: decoded.give_intent,
-                    spiked,
                 }
             } else {
                 ActuationResult::default()
@@ -6518,7 +6461,6 @@ impl WorldState {
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 runtime.energy = results[idx].energy;
-                runtime.spiked = results[idx].spiked;
                 runtime.sound_output = results[idx].sound_level;
                 runtime.sound_multiplier = results[idx].sound_level;
                 runtime.give_intent = results[idx].give_intent;
@@ -6784,9 +6726,11 @@ impl WorldState {
         let waste_rate = self.config.food_waste_rate.max(0.0);
         let reproduction_bonus = self.config.reproduction_food_bonus.max(0.0);
         let fertility_bonus_scale = self.config.reproduction_fertility_bonus.max(0.0);
+        let healths = self.agents.columns_mut().health_mut();
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                if intake_rate > 0.0 || waste_rate > 0.0 {
+                // legacy C++ gate: a full agent neither eats nor wastes cell food
+                if (intake_rate > 0.0 || waste_rate > 0.0) && healths[idx] < 2.0 {
                     let pos = positions[idx];
                     let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
                     let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
@@ -6833,6 +6777,9 @@ impl WorldState {
                                 let nutrient = profile.nutrient_density;
                                 let energy_gain = intake * (0.5 + nutrient * 0.5);
                                 runtime.energy = (runtime.energy + energy_gain).min(2.0);
+                                // Eating restores health as well (legacy: health += itk);
+                                // without this, metabolism drain is a fixed death timer.
+                                healths[idx] = (healths[idx] + energy_gain).min(2.0);
                                 runtime.food_delta += energy_gain;
                                 if reproduction_bonus > 0.0 {
                                     let fertility_multiplier =
@@ -6869,12 +6816,26 @@ impl WorldState {
 
         // Defer indicator pulses to avoid borrowing conflicts
         let mut indicator_pulses: Vec<(AgentId, f32, [f32; 3])> = Vec::new();
+        // The spatial index still holds the pre-actuation buckets; one tick of
+        // movement is far smaller than a cell, and the +1-cell query margin
+        // absorbs any boundary crossing. Exact distances use live positions.
+        let query_radius = distance + self.index.cell_size;
+        let mut recipient_candidates: Vec<usize> = Vec::new();
         for &giver_idx in &sharers {
             let giver_id = handles[giver_idx];
-            for (recipient_idx, recipient_id) in handles.iter().enumerate() {
-                if recipient_idx == giver_idx {
+            recipient_candidates.clear();
+            self.index
+                .visit_neighbor_buckets(giver_idx, query_radius, &mut |indices| {
+                    recipient_candidates.extend_from_slice(indices);
+                });
+            // Ascending order matches the previous full-population scan.
+            recipient_candidates.sort_unstable();
+            recipient_candidates.dedup();
+            for &recipient_idx in &recipient_candidates {
+                if recipient_idx == giver_idx || recipient_idx >= handles.len() {
                     continue;
                 }
+                let recipient_id = &handles[recipient_idx];
                 let dx = toroidal_delta(
                     positions[recipient_idx].x,
                     positions[giver_idx].x,
@@ -7025,16 +6986,40 @@ impl WorldState {
         );
 
         let child_id = self.spawn_agent(child_data);
+        let child_rates = child_runtime.mutation_rates;
         if let Some(runtime) = self.runtime.get_mut(child_id) {
             *runtime = child_runtime;
-            // Inherit parent brain binding (same kind already enforced)
-            if let Some(key) = parent_runtime.brain.registry_key() {
-                let _ = self.bind_agent_brain(child_id, key);
-            }
-            true
         } else {
-            false
+            return false;
         }
+
+        // Real brain crossover (same kind already enforced above); fall back
+        // to a fresh registry spawn of the parent's family when the runners
+        // cannot recombine.
+        let inherited_key = parent_runtime.brain.registry_key();
+        let inherited_runner: Option<Box<dyn BrainRunner>> = {
+            let parent_runner = self.runtime.get(parent_id).and_then(|rt| rt.brain.runner());
+            let partner_runner = self
+                .runtime
+                .get(partner_id)
+                .and_then(|rt| rt.brain.runner());
+            match (parent_runner, partner_runner) {
+                (Some(parent), Some(partner)) => parent
+                    .crossover(partner, &mut self.rng)
+                    .or_else(|| parent.clone_runner()),
+                (Some(parent), None) => parent.clone_runner(),
+                _ => None,
+            }
+        };
+        if let Some(mut runner) = inherited_runner {
+            runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary);
+            if let Some(rt) = self.runtime.get_mut(child_id) {
+                rt.brain = BrainBinding::inherited(runner, inherited_key);
+            }
+        } else if let Some(key) = inherited_key {
+            let _ = self.bind_agent_brain(child_id, key);
+        }
+        true
     }
 
     fn stage_population(&mut self, next_tick: Tick) {
@@ -7151,19 +7136,31 @@ impl WorldState {
         for p in positions.iter() {
             self.work_position_pairs.push((p.x, p.y));
         }
-        let _ = self.index.rebuild(&self.work_position_pairs);
+        if self.index.rebuild(&self.work_position_pairs).is_err() {
+            // Same policy as stage_sense: never run queries against an index
+            // whose membership reflects a previous tick.
+            return;
+        }
 
         let spike_damage = self.config.spike_damage;
         let spike_energy_cost = self.config.spike_energy_cost;
         let index = &self.index;
-        // Reuse runtime snapshot buffer
-        self.work_runtime_snapshot.clear();
-        self.work_runtime_snapshot.reserve(handles.len());
+        // Reuse the compact combat view buffer
+        self.work_combat_views.clear();
+        self.work_combat_views.reserve(handles.len());
         for id in handles.iter() {
-            self.work_runtime_snapshot
-                .push(self.runtime.get(*id).cloned().unwrap_or_default());
+            let view = self
+                .runtime
+                .get(*id)
+                .map(|rt| CombatAgentView {
+                    herbivore_tendency: rt.herbivore_tendency,
+                    energy: rt.energy,
+                    outputs: rt.outputs,
+                })
+                .unwrap_or_default();
+            self.work_combat_views.push(view);
         }
-        let runtime_snapshot = &self.work_runtime_snapshot;
+        let runtime_snapshot = &self.work_combat_views;
 
         let results: Vec<CombatResult> = collect_handles!(handles, |idx, _handle| {
             let mut result = CombatResult::default();
@@ -7180,7 +7177,9 @@ impl WorldState {
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
 
-            if !attacker_runtime.spiked {
+            // Attack eligibility is the physical spike extension, not the
+            // "was stabbed this tick" flag that combat writes on victims.
+            if spike_lengths[idx] <= 0.5 {
                 result.energy = energy_before;
                 return result;
             }
@@ -7218,17 +7217,18 @@ impl WorldState {
                 .abs();
             let velocity = velocities[idx];
             let speed_mag = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
-            let boost = attacker_runtime
-                .outputs
-                .get(3)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
+            // outputs[6] is the boost channel (outputs[3] is color green);
+            // legacy C++ gates the damage bonus on boost > 0.5.
+            let boost_bonus = if attacker_runtime.outputs.get(6).copied().unwrap_or(0.0) > 0.5 {
+                1.0
+            } else {
+                0.0
+            };
 
             let base_power = spike_damage * spike_power;
             let length_factor = 1.0 + spike_length * length_bonus;
             let speed_factor =
-                1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost;
+                1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost_bonus;
             let base_damage = base_power * length_factor * speed_factor;
 
             let origin = positions[idx];
@@ -7680,6 +7680,20 @@ impl WorldState {
     }
 
     fn stage_death_cleanup(&mut self, tick: Tick) {
+        // Health exhaustion is fatal no matter which stage drained it; the
+        // legacy sim erases every health<=0 agent each tick. Without this
+        // sweep, agents drained by actuation/metabolism linger as zombies.
+        {
+            let healths = self.agents.columns().health();
+            let exhausted: Vec<AgentId> = self
+                .agents
+                .iter_handles()
+                .enumerate()
+                .filter(|(idx, _)| healths[*idx] <= 0.0)
+                .map(|(_, id)| id)
+                .collect();
+            self.pending_deaths.extend(exhausted);
+        }
         if self.pending_deaths.is_empty() {
             return;
         }
@@ -7778,10 +7792,6 @@ impl WorldState {
             .map(|idx| columns.snapshot(idx))
             .collect();
         let ages: Vec<u32> = columns.ages().to_vec();
-        let runtime_snapshots: Vec<AgentRuntime> = handles
-            .iter()
-            .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
-            .collect();
         let reproduction_window = self.cadence.reproduction_window(self.tick.next());
         let reproduction_chance = self.cadence.reproduction_chance();
 
@@ -7833,7 +7843,9 @@ impl WorldState {
             let partner_index =
                 self.select_partner_index(idx, &ages, partner_chance, handles.len());
             let partner_data = partner_index.map(|j| parent_snapshots[j]);
-            let partner_runtime = partner_index.map(|j| runtime_snapshots[j].clone());
+            // Cloning an AgentRuntime is deep (logs, sensor arrays); do it only
+            // for the one partner of an actual birth, not the whole population.
+            let partner_runtime = partner_index.and_then(|j| self.runtime.get(handles[j]).cloned());
 
             let child_data = self.build_child_data(
                 &parent_snapshots[idx],
@@ -7907,7 +7919,38 @@ impl WorldState {
                 runtime,
             } = order;
             let child_id = self.spawn_agent(data);
+            let inherited_key = runtime.brain.registry_key();
+            let child_rates = runtime.mutation_rates;
             self.runtime.insert(child_id, runtime);
+
+            // Brain heredity (legacy: child receives parent weights, then
+            // mutates): crossover when both parents are live and same-kind,
+            // else clone the parent, else respawn the family from the
+            // registry as a last resort.
+            let inherited_runner: Option<Box<dyn BrainRunner>> = {
+                let parent_runner = self.runtime.get(parent_id).and_then(|rt| rt.brain.runner());
+                parent_runner
+                    .map(|parent_runner| {
+                        let partner_runner = partner_id
+                            .and_then(|pid| self.runtime.get(pid))
+                            .and_then(|rt| rt.brain.runner())
+                            .filter(|partner| partner.kind() == parent_runner.kind());
+                        (parent_runner, partner_runner)
+                    })
+                    .and_then(|(parent_runner, partner_runner)| {
+                        partner_runner
+                            .and_then(|partner| parent_runner.crossover(partner, &mut self.rng))
+                            .or_else(|| parent_runner.clone_runner())
+                    })
+            };
+            if let Some(mut runner) = inherited_runner {
+                runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary);
+                if let Some(rt) = self.runtime.get_mut(child_id) {
+                    rt.brain = BrainBinding::inherited(runner, inherited_key);
+                }
+            } else if let Some(key) = inherited_key {
+                self.bind_agent_brain(child_id, key);
+            }
 
             if let (Some(child_runtime), Some(idx)) =
                 (self.runtime.get(child_id), self.agents.index_of(child_id))
@@ -8003,7 +8046,12 @@ impl WorldState {
         runtime.indicator = IndicatorState::default();
         runtime.selection = SelectionState::None;
         runtime.mutation_log.clear();
-        runtime.brain = BrainBinding::default();
+        // parent.clone() keeps registry_key/kind with runner=None; stage_spawn_commit
+        // rebinds a live runner from the registry using that key. Without a key no
+        // runner can be rehydrated, so drop the stale kind instead of claiming one.
+        if runtime.brain.registry_key().is_none() {
+            runtime.brain = BrainBinding::default();
+        }
         runtime.lineage = [Some(parent_id), partner_id];
 
         if let Some(partner_runtime) = partner {
@@ -9162,7 +9210,13 @@ impl WorldState {
     ) -> Result<(), WorldStateError> {
         let (food_w, food_h) = new_config.food_dimensions()?;
         let current_dims = (self.food.width(), self.food.height());
-        if (food_w, food_h) != current_dims {
+        // Compare the raw geometry too: proportional width/cell_size changes
+        // keep the derived food dims identical while rescaling the world.
+        if (food_w, food_h) != current_dims
+            || new_config.world_width != self.config.world_width
+            || new_config.world_height != self.config.world_height
+            || new_config.food_cell_size != self.config.food_cell_size
+        {
             return Err(WorldStateError::InvalidConfig(
                 "changing world dimensions at runtime is not supported; restart with the new configuration",
             ));
@@ -9216,7 +9270,22 @@ impl WorldState {
         self.food_profiles = food_profiles;
         self.index = new_index;
         self.cadence = TickCadence::from_config(&self.config);
+        self.config_revision = self.config_revision.saturating_add(1);
         Ok(())
+    }
+
+    /// Monotonic count of applied configuration updates. Unlike the capped
+    /// audit log length, this never plateaus, so caches can key off it.
+    #[must_use]
+    pub const fn config_revision(&self) -> u64 {
+        self.config_revision
+    }
+
+    /// Ask the next ticks to capture brain activations for `agent` (in
+    /// addition to any hovered/selected agents). Frontends set this for the
+    /// agent their inspector is focused on; `None` disables the extra probe.
+    pub fn set_activation_probe(&mut self, agent: Option<AgentId>) {
+        self.activation_probe = agent;
     }
 
     /// Replace the persistence sink.
@@ -12370,6 +12439,8 @@ mod tests {
             let idx = arena.index_of(agent).unwrap();
             let columns = arena.columns_mut();
             columns.positions_mut()[idx] = Position::new(15.0, 5.0);
+            // below the health cap so the intake/waste gate stays open
+            columns.health_mut()[idx] = 1.0;
         }
         {
             let runtime = world.agent_runtime_mut(agent).unwrap();
@@ -12574,6 +12645,9 @@ mod tests {
             let columns = arena.columns_mut();
             columns.positions_mut()[fertile_slot] = fertile_pos;
             columns.positions_mut()[infertile_slot] = infertile_pos;
+            // below the health cap so the intake/waste gate stays open
+            columns.health_mut()[fertile_slot] = 1.0;
+            columns.health_mut()[infertile_slot] = 1.0;
         }
         for agent in [fertile_agent, infertile_agent] {
             if let Some(runtime) = world.agent_runtime_mut(agent) {
