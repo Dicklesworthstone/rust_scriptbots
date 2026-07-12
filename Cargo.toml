@@ -21,6 +21,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 authors = ["ScriptBots Team"]
 description = "Evolutionary agent simulation rebuilt in modern Rust with GPUI rendering."
+repository = "https://github.com/Dicklesworthstone/rust_scriptbots"
 
 [workspace.dependencies]
 anyhow = "1.0.93"
@@ -51,6 +52,12 @@ kiddo = "4.2.0"
 neuroflow = "0.2.0"
 serde-wasm-bindgen = "0.6.5"
 wasm-bindgen = { version = "0.2.104", features = ["serde-serialize"] }
+
+[patch.crates-io]
+# GPUI's inactive screen-capture option still puts xcb 1.7.0 in Cargo.lock.
+# Keep broad lockfile audits clean with this exact upstream compatibility commit,
+# which replaces xcb's vulnerable build-time quick-xml 0.30 parser with 0.41.
+xcb = { git = "https://github.com/rust-x-bindings/rust-xcb", rev = "ae3b2cd080e78173223038ccbebdc644eaf4a9ad" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use ratatui::{
 use reqwest::{Client, StatusCode};
 use scriptbots_app::{
     ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest, KnobEntry, KnobKind,
-    KnobUpdate,
+    KnobUpdate, STORAGE_SIDECAR_SUFFIXES,
 };
 use scriptbots_storage::StorageReader;
 use serde::de::DeserializeOwned;
@@ -199,11 +199,10 @@ fn export_command(
         )
     })?;
 
-    let export_result = (|| -> Result<usize> {
-        ensure_distinct_export_destination(&database, &out)?;
-        let file = std::fs::File::create(&out)
-            .with_context(|| format!("failed to create export file {}", out.display()))?;
-        let mut writer = Writer::from_writer(file);
+    let export_result = (|| -> Result<(usize, Vec<u8>)> {
+        // Finish every database read and CSV serialization before publishing the requested path.
+        // A query/encoding failure therefore cannot leave an empty final-name export behind.
+        let mut writer = Writer::from_writer(Vec::new());
 
         let written = match kind {
             ExportKind::Metrics => export_metrics(&storage, &mut writer, last)?,
@@ -211,7 +210,10 @@ fn export_command(
         };
 
         writer.flush().context("failed to flush CSV writer")?;
-        Ok(written)
+        let bytes = writer
+            .into_inner()
+            .map_err(|error| anyhow::anyhow!("failed to finalize CSV buffer: {error}"))?;
+        Ok((written, bytes))
     })();
     let close_result = storage.close().with_context(|| {
         format!(
@@ -219,8 +221,13 @@ fn export_command(
             database.display()
         )
     });
-    let written = export_result?;
+    let (written, bytes) = export_result?;
     close_result?;
+    let mut file = open_distinct_export_destination(&database, &out)?;
+    file.write_all(&bytes)
+        .with_context(|| format!("failed to write export file {}", out.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync export file {}", out.display()))?;
     println!(
         "{} {} rows from {} to {}",
         "exported".green().bold(),
@@ -232,76 +239,90 @@ fn export_command(
     Ok(())
 }
 
-fn ensure_distinct_export_destination(database: &Path, out: &Path) -> Result<()> {
-    let out_metadata = match fs::metadata(out) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to inspect existing export destination {}",
-                    out.display()
-                )
-            });
-        }
-    };
-    let database_metadata = fs::metadata(database).with_context(|| {
-        format!(
-            "failed to inspect FrankenSQLite database {} before export",
-            database.display()
-        )
-    })?;
-
+fn open_distinct_export_destination(database: &Path, out: &Path) -> Result<fs::File> {
     let canonical_database = fs::canonicalize(database).with_context(|| {
         format!(
             "failed to resolve FrankenSQLite database {} before export",
             database.display()
         )
     })?;
-    let canonical_out = fs::canonicalize(out).with_context(|| {
-        format!(
-            "failed to resolve existing export destination {}",
-            out.display()
-        )
-    })?;
-
-    if canonical_database == canonical_out || same_file_identity(&database_metadata, &out_metadata)
+    let canonical_out = resolve_export_destination(out)?;
+    if canonical_database == canonical_out
+        || is_database_sidecar(&canonical_database, &canonical_out)
     {
         bail!(
-            "refusing to export CSV to {} because --out refers to the FrankenSQLite database {}",
+            "refusing to export CSV to {} because --out refers to the FrankenSQLite database {} or one of its live sidecars",
             out.display(),
             database.display()
         );
     }
 
-    Ok(())
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!(
+                    "refusing to export CSV to {} because --out already exists; exports require a new path so no database, sidecar, hard link, symbolic link, or prior export can be overwritten",
+                    out.display()
+                )
+            } else {
+                anyhow::Error::new(error)
+                    .context(format!("failed to create export file {}", out.display()))
+            }
+        })?;
+    Ok(file)
 }
 
-#[cfg(unix)]
-fn same_file_identity(database: &fs::Metadata, out: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
+fn resolve_export_destination(out: &Path) -> Result<PathBuf> {
+    if out.exists() {
+        return fs::canonicalize(out).with_context(|| {
+            format!(
+                "failed to resolve existing export destination {}",
+                out.display()
+            )
+        });
+    }
 
-    database.dev() == out.dev() && database.ino() == out.ino()
+    let parent = out.parent().filter(|path| !path.as_os_str().is_empty());
+    let canonical_parent = match parent {
+        Some(parent) => fs::canonicalize(parent)
+            .with_context(|| format!("failed to resolve export directory {}", parent.display()))?,
+        None => std::env::current_dir().context("failed to resolve current export directory")?,
+    };
+    let file_name = out
+        .file_name()
+        .with_context(|| format!("export destination {} has no file name", out.display()))?;
+    Ok(canonical_parent.join(file_name))
 }
 
-#[cfg(windows)]
-fn same_file_identity(database: &fs::Metadata, out: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    database.volume_serial_number().is_some()
-        && database.volume_serial_number() == out.volume_serial_number()
-        && database.file_index().is_some()
-        && database.file_index() == out.file_index()
+fn is_database_sidecar(database: &Path, out: &Path) -> bool {
+    STORAGE_SIDECAR_SUFFIXES.into_iter().any(|suffix| {
+        let mut sidecar = database.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        paths_equal_for_platform(out.as_os_str(), sidecar.as_os_str())
+    })
 }
 
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(_database: &fs::Metadata, _out: &fs::Metadata) -> bool {
-    false
+fn paths_equal_for_platform(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        // Canonicalization cannot resolve a destination that does not exist yet. Fold the full
+        // planned path before create-new so case variants cannot claim a live SQLite sidecar on
+        // Windows' default case-insensitive filesystems. Lossy conversion can only make this
+        // guard more conservative for malformed UTF-16 names.
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
-fn export_metrics(
+fn export_metrics<W: Write>(
     storage: &StorageReader,
-    writer: &mut Writer<std::fs::File>,
+    writer: &mut Writer<W>,
     last: Option<usize>,
 ) -> Result<usize> {
     let records = storage.recent_metrics(last)?;
@@ -320,9 +341,9 @@ fn export_metrics(
     Ok(records.len())
 }
 
-fn export_ticks(
+fn export_ticks<W: Write>(
     storage: &StorageReader,
-    writer: &mut Writer<std::fs::File>,
+    writer: &mut Writer<W>,
     last: Option<usize>,
 ) -> Result<usize> {
     let records = storage.recent_ticks(last)?;
@@ -878,17 +899,15 @@ fn value_to_string(value: &Value, max_len: usize) -> String {
         return String::new();
     }
 
-    let mut chars = raw.chars();
+    let chars = raw.chars();
     let mut truncated = String::new();
-    let mut count = 0usize;
 
-    while let Some(ch) = chars.next() {
+    for (count, ch) in chars.enumerate() {
         if count + 1 >= max_len {
             truncated.push('…');
             return truncated;
         }
         truncated.push(ch);
-        count += 1;
     }
 
     raw
@@ -997,7 +1016,7 @@ mod tests {
             .expect_err("an export destination aliasing the database must be rejected");
         let rendered = format!("{error:#}");
         assert!(
-            rendered.contains("--out refers to the FrankenSQLite database"),
+            rendered.contains("refusing to export CSV"),
             "unexpected error: {rendered}"
         );
 
@@ -1142,6 +1161,50 @@ mod tests {
         write_storage_fixture(&database)?;
 
         assert_alias_export_is_rejected_without_mutation(&database, database.clone())
+    }
+
+    #[test]
+    fn export_rejects_every_database_sidecar_without_mutating_it() -> Result<()> {
+        let directory = tempdir()?;
+        let database = directory.path().join("run.sqlite");
+        write_storage_fixture(&database)?;
+
+        for suffix in STORAGE_SIDECAR_SUFFIXES {
+            let output = directory.path().join(format!("run.sqlite{suffix}"));
+            let sidecar_before = fs::read(&output).ok();
+            assert_alias_export_is_rejected_without_mutation(&database, output.clone())?;
+            assert_eq!(
+                fs::read(&output).ok(),
+                sidecar_before,
+                "export mutated forbidden database sidecar {}",
+                output.display(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_guard_is_case_insensitive_on_windows() {
+        assert!(is_database_sidecar(
+            Path::new(r"C:\runs\Run.SQLite"),
+            Path::new(r"c:\RUNS\run.sqlite-WAL")
+        ));
+    }
+
+    #[test]
+    fn export_refuses_to_overwrite_an_existing_csv() -> Result<()> {
+        let directory = tempdir()?;
+        let database = directory.path().join("run.sqlite");
+        let output = directory.path().join("metrics.csv");
+        write_storage_fixture(&database)?;
+        fs::write(&output, b"existing export must survive")?;
+
+        let error = export_command(ExportKind::Metrics, database, output.clone(), None)
+            .expect_err("an existing export path must be rejected");
+        assert!(format!("{error:#}").contains("exports require a new path"));
+        assert_eq!(fs::read(&output)?, b"existing export must survive");
+        Ok(())
     }
 
     #[test]

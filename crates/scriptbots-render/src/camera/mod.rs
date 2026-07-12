@@ -450,6 +450,17 @@ impl Camera {
     }
 }
 
+struct LayoutComputation {
+    scale: f32,
+    render_w: f32,
+    render_h: f32,
+    pad_x: f32,
+    pad_y: f32,
+    offset_x: f32,
+    offset_y: f32,
+    fully_offscreen: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,15 +602,4 @@ mod tests {
             recovered
         );
     }
-}
-
-struct LayoutComputation {
-    scale: f32,
-    render_w: f32,
-    render_h: f32,
-    pad_x: f32,
-    pad_y: f32,
-    offset_x: f32,
-    offset_y: f32,
-    fully_offscreen: bool,
 }

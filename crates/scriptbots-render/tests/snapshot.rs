@@ -44,8 +44,10 @@ fn seed_agents(world: &mut WorldState, brain_key: u64) {
 
 #[test]
 fn rust_renderer_matches_golden_snapshot() {
-    let mut config = ScriptBotsConfig::default();
-    config.rng_seed = Some(424_242);
+    let config = ScriptBotsConfig {
+        rng_seed: Some(424_242),
+        ..ScriptBotsConfig::default()
+    };
     let mut world = WorldState::new(config).expect("initialize world");
 
     let brain_key = register_brains(&mut world);
@@ -56,6 +58,14 @@ fn rust_renderer_matches_golden_snapshot() {
 
     let png = render_png_offscreen(&world, 1600, 900);
     let golden_path = golden_dir().join("rust_default.png");
+    if std::env::var("RUST_REGEN_GOLDEN")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        fs::create_dir_all(golden_dir()).expect("create golden snapshot directory");
+        fs::write(&golden_path, &png).expect("write updated golden");
+        return;
+    }
     let expected = fs::read(&golden_path).expect("golden snapshot missing; generate via harness");
 
     if png != expected {

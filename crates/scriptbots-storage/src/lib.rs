@@ -1717,18 +1717,13 @@ enum StorageCommand {
 }
 
 /// Persistence strength associated with an acknowledged commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PersistenceGuarantee {
     /// Transaction committed in an in-memory database and will not survive close or process exit.
+    #[default]
     CommittedVolatile,
     /// Transaction committed to a file-backed database under the configured durability policy.
     Durable,
-}
-
-impl Default for PersistenceGuarantee {
-    fn default() -> Self {
-        Self::CommittedVolatile
-    }
 }
 
 /// Proof that every persistence command admitted before a flush has committed.
@@ -1778,9 +1773,9 @@ pub struct StorageSink {
 }
 
 impl StorageSink {
-    /// Admit a persistence batch to the bounded, lossless worker queue.
+    /// Admit a persistence batch to the bounded worker queue.
     pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
-        let prepared = PreparedPersistenceBatch::from_batch(payload).map_err(|error| {
+        let prepared = PreparedPersistenceBatch::from_batch(payload).inspect_err(|error| {
             let worker_error = StorageWorkerError::Internal {
                 operation: StorageOperation::Admit,
                 path: self.path.to_string(),
@@ -1789,7 +1784,6 @@ impl StorageSink {
                 detail: error.to_string(),
             };
             self.analytics.publish_worker_error(&worker_error, false);
-            error
         })?;
         let admission = self.admission.lock().map_err(|error| {
             let worker_error = StorageWorkerError::Internal {
@@ -1947,7 +1941,7 @@ impl StoragePipeline {
         self.sink.clone()
     }
 
-    /// Admit a persistence batch to the bounded, lossless worker queue.
+    /// Admit a persistence batch to the bounded worker queue.
     pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
         self.sink.submit(payload)
     }
@@ -2376,7 +2370,7 @@ fn replay_row_from_event(
                     "left_wheel": left_wheel,
                     "right_wheel": right_wheel,
                     "boost": boost,
-                    "spike_target": spike_target,
+                    "spike_target": spike_target.map(|agent_id| agent_id.data().as_ffi()),
                     "sound_level": sound_level,
                     "give_intent": give_intent,
                 }),
@@ -2774,6 +2768,36 @@ mod tests {
                 range_min: -1.0,
                 range_max: 1.0,
                 value: 0.25,
+            },
+        });
+        storage.persist(&batch)?;
+        storage.flush()?;
+
+        let replay = storage.load_replay_events()?;
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event, batch.replay_events[0]);
+        storage.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_action_preserves_spike_target_agent_id() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-replay-action-spike-target");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let actor = AgentId::from(KeyData::from_ffi(0x0000_0001_0000_0001));
+        let target = AgentId::from(KeyData::from_ffi(0x0000_0002_0000_0001));
+        let mut batch = sample_batch(6, 1.0);
+        batch.replay_events.push(ReplayEvent {
+            agent_id: Some(actor),
+            kind: ReplayEventKind::Action {
+                left_wheel: -0.25,
+                right_wheel: 0.75,
+                boost: true,
+                spike_target: Some(target),
+                sound_level: 0.5,
+                give_intent: 0.125,
             },
         });
         storage.persist(&batch)?;

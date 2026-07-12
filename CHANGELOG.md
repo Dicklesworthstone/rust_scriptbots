@@ -35,15 +35,29 @@ The recovery program replaced the former DuckDB stack with exact-revision Franke
 
 - Pinned `fsqlite` 0.1.16 to immutable revision `cd9990bb16291d8c7c247b75b47faae8d7701adb` and qualified the real ScriptBots schema/query/transaction workload.
 - Ported the seven-table run schema, explicit values, migrations, lifecycle rows, replay events, analytics queries, and CSV exports.
-- Moved the deliberately non-`Send`/non-`Sync` connection entirely inside one bounded worker thread with startup, flush, durability, failure, and shutdown acknowledgements.
+- Moved the deliberately non-`Send`/non-`Sync` connection entirely inside one bounded worker thread with startup acknowledgement plus explicit flush/shutdown commit receipts.
+- Made synchronous admission rejection definitely `NotAdmitted`: the world retains the exact completed batch, latches the fault, and blocks later science ticks until explicit retry admits it.
+- Kept enqueue success distinct from commit and durability proof. The durable outbox and per-batch applied/durable watermarks are still open, so the current asynchronous path is not yet end-to-end lossless.
 - Replaced GUI/TUI SQL and mutex access with revisioned immutable analytics snapshots; frontends now expose commit lag and storage health.
 - Added a read-only `StorageReader` boundary so the control CLI and E2E tests never import the database engine or mutate a database during export.
 - Changed application targets to `--storage {file|memory}`, fresh run paths to `.sqlite`, and CI replay artifacts to unique runner-temporary paths without destructive cleanup.
-- Removed the DuckDB, bundled C++ database, Arrow, and Parquet dependency closure from manifests and the lockfile.
+- Isolated every file-mode auto-tune/profile child on its own benchmark-only temporary database so probes cannot consume or corrupt the requested final run path.
+- Removed the DuckDB, bundled C++ database, and Arrow dependency closure from manifests and the lockfile.
+
+### Rendering, browser, and CI recovery
+
+- Replaced stale-file WGPU capture checks with current-run, nonempty artifact assertions that genuinely exercise software rendering on headless builders.
+- Fixed two invalid WGSL mutable declarations that had kept the agent shader from compiling at runtime.
+- Added meaningful Rust and Bevy renderer goldens with deterministic agent signal and committed both baselines.
+- Pinned every GitHub Action to an immutable revision, pinned cargo-audit, cargo-dist, and wasm-pack, and reduced workflow token permissions to the scopes each job needs.
+- Fixed release-tag shell injection by moving event data through the environment and validating semantic-version tags before using them.
+- Made the browser lane reproducible with checksummed Chrome-for-Testing and ChromeDriver 148 artifacts, a locked wasm-pack build, the correct output directory, and a live headless browser parity test.
+- Replaced the guaranteed-red replay-determinism claim with a live contract job that proves both verification and comparison fail closed until nonempty production replay instrumentation exists.
+- Replaced stale cargo-audit suppressions with an inverse-path-guarded temporary exception for the unreleased Wayland scanner fix; every other vulnerability still fails CI.
 
 ### Browser storage decision
 
-FrankenSQLite remains the only SQL engine in browsers. The current WASM build is honestly documented as memory-only; durable browser storage requires a dedicated Worker plus SQLite-image checkpoints and an idempotent IndexedDB journal until a native FrankenSQLite OPFS/IndexedDB VFS passes real browser recovery tests.
+The current WASM build has no SQL engine and remains memory-only. If browser persistence is added, FrankenSQLite is the sole permitted SQL backend; durable storage still requires a dedicated Worker, SQLite-image checkpoints, an idempotent IndexedDB journal, and real recovery tests for an OPFS/IndexedDB VFS.
 
 ---
 
@@ -775,9 +789,9 @@ Updated multi-agent conventions and project documentation.
 |-------|------|
 | `scriptbots-core` | Simulation engine: WorldState, tick pipeline, config, terrain, hydrology |
 | `scriptbots-brain` | Brain trait + MLP, DWRAON, Assembly implementations |
-| `scriptbots-brain-ml` | Optional ML backends (Candle, Tract, tch), feature-gated |
+| `scriptbots-brain-ml` | Feature-gated placeholders for future Candle, Tract, and tch inference |
 | `scriptbots-brain-neuro` | Optional NeuroFlow brain, feature-gated |
-| `scriptbots-index` | Pluggable spatial indices (grid, rstar, kd-tree) |
+| `scriptbots-index` | Uniform-grid index; alternate backend features remain scaffolding |
 | `scriptbots-storage` | FrankenSQLite persistence, bounded worker, replay, read-only analytics |
 | `scriptbots-render` | GPUI UI layer: window shell, HUD, canvas renderer, inspector |
 | `scriptbots-app` | Binary orchestrator: CLI, REST/MCP servers, renderer selection |

@@ -87,12 +87,12 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 WorldSnapshot::from_world(&guard)
             };
 
-            if let Some(snapshot) = snapshot {
-                if snapshot.tick != last_tick {
-                    last_tick = snapshot.tick;
-                    if tx.send(snapshot).is_err() {
-                        break;
-                    }
+            if let Some(snapshot) = snapshot
+                && snapshot.tick != last_tick
+            {
+                last_tick = snapshot.tick;
+                if tx.send(snapshot).is_err() {
+                    break;
                 }
             }
 
@@ -335,6 +335,7 @@ fn make_material(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_part(
     commands: &mut Commands,
     mesh_handle: &Handle<Mesh>,
@@ -380,11 +381,11 @@ fn update_part_colors(
     base: Color,
     emissive: Color,
 ) {
-    if let Some(handle) = part.material.as_ref() {
-        if let Some(mat) = materials.get_mut(handle) {
-            mat.base_color = base;
-            mat.emissive = emissive.into();
-        }
+    if let Some(handle) = part.material.as_ref()
+        && let Some(mat) = materials.get_mut(handle)
+    {
+        mat.base_color = base;
+        mat.emissive = emissive.into();
     }
 }
 
@@ -920,15 +921,17 @@ impl TonemappingState {
         }
         if let Some(auto) = &settings.auto_exposure {
             state.auto_exposure_enabled = auto.enabled;
-            if let Some(speed) = auto.speed_brighten {
-                if speed.is_finite() && speed >= 0.0 {
-                    state.auto_exposure_speed_brighten = speed;
-                }
+            if let Some(speed) = auto.speed_brighten
+                && speed.is_finite()
+                && speed >= 0.0
+            {
+                state.auto_exposure_speed_brighten = speed;
             }
-            if let Some(speed) = auto.speed_darken {
-                if speed.is_finite() && speed >= 0.0 {
-                    state.auto_exposure_speed_darken = speed;
-                }
+            if let Some(speed) = auto.speed_darken
+                && speed.is_finite()
+                && speed >= 0.0
+            {
+                state.auto_exposure_speed_darken = speed;
             }
         }
 
@@ -949,6 +952,8 @@ struct AutoExposureToggleButton;
 struct ExposureAdjustButton {
     delta: f32,
 }
+
+type ChangedButtonFilter = (Changed<Interaction>, With<Button>);
 
 #[derive(Clone)]
 struct TerrainColorMap {
@@ -1173,7 +1178,7 @@ impl WorldSnapshot {
                     eye_fov.copy_from_slice(&rt.eye_fov);
                     (
                         rt.selection,
-                        rt.outputs.get(0).copied().unwrap_or(0.0),
+                        rt.outputs.first().copied().unwrap_or(0.0),
                         rt.outputs.get(1).copied().unwrap_or(0.0),
                         rt.herbivore_tendency,
                         rt.temperature_preference,
@@ -1279,7 +1284,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         InheritedVisibility::default(),
         Tonemapping::AcesFitted,
         ColorGrading::default(),
-        Hdr::default(),
+        Hdr,
         PrimaryCamera,
     ));
 
@@ -1328,7 +1333,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     });
 
     commands.spawn((
-        Camera2d::default(),
+        Camera2d,
         Camera {
             order: 1,
             ..Default::default()
@@ -1635,6 +1640,7 @@ fn poll_snapshots(inbox: NonSendMut<SnapshotInbox>, mut state: ResMut<SnapshotSt
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_world(
     mut commands: Commands,
     mut state: ResMut<SnapshotState>,
@@ -1711,6 +1717,7 @@ fn sync_world(
     state.first_agent_position = first_agent;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     mut state: ResMut<SnapshotState>,
     rig: Res<CameraRig>,
@@ -1998,7 +2005,7 @@ fn handle_selection_input(
 fn handle_playback_buttons(
     controls: Res<SimulationControl>,
     submitter: Option<Res<CommandSubmitter>>,
-    mut query: Query<(&PlaybackButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+    mut query: Query<(&PlaybackButton, &Interaction), ChangedButtonFilter>,
 ) {
     for (button, interaction) in query.iter_mut() {
         if *interaction != Interaction::Pressed {
@@ -2178,7 +2185,7 @@ fn update_playback_button_colors(
 }
 fn handle_follow_button_interactions(
     mut rig: ResMut<CameraRig>,
-    mut query: Query<(&FollowButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+    mut query: Query<(&FollowButton, &Interaction), ChangedButtonFilter>,
 ) {
     for (button, interaction) in query.iter_mut() {
         if *interaction == Interaction::Pressed {
@@ -2214,7 +2221,7 @@ fn handle_clear_selection_button(
 
 fn handle_tonemap_mode_buttons(
     mut state: ResMut<TonemappingState>,
-    mut query: Query<(&TonemapButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+    mut query: Query<(&TonemapButton, &Interaction), ChangedButtonFilter>,
 ) {
     for (button, interaction) in &mut query {
         if *interaction == Interaction::Pressed && state.mode != button.mode {
@@ -2238,7 +2245,7 @@ fn handle_auto_exposure_toggle(
 
 fn handle_exposure_adjust_buttons(
     mut state: ResMut<TonemappingState>,
-    mut query: Query<(&ExposureAdjustButton, &Interaction), (Changed<Interaction>, With<Button>)>,
+    mut query: Query<(&ExposureAdjustButton, &Interaction), ChangedButtonFilter>,
 ) {
     for (button, interaction) in &mut query {
         if *interaction == Interaction::Pressed {
@@ -2364,6 +2371,7 @@ fn update_follow_button_colors(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn control_camera(
     time: Res<Time>,
     mut rig: ResMut<CameraRig>,
@@ -2457,42 +2465,41 @@ fn control_camera(
     }
 
     let mut focus_override = None;
-    if state.latest.is_some() {
-        if let Some(command) = rig.pending_fit {
-            match command {
-                FitCommand::World => {
+    if state.latest.is_some()
+        && let Some(command) = rig.pending_fit
+    {
+        match command {
+            FitCommand::World => {
+                focus_override = Some(state.world_center);
+                let distance = fit_distance_for_extent(state.world_size, FIT_WORLD_FACTOR);
+                rig.distance = distance;
+                rig.distance_smoothed = distance;
+            }
+            FitCommand::Selection => {
+                if let Some(bounds) = state.selection_bounds {
+                    let center = state
+                        .selection_center
+                        .unwrap_or_else(|| (bounds.0 + bounds.1) * 0.5);
+                    focus_override = Some(center);
+                    let extent = bounds_extent(bounds);
+                    let distance = fit_distance_for_extent(extent, FIT_SELECTION_FACTOR);
+                    rig.distance = distance;
+                    rig.distance_smoothed = distance;
+                } else if let Some(selected) = state.first_agent_position {
+                    focus_override = Some(selected);
+                    let distance =
+                        fit_distance_for_extent(Vec2::splat(400.0), FIT_SELECTION_FACTOR);
+                    rig.distance = distance;
+                    rig.distance_smoothed = distance;
+                } else {
                     focus_override = Some(state.world_center);
-                    let distance = fit_distance_for_extent(state.world_size, FIT_WORLD_FACTOR);
+                    let distance = fit_distance_for_extent(state.world_size, FIT_SELECTION_FACTOR);
                     rig.distance = distance;
                     rig.distance_smoothed = distance;
                 }
-                FitCommand::Selection => {
-                    if let Some(bounds) = state.selection_bounds {
-                        let center = state
-                            .selection_center
-                            .unwrap_or_else(|| (bounds.0 + bounds.1) * 0.5);
-                        focus_override = Some(center);
-                        let extent = bounds_extent(bounds);
-                        let distance = fit_distance_for_extent(extent, FIT_SELECTION_FACTOR);
-                        rig.distance = distance;
-                        rig.distance_smoothed = distance;
-                    } else if let Some(selected) = state.first_agent_position {
-                        focus_override = Some(selected);
-                        let distance =
-                            fit_distance_for_extent(Vec2::splat(400.0), FIT_SELECTION_FACTOR);
-                        rig.distance = distance;
-                        rig.distance_smoothed = distance;
-                    } else {
-                        focus_override = Some(state.world_center);
-                        let distance =
-                            fit_distance_for_extent(state.world_size, FIT_SELECTION_FACTOR);
-                        rig.distance = distance;
-                        rig.distance_smoothed = distance;
-                    }
-                }
             }
-            rig.pending_fit = None;
         }
+        rig.pending_fit = None;
     }
 
     let follow_target = match rig.follow_mode {
@@ -2563,8 +2570,8 @@ fn sync_terrain(
     }
 
     let chunk_size = registry.chunk_size.max(1);
-    let chunks_x = (dims.x + chunk_size - 1) / chunk_size;
-    let chunks_y = (dims.y + chunk_size - 1) / chunk_size;
+    let chunks_x = dims.x.div_ceil(chunk_size);
+    let chunks_y = dims.y.div_ceil(chunk_size);
 
     let mut seen: HashSet<TerrainChunkKey> = HashSet::with_capacity((chunks_x * chunks_y) as usize);
 
@@ -2852,18 +2859,18 @@ fn build_chunk_mesh(
     let stride = verts_x;
     for z in 0..bounds.size.y {
         for x in 0..bounds.size.x {
-            let i0 = (z * stride + x) as u32;
+            let i0 = z * stride + x;
             let i1 = i0 + 1;
-            let i2 = i0 + stride as u32;
+            let i2 = i0 + stride;
             let i3 = i2 + 1;
             indices.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
         }
     }
 
-    for tri in indices.chunks_exact(3) {
-        let ia = tri[0] as usize;
-        let ib = tri[1] as usize;
-        let ic = tri[2] as usize;
+    for &[ia, ib, ic] in indices.as_chunks::<3>().0 {
+        let ia = ia as usize;
+        let ib = ib as usize;
+        let ic = ic as usize;
         let a = Vec3::from_array(positions[ia]);
         let b = Vec3::from_array(positions[ib]);
         let c = Vec3::from_array(positions[ic]);
@@ -4631,9 +4638,11 @@ mod tests {
             sim_rate: 0.0,
         });
 
-        let mut rig = CameraRig::default();
-        rig.follow_mode = FollowMode::Selected;
-        rig.recenter_now = true;
+        let rig = CameraRig {
+            follow_mode: FollowMode::Selected,
+            recenter_now: true,
+            ..Default::default()
+        };
         app.insert_resource(rig);
 
         let camera_entity = app

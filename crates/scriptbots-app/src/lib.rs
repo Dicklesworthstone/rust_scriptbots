@@ -20,6 +20,19 @@ pub const RUN_MANIFEST_V0_SCHEMA: &str = "scriptbots.run-manifest";
 pub const CHARACTERIZATION_TRACE_V0_SCHEMA: &str = "scriptbots.characterization-trace";
 /// Safety bound for the temporary characterization runner.
 pub const MAX_CHARACTERIZATION_TICKS_V0: u64 = 256;
+/// Files that may belong to a live or interrupted FrankenSQLite database.
+///
+/// Every path guard that reserves or exports alongside a database must use this single list so
+/// a CSV can never be created where the engine expects a lock or journal sidecar.
+pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
+    "-wal",
+    "-shm",
+    "-journal",
+    "-wal-fec",
+    "-lock-shared",
+    "-lock-reserved",
+    "-lock-pending",
+];
 
 const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 const RUST_TOOLCHAIN_BYTES: &[u8] = include_bytes!("../../../rust-toolchain.toml");
@@ -522,8 +535,10 @@ mod characterization_tests {
         })
         .expect("test world");
         for (x, y) in [(10.0, 10.0), (30.0, 30.0)] {
-            let mut agent = scriptbots_core::AgentData::default();
-            agent.position = scriptbots_core::Position::new(x, y);
+            let agent = scriptbots_core::AgentData {
+                position: scriptbots_core::Position::new(x, y),
+                ..scriptbots_core::AgentData::default()
+            };
             world.spawn_agent(agent);
         }
         world
@@ -668,20 +683,20 @@ mod characterization_tests {
             sequence(&trace_a),
             [
                 "38f7452ccda6bcba",
-                "e3336b0b3599ba31",
-                "da4c055f50cb55da",
-                "6686ff50ffb55aad",
-                "f20e7c3e62d137e1",
+                "34b0a76c99269b47",
+                "7d0464f81092c907",
+                "5538f487ce073b93",
+                "7f09761b265ce657",
             ]
         );
         assert_eq!(
             sequence(&trace_c),
             [
                 "f024060ee12a9fd0",
-                "90f514f9b7455865",
-                "16ce446c9f03c596",
-                "3d47abb00873acdb",
-                "3708f4693e23f2f0",
+                "9dbc3883e0bf1973",
+                "fda69e3aa36a88c4",
+                "9f536f95875cfac5",
+                "4b004298efa2cafa",
             ]
         );
 

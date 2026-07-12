@@ -358,10 +358,10 @@ impl NeighborhoodIndex for UniformGridIndex {
                         }
                     }
                     Buckets::Sparse(m) => {
-                        if let Some(indices) = m.get(&(nx, ny)) {
-                            if !indices.is_empty() {
-                                visitor(indices);
-                            }
+                        if let Some(indices) = m.get(&(nx, ny))
+                            && !indices.is_empty()
+                        {
+                            visitor(indices);
                         }
                     }
                 }

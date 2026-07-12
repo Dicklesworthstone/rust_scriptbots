@@ -192,10 +192,10 @@ cargo test --workspace --all-features
 |-------|-------------|
 | `scriptbots-core` | World simulation, agent lifecycle, tick processing, spatial indexing, food/terrain systems, evolution, genome serialization |
 | `scriptbots-brain` | Brain trait contracts, MLP forward pass, DWRAON network, Assembly brain, mutation/crossover |
-| `scriptbots-brain-ml` | Candle/Tract/Tch inference backends, model loading, brain adapter integration |
+| `scriptbots-brain-ml` | Candle/Tract/Tch dependency probes and sensor-copy placeholder; model inference remains open |
 | `scriptbots-brain-neuro` | Neuroflow brain wrapper, training, serialization |
-| `scriptbots-index` | Spatial indexing (uniform grid, R-tree, k-d tree), neighbor queries, boundary conditions |
-| `scriptbots-storage` | FrankenSQLite persistence, metric recording, replay events, bounded pipeline acknowledgements, analytics snapshots |
+| `scriptbots-index` | Uniform-grid neighbor queries and boundary conditions; R-tree/k-d backends remain open |
+| `scriptbots-storage` | FrankenSQLite persistence, metric/replay recording, bounded admission, flush/shutdown receipts, analytics snapshots |
 | `scriptbots-render` | GPUI rendering, camera controls, world visualization, audio integration |
 | `scriptbots-world-gfx` | wgpu pipeline, shader compilation, offscreen readback, compute binning |
 | `scriptbots-bevy` | Bevy ECS integration, entity spawning, system scheduling |
@@ -252,9 +252,9 @@ rust_scriptbots/
 ├── crates/
 │   ├── scriptbots-core/                    # World simulation, agents, evolution, spatial indexing
 │   ├── scriptbots-brain/                   # Brain trait + impls (MLP, DWRAON, Assembly)
-│   ├── scriptbots-brain-ml/                # ML backends (Candle, Tract, Tch)
+│   ├── scriptbots-brain-ml/                # ML dependency probes; inference placeholder
 │   ├── scriptbots-brain-neuro/             # Neuroflow brain backend
-│   ├── scriptbots-index/                   # Spatial indexing (uniform grid, R-tree, k-d tree)
+│   ├── scriptbots-index/                   # Uniform-grid spatial indexing
 │   ├── scriptbots-storage/                 # FrankenSQLite persistence worker + analytics snapshots
 │   ├── scriptbots-render/                  # GPUI rendering + audio (kira)
 │   ├── scriptbots-world-gfx/              # wgpu custom world renderer
@@ -278,9 +278,9 @@ rust_scriptbots/
 | `scriptbots-brain` | `src/mlp.rs` | `MlpBrain` — multi-layer perceptron implementation |
 | `scriptbots-brain` | `src/dwraon.rs` | `DwraonBrain` — DWRAON network implementation |
 | `scriptbots-brain` | `src/assembly.rs` | `AssemblyBrain` — assembly-style brain with instruction set |
-| `scriptbots-brain-ml` | `src/lib.rs` | ML backend adapters (Candle, Tract, Tch) |
+| `scriptbots-brain-ml` | `src/lib.rs` | ML feature selection and current sensor-copy placeholder |
 | `scriptbots-brain-neuro` | `src/lib.rs` | Neuroflow neural network brain adapter |
-| `scriptbots-index` | `src/lib.rs` | `NeighborhoodIndex` trait, `UniformGridIndex`, R-tree/k-d tree spatial queries |
+| `scriptbots-index` | `src/lib.rs` | `NeighborhoodIndex` trait and `UniformGridIndex`; alternate backends remain open |
 | `scriptbots-storage` | `src/lib.rs` | `Storage`, `StoragePipeline`, FrankenSQLite schema, metric/replay persistence, immutable analytics snapshots |
 | `scriptbots-render` | `src/lib.rs` | GPUI rendering, camera system, world visualization, agent drawing |
 | `scriptbots-world-gfx` | `src/lib.rs` | wgpu pipeline, WGSL shaders, offscreen readback for GPUI composition |
@@ -307,9 +307,9 @@ rust_scriptbots/
 | `FoodGrid` | Spatial grid of food cells with growth/decay dynamics |
 | `TerrainLayer` | Terrain types (land, water, hazard) with procedural generation |
 | `Storage` | Same-thread FrankenSQLite persistence boundary; owns the connection and typed SQL conversions |
-| `StoragePipeline` | Bounded, acknowledged batch writer for metrics, replay events, flush, and shutdown |
+| `StoragePipeline` | Bounded batch-admission worker with explicit flush/shutdown commit receipts; durable per-batch watermarks remain open |
 | `AnalyticsSnapshot` | Immutable latest-value read model published lock-free to GUI, TUI, and API consumers |
-| `NeighborhoodIndex` | Trait for spatial queries (uniform grid, R-tree, k-d tree) |
+| `NeighborhoodIndex` | Trait currently implemented by the uniform-grid spatial index |
 | `Tick` | Newtype wrapper for simulation time step (`u64`) |
 | `ControlCommand` | Enum of simulation control actions |
 | `MutationRates` | Per-genome mutation rate parameters |
@@ -337,10 +337,10 @@ We want all console output to be informative, detailed, stylish, colorful, etc. 
 
 - **One engine:** use the public `fsqlite` facade at package version `0.1.16`, pinned to immutable revision `cd9990bb16291d8c7c247b75b47faae8d7701adb` from `https://github.com/Dicklesworthstone/frankensqlite`. The workspace declaration uses `version = "=0.1.16"`, `default-features = false`, and `features = ["native"]` until the lean native feature qualification is complete.
 - **Thread ownership:** `fsqlite::Connection` is deliberately `!Send + !Sync`. Construct, use, explicitly close, and drop it inside the storage worker thread. Never place a connection or connection-owning `Storage` inside cross-thread `Arc<Mutex<_>>` state.
-- **Bounded and acknowledged:** `StoragePipeline` carries bounded persistence commands. Lossless lifecycle, replay, and command-journal records apply backpressure rather than disappearing. Flush and shutdown have explicit acknowledgements; a command becomes `Durable` only after its transaction is committed and acknowledged.
+- **Bounded admission and explicit proof:** `StoragePipeline` carries a bounded persistence queue. A synchronous rejection is definitely `NotAdmitted`; the world latches the fault, retains the exact completed batch, and prevents later science ticks until an explicit retry admits that batch. Successful enqueue proves only admission, not commit or crash durability. Flush and shutdown receipts prove that all earlier admitted transactions committed (`CommittedVolatile` for `memory`, `Durable` for `file`). The durable outbox and per-batch applied/durable watermarks required for an end-to-end lossless claim remain open work; do not describe the current asynchronous path as lossless.
 - **Lock-free reads:** the worker atomically publishes immutable `Arc<AnalyticsSnapshot>` latest values. GUI, TUI, and API consumers load them without a mutex; rendering and paint paths never acquire a database lock or issue SQL.
-- **Modes and files:** the application storage targets are `file` and `memory`. `file` opens `SCRIPTBOTS_STORAGE_PATH` or creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`; `memory` opens `:memory:` through the same FrankenSQLite implementation. Never reuse a single-run file for a new run.
-- **Maintenance:** checkpoint, integrity checking, and `VACUUM` are explicit storage-worker operations, never UI-path work. Do not claim unsupported pragmas performed maintenance.
+- **Modes and files:** the application storage targets are `file` and `memory`. `file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`; startup refuses an existing database or stale SQLite sidecar instead of reusing a prior run. `memory` opens `:memory:` through the same FrankenSQLite implementation. The app prints the selected file path; use that exact path for later reads and exports.
+- **Maintenance:** same-thread `Storage::optimize` flushes before `VACUUM`, and explicit close handles checkpointing on the connection-owning thread. The asynchronous pipeline currently exposes only flush and shutdown barriers. `PRAGMA integrity_check` is a conformance-test gate, not a runtime maintenance command. Never run database maintenance in a UI path or claim unsupported pragmas performed it.
 
 ---
 

@@ -363,6 +363,29 @@ pub mod world_compositor {
             }
         }
 
+        #[cfg(test)]
+        pub(super) fn new_for_capture_test(
+            save_dir: std::path::PathBuf,
+            save_prefix: String,
+        ) -> Self {
+            let mut compositor = Self::new();
+            compositor.min_interval = 0.0;
+            compositor.render_scale = 1.0;
+            compositor.allow_software_adapter = true;
+            compositor.save_enabled = true;
+            compositor.save_dir = save_dir;
+            compositor.save_every = 1;
+            compositor.save_counter = 0;
+            compositor.save_prefix = save_prefix;
+            compositor.force_first_capture = false;
+            compositor
+        }
+
+        #[cfg(test)]
+        pub(super) fn adapter_failure(&self) -> Option<&str> {
+            self.adapter_failure.as_deref()
+        }
+
         pub fn set_camera_params(&mut self, scale: f32, offset: (f32, f32)) {
             self.cam_scale = scale;
             self.cam_offset = offset;
@@ -457,12 +480,11 @@ pub mod world_compositor {
                 return;
             }
             // Optional FPS cap: skip re-render and reuse last-ready image if interval not elapsed
-            if self.min_interval > 0.0 {
-                if let Some(last) = self.last_submit {
-                    if last.elapsed().as_secs_f32() < self.min_interval {
-                        return;
-                    }
-                }
+            if self.min_interval > 0.0
+                && let Some(last) = self.last_submit
+                && last.elapsed().as_secs_f32() < self.min_interval
+            {
+                return;
             }
             let render_size = if self.render_scale < 0.9999 {
                 (
@@ -508,7 +530,7 @@ pub mod world_compositor {
             }
             if let Some(view) = view_opt {
                 let digest = readback_stats(&view);
-                self.last_digest = Some(digest.clone());
+                self.last_digest = Some(digest);
                 // Lazy-initialize image with known dimensions; avoid stale size from previous runs
                 if self.image.is_none() {
                     self.image = Some(GpuiImage::new(
@@ -603,7 +625,7 @@ pub mod world_compositor {
                     .or_else(|| Some("full".to_string()));
                 match mode.as_deref() {
                     Some("full") => img.paint_full(bounds, window),
-                    Some("diff") | _ => img.paint_diff(bounds, window),
+                    _ => img.paint_diff(bounds, window),
                 }
                 true
             } else {
@@ -626,7 +648,7 @@ pub mod world_compositor {
                 return;
             }
             self.save_counter = self.save_counter.saturating_add(1);
-            if ((self.save_counter - 1) % (self.save_every as u64)) != 0 {
+            if !(self.save_counter - 1).is_multiple_of(u64::from(self.save_every)) {
                 return;
             }
 
@@ -705,6 +727,12 @@ pub mod world_compositor {
             );
             // Only force one capture
             self.force_first_capture = false;
+        }
+    }
+
+    impl Default for Compositor {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -792,19 +820,62 @@ mod wgpu_capture_test {
     use super::world_compositor::Compositor;
     use scriptbots_world_gfx::{AgentInstance, TerrainView, WorldSnapshot as GfxSnapshot};
 
+    fn capture_target(label: &str) -> (std::path::PathBuf, String, std::path::PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time must follow the Unix epoch")
+            .as_nanos();
+        let prefix = format!("scriptbots_{label}_{}_{nonce}", std::process::id());
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("{prefix}_000001.png"));
+        (dir, prefix, path)
+    }
+
+    fn test_agent(
+        position: [f32; 2],
+        size: f32,
+        color: [f32; 4],
+        selection: f32,
+        glow: f32,
+        boost: f32,
+    ) -> AgentInstance {
+        let body_radius = size * 0.25;
+        AgentInstance {
+            position,
+            quad_extent: [size * 0.5, size * 0.5],
+            heading: [1.0, 0.0],
+            body_radius,
+            body_half_length: size * 0.32,
+            wheel_offset: body_radius * 1.35,
+            wheel_radius: body_radius * 0.38,
+            mouth_open: 0.35,
+            herbivore_tendency: 0.5,
+            temperature_preference: 0.5,
+            food_delta: 0.0,
+            sound_level: 0.0,
+            sound_output: 0.0,
+            wheel_left: 0.0,
+            wheel_right: 0.0,
+            spike_length: 0.0,
+            trait_smell: 0.5,
+            trait_sound: 0.5,
+            trait_hearing: 0.5,
+            trait_eye: 0.5,
+            trait_blood: 0.5,
+            selection,
+            color,
+            glow,
+            boost,
+            spiked: 0.0,
+            eye_dirs: [0.0; scriptbots_core::NUM_EYES],
+            eye_fov: [0.0; scriptbots_core::NUM_EYES],
+        }
+    }
+
     #[test]
     fn wgpu_capture_smoke() {
-        // Enable compositor saving
-        unsafe {
-            std::env::set_var("SB_WGPU_SAVE_FRAMES", "1");
-            std::env::set_var("SB_WGPU_SAVE_DIR", "frames_render_test");
-            std::env::set_var("SB_WGPU_SAVE_EVERY", "1");
-            std::env::set_var("SB_WGPU_SAVE_PREFIX", "render");
-        }
-
-        // Ensure output directory exists
-        let _ = std::fs::create_dir_all("frames_render_test");
-        let mut comp = Compositor::new();
+        let (save_dir, save_prefix, expected_png) = capture_target("render");
+        let mut comp = Compositor::new_for_capture_test(save_dir, save_prefix);
         let viewport = (640u32, 360u32);
         // Simple 120x60 grass snapshot (50-unit cells matching default config)
         let dims = (120u32, 60u32);
@@ -822,33 +893,25 @@ mod wgpu_capture_test {
         comp.set_camera_params(1.0, (0.0, 0.0));
         comp.render_snapshot(&snapshot, viewport);
 
-        // Best-effort: ensure at least one file exists
-        let dir = std::path::Path::new("frames_render_test");
-        assert!(dir.exists(), "frames_render_test dir should exist");
-        // Best-effort check for at least one PNG file
-        let produced = std::fs::read_dir(dir)
-            .ok()
-            .map(|it| {
-                it.filter_map(|e| e.ok())
-                    .any(|e| e.path().extension().map(|s| s == "png").unwrap_or(false))
-            })
-            .unwrap_or(false);
-        assert!(produced, "expected at least one PNG to be written");
+        assert!(
+            expected_png.is_file(),
+            "expected current render capture at {}; adapter failure: {:?}",
+            expected_png.display(),
+            comp.adapter_failure()
+        );
+        assert!(
+            std::fs::metadata(&expected_png)
+                .expect("capture metadata")
+                .len()
+                > 0,
+            "render capture must not be empty"
+        );
     }
 
     #[test]
     fn wgpu_capture_agents() {
-        // Enable compositor saving with a distinct prefix
-        unsafe {
-            std::env::set_var("SB_WGPU_SAVE_FRAMES", "1");
-            std::env::set_var("SB_WGPU_SAVE_DIR", "frames_render_test");
-            std::env::set_var("SB_WGPU_SAVE_EVERY", "1");
-            std::env::set_var("SB_WGPU_SAVE_PREFIX", "agents");
-        }
-
-        // Ensure output directory exists
-        let _ = std::fs::create_dir_all("frames_render_test");
-        let mut comp = Compositor::new();
+        let (save_dir, save_prefix, expected_png) = capture_target("agents");
+        let mut comp = Compositor::new_for_capture_test(save_dir, save_prefix);
         let viewport = (640u32, 360u32);
 
         // Patterned 120x60 terrain across all six kinds
@@ -856,7 +919,7 @@ mod wgpu_capture_test {
         let mut tiles: Vec<u32> = Vec::with_capacity((dims.0 * dims.1) as usize);
         for y in 0..dims.1 {
             for x in 0..dims.0 {
-                tiles.push(((x + y) % 6) as u32);
+                tiles.push((x + y) % 6);
             }
         }
 
@@ -871,22 +934,22 @@ mod wgpu_capture_test {
 
         // Two visible agents near center with distinct colors
         let agents = vec![
-            AgentInstance {
-                position: [world_size.0 * 0.5, world_size.1 * 0.5],
-                size: 48.0,
-                color: [1.0, 0.25, 0.2, 1.0],
-                selection: 2,
-                glow: 0.4,
-                boost: 0.0,
-            },
-            AgentInstance {
-                position: [world_size.0 * 0.55, world_size.1 * 0.48],
-                size: 36.0,
-                color: [0.2, 0.9, 0.3, 1.0],
-                selection: 1,
-                glow: 0.2,
-                boost: 1.0,
-            },
+            test_agent(
+                [world_size.0 * 0.5, world_size.1 * 0.5],
+                48.0,
+                [1.0, 0.25, 0.2, 1.0],
+                2.0,
+                0.4,
+                0.0,
+            ),
+            test_agent(
+                [world_size.0 * 0.55, world_size.1 * 0.48],
+                36.0,
+                [0.2, 0.9, 0.3, 1.0],
+                1.0,
+                0.2,
+                1.0,
+            ),
         ];
 
         let snapshot = GfxSnapshot {
@@ -902,23 +965,19 @@ mod wgpu_capture_test {
 
         comp.render_snapshot(&snapshot, viewport);
 
-        // Best-effort: ensure at least one agents PNG exists
-        let dir = std::path::Path::new("frames_render_test");
-        assert!(dir.exists(), "frames_render_test dir should exist");
-        let produced = std::fs::read_dir(dir)
-            .ok()
-            .map(|it| {
-                it.filter_map(|e| e.ok()).any(|e| {
-                    let p = e.path();
-                    p.extension().map(|s| s == "png").unwrap_or(false)
-                        && p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| n.starts_with("agents_"))
-                            .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-        assert!(produced, "expected at least one agents PNG to be written");
+        assert!(
+            expected_png.is_file(),
+            "expected current agents capture at {}; adapter failure: {:?}",
+            expected_png.display(),
+            comp.adapter_failure()
+        );
+        assert!(
+            std::fs::metadata(&expected_png)
+                .expect("capture metadata")
+                .len()
+                > 0,
+            "agents capture must not be empty"
+        );
     }
 }
 
@@ -947,7 +1006,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     use world_compositor::Compositor;
     static COMPOSITOR: OnceLock<std::sync::Mutex<Compositor>> = OnceLock::new();
     let comp = COMPOSITOR.get_or_init(|| std::sync::Mutex::new(Compositor::new()));
-    let mut comp = comp.lock().ok().expect("compositor mutex");
+    let mut comp = comp.lock().expect("compositor mutex");
 
     tracing::info!("entered paint_world_with_wgpu");
 
@@ -10589,6 +10648,7 @@ fn palette_color(color: Rgba, palette: ColorPaletteMode, palette_is_natural: boo
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_agent_avatar(
     window: &mut Window,
     agent: &AgentRenderData,
@@ -12671,7 +12731,7 @@ fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
 
     let blend_channel = |base: f32| {
         let lit = base * health_factor * shade;
-        (lit * 0.85 + base * 0.15).max(0.08).min(1.0)
+        (lit * 0.85 + base * 0.15).clamp(0.08, 1.0)
     };
 
     let mut color = Rgba {

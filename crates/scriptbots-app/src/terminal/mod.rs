@@ -1,5 +1,5 @@
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::{HashMap, VecDeque},
     f32::consts::{PI, TAU},
     fs::{self, File},
@@ -331,10 +331,10 @@ impl<'a> TerminalApp<'a> {
             self.refresh_snapshot();
             return;
         }
-        if let Some(pending) = pending_commands {
-            if self.apply_simulation_commands(pending) {
-                force_step = true;
-            }
+        if let Some(pending) = pending_commands
+            && self.apply_simulation_commands(pending)
+        {
+            force_step = true;
         }
 
         if single_step {
@@ -2293,7 +2293,7 @@ impl Snapshot {
                 generation: agent.generation,
             })
             .collect();
-        oldest.sort_by(|a, b| b.age.cmp(&a.age));
+        oldest.sort_by_key(|entry| Reverse(entry.age));
         oldest.truncate(LEADERBOARD_LIMIT);
 
         let food_grid = world.food();

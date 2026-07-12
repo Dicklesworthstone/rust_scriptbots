@@ -2,48 +2,76 @@ use std::{fs, path::PathBuf};
 
 use image::{ImageBuffer, Rgba};
 use scriptbots_bevy::render_png_offscreen;
-use scriptbots_core::{ScriptBotsConfig, WorldState};
+use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
 
 fn golden_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/rendering_reference/golden/bevy_default.png")
-        .canonicalize()
-        .unwrap_or_else(|_| {
-            panic!(
-                "unable to resolve golden path from {}",
-                env!("CARGO_MANIFEST_DIR")
-            )
-        })
+}
+
+fn seed_visible_agents(world: &mut WorldState) {
+    let world_width = world.config().world_width as f32;
+    let world_height = world.config().world_height as f32;
+    let mut agent = AgentData::default();
+
+    for row in 0..4 {
+        for column in 0..4 {
+            agent.position.x = (column + 1) as f32 * world_width / 5.0;
+            agent.position.y = (row + 1) as f32 * world_height / 5.0;
+            agent.heading = (row * 4 + column) as f32 * std::f32::consts::FRAC_PI_8;
+            agent.spike_length = 10.0;
+            world.spawn_agent(agent);
+        }
+    }
 }
 
 #[test]
 fn bevy_renderer_matches_golden() {
     let path = golden_path();
-    let golden = fs::read(&path).expect("load golden bevy snapshot");
-
-    let mut config = ScriptBotsConfig::default();
-    config.rng_seed = Some(0xBEEF_F00D);
+    let config = ScriptBotsConfig {
+        rng_seed: Some(0xBEEF_F00D),
+        bot_radius: 30.0,
+        ..ScriptBotsConfig::default()
+    };
     let mut world = WorldState::new(config).expect("world init");
     for _ in 0..120 {
         world
             .step()
             .expect("snapshot test world should accept each simulation step");
     }
+    let terrain_only = render_png_offscreen(&world, 1600, 900).expect("render terrain fixture");
+    seed_visible_agents(&mut world);
     let produced = render_png_offscreen(&world, 1600, 900).expect("render bevy png");
+    let terrain_img = image::load_from_memory(&terrain_only)
+        .expect("decode terrain fixture")
+        .to_rgba8();
+    let produced_img = image::load_from_memory(&produced)
+        .expect("decode produced")
+        .to_rgba8();
+    let agent_signal_pixels = terrain_img
+        .pixels()
+        .zip(produced_img.pixels())
+        .filter(|(terrain, rendered)| terrain.0[..3] != rendered.0[..3])
+        .count();
+    assert!(
+        agent_signal_pixels >= 1_000,
+        "snapshot fixture rendered only {agent_signal_pixels} agent-signal pixels"
+    );
 
     if std::env::var("BEVY_REGEN_GOLDEN")
         .map(|v| v == "1")
         .unwrap_or(false)
     {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create golden snapshot directory");
+        }
         fs::write(&path, &produced).expect("write updated golden");
         return;
     }
 
+    let golden = fs::read(&path).expect("load golden bevy snapshot");
     let golden_img = image::load_from_memory(&golden)
         .expect("decode golden")
-        .to_rgba8();
-    let produced_img = image::load_from_memory(&produced)
-        .expect("decode produced")
         .to_rgba8();
 
     assert_eq!(golden_img.dimensions(), produced_img.dimensions());

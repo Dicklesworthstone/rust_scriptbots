@@ -1386,7 +1386,7 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   // Diet stripe
   let herb_color = vec3<f32>(0.24, 0.78, 0.36);
   let carn_color = vec3<f32>(0.88, 0.26, 0.21);
-  let mut stripe = mix(carn_color, herb_color, herbivore);
+  var stripe = mix(carn_color, herb_color, herbivore);
   let blood_tint = clamp(0.7 + trait_blood * 0.2, 0.8, 1.35);
   stripe = clamp(stripe * blood_tint, vec3<f32>(0.0), vec3<f32>(1.2));
   let stripe_dist = capsule_distance(local, body_half_length * 0.82, body_radius * 0.45);
@@ -1419,7 +1419,7 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let mouth_dist = capsule_distance(mouth_swapped, mouth_half_length, mouth_radius);
   let eat_level = clamp(abs(food_delta), 0.0, 1.5);
   let yell_level = max(sound_output, sound_level);
-  let mut mouth_color = vec3<f32>(
+  let mouth_color = vec3<f32>(
       0.85 + eat_level * 0.08,
       0.28 + eat_level * 0.3,
       0.32 + yell_level * 0.12

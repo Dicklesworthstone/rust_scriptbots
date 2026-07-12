@@ -60,8 +60,8 @@ fn terminal_headless_emits_bootstrap_metrics() {
         "expected terminal completion log; stderr:\n{clean}"
     );
     assert!(
-        clean.contains("final_tick=120"),
-        "expected final tick=120 in summary; stderr:\n{clean}"
+        clean.contains("final_tick=132"),
+        "expected 120 bootstrap ticks plus 12 headless-renderer ticks; stderr:\n{clean}"
     );
 }
 

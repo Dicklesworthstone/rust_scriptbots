@@ -187,6 +187,7 @@ fn combat_records_carnivore_event_flags() {
     let config = ScriptBotsConfig {
         world_width: 240,
         world_height: 240,
+        food_cell_size: 40,
         initial_food: 0.2,
         food_max: 1.0,
         spike_damage: 0.5,

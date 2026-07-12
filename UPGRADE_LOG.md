@@ -163,6 +163,11 @@ Disposition codes used below:
 Every unique external crate is listed once. The owner column names every
 declaring package when occurrences have different dispositions.
 
+> **Superseded storage row:** this table captured the pre-migration graph. Its
+> `KEEP current` disposition for DuckDB was superseded later on 2026-07-11 by
+> the exact-revision FrankenSQLite production migration recorded at the end of
+> this log. DuckDB is no longer an allowed current backend.
+
 | Crate | Owners and resolved graph | Latest stable; license; MSRV | Disposition, owner bead, and update gate |
 |---|---|---|---|
 | [anyhow](https://crates.io/crates/anyhow/1.0.103) | app, Bevy, web; 1.0.103 | 1.0.103; MIT/Apache; 1.68 | KEEP; `bd-2z0.8.6`; raise the manifest floor only with CLI error-path tests. |
@@ -181,7 +186,7 @@ declaring package when occurrences have different dispositions.
 | [crossterm](https://crates.io/crates/crossterm/0.29.0) | app direct 0.27.0; graph also 0.28.1 and 0.29.0 | 0.29.0; MIT; 1.63 | MIGRATE/converge through FrankenTUI; `bd-2z0.8.8`; PTY, input, paste, resize, and terminal-restore tests. |
 | [csv](https://crates.io/crates/csv/1.4.0) | app via root; 1.2.2 | 1.4.0; Unlicense/MIT; 1.73 | HOLD: NeuroFlow pins `~1.2`; `bd-2z0.8.9` with `.8.10`; export corpus tests. |
 | [direction](https://crates.io/crates/direction/0.19.1) | core map generation; 0.18.1 | 0.19.1; MIT; undeclared | HOLD with WFC/rand08; `bd-2z0.8.5`; map-generation conformance before coupled migration. |
-| [duckdb](https://crates.io/crates/duckdb/1.10504.0) | app/control CLI and storage; 1.10504.0 bundled | 1.10504.0; MIT; 1.85.1 | KEEP current; `bd-2z0.8.9`; first make storage optional/bounded, then schema and native-build matrix. |
+| [duckdb](https://crates.io/crates/duckdb/1.10504.0) | Historical pre-migration graph: app/control CLI and storage; 1.10504.0 bundled | 1.10504.0; MIT; 1.85.1 | **SUPERSEDED 2026-07-11:** removed from live manifests and lockfile under `bd-2z0.8.9`; retained in this dated table only as audit evidence. |
 | [futures-intrusive](https://crates.io/crates/futures-intrusive/0.5.0) | world-gfx; 0.5.0 | 0.5.0; MIT/Apache; undeclared | REMOVE; no source reference; `bd-2z0.8.2`. |
 | [futures-util](https://crates.io/crates/futures-util/0.3.32) | app; 0.3.32 | 0.3.32; MIT/Apache; 1.71 | KEEP; `bd-2z0.8.7`; streaming/API tests. |
 | [getrandom](https://crates.io/crates/getrandom/0.4.3) | core activation-only 0.3.4 with `wasm_js`; web wasm32 activation-only 0.2.17 with `js`; graph also 0.4.3 | 0.4.3; MIT/Apache; 1.85 | HOLD both direct activation edges: they feature-unify the rand_core 0.9/0.6 getrandom lines despite having no API references. MIGRATE only after RandomStream and wasm32 graph proof in `.8.4/.8.13`. |
@@ -716,3 +721,169 @@ No version migration in this ledger is authorized merely by being newer.
 - **Rollback:** manually restore only the two manifest edges and reviewed lock
   additions. The new test file may not be deleted without explicit user
   permission.
+
+## 2026-07-11 — Replace production DuckDB with FrankenSQLite
+
+- **Beads:** `bd-2z0.8.9.3` through `bd-2z0.8.9.6`, plus dependency-closure
+  bead `bd-2z0.8.9.9`
+- **Change class:** production engine, schema/value, ownership, admission,
+  frontend-read, CLI-export, and lockfile migration. This entry supersedes the
+  dated `KEEP current` DuckDB disposition above; DuckDB is not a fallback or
+  coexisting compatibility backend.
+- **Exact source:** the sole native SQL engine is the public `fsqlite` facade at
+  `version = "=0.1.16"`, Git revision
+  `cd9990bb16291d8c7c247b75b47faae8d7701adb` from
+  `https://github.com/Dicklesworthstone/frankensqlite`, with default features
+  disabled and `native` enabled.
+- **Manifest and lock boundaries:** root manifest SHA-256 changed from
+  `815dcb0614e3b6231f5c69b704e8435b14512de4bdc31530ce2afc5af5c7cf8d` to
+  `7ff0be2e2b0c8b69bb6e30c26cadaf82ba24b6f421b460a6efd747ea17f2183c`;
+  the storage manifest changed from
+  `f41ca369eb65216ad3d05209ada2b28cd01bbff23c633b2f2b66bd308b2d0a69` to
+  `b2935f7e7c7d429dec0fea4ce2f2fb973b43f291d3f064d1b9767b5864dfa4fe`;
+  the application manifest changed from
+  `3f5530bbd3c5b364fb759b99a769d3987fd0c009f4572e76d0f1c23668e0430d` to
+  `044130238d51f9d65396cdfbdc53d9f66049b5a3dc797b8d67bd94903832df51`;
+  and `Cargo.lock` changed from
+  `8b4abff5f7f7109b58cb0b701043d4d5fb7de291501c4763a6e8cbbfb27a0ccc` to
+  `cb3b46fe05da6e2b7861ae5101e536e554ae2bee65d30e5145bdc5ba07f1680c`.
+  The reviewed lock migration removes the `duckdb`, `libduckdb-sys`, and Arrow
+  package records and resolves every FrankenSQLite Git package to the same
+  immutable revision. The root lock change also includes the reviewed
+  `arc-swap` and exact-Zed `gpui_platform` edges; not every lock line is
+  attributable to the database engine alone.
+- **Production shape:** the seven-table single-run schema now uses canonical
+  SQLite `INTEGER`, `REAL`, and `TEXT` values. One worker thread constructs,
+  owns, uses, explicitly closes, and drops the deliberately `!Send + !Sync`
+  `fsqlite::Connection`. GUI and TUI consumers load immutable
+  `AnalyticsSnapshot` values; the control CLI uses a separate read-only
+  `StorageReader` boundary.
+- **Admission and receipt truth:** synchronous validation/channel rejection is
+  definitely `NotAdmitted`. The completed batch is retained exactly, the world
+  latches the fault, and later science ticks stop until explicit retry admits
+  it. Successful enqueue is admission, not a commit or durability proof.
+  Flush and shutdown barriers prove all earlier admitted transactions committed
+  and report `CommittedVolatile` for `:memory:` or `Durable` for file-backed
+  storage. A durable outbox and individual applied/durable watermarks remain
+  open; the asynchronous path is not yet entitled to an end-to-end lossless
+  claim.
+- **Run-file policy:** the application exposes `--storage {file|memory}`. File
+  mode exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or generates and prints
+  `runs/scriptbots-<unix-ms>-<pid>.sqlite`; it refuses an existing database and
+  stale SQLite sidecars. Memory mode uses volatile `:memory:` through the same
+  engine. `scriptbots-control export` requires `--db` and callers must pass the
+  actual printed run path.
+- **License gate:** FrankenSQLite declares
+  `LicenseRef-MIT-OpenAI-Anthropic-Rider`. Public binaries must preserve its
+  license and notice terms, and the combined distribution must not be described
+  as only `MIT OR Apache-2.0`.
+- **Verification completed:** the exact-revision remote storage suite passed 18
+  tests: 14 storage unit tests, two real-engine conformance tests, one historical
+  golden, and one persistence integration test. Those tests cover file and
+  memory modes, rollback/terminal-failure handling, close/reopen, typed decode
+  failures, replay encoding, bounded admission races, flush/shutdown receipts,
+  and committed analytics publication. The final locked workspace all-target
+  check, Clippy with `-D warnings`, and complete serialized workspace test suite
+  also pass. Durable outbox recovery, crash recovery, and meaningful replay
+  production remain explicitly open.
+- **Residue boundary:** live manifests, live source, and `Cargo.lock` no longer
+  use DuckDB. Historical prose remains labeled as history. The tracked
+  `ci-baseline.duckdb` binary remains untouched because repository policy
+  forbids deleting any file without the user's explicit written permission; no
+  live code references it.
+- **Result:** the production engine replacement and dependency removal are
+  accepted. Bead `bd-2z0.8.9.3` is complete; `bd-2z0.8.9.4` remains the
+  authority for the unfinished asynchronous durability gate.
+- **Rollback boundary:** if an emergency rollback is explicitly approved,
+  manually revert only the reviewed manifest, lock, storage, application, and
+  frontend commits by path. Never restore DuckDB as a second backend, use a
+  compatibility shim, or run a destructive Git/filesystem command.
+
+## 2026-07-11 — Harden dependency, workflow, and browser-tool supply chains
+
+- **Beads:** `bd-2z0.8.14` and `bd-2z0.8.13`
+- **Change class:** immutable CI inputs, vulnerability containment, and live
+  WASM/browser compatibility proof
+- **GitHub Actions:** every `uses:` reference is now an immutable 40-character
+  revision. The selected upstream releases are checkout 7.0.0, rust-cache
+  2.9.1, upload-artifact 7.0.1, download-artifact 8.0.1, paths-filter 4.0.2,
+  install-action 2.83.1, and the reviewed dated rust-toolchain commit. Workflow
+  permissions default to `contents: read`; only the render path-filter job adds
+  `pull-requests: read` for pull-request file enumeration.
+- **Tool pins:** cargo-audit 0.22.2, cargo-dist 0.32.0, and wasm-pack 0.15.0.
+  Release tags cross the expression/shell boundary only through environment
+  variables and must match the explicit `vMAJOR.MINOR.PATCH[-prerelease]`
+  grammar before reaching cargo-dist.
+- **Workflow validation:** checksummed actionlint 1.7.12 passes both workflows.
+  Its review also moved replay paths out of an illegal job-level `runner.temp`
+  expression and made archive/checksum globs option-safe. Because production
+  replay instrumentation is still explicitly unfinished, the replay job now
+  proves that both verification and comparison fail closed on empty nonzero
+  event streams; it no longer makes the guaranteed-false claim that the
+  scaffold has already established replay determinism.
+- **Latent XCB path:** GPUI's inactive screen-capture option still places
+  zed-scap and XCB 1.7.0 in the lockfile even though no ScriptBots all-feature,
+  all-target product graph activates either package. Exact upstream XCB
+  revision `ae3b2cd080e78173223038ccbebdc644eaf4a9ad` replaces its vulnerable
+  build-time quick-xml 0.30 parser with 0.41.0. The zed-scap feature-equivalent
+  `randr,xlib_xcb,xfixes` build passed. This Git patch is temporary broad-lock
+  audit hygiene, not a claim of runtime exposure.
+- **Wayland exception:** wayland-scanner 0.31.10 is still the newest stable
+  release and alone retains quick-xml 0.39.4. RUSTSEC-2026-0194 is reachable
+  only while the proc macro parses trusted, vendored protocol XML;
+  RUSTSEC-2026-0195's `NsReader` API is not used by the scanner. Upstream commit
+  `d07c4f91f28b42e5a485823ffd9d8d5a210b1053` moves to quick-xml 0.41, but its
+  unreleased source family includes scanner/API changes incompatible with the
+  released SCTK/Wayland graph. CI therefore allows exactly those two advisory
+  IDs only after an inverse-tree guard proves that the reviewed direct path is
+  still exactly quick-xml 0.39.4 to wayland-scanner 0.31.10. An upgrade, a new
+  parent, or path disappearance fails closed and forces review.
+- **Audit result:** cargo-audit 0.22.2 exits successfully with that guarded
+  exception and reports six informational unmaintained-package warnings:
+  bincode 1.3.3 through NeuroFlow (`bd-2z0.8.10`), paste through the ML/audio/
+  renderer families (`.8.10-.12`), proc-macro-error2 through pinned GPUI
+  (`.8.12`), and ttf-parser 0.20/0.21/0.25 through Bevy/GPUI/Winit
+  (`.8.11-.12`). Vulnerabilities outside the guarded Wayland path still fail.
+- **Browser toolchain:** wasm-pack's latest browser runner still emits the
+  legacy Chrome session request, which ChromeDriver 149 rejects. The CI lane
+  therefore downloads matching Chrome for Testing and ChromeDriver
+  148.0.7778.167 directly from the official immutable version path and checks
+  SHA-256 before extraction. Chrome is
+  `7096879de995091dff2eb3f4b5e7d36ca3395c07fb552a9a391887cb5def574a`;
+  ChromeDriver is
+  `f730a232329f133f3f6f992a9fb8b25745328b43b7b6244bd8168d95bc727c7e`.
+  A generated WebDriver capability file names the exact browser binary; no
+  floating Node, npm, Playwright, browser, or driver install remains.
+- **WASM fixes and proof:** the Rayon limiter's native-only static now has a
+  native-only cfg, eliminating the wasm warning. wasm-pack resolves `--out-dir`
+  relative to the web crate, so CI and the harness guide now use `web/pkg`
+  rather than a duplicated workspace path. The exact CI build command succeeds
+  with `--locked`, produces `crates/scriptbots-web/web/pkg`, and the pinned
+  headless Chrome lane passes the native/WASM parity test 1/1.
+- **Profiling storage isolation:** file-mode profile-sweep and auto-tune
+  children now receive unique benchmark-only paths under the platform temp
+  directory. They never inherit or reserve the caller's requested
+  `SCRIPTBOTS_STORAGE_PATH`; memory probes explicitly remove that environment
+  variable. A command-environment regression test proves distinct file paths
+  and the memory override. A release-mode file-backed `--auto-tune 1` run then
+  completed its probe matrix and created the caller's requested nonempty final
+  database successfully.
+- **Golden boundary:** the current Rust and Bevy PNGs independently match their
+  recorded SHA-256 values. Five older `legacy_*.png` entries in
+  `docs/rendering_reference/checksums.txt` have no corresponding tracked files,
+  so whole-manifest checksum verification remains open under `bd-2z0.1.3`
+  rather than being misreported as green.
+- **Current hashes:** root manifest
+  `b190ad00f47bd18ed7e147dba8760f2093d94ee7ce5b6e0776470063b9b9b2ad`;
+  lockfile
+  `47a7cabaebaa68e68eb28e6f6d13d8669655e1eb668f2c9a8878d23bd2ae7491`;
+  CI workflow
+  `5be83dabfac59972007d98a7e164244e89caabbbf7cd5fcd11a929570b554f00`;
+  release workflow
+  `f3ebb439941368d03ee885da6587fc97fd0b6f7b8aea67d03fcbf43d0b44c360`.
+  Regenerate these values if any later review edit changes the corresponding
+  file before commit.
+- **Rollback:** manually restore only the reviewed manifest/lock/workflow/WASM
+  lines. Do not remove files or use destructive Git commands. Keep the security
+  bead open until the compatible stable Wayland and W3C WebDriver releases let
+  both temporary compatibility pins disappear.

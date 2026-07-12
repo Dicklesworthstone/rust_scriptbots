@@ -5,7 +5,7 @@ Thin Canvas harness for exercising the `scriptbots-web` WASM bindings. The setup
 ## Build steps
 
 ```bash
-wasm-pack build crates/scriptbots-web --target web --out-dir crates/scriptbots-web/web/pkg
+wasm-pack build crates/scriptbots-web --target web --out-dir web/pkg -- --locked
 
 # Option A: Python http.server
 cd crates/scriptbots-web/web

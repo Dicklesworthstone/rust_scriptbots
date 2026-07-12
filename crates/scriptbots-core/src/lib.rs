@@ -9,7 +9,7 @@ use slotmap::{Key, KeyData, SecondaryMap, SlotMap, new_key_type};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 use std::sync::OnceLock;
 use thiserror::Error;
 #[cfg(feature = "simd_wide")]
@@ -36,7 +36,7 @@ pub struct ActivationEdge {
     pub weight: f32,
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 static RAYON_LIMIT_GUARD: OnceLock<()> = OnceLock::new();
 
 #[cfg(feature = "parallel")]
@@ -4439,6 +4439,35 @@ impl TickCadence {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PersistenceRuntimeTail {
+    food_delta: f32,
+    spiked: bool,
+    sound_output: f32,
+    give_intent: f32,
+    indicator: IndicatorState,
+}
+
+impl PersistenceRuntimeTail {
+    fn capture(runtime: &AgentRuntime) -> Self {
+        Self {
+            food_delta: runtime.food_delta,
+            spiked: runtime.spiked,
+            sound_output: runtime.sound_output,
+            give_intent: runtime.give_intent,
+            indicator: runtime.indicator,
+        }
+    }
+
+    fn restore_into(self, runtime: &mut AgentRuntime) {
+        runtime.food_delta = self.food_delta;
+        runtime.spiked = self.spiked;
+        runtime.sound_output = self.sound_output;
+        runtime.give_intent = self.give_intent;
+        runtime.indicator = self.indicator;
+    }
+}
+
 /// Aggregate world state shared by the simulation and rendering layers.
 pub struct WorldState {
     config: ScriptBotsConfig,
@@ -4483,12 +4512,16 @@ pub struct WorldState {
     pending_spawns: Vec<SpawnOrder>,
     pending_birth_records: Vec<BirthRecord>,
     pending_death_records: Vec<DeathRecord>,
+    pending_lifecycle_birth_metrics: Vec<BirthRecord>,
+    pending_lifecycle_death_metrics: Vec<DeathRecord>,
     #[allow(dead_code)]
     replay_tick: u64,
     replay_events: Vec<ReplayEvent>,
     persistence: Box<dyn WorldPersistence>,
     pending_persistence_batch: Option<PersistenceBatch>,
     persistence_fault: Option<PersistenceAdmissionError>,
+    last_admitted_persistence_tick: Option<Tick>,
+    pending_persistence_runtime_tail: AgentMap<PersistenceRuntimeTail>,
     pending_birth_events: usize,
     pending_death_events: usize,
     pending_spike_attempt_events: u32,
@@ -4598,11 +4631,15 @@ impl WorldState {
             pending_spawns: Vec::new(),
             pending_birth_records: Vec::new(),
             pending_death_records: Vec::new(),
+            pending_lifecycle_birth_metrics: Vec::new(),
+            pending_lifecycle_death_metrics: Vec::new(),
             replay_tick: 0,
             replay_events: Vec::new(),
             persistence,
             pending_persistence_batch: None,
             persistence_fault: None,
+            last_admitted_persistence_tick: None,
+            pending_persistence_runtime_tail: AgentMap::new(),
             pending_birth_events: 0,
             pending_death_events: 0,
             pending_spike_attempt_events: 0,
@@ -5176,7 +5213,8 @@ impl WorldState {
                 #[cfg(feature = "simd_wide")]
                 {
                     // SIMD-batch smell/sound/hearing; eyes/blood remain per-lane for correctness
-                    for chunk in indices.chunks_exact(4) {
+                    let (chunks, remainder) = indices.as_chunks::<4>();
+                    for chunk in chunks {
                         let ids = [chunk[0], chunk[1], chunk[2], chunk[3]];
                         let dx_arr = [
                             toroidal_delta(positions[ids[0]].x, position.x, world_width),
@@ -5343,7 +5381,7 @@ impl WorldState {
                         }
                     }
                     // Remainder (less than 4)
-                    for &other_idx in indices.chunks_exact(4).remainder() {
+                    for &other_idx in remainder {
                         if other_idx == idx {
                             continue;
                         }
@@ -5756,7 +5794,8 @@ impl WorldState {
         let mut results: Vec<ActuationResult> = vec![ActuationResult::default(); handles.len()];
         #[cfg(feature = "simd_wide")]
         {
-            for (chunk_i, chunk) in handles.chunks_exact(4).enumerate() {
+            let (handle_chunks, remainder) = handles.as_chunks::<4>();
+            for (chunk_i, chunk) in handle_chunks.iter().enumerate() {
                 let base = chunk_i * 4;
                 for (lane, &agent_id) in chunk.iter().enumerate() {
                     let idx = base + lane;
@@ -5857,9 +5896,8 @@ impl WorldState {
                 // Remainder handled below outside loop
             }
 
-            let rem = handles.chunks_exact(4).remainder();
-            let base = handles.len() - rem.len();
-            for (o, agent_id) in rem.iter().enumerate() {
+            let base = handles.len() - remainder.len();
+            for (o, agent_id) in remainder.iter().enumerate() {
                 let idx = base + o;
                 let Some(runtime) = runtime.get(*agent_id) else {
                     continue;
@@ -6132,7 +6170,8 @@ impl WorldState {
         {
             use wide::f32x4;
 
-            for (base, chunk) in handles.chunks_exact(4).enumerate() {
+            let (handle_chunks, remainder) = handles.as_chunks::<4>();
+            for (base, chunk) in handle_chunks.iter().enumerate() {
                 let i0 = base * 4;
                 let idxs = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 // Gather env temps and preferences per lane
@@ -6191,9 +6230,8 @@ impl WorldState {
             }
 
             // Remainder (less than 4)
-            let rem = handles.chunks_exact(4).remainder();
-            let base = handles.len() - rem.len();
-            for (o, agent_id) in rem.iter().enumerate() {
+            let base = handles.len() - remainder.len();
+            for (o, agent_id) in remainder.iter().enumerate() {
                 let idx = base + o;
                 let env_temperature = sample_temperature(&self.config, positions_snapshot[idx].x);
                 let Some(runtime) = self.runtime.get(*agent_id) else {
@@ -6254,8 +6292,22 @@ impl WorldState {
         }
     }
 
-    fn stage_reset_events(&mut self) {
+    fn stage_accumulate_food_balance(&mut self) {
         for runtime in self.runtime.values_mut() {
+            runtime.food_balance_total += runtime.food_delta;
+        }
+    }
+
+    fn stage_reset_events(&mut self, preserve_persistence_tail: bool) {
+        // Reuse the same secondary-map allocation and populate it during the reset pass that we
+        // already owe. This preserves a non-cadence-aligned final tick without allocating and
+        // copying a second full agent map on every simulation tick.
+        self.pending_persistence_runtime_tail.clear();
+        for (agent_id, runtime) in self.runtime.iter_mut() {
+            if preserve_persistence_tail {
+                self.pending_persistence_runtime_tail
+                    .insert(agent_id, PersistenceRuntimeTail::capture(runtime));
+            }
             runtime.spiked = false;
             runtime.food_delta = 0.0;
             runtime.sound_output = runtime.sound_multiplier;
@@ -6267,6 +6319,46 @@ impl WorldState {
                 }
             }
         }
+    }
+
+    fn stage_record_history(&mut self, next_tick: Tick) {
+        let agent_count = self.agents.len();
+        let total_energy: f32 = self.runtime.values().map(|runtime| runtime.energy).sum();
+        let total_health: f32 = self.agents.columns().health().iter().copied().sum();
+        let max_age = self
+            .agents
+            .columns()
+            .ages()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let divisor = agent_count as f32;
+        let summary = TickSummary {
+            tick: next_tick,
+            agent_count,
+            births: self.last_births,
+            deaths: self.last_deaths,
+            total_energy,
+            average_energy: if agent_count == 0 {
+                0.0
+            } else {
+                total_energy / divisor
+            },
+            average_health: if agent_count == 0 {
+                0.0
+            } else {
+                total_health / divisor
+            },
+            max_age,
+            spike_hits: self.combat_spike_hits,
+        };
+        if self.history.len() >= self.config.history_capacity {
+            self.history.pop_front();
+        }
+        self.history.push_back(summary);
+        self.last_spike_hits = self.combat_spike_hits;
+        self.last_max_age = max_age;
     }
 
     fn stage_food(&mut self) {
@@ -6743,7 +6835,8 @@ impl WorldState {
             index.visit_neighbor_buckets(idx, reach, &mut |indices| {
                 #[cfg(feature = "simd_wide")]
                 {
-                    for chunk in indices.chunks_exact(4) {
+                    let (chunks, remainder) = indices.as_chunks::<4>();
+                    for chunk in chunks {
                         let a0 = chunk[0];
                         let a1 = chunk[1];
                         let a2 = chunk[2];
@@ -6813,8 +6906,7 @@ impl WorldState {
                             });
                         }
                     }
-                    let rem = indices.chunks_exact(4).remainder();
-                    for &other_idx in rem {
+                    for &other_idx in remainder {
                         if other_idx == idx {
                             continue;
                         }
@@ -7052,7 +7144,8 @@ impl WorldState {
             #[cfg(feature = "simd_wide")]
             {
                 use wide::f32x4;
-                for (chunk_i, chunk) in handles.chunks_exact(4).enumerate() {
+                let (handle_chunks, remainder) = handles.as_chunks::<4>();
+                for (chunk_i, chunk) in handle_chunks.iter().enumerate() {
                     let base = chunk_i * 4;
                     let ids = [chunk[0], chunk[1], chunk[2], chunk[3]];
                     let mut dx_arr = [0.0_f32; 4];
@@ -7079,9 +7172,8 @@ impl WorldState {
                         }
                     }
                 }
-                let rem = handles.chunks_exact(4).remainder();
-                let base = handles.len() - rem.len();
-                for (o, neighbor_id) in rem.iter().enumerate() {
+                let base = handles.len() - remainder.len();
+                for (o, neighbor_id) in remainder.iter().enumerate() {
                     let idx = base + o;
                     if *neighbor_id == *agent_id {
                         continue;
@@ -7244,6 +7336,8 @@ impl WorldState {
                 .collect()
         };
         if !death_records.is_empty() {
+            self.pending_lifecycle_death_metrics
+                .extend(death_records.iter().cloned());
             self.pending_death_records.extend(death_records);
         }
 
@@ -7432,6 +7526,7 @@ impl WorldState {
                     position: snapshot.position,
                     is_hybrid: child_runtime.hybrid,
                 };
+                self.pending_lifecycle_birth_metrics.push(record.clone());
                 self.pending_birth_records.push(record);
             }
         }
@@ -7824,12 +7919,18 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
-    fn stage_persistence(&mut self, next_tick: Tick) -> Result<(), PersistenceAdmissionError> {
+    fn stage_persistence(
+        &mut self,
+        next_tick: Tick,
+        force_partial_batch: bool,
+    ) -> Result<(), PersistenceAdmissionError> {
         if self.config.persistence_interval == 0 {
             self.last_births = 0;
             self.last_deaths = 0;
             self.pending_birth_records.clear();
             self.pending_death_records.clear();
+            self.pending_lifecycle_birth_metrics.clear();
+            self.pending_lifecycle_death_metrics.clear();
             self.replay_events.clear();
             self.pending_birth_events = 0;
             self.pending_death_events = 0;
@@ -7837,10 +7938,10 @@ impl WorldState {
             self.pending_spike_hit_events = 0;
             self.combat_spike_attempts = 0;
             self.combat_spike_hits = 0;
+            self.pending_persistence_runtime_tail.clear();
             return Ok(());
         }
 
-        self.last_spike_hits = self.combat_spike_hits;
         self.pending_birth_events = self.pending_birth_events.saturating_add(self.last_births);
         self.pending_death_events = self.pending_death_events.saturating_add(self.last_deaths);
         self.pending_spike_attempt_events = self
@@ -7851,15 +7952,16 @@ impl WorldState {
             .saturating_add(self.combat_spike_hits);
 
         let analytics = self.config.analytics_stride;
-        if !next_tick
-            .0
-            .is_multiple_of(self.config.persistence_interval as u64)
+        if !force_partial_batch
+            && !next_tick
+                .0
+                .is_multiple_of(self.config.persistence_interval as u64)
         {
             self.last_births = 0;
             self.last_deaths = 0;
             if analytics.lifecycle_events == 0 {
-                self.pending_birth_records.clear();
-                self.pending_death_records.clear();
+                self.pending_lifecycle_birth_metrics.clear();
+                self.pending_lifecycle_death_metrics.clear();
             }
             self.combat_spike_attempts = 0;
             self.combat_spike_hits = 0;
@@ -7867,15 +7969,17 @@ impl WorldState {
         }
 
         let macro_enabled = analytics.macro_metrics != 0
-            && next_tick.0.is_multiple_of(analytics.macro_metrics as u64);
+            && (force_partial_batch || next_tick.0.is_multiple_of(analytics.macro_metrics as u64));
         let behavior_enabled = analytics.behavior_metrics != 0
-            && next_tick
-                .0
-                .is_multiple_of(analytics.behavior_metrics as u64);
+            && (force_partial_batch
+                || next_tick
+                    .0
+                    .is_multiple_of(analytics.behavior_metrics as u64));
         let lifecycle_enabled = analytics.lifecycle_events != 0
-            && next_tick
-                .0
-                .is_multiple_of(analytics.lifecycle_events as u64);
+            && (force_partial_batch
+                || next_tick
+                    .0
+                    .is_multiple_of(analytics.lifecycle_events as u64));
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let agent_count = handles.len();
@@ -8007,7 +8111,14 @@ impl WorldState {
                 }
 
                 if behavior_enabled || macro_enabled {
-                    let delta = f64::from(runtime.food_delta);
+                    let food_delta = if force_partial_batch {
+                        self.pending_persistence_runtime_tail
+                            .get(*agent_id)
+                            .map_or(runtime.food_delta, |tail| tail.food_delta)
+                    } else {
+                        runtime.food_delta
+                    };
+                    let delta = f64::from(food_delta);
                     food_delta_sum += delta;
                     food_delta_abs_sum += delta.abs();
                 }
@@ -8287,24 +8398,29 @@ impl WorldState {
 
         let mut agents = Vec::with_capacity(agent_count);
         for id in &handles {
-            if let Some(snapshot) = self.snapshot_agent(*id) {
-                agents.push(snapshot);
+            if let (Some(data), Some(mut runtime)) =
+                (self.agents.snapshot(*id), self.runtime.get(*id).cloned())
+            {
+                if force_partial_batch
+                    && let Some(tail) = self.pending_persistence_runtime_tail.get(*id)
+                {
+                    tail.restore_into(&mut runtime);
+                }
+                agents.push(AgentState {
+                    id: *id,
+                    data,
+                    runtime,
+                });
             }
         }
 
-        for id in &handles {
-            if let Some(runtime) = self.runtime.get_mut(*id) {
-                runtime.food_balance_total += runtime.food_delta;
-            }
-        }
-
-        if lifecycle_enabled && !self.pending_death_records.is_empty() {
+        if lifecycle_enabled && !self.pending_lifecycle_death_metrics.is_empty() {
             let mut combat_carnivore = 0usize;
             let mut combat_herbivore = 0usize;
             let mut starvation = 0usize;
             let mut aging = 0usize;
             let mut unknown = 0usize;
-            for record in &self.pending_death_records {
+            for record in &self.pending_lifecycle_death_metrics {
                 match record.cause {
                     DeathCause::CombatCarnivore => combat_carnivore += 1,
                     DeathCause::CombatHerbivore => combat_herbivore += 1,
@@ -8353,10 +8469,10 @@ impl WorldState {
             }
         }
 
-        if lifecycle_enabled && !self.pending_birth_records.is_empty() {
-            let total = self.pending_birth_records.len();
+        if lifecycle_enabled && !self.pending_lifecycle_birth_metrics.is_empty() {
+            let total = self.pending_lifecycle_birth_metrics.len();
             let hybrid = self
-                .pending_birth_records
+                .pending_lifecycle_birth_metrics
                 .iter()
                 .filter(|record| record.is_hybrid)
                 .count();
@@ -8370,23 +8486,12 @@ impl WorldState {
             }
         }
 
-        let births = if lifecycle_enabled {
-            std::mem::take(&mut self.pending_birth_records)
-        } else if analytics.lifecycle_events == 0 {
-            self.pending_birth_records.clear();
-            Vec::new()
-        } else {
-            Vec::new()
-        };
-
-        let deaths = if lifecycle_enabled {
-            std::mem::take(&mut self.pending_death_records)
-        } else if analytics.lifecycle_events == 0 {
-            self.pending_death_records.clear();
-            Vec::new()
-        } else {
-            Vec::new()
-        };
+        let births = std::mem::take(&mut self.pending_birth_records);
+        let deaths = std::mem::take(&mut self.pending_death_records);
+        if lifecycle_enabled || analytics.lifecycle_events == 0 {
+            self.pending_lifecycle_birth_metrics.clear();
+            self.pending_lifecycle_death_metrics.clear();
+        }
 
         let batch = PersistenceBatch {
             summary: summary.clone(),
@@ -8399,19 +8504,18 @@ impl WorldState {
             deaths,
             replay_events: std::mem::take(&mut self.replay_events),
         };
-        self.last_max_age = age_max;
+        self.pending_persistence_runtime_tail.clear();
         let persistence_result = match self.persistence.on_tick(&batch) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.last_admitted_persistence_tick = Some(next_tick);
+                Ok(())
+            }
             Err(error) => {
                 self.persistence_fault = Some(error.clone());
                 self.pending_persistence_batch = Some(batch);
                 Err(error)
             }
         };
-        if self.history.len() >= self.config.history_capacity {
-            self.history.pop_front();
-        }
-        self.history.push_back(summary);
         self.last_births = 0;
         self.last_deaths = 0;
         self.pending_birth_events = 0;
@@ -8448,7 +8552,13 @@ impl WorldState {
         self.stage_reproduction();
         self.stage_population(next_tick);
         self.stage_spawn_commit(next_tick);
-        let persistence_result = self.stage_persistence(next_tick);
+        self.stage_accumulate_food_balance();
+        self.stage_record_history(next_tick);
+        let preserve_persistence_tail = self.config.persistence_interval != 0
+            && !next_tick
+                .0
+                .is_multiple_of(self.config.persistence_interval as u64);
+        let persistence_result = self.stage_persistence(next_tick, false);
 
         let mut events = TickEvents {
             tick: next_tick,
@@ -8457,7 +8567,7 @@ impl WorldState {
             food_respawned,
         };
 
-        self.stage_reset_events();
+        self.stage_reset_events(preserve_persistence_tail);
         self.advance_tick();
         events.tick = self.tick;
         events.epoch_rolled = self.epoch != previous_epoch;
@@ -8749,6 +8859,7 @@ impl WorldState {
         };
         match self.persistence.on_tick(&batch) {
             Ok(()) => {
+                self.last_admitted_persistence_tick = Some(batch.summary.tick);
                 self.persistence_fault = None;
                 Ok(true)
             }
@@ -8758,6 +8869,26 @@ impl WorldState {
                 Err(error)
             }
         }
+    }
+
+    /// Admit the final partial persistence-cadence batch, if one exists.
+    ///
+    /// This is idempotent at a completed tick boundary. It proves only synchronous admission to
+    /// the configured sink; callers must still obtain the sink's flush or shutdown receipt before
+    /// claiming that the batch committed.
+    pub fn finalize_persistence(&mut self) -> Result<bool, PersistenceAdmissionError> {
+        if let Some(error) = &self.persistence_fault {
+            return Err(error.clone());
+        }
+        if self.config.persistence_interval == 0
+            || self.tick == Tick::zero()
+            || self.last_admitted_persistence_tick == Some(self.tick)
+        {
+            return Ok(false);
+        }
+
+        self.stage_persistence(self.tick, true)?;
+        Ok(true)
     }
 
     /// Whether a completed tick is paused at the persistence admission boundary.
@@ -9349,10 +9480,11 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
         let expected_width = config.world_width;
+        let expected_food_dimensions = config.food_dimensions().expect("food dimensions");
         let mut world = WorldState::new(config).expect("world");
         assert_eq!(world.agent_count(), 0);
-        assert_eq!(world.food().width(), 100);
-        assert_eq!(world.food().height(), 100);
+        assert_eq!(world.food().width(), expected_food_dimensions.0);
+        assert_eq!(world.food().height(), expected_food_dimensions.1);
         assert_eq!(world.food().get(0, 0), Some(0.25));
         assert_eq!(world.config().world_width, expected_width);
 
@@ -9882,6 +10014,9 @@ mod tests {
         let mut world =
             WorldState::with_persistence(config, Box::new(rejecting)).expect("test world");
         world.pending_birth_records.push(lifecycle_birth(1));
+        world
+            .pending_lifecycle_birth_metrics
+            .push(lifecycle_birth(1));
         world.pending_death_records.push(lifecycle_death(1));
         world.last_births = 1;
         world.last_deaths = 1;
@@ -10001,12 +10136,18 @@ mod tests {
         let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
 
         world.pending_birth_records.push(lifecycle_birth(1));
+        world
+            .pending_lifecycle_birth_metrics
+            .push(lifecycle_birth(1));
         world.last_births = 1;
         world.step().expect("tick one");
         world.step().expect("tick two");
         world.step().expect("tick three persistence boundary");
 
         world.pending_birth_records.push(lifecycle_birth(4));
+        world
+            .pending_lifecycle_birth_metrics
+            .push(lifecycle_birth(4));
         world.last_births = 1;
         world.step().expect("tick four");
         world.step().expect("tick five");
@@ -10017,23 +10158,140 @@ mod tests {
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].summary.births, 1);
-        assert!(entries[0].births.is_empty());
+        assert_eq!(entries[0].births, vec![lifecycle_birth(1)]);
         assert_eq!(entries[1].summary.births, 1);
-        assert_eq!(entries[1].births.len(), 2);
+        assert_eq!(entries[1].births, vec![lifecycle_birth(4)]);
         let birth_event_total: usize = entries
             .iter()
             .flat_map(|batch| &batch.events)
             .filter(|event| matches!(event.kind, PersistenceEventKind::Births))
             .map(|event| event.count)
             .sum();
-        assert_eq!(birth_event_total, entries[1].births.len());
+        let raw_birth_total: usize = entries.iter().map(|batch| batch.births.len()).sum();
+        assert_eq!(birth_event_total, raw_birth_total);
+        let lifecycle_metric_total: f64 = entries
+            .iter()
+            .flat_map(|batch| &batch.metrics)
+            .filter(|metric| metric.name == "births.total.count")
+            .map(|metric| metric.value)
+            .sum();
+        assert_eq!(lifecycle_metric_total, raw_birth_total as f64);
         assert_eq!(
-            entries[1]
-                .births
+            entries
                 .iter()
+                .flat_map(|batch| &batch.births)
                 .map(|record| record.tick)
                 .collect::<Vec<_>>(),
             vec![Tick(1), Tick(4)]
+        );
+    }
+
+    #[test]
+    fn finalize_persistence_admits_partial_tail_exactly_once() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            analytics_stride: AnalyticsStride {
+                lifecycle_events: 6,
+                ..AnalyticsStride::default()
+            },
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            food_sharing_rate: 0.0,
+            reproduction_energy_threshold: 10.0,
+            rng_seed: Some(81),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+        let agent_id = world.spawn_agent(sample_agent(0));
+
+        world.pending_birth_records.push(lifecycle_birth(1));
+        world.last_births = 1;
+        world.step().expect("tick one");
+        world.step().expect("tick two");
+        world.step().expect("tick three persistence boundary");
+
+        world.pending_birth_records.push(lifecycle_birth(4));
+        world.pending_death_records.push(lifecycle_death(4));
+        world.last_births = 1;
+        world.last_deaths = 1;
+        world.replay_events.push(replay_marker(0.4));
+        world.agent_runtime_mut(agent_id).unwrap().food_delta = 0.4;
+        world.step().expect("tick four partial cadence tail");
+        assert_eq!(world.agent_runtime(agent_id).unwrap().food_delta, 0.0);
+
+        assert!(world.finalize_persistence().expect("tail admission"));
+        assert!(
+            !world
+                .finalize_persistence()
+                .expect("idempotent tail finalization")
+        );
+
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].summary.tick, Tick(3));
+        assert_eq!(entries[0].births, vec![lifecycle_birth(1)]);
+        let tail = &entries[1];
+        assert_eq!(tail.summary.tick, Tick(4));
+        assert_eq!(tail.summary.births, 1);
+        assert_eq!(tail.summary.deaths, 1);
+        assert_eq!(tail.births, vec![lifecycle_birth(4)]);
+        assert_eq!(tail.deaths, vec![lifecycle_death(4)]);
+        assert_eq!(tail.replay_events, vec![replay_marker(0.4)]);
+        assert!((tail.agents[0].runtime.food_delta - 0.4).abs() < 1e-6);
+        assert!(tail.metrics.iter().any(|metric| {
+            metric.name == "food_delta.mean" && (metric.value - 0.4).abs() < 1e-6
+        }));
+    }
+
+    #[test]
+    fn food_balance_accumulates_every_tick_between_persistence_boundaries() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            food_sharing_rate: 0.0,
+            reproduction_energy_threshold: 10.0,
+            rng_seed: Some(80),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+        let agent_id = world.spawn_agent(sample_agent(0));
+
+        for (index, delta) in [0.5, -0.25, 1.0].into_iter().enumerate() {
+            world.agent_runtime_mut(agent_id).unwrap().food_delta = delta;
+            world.step().expect("persistence cadence step");
+            assert_eq!(world.tick(), Tick(index as u64 + 1));
+        }
+
+        let expected = 1.25;
+        assert!(
+            (world
+                .agent_runtime(agent_id)
+                .expect("live agent runtime")
+                .food_balance_total
+                - expected)
+                .abs()
+                < 1e-6
+        );
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            (entries[0].agents[0].runtime.food_balance_total - expected).abs() < 1e-6,
+            "persisted agent snapshot must include every completed tick"
         );
     }
 
@@ -10774,7 +11032,9 @@ mod tests {
 
         world.pending_deaths.push(victim);
         world.stage_death_cleanup(Tick::zero());
-        world.stage_persistence(Tick(1));
+        world
+            .stage_persistence(Tick(1), false)
+            .expect("carcass metrics should be admitted");
 
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);

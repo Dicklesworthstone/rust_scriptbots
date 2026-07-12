@@ -2,7 +2,7 @@
 
 ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-based evolution simulator. Our goal is a faithful, deterministic port with a GPU-accelerated UI, pluggable brain implementations, and first-class analytics. This is a multi-crate Cargo workspace separating simulation core, brains, storage, rendering, and the application shell.
 
-For design intent and the living roadmap, see `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` (the project “bible”). A sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
+The authoritative roadmap is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`. The older GPUI port plan is retained as historical design evidence, and a sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
 
 ### Philosophy & purpose
 - **Why this exists**: ScriptBots is a minimalist artificial life laboratory. By rebuilding the original simulator with rigorously deterministic Rust systems, we can observe, measure, and reproduce emergent behavior at scale—without undefined behavior or global state muddying results.
@@ -19,7 +19,7 @@ For design intent and the living roadmap, see `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN
 - **Reproducible research**: Deterministic pipelines + a growing replay roadmap mean results can be shared and re-run bit-for-bit, making the project a solid platform for pedagogy, papers, and benchmarking new brain designs.
 
 ### Why this exists
-- **Determinism and safety**: Replace legacy C++/GLUT and global state with idiomatic Rust, zero `unsafe` in v1, and reproducible runs.
+- **Determinism and safety**: Replace legacy C++/GLUT and global state with idiomatic Rust, tightly audited platform-boundary `unsafe`, and reproducible runs.
 - **Performance at scale**: Data-parallelism (Rayon) and cache-friendly layouts to simulate thousands of agents efficiently.
 - **Modern UX**: Declarative, GPU-accelerated GPUI interface with an inspector, overlays, and smooth camera controls.
 - **Observability**: Persist metrics and snapshots to FrankenSQLite for replay, analytics, and regression testing while the UI consumes lock-free immutable read models.
@@ -36,9 +36,9 @@ rust_scriptbots/
 ├── crates/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
-│   ├── scriptbots-brain-ml   # Optional ML backends (Candle/Tract/tch), feature-gated
+│   ├── scriptbots-brain-ml   # Feature probes/placeholders for future Candle/Tract/tch adapters
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
-│   ├── scriptbots-index      # Pluggable spatial indices (grid, rstar, kd-tree)
+│   ├── scriptbots-index      # Uniform-grid index; alternate backends are not implemented
 │   ├── scriptbots-storage    # FrankenSQLite persistence worker & analytics snapshots
 │   ├── scriptbots-render     # GPUI integration and visual layer (HUD, canvas renderer)
 │   ├── scriptbots-app        # Binary crate wiring everything together
@@ -103,17 +103,17 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Background workers: `StoragePipeline` is a bounded, acknowledged writer whose dedicated thread creates and exclusively owns its FrankenSQLite connection; `ControlRuntime` (Tokio) is separately isolated. The core drains commands inside the tick loop for deterministic application.
+- Background workers: `StoragePipeline` is a bounded-admission writer whose dedicated thread creates and exclusively owns its FrankenSQLite connection; `ControlRuntime` (Tokio) is separately isolated. A successful enqueue is not a durability receipt: flush or shutdown must acknowledge the earlier transactions. The core drains commands inside the tick loop for deterministic application.
 - Renderers are read-only consumers of world and analytics snapshots; they do not mutate simulation state, query the database, or wait on a storage mutex during paint.
 - Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
 
 ### Crate roles
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
-- **`scriptbots-brain-ml`**: Optional ML backends (Candle, Tract, tch) for alternative/accelerated inference (feature-gated).
+- **`scriptbots-brain-ml`**: Feature selection and a sensor-copy placeholder for future Candle, Tract, and tch inference. It does not load or execute models yet.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
-- **`scriptbots-index`**: Spatial indexing implementations; default uniform grid, optional `rstar` (R-tree) and `kd` (kiddo).
-- **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded durability acknowledgements, and immutable latest-value analytics snapshots for frontends.
+- **`scriptbots-index`**: Production uniform-grid neighborhood index. The declared `rstar` and `kd` dependency features are compile-time scaffolding, not implemented index backends.
+- **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
 - **`scriptbots-render`**: GPUI UI layer with a window shell, HUD, canvas renderer for agents/food, selection highlights, and diagnostics overlay.
 - **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env, storage pipeline, installs brains, seeds agents, and launches the GPUI shell.
 - **`scriptbots-web`**: WebAssembly harness exposing bindings to init/tick/reset and snapshot the simulation; consumes `scriptbots-core` with `default-features = false` (sequential fallback; Rayon disabled on wasm).
@@ -122,11 +122,11 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - Workspace scaffolding, shared lints, and profiles are in place.
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
 - `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
-- `scriptbots-brain`: `MlpBrain` available; experimental `assembly` feature; DWRAON planned; registry wiring present.
+- `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
 - `scriptbots-brain-neuro`: NeuroFlow-backed brain available behind the `neuro` feature (runtime toggles below).
-- `scriptbots-storage`: the exact FrankenSQLite source is pinned and its ScriptBots workload is covered by in-memory and file-backed conformance tests; the production worker migration and mock-free end-to-end gates are tracked in the active rearchitecture plan.
+- `scriptbots-storage`: the exact FrankenSQLite source is pinned; its ScriptBots workload and production worker have targeted in-memory and file-backed tests. The durable outbox, per-batch applied/durable watermarks, and mock-free recovery gates remain tracked in the active rearchitecture plan.
 
-See the migration roadmap in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` for staged milestones and parity checklists.
+See the active recovery roadmap in `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md` for staged milestones and acceptance gates. The older GPUI port plan is historical evidence, not current policy.
 
 ## Getting started
 
@@ -374,17 +374,17 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - Note: default features enable `ml`, `neuro`, and `fast-alloc`. To disable defaults, use `--no-default-features` and opt-in explicitly.
 - **`scriptbots-render`**:
   - `audio` → enable Kira-driven audio in the UI layer
-- **`scriptbots-index`** (pluggable spatial indices):
-  - Default: `grid`; optional: `rstar`, `kd`
+- **`scriptbots-index`**:
+  - `grid` is the implemented backend; `rstar` and `kd` currently enable dependencies only.
   - Example: `cargo build -p scriptbots-index --features rstar`
-- **`scriptbots-brain-ml`** (optional ML backends):
-  - `candle`, `tract`, `tch` (all optional)
+- **`scriptbots-brain-ml`** (backend compile probes; inference remains a placeholder):
+  - `candle`, `tract`, `tch` (all optional dependency features)
   - Examples:
     - `cargo build -p scriptbots-brain-ml --features candle`
     - `cargo build -p scriptbots-brain-ml --features tract`
     - `cargo build -p scriptbots-brain-ml --features tch`
 
-Note: App-level switches for brain/index selection are wired in the binary; crate-specific features control availability.
+Note: NeuroFlow and the native brain implementations are functional. The alternate spatial-index and Candle/Tract/tch execution paths remain tracked implementation work despite their dependency features compiling.
 
 ### NeuroFlow runtime configuration (optional)
 If built with the `neuro` feature, runtime toggles can be applied via env vars before launch:
@@ -405,7 +405,7 @@ cargo build --workspace
 cargo run -p scriptbots-app
 
 # Lint and format
-cargo clippy --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
 # Run tests (as they land)
@@ -413,13 +413,14 @@ cargo test --workspace
 
 # Build optional crates with features
 cargo build -p scriptbots-index --features rstar
-cargo build -p scriptbots-brain-ml --features candle
+cargo build -p scriptbots-brain-ml --features candle # compile probe; inference is still a placeholder
 ```
 
 ### Command-line options (scriptbots-app)
-- `--mode {auto|gui|terminal}`: select renderer. Defaults to `auto` and can be set via `SCRIPTBOTS_MODE`.
+- `--mode {auto|gui|bevy|terminal}`: select renderer. Defaults to `auto` and can be set via `SCRIPTBOTS_MODE`.
   - `auto`: use GPUI when a display is detected; otherwise fall back to terminal.
   - `gui`: force GPUI; may fail on headless systems.
+  - `bevy`: force the Bevy frontend when built with the `bevy_render` application feature.
   - `terminal`: force emoji TUI.
  - `--dump-png <FILE>` (GUI builds): write an offscreen PNG and exit (no UI). Pair with `--png-size WxH`.
  - `--png-size WxH` (GUI builds): snapshot size for `--dump-png` (e.g., `1280x720`).
@@ -434,7 +435,7 @@ cargo build -p scriptbots-brain-ml --features candle
  - `--auto-tune N`: quick sweep to pick threads/thresholds for the chosen storage, then continue.
  - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.
- - `--storage {file|memory}`: select the FrankenSQLite target; `file` uses `SCRIPTBOTS_STORAGE_PATH`, while `memory` opens `:memory:` through the same engine.
+ - `--storage {file|memory}`: select the FrankenSQLite target. `file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a fresh generated run path and refuses existing databases or stale sidecars; `memory` opens volatile `:memory:` through the same engine.
  - Auto-pause (any renderer):
    - `--auto-pause-below COUNT` (or `SCRIPTBOTS_AUTO_PAUSE_BELOW`) pauses when population ≤ COUNT
    - `--auto-pause-age-above AGE` (or `SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE`) pauses when any agent’s age ≥ AGE
@@ -443,7 +444,7 @@ cargo build -p scriptbots-brain-ml --features candle
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
 - `RAYON_NUM_THREADS` — set simulation thread pool size when `parallel` is enabled.
-- `SCRIPTBOTS_MODE` — `auto|gui|terminal` (renderer selection).
+- `SCRIPTBOTS_MODE` — `auto|gui|bevy|terminal` (renderer selection).
 - `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — hard override renderer detection (`1|true|yes`).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
 - `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
@@ -460,7 +461,7 @@ cargo build -p scriptbots-brain-ml --features candle
 - `SCRIPTBOTS_CONTROL_REST_ENABLED` — `true|false`.
 - `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
 - `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
-- `SCRIPTBOTS_STORAGE_PATH` — optional FrankenSQLite file path. Without it, ScriptBots creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite` file so a new launch cannot overwrite or mix with an earlier run.
+- `SCRIPTBOTS_STORAGE_PATH` — optional new-run FrankenSQLite file path. Without it, ScriptBots creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`. In either case the app reserves the path with create-new semantics and refuses an existing database or stale `-wal`, `-shm`, `-journal`, `-wal-fec`, or lock sidecar. The selected path is printed as `Run database: ...`; save that exact value for later reads and exports.
 
 ### Dual-window mode (GUI)
 - On capable desktops, ScriptBots opens two GPUI windows: a canvas window rendering the world and a HUD window with controls, charts, and inspector. If a second window cannot be created (WM limits/remote desktop), the app falls back to a single-window overlay layout automatically.
@@ -469,17 +470,17 @@ cargo build -p scriptbots-brain-ml --features candle
 Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 1. Aging and scheduled tasks
 2. Food respawn/diffusion
-3. Reset runtime flags
-4. Sense (spatial index snapshot)
-5. Brain tick (no per-tick allocs)
-6. Actuation (double-buffered state)
-7. Food intake/sharing (deterministic reductions)
-8. Combat and death (queued → commit)
-9. Reproduction (mutation/crossover) in stable order
-10. Persistence projection (batched to the bounded FrankenSQLite worker)
+3. Sense (spatial index snapshot)
+4. Brain tick
+5. Actuation (double-buffered state)
+6. Food intake/sharing (deterministic reductions)
+7. Combat and death (queued → commit)
+8. Reproduction (mutation/crossover) in stable order
+9. History and persistence projection (batched to the bounded FrankenSQLite worker)
+10. Preserve the final persistence tail and reset transient runtime flags
 
 ### Design principles & determinism
-- **Zero undefined behavior**: no `unsafe` in v1; clear ownership and lifetimes.
+- **No undefined behavior**: workspace lints flag `unsafe`; the remaining platform/environment boundary blocks are explicit and reviewable.
 - **Stable order of effects**: floating-point reductions and removals are staged and applied in a fixed order for bitwise-stable runs across thread counts.
 - **Per-agent RNG**: seeds derive from a global seed + `AgentId`, keeping behavior stable as populations change and threads vary.
 - **Feature-gated parallelism**: `scriptbots-core` defaults to `parallel` (Rayon), while web builds disable it for single-thread determinism.
@@ -494,7 +495,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 ### Data model & spatial indexing
 - **SoA layout**: agents use cache-friendly columns (`AgentColumns`) for fast scans during sense/actuation.
 - **Generational IDs**: slotmap-backed `AgentId` prevents stale references and enables stable iteration.
-- **Spatial index**: uniform hash grid by default (opt-in `rstar`/`kd`). Sense builds a read-only snapshot; actuation writes into a double buffer to avoid races.
+- **Spatial index**: uniform hash grid. Sense builds a read-only snapshot; the declared `rstar`/`kd` features do not yet provide alternate implementations.
 
 ### Sensors & outputs
 - **Sensors**: multi-eye vision cones (angular), smell/sound/blood channels with attenuation, temperature discomfort, and clock/age cues.
@@ -502,7 +503,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - **Mapping**: outputs drive physics and side-effects (e.g., spike damage scales with spike length and speed) and are logged for analytics.
 
 ### Brains & evolution
-- **Brain trait** with `tick`/`mutate`/`crossover`; implementations include MLP (production), `dwraon` (feature), `assembly` (experimental).
+- **Brain trait** with `tick`/`mutate`/`crossover`; implementations include MLP and DWRAON by default, plus experimental Assembly.
 - **Brain registry**: per-run registry attaches runners by key, enabling hybrid populations and runtime selection. Random spawns draw from `BrainRegistry::random_key` for mixed-species runs; sexual crossover is gated to same-kind brains (species barrier). Brains can optionally expose activation snapshots for visualization.
 - **Genome & genetics**: genomes capture topology/activations; mutation/crossover create hybrid births with lineage tracking and tests.
 - **NeuroFlow** (optional): deterministic CPU MLP with runtime toggles; seed-stable outputs verified in tests.
@@ -546,7 +547,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - **Narration hooks** prepared for future screen-reader integration; toggles surfaced in the inspector.
 
 ### Renderer abstraction
-- The app selects a `Renderer` implementation at runtime (`gpui` or `terminal`) via `--mode {auto|gui|terminal}` or environment variables. Both renderers consume the same world snapshots and control bus.
+- The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features). Every frontend consumes the same world and immutable analytics snapshots.
 
 ### Keyboard shortcuts (GUI)
 - Playback: `space` pause/resume, `+`/`-` speed up/down, `s` single-step
@@ -559,8 +560,8 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - Optional `kira`-backed mixer (feature `audio`) with event-driven cues (births, deaths, spikes) and accessibility toggles.
 - Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
 
-### Terminal mode (planned)
-An emoji-rich terminal renderer is planned behind a `terminal` feature/CLI mode (`--mode {auto|gui|terminal}`) with fallback when GPUI cannot start. See the “Terminal Rendering Mode (Emoji TUI)” section in `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md`.
+### Terminal mode
+The implemented Ratatui frontend provides an emoji-rich dashboard, headless snapshot mode, and automatic fallback when GPUI cannot start.
 
 #### Terminal-only mode
 - Force the emoji TUI renderer (useful on headless machines):
@@ -586,9 +587,10 @@ Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baselin
 ## Storage & analytics
 
 - **One embedded engine:** ScriptBots uses the public `fsqlite` facade from FrankenSQLite with `version = "=0.1.16"`, pinned to immutable revision `cd9990bb16291d8c7c247b75b47faae8d7701adb` at `https://github.com/Dicklesworthstone/frankensqlite`. The current dependency enables `native` with default features disabled.
-- **Two storage targets:** `--storage file` opens `SCRIPTBOTS_STORAGE_PATH` (for example, `runs/predator-prey.sqlite`); `--storage memory` opens `:memory:` through the same implementation.
+- **Two storage targets:** `--storage file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a generated `runs/scriptbots-<unix-ms>-<pid>.sqlite` and prints the selected run database; it refuses reuse or stale sidecars. `--storage memory` opens volatile `:memory:` through the same implementation.
 - **Thread-confined connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. No connection-owning value is shared through `Arc<Mutex<_>>`.
-- **Bounded durability protocol:** persistence batches enter a bounded queue. Lossless command, lifecycle, and replay records apply backpressure instead of being silently dropped. Flush and shutdown are acknowledged, and `Durable` means the corresponding transaction committed successfully.
+- **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. A synchronous rejection is definitely `NotAdmitted`; the world retains the exact completed batch, latches the fault, and blocks later science ticks until explicit retry succeeds. Enqueue success proves admission only. A flush or shutdown receipt proves that all earlier admitted transactions committed and reports `CommittedVolatile` for `memory` or `Durable` for `file`.
+- **Open durability gap:** the durable outbox and per-batch applied/durable watermarks are not implemented yet. An asynchronously admitted batch therefore lacks an individual terminal receipt until a later flush/shutdown barrier. The current path must not be described as end-to-end lossless; recovery and crash-boundary proofs remain active Beads work.
 - **Lock-free frontend reads:** the worker atomically publishes immutable `Arc<AnalyticsSnapshot>` latest-value state. GUI, TUI, and API consumers load it without a mutex and may skip stale snapshots; they never run SQL while rendering.
 
 ### Tables and query examples
@@ -626,8 +628,8 @@ JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. 
 ### Pipeline and maintenance
 
 - A persistence transaction either commits the entire accepted batch or rolls it back; a failed statement may not leave the connection in an active transaction.
-- Queue depth, lag, last committed tick, last error, and acknowledgement state belong in the published health snapshot.
-- Explicit flush, WAL checkpoint, `PRAGMA integrity_check`, and `VACUUM` operations run on the worker, never on a GUI/TUI paint path. Expensive maintenance is opt-in and observable.
+- The published health snapshot exposes revision, last committed tick, committed agent count, structured last failure, and stopped state. GUI/TUI code derives lag from live and committed ticks. Queue depth and per-batch acknowledgement state are not published yet.
+- The same-thread `Storage` boundary provides explicit flush, close/checkpoint, and `VACUUM` operations. The asynchronous pipeline currently exposes flush and shutdown barriers; maintenance must stay on the connection-owning worker and never run on a GUI/TUI paint path.
 - The exact-revision file-backed conformance test closes and reopens the database and verifies committed data and integrity. Dedicated durability and concurrent-reader/writer gates must use independent connections rather than sharing one connection across threads.
 
 ## Development workflow
@@ -658,7 +660,7 @@ JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. 
 - Logging uses `tracing` with `RUST_LOG` filters (e.g., `RUST_LOG=info,scriptbots_core=debug`).
 - Categories of interest:
   - `scriptbots_core::world` — tick summaries, seeding, closed/open flips
-  - `scriptbots_storage` — queue depth, lag, transaction/flush acknowledgements, checkpoint/vacuum
+  - `scriptbots_storage` — transaction attempts, structured worker errors (including commit state), committed-tick publication, and flush/shutdown receipts. The GUI/TUI derive live-versus-committed lag from the published snapshot; no queue-depth metric is exposed yet.
   - `scriptbots_app::servers` — REST and MCP server lifecycle, tool invocations
   - `scriptbots_render` — window lifecycle, input bindings
 - Prefer structured fields (e.g., `tick = summary.tick.0`) for machine-readable logs. Avoid panics in production; release profile uses `panic = abort`.
@@ -763,7 +765,10 @@ cargo run -p scriptbots-app --bin control_cli -- get
 cargo run -p scriptbots-app --bin control_cli -- set neuroflow.enabled true
 cargo run -p scriptbots-app --bin control_cli -- patch --json '{"food_max":0.6}'
 cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
-cargo run -p scriptbots-app --bin control_cli -- export metrics --db scriptbots.sqlite --last 1000 --out latest_metrics.csv
+# `--db` is required: paste the exact path printed as `Run database: ...` by the file-mode app.
+# `--out` must name a fresh path; export refuses every existing file, symlink, or database sidecar.
+RUN_DB='runs/scriptbots-1773264512345-4242.sqlite' # example shape; replace with the printed path
+cargo run -p scriptbots-app --bin control_cli -- export metrics --db "$RUN_DB" --last 1000 --out latest_metrics.csv
 # New commands:
 cargo run -p scriptbots-app --bin control_cli -- presets
 cargo run -p scriptbots-app --bin control_cli -- apply-preset arctic
@@ -778,10 +783,10 @@ Interactive dashboard:
 cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
 ```
 
-### Scenario layering & deterministic replay CLI
+### Scenario layering & replay CLI scaffold
 - **Layered configs**: pass one or more `--config path/to/file.toml` (or `.ron`) flags—or set `SCRIPTBOTS_CONFIG` with semicolon-separated paths—to build scenarios from reusable fragments (e.g., `base.toml → arctic_biome.toml → evolution_study.toml`). Layers merge in order before env overrides, unlocking repeatable experiments without editing code.
 - **Config inspection**: add `--print-config` to dump the merged configuration (default JSON) or `--write-config output.toml` to persist it; choose `--config-format json|toml|ron` and combine with `--config-only` for a dry run in CI/tooling workflows.
-- **Replay verification**: `cargo run -p scriptbots-app -- --replay-db run.sqlite [--compare-db candidate.sqlite] [--tick-limit 500]` loads persisted events, re-simulates ticks headlessly, and reports colored diffs (tick/sequence mismatches, event payload divergences) together with event-type counts.
+- **Replay status**: `--replay-db` and `--compare-db` load, re-simulate, and diff encoded event streams, but production does not yet emit a meaningful nonempty stream. Nonzero empty-vs-empty runs now fail closed instead of claiming verification; track `bd-2z0.8.9.8` for complete instrumentation and mock-free proof.
 - **Storage helpers**: FrankenSQLite-backed accessors (`max_tick`, `load_replay_events`, `replay_event_counts`) underpin the CLI so analytics pipelines or external tools can reuse the same deterministic data.
 
 ### MCP HTTP server (Model Context Protocol)
@@ -800,23 +805,23 @@ MCP quickstart:
 - Each tool returns structured JSON; use your MCP-compatible agent to orchestrate parameter sweeps and log findings to FrankenSQLite.
 
 ## Configuration files & scenarios
-- **Current state**: all configuration changes flow through the control surfaces (REST, MCP HTTP, CLI). Values persist only for the lifetime of the session unless you export them yourself.
-- **Planned**: upcoming releases will load layered configuration files (TOML/RON) so experiments can stack reusable building blocks (e.g., base world defaults → biome overrides → study-specific tweaks).
+- **Current state**: repeatable scenarios can layer TOML or RON files with repeated `--config` flags or the semicolon-separated `SCRIPTBOTS_CONFIG` variable; later layers override earlier ones before environment overrides.
   ```text
   base.toml → arctic_biome.toml → evolution_study.toml
   ```
-- **Workaround today**: capture the desired configuration via the REST API (`GET /api/config`), version it externally, and apply deltas back with `PATCH /api/config` or the CLI.
+- **Inspection/export**: use `--print-config`, `--write-config`, `--config-format`, and `--config-only` to inspect or persist the composed configuration without launching a renderer.
 - **Value**: researchers gain repeatable, composable scenarios without hand-editing large monolithic files, making it easy to swap biomes, mutation parameters, or analytics presets on demand.
 
 ## Deterministic replay roadmap
 - **Already implemented**
-  - ✅ Event-log schema (`replay_events` table) storing every tick’s RNG scope, brain outputs, and actions.
+  - ✅ Event-log schema (`replay_events` table) and typed event encoding.
   - ✅ Type-safe encoding for replay artifacts shared by storage and analytics crates.
   - ✅ Storage plumbing to persist replay batches alongside standard metrics.
+  - ✅ Headless runner and CLI comparison scaffold that refuses vacuous nonzero runs.
 - **Planned**
-  - ❌ Headless replay runner capable of deterministic re-simulation from stored events.
+  - ❌ Production instrumentation for nonempty RNG/brain/action event streams.
   - ❌ Branch/diff workflows comparing Rust vs. Rust PR builds vs. the legacy C++ baseline.
-  - ❌ CLI tooling that surfaces divergence reports and snapshot diffs.
+  - ❌ Mock-free positive and perturbed-candidate E2E proofs.
   - ❌ FrankenSQLite-backed analysis views for quick triage of regressions and experiment outcomes.
 - **Use cases**
   - Parity testing between the Rust port and the original C++ implementation.
@@ -851,7 +856,7 @@ Runtime constraints:
 ## Contributing
 - Keep changes scoped to the relevant crate; prefer improving existing files over adding new ones unless functionality is genuinely new.
 - Update docs where it helps future maintainers understand decisions and invariants.
-- For larger tasks, update `PLAN_TO_PORT_SCRIPTBOTS_TO_MODERN_IDIOMATIC_RUST_USING_GPUI.md` inline to mark progress.
+- For larger tasks, update `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md` inline to mark progress.
 
 ## WebAssembly (sibling crate plan)
 We maintain a sibling browser-targeted crate, `scriptbots-web`, that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and `docs/wasm/` (ADRs, audits, capability matrix). Initial MVP runs single-threaded by disabling `scriptbots-core`’s `parallel` feature on wasm; WebGPU vs Canvas2D rendering is under evaluation.
@@ -891,7 +896,7 @@ ScriptBots source is licensed under `MIT OR Apache-2.0` (see the workspace manif
 ## Troubleshooting
 - **MSVC/SDK link errors on Windows**: Ensure VS Build Tools "Desktop development with C++" and Windows 11 SDK are installed. Then run `rustup default stable-x86_64-pc-windows-msvc`.
 - **Blank or crashing window**: Update GPU drivers. On WSL2, update the WSL kernel and try again. Verify that your system supports D3D12 (Windows) or Vulkan/Metal (Linux/macOS).
-- **Storage backlog or durability timeout**: Inspect `scriptbots_storage` queue-depth, lag, and last-error fields. Strict experiment mode pauses before a lossless queue overflows; resolve the worker error and retry rather than bypassing acknowledgements.
+- **Storage admission or commit failure**: Compare the live tick with the published committed tick (lag is `unknown` before the first commit) and inspect the structured last error, operation, attempt, and commit state. A definite synchronous `NotAdmitted` fault pauses later science ticks and retains the exact batch for explicit retry. For an admitted batch, use a flush/shutdown receipt as the current commit proof; do not infer per-batch durability from enqueue success.
 - **Determinism regressions**: Ensure you haven't introduced unordered parallel reductions; stage results and apply in a stable commit phase.
 
 ## Releases
@@ -909,7 +914,7 @@ ScriptBots source is licensed under `MIT OR Apache-2.0` (see the workspace manif
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
-4. Storage: complete the bounded FrankenSQLite worker, multi-run schema, replay hooks, immutable analytics snapshots, and mock-free regression tests.
+4. Storage: add the durable outbox and per-batch applied/durable watermarks, then complete the multi-run schema, replay hooks, and mock-free crash/recovery tests around the existing bounded FrankenSQLite worker and immutable analytics snapshots.
 5. Rendering: HUD/overlays/inspector polish; performance diagnostics.
 6. Packaging/CI: release builds, binaries; wasm sibling crate scaffolding (non-invasive).
 

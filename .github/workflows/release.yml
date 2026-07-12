@@ -10,6 +10,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 # Only allow one release build at a time
 concurrency:
   group: release-${{ github.ref }}
@@ -49,23 +52,27 @@ jobs:
       - name: Determine release tag
         id: release
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ github.event.inputs.tag }}"
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
-          if [[ -z "$TAG" ]]; then
-            echo "::error::Release tag could not be determined."
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::Release tag must be a semantic version such as v0.3.0 or v0.3.0-rc.1."
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly-2026-07-09
 
@@ -75,27 +82,29 @@ jobs:
         run: rustup target add ${{ matrix.extra-targets }}
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           shared-key: release-${{ matrix.target }}-${{ matrix.build_target }}
         env:
           CARGO_BUILD_TARGET: ${{ matrix.build_target }}
 
       - name: Install cargo-dist
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145
         with:
-          tool: cargo-dist
+          tool: cargo-dist@0.32.0
 
       - name: Generate dist manifest
-        run: cargo dist manifest --tag "${{ steps.release.outputs.tag }}" --ci github
+        run: cargo dist manifest --tag "$RELEASE_TAG" --ci github
         env:
           CARGO_BUILD_TARGET: ${{ matrix.build_target }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
 
       - name: Build release artifacts
         shell: bash
-        run: cargo dist build ${{ matrix.dist-args }} --artifacts archive --tag "${{ steps.release.outputs.tag }}" --out dist
+        run: cargo dist build ${{ matrix.dist-args }} --artifacts archive --tag "$RELEASE_TAG" --out dist
         env:
           CARGO_BUILD_TARGET: ${{ matrix.build_target }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
 
       - name: Codesign macOS artifacts
         if: ${{ matrix.apple }}
@@ -123,7 +132,7 @@ jobs:
           security import "$CERT_P12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
           security list-keychain -s "$KEYCHAIN" login.keychain
 
-          for ARCHIVE in dist/*.tar.*; do
+          for ARCHIVE in ./dist/*.tar.*; do
             TMP_DIR=$(mktemp -d)
             if [[ "$ARCHIVE" == *.tar.xz ]]; then
               tar -xJf "$ARCHIVE" -C "$TMP_DIR"
@@ -151,9 +160,9 @@ jobs:
             (
               cd "$TMP_DIR"
               if [[ "$ARCHIVE" == *.tar.xz ]]; then
-                tar -cJf "$OLDPWD/$ARCHIVE" *
+                tar -cJf "$OLDPWD/$ARCHIVE" -- ./*
               else
-                tar -czf "$OLDPWD/$ARCHIVE" *
+                tar -czf "$OLDPWD/$ARCHIVE" -- ./*
               fi
             )
             rm -rf "$TMP_DIR"
@@ -167,15 +176,15 @@ jobs:
         shell: bash
         run: |
           cd dist
-          for f in *; do
+          for f in ./*; do
             if [[ -f "$f" ]]; then
               shasum -a 256 "$f" > "$f.sha256"
               shasum -a 512 "$f" > "$f.sha512"
             fi
           done
           # Create combined checksum files
-          cat *.sha256 > checksums-sha256.txt 2>/dev/null || true
-          cat *.sha512 > checksums-sha512.txt 2>/dev/null || true
+          cat -- ./*.sha256 > checksums-sha256.txt 2>/dev/null || true
+          cat -- ./*.sha512 > checksums-sha512.txt 2>/dev/null || true
 
       - name: Generate checksums (Windows)
         if: runner.os == 'Windows'
@@ -193,7 +202,7 @@ jobs:
           Get-Content *.sha512 | Out-File -Encoding ASCII checksums-sha512.txt
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
@@ -207,7 +216,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: all-artifacts
           pattern: dist-*
@@ -227,7 +236,7 @@ jobs:
           done
 
       - name: Upload combined release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-all
           path: |

@@ -3,8 +3,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    CharacterizationTraceV0, ControlRuntime, ControlServerConfig, ScenarioIdentityV0,
-    SharedAnalytics, SharedWorld,
+    CharacterizationTraceV0, ControlRuntime, ControlServerConfig, STORAGE_SIDECAR_SUFFIXES,
+    ScenarioIdentityV0, SharedAnalytics, SharedWorld,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -26,7 +26,10 @@ use std::{
     env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, info, warn};
@@ -92,40 +95,39 @@ fn main() -> Result<()> {
 
     // Auto-tune: run a quick sweep for the chosen storage mode, apply best settings, then continue.
     let mut thresholds = thresholds;
-    if let Some(ticks) = cli.auto_tune {
-        if let Some(best) =
+    if let Some(ticks) = cli.auto_tune
+        && let Some(best) =
             pick_best_for_storage(&config, ticks, cli.storage, cli.threads, cli.low_power)?
-        {
-            // Apply threads if not explicitly set
-            if cli.threads.is_none() {
-                unsafe {
-                    std::env::set_var("SCRIPTBOTS_MAX_THREADS", best.threads.to_string());
-                }
+    {
+        // Apply threads if not explicitly set
+        if cli.threads.is_none() {
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_MAX_THREADS", best.threads.to_string());
             }
-            // Apply thresholds if not provided via CLI
-            if cli.storage_thresholds.is_none() {
-                thresholds = ThresholdsOverride {
-                    tick: Some(best.tick),
-                    agent: Some(best.agent),
-                    event: Some(best.event),
-                    metric: Some(best.metric),
-                };
-            }
-            println!(
-                "{} Auto-tune selected: threads={} storage={} thresholds={},{},{},{} ({:.0} tps)",
-                "✔".green().bold(),
-                best.threads,
-                match cli.storage {
-                    StorageMode::File => "file",
-                    StorageMode::Memory => "memory",
-                },
-                best.tick,
-                best.agent,
-                best.event,
-                best.metric,
-                best.tps
-            );
         }
+        // Apply thresholds if not provided via CLI
+        if cli.storage_thresholds.is_none() {
+            thresholds = ThresholdsOverride {
+                tick: Some(best.tick),
+                agent: Some(best.agent),
+                event: Some(best.event),
+                metric: Some(best.metric),
+            };
+        }
+        println!(
+            "{} Auto-tune selected: threads={} storage={} thresholds={},{},{},{} ({:.0} tps)",
+            "✔".green().bold(),
+            best.threads,
+            match cli.storage {
+                StorageMode::File => "file",
+                StorageMode::Memory => "memory",
+            },
+            best.tick,
+            best.agent,
+            best.event,
+            best.metric,
+            best.tps
+        );
     }
 
     // Configure low-power / thread budget before world creation so the Rayon pool is capped.
@@ -214,14 +216,14 @@ fn main() -> Result<()> {
                 w,
                 h
             );
-            shutdown_storage(&mut storage_pipeline)?;
+            finalize_and_shutdown_storage(&world, &mut storage_pipeline)?;
             return Ok(());
         }
         #[cfg(not(feature = "gui"))]
         {
             // Avoid unused-variable warning when GUI is not enabled
             let _ = path;
-            shutdown_storage(&mut storage_pipeline)?;
+            finalize_and_shutdown_storage(&world, &mut storage_pipeline)?;
             bail!("--dump-png requires GUI feature; recompile with --features gui");
         }
     }
@@ -247,7 +249,7 @@ fn main() -> Result<()> {
             w,
             h
         );
-        shutdown_storage(&mut storage_pipeline)?;
+        finalize_and_shutdown_storage(&world, &mut storage_pipeline)?;
         return Ok(());
     }
     let control_config = ControlServerConfig::from_env();
@@ -269,7 +271,7 @@ fn main() -> Result<()> {
     };
     let render_result = renderer.run(context);
     let control_result = control_runtime.shutdown();
-    let storage_result = shutdown_storage(&mut storage_pipeline);
+    let storage_result = finalize_and_shutdown_storage(&world, &mut storage_pipeline);
     if let Err(storage_error) = storage_result {
         let mut concurrent = Vec::new();
         if let Err(render_error) = &render_result {
@@ -301,6 +303,42 @@ fn shutdown_storage(pipeline: &mut StoragePipeline) -> Result<()> {
         "FrankenSQLite worker shut down with an explicit persistence receipt"
     );
     Ok(())
+}
+
+fn finalize_and_shutdown_storage(
+    world: &Arc<Mutex<WorldState>>,
+    pipeline: &mut StoragePipeline,
+) -> Result<()> {
+    let finalization = (|| -> Result<bool> {
+        let mut world = world
+            .lock()
+            .map_err(|error| anyhow::anyhow!("world mutex poisoned during shutdown: {error}"))?;
+        world
+            .finalize_persistence()
+            .context("failed to admit the final partial persistence batch")
+    })();
+    finalize_then_shutdown_storage(finalization, pipeline)
+}
+
+fn finalize_then_shutdown_storage(
+    finalization: Result<bool>,
+    pipeline: &mut StoragePipeline,
+) -> Result<()> {
+    let shutdown = shutdown_storage(pipeline);
+
+    match (finalization, shutdown) {
+        (Ok(admitted_tail), Ok(())) => {
+            if admitted_tail {
+                info!("Admitted and committed final partial persistence batch");
+            }
+            Ok(())
+        }
+        (Err(finalization_error), Ok(())) => Err(finalization_error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(finalization_error), Err(shutdown_error)) => Err(finalization_error).context(format!(
+            "FrankenSQLite worker shutdown also failed: {shutdown_error:#}"
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -404,14 +442,14 @@ fn run_det_child(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
     #[derive(serde::Serialize)]
     struct DetOut {
         events: usize,
-        ticks: usize,
+        ticks: u64,
         last_tick: u64,
         summaries: Vec<TickSummary>,
     }
     let last_tick = run.summaries.last().map(|s| s.tick.0).unwrap_or(0);
     let out = DetOut {
         events: run.events.len(),
-        ticks: run.summaries.len(),
+        ticks: run.simulated_ticks,
         last_tick,
         summaries: run.summaries,
     };
@@ -463,7 +501,7 @@ fn run_det_check(_cli: &AppCli, ticks: u64) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct DetOutIn {
         events: usize,
-        ticks: usize,
+        ticks: u64,
         last_tick: u64,
         summaries: Vec<TickSummary>,
     }
@@ -559,22 +597,14 @@ fn prepare_storage_parent(path: &str) -> Result<()> {
 }
 
 fn storage_sidecar_paths(path: &Path) -> Vec<PathBuf> {
-    [
-        "-wal",
-        "-shm",
-        "-journal",
-        "-wal-fec",
-        "-lock-shared",
-        "-lock-reserved",
-        "-lock-pending",
-    ]
-    .into_iter()
-    .map(|suffix| {
-        let mut sidecar = path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        PathBuf::from(sidecar)
-    })
-    .collect()
+    STORAGE_SIDECAR_SUFFIXES
+        .into_iter()
+        .map(|suffix| {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            PathBuf::from(sidecar)
+        })
+        .collect()
 }
 
 fn reserve_new_run_storage(path: &str) -> Result<()> {
@@ -957,10 +987,10 @@ fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Rendere
             #[cfg(not(feature = "gui"))]
             {
                 warn!("GUI feature not enabled; falling back to terminal renderer");
-                return Ok((
+                Ok((
                     RendererMode::Terminal,
                     Box::new(TerminalRenderer::default()),
-                ));
+                ))
             }
             #[cfg(feature = "gui")]
             {
@@ -990,10 +1020,10 @@ fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Rendere
                 warn!(
                     "Bevy renderer requested, but binary was built without bevy_render. Falling back to terminal UI."
                 );
-                return Ok((
+                Ok((
                     RendererMode::Terminal,
                     Box::new(TerminalRenderer::default()),
-                ));
+                ))
             }
         }
         RendererMode::Terminal => Ok((
@@ -1089,7 +1119,7 @@ fn should_use_terminal_mode() -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "gui", feature = "bevy_render")))]
 fn prepare_linux_gui_backend() {
     use std::sync::Once;
 
@@ -1101,10 +1131,13 @@ fn prepare_linux_gui_backend() {
     });
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    any(feature = "gui", feature = "bevy_render")
+))]
 fn prepare_linux_gui_backend() {}
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "gui", feature = "bevy_render")))]
 fn maybe_force_x11_for_legacy_wayland() -> Result<()> {
     use std::env;
     use wayland_client::{
@@ -1202,7 +1235,7 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
     }
 
     let replay_run = run_headless_simulation(config, tick_limit)?;
-    let simulated_tick_count = replay_run.summaries.len() as u64;
+    let simulated_tick_count = replay_run.simulated_ticks;
     debug!(
         simulated_ticks = simulated_tick_count,
         simulated_events = replay_run.events.len(),
@@ -1215,6 +1248,7 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
             "Simulated tick count differs from requested limit"
         );
     }
+    require_non_vacuous_replay(tick_limit, persisted_events.len(), replay_run.events.len())?;
     let diff = diff_event_stream(&persisted_events, &replay_run.events);
 
     let recorded_map = recorded_counts
@@ -1289,6 +1323,19 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
     Ok(())
 }
 
+fn require_non_vacuous_replay(
+    tick_limit: u64,
+    recorded_events: usize,
+    simulated_events: usize,
+) -> Result<()> {
+    if tick_limit > 0 && (recorded_events == 0 || simulated_events == 0) {
+        bail!(
+            "replay verification refused a vacuous nonzero run: {recorded_events} recorded events and {simulated_events} simulated events across {tick_limit} ticks; production replay instrumentation is not yet complete"
+        );
+    }
+    Ok(())
+}
+
 struct ReplayCollector {
     ticks: Arc<Mutex<Vec<ReplayTickRecord>>>,
 }
@@ -1338,6 +1385,7 @@ struct ReplayTickRecord {
 struct ReplayRun {
     events: Vec<PersistedReplayEvent>,
     summaries: Vec<TickSummary>,
+    simulated_ticks: u64,
 }
 
 fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result<ReplayRun> {
@@ -1349,6 +1397,9 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
     for _ in 0..tick_limit {
         world.step()?;
     }
+    world
+        .finalize_persistence()
+        .context("failed to admit the final partial replay batch")?;
 
     drop(world);
 
@@ -1370,7 +1421,11 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
         }
     }
 
-    Ok(ReplayRun { events, summaries })
+    Ok(ReplayRun {
+        events,
+        summaries,
+        simulated_ticks: tick_limit,
+    })
 }
 
 fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
@@ -1436,7 +1491,10 @@ fn profile_world_steps_with_storage(
     for _ in 0..tick_limit {
         world.step()?;
     }
-    shutdown_storage(&mut pipeline)?;
+    let finalization = world
+        .finalize_persistence()
+        .context("failed to admit the final partial persistence batch");
+    finalize_then_shutdown_storage(finalization, &mut pipeline)?;
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
     let tps = tick_limit as f64 / secs;
@@ -1467,6 +1525,27 @@ fn parse_tps_from_stdout(stdout: &[u8]) -> Option<f64> {
         }
     }
     None
+}
+
+static PROFILE_STORAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn configure_profile_child_storage(command: &mut Command, storage: StorageMode) {
+    match storage {
+        StorageMode::File => {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let sequence = PROFILE_STORAGE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "scriptbots-profile-{}-{timestamp}-{sequence}.sqlite",
+                std::process::id()
+            ));
+            command.env("SCRIPTBOTS_STORAGE_PATH", path);
+        }
+        StorageMode::Memory => {
+            command.env_remove("SCRIPTBOTS_STORAGE_PATH");
+        }
+    }
 }
 
 fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Result<()> {
@@ -1509,6 +1588,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
                 let mut cmd = Command::new(&exe);
                 cmd.env("SCRIPTBOTS_DET_RUN", "0");
                 cmd.env("RUST_LOG", "error");
+                configure_profile_child_storage(&mut cmd, storage);
                 cmd.arg("--profile-storage-steps").arg(ticks.to_string());
                 cmd.arg("--storage").arg(storage_label);
                 cmd.arg("--storage-thresholds").arg(thresholds);
@@ -1620,6 +1700,7 @@ fn pick_best_for_storage(
             let mut cmd = Command::new(&exe);
             cmd.env("SCRIPTBOTS_DET_RUN", "0");
             cmd.env("RUST_LOG", "error");
+            configure_profile_child_storage(&mut cmd, storage);
             cmd.arg("--profile-storage-steps").arg(ticks.to_string());
             cmd.arg("--storage").arg(match storage {
                 StorageMode::File => "file",
@@ -1638,26 +1719,26 @@ fn pick_best_for_storage(
             }
             if let Some(tps) = parse_tps_from_stdout(&out.stdout) {
                 let parts: Vec<_> = thresholds.split(',').collect();
-                if parts.len() == 4 {
-                    if let (Ok(tk), Ok(ag), Ok(ev), Ok(me)) = (
+                if parts.len() == 4
+                    && let (Ok(tk), Ok(ag), Ok(ev), Ok(me)) = (
                         parts[0].parse(),
                         parts[1].parse(),
                         parts[2].parse(),
                         parts[3].parse(),
-                    ) {
-                        let candidate = BestPick {
-                            threads,
-                            tick: tk,
-                            agent: ag,
-                            event: ev,
-                            metric: me,
-                            tps,
-                        };
-                        match &best {
-                            Some(b) if b.tps >= candidate.tps => {}
-                            _ => {
-                                best = Some(candidate);
-                            }
+                    )
+                {
+                    let candidate = BestPick {
+                        threads,
+                        tick: tk,
+                        agent: ag,
+                        event: ev,
+                        metric: me,
+                        tps,
+                    };
+                    match &best {
+                        Some(b) if b.tps >= candidate.tps => {}
+                        _ => {
+                            best = Some(candidate);
                         }
                     }
                 }
@@ -2108,6 +2189,40 @@ mod tests {
     }
 
     #[test]
+    fn profile_children_never_consume_the_requested_run_database() {
+        fn storage_override(command: &Command) -> Option<Option<PathBuf>> {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("SCRIPTBOTS_STORAGE_PATH"))
+                .map(|(_, value)| value.map(PathBuf::from))
+        }
+
+        let requested = PathBuf::from("requested-final-run.sqlite");
+        let mut first = Command::new("scriptbots-app");
+        first.env("SCRIPTBOTS_STORAGE_PATH", &requested);
+        configure_profile_child_storage(&mut first, StorageMode::File);
+        let first_path = storage_override(&first)
+            .flatten()
+            .expect("file profile child path");
+        assert_ne!(first_path, requested);
+        assert_eq!(first_path.extension(), Some(std::ffi::OsStr::new("sqlite")));
+
+        let mut second = Command::new("scriptbots-app");
+        second.env("SCRIPTBOTS_STORAGE_PATH", &requested);
+        configure_profile_child_storage(&mut second, StorageMode::File);
+        let second_path = storage_override(&second)
+            .flatten()
+            .expect("second file profile child path");
+        assert_ne!(second_path, requested);
+        assert_ne!(first_path, second_path);
+
+        let mut memory = Command::new("scriptbots-app");
+        memory.env("SCRIPTBOTS_STORAGE_PATH", &requested);
+        configure_profile_child_storage(&mut memory, StorageMode::Memory);
+        assert_eq!(storage_override(&memory), Some(None));
+    }
+
+    #[test]
     fn characterization_cli_parses_ticks_and_output() {
         let cli = AppCli::parse_from([
             "scriptbots-app",
@@ -2195,7 +2310,7 @@ activation = "Sigmoid"
 
     #[test]
     #[serial]
-    fn headless_replay_matches_storage() {
+    fn headless_replay_finalizes_non_aligned_persistence_tail() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("replay.sqlite");
         let db_str = db_path.to_string_lossy().to_string();
@@ -2204,7 +2319,7 @@ activation = "Sigmoid"
             world_width: 600,
             world_height: 600,
             food_cell_size: 60,
-            persistence_interval: 1,
+            persistence_interval: 5,
             history_capacity: 128,
             rng_seed: Some(0xA1B2C3D4),
             ..ScriptBotsConfig::default()
@@ -2220,6 +2335,11 @@ activation = "Sigmoid"
             for _ in 0..16 {
                 world.step().expect("durable replay fixture step");
             }
+            assert!(
+                world
+                    .finalize_persistence()
+                    .expect("admit non-aligned durable replay tail")
+            );
             pipeline
                 .shutdown()
                 .expect("durable replay fixture shutdown");
@@ -2229,10 +2349,35 @@ activation = "Sigmoid"
         let recorded_events = storage.load_replay_events().expect("load events");
         let max_tick = storage.max_tick().expect("max tick").unwrap_or(0);
         storage.close().expect("close storage reader");
+        assert_eq!(max_tick, 16, "fixture must persist its partial final tail");
 
         let replay = run_headless_simulation(&config, max_tick).expect("replay run");
+        assert_eq!(replay.simulated_ticks, max_tick);
+        assert_eq!(
+            replay
+                .summaries
+                .iter()
+                .map(|summary| summary.tick.0)
+                .collect::<Vec<_>>(),
+            [5, 10, 15, 16]
+        );
+        assert!(
+            recorded_events.is_empty() && replay.events.is_empty(),
+            "this cadence test must not masquerade as meaningful replay instrumentation"
+        );
         let diff = diff_event_stream(&recorded_events, &replay.events);
-        assert!(diff.is_none(), "expected replay to match persisted events");
+        assert!(
+            diff.is_none(),
+            "empty event-stream plumbing should remain stable"
+        );
+    }
+
+    #[test]
+    fn replay_verification_rejects_empty_nonzero_event_streams() {
+        let error = require_non_vacuous_replay(16, 0, 0)
+            .expect_err("empty nonzero replay must not be reported as verified");
+        assert!(error.to_string().contains("refused a vacuous nonzero run"));
+        require_non_vacuous_replay(0, 0, 0).expect("a zero-tick replay is not vacuous");
     }
 
     #[test]

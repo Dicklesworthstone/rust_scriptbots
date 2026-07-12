@@ -945,7 +945,7 @@ async fn get_config_audit(
         .into_iter()
         .map(ConfigAuditEntryView::from)
         .collect();
-    entries.sort_by(|a, b| a.tick.cmp(&b.tick));
+    entries.sort_by_key(|entry| entry.tick);
     Ok(Json(entries))
 }
 
