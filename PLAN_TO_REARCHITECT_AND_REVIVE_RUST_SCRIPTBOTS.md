@@ -891,7 +891,15 @@ Each optional adapter has a small conformance fixture and does not change core d
 
 ## 8. FrankenTUI Frontend
 
-FrankenTUI is already current at local/upstream commit `fccff2a7e51d39a927bced882877a45aef5c8d39`. The repository has unrelated local changes, so no stash or pull is needed or appropriate. Adoption should pin an exact released version or exact commit after licensing/distribution review; it must not use a mutable sibling path in CI.
+The approved FrankenTUI candidate began at
+`fccff2a7e51d39a927bced882877a45aef5c8d39`. Its required lifecycle and
+deterministic-simulator fixes are now upstream at immutable commit
+`15cc6543f76b814394c590f9e7719dedd6684e4c`, the exact tip of both upstream
+branches. The user's original checkout still has unrelated
+local changes and remains untouched at the older candidate; no stash or pull
+is appropriate there. ScriptBots adoption must advance to the fixed commit
+only through the serialized terminal dependency bead, never through a mutable
+sibling path or branch in CI.
 
 ### 8.1 adoption boundary
 
@@ -1870,6 +1878,11 @@ This is a protocol bead. Separate child beads implement each family and integrat
 
 #### 3.3 FrankenTUI shell and harness
 
+**Upstream prerequisite:** [Completed — lifecycle finalization, `Model::on_error`,
+deterministic `ProgramSimulator` time/subscription/error injection, and
+idempotent cancel/shutdown landed and were pushed at exact revision
+`15cc6543f76b814394c590f9e7719dedd6684e4c`, Codex, 2026-07-12]
+
 - Model/update/view/subscriptions;
 - ProgramSimulator;
 - command palette;
@@ -2841,8 +2854,10 @@ dated stashes before dirty checkouts moved; untracked files and all pre-existing
 stashes were retained. No stash was dropped or reapplied, and no reset, clean,
 or manual file deletion was used.
 
-- `frankentui`: local and `origin/main` remain at immutable candidate
-  `fccff2a7e51d39a927bced882877a45aef5c8d39`; unrelated `.gitignore` and
+- `frankentui`: the user's dirty checkout remains untouched at candidate
+  `fccff2a7e51d39a927bced882877a45aef5c8d39`; both upstream branches now
+  point to lifecycle-complete revision
+  `15cc6543f76b814394c590f9e7719dedd6684e4c`. Its unrelated `.gitignore` and
   untracked files remain untouched.
 - `asupersync`: clean `main` fast-forwarded to
   `90949d62ffd6221873a047ea14c7b6bb0060849f`. Use its bounded MPSC,
