@@ -665,11 +665,18 @@ scripts/test_bv_authoritative.sh
 ```
 
 The wrapper creates a unique external read-only view, forces JSON robot mode,
-and emits a result only after BR all/ready counts and BV issue, status, blocking
-edge, actionable, and `data_hash` evidence agree. It refuses caller-selected
-databases/workspaces, missing or empty exports, non-JSON graph output, and a
-source export that changes during analysis. Neither repository snapshot is
-overwritten or deleted.
+and emits a result only after BR all/ready state and BV issue, status, blocking
+edge, exact actionable issue IDs, and `data_hash` evidence agree. Every BV next
+result, plan item, and triage top pick is checked against `br ready`, which
+remains the sole actionability and claim authority. The wrapper refuses
+caller-selected databases/workspaces, missing or empty exports, non-JSON graph
+output, every unrecognized or mutating BV option, and a source export that
+changes during analysis. Historical `--as-of` sources are refused. Neither
+repository snapshot is overwritten or deleted.
+
+BV history and diff are also refused until their handlers honor the explicitly
+isolated tracker source; otherwise a stale checkout snapshot can contaminate the
+result.
 
 ## Testing & CI
 - **Core tests**: unit and property tests for reproduction math, spike damage, food sharing/consumption; determinism tests run seeded scenarios and assert stable summaries.

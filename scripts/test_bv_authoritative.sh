@@ -62,6 +62,19 @@ chmod +x "$fixture/scripts/bv_authoritative.sh"
     and .triage.quick_ref.actionable_count == 2
   ' <<<"$authoritative_result" >/dev/null || fail "authoritative wrapper returned incorrect tracker state"
 
+  authoritative_plan="$(scripts/bv_authoritative.sh --robot-plan)"
+  jq -e --argjson ready "$br_ready" '
+    ([.plan.tracks[]?.items[]?.id] | sort) == ($ready | map(.id) | sort)
+    and .plan.total_actionable == ($ready | length)
+  ' <<<"$authoritative_plan" >/dev/null ||
+    fail "authoritative wrapper did not preserve the exact br ready ID set"
+
+  authoritative_next="$(scripts/bv_authoritative.sh --robot-next)"
+  jq -e --argjson ready "$br_ready" '
+    .id as $candidate | any($ready[]; .id == $candidate)
+  ' <<<"$authoritative_next" >/dev/null ||
+    fail "authoritative wrapper returned a next issue outside br ready"
+
   authoritative_hash="$(jq -r '.data_hash' <<<"$authoritative_result")"
   stale_hash="$(jq -r '.data_hash' <<<"$stale_result")"
   [[ -n "$authoritative_hash" && "$authoritative_hash" != "$stale_hash" ]] ||
@@ -71,12 +84,36 @@ chmod +x "$fixture/scripts/bv_authoritative.sh"
     fail "wrapper accepted a caller-controlled BV source"
   fi
 
+  [[ ! -e .bv ]] || fail "fixture unexpectedly contains BV mutation state"
+  feedback_before="$(find . -maxdepth 3 -type f -iname '*feedback*' -print)"
+  if scripts/bv_authoritative.sh --robot-drift --save-baseline unsafe >/dev/null 2>&1; then
+    fail "wrapper accepted a baseline-writing BV command"
+  fi
+  if scripts/bv_authoritative.sh --robot-confirm-correlation deadbeef:"$ready_id" >/dev/null 2>&1; then
+    fail "wrapper accepted a correlation-feedback mutation"
+  fi
+  if scripts/bv_authoritative.sh --robot-triage-by-track >/dev/null 2>&1; then
+    fail "wrapper accepted a modifier without a primary robot command"
+  fi
+  if scripts/bv_authoritative.sh --robot-insights --as-of HEAD >/dev/null 2>&1; then
+    fail "wrapper accepted a historical source for current-authority analysis"
+  fi
+  if scripts/bv_authoritative.sh --robot-history >/dev/null 2>&1; then
+    fail "wrapper accepted BV history, which does not honor the isolated source"
+  fi
+  if scripts/bv_authoritative.sh --robot-diff --diff-since HEAD >/dev/null 2>&1; then
+    fail "wrapper accepted BV diff, whose historical loader does not honor the isolated source"
+  fi
+  [[ ! -e .bv ]] || fail "rejected BV mutation options created repository state"
+  [[ "$(find . -maxdepth 3 -type f -iname '*feedback*' -print)" == "$feedback_before" ]] ||
+    fail "rejected BV mutation options created a feedback file"
+
   [[ "$(git hash-object .beads/issues.jsonl)" == "$issues_hash_before" ]] ||
     fail "wrapper modified the authoritative issues.jsonl export"
   [[ "$(git hash-object .beads/beads.jsonl)" == "$stale_hash_before" ]] ||
     fail "wrapper modified the stale beads.jsonl snapshot"
 
-  printf 'authoritative fixture: total=4 statuses=2-open/1-in_progress/1-closed stored_relationships=3 blocking_edges=1 actionable=2 hash=%s stale_hash=%s\n' \
+  printf 'authoritative fixture: total=4 statuses=2-open/1-in_progress/1-closed stored_relationships=3 blocking_edges=1 actionable_ids_exact=2 hash=%s stale_hash=%s\n' \
     "$authoritative_hash" "$stale_hash"
   printf 'fixture retained for audit: %s\n' "$fixture"
 )
@@ -97,4 +134,4 @@ chmod +x "$empty_fixture/scripts/bv_authoritative.sh"
 if "$empty_fixture/scripts/bv_authoritative.sh" --robot-triage >/dev/null 2>&1; then
   fail "wrapper accepted an empty authoritative export"
 fi
-printf 'negative gates: caller source override, missing export, and empty export all refused\n'
+printf 'negative gates: source override, mutation flags, modifier-only, historical and mixed-source commands, missing export, and empty export all refused\n'

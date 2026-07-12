@@ -462,7 +462,7 @@ emitting JSON.
 
 **`scripts/bv_authoritative.sh --robot-triage` is your single entry point.** It returns:
 - `quick_ref`: at-a-glance counts + top 3 picks
-- `recommendations`: ranked actionable items with scores, reasons, unblock info
+- `recommendations`: graph-ranked issues with scores, reasons, unblock info (including blocked work)
 - `quick_wins`: low-effort high-impact items
 - `blockers_to_clear`: items that unblock the most downstream work
 - `project_health`: status/type/priority distributions, graph metrics
@@ -470,8 +470,12 @@ emitting JSON.
 
 ```bash
 scripts/bv_authoritative.sh --robot-triage  # THE MEGA-COMMAND: start here
-scripts/bv_authoritative.sh --robot-next    # Minimal: just the single top pick + claim command
+br ready --json                             # The sole actionability and claim authority
 ```
+
+The wrapper compares BV's complete planned issue-ID set with `br ready`, and
+validates every `--robot-next`, plan item, and triage top pick against that BR
+set. A BV recommendation is graph analysis, not authorization to claim work.
 
 ### Command Reference
 
@@ -489,11 +493,10 @@ scripts/bv_authoritative.sh --robot-next    # Minimal: just the single top pick 
 | `--robot-label-flow` | Cross-label dependency: `flow_matrix`, `dependencies`, `bottleneck_labels` |
 | `--robot-label-attention [--attention-limit=N]` | Attention-ranked labels |
 
-**History & Change Tracking:**
-| Command | Returns |
-|---------|---------|
-| `--robot-history` | Bead-to-commit correlations |
-| `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues, cycles |
+**History and change tracking:** `--robot-history` and `--robot-diff` are
+refused because BV 0.16.0 resolves their historical JSONL from the checkout
+instead of honoring the wrapper's isolated source. Its preferred historical
+filename can therefore mix stale data with an authoritative report hash.
 
 **Other:**
 | Command | Returns |
@@ -520,7 +523,10 @@ scripts/bv_authoritative.sh --robot-triage --robot-triage-by-label  # Group by d
 **All robot JSON includes:**
 - `data_hash` — Fingerprint of the isolated authoritative `issues.jsonl` view
 - `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
-- `as_of` / `as_of_commit` — Present when using `--as-of`
+
+Historical `--as-of` analysis is deliberately refused by this current-authority
+wrapper. Use a separately audited historical snapshot workflow when that is the
+actual task.
 
 **Two-phase analysis:**
 - **Phase 1 (instant):** degree, topo sort, density

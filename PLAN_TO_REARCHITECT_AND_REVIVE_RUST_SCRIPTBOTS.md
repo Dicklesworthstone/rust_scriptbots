@@ -2512,11 +2512,11 @@ The tracker should contain one top-level epic and focused child epics. Beads car
 | `WEB` | `bd-2z0.12` | Web and agent interfaces | P2 |
 | `DOCS` | `bd-2z0.13` | Truthful docs, packaging, and release | P1 |
 
-The validated tracker snapshot contains 103 issues: 14 epic containers and 89
-focused executable leaves. The 184 blocking edges are leaf-to-leaf prerequisites;
-the remaining dependency records are hierarchy. `br dep cycles --json` reported
-zero cycles. All expensive metrics from the isolated authoritative BV view
-reported `computed`.
+The initial validated tracker snapshot contained 103 issues: 14 epic containers
+and 89 focused executable leaves. The 184 blocking edges are leaf-to-leaf
+prerequisites; the remaining dependency records are hierarchy. `br dep cycles
+--json` reported zero cycles. All expensive metrics from the isolated
+authoritative BV view reported `computed`.
 Because `bv 0.16.0` currently treats `parent-child` hierarchy as a blocker in
 `--robot-next`, execution uses `br ready --json` as the actionability authority
 and the authoritative BV wrapper for centrality, critical-path, parallel-track,
@@ -2593,9 +2593,12 @@ After creation:
 
 The fail-closed `scripts/bv_authoritative.sh` integration now makes the tracked
 `.beads/issues.jsonl` export the only documented BV source. It uses a unique
-external symlink view, forces JSON robot mode, rejects source overrides, and
-cross-checks BR all/ready state against BV issue, status, blocking-edge,
-actionable, and `data_hash` evidence before emitting a result. The live
+external symlink view, forces JSON robot mode, positively allows only supported
+read-only commands/modifiers, rejects source overrides and mutation flags, and
+cross-checks BR all/ready state against BV issue, status, blocking-edge, exact
+actionable issue-ID sets, and `data_hash` evidence before emitting a result.
+Every BV next result, plan item, and triage top pick is checked against BR's
+ready set; BR remains the sole claim authority. The live
 239-issue snapshot proves 28 closed, 22 in progress, 189 open, 326 blocking
 edges, 58 actionable issues, and authoritative BV hash `5d1d45dfe541f203`.
 The automated mutation fixture also proves that a stale sibling snapshot gets a
