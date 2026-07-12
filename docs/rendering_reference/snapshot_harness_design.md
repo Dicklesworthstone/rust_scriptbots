@@ -43,7 +43,7 @@ cargo run -p scriptbots-app --features gui -- \
 docs/rendering_reference/
   golden/
     rust_default.png      # baseline snapshot
-    legacy_default.png    # legacy GLUT reference (already captured)
+    legacy_default.png    # unavailable historical reference; regenerate explicitly
   checksums.txt           # extend with SHA256 for rust_default.png
   diff/                   # optional: store latest diff artifacts for investigation
 ```

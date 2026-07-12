@@ -17,7 +17,9 @@ This note summarises observed differences between the existing `scriptbots-rende
 
 ## Snapshot & Regression Tooling
 
-- Headless PNG rendering entry point `render_png_offscreen` exists, yet there is no automated command wiring it to the app binary or CI. No golden assets stored.
+- Two tracked CPU semantic references exercise the Rust and Bevy helper
+  rasterizers in CI. They do not exercise a live GPUI or Bevy GPU render path;
+  actual-render, backend-specific captures remain open work.
 - No viewport/unit tests verifying camera coordinate mapping. QA needs integration with `cargo test` plus future GitHub Action (plan §1.3, §2.4).
 
 ## Dependencies & Risks

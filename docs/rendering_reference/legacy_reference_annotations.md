@@ -1,6 +1,12 @@
 # Legacy Renderer Screenshot Callouts
 
-Baseline imagery captured on 2025-10-30 under Xvfb (`legacy_default.png`, `legacy_selected_agent.png`, `legacy_food_peak.png`). The viewport exported by ImageMagick measures 1570×870 px; the tables below document the regions of interest (ROIs) that should be annotated in downstream documentation or automated visual tests.
+The historical capture log reports that baseline imagery was captured on
+2025-10-30 under Xvfb (`legacy_default.png`,
+`legacy_selected_agent.png`, and `legacy_food_peak.png`). Those PNGs are absent
+from the current repository and reachable Git history. The 1570×870 viewport
+measurements and regions of interest below are retained as unverified historical
+annotations; they must not be used as an automated visual oracle unless the
+source PNGs are deliberately regenerated, reviewed, and committed.
 
 ## `legacy_default.png`
 

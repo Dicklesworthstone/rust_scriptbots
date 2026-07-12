@@ -40,6 +40,52 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  # Keep the approved semantic references present, reviewable, and immutable in CI.
+  golden_assets:
+    name: Golden Asset Policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Verify approved assets and checksums
+        shell: bash
+        env:
+          RUST_REGEN_GOLDEN: "0"
+          BEVY_REGEN_GOLDEN: "0"
+        run: |
+          set -euo pipefail
+          cd docs/rendering_reference
+
+          if [[ "$RUST_REGEN_GOLDEN" != "0" || "$BEVY_REGEN_GOLDEN" != "0" ]]; then
+            echo "::error::CI must never regenerate or bless golden assets."
+            exit 1
+          fi
+
+          missing=0
+          if [[ ! -f golden/rust_default.png ]]; then
+            echo "::error file=docs/rendering_reference/golden/rust_default.png::Missing approved Rust semantic golden. Generate locally with: RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-render --test snapshot rust_renderer_matches_golden_snapshot -- --exact --nocapture"
+            missing=1
+          fi
+          if [[ ! -f golden/bevy_default.png ]]; then
+            echo "::error file=docs/rendering_reference/golden/bevy_default.png::Missing approved Bevy semantic golden. Generate locally with: BEVY_REGEN_GOLDEN=1 cargo test -p scriptbots-bevy --test snapshot bevy_renderer_matches_golden -- --exact --nocapture"
+            missing=1
+          fi
+          if (( missing != 0 )); then
+            exit 1
+          fi
+
+          expected_paths=$'golden/rust_default.png\ngolden/bevy_default.png'
+          actual_paths="$(awk 'NF && $1 !~ /^#/ { print $2 }' checksums.txt)"
+          if [[ "$actual_paths" != "$expected_paths" ]]; then
+            echo "::error file=docs/rendering_reference/checksums.txt::The active manifest must list exactly the two approved, tracked semantic references."
+            printf 'Expected paths:\n%s\nActual paths:\n%s\n' "$expected_paths" "$actual_paths"
+            exit 1
+          fi
+
+          grep -Ev '^[[:space:]]*(#|$)' checksums.txt | sha256sum --check --strict -
+
   # Clippy runs on all platforms to catch platform-specific lint issues
   clippy:
     name: Clippy (${{ matrix.os }})
@@ -332,7 +378,7 @@ jobs:
 
   render_regression:
     name: Render Regression (${{ matrix.os }})
-    needs: [clippy, test]
+    needs: [golden_assets, clippy, test]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:

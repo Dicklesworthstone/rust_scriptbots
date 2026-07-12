@@ -2,6 +2,12 @@
 
 Please append brief updates (date, handle, bullet) so collaborators can see who’s tackling what in PLAN_TO_FIX_RENDERING_ISSUES.md.
 
+> Current-state correction (2026-07-12): the five legacy PNGs reported as
+> regenerated below are absent from the current repository and reachable Git
+> history. Their hashes remain historical evidence in
+> `legacy_capture_checklist.md`; only the tracked Rust and Bevy semantic CPU
+> references are active golden assets.
+
 ## 2025-10-30
 - Codex: Completed PLAN §1.1 reference capture/spec docs; awaiting volunteers for §1.3 snapshot harness + viewport invariants + CI wiring.
 - PurpleBear: Drafted `docs/rendering_reference/snapshot_harness_design.md` outlining inputs, command sketch, goldens layout, diff strategy, and CI requirements for PLAN §1.3. Ready for review/ownership.

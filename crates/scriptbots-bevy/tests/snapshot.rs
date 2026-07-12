@@ -58,10 +58,14 @@ fn bevy_renderer_matches_golden() {
         "snapshot fixture rendered only {agent_signal_pixels} agent-signal pixels"
     );
 
-    if std::env::var("BEVY_REGEN_GOLDEN")
+    let regenerate = std::env::var("BEVY_REGEN_GOLDEN")
         .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    assert!(
+        !(regenerate && std::env::var_os("CI").is_some()),
+        "CI must never regenerate or bless Bevy golden assets"
+    );
+    if regenerate {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create golden snapshot directory");
         }
@@ -69,7 +73,9 @@ fn bevy_renderer_matches_golden() {
         return;
     }
 
-    let golden = fs::read(&path).expect("load golden bevy snapshot");
+    let golden = fs::read(&path).expect(
+        "golden snapshot missing; generate locally with: BEVY_REGEN_GOLDEN=1 cargo test -p scriptbots-bevy --test snapshot bevy_renderer_matches_golden -- --exact --nocapture",
+    );
     let golden_img = image::load_from_memory(&golden)
         .expect("decode golden")
         .to_rgba8();

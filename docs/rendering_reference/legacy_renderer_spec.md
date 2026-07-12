@@ -74,21 +74,28 @@ Sampling was performed on `legacy_default.png` (resampled to isolate terrain str
 
 Agent overlays contribute additional colours (selection ring `#FFFF00`, boost outline `#CC0000`, indicator pulses e.g. `#C830BF`). Food tiles transition from `#F9F9FF` (empty) to `#C8F6CC` (full) per `glColor3f(0.9-f, 0.9-f, 1.0-f)`.
 
-## Reference Assets
+## Historical Reference Records
 
-| Asset | Description | SHA256 |
-| --- | --- | --- |
-| `legacy_default.png` (+ `legacy_default_overlay.svg`) | Default camera framing, no selection, food overlay on. | `8e9e407ad0c9ebef870b879eb0fa92c30fa76034301c2804937f644cb7e30c84` |
-| `legacy_selected_agent.png` (+ `legacy_selected_overlay.svg`) | Same scene after selecting central agent; shows HUD panel, indicator ribbons, selection halo. | `3a5275239e392e518e469c9f07410924b316273b2f695c306c7ffa52dc63e922` |
-| `legacy_food_peak.png` (+ `legacy_food_peak_overlay.svg`) | Food overlay emphasised after toggling `[f]`; highlights full grids with blue-toward-green gradient. | `3f355f970c8712720e3ff58ec74a5d8c7a1a30eff36bb9078962fb121fa671d2` |
-| `legacy_food_off.png` | Food overlay disabled to reveal raw terrain palette basemap. | `a9446fd2cd405b60eb7782fcb098f082f974a06d179330e9d325fd014571f7a2` |
-| `legacy_zoomed_hud.png` | Slight zoom after middle-button drag, capturing HUD text legibility and agent detail. | `d113b13b59556db4f1e215450297370576a6d45bdc34f764262fb95e81103fa8` |
-| (future) `legacy_follow_modes.png` | Capture follow behaviour (`s`, `o`) once automation lands. | _pending_ |
-| (future) `legacy_camera_pan.png` | Capture pan extremes once scripted. | _pending_ |
-| (future) `legacy_terminal.png` | Capture terminal renderer baseline. | _pending_ |
-| (future) `legacy_terminal_zoom.png` | Capture terminal zoom overlay. | _pending_ |
+The PNGs named below are unavailable in the current repository and its
+reachable Git history. The descriptions and reported hashes are retained as
+historical evidence only; the companion SVG overlays do not reconstruct or
+validate the missing raster sources.
 
-All captures collected via `capture_legacy_render.sh` (see `legacy_capture_checklist.md`), ensuring reproducibility. Companion SVG overlays provide precise ROIs for documentation and automated diff tooling.
+| Asset record | Availability | Description | Reported SHA256 |
+| --- | --- | --- | --- |
+| `legacy_default.png` (+ `legacy_default_overlay.svg`) | PNG unavailable | Default camera framing, no selection, food overlay on. | `8e9e407ad0c9ebef870b879eb0fa92c30fa76034301c2804937f644cb7e30c84` |
+| `legacy_selected_agent.png` (+ `legacy_selected_overlay.svg`) | PNG unavailable | Same scene after selecting central agent; shows HUD panel, indicator ribbons, selection halo. | `3a5275239e392e518e469c9f07410924b316273b2f695c306c7ffa52dc63e922` |
+| `legacy_food_peak.png` (+ `legacy_food_peak_overlay.svg`) | PNG unavailable | Food overlay emphasised after toggling `[f]`; highlights full grids with blue-toward-green gradient. | `3f355f970c8712720e3ff58ec74a5d8c7a1a30eff36bb9078962fb121fa671d2` |
+| `legacy_food_off.png` | PNG unavailable | Food overlay disabled to reveal raw terrain palette basemap. | `a9446fd2cd405b60eb7782fcb098f082f974a06d179330e9d325fd014571f7a2` |
+| `legacy_zoomed_hud.png` | PNG unavailable | Slight zoom after middle-button drag, capturing HUD text legibility and agent detail. | `d113b13b59556db4f1e215450297370576a6d45bdc34f764262fb95e81103fa8` |
+| (future) `legacy_follow_modes.png` | Not captured | Capture follow behaviour (`s`, `o`) once automation lands. | _pending_ |
+| (future) `legacy_camera_pan.png` | Not captured | Capture pan extremes once scripted. | _pending_ |
+| (future) `legacy_terminal.png` | Not captured | Capture terminal renderer baseline. | _pending_ |
+| (future) `legacy_terminal_zoom.png` | Not captured | Capture terminal zoom overlay. | _pending_ |
+
+The historical log reports use of `capture_legacy_render.sh`; see
+`legacy_capture_checklist.md` for the recorded procedure and current
+availability warning.
 
 ## Open Questions / Follow-ups
 

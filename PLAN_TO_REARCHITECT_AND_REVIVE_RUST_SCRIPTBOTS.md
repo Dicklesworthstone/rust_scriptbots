@@ -1605,7 +1605,7 @@ Priorities are `P0` correctness/blocking, `P1` usable product, `P2` scientific e
 - add `UPGRADE_LOG.md`;
 - capture duplicates and default feature graph;
 - repair invalid CI feature names and action refs;
-- make golden paths trackable without allowing runtime frame dumps everywhere.
+- make golden paths trackable without allowing runtime frame dumps everywhere [Completed — `bd-2z0.1.3`].
 
 The existing `.gitignore` contains unrelated user changes. This bead must reserve/coordinate that file, preserve those exact hunks, and apply only the minimal lock/golden exceptions. Reproducibility pins are a hard dependency of semantic implementation beads.
 
@@ -1613,10 +1613,12 @@ The existing `.gitignore` contains unrelated user changes. This bead must reserv
 
 #### 0.3 honest test assets
 
-- distinguish semantic CPU references from live renderer captures;
-- add tracked metadata-bearing golden directories;
-- make missing goldens a clear failure with generation instructions;
-- prohibit CI auto-bless;
+Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
+
+- distinguish semantic CPU references from live renderer captures [Completed — `bd-2z0.1.3`];
+- add tracked metadata-bearing golden directories [Completed — `bd-2z0.1.3`];
+- make missing goldens a clear failure with generation instructions [Completed — `bd-2z0.1.3`];
+- prohibit CI auto-bless [Completed — `bd-2z0.1.3`];
 - inspect TUI buffers;
 - require nonempty replay evidence.
 

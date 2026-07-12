@@ -58,15 +58,21 @@ fn rust_renderer_matches_golden_snapshot() {
 
     let png = render_png_offscreen(&world, 1600, 900);
     let golden_path = golden_dir().join("rust_default.png");
-    if std::env::var("RUST_REGEN_GOLDEN")
+    let regenerate = std::env::var("RUST_REGEN_GOLDEN")
         .map(|value| value == "1")
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    assert!(
+        !(regenerate && std::env::var_os("CI").is_some()),
+        "CI must never regenerate or bless Rust golden assets"
+    );
+    if regenerate {
         fs::create_dir_all(golden_dir()).expect("create golden snapshot directory");
         fs::write(&golden_path, &png).expect("write updated golden");
         return;
     }
-    let expected = fs::read(&golden_path).expect("golden snapshot missing; generate via harness");
+    let expected = fs::read(&golden_path).expect(
+        "golden snapshot missing; generate locally with: RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-render --test snapshot rust_renderer_matches_golden_snapshot -- --exact --nocapture",
+    );
 
     if png != expected {
         let failure_dir = project_root().join("target").join("snapshot-failures");

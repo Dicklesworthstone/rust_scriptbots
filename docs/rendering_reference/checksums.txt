@@ -1,9 +1,6 @@
-# Legacy rendering reference assets (SHA256)
-# Captured via Xvfb + ImageMagick from original GLUT renderer on 2025-10-30.
-8e9e407ad0c9ebef870b879eb0fa92c30fa76034301c2804937f644cb7e30c84  legacy_default.png
-3a5275239e392e518e469c9f07410924b316273b2f695c306c7ffa52dc63e922  legacy_selected_agent.png
-3f355f970c8712720e3ff58ec74a5d8c7a1a30eff36bb9078962fb121fa671d2  legacy_food_peak.png
-a9446fd2cd405b60eb7782fcb098f082f974a06d179330e9d325fd014571f7a2  legacy_food_off.png
-d113b13b59556db4f1e215450297370576a6d45bdc34f764262fb95e81103fa8  legacy_zoomed_hud.png
+# Active approved semantic-render references (SHA-256).
+# Paths are relative to this directory. Every entry must exist in Git.
+# Unavailable legacy-capture hashes remain historical evidence in
+# legacy_capture_checklist.md; they are deliberately excluded from this manifest.
 47f10154be6fa9020c51ba2a60698e580bde8d4343df1b575bdbd970f0ce3b4e  golden/rust_default.png
 4ec2882d577a9276395381b58f1ca28e226baf47d9b90b38f5af4ae1ed0bc356  golden/bevy_default.png

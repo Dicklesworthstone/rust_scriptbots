@@ -1,6 +1,27 @@
 # Legacy Renderer Capture Checklist
 
-Purpose: ensure consistent screenshot/metric capture from the original GLUT ScriptBots build before validating the Rust GPUI renderer.
+Purpose: preserve the reproduction procedure and historical record for screenshots from the original GLUT ScriptBots build.
+
+## Repository status
+
+The five PNGs reported as captured on 2025-10-30 are not present in the current
+repository or its reachable Git history. They are therefore unavailable
+historical evidence, not active visual-test fixtures. Their reported hashes are
+preserved here so the record is not lost, but they are intentionally absent from
+the active `checksums.txt` manifest until someone explicitly regenerates,
+reviews, and commits the corresponding files.
+
+| Unavailable historical file | Reported SHA-256 |
+| --- | --- |
+| `legacy_default.png` | `8e9e407ad0c9ebef870b879eb0fa92c30fa76034301c2804937f644cb7e30c84` |
+| `legacy_selected_agent.png` | `3a5275239e392e518e469c9f07410924b316273b2f695c306c7ffa52dc63e922` |
+| `legacy_food_peak.png` | `3f355f970c8712720e3ff58ec74a5d8c7a1a30eff36bb9078962fb121fa671d2` |
+| `legacy_food_off.png` | `a9446fd2cd405b60eb7782fcb098f082f974a06d179330e9d325fd014571f7a2` |
+| `legacy_zoomed_hud.png` | `d113b13b59556db4f1e215450297370576a6d45bdc34f764262fb95e81103fa8` |
+
+Regeneration is a deliberate review operation. Do not treat the reported
+hashes as proof that an output is correct, and do not generate or bless these
+assets in CI.
 
 ## Prerequisites
 
@@ -28,7 +49,7 @@ Purpose: ensure consistent screenshot/metric capture from the original GLUT Scri
 4. For each screenshot, log SHA256 in `docs/rendering_reference/checksums.txt`.
 5. Note FPS from window title for baseline performance (record min/avg over 10s).
 
-### Automated headless capture (used 2025-10-30)
+### Automated headless capture (reported as used 2025-10-30)
 
 Run inside the repo root:
 
@@ -59,7 +80,9 @@ wait $PID || true
 '
 ```
 
-This script reproduces the manual protocol under Xvfb, yielding the PNGs and allowing checksum updates.
+This command is the recorded reproduction recipe. The outputs from the reported
+2025 capture are unavailable; a new capture must be reviewed before its files or
+hashes become active test data.
 
 ## Keyboard/Interaction Validation
 
@@ -68,9 +91,10 @@ This script reproduces the manual protocol under Xvfb, yielding the PNGs and all
 
 ## Data Handoff
 
-- Store PNGs in `docs/rendering_reference/`.
-- Append metrics and capture date to `legacy_renderer_spec.md` (World Geometry section).
-- Notify Camera/Visuals leads once assets committed so they can reference palette samples.
+- Store reviewed PNGs in `docs/rendering_reference/`.
+- Record metrics and the new capture date in `legacy_renderer_spec.md` (World Geometry section).
+- Add hashes to the active manifest only in the same reviewed commit that adds the files.
+- Notify Camera/Visuals leads once assets are committed so they can reference palette samples.
 
 ## Open Items
 
