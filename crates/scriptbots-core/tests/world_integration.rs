@@ -210,9 +210,13 @@ fn seeded_world_advances_deterministically() {
     let mut world_b = WorldState::new(config).expect("world_b");
 
     let agent = AgentData::default();
-    let id_a = world_a.spawn_agent(agent);
+    let id_a = world_a
+        .try_spawn_agent(agent)
+        .expect("default agent is finite");
     let agent = AgentData::default();
-    let id_b = world_b.spawn_agent(agent);
+    let id_b = world_b
+        .try_spawn_agent(agent)
+        .expect("default agent is finite");
 
     for _ in 0..8 {
         world_a
@@ -271,7 +275,9 @@ fn registry_executes_custom_brain() {
             Ok(Box::new(ConstantBrain { value: 0.75 }))
         });
 
-    let agent_id = world.spawn_agent(AgentData::default());
+    let agent_id = world
+        .try_spawn_agent(AgentData::default())
+        .expect("default agent is finite");
     assert!(
         world
             .bind_agent_brain(agent_id, key)
@@ -335,8 +341,8 @@ fn combat_records_carnivore_event_flags() {
         ..AgentData::default()
     };
 
-    let attacker_id = world.spawn_agent(attacker);
-    let victim_id = world.spawn_agent(victim);
+    let attacker_id = world.try_spawn_agent(attacker).expect("attacker is finite");
+    let victim_id = world.try_spawn_agent(victim).expect("victim is finite");
 
     let spike_key = world
         .brain_registry_mut()
@@ -346,12 +352,12 @@ fn combat_records_carnivore_event_flags() {
             .bind_agent_brain(attacker_id, spike_key)
             .expect("spike-brain factory")
     );
-    if let Some(runtime) = world.agent_runtime_mut(attacker_id) {
-        runtime.herbivore_tendency = 0.1;
-    }
-    if let Some(runtime) = world.agent_runtime_mut(victim_id) {
-        runtime.herbivore_tendency = 0.9;
-    }
+    world
+        .try_update_agent_runtime(attacker_id, |runtime| runtime.herbivore_tendency = 0.1)
+        .expect("finite attacker update");
+    world
+        .try_update_agent_runtime(victim_id, |runtime| runtime.herbivore_tendency = 0.9)
+        .expect("finite victim update");
 
     world
         .step()
@@ -414,36 +420,41 @@ fn legacy_eye_density_micro_oracle_single_neighbor() {
     let mut world = WorldState::new(config).expect("legacy eye oracle world");
     world.set_closed(true);
 
-    let subject = world.spawn_agent(AgentData {
-        position: Position::new(100.0, 100.0),
-        heading: 0.0,
-        ..AgentData::default()
-    });
-    let target = world.spawn_agent(AgentData {
-        position: Position::new(125.0, 100.0),
-        heading: 0.0,
-        health: 2.0,
-        ..AgentData::default()
-    });
+    let subject = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            heading: 0.0,
+            ..AgentData::default()
+        })
+        .expect("subject is finite");
+    let target = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(125.0, 100.0),
+            heading: 0.0,
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("target is finite");
     bind_zero_brain(&mut world, &[subject, target]);
 
-    let runtime = world
-        .agent_runtime_mut(subject)
-        .expect("subject runtime should exist");
-    runtime.trait_modifiers = TraitModifiers {
-        smell: 0.0,
-        sound: 0.0,
-        hearing: 0.0,
-        eye: 1.0,
-        blood: 0.0,
-    };
-    runtime.eye_fov = [std::f32::consts::FRAC_PI_4; NUM_EYES];
-    runtime.eye_direction = [
-        0.0,
-        std::f32::consts::FRAC_PI_2,
-        std::f32::consts::PI,
-        -std::f32::consts::FRAC_PI_2,
-    ];
+    world
+        .try_update_agent_runtime(subject, |runtime| {
+            runtime.trait_modifiers = TraitModifiers {
+                smell: 0.0,
+                sound: 0.0,
+                hearing: 0.0,
+                eye: 1.0,
+                blood: 0.0,
+            };
+            runtime.eye_fov = [std::f32::consts::FRAC_PI_4; NUM_EYES];
+            runtime.eye_direction = [
+                0.0,
+                std::f32::consts::FRAC_PI_2,
+                std::f32::consts::PI,
+                -std::f32::consts::FRAC_PI_2,
+            ];
+        })
+        .expect("finite subject runtime update");
 
     world
         .step()
@@ -554,12 +565,14 @@ fn legacy_eye_chunk_boundary_oracle_is_feature_invariant() {
         let mut world = WorldState::new(config).expect("legacy eye chunk-boundary oracle world");
         world.set_closed(true);
 
-        let subject = world.spawn_agent(AgentData {
-            position: SUBJECT_POSITION,
-            heading: SUBJECT_HEADING,
-            health: 2.0,
-            ..AgentData::default()
-        });
+        let subject = world
+            .try_spawn_agent(AgentData {
+                position: SUBJECT_POSITION,
+                heading: SUBJECT_HEADING,
+                health: 2.0,
+                ..AgentData::default()
+            })
+            .expect("eye-oracle subject is finite");
         let view_angle = SUBJECT_HEADING + EYE_DIRECTION;
         let mut target_ids = Vec::with_capacity(targets.len());
         for &target in targets {
@@ -579,36 +592,41 @@ fn legacy_eye_chunk_boundary_oracle_is_feature_invariant() {
                 ),
                 "the fixture must keep every target in the subject's bucket",
             );
-            target_ids.push(world.spawn_agent(AgentData {
-                position,
-                heading: 0.0,
-                color: target.color,
-                health: 2.0,
-                ..AgentData::default()
-            }));
+            target_ids.push(
+                world
+                    .try_spawn_agent(AgentData {
+                        position,
+                        heading: 0.0,
+                        color: target.color,
+                        health: 2.0,
+                        ..AgentData::default()
+                    })
+                    .expect("eye-oracle target is finite"),
+            );
         }
         let mut all_ids = Vec::with_capacity(targets.len() + 1);
         all_ids.push(subject);
         all_ids.extend_from_slice(&target_ids);
         bind_zero_brain(&mut world, &all_ids);
 
-        let runtime = world
-            .agent_runtime_mut(subject)
-            .expect("eye-oracle subject runtime");
-        runtime.trait_modifiers = TraitModifiers {
-            smell: 0.0,
-            sound: 0.0,
-            hearing: 0.0,
-            eye: EYE_SENSITIVITY,
-            blood: 0.0,
-        };
-        runtime.eye_fov = [EYE_FOV; NUM_EYES];
-        runtime.eye_direction = [
-            EYE_DIRECTION,
-            EYE_DIRECTION + std::f32::consts::FRAC_PI_2,
-            EYE_DIRECTION + std::f32::consts::PI,
-            EYE_DIRECTION - std::f32::consts::FRAC_PI_2,
-        ];
+        world
+            .try_update_agent_runtime(subject, |runtime| {
+                runtime.trait_modifiers = TraitModifiers {
+                    smell: 0.0,
+                    sound: 0.0,
+                    hearing: 0.0,
+                    eye: EYE_SENSITIVITY,
+                    blood: 0.0,
+                };
+                runtime.eye_fov = [EYE_FOV; NUM_EYES];
+                runtime.eye_direction = [
+                    EYE_DIRECTION,
+                    EYE_DIRECTION + std::f32::consts::FRAC_PI_2,
+                    EYE_DIRECTION + std::f32::consts::PI,
+                    EYE_DIRECTION - std::f32::consts::FRAC_PI_2,
+                ];
+            })
+            .expect("finite eye-oracle runtime update");
 
         // This is the independent legacy World.cpp:241-259 oracle: angular and
         // distance falloff contribute to every eye channel, while density alone
@@ -694,33 +712,38 @@ fn fixed_seed_blood_sensor_reading(seed: u64, target_angle: f32, target_health: 
 
     let subject_position = Position::new(200.0, 200.0);
     let target_distance = 40.0;
-    let subject = world.spawn_agent(AgentData {
-        position: subject_position,
-        heading: 0.0,
-        health: 2.0,
-        ..AgentData::default()
-    });
-    let target = world.spawn_agent(AgentData {
-        position: Position::new(
-            subject_position.x + target_distance * target_angle.cos(),
-            subject_position.y + target_distance * target_angle.sin(),
-        ),
-        heading: 0.0,
-        health: target_health,
-        ..AgentData::default()
-    });
+    let subject = world
+        .try_spawn_agent(AgentData {
+            position: subject_position,
+            heading: 0.0,
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("subject is finite");
+    let target = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(
+                subject_position.x + target_distance * target_angle.cos(),
+                subject_position.y + target_distance * target_angle.sin(),
+            ),
+            heading: 0.0,
+            health: target_health,
+            ..AgentData::default()
+        })
+        .expect("target is finite");
     bind_zero_brain(&mut world, &[subject, target]);
 
-    let runtime = world
-        .agent_runtime_mut(subject)
-        .expect("blood-oracle subject runtime");
-    runtime.trait_modifiers = TraitModifiers {
-        smell: 0.0,
-        sound: 0.0,
-        hearing: 0.0,
-        eye: 0.0,
-        blood: 1.0,
-    };
+    world
+        .try_update_agent_runtime(subject, |runtime| {
+            runtime.trait_modifiers = TraitModifiers {
+                smell: 0.0,
+                sound: 0.0,
+                hearing: 0.0,
+                eye: 0.0,
+                blood: 1.0,
+            };
+        })
+        .expect("finite blood-oracle runtime update");
 
     world
         .step()
@@ -821,48 +844,57 @@ fn sensory_pipeline_populates_expected_channels() {
     };
 
     let mut world = WorldState::new(config).expect("world");
-    let subject = world.spawn_agent(AgentData::default());
-    let neighbor = world.spawn_agent(AgentData::default());
+    let subject = world
+        .try_spawn_agent(AgentData::default())
+        .expect("subject is finite");
+    let neighbor = world
+        .try_spawn_agent(AgentData::default())
+        .expect("neighbor is finite");
 
-    {
-        let arena = world.agents_mut();
-        let idx_subject = arena.index_of(subject).expect("subject index");
-        let idx_neighbor = arena.index_of(neighbor).expect("neighbor index");
-        let columns = arena.columns_mut();
-        columns.positions_mut()[idx_subject] = Position::new(80.0, 100.0);
-        columns.positions_mut()[idx_neighbor] = Position::new(120.0, 100.0);
-        columns.headings_mut()[idx_subject] = 0.0;
-        columns.headings_mut()[idx_neighbor] = 0.0;
-        columns.colors_mut()[idx_neighbor] = [1.0, 0.2, 0.2];
-        columns.health_mut()[idx_neighbor] = 0.4;
-    }
+    world
+        .try_update_agent(subject, |data, _runtime| {
+            data.position = Position::new(80.0, 100.0);
+            data.heading = 0.0;
+        })
+        .expect("finite subject state update");
+    world
+        .try_update_agent(neighbor, |data, _runtime| {
+            data.position = Position::new(120.0, 100.0);
+            data.heading = 0.0;
+            data.color = [1.0, 0.2, 0.2];
+            data.health = 0.4;
+        })
+        .expect("finite neighbor state update");
 
     let food_max = world.config().food_max;
-    if let Some(cell) = world.food_mut().get_mut(4, 5) {
-        *cell = food_max * 0.8;
-    }
+    let food_index = 5 * world.food().width() as usize + 4;
+    world
+        .try_update_food(|cells| cells[food_index] = food_max * 0.8)
+        .expect("finite food update");
 
-    if let Some(runtime) = world.runtime_mut().get_mut(subject) {
-        runtime.trait_modifiers = TraitModifiers {
-            smell: 1.0,
-            sound: 1.0,
-            hearing: 1.0,
-            eye: 1.0,
-            blood: 1.0,
-        };
-        runtime.eye_fov = [1.2; NUM_EYES];
-        runtime.eye_direction = [
-            0.0,
-            std::f32::consts::FRAC_PI_2,
-            std::f32::consts::PI,
-            -std::f32::consts::FRAC_PI_2,
-        ];
-        runtime.temperature_preference = 0.2;
-    }
+    world
+        .try_update_agent_runtime(subject, |runtime| {
+            runtime.trait_modifiers = TraitModifiers {
+                smell: 1.0,
+                sound: 1.0,
+                hearing: 1.0,
+                eye: 1.0,
+                blood: 1.0,
+            };
+            runtime.eye_fov = [1.2; NUM_EYES];
+            runtime.eye_direction = [
+                0.0,
+                std::f32::consts::FRAC_PI_2,
+                std::f32::consts::PI,
+                -std::f32::consts::FRAC_PI_2,
+            ];
+            runtime.temperature_preference = 0.2;
+        })
+        .expect("finite subject runtime update");
 
-    if let Some(runtime) = world.runtime_mut().get_mut(neighbor) {
-        runtime.sound_multiplier = 0.9;
-    }
+    world
+        .try_update_agent_runtime(neighbor, |runtime| runtime.sound_multiplier = 0.9)
+        .expect("finite neighbor runtime update");
 
     world
         .step()
@@ -986,30 +1018,31 @@ fn ground_food_micro_oracle_documents_energy_policy() {
     let mut world = WorldState::new(config).expect("ground-food oracle world");
     world.set_closed(true);
 
-    let agent = world.spawn_agent(AgentData {
-        position: Position::new(5.0, 5.0),
-        health: 1.0,
-        ..AgentData::default()
-    });
+    let agent = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(5.0, 5.0),
+            health: 1.0,
+            ..AgentData::default()
+        })
+        .expect("agent is finite");
     bind_zero_brain(&mut world, &[agent]);
-    let runtime = world
-        .agent_runtime_mut(agent)
-        .expect("oracle herbivore runtime should exist");
-    runtime.energy = 0.5;
-    runtime.herbivore_tendency = 1.0;
-    runtime.reproduction_counter = 0.0;
-    runtime.food_balance_total = 0.0;
+    world
+        .try_update_agent_runtime(agent, |runtime| {
+            runtime.energy = 0.5;
+            runtime.herbivore_tendency = 1.0;
+            runtime.reproduction_counter = 0.0;
+            runtime.food_balance_total = 0.0;
+        })
+        .expect("finite herbivore runtime update");
 
     let profile = world
         .food_profile(0, 0)
         .expect("oracle food cell should have a generated profile");
     oracle.assert_close("cell fertility", profile.fertility);
     oracle.assert_close("nutrient density", profile.nutrient_density);
-    let cell = world
-        .food_mut()
-        .get_mut(0, 0)
-        .expect("oracle food cell should exist");
-    *cell = 0.2;
+    world
+        .try_update_food(|cells| cells[0] = 0.2)
+        .expect("finite food update");
 
     world
         .step()
@@ -1091,9 +1124,9 @@ fn food_diffusion_spreads_across_neighbors() {
 
     let mut world = WorldState::new(config).expect("world");
     let max_food = world.config().food_max;
-    if let Some(cell) = world.food_mut().get_mut(0, 0) {
-        *cell = max_food;
-    }
+    world
+        .try_update_food(|cells| cells[0] = max_food)
+        .expect("finite food update");
 
     let before = world.food().cells().to_vec();
     world
@@ -1173,7 +1206,9 @@ fn run_world_summary(seed: u64, ticks: u32) -> TickSummary {
     };
 
     let mut world = WorldState::new(config).expect("world");
-    world.spawn_agent(AgentData::default());
+    world
+        .try_spawn_agent(AgentData::default())
+        .expect("default agent is finite");
 
     for _ in 0..ticks {
         world
@@ -1245,11 +1280,13 @@ fn narrated_timeline_respects_its_false_positive_budget_on_real_runs() {
     fn run(config: ScriptBotsConfig, agents: usize, ticks: usize) -> Vec<(u64, String, f64, f64)> {
         let mut world = WorldState::new(config).expect("world");
         for seed in 0..agents {
-            world.spawn_agent(AgentData {
-                position: Position::new((seed * 37 % 190) as f32, (seed * 53 % 190) as f32),
-                health: 1.0,
-                ..AgentData::default()
-            });
+            world
+                .try_spawn_agent(AgentData {
+                    position: Position::new((seed * 37 % 190) as f32, (seed * 53 % 190) as f32),
+                    health: 1.0,
+                    ..AgentData::default()
+                })
+                .expect("generated agent is finite");
         }
         for _ in 0..ticks {
             world.step().expect("step");

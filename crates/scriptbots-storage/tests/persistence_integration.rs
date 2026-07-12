@@ -67,7 +67,9 @@ fn storage_persists_metrics_roundtrip() {
     {
         let mut world =
             WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
-        world.spawn_agent(AgentData::default());
+        world
+            .try_spawn_agent(AgentData::default())
+            .expect("default agent is finite");
 
         for _ in 0..5 {
             world.step().expect("file-backed persistence step");

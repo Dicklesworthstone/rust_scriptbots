@@ -36,7 +36,9 @@ fn seed_agents(world: &mut WorldState, brain_key: u64) {
             agent.position.y = row as f32 * spacing + spacing * 0.5;
             agent.heading = 0.0;
             agent.spike_length = 10.0;
-            let id = world.spawn_agent(agent);
+            let id = world
+                .try_spawn_agent(agent)
+                .expect("snapshot agent is finite");
             assert!(
                 world
                     .bind_agent_brain(id, brain_key)

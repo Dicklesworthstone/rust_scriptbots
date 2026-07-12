@@ -161,7 +161,9 @@ fn terminal_headless_generates_report() -> Result<()> {
             0,
             Generation::default(),
         );
-        world.spawn_agent(agent);
+        world
+            .try_spawn_agent(agent)
+            .expect("terminal fixture agent is finite");
     }
     let shared_world = Arc::new(Mutex::new(world));
 
@@ -403,7 +405,9 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
             0,
             Generation::default(),
         );
-        world.spawn_agent(agent);
+        world
+            .try_spawn_agent(agent)
+            .expect("terminal fixture agent is finite");
     }
     let shared_world = Arc::new(Mutex::new(world));
 

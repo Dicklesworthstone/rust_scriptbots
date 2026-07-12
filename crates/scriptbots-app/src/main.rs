@@ -2600,7 +2600,9 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) -> Result<()> {
             agent.position.y = row as f32 * spacing + spacing * 0.5;
             agent.heading = 0.0;
             agent.spike_length = 10.0;
-            let id = world.spawn_agent(agent);
+            let id = world
+                .try_spawn_agent(agent)
+                .context("seeded agent must be finite")?;
             let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len()) else {
                 bail!("registered-brain selection invariant failed while seeding agent {id:?}");
             };
@@ -3681,7 +3683,9 @@ activation = "Sigmoid"
         );
 
         let neuro_key = *keys_enabled.last().expect("neuro key");
-        let agent_id = world_enabled.spawn_agent(AgentData::default());
+        let agent_id = world_enabled
+            .try_spawn_agent(AgentData::default())
+            .expect("default agent is finite");
         assert!(
             world_enabled
                 .bind_agent_brain(agent_id, neuro_key)
@@ -3697,7 +3701,9 @@ activation = "Sigmoid"
             install_brains(&mut world_repeat).expect("install repeat NeuroFlow brain");
         assert_eq!(keys_repeat.len(), expected_base + 1);
         let neuro_repeat = *keys_repeat.last().unwrap();
-        let agent_repeat = world_repeat.spawn_agent(AgentData::default());
+        let agent_repeat = world_repeat
+            .try_spawn_agent(AgentData::default())
+            .expect("default agent is finite");
         assert!(
             world_repeat
                 .bind_agent_brain(agent_repeat, neuro_repeat)

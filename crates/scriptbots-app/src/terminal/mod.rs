@@ -3558,7 +3558,9 @@ mod tests {
     fn snapshot_reflects_world_state() {
         let config = ScriptBotsConfig::default();
         let mut world = WorldState::new(config).expect("world");
-        world.spawn_agent(AgentData::default());
+        world
+            .try_spawn_agent(AgentData::default())
+            .expect("default agent is finite");
 
         let snapshot = Snapshot::from_world(&world);
 
@@ -3681,7 +3683,9 @@ mod tests {
         config.control.auto_pause_population_below = Some(5);
         let mut world = WorldState::new(config).expect("world");
         for _ in 0..3 {
-            world.spawn_agent(AgentData::default());
+            world
+                .try_spawn_agent(AgentData::default())
+                .expect("default agent is finite");
         }
 
         let world = Arc::new(std::sync::Mutex::new(world));

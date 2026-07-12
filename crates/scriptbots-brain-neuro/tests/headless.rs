@@ -22,8 +22,12 @@ fn neuroflow_only_world_is_deterministic() {
     let key_b = NeuroflowBrain::register(&mut world_b, brain_config)
         .expect("register second NeuroFlow brain");
 
-    let agent_a = world_a.spawn_agent(AgentData::default());
-    let agent_b = world_b.spawn_agent(AgentData::default());
+    let agent_a = world_a
+        .try_spawn_agent(AgentData::default())
+        .expect("default agent is finite");
+    let agent_b = world_b
+        .try_spawn_agent(AgentData::default())
+        .expect("default agent is finite");
 
     assert!(
         world_a

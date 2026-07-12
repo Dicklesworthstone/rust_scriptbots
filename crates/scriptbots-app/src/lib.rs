@@ -526,7 +526,7 @@ mod characterization_tests {
                 position: scriptbots_core::Position::new(x, y),
                 ..scriptbots_core::AgentData::default()
             };
-            world.spawn_agent(agent);
+            world.try_spawn_agent(agent).expect("test agent is finite");
         }
         world
     }

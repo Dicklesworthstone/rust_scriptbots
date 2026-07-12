@@ -25,6 +25,7 @@ wide = { version = "0.8.1", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", default-features = false, features = ["html_reports"] }
+postcard = { workspace = true }
 
 [[bench]]
 name = "world_bench"

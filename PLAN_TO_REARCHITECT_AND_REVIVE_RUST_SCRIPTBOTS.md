@@ -1717,7 +1717,9 @@ Phase 0.4 therefore remains in progress. This slice hardens renderer selection, 
 - green-versus-boost damage regression;
 - replay/render use same accessors;
 - finite/range validation [Completed — `bd-2z0.2.6`].
-  - The broader mutable agent/food/terrain/hydrology ingress audit is owned by `bd-2z0.2.11`.
+  - [Completed — `bd-2z0.2.11`] Agent, runtime, dense-column, food, terrain,
+    scalar-field, hydrology, and map-import ingress now uses exact-path validation and atomic
+    commit boundaries; NaN/infinity rejection preserves fixed-seed state and digests.
   - [Completed — `bd-2z0.3.11`] Fallible finite construction for public NeuroFlow `f64` learning-rate and momentum values.
 
 **Exit:** no raw magic indexes outside the centralized conversion hot path.

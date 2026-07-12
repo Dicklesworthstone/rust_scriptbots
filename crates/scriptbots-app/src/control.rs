@@ -1185,7 +1185,9 @@ mod tests {
         let (handle, receiver) = handle();
         let raw_id = {
             let mut world = handle.lock_world().expect("world lock");
-            let id = world.spawn_agent(scriptbots_core::AgentData::default());
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("default agent is finite");
             world.apply_selection_update(SelectionUpdate {
                 mode: SelectionMode::Replace,
                 agent_ids: vec![id.data().as_ffi()],
@@ -1211,7 +1213,9 @@ mod tests {
         let (handle, receiver) = handle();
         let raw_id = {
             let mut world = handle.lock_world().expect("world lock");
-            let id = world.spawn_agent(scriptbots_core::AgentData::default());
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("default agent is finite");
             id.data().as_ffi()
         };
         handle

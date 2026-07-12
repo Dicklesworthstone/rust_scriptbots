@@ -97,6 +97,14 @@ new_key_type! {
     pub struct AgentId;
 }
 
+impl AgentId {
+    /// Stable raw key representation used by external control DTOs.
+    #[must_use]
+    pub fn raw(self) -> u64 {
+        self.data().as_ffi()
+    }
+}
+
 /// Convenience alias for associating side data with agents.
 pub type AgentMap<T> = SecondaryMap<AgentId, T>;
 
@@ -1046,6 +1054,62 @@ impl Default for AgentRuntime {
     }
 }
 impl AgentRuntime {
+    /// Validate every floating-point runtime field before committing an external update.
+    pub fn validate(&self) -> Result<(), ScientificStateError> {
+        self.validate_at("runtime")
+    }
+
+    fn validate_at(&self, path: &str) -> Result<(), ScientificStateError> {
+        validate_finite(&format!("{path}.energy"), self.energy)?;
+        validate_finite(
+            &format!("{path}.reproduction_counter"),
+            self.reproduction_counter,
+        )?;
+        validate_finite(
+            &format!("{path}.herbivore_tendency"),
+            self.herbivore_tendency,
+        )?;
+        validate_finite(
+            &format!("{path}.mutation_rates.primary"),
+            self.mutation_rates.primary,
+        )?;
+        validate_finite(
+            &format!("{path}.mutation_rates.secondary"),
+            self.mutation_rates.secondary,
+        )?;
+        for (name, value) in [
+            ("smell", self.trait_modifiers.smell),
+            ("sound", self.trait_modifiers.sound),
+            ("hearing", self.trait_modifiers.hearing),
+            ("eye", self.trait_modifiers.eye),
+            ("blood", self.trait_modifiers.blood),
+        ] {
+            validate_finite(&format!("{path}.trait_modifiers.{name}"), value)?;
+        }
+        validate_finite_slice(&format!("{path}.clocks"), &self.clocks)?;
+        validate_finite_slice(&format!("{path}.eye_fov"), &self.eye_fov)?;
+        validate_finite_slice(&format!("{path}.eye_direction"), &self.eye_direction)?;
+        validate_finite(&format!("{path}.sound_multiplier"), self.sound_multiplier)?;
+        validate_finite(&format!("{path}.give_intent"), self.give_intent)?;
+        validate_finite_slice(&format!("{path}.sensors"), &self.sensors)?;
+        validate_finite_slice(&format!("{path}.outputs"), &self.outputs)?;
+        validate_finite(
+            &format!("{path}.indicator.intensity"),
+            self.indicator.intensity,
+        )?;
+        validate_finite_slice(&format!("{path}.indicator.color"), &self.indicator.color)?;
+        validate_finite(&format!("{path}.food_delta"), self.food_delta)?;
+        validate_finite(&format!("{path}.sound_output"), self.sound_output)?;
+        validate_finite(
+            &format!("{path}.temperature_preference"),
+            self.temperature_preference,
+        )?;
+        validate_finite(
+            &format!("{path}.food_balance_total"),
+            self.food_balance_total,
+        )
+    }
+
     /// Sample randomized sensory parameters matching the legacy ScriptBots defaults.
     pub fn new_random(rng: &mut dyn RngCore) -> Self {
         let mut runtime = Self::default();
@@ -2535,6 +2599,25 @@ impl AgentData {
             generation,
         }
     }
+
+    /// Validate every floating-point field before this payload crosses a scientific-state
+    /// boundary.
+    pub fn validate(&self) -> Result<(), ScientificStateError> {
+        self.validate_at("agent")
+    }
+
+    fn validate_at(&self, path: &str) -> Result<(), ScientificStateError> {
+        validate_finite(&format!("{path}.position.x"), self.position.x)?;
+        validate_finite(&format!("{path}.position.y"), self.position.y)?;
+        validate_finite(&format!("{path}.velocity.vx"), self.velocity.vx)?;
+        validate_finite(&format!("{path}.velocity.vy"), self.velocity.vy)?;
+        validate_finite(&format!("{path}.heading"), self.heading)?;
+        validate_finite(&format!("{path}.health"), self.health)?;
+        for (index, value) in self.color.iter().copied().enumerate() {
+            validate_finite(&format!("{path}.color[{index}]"), value)?;
+        }
+        validate_finite(&format!("{path}.spike_length"), self.spike_length)
+    }
 }
 
 impl Default for AgentData {
@@ -2554,7 +2637,7 @@ impl Default for AgentData {
 }
 
 /// Collection of per-agent columns for hot-path iteration.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct AgentColumns {
     positions: Vec<Position>,
     velocities: Vec<Velocity>,
@@ -2627,8 +2710,15 @@ impl AgentColumns {
         self.generations.clear();
     }
 
-    /// Push a new row onto each column.
-    pub fn push(&mut self, agent: AgentData) {
+    /// Validate and append a new row atomically.
+    pub fn try_push(&mut self, agent: AgentData) -> Result<(), ScientificStateError> {
+        agent.validate_at(&format!("agents[{}]", self.len()))?;
+        self.push_trusted(agent);
+        Ok(())
+    }
+
+    /// Push a row that has already been validated at the owning boundary.
+    fn push_trusted(&mut self, agent: AgentData) {
         self.positions.push(agent.position);
         self.velocities.push(agent.velocity);
         self.headings.push(agent.heading);
@@ -2712,9 +2802,9 @@ impl AgentColumns {
         &self.positions
     }
 
-    /// Mutable access to the positions slice.
+    /// Internal mutable access to trusted positions in the tick hot path.
     #[must_use]
-    pub fn positions_mut(&mut self) -> &mut [Position] {
+    fn positions_mut(&mut self) -> &mut [Position] {
         &mut self.positions
     }
 
@@ -2724,9 +2814,9 @@ impl AgentColumns {
         &self.velocities
     }
 
-    /// Mutable access to the velocities slice.
+    /// Internal mutable access to trusted velocities in the tick hot path.
     #[must_use]
-    pub fn velocities_mut(&mut self) -> &mut [Velocity] {
+    fn velocities_mut(&mut self) -> &mut [Velocity] {
         &mut self.velocities
     }
 
@@ -2736,9 +2826,9 @@ impl AgentColumns {
         &self.headings
     }
 
-    /// Mutable access to headings.
+    /// Internal mutable access to trusted headings in the tick hot path.
     #[must_use]
-    pub fn headings_mut(&mut self) -> &mut [f32] {
+    fn headings_mut(&mut self) -> &mut [f32] {
         &mut self.headings
     }
 
@@ -2748,9 +2838,9 @@ impl AgentColumns {
         &self.health
     }
 
-    /// Mutable access to health values.
+    /// Internal mutable access to trusted health in the tick hot path.
     #[must_use]
-    pub fn health_mut(&mut self) -> &mut [f32] {
+    fn health_mut(&mut self) -> &mut [f32] {
         &mut self.health
     }
 
@@ -2760,9 +2850,9 @@ impl AgentColumns {
         &self.colors
     }
 
-    /// Mutable access to color triples.
+    /// Internal mutable access to trusted colors in the tick hot path.
     #[must_use]
-    pub fn colors_mut(&mut self) -> &mut [[f32; 3]] {
+    fn colors_mut(&mut self) -> &mut [[f32; 3]] {
         &mut self.colors
     }
 
@@ -2772,9 +2862,9 @@ impl AgentColumns {
         &self.spike_lengths
     }
 
-    /// Mutable access to spike lengths.
+    /// Internal mutable access to trusted spike lengths in the tick hot path.
     #[must_use]
-    pub fn spike_lengths_mut(&mut self) -> &mut [f32] {
+    fn spike_lengths_mut(&mut self) -> &mut [f32] {
         &mut self.spike_lengths
     }
 
@@ -2784,21 +2874,15 @@ impl AgentColumns {
         &self.boosts
     }
 
-    /// Mutable access to boost flags.
-    #[must_use]
-    pub fn boosts_mut(&mut self) -> &mut [bool] {
-        &mut self.boosts
-    }
-
     /// Immutable access to age counters.
     #[must_use]
     pub fn ages(&self) -> &[u32] {
         &self.ages
     }
 
-    /// Mutable access to age counters.
+    /// Internal mutable access to age counters in the tick hot path.
     #[must_use]
-    pub fn ages_mut(&mut self) -> &mut [u32] {
+    fn ages_mut(&mut self) -> &mut [u32] {
         &mut self.ages
     }
 
@@ -2806,12 +2890,6 @@ impl AgentColumns {
     #[must_use]
     pub fn generations(&self) -> &[Generation] {
         &self.generations
-    }
-
-    /// Mutable access to agent generations.
-    #[must_use]
-    pub fn generations_mut(&mut self) -> &mut [Generation] {
-        &mut self.generations
     }
 
     #[inline]
@@ -2892,9 +2970,9 @@ impl AgentArena {
         &self.columns
     }
 
-    /// Mutably borrow the underlying column storage.
+    /// Mutably borrow trusted column storage inside the simulation crate.
     #[must_use]
-    pub fn columns_mut(&mut self) -> &mut AgentColumns {
+    fn columns_mut(&mut self) -> &mut AgentColumns {
         &mut self.columns
     }
 
@@ -2910,13 +2988,42 @@ impl AgentArena {
         self.slots.contains_key(id)
     }
 
-    /// Insert a new agent and return its handle.
-    pub fn insert(&mut self, agent: AgentData) -> AgentId {
+    /// Validate and insert an agent without changing allocator state on rejection.
+    pub fn try_insert(&mut self, agent: AgentData) -> Result<AgentId, ScientificStateError> {
+        agent.validate_at(&format!("agents[{}]", self.len()))?;
+        Ok(self.insert_trusted(agent))
+    }
+
+    /// Insert a payload already validated by the owning boundary.
+    fn insert_trusted(&mut self, agent: AgentData) -> AgentId {
         let index = self.columns.len();
-        self.columns.push(agent);
+        self.columns.push_trusted(agent);
         let id = self.slots.insert(index);
         self.handles.push(id);
         id
+    }
+
+    /// Internal insertion path for values produced by validated simulation logic.
+    fn insert(&mut self, agent: AgentData) -> AgentId {
+        debug_assert!(agent.validate().is_ok());
+        self.insert_trusted(agent)
+    }
+
+    /// Replace one dense row after validating the complete candidate.
+    fn replace_trusted(&mut self, id: AgentId, agent: AgentData) -> bool {
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        self.columns.positions[index] = agent.position;
+        self.columns.velocities[index] = agent.velocity;
+        self.columns.headings[index] = agent.heading;
+        self.columns.health[index] = agent.health;
+        self.columns.colors[index] = agent.color;
+        self.columns.spike_lengths[index] = agent.spike_length;
+        self.columns.boosts[index] = agent.boost;
+        self.columns.ages[index] = agent.age;
+        self.columns.generations[index] = agent.generation;
+        true
     }
 
     /// Capture the allocator and dense length before an append-only transaction.
@@ -2998,12 +3105,102 @@ impl AgentArena {
     }
 }
 
+/// Typed rejection at a scientific-state construction or mutation boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ScientificStateError {
+    /// A float that can influence simulation or imported environment state was not finite.
+    #[error("non-finite scientific state at `{path}`")]
+    NonFinite { path: String },
+    /// A dense imported field did not contain exactly one value per declared cell.
+    #[error("scientific-state length mismatch at `{path}`: expected {expected}, got {actual}")]
+    LengthMismatch {
+        path: String,
+        expected: usize,
+        actual: usize,
+    },
+    /// Declared dimensions could not be represented safely as a flat allocation length.
+    #[error("scientific-state dimensions overflow at `{path}`")]
+    DimensionOverflow { path: String },
+    /// Two coupled dense fields declared different shapes even when their flat lengths matched.
+    #[error(
+        "scientific-state dimensions mismatch at `{path}`: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
+    )]
+    DimensionsMismatch {
+        path: String,
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+    /// A coupled imported state supplied only one half of a required pair.
+    #[error("incomplete coupled scientific state at `{path}`")]
+    IncompletePair { path: String },
+}
+
+impl ScientificStateError {
+    /// Exact field or collection path rejected by validation.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::NonFinite { path }
+            | Self::LengthMismatch { path, .. }
+            | Self::DimensionOverflow { path }
+            | Self::DimensionsMismatch { path, .. }
+            | Self::IncompletePair { path } => path,
+        }
+    }
+}
+
+fn validate_finite(path: &str, value: f32) -> Result<(), ScientificStateError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(ScientificStateError::NonFinite {
+            path: path.to_owned(),
+        })
+    }
+}
+
+fn validated_cell_count_for<T>(
+    path: &str,
+    width: u32,
+    height: u32,
+) -> Result<usize, ScientificStateError> {
+    let width = usize::try_from(width).map_err(|_| ScientificStateError::DimensionOverflow {
+        path: path.to_owned(),
+    })?;
+    let height = usize::try_from(height).map_err(|_| ScientificStateError::DimensionOverflow {
+        path: path.to_owned(),
+    })?;
+    let count =
+        width
+            .checked_mul(height)
+            .ok_or_else(|| ScientificStateError::DimensionOverflow {
+                path: path.to_owned(),
+            })?;
+    std::alloc::Layout::array::<T>(count)
+        .map(|_| count)
+        .map_err(|_| ScientificStateError::DimensionOverflow {
+            path: path.to_owned(),
+        })
+}
+
+fn validate_finite_slice(path: &str, values: &[f32]) -> Result<(), ScientificStateError> {
+    for (index, value) in values.iter().copied().enumerate() {
+        validate_finite(&format!("{path}[{index}]"), value)?;
+    }
+    Ok(())
+}
+
 /// Errors that can occur when constructing world state.
 #[derive(Debug, Error)]
 pub enum WorldStateError {
     /// Indicates an invalid configuration value.
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
+    /// A direct-Rust or imported-map state payload violated the finite-state contract.
+    #[error(transparent)]
+    InvalidState(#[from] ScientificStateError),
 }
 
 /// Control-related runtime behavior toggles.
@@ -4006,7 +4203,7 @@ impl ScriptBotsConfig {
 }
 
 /// 2D food grid storing scalar energy values.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FoodGrid {
     width: u32,
     height: u32,
@@ -4021,10 +4218,12 @@ impl FoodGrid {
                 "food grid dimensions must be non-zero",
             ));
         }
+        validate_finite("food.initial", initial)?;
+        let len = validated_cell_count_for::<f32>("food", width, height)?;
         Ok(Self {
             width,
             height,
-            cells: vec![initial; (width as usize) * (height as usize)],
+            cells: vec![initial; len],
         })
     }
 
@@ -4044,8 +4243,34 @@ impl FoodGrid {
     }
 
     #[must_use]
-    pub fn cells_mut(&mut self) -> &mut [f32] {
+    fn cells_mut(&mut self) -> &mut [f32] {
         &mut self.cells
+    }
+
+    /// Apply a bulk edit to a detached copy, validate every resulting cell, then commit once.
+    pub fn try_update_cells(
+        &mut self,
+        update: impl FnOnce(&mut [f32]),
+    ) -> Result<(), ScientificStateError> {
+        let mut candidate = self.cells.clone();
+        update(&mut candidate);
+        validate_finite_slice("food.cells", &candidate)?;
+        self.cells = candidate;
+        Ok(())
+    }
+
+    /// Replace the complete dense field after validating its length and all values.
+    pub fn try_replace_cells(&mut self, cells: Vec<f32>) -> Result<(), ScientificStateError> {
+        if cells.len() != self.cells.len() {
+            return Err(ScientificStateError::LengthMismatch {
+                path: "food.cells".to_owned(),
+                expected: self.cells.len(),
+                actual: cells.len(),
+            });
+        }
+        validate_finite_slice("food.cells", &cells)?;
+        self.cells = cells;
+        Ok(())
     }
 
     /// Returns the flat index for `(x, y)` without bounds checks.
@@ -4064,7 +4289,7 @@ impl FoodGrid {
     }
 
     /// Mutable access to a specific cell.
-    pub fn get_mut(&mut self, x: u32, y: u32) -> Option<&mut f32> {
+    fn get_mut(&mut self, x: u32, y: u32) -> Option<&mut f32> {
         if x < self.width && y < self.height {
             let idx = self.offset(x, y);
             Some(&mut self.cells[idx])
@@ -4074,8 +4299,10 @@ impl FoodGrid {
     }
 
     /// Fills the grid with the provided scalar value.
-    pub fn fill(&mut self, value: f32) {
+    pub fn fill(&mut self, value: f32) -> Result<(), ScientificStateError> {
+        validate_finite("food.fill", value)?;
         self.cells.fill(value);
+        Ok(())
     }
 }
 
@@ -4096,13 +4323,17 @@ impl TerrainLayer {
         cell_size: u32,
         rng: &mut SmallRng,
     ) -> Result<Self, WorldStateError> {
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || cell_size == 0 {
             return Err(WorldStateError::InvalidConfig(
-                "terrain dimensions must be non-zero",
+                "terrain dimensions and cell size must be non-zero",
             ));
         }
 
-        let mut tiles = Vec::with_capacity((width as usize) * (height as usize));
+        let mut tiles = Vec::with_capacity(validated_cell_count_for::<TerrainTile>(
+            "terrain.tiles",
+            width,
+            height,
+        )?);
         let width_f = width as f32;
         let height_f = height as f32;
 
@@ -4165,23 +4396,25 @@ impl TerrainLayer {
         cell_size: u32,
         tiles: Vec<TerrainTile>,
     ) -> Result<Self, WorldStateError> {
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || cell_size == 0 {
             return Err(WorldStateError::InvalidConfig(
-                "terrain dimensions must be non-zero",
+                "terrain dimensions and cell size must be non-zero",
             ));
         }
-        let expected = (width as usize) * (height as usize);
+        let expected = validated_cell_count_for::<TerrainTile>("terrain.tiles", width, height)?;
         if tiles.len() != expected {
             return Err(WorldStateError::InvalidConfig(
                 "terrain tile count does not match dimensions",
             ));
         }
-        Ok(Self {
+        let layer = Self {
             width,
             height,
             cell_size,
             tiles,
-        })
+        };
+        layer.validate()?;
+        Ok(layer)
     }
 
     #[must_use]
@@ -4202,6 +4435,23 @@ impl TerrainLayer {
     #[must_use]
     pub fn tiles(&self) -> &[TerrainTile] {
         &self.tiles
+    }
+
+    /// Validate all imported floating tile fields without normalizing them.
+    pub fn validate(&self) -> Result<(), ScientificStateError> {
+        let expected =
+            validated_cell_count_for::<TerrainTile>("terrain.tiles", self.width, self.height)?;
+        if self.tiles.len() != expected {
+            return Err(ScientificStateError::LengthMismatch {
+                path: "terrain.tiles".to_owned(),
+                expected,
+                actual: self.tiles.len(),
+            });
+        }
+        for (index, tile) in self.tiles.iter().enumerate() {
+            tile.validate_at(&format!("terrain.tiles[{index}]"))?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -4317,6 +4567,21 @@ pub struct TerrainTile {
     pub temperature_bias: f32,
     #[serde(default)]
     pub palette_index: u16,
+}
+
+impl TerrainTile {
+    /// Validate every floating value carried by an imported terrain tile.
+    pub fn validate(&self) -> Result<(), ScientificStateError> {
+        self.validate_at("terrain_tile")
+    }
+
+    fn validate_at(&self, path: &str) -> Result<(), ScientificStateError> {
+        validate_finite(&format!("{path}.elevation"), self.elevation)?;
+        validate_finite(&format!("{path}.moisture"), self.moisture)?;
+        validate_finite(&format!("{path}.accent"), self.accent)?;
+        validate_finite(&format!("{path}.fertility_bias"), self.fertility_bias)?;
+        validate_finite(&format!("{path}.temperature_bias"), self.temperature_bias)
+    }
 }
 
 const fn default_narrative_interval() -> u32 {
@@ -4710,8 +4975,9 @@ pub mod narrative {
 
 mod map_sandbox {
     use super::{
-        TerrainKind, TerrainLayer, TerrainTile, default_tile_fertility_bias,
-        default_tile_palette_index,
+        ScientificStateError, TerrainKind, TerrainLayer, TerrainTile, default_tile_fertility_bias,
+        default_tile_palette_index, validate_finite, validate_finite_slice,
+        validated_cell_count_for,
     };
     use direction::{CardinalDirection, CardinalDirectionTable};
     use rand08::{SeedableRng, rngs::StdRng};
@@ -4748,6 +5014,8 @@ mod map_sandbox {
         Contradiction { attempts: usize },
         #[error("terrain dimensions must be non-zero")]
         InvalidDimensions,
+        #[error(transparent)]
+        InvalidState(#[from] ScientificStateError),
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4848,13 +5116,18 @@ mod map_sandbox {
     }
 
     impl ScalarField {
-        pub fn new(width: u32, height: u32, values: Vec<f32>) -> Self {
-            debug_assert_eq!(values.len(), (width as usize) * (height as usize));
-            Self {
+        pub fn new(
+            width: u32,
+            height: u32,
+            values: Vec<f32>,
+        ) -> Result<Self, ScientificStateError> {
+            let field = Self {
                 width,
                 height,
                 values,
-            }
+            };
+            field.validate_at("scalar_field")?;
+            Ok(field)
         }
 
         pub fn width(&self) -> u32 {
@@ -4868,6 +5141,22 @@ mod map_sandbox {
         pub fn values(&self) -> &[f32] {
             &self.values
         }
+
+        pub fn validate(&self) -> Result<(), ScientificStateError> {
+            self.validate_at("scalar_field")
+        }
+
+        fn validate_at(&self, path: &str) -> Result<(), ScientificStateError> {
+            let expected = validated_cell_count_for::<f32>(path, self.width, self.height)?;
+            if self.values.len() != expected {
+                return Err(ScientificStateError::LengthMismatch {
+                    path: format!("{path}.values"),
+                    expected,
+                    actual: self.values.len(),
+                });
+            }
+            validate_finite_slice(&format!("{path}.values"), &self.values)
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4879,6 +5168,20 @@ mod map_sandbox {
         pub swim_cost: f32,
     }
 
+    impl HydrologyTile {
+        pub fn validate(&self) -> Result<(), ScientificStateError> {
+            self.validate_at("hydrology_tile")
+        }
+
+        fn validate_at(&self, path: &str) -> Result<(), ScientificStateError> {
+            validate_finite(&format!("{path}.permeability"), self.permeability)?;
+            validate_finite(&format!("{path}.runoff_bias"), self.runoff_bias)?;
+            validate_finite(&format!("{path}.basin_rank"), self.basin_rank)?;
+            validate_finite(&format!("{path}.channel_priority"), self.channel_priority)?;
+            validate_finite(&format!("{path}.swim_cost"), self.swim_cost)
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct HydrologyTileLayer {
         width: u32,
@@ -4887,13 +5190,18 @@ mod map_sandbox {
     }
 
     impl HydrologyTileLayer {
-        pub fn new(width: u32, height: u32, tiles: Vec<HydrologyTile>) -> Self {
-            debug_assert_eq!(tiles.len(), (width as usize) * (height as usize));
-            Self {
+        pub fn new(
+            width: u32,
+            height: u32,
+            tiles: Vec<HydrologyTile>,
+        ) -> Result<Self, ScientificStateError> {
+            let layer = Self {
                 width,
                 height,
                 tiles,
-            }
+            };
+            layer.validate()?;
+            Ok(layer)
         }
 
         pub fn width(&self) -> u32 {
@@ -4906,6 +5214,25 @@ mod map_sandbox {
 
         pub fn tiles(&self) -> &[HydrologyTile] {
             &self.tiles
+        }
+
+        pub fn validate(&self) -> Result<(), ScientificStateError> {
+            let expected = validated_cell_count_for::<HydrologyTile>(
+                "hydrology.tiles",
+                self.width,
+                self.height,
+            )?;
+            if self.tiles.len() != expected {
+                return Err(ScientificStateError::LengthMismatch {
+                    path: "hydrology.tiles".to_owned(),
+                    expected,
+                    actual: self.tiles.len(),
+                });
+            }
+            for (index, tile) in self.tiles.iter().enumerate() {
+                tile.validate_at(&format!("hydrology.tiles[{index}]"))?;
+            }
+            Ok(())
         }
     }
 
@@ -4950,13 +5277,8 @@ mod map_sandbox {
             spill_elevation: Vec<f32>,
             basin_ids: Vec<u32>,
             initial_water_depth: Vec<f32>,
-        ) -> Self {
-            debug_assert_eq!(flow_directions.len(), (width as usize) * (height as usize));
-            debug_assert_eq!(accumulation.len(), flow_directions.len());
-            debug_assert_eq!(spill_elevation.len(), flow_directions.len());
-            debug_assert_eq!(basin_ids.len(), flow_directions.len());
-            debug_assert_eq!(initial_water_depth.len(), flow_directions.len());
-            Self {
+        ) -> Result<Self, ScientificStateError> {
+            let field = Self {
                 width,
                 height,
                 flow_directions,
@@ -4964,7 +5286,9 @@ mod map_sandbox {
                 spill_elevation,
                 basin_ids,
                 initial_water_depth,
-            }
+            };
+            field.validate()?;
+            Ok(field)
         }
 
         pub fn width(&self) -> u32 {
@@ -4994,6 +5318,41 @@ mod map_sandbox {
         pub fn initial_water_depth(&self) -> &[f32] {
             &self.initial_water_depth
         }
+
+        pub fn validate(&self) -> Result<(), ScientificStateError> {
+            let expected =
+                validated_cell_count_for::<f32>("hydrology.field", self.width, self.height)?;
+            for (path, actual) in [
+                (
+                    "hydrology.field.flow_directions",
+                    self.flow_directions.len(),
+                ),
+                ("hydrology.field.accumulation", self.accumulation.len()),
+                (
+                    "hydrology.field.spill_elevation",
+                    self.spill_elevation.len(),
+                ),
+                ("hydrology.field.basin_ids", self.basin_ids.len()),
+                (
+                    "hydrology.field.initial_water_depth",
+                    self.initial_water_depth.len(),
+                ),
+            ] {
+                if actual != expected {
+                    return Err(ScientificStateError::LengthMismatch {
+                        path: path.to_owned(),
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            validate_finite_slice("hydrology.field.accumulation", &self.accumulation)?;
+            validate_finite_slice("hydrology.field.spill_elevation", &self.spill_elevation)?;
+            validate_finite_slice(
+                "hydrology.field.initial_water_depth",
+                &self.initial_water_depth,
+            )
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5007,6 +5366,26 @@ mod map_sandbox {
     }
 
     impl MapArtifact {
+        pub fn new(
+            terrain: TerrainLayer,
+            fertility: Option<ScalarField>,
+            temperature: Option<ScalarField>,
+            hydrology_tiles: Option<HydrologyTileLayer>,
+            hydrology_field: Option<HydrologyField>,
+            metadata: MapArtifactMetadata,
+        ) -> Result<Self, ScientificStateError> {
+            let artifact = Self {
+                terrain,
+                fertility,
+                temperature,
+                hydrology_tiles,
+                hydrology_field,
+                metadata,
+            };
+            artifact.validate()?;
+            Ok(artifact)
+        }
+
         pub fn terrain(&self) -> &TerrainLayer {
             &self.terrain
         }
@@ -5029,6 +5408,77 @@ mod map_sandbox {
 
         pub fn metadata(&self) -> &MapArtifactMetadata {
             &self.metadata
+        }
+
+        pub fn validate(&self) -> Result<(), ScientificStateError> {
+            self.terrain.validate()?;
+            if let Some(field) = &self.fertility {
+                field.validate_at("map.fertility")?;
+                validate_matching_dimensions(
+                    "map.fertility.dimensions",
+                    self.terrain.width(),
+                    self.terrain.height(),
+                    field.width(),
+                    field.height(),
+                )?;
+            }
+            if let Some(field) = &self.temperature {
+                field.validate_at("map.temperature")?;
+                validate_matching_dimensions(
+                    "map.temperature.dimensions",
+                    self.terrain.width(),
+                    self.terrain.height(),
+                    field.width(),
+                    field.height(),
+                )?;
+            }
+            match (&self.hydrology_tiles, &self.hydrology_field) {
+                (Some(tiles), Some(field)) => {
+                    tiles.validate()?;
+                    field.validate()?;
+                    validate_matching_dimensions(
+                        "map.hydrology_tiles.dimensions",
+                        self.terrain.width(),
+                        self.terrain.height(),
+                        tiles.width(),
+                        tiles.height(),
+                    )?;
+                    validate_matching_dimensions(
+                        "map.hydrology_field.dimensions",
+                        self.terrain.width(),
+                        self.terrain.height(),
+                        field.width(),
+                        field.height(),
+                    )?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ScientificStateError::IncompletePair {
+                        path: "map.hydrology".to_owned(),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn validate_matching_dimensions(
+        path: &str,
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    ) -> Result<(), ScientificStateError> {
+        if (actual_width, actual_height) == (expected_width, expected_height) {
+            Ok(())
+        } else {
+            Err(ScientificStateError::DimensionsMismatch {
+                path: path.to_owned(),
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            })
         }
     }
 
@@ -5130,6 +5580,8 @@ mod map_sandbox {
             if width == 0 || height == 0 {
                 return Err(MapGenerationError::InvalidDimensions);
             }
+            let tile_capacity =
+                validated_cell_count_for::<TerrainTile>("map.tiles", width, height)?;
 
             let mut rng = StdRng::seed_from_u64(seed);
             let runner = RunOwnAll::new(
@@ -5151,7 +5603,6 @@ mod map_sandbox {
             let attempts_spent = budget - retry.0;
             let success_attempt = attempts_spent + 1;
 
-            let tile_capacity = (width as usize) * (height as usize);
             let mut tiles = Vec::with_capacity(tile_capacity);
             let mut fertility = Vec::with_capacity(tile_capacity);
             let mut temperature = Vec::with_capacity(tile_capacity);
@@ -5194,11 +5645,11 @@ mod map_sandbox {
 
             let terrain = TerrainLayer::from_tiles(width, height, cell_size, tiles)
                 .map_err(|_| MapGenerationError::InvalidDimensions)?;
-            let fertility_field = ScalarField::new(width, height, fertility);
-            let temperature_field = ScalarField::new(width, height, temperature);
-            let hydrology_layer = HydrologyTileLayer::new(width, height, hydrology_tiles);
+            let fertility_field = ScalarField::new(width, height, fertility)?;
+            let temperature_field = ScalarField::new(width, height, temperature)?;
+            let hydrology_layer = HydrologyTileLayer::new(width, height, hydrology_tiles)?;
             let hydrology_field =
-                compute_hydrology_field(width, height, &terrain, &hydrology_layer);
+                compute_hydrology_field(width, height, &terrain, &hydrology_layer)?;
             let metadata = MapArtifactMetadata {
                 generator: MapGeneratorKind::RuleBased,
                 tileset_id: self.spec.id.clone(),
@@ -5211,14 +5662,14 @@ mod map_sandbox {
                 generated_at_epoch_ms: current_epoch_ms(),
             };
 
-            Ok(MapArtifact {
+            Ok(MapArtifact::new(
                 terrain,
-                fertility: Some(fertility_field),
-                temperature: Some(temperature_field),
-                hydrology_tiles: Some(hydrology_layer),
-                hydrology_field: Some(hydrology_field),
+                Some(fertility_field),
+                Some(temperature_field),
+                Some(hydrology_layer),
+                Some(hydrology_field),
                 metadata,
-            })
+            )?)
         }
     }
 
@@ -5318,6 +5769,21 @@ mod map_sandbox {
         let swim_cost = tile
             .swim_cost
             .unwrap_or(default_swim_cost_for_kind(tile.terrain_kind));
+
+        for (field, value) in [
+            ("fertility_bias", fertility_bias),
+            ("temperature_bias", temperature_bias),
+            ("elevation", elevation),
+            ("moisture", moisture),
+            ("accent", accent),
+            ("permeability", permeability),
+            ("runoff_bias", runoff_bias),
+            ("basin_rank", basin_rank),
+            ("channel_priority", channel_priority),
+            ("swim_cost", swim_cost),
+        ] {
+            validate_finite(&format!("tileset.tiles[{}].{field}", tile.id), value)?;
+        }
 
         Ok(CompiledTile {
             id: tile.id.clone(),
@@ -5459,8 +5925,8 @@ mod map_sandbox {
         height: u32,
         terrain: &TerrainLayer,
         hydrology: &HydrologyTileLayer,
-    ) -> HydrologyField {
-        let len = (width as usize) * (height as usize);
+    ) -> Result<HydrologyField, ScientificStateError> {
+        let len = validated_cell_count_for::<Vec<usize>>("hydrology.field", width, height)?;
         let terrain_tiles = terrain.tiles();
         let hydrology_tiles = hydrology.tiles();
         let mut flow_directions = vec![HydrologyFlowDirection::None; len];
@@ -5849,6 +6315,18 @@ mod map_sandbox {
             }
         }
 
+        fn grass_tile() -> TerrainTile {
+            TerrainTile {
+                kind: TerrainKind::Grass,
+                elevation: 0.5,
+                moisture: 0.5,
+                accent: 0.25,
+                fertility_bias: 0.6,
+                temperature_bias: 0.4,
+                palette_index: 3,
+            }
+        }
+
         #[test]
         fn maximal_length_meandering_large_grid_is_stack_safe_and_deterministic() {
             // 512^2 first visits would require 262,144 nested calls in the
@@ -5894,6 +6372,104 @@ mod map_sandbox {
                     threaded, baseline,
                     "ambient Rayon thread count {thread_count} changed traversal"
                 );
+            }
+        }
+
+        #[test]
+        fn imported_dense_fields_validate_empty_single_bulk_and_exact_non_finite_paths() {
+            ScalarField::new(0, 0, Vec::new()).expect("empty scalar field");
+            ScalarField::new(1, 1, vec![-0.0]).expect("single scalar field");
+            ScalarField::new(2, 2, vec![0.0, 0.25, 0.5, f32::MIN_POSITIVE])
+                .expect("bulk scalar field");
+
+            let error = ScalarField::new(u32::MAX, u32::MAX, Vec::new())
+                .expect_err("oversized scalar layout must reject before length comparison");
+            assert_eq!(error.path(), "scalar_field");
+            assert!(matches!(
+                error,
+                ScientificStateError::DimensionOverflow { .. }
+            ));
+
+            let error = TerrainLayer::from_tiles(u32::MAX, u32::MAX, 1, Vec::new())
+                .expect_err("oversized terrain layout must reject before length comparison");
+            let super::super::WorldStateError::InvalidState(error) = error else {
+                panic!("expected terrain layout state error");
+            };
+            assert_eq!(error.path(), "terrain.tiles");
+            assert!(matches!(
+                error,
+                ScientificStateError::DimensionOverflow { .. }
+            ));
+
+            let error = HydrologyTileLayer::new(u32::MAX, u32::MAX, Vec::new())
+                .expect_err("oversized hydrology tile layout must reject");
+            assert_eq!(error.path(), "hydrology.tiles");
+            assert!(matches!(
+                error,
+                ScientificStateError::DimensionOverflow { .. }
+            ));
+
+            let error = HydrologyField::new(
+                u32::MAX,
+                u32::MAX,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("oversized hydrology field layout must reject");
+            assert_eq!(error.path(), "hydrology.field");
+            assert!(matches!(
+                error,
+                ScientificStateError::DimensionOverflow { .. }
+            ));
+
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let error = ScalarField::new(2, 1, vec![0.0, value])
+                    .expect_err("non-finite scalar field must fail");
+                assert_eq!(error.path(), "scalar_field.values[1]");
+
+                let mut tiles = vec![grass_tile(), grass_tile()];
+                tiles[1].moisture = value;
+                let error = TerrainLayer::from_tiles(2, 1, 16, tiles)
+                    .expect_err("non-finite terrain tile must fail");
+                let super::super::WorldStateError::InvalidState(error) = error else {
+                    panic!("expected terrain state error");
+                };
+                assert_eq!(error.path(), "terrain.tiles[1].moisture");
+
+                let hydrology = vec![
+                    HydrologyTile {
+                        permeability: 0.5,
+                        runoff_bias: 0.0,
+                        basin_rank: 0.25,
+                        channel_priority: 0.5,
+                        swim_cost: 1.0,
+                    },
+                    HydrologyTile {
+                        permeability: 0.5,
+                        runoff_bias: 0.0,
+                        basin_rank: value,
+                        channel_priority: 0.5,
+                        swim_cost: 1.0,
+                    },
+                ];
+                let error = HydrologyTileLayer::new(2, 1, hydrology)
+                    .expect_err("non-finite hydrology tile must fail");
+                assert_eq!(error.path(), "hydrology.tiles[1].basin_rank");
+
+                let error = HydrologyField::new(
+                    2,
+                    1,
+                    vec![HydrologyFlowDirection::None; 2],
+                    vec![1.0, value],
+                    vec![0.5; 2],
+                    vec![0; 2],
+                    vec![0.0; 2],
+                )
+                .expect_err("non-finite hydrology vector must fail");
+                assert_eq!(error.path(), "hydrology.field.accumulation[1]");
             }
         }
 
@@ -5963,6 +6539,113 @@ mod map_sandbox {
                     .all(|value| *value >= 1.0)
             );
         }
+
+        #[test]
+        fn map_application_rejects_non_finite_bulk_input_atomically() {
+            let tileset = TilesetSpec {
+                id: "atomic-map".into(),
+                label: None,
+                description: None,
+                tiles: vec![TileSpec {
+                    id: "grass".into(),
+                    label: None,
+                    weight: 1,
+                    terrain_kind: TerrainKind::Grass,
+                    fertility_bias: Some(0.7),
+                    temperature_bias: Some(0.5),
+                    elevation: Some(0.48),
+                    moisture: Some(0.6),
+                    accent: Some(0.3),
+                    palette_index: Some(3),
+                    permeability: Some(0.35),
+                    runoff_bias: Some(0.2),
+                    basin_rank: Some(0.55),
+                    channel_priority: Some(0.4),
+                    swim_cost: Some(1.2),
+                }],
+                adjacency: Vec::new(),
+            };
+            let generator = RuleBasedMapGenerator::new(tileset).expect("compile tileset");
+            let artifact = generator.generate(8, 8, 16, 7).expect("generate artifact");
+            let mut world = super::super::WorldState::new(super::super::ScriptBotsConfig {
+                world_width: 128,
+                world_height: 128,
+                food_cell_size: 16,
+                rng_seed: Some(7),
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..super::super::ScriptBotsConfig::default()
+            })
+            .expect("world");
+            world
+                .apply_map_artifact(&artifact)
+                .expect("valid artifact applies");
+            let baseline = world.characterization_digest_v0().expect("baseline digest");
+            let baseline_revision = world.config_revision();
+            let baseline_audit = world.config_audit().to_vec();
+
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut invalid = artifact.clone();
+                invalid.fertility.as_mut().expect("fertility").values[17] = value;
+                let encoded = postcard::to_stdvec(&invalid).expect("encode invalid fixture");
+                let imported = postcard::from_bytes::<MapArtifact>(&encoded)
+                    .expect("decode untrusted imported-map fixture");
+                let error = world
+                    .apply_map_artifact(&imported)
+                    .expect_err("invalid imported map must fail");
+                let super::super::WorldStateError::InvalidState(error) = error else {
+                    panic!("expected imported-map state error");
+                };
+                assert_eq!(error.path(), "map.fertility.values[17]");
+                assert_eq!(
+                    world
+                        .characterization_digest_v0()
+                        .expect("unchanged digest"),
+                    baseline
+                );
+                assert_eq!(world.config_revision(), baseline_revision);
+                assert_eq!(world.config_audit(), baseline_audit);
+            }
+        }
+
+        #[test]
+        fn rule_based_generator_rejects_unrepresentable_layout_before_wfc_allocation() {
+            let generator = RuleBasedMapGenerator::new(TilesetSpec {
+                id: "layout-guard".into(),
+                label: None,
+                description: None,
+                tiles: vec![TileSpec {
+                    id: "grass".into(),
+                    label: None,
+                    weight: 1,
+                    terrain_kind: TerrainKind::Grass,
+                    fertility_bias: None,
+                    temperature_bias: None,
+                    elevation: None,
+                    moisture: None,
+                    accent: None,
+                    palette_index: None,
+                    permeability: None,
+                    runoff_bias: None,
+                    basin_rank: None,
+                    channel_priority: None,
+                    swim_cost: None,
+                }],
+                adjacency: Vec::new(),
+            })
+            .expect("compile one-tile generator");
+            let error = generator
+                .generate(u32::MAX, u32::MAX, 1, 7)
+                .expect_err("oversized map must reject before WFC allocation");
+            let MapGenerationError::InvalidState(error) = error else {
+                panic!("expected typed map layout error");
+            };
+            assert_eq!(error.path(), "map.tiles");
+            assert!(matches!(
+                error,
+                ScientificStateError::DimensionOverflow { .. }
+            ));
+        }
     }
 }
 
@@ -5981,15 +6664,34 @@ pub struct HydrologyState {
 }
 
 impl HydrologyState {
-    pub fn new(tiles: HydrologyTileLayer, field: HydrologyField) -> Self {
-        let len = (tiles.width() as usize) * (tiles.height() as usize);
+    pub fn new(
+        tiles: HydrologyTileLayer,
+        field: HydrologyField,
+    ) -> Result<Self, ScientificStateError> {
+        tiles.validate()?;
+        field.validate()?;
+        let len = validated_cell_count_for::<f32>(
+            "hydrology.water_depth",
+            tiles.width(),
+            tiles.height(),
+        )?;
+        if field.width() != tiles.width() || field.height() != tiles.height() {
+            return Err(ScientificStateError::DimensionsMismatch {
+                path: "hydrology.field.dimensions".to_owned(),
+                expected_width: tiles.width(),
+                expected_height: tiles.height(),
+                actual_width: field.width(),
+                actual_height: field.height(),
+            });
+        }
         let mut water_depth = Vec::with_capacity(len);
         water_depth.extend_from_slice(field.initial_water_depth());
-        Self {
+        validate_finite_slice("hydrology.water_depth", &water_depth)?;
+        Ok(Self {
             tiles,
             field,
             water_depth,
-        }
+        })
     }
 
     pub fn tiles(&self) -> &HydrologyTileLayer {
@@ -6016,8 +6718,16 @@ impl HydrologyState {
         &self.water_depth
     }
 
-    pub fn water_depth_mut(&mut self) -> &mut [f32] {
-        &mut self.water_depth
+    /// Apply a detached bulk water-depth edit and commit only when every value is finite.
+    pub fn try_update_water_depth(
+        &mut self,
+        update: impl FnOnce(&mut [f32]),
+    ) -> Result<(), ScientificStateError> {
+        let mut candidate = self.water_depth.clone();
+        update(&mut candidate);
+        validate_finite_slice("hydrology.water_depth", &candidate)?;
+        self.water_depth = candidate;
+        Ok(())
     }
 
     pub fn total_water_depth(&self) -> f32 {
@@ -11314,9 +12024,10 @@ impl WorldState {
         &self.agents
     }
 
-    /// Mutable access to the agent arena.
+    /// Internal mutable access to trusted agent storage.
+    #[cfg(test)]
     #[must_use]
-    pub fn agents_mut(&mut self) -> &mut AgentArena {
+    fn agents_mut(&mut self) -> &mut AgentArena {
         &mut self.agents
     }
 
@@ -11336,10 +12047,38 @@ impl WorldState {
         self.last_max_age
     }
 
-    /// Spawn a new agent, returning its handle.
-    pub fn spawn_agent(&mut self, agent: AgentData) -> AgentId {
-        let id = self.agents.insert(agent);
+    /// Validate and spawn one direct-Rust agent without consuming RNG or allocator state on
+    /// rejection.
+    pub fn try_spawn_agent(&mut self, agent: AgentData) -> Result<AgentId, ScientificStateError> {
+        self.try_spawn_agent_with(agent, |_| {})
+    }
+
+    /// Validate scalar and caller-customized runtime state as one atomic spawn transaction.
+    pub fn try_spawn_agent_with(
+        &mut self,
+        agent: AgentData,
+        update_runtime: impl FnOnce(&mut AgentRuntime),
+    ) -> Result<AgentId, ScientificStateError> {
+        agent.validate()?;
+        let rng_before = self.rng.clone();
+        let mut runtime = AgentRuntime::new_random(&mut self.rng);
+        update_runtime(&mut runtime);
+        if let Err(error) = runtime.validate_at("agent.runtime") {
+            self.rng = rng_before;
+            return Err(error);
+        }
+        let id = self.agents.insert_trusted(agent);
+        self.runtime.insert(id, runtime);
+        Ok(id)
+    }
+
+    /// Internal spawn path for values constructed by trusted simulation logic.
+    #[cfg(test)]
+    fn spawn_agent(&mut self, agent: AgentData) -> AgentId {
+        debug_assert!(agent.validate().is_ok());
+        let id = self.agents.insert_trusted(agent);
         let runtime = AgentRuntime::new_random(&mut self.rng);
+        debug_assert!(runtime.validate().is_ok());
         self.runtime.insert(id, runtime);
         id
     }
@@ -11356,9 +12095,18 @@ impl WorldState {
         &self.food
     }
 
-    /// Mutable access to the food grid.
+    /// Apply a transactional bulk edit to the food field.
+    pub fn try_update_food(
+        &mut self,
+        update: impl FnOnce(&mut [f32]),
+    ) -> Result<(), ScientificStateError> {
+        self.food.try_update_cells(update)
+    }
+
+    /// Internal mutable access to the trusted food grid.
+    #[cfg(test)]
     #[must_use]
-    pub fn food_mut(&mut self) -> &mut FoodGrid {
+    fn food_mut(&mut self) -> &mut FoodGrid {
         &mut self.food
     }
 
@@ -11376,14 +12124,9 @@ impl WorldState {
     pub fn terrain(&self) -> &TerrainLayer {
         &self.terrain
     }
-    /// Mutable access to the terrain layer.
-    #[must_use]
-    pub fn terrain_mut(&mut self) -> &mut TerrainLayer {
-        &mut self.terrain
-    }
-
     /// Replace the current terrain and food fields using a pre-generated map artifact.
     pub fn apply_map_artifact(&mut self, artifact: &MapArtifact) -> Result<(), WorldStateError> {
+        artifact.validate()?;
         let terrain = artifact.terrain();
         if terrain.width() != self.food.width() || terrain.height() != self.food.height() {
             return Err(WorldStateError::InvalidConfig(
@@ -11396,26 +12139,30 @@ impl WorldState {
             ));
         }
 
-        self.terrain = terrain.clone();
-        self.food_profiles = FoodCellProfile::compute(&self.config, &self.terrain);
+        let candidate_terrain = terrain.clone();
+        let candidate_food_profiles = FoodCellProfile::compute(&self.config, &candidate_terrain);
+        let mut candidate_food = self.food.clone();
 
         if let Some(field) = artifact.fertility() {
-            if field.width() != self.food.width() || field.height() != self.food.height() {
-                return Err(WorldStateError::InvalidConfig(
-                    "fertility artifact dimensions must match existing food grid",
-                ));
-            }
             let max_food = self.config.food_max;
-            for (cell, value) in self.food.cells_mut().iter_mut().zip(field.values().iter()) {
+            for (cell, value) in candidate_food
+                .cells_mut()
+                .iter_mut()
+                .zip(field.values().iter())
+            {
                 *cell = value.clamp(0.0, 1.0) * max_food;
             }
         }
 
-        self.hydrology = match (artifact.hydrology_tiles(), artifact.hydrology_field()) {
-            (Some(tiles), Some(field)) => Some(HydrologyState::new(tiles.clone(), field.clone())),
+        let candidate_hydrology = match (artifact.hydrology_tiles(), artifact.hydrology_field()) {
+            (Some(tiles), Some(field)) => Some(HydrologyState::new(tiles.clone(), field.clone())?),
             _ => None,
         };
 
+        self.terrain = candidate_terrain;
+        self.food_profiles = candidate_food_profiles;
+        self.food = candidate_food;
+        self.hydrology = candidate_hydrology;
         self.map_metadata = Some(artifact.metadata().clone());
         Ok(())
     }
@@ -11428,11 +12175,6 @@ impl WorldState {
     /// Immutable access to hydrology state when available.
     pub fn hydrology(&self) -> Option<&HydrologyState> {
         self.hydrology.as_ref()
-    }
-
-    /// Mutable access to hydrology state when available.
-    pub fn hydrology_mut(&mut self) -> Option<&mut HydrologyState> {
-        self.hydrology.as_mut()
     }
 
     /// Immutable access to the brain registry.
@@ -11478,21 +12220,73 @@ impl WorldState {
         &self.runtime
     }
 
-    /// Mutable access to per-agent runtime metadata.
-    #[must_use]
-    pub fn runtime_mut(&mut self) -> &mut AgentMap<AgentRuntime> {
-        &mut self.runtime
-    }
-
     /// Borrow runtime data for a specific agent.
     #[must_use]
     pub fn agent_runtime(&self, id: AgentId) -> Option<&AgentRuntime> {
         self.runtime.get(id)
     }
 
-    /// Mutably borrow runtime data for a specific agent.
+    /// Transactionally edit both scalar and runtime state for one agent.
+    pub fn try_update_agent(
+        &mut self,
+        id: AgentId,
+        update: impl FnOnce(&mut AgentData, &mut AgentRuntime),
+    ) -> Result<bool, ScientificStateError> {
+        let Some(mut data) = self.agents.snapshot(id) else {
+            return Ok(false);
+        };
+        let Some(original_runtime) = self.runtime.get(id) else {
+            return Ok(false);
+        };
+        let original_brain_key = original_runtime.brain.registry_key();
+        let original_brain_kind = original_runtime.brain.kind().map(str::to_owned);
+        let mut runtime = original_runtime.clone();
+        update(&mut data, &mut runtime);
+        let agent_path = format!("agents[{}]", id.data().as_ffi());
+        data.validate_at(&agent_path)?;
+        runtime.validate_at(&format!("{agent_path}.runtime"))?;
+        let replaced = self.agents.replace_trusted(id, data);
+        debug_assert!(replaced);
+        if !runtime.brain.is_bound()
+            && runtime.brain.registry_key() == original_brain_key
+            && runtime.brain.kind() == original_brain_kind.as_deref()
+            && let Some(original_runtime) = self.runtime.get_mut(id)
+        {
+            runtime.brain = std::mem::take(&mut original_runtime.brain);
+        }
+        self.runtime.insert(id, runtime);
+        Ok(true)
+    }
+
+    /// Transactionally edit runtime metadata for one agent.
+    pub fn try_update_agent_runtime(
+        &mut self,
+        id: AgentId,
+        update: impl FnOnce(&mut AgentRuntime),
+    ) -> Result<bool, ScientificStateError> {
+        let Some(original_runtime) = self.runtime.get(id) else {
+            return Ok(false);
+        };
+        let original_brain_key = original_runtime.brain.registry_key();
+        let original_brain_kind = original_runtime.brain.kind().map(str::to_owned);
+        let mut runtime = original_runtime.clone();
+        update(&mut runtime);
+        runtime.validate_at(&format!("agents[{}].runtime", id.data().as_ffi()))?;
+        if !runtime.brain.is_bound()
+            && runtime.brain.registry_key() == original_brain_key
+            && runtime.brain.kind() == original_brain_kind.as_deref()
+            && let Some(original_runtime) = self.runtime.get_mut(id)
+        {
+            runtime.brain = std::mem::take(&mut original_runtime.brain);
+        }
+        self.runtime.insert(id, runtime);
+        Ok(true)
+    }
+
+    /// Internal mutable borrow for trusted tick logic and in-module oracle setup.
+    #[cfg(test)]
     #[must_use]
-    pub fn agent_runtime_mut(&mut self, id: AgentId) -> Option<&mut AgentRuntime> {
+    fn agent_runtime_mut(&mut self, id: AgentId) -> Option<&mut AgentRuntime> {
         self.runtime.get_mut(id)
     }
 
@@ -11685,6 +12479,15 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    fn invalid_config_message(error: WorldStateError) -> &'static str {
+        match error {
+            WorldStateError::InvalidConfig(message) => message,
+            WorldStateError::InvalidState(error) => {
+                panic!("expected configuration rejection, got state rejection: {error}")
+            }
+        }
+    }
+
     fn sample_agent(seed: u32) -> AgentData {
         AgentData {
             position: Position::new(seed as f32, seed as f32 + 1.0),
@@ -11697,6 +12500,223 @@ mod tests {
             age: seed,
             generation: Generation(seed),
         }
+    }
+
+    fn assert_non_finite_path(error: ScientificStateError, expected_path: &str) {
+        assert_eq!(error.path(), expected_path);
+        assert!(matches!(error, ScientificStateError::NonFinite { .. }));
+    }
+
+    fn assert_dimension_overflow(error: WorldStateError, expected_path: &str) {
+        let WorldStateError::InvalidState(error) = error else {
+            panic!("expected typed scientific-state rejection");
+        };
+        assert_eq!(error.path(), expected_path);
+        assert!(matches!(
+            error,
+            ScientificStateError::DimensionOverflow { .. }
+        ));
+    }
+
+    #[test]
+    fn direct_agent_ingress_rejects_each_non_finite_class_without_state_or_rng_drift() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let config = ScriptBotsConfig {
+                rng_seed: Some(0x5EA1_ED11),
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            let mut rejected = WorldState::new(config.clone()).expect("rejected world");
+            let mut reference = WorldState::new(config).expect("reference world");
+            let before = rejected
+                .characterization_digest_v0()
+                .expect("quiescent digest");
+            let before_revision = rejected.config_revision();
+            let before_audit = rejected.config_audit().to_vec();
+
+            let error = rejected
+                .try_spawn_agent(AgentData {
+                    velocity: Velocity::new(0.25, value),
+                    ..AgentData::default()
+                })
+                .expect_err("non-finite velocity must be rejected");
+            assert_non_finite_path(error, "agent.velocity.vy");
+            assert_eq!(
+                rejected
+                    .characterization_digest_v0()
+                    .expect("unchanged digest"),
+                before
+            );
+            assert_eq!(rejected.config_revision(), before_revision);
+            assert_eq!(rejected.config_audit(), before_audit);
+
+            let error = rejected
+                .try_spawn_agent_with(AgentData::default(), |runtime| {
+                    runtime.outputs[2] = value;
+                })
+                .expect_err("non-finite runtime must reject the whole spawn");
+            assert_non_finite_path(error, "agent.runtime.outputs[2]");
+            assert_eq!(
+                rejected
+                    .characterization_digest_v0()
+                    .expect("unchanged runtime-rejection digest"),
+                before
+            );
+
+            let rejected_id = rejected
+                .try_spawn_agent(AgentData::default())
+                .expect("finite follow-up spawn");
+            let reference_id = reference
+                .try_spawn_agent(AgentData::default())
+                .expect("finite reference spawn");
+            assert_eq!(rejected_id, reference_id, "allocator state must not drift");
+            assert_eq!(
+                rejected
+                    .characterization_digest_v0()
+                    .expect("follow-up digest"),
+                reference
+                    .characterization_digest_v0()
+                    .expect("reference digest"),
+                "rejection must not consume the fixed-seed random stream"
+            );
+        }
+    }
+
+    #[test]
+    fn transactional_agent_and_food_updates_are_atomic_and_report_exact_indexes() {
+        struct IngressTestBrain;
+        impl BrainRunner for IngressTestBrain {
+            fn kind(&self) -> &'static str {
+                "ingress-test"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+        }
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0xA70C_1C11),
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let agent = world
+            .try_spawn_agent_with(AgentData::default(), |runtime| {
+                runtime.energy = -0.0;
+                runtime.sensors[INPUT_SIZE - 1] = f32::MIN_POSITIVE;
+                runtime.brain = BrainBinding::with_runner(Box::new(IngressTestBrain));
+            })
+            .expect("representative finite boundaries are admitted");
+        world
+            .try_update_agent_runtime(agent, |runtime| runtime.energy = 0.75)
+            .expect("finite runtime edit");
+        assert!(
+            world
+                .agent_runtime(agent)
+                .expect("runtime")
+                .brain
+                .is_bound(),
+            "staging a finite runtime edit must preserve its non-cloneable live brain runner"
+        );
+        let baseline = world.characterization_digest_v0().expect("baseline digest");
+        let baseline_food = world.food().cells().to_vec();
+        let baseline_revision = world.config_revision();
+        let baseline_audit = world.config_audit().to_vec();
+
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = world
+                .try_update_agent(agent, |data, runtime| {
+                    data.heading = 0.75;
+                    runtime.sensors[7] = value;
+                })
+                .expect_err("runtime non-finite value must reject the whole candidate");
+            assert_non_finite_path(
+                error,
+                &format!("agents[{}].runtime.sensors[7]", agent.raw()),
+            );
+            assert_eq!(
+                world
+                    .characterization_digest_v0()
+                    .expect("unchanged agent digest"),
+                baseline,
+                "the finite scalar edit must roll back with the invalid runtime edit"
+            );
+
+            let error = world
+                .try_update_food(|cells| {
+                    cells[0] = 0.125;
+                    cells[3] = value;
+                })
+                .expect_err("bulk food update must reject non-finite cell");
+            assert_non_finite_path(error, "food.cells[3]");
+            assert_eq!(world.food().cells(), baseline_food);
+            assert_eq!(world.config_revision(), baseline_revision);
+            assert_eq!(world.config_audit(), baseline_audit);
+        }
+    }
+
+    #[test]
+    fn detached_food_and_dense_agent_boundaries_cover_empty_single_and_bulk_values() {
+        let mut columns = AgentColumns::new();
+        assert!(columns.is_empty());
+        columns
+            .try_push(AgentData::default())
+            .expect("single finite row");
+        columns
+            .try_push(AgentData {
+                position: Position::new(-0.0, f32::MIN_POSITIVE),
+                ..AgentData::default()
+            })
+            .expect("bulk finite row");
+        let before_len = columns.len();
+        let error = columns
+            .try_push(AgentData {
+                color: [0.0, f32::INFINITY, 1.0],
+                ..AgentData::default()
+            })
+            .expect_err("invalid append must reject before touching any column");
+        assert_non_finite_path(error, "agents[2].color[1]");
+        assert_eq!(columns.len(), before_len);
+
+        let mut food = FoodGrid::new(2, 2, -0.0).expect("finite initial field");
+        food.try_replace_cells(vec![0.0, 0.25, 0.5, 1.0])
+            .expect("finite bulk replacement");
+        let before = food.cells().to_vec();
+        let error = food
+            .try_replace_cells(vec![0.0])
+            .expect_err("short replacement must reject atomically");
+        assert_eq!(error.path(), "food.cells");
+        assert_eq!(food.cells(), before);
+        let error = FoodGrid::new(1, 1, f32::NAN).expect_err("invalid single cell");
+        let WorldStateError::InvalidState(error) = error else {
+            panic!("expected typed state error");
+        };
+        assert_non_finite_path(error, "food.initial");
+    }
+
+    #[test]
+    fn public_dense_allocators_reject_unrepresentable_layouts_before_allocation_or_rng_use() {
+        assert_dimension_overflow(
+            FoodGrid::new(u32::MAX, u32::MAX, 0.0)
+                .expect_err("oversized food layout must be rejected"),
+            "food",
+        );
+
+        let mut rng = SmallRng::seed_from_u64(0xA110_CAFE);
+        let mut untouched_rng = rng.clone();
+        assert_dimension_overflow(
+            TerrainLayer::generate(u32::MAX, u32::MAX, 1, &mut rng)
+                .expect_err("oversized terrain layout must be rejected"),
+            "terrain.tiles",
+        );
+        assert_eq!(
+            rng.next_u64(),
+            untouched_rng.next_u64(),
+            "layout rejection must happen before terrain generation consumes RNG"
+        );
     }
 
     #[test]
@@ -11805,7 +12825,7 @@ mod tests {
         *grid.get_mut(2, 0).expect("cell") = 3.0;
         assert_eq!(grid.get(2, 0), Some(3.0));
         assert!(grid.get(5, 0).is_none());
-        grid.fill(2.0);
+        grid.fill(2.0).expect("finite fill");
         assert!(
             grid.cells()
                 .iter()
@@ -12081,9 +13101,12 @@ mod tests {
             for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
                 let mut config = ScriptBotsConfig::default();
                 setter(&mut config, value);
-                let WorldStateError::InvalidConfig(message) = config
+                let error = config
                     .validate()
                     .expect_err("every non-finite public config float must be rejected");
+                let WorldStateError::InvalidConfig(message) = error else {
+                    panic!("non-finite config unexpectedly produced state error: {error}");
+                };
                 assert!(
                     message.starts_with(field),
                     "{field}={value:?} produced unrelated validation error: {message}"
@@ -12376,9 +13399,11 @@ mod tests {
             food_capacity_fertility: 0.5,
             ..ScriptBotsConfig::default()
         };
-        let WorldStateError::InvalidConfig(message) = capacity
-            .validate()
-            .expect_err("capacity fractions above one must be rejected");
+        let message = invalid_config_message(
+            capacity
+                .validate()
+                .expect_err("capacity fractions above one must be rejected"),
+        );
         assert_eq!(
             message,
             "food_capacity_base + food_capacity_fertility must be <= 1.0"
@@ -12388,9 +13413,11 @@ mod tests {
             reproduction_energy_cost: 0.66,
             ..ScriptBotsConfig::default()
         };
-        let WorldStateError::InvalidConfig(message) = reproduction
-            .validate()
-            .expect_err("reproduction cost above threshold must be rejected");
+        let message = invalid_config_message(
+            reproduction
+                .validate()
+                .expect_err("reproduction cost above threshold must be rejected"),
+        );
         assert_eq!(
             message,
             "reproduction_energy_cost cannot exceed reproduction_energy_threshold"
@@ -12401,9 +13428,11 @@ mod tests {
             aging_health_decay_max: 0.01,
             ..ScriptBotsConfig::default()
         };
-        let WorldStateError::InvalidConfig(message) = aging
-            .validate()
-            .expect_err("enabled aging decay must fit within its cap");
+        let message = invalid_config_message(
+            aging
+                .validate()
+                .expect_err("enabled aging decay must fit within its cap"),
+        );
         assert_eq!(
             message,
             "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled"
@@ -12479,7 +13508,7 @@ mod tests {
     fn config_validation_rejects_excessive_food_waste() {
         let mut config = ScriptBotsConfig::default();
         config.food_waste_rate = config.food_max + 0.1;
-        let WorldStateError::InvalidConfig(message) = WorldState::new(config).unwrap_err();
+        let message = invalid_config_message(WorldState::new(config).unwrap_err());
         assert!(
             message.contains("food_waste_rate"),
             "expected food_waste_rate validation error, got {message}"
@@ -16865,9 +17894,11 @@ mod tests {
 
         let mut invalid = world.config().clone();
         invalid.food_growth_rate = f32::NAN;
-        let WorldStateError::InvalidConfig(message) = world
-            .apply_config_update(invalid)
-            .expect_err("non-finite runtime update must be rejected");
+        let message = invalid_config_message(
+            world
+                .apply_config_update(invalid)
+                .expect_err("non-finite runtime update must be rejected"),
+        );
         assert_eq!(message, "food_growth_rate must be finite");
         assert_eq!(
             serde_json::to_value(world.config()).expect("serialize unchanged config"),
@@ -16885,9 +17916,11 @@ mod tests {
             speed_multiplier: Some(f32::NAN),
             step_once: false,
         };
-        let WorldStateError::InvalidConfig(message) = world
-            .enqueue_simulation_command(command)
-            .expect_err("non-finite speed must be rejected");
+        let message = invalid_config_message(
+            world
+                .enqueue_simulation_command(command)
+                .expect_err("non-finite speed must be rejected"),
+        );
         assert_eq!(message, "speed_multiplier must be finite");
         assert!(world.drain_simulation_commands().is_empty());
     }

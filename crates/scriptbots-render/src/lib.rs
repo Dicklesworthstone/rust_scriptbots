@@ -16,8 +16,8 @@ use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
     BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, NUM_EYES,
     OutputChannel, OutputsExt, Position, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
-    SelectionState, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
-    TraitModifiers, Velocity, WorldState,
+    SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer,
+    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -1796,29 +1796,14 @@ impl SimulationView {
     }
 
     fn clear_all_selections(&mut self) -> bool {
-        let prev_hover = self
-            .inspector
-            .lock()
-            .map(|state| state.hovered_agent)
-            .unwrap_or(None);
-
         let mut changed = false;
         if let Ok(mut world) = self.world.lock() {
-            let runtime = world.runtime_mut();
-            for entry in runtime.values_mut() {
-                if !matches!(entry.selection, SelectionState::None) {
-                    entry.selection = SelectionState::None;
-                    changed = true;
-                }
-            }
-
-            if let Some(prev) = prev_hover
-                && let Some(entry) = runtime.get_mut(prev)
-                && matches!(entry.selection, SelectionState::Hovered)
-            {
-                entry.selection = SelectionState::None;
-                changed = true;
-            }
+            let result = world.apply_selection_update(SelectionUpdate {
+                mode: SelectionMode::Clear,
+                agent_ids: Vec::new(),
+                state: SelectionState::None,
+            });
+            changed = result.cleared > 0;
         }
 
         if let Ok(mut inspector) = self.inspector.lock() {
@@ -1845,15 +1830,13 @@ impl SimulationView {
             return cleared;
         };
 
-        let (prior_focus, prev_hover) = self
+        let prior_focus = self
             .inspector
             .lock()
-            .map(|state| (state.focused_agent, state.hovered_agent))
-            .unwrap_or((None, None));
+            .map(|state| state.focused_agent)
+            .unwrap_or(None);
 
-        let mut selection_changed = false;
         let mut candidate_id = None;
-        let selected_after: Vec<AgentId>;
 
         let mut world = match self.world.lock() {
             Ok(world) => world,
@@ -1863,55 +1846,41 @@ impl SimulationView {
         let pick_radius = self.selection_pick_radius(&world);
         let candidate = self.pick_agent_near(&world, world_point, pick_radius);
 
-        {
-            let runtime = world.runtime_mut();
-
-            if !extend {
-                for entry in runtime.values_mut() {
-                    if !matches!(entry.selection, SelectionState::None) {
-                        entry.selection = SelectionState::None;
-                        selection_changed = true;
-                    }
-                }
+        let was_selected = candidate.is_some_and(|id| {
+            world
+                .agent_runtime(id)
+                .is_some_and(|entry| matches!(entry.selection, SelectionState::Selected))
+        });
+        let (mode, state, ids) = match (extend, candidate, was_selected) {
+            (false, Some(id), _) => {
+                candidate_id = Some(id);
+                (
+                    SelectionMode::Replace,
+                    SelectionState::Selected,
+                    vec![id.raw()],
+                )
             }
-
-            if let Some(id) = candidate
-                && let Some(entry) = runtime.get_mut(id)
-            {
-                let was_selected = matches!(entry.selection, SelectionState::Selected);
-                match (extend, was_selected) {
-                    (true, true) => {
-                        entry.selection = SelectionState::None;
-                        selection_changed = true;
-                    }
-                    (_, false) => {
-                        entry.selection = SelectionState::Selected;
-                        selection_changed = true;
-                        candidate_id = Some(id);
-                    }
-                    _ => {
-                        candidate_id = Some(id);
-                    }
-                }
-            } else if !extend {
-                candidate_id = None;
+            (false, None, _) => (SelectionMode::Clear, SelectionState::None, Vec::new()),
+            (true, Some(id), true) => (SelectionMode::Clear, SelectionState::None, vec![id.raw()]),
+            (true, Some(id), false) => {
+                candidate_id = Some(id);
+                (SelectionMode::Add, SelectionState::Selected, vec![id.raw()])
             }
-
-            if let Some(prev) = prev_hover
-                && let Some(entry) = runtime.get_mut(prev)
-                && matches!(entry.selection, SelectionState::Hovered)
-            {
-                entry.selection = SelectionState::None;
-                selection_changed = true;
-            }
-
-            selected_after = runtime
-                .iter()
-                .filter_map(|(id, entry)| {
-                    matches!(entry.selection, SelectionState::Selected).then_some(id)
-                })
-                .collect();
-        }
+            (true, None, _) => (SelectionMode::Add, SelectionState::Selected, Vec::new()),
+        };
+        let result = world.apply_selection_update(SelectionUpdate {
+            mode,
+            agent_ids: ids,
+            state,
+        });
+        let selection_changed = result.applied > 0 || result.cleared > 0;
+        let selected_after: Vec<AgentId> = world
+            .runtime()
+            .iter()
+            .filter_map(|(id, entry)| {
+                matches!(entry.selection, SelectionState::Selected).then_some(id)
+            })
+            .collect();
 
         drop(world);
 
@@ -1985,27 +1954,32 @@ impl SimulationView {
         let mut selection_changed = false;
 
         if let Ok(mut world) = self.world.lock() {
-            let runtime = world.runtime_mut();
-
             if let Some(prev) = prev_hover
-                && let Some(entry) = runtime.get_mut(prev)
-                && matches!(entry.selection, SelectionState::Hovered)
+                && world
+                    .agent_runtime(prev)
+                    .is_some_and(|entry| matches!(entry.selection, SelectionState::Hovered))
             {
-                entry.selection = SelectionState::None;
-                selection_changed = true;
+                let result = world.apply_selection_update(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: vec![prev.raw()],
+                    state: SelectionState::None,
+                });
+                selection_changed |= result.cleared > 0;
             }
 
             if let Some(curr) = hovered {
-                if runtime
-                    .get(curr)
+                if world
+                    .agent_runtime(curr)
                     .is_some_and(|entry| matches!(entry.selection, SelectionState::Selected))
                 {
                     desired = None;
-                } else if let Some(entry) = runtime.get_mut(curr)
-                    && !matches!(entry.selection, SelectionState::Hovered)
-                {
-                    entry.selection = SelectionState::Hovered;
-                    selection_changed = true;
+                } else {
+                    let result = world.apply_selection_update(SelectionUpdate {
+                        mode: SelectionMode::Add,
+                        agent_ids: vec![curr.raw()],
+                        state: SelectionState::Hovered,
+                    });
+                    selection_changed |= result.applied > 0;
                 }
             }
         } else {
@@ -3116,10 +3090,12 @@ impl SimulationView {
             inspector.focused_agent = Some(agent_id);
         }
 
-        if let Ok(mut world) = self.world.lock()
-            && let Some(runtime) = world.runtime_mut().get_mut(agent_id)
-        {
-            runtime.selection = SelectionState::Selected;
+        if let Ok(mut world) = self.world.lock() {
+            world.apply_selection_update(SelectionUpdate {
+                mode: SelectionMode::Add,
+                agent_ids: vec![agent_id.raw()],
+                state: SelectionState::Selected,
+            });
         }
 
         cx.notify();
@@ -3200,16 +3176,14 @@ impl SimulationView {
         let mut first_selected: Option<AgentId> = None;
         {
             if let Ok(mut world) = self.world.lock() {
-                let runtime = world.runtime_mut();
-                for (id, entry) in runtime.iter_mut() {
-                    if entry.selection != SelectionState::Selected {
-                        entry.selection = SelectionState::Selected;
-                        changed = true;
-                    }
-                    if first_selected.is_none() {
-                        first_selected = Some(id);
-                    }
-                }
+                let ids = world.agents().iter_handles().collect::<Vec<_>>();
+                first_selected = ids.first().copied();
+                let result = world.apply_selection_update(SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: ids.into_iter().map(AgentId::raw).collect(),
+                    state: SelectionState::Selected,
+                });
+                changed = result.applied > 0 || result.cleared > 0;
             }
         }
         if changed {
@@ -3326,13 +3300,19 @@ impl SimulationView {
                 warn!(error = %error, "Mutation-rate edit blocked by terminal simulation failure");
                 return;
             }
-            let Some(runtime) = world.runtime_mut().get_mut(agent_id) else {
-                return;
-            };
-            runtime.mutation_rates.primary =
-                (runtime.mutation_rates.primary + delta_primary).max(0.0001);
-            runtime.mutation_rates.secondary =
-                (runtime.mutation_rates.secondary + delta_secondary).max(0.0);
+            match world.try_update_agent_runtime(agent_id, |runtime| {
+                runtime.mutation_rates.primary =
+                    (runtime.mutation_rates.primary + delta_primary).max(0.0001);
+                runtime.mutation_rates.secondary =
+                    (runtime.mutation_rates.secondary + delta_secondary).max(0.0);
+            }) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    warn!(%error, "Rejected non-finite agent mutation-rate edit");
+                    return;
+                }
+            }
         }
 
         cx.notify();
@@ -4146,11 +4126,13 @@ impl SimulationView {
             color,
             ..AgentData::default()
         };
-        let agent_id = world.spawn_agent(agent);
-        if let Some(runtime) = world.runtime_mut().get_mut(agent_id) {
+        let Ok(agent_id) = world.try_spawn_agent_with(agent, |runtime| {
             runtime.herbivore_tendency = herbivore_bias.clamp(0.0, 1.0);
             runtime.energy = runtime.energy.max(1.0);
-        }
+        }) else {
+            warn!("Rejected non-finite agent spawn");
+            return false;
+        };
         info!(agent = ?agent_id, bias = herbivore_bias, "Spawned agent");
         true
     }
@@ -4195,8 +4177,7 @@ impl SimulationView {
                     ..AgentData::default()
                 };
 
-                let child_id = world.spawn_agent(child);
-                if let Some(runtime) = world.runtime_mut().get_mut(child_id) {
+                let Ok(child_id) = world.try_spawn_agent_with(child, |runtime| {
                     runtime.herbivore_tendency = (parent_a.runtime.herbivore_tendency
                         + parent_b.runtime.herbivore_tendency)
                         * 0.5;
@@ -4208,7 +4189,10 @@ impl SimulationView {
                         * 0.5;
                     runtime.indicator.intensity = 0.6;
                     runtime.indicator.color = [0.2, 0.8, 0.9];
-                }
+                }) else {
+                    warn!("Rejected non-finite crossover agent spawn");
+                    return;
+                };
                 info!(child = ?child_id, "Spawned crossover agent");
                 spawned = true;
             }

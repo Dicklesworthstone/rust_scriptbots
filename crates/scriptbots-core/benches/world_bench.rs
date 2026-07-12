@@ -109,7 +109,9 @@ fn bench_world_steps(c: &mut Criterion) {
                             0,
                             scriptbots_core::Generation(0),
                         );
-                        world.spawn_agent(data);
+                        world
+                            .try_spawn_agent(data)
+                            .expect("benchmark agent is finite");
                     }
                     world
                 },

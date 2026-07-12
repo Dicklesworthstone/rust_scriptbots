@@ -499,7 +499,9 @@ fn seed_agents(
             )
         };
 
-        let id = world.spawn_agent(agent);
+        let id = world
+            .try_spawn_agent(agent)
+            .context("generated web agent must be finite")?;
         if let Some(key) = mlp_key {
             ensure!(
                 world
@@ -564,13 +566,13 @@ pub fn decode_snapshot_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
 }
 
 fn bind_wander_brain(world: &mut WorldState, agent: AgentId, seed: u64) -> Result<()> {
-    if let Some(runtime) = world.agent_runtime_mut(agent) {
+    match world.try_update_agent_runtime(agent, |runtime| {
         runtime.brain = BrainBinding::with_runner(Box::new(WanderBrain::new(seed)));
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
+    })? {
+        true => Ok(()),
+        false => Err(anyhow::anyhow!(
             "agent runtime missing while binding wander brain"
-        ))
+        )),
     }
 }
 
