@@ -1491,35 +1491,64 @@ pub struct PersistenceBatch {
 
 /// Persistence sink invoked after each tick.
 pub trait WorldPersistence: Send {
-    /// Admit a completed tick without silently discarding a rejected batch.
+    /// Admit a completed tick without silently discarding an unacknowledged batch.
     ///
-    /// An error guarantees that the batch was not admitted and is therefore safe for the world
-    /// host to retain and retry exactly once after the sink has been recovered or replaced.
+    /// An error means the caller has no admission proof and must retain the exact batch. A sink
+    /// must either prove `NotAdmitted` or make an indeterminate acknowledgement failure safe to
+    /// retry through stable identity and exact-payload deduplication. A changed payload is never
+    /// a valid retry for the same completed tick.
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError>;
+}
+
+/// What the caller knows about a completed batch after admission failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceAdmissionState {
+    /// The sink proved that the completed batch did not enter durable admission state.
+    NotAdmitted,
+    /// Admission may have committed, but its acknowledgement did not reach the caller.
+    Indeterminate,
 }
 
 /// Typed rejection at the lossless persistence admission boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("persistence rejected completed simulation tick {tick}: {detail}")]
+#[error("persistence did not acknowledge completed simulation tick {tick} ({state:?}): {detail}")]
 pub struct PersistenceAdmissionError {
     tick: u64,
+    state: PersistenceAdmissionState,
     detail: String,
 }
 
 impl PersistenceAdmissionError {
-    /// Create an admission failure while preserving the backend's diagnostic text.
+    /// Create a proven non-admission failure while preserving the backend's diagnostic text.
     #[must_use]
     pub fn new(tick: u64, detail: impl Into<String>) -> Self {
         Self {
             tick,
+            state: PersistenceAdmissionState::NotAdmitted,
             detail: detail.into(),
         }
     }
 
-    /// Completed tick that was definitely not admitted.
+    /// Create an acknowledgement failure whose admission outcome is indeterminate.
+    #[must_use]
+    pub fn indeterminate(tick: u64, detail: impl Into<String>) -> Self {
+        Self {
+            tick,
+            state: PersistenceAdmissionState::Indeterminate,
+            detail: detail.into(),
+        }
+    }
+
+    /// Completed tick whose exact batch must remain available for retry.
     #[must_use]
     pub const fn tick(&self) -> u64 {
         self.tick
+    }
+
+    /// Proven non-admission versus a lost acknowledgement after possible admission.
+    #[must_use]
+    pub const fn state(&self) -> PersistenceAdmissionState {
+        self.state
     }
 
     /// Backend diagnostic suitable for structured host reporting.
@@ -8843,10 +8872,11 @@ impl WorldState {
         self.persistence = persistence;
     }
 
-    /// Retry the exact completed batch retained after a definite admission rejection.
+    /// Retry the exact completed batch retained after an unacknowledged admission attempt.
     ///
     /// Returns `Ok(true)` after admitting a retained batch, `Ok(false)` when no retry was
-    /// pending, and leaves the world latched on the same batch after another rejection.
+    /// pending, and leaves the world latched on the same batch after another definite or
+    /// indeterminate admission failure.
     pub fn retry_pending_persistence(&mut self) -> Result<bool, PersistenceAdmissionError> {
         let Some(batch) = self.pending_persistence_batch.take() else {
             debug_assert!(self.persistence_fault.is_none());
@@ -8868,9 +8898,10 @@ impl WorldState {
 
     /// Admit the final partial persistence-cadence batch, if one exists.
     ///
-    /// This is idempotent at a completed tick boundary. It proves only synchronous admission to
-    /// the configured sink; callers must still obtain the sink's flush or shutdown receipt before
-    /// claiming that the batch committed.
+    /// This is idempotent at a completed tick boundary. It proves only the configured sink's
+    /// synchronous admission guarantee. The FrankenSQLite file sink thereby proves its durable
+    /// outbox commit; callers still need a flush or shutdown receipt before claiming scientific
+    /// table application and terminal durable-watermark advancement.
     pub fn finalize_persistence(&mut self) -> Result<bool, PersistenceAdmissionError> {
         if let Some(error) = &self.persistence_fault {
             return Err(error.clone());
@@ -10021,6 +10052,7 @@ mod tests {
             .step()
             .expect_err("definite persistence rejection must fail the completed tick");
         assert_eq!(first_error.tick(), 1);
+        assert_eq!(first_error.state(), PersistenceAdmissionState::NotAdmitted);
         assert_eq!(world.tick(), Tick(1));
         assert!(world.has_pending_persistence_batch());
         assert_eq!(world.persistence_fault(), Some(&first_error));

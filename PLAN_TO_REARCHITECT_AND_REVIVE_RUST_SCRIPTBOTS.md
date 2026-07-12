@@ -794,6 +794,8 @@ Empty-versus-empty is reported as `NoEvidence`, never “matched.”
 
 ### 7.5 bounded storage worker
 
+**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, strict single-writer/validated repair mode, ordered/idempotent recovery, bounded controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs implemented under `bd-2z0.8.9.4`; queue telemetry and strict-run pause/fail-closed host policy remain under `bd-2z0.4.10`, Codex, 2026-07-12]
+
 The current unbounded storage channel carrying cloned full batches can exhaust memory. The new worker uses:
 
 - a bounded queue sized from measured write throughput;

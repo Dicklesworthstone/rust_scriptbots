@@ -10116,8 +10116,10 @@ name = "scriptbots-storage"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "blake3",
  "crossbeam-channel",
  "fsqlite",
+ "libc",
  "scriptbots-core",
  "serde",
  "serde_json",

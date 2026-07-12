@@ -9,17 +9,18 @@ use fsqlite::{
 };
 use scriptbots_core::{
     AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord,
-    PersistenceAdmissionError, PersistenceBatch, PersistenceEventKind, ReplayAgentPhase,
-    ReplayEvent, ReplayEventKind, ReplayRngScope, WorldPersistence,
+    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
+    ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, WorldPersistence,
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
 use slotmap::{Key, KeyData};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -31,7 +32,14 @@ const DEFAULT_METRIC_BUFFER: usize = 256;
 const DEFAULT_LIFECYCLE_BUFFER: usize = 512;
 const DEFAULT_REPLAY_BUFFER: usize = 1024;
 const DEFAULT_COMMAND_CAPACITY: usize = 8;
+const DEFAULT_STARTUP_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_COMMAND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_ADMISSION_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
+const OUTBOX_PAYLOAD_VERSION: u32 = 1;
 
 const SCRIPTBOTS_SCHEMA_V1: &str = "
     CREATE TABLE ticks (
@@ -144,6 +152,32 @@ const SCRIPTBOTS_SCHEMA_V1: &str = "
     );
 ";
 
+const SCRIPTBOTS_SCHEMA_V2: &str = "
+    CREATE TABLE storage_progress (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        admitted_batch_id INTEGER NOT NULL CHECK (admitted_batch_id >= 0),
+        applied_batch_id INTEGER NOT NULL CHECK (
+            applied_batch_id >= 0 AND applied_batch_id <= admitted_batch_id
+        ),
+        durable_batch_id INTEGER NOT NULL CHECK (
+            durable_batch_id >= 0 AND durable_batch_id <= applied_batch_id
+        )
+    );
+    INSERT INTO storage_progress (
+        singleton, admitted_batch_id, applied_batch_id, durable_batch_id
+    ) VALUES (1, 0, 0, 0);
+    CREATE TABLE storage_batch_ledger (
+        batch_id INTEGER PRIMARY KEY CHECK (batch_id > 0),
+        tick INTEGER NOT NULL UNIQUE CHECK (tick >= 0),
+        payload_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('admitted', 'applied', 'durable'))
+    );
+    CREATE TABLE storage_outbox (
+        batch_id INTEGER PRIMARY KEY CHECK (batch_id > 0),
+        payload TEXT NOT NULL
+    );
+";
+
 const AGENT_COLUMNS: &[&str] = &[
     "tick",
     "agent_id",
@@ -210,6 +244,12 @@ pub enum StorageError {
         context: &'static str,
         reason: String,
     },
+    #[error("storage filesystem operation failed for {path}: {source}")]
+    Filesystem {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Worker(#[from] StorageWorkerError),
     #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
@@ -220,9 +260,11 @@ pub enum StorageError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageOperation {
     Startup,
+    Recovery,
     Admit,
     Persist,
     Flush,
+    Durability,
     Shutdown,
     Close,
     Join,
@@ -235,6 +277,14 @@ pub enum FailureCommitState {
     RolledBack,
     Indeterminate,
     Committed,
+}
+
+/// Controller-side wait phase that exhausted its configured deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageWaitPhase {
+    AdmissionGate,
+    CommandEnqueue,
+    Acknowledgement,
 }
 
 /// Structured error crossing the storage worker boundary.
@@ -252,6 +302,17 @@ pub enum StorageWorkerError {
         commit_state: FailureCommitState,
         #[source]
         source: FrankenError,
+    },
+    #[error(
+        "storage {operation:?} timed out during {phase:?} at {path} after {waited:?} (tick={tick:?}, commit_state={commit_state:?})"
+    )]
+    Timeout {
+        operation: StorageOperation,
+        phase: StorageWaitPhase,
+        path: String,
+        tick: Option<u64>,
+        waited: Duration,
+        commit_state: FailureCommitState,
     },
     #[error(
         "storage {operation:?} channel failed at {path} (tick={tick:?}, commit_state={commit_state:?}): {detail}"
@@ -292,6 +353,7 @@ pub struct StorageFailureStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StorageFailureKind {
     Channel,
+    Timeout,
     Internal,
     Database,
 }
@@ -317,6 +379,23 @@ impl StorageWorkerError {
                 transient: *transient,
                 commit_state: *commit_state,
                 detail: source.to_string(),
+            },
+            Self::Timeout {
+                operation,
+                phase,
+                path,
+                tick,
+                waited,
+                commit_state,
+            } => StorageFailureStatus {
+                kind: StorageFailureKind::Timeout,
+                operation: *operation,
+                path: Some(path.clone()),
+                tick: *tick,
+                attempt: 0,
+                transient: true,
+                commit_state: *commit_state,
+                detail: format!("{phase:?} deadline exhausted after {waited:?}"),
             },
             Self::Channel {
                 operation,
@@ -351,6 +430,16 @@ impl StorageWorkerError {
                 detail: detail.clone(),
             },
         }
+    }
+
+    fn with_commit_state(mut self, state: FailureCommitState) -> Self {
+        match &mut self {
+            Self::Database { commit_state, .. }
+            | Self::Timeout { commit_state, .. }
+            | Self::Channel { commit_state, .. }
+            | Self::Internal { commit_state, .. } => *commit_state = state,
+        }
+        self
     }
 }
 
@@ -397,7 +486,7 @@ fn worker_error_from_storage(
 }
 
 /// Summary row written to the `ticks` table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TickRow {
     tick: i64,
     epoch: i64,
@@ -411,7 +500,7 @@ struct TickRow {
 }
 
 /// Metric row written to the `metrics` table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetricRow {
     tick: i64,
     name: String,
@@ -419,7 +508,7 @@ struct MetricRow {
 }
 
 /// Event row persisted for analytics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventRow {
     tick: i64,
     kind: String,
@@ -467,12 +556,114 @@ pub struct RunLedgerSummary {
     pub death_events: u64,
 }
 
+/// Monotonic identifier assigned when a lossless batch enters the durable outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PersistenceBatchId(u64);
+
+impl PersistenceBatchId {
+    /// Construct an identifier from its persisted positive integer representation.
+    fn new(value: u64) -> Result<Self, StorageError> {
+        if value == 0 || value > i64::MAX as u64 {
+            return Err(StorageError::InvalidData {
+                context: "storage_batch_ledger.batch_id",
+                reason: format!("batch id {value} is outside 1..=i64::MAX"),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the stable integer representation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+}
+
+/// Monotonic prefixes proven at each persistence boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistenceWatermarks {
+    /// Highest batch whose exact payload was admitted to the outbox.
+    pub admitted: Option<PersistenceBatchId>,
+    /// Highest contiguous batch atomically applied to the scientific tables.
+    pub applied: Option<PersistenceBatchId>,
+    /// Highest contiguous file-backed batch carrying a durable marker.
+    pub durable: Option<PersistenceBatchId>,
+}
+
+impl PersistenceWatermarks {
+    fn from_raw(admitted: i64, applied: i64, durable: i64) -> Result<Self, StorageError> {
+        if admitted < 0 || applied < 0 || durable < 0 || durable > applied || applied > admitted {
+            return Err(StorageError::InvalidData {
+                context: "storage_progress",
+                reason: format!(
+                    "invalid watermark ordering durable={durable}, applied={applied}, admitted={admitted}"
+                ),
+            });
+        }
+        let decode = |value: i64| -> Result<Option<PersistenceBatchId>, StorageError> {
+            if value == 0 {
+                Ok(None)
+            } else {
+                PersistenceBatchId::new(value as u64).map(Some)
+            }
+        };
+        Ok(Self {
+            admitted: decode(admitted)?,
+            applied: decode(applied)?,
+            durable: decode(durable)?,
+        })
+    }
+
+    fn admitted_raw(self) -> i64 {
+        self.admitted.map_or(0, PersistenceBatchId::as_i64)
+    }
+
+    fn applied_raw(self) -> i64 {
+        self.applied.map_or(0, PersistenceBatchId::as_i64)
+    }
+
+    fn durable_raw(self) -> i64 {
+        self.durable.map_or(0, PersistenceBatchId::as_i64)
+    }
+}
+
+/// Durable ledger state for one admitted persistence batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchPersistenceState {
+    Admitted,
+    Applied,
+    Durable,
+}
+
+/// Query result for one batch in the compact persistence ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedBatchStatus {
+    pub batch_id: PersistenceBatchId,
+    pub tick: u64,
+    pub payload_digest: String,
+    pub state: BatchPersistenceState,
+}
+
+/// Synchronous proof that the exact batch payload entered the worker outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionReceipt {
+    pub batch_id: PersistenceBatchId,
+    pub tick: u64,
+    pub guarantee: PersistenceGuarantee,
+    pub watermarks: PersistenceWatermarks,
+}
+
 /// Immutable, lock-free read model published after successful storage commits.
 #[derive(Debug, Clone)]
 pub struct AnalyticsSnapshot {
     pub revision: u64,
     pub committed_tick: Option<u64>,
     pub committed_agent_count: Option<usize>,
+    pub watermarks: PersistenceWatermarks,
     pub readings: Arc<[MetricReading]>,
     pub last_error: Option<Arc<str>>,
     pub last_failure: Option<Arc<StorageFailureStatus>>,
@@ -485,6 +676,7 @@ impl Default for AnalyticsSnapshot {
             revision: 0,
             committed_tick: None,
             committed_agent_count: None,
+            watermarks: PersistenceWatermarks::default(),
             readings: Arc::from([]),
             last_error: None,
             last_failure: None,
@@ -512,7 +704,25 @@ impl AnalyticsSnapshotProvider {
         self.inner.load_full()
     }
 
-    fn publish_committed(&self, pending: PendingAnalytics) {
+    fn publish_progress(&self, watermarks: PersistenceWatermarks) {
+        self.inner.rcu(|current| {
+            if current.stopped || current.watermarks == watermarks {
+                return Arc::clone(current);
+            }
+            Arc::new(AnalyticsSnapshot {
+                revision: current.revision.saturating_add(1),
+                committed_tick: current.committed_tick,
+                committed_agent_count: current.committed_agent_count,
+                watermarks,
+                readings: Arc::clone(&current.readings),
+                last_error: current.last_error.clone(),
+                last_failure: current.last_failure.clone(),
+                stopped: false,
+            })
+        });
+    }
+
+    fn publish_committed(&self, pending: PendingAnalytics, watermarks: PersistenceWatermarks) {
         self.inner.rcu(|current| {
             if current.stopped {
                 return Arc::clone(current);
@@ -521,6 +731,7 @@ impl AnalyticsSnapshotProvider {
                 revision: current.revision.saturating_add(1),
                 committed_tick: Some(pending.tick),
                 committed_agent_count: Some(pending.agent_count),
+                watermarks,
                 readings: Arc::clone(&pending.readings),
                 last_error: None,
                 last_failure: None,
@@ -545,6 +756,7 @@ impl AnalyticsSnapshotProvider {
                 revision: current.revision.saturating_add(1),
                 committed_tick: current.committed_tick,
                 committed_agent_count: current.committed_agent_count,
+                watermarks: current.watermarks,
                 readings: Arc::clone(&current.readings),
                 last_error: Some(Arc::clone(&error_text)),
                 last_failure: Some(Arc::clone(&incoming)),
@@ -562,6 +774,7 @@ impl AnalyticsSnapshotProvider {
                 revision: current.revision.saturating_add(1),
                 committed_tick: current.committed_tick,
                 committed_agent_count: current.committed_agent_count,
+                watermarks: current.watermarks,
                 readings: Arc::clone(&current.readings),
                 last_error: current.last_error.clone(),
                 last_failure: current.last_failure.clone(),
@@ -619,7 +832,7 @@ impl PreparedPersistenceBatch {
 }
 
 /// Agent snapshot row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentRow {
     tick: i64,
     agent_id: i64,
@@ -662,7 +875,7 @@ struct AgentRow {
     hit_by_herbivore: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BirthRow {
     tick: i64,
     agent_id: i64,
@@ -677,7 +890,7 @@ struct BirthRow {
     is_hybrid: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeathRow {
     tick: i64,
     agent_id: i64,
@@ -698,7 +911,7 @@ struct DeathRow {
     hit_by_herbivore: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReplayEventRow {
     tick: i64,
     seq: i64,
@@ -723,7 +936,7 @@ pub struct PersistedReplayEvent {
     pub event: ReplayEvent,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct StorageBuffer {
     ticks: Vec<TickRow>,
     metrics: Vec<MetricRow>,
@@ -732,6 +945,28 @@ struct StorageBuffer {
     births: Vec<BirthRow>,
     deaths: Vec<DeathRow>,
     replay_events: Vec<ReplayEventRow>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OutboxPayload {
+    version: u32,
+    tick: u64,
+    storage: StorageBuffer,
+}
+
+#[derive(Serialize)]
+struct OutboxPayloadRef<'a> {
+    version: u32,
+    tick: u64,
+    storage: &'a StorageBuffer,
+}
+
+#[derive(Debug)]
+struct RecoveredOutboxBatch {
+    batch_id: PersistenceBatchId,
+    tick: u64,
+    payload_digest: String,
+    storage: StorageBuffer,
 }
 
 #[derive(Debug)]
@@ -744,6 +979,67 @@ fn should_retry_transaction(error: &FlushAttemptError, attempt: u8) -> bool {
     error.source.is_transient()
         && error.commit_state == FailureCommitState::RolledBack
         && attempt < MAX_TRANSACTION_ATTEMPTS
+}
+
+fn execute_transaction_with_retry<F>(
+    connection: &Connection,
+    mut operation: F,
+) -> Result<u8, StorageError>
+where
+    F: FnMut(&Transaction<'_>) -> Result<(), FrankenError>,
+{
+    let mut attempt = 1_u8;
+    loop {
+        let mut transaction = match connection.transaction() {
+            Ok(transaction) => transaction,
+            Err(source) => {
+                let failure = FlushAttemptError {
+                    source,
+                    commit_state: FailureCommitState::RolledBack,
+                };
+                if should_retry_transaction(&failure, attempt) {
+                    thread::sleep(Duration::from_millis(1_u64 << attempt));
+                    attempt += 1;
+                    continue;
+                }
+                return Err(StorageError::Transaction {
+                    attempts: attempt,
+                    transient: failure.source.is_transient(),
+                    commit_state: failure.commit_state,
+                    source: failure.source,
+                });
+            }
+        };
+        let result = operation(&transaction).and_then(|()| transaction.commit());
+        match result {
+            Ok(()) => return Ok(attempt),
+            Err(source) => {
+                let failure = match transaction.rollback() {
+                    Ok(()) => FlushAttemptError {
+                        source,
+                        commit_state: FailureCommitState::RolledBack,
+                    },
+                    Err(rollback_error) => FlushAttemptError {
+                        source: FrankenError::Internal(format!(
+                            "transaction failed ({source}); rollback also failed ({rollback_error})"
+                        )),
+                        commit_state: FailureCommitState::Indeterminate,
+                    },
+                };
+                if should_retry_transaction(&failure, attempt) {
+                    thread::sleep(Duration::from_millis(1_u64 << attempt));
+                    attempt += 1;
+                    continue;
+                }
+                return Err(StorageError::Transaction {
+                    attempts: attempt,
+                    transient: failure.source.is_transient(),
+                    commit_state: failure.commit_state,
+                    source: failure.source,
+                });
+            }
+        }
+    }
 }
 
 impl StorageBuffer {
@@ -775,6 +1071,150 @@ impl StorageBuffer {
         self.births.append(&mut other.births);
         self.deaths.append(&mut other.deaths);
         self.replay_events.append(&mut other.replay_events);
+    }
+
+    fn validate_finite(&self) -> Result<(), StorageError> {
+        let invalid = |context: &'static str, value: f64| StorageError::InvalidData {
+            context,
+            reason: format!("non-finite value {value}"),
+        };
+        for row in &self.ticks {
+            for (context, value) in [
+                ("ticks.total_energy", row.total_energy),
+                ("ticks.average_energy", row.average_energy),
+                ("ticks.average_health", row.average_health),
+            ] {
+                if !value.is_finite() {
+                    return Err(invalid(context, value));
+                }
+            }
+        }
+        for row in &self.metrics {
+            if !row.value.is_finite() {
+                return Err(invalid("metrics.value", row.value));
+            }
+        }
+        for row in &self.agents {
+            for (context, value) in [
+                ("agents.position_x", row.position_x),
+                ("agents.position_y", row.position_y),
+                ("agents.velocity_x", row.velocity_x),
+                ("agents.velocity_y", row.velocity_y),
+                ("agents.heading", row.heading),
+                ("agents.health", row.health),
+                ("agents.energy", row.energy),
+                ("agents.color_r", row.color_r),
+                ("agents.color_g", row.color_g),
+                ("agents.color_b", row.color_b),
+                ("agents.spike_length", row.spike_length),
+                ("agents.herbivore_tendency", row.herbivore_tendency),
+                ("agents.sound_multiplier", row.sound_multiplier),
+                ("agents.reproduction_counter", row.reproduction_counter),
+                ("agents.mutation_rate_primary", row.mutation_rate_primary),
+                (
+                    "agents.mutation_rate_secondary",
+                    row.mutation_rate_secondary,
+                ),
+                ("agents.trait_smell", row.trait_smell),
+                ("agents.trait_sound", row.trait_sound),
+                ("agents.trait_hearing", row.trait_hearing),
+                ("agents.trait_eye", row.trait_eye),
+                ("agents.trait_blood", row.trait_blood),
+                ("agents.give_intent", row.give_intent),
+                ("agents.food_delta", row.food_delta),
+                ("agents.sound_output", row.sound_output),
+            ] {
+                if !value.is_finite() {
+                    return Err(invalid(context, value));
+                }
+            }
+        }
+        for row in &self.births {
+            for (context, value) in [
+                ("births.herbivore_tendency", row.herbivore_tendency),
+                ("births.position_x", row.position_x),
+                ("births.position_y", row.position_y),
+            ] {
+                if !value.is_finite() {
+                    return Err(invalid(context, value));
+                }
+            }
+        }
+        for row in &self.deaths {
+            for (context, value) in [
+                ("deaths.herbivore_tendency", row.herbivore_tendency),
+                ("deaths.energy", row.energy),
+                ("deaths.food_balance_total", row.food_balance_total),
+            ] {
+                if !value.is_finite() {
+                    return Err(invalid(context, value));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_outbox(&self, tick: u64) -> Result<(String, String), StorageError> {
+        self.validate_finite()?;
+        let payload = serde_json::to_string(&OutboxPayloadRef {
+            version: OUTBOX_PAYLOAD_VERSION,
+            tick,
+            storage: self,
+        })
+        .map_err(|error| StorageError::InvalidData {
+            context: "storage_outbox.payload",
+            reason: error.to_string(),
+        })?;
+        let digest = format!("blake3:{}", blake3::hash(payload.as_bytes()).to_hex());
+        Ok((payload, digest))
+    }
+
+    fn decode_outbox(
+        payload: &str,
+        expected_tick: u64,
+        expected_digest: &str,
+    ) -> Result<Self, StorageError> {
+        let actual_digest = format!("blake3:{}", blake3::hash(payload.as_bytes()).to_hex());
+        if actual_digest != expected_digest {
+            return Err(StorageError::InvalidData {
+                context: "storage_outbox.payload_digest",
+                reason: format!("expected {expected_digest}, computed {actual_digest}"),
+            });
+        }
+        let decoded: OutboxPayload =
+            serde_json::from_str(payload).map_err(|error| StorageError::InvalidData {
+                context: "storage_outbox.payload",
+                reason: error.to_string(),
+            })?;
+        if decoded.version != OUTBOX_PAYLOAD_VERSION {
+            return Err(StorageError::InvalidData {
+                context: "storage_outbox.payload.version",
+                reason: format!(
+                    "unsupported version {}, expected {}",
+                    decoded.version, OUTBOX_PAYLOAD_VERSION
+                ),
+            });
+        }
+        if decoded.tick != expected_tick {
+            return Err(StorageError::InvalidData {
+                context: "storage_outbox.payload.tick",
+                reason: format!("ledger tick {expected_tick}, payload tick {}", decoded.tick),
+            });
+        }
+        decoded.storage.validate_finite()?;
+        Ok(decoded.storage)
+    }
+}
+
+fn decode_batch_state(value: &str) -> Result<BatchPersistenceState, StorageError> {
+    match value {
+        "admitted" => Ok(BatchPersistenceState::Admitted),
+        "applied" => Ok(BatchPersistenceState::Applied),
+        "durable" => Ok(BatchPersistenceState::Durable),
+        other => Err(StorageError::InvalidData {
+            context: "storage_batch_ledger.state",
+            reason: format!("unknown state {other:?}"),
+        }),
     }
 }
 
@@ -853,6 +1293,49 @@ impl StorageReader {
             .query_row("SELECT MAX(tick) FROM ticks")?;
         decode::<Option<i64>>(&row, 0, "ticks.max_tick")?
             .map(|tick| checked_u64("ticks.max_tick", tick))
+            .transpose()
+    }
+
+    /// Return durable outbox progress from an independent read connection.
+    pub fn persistence_watermarks(&self) -> Result<PersistenceWatermarks, StorageError> {
+        let row = self.connection()?.query_row(
+            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress
+             WHERE singleton = 1",
+        )?;
+        PersistenceWatermarks::from_raw(
+            decode(&row, 0, "storage_progress.admitted_batch_id")?,
+            decode(&row, 1, "storage_progress.applied_batch_id")?,
+            decode(&row, 2, "storage_progress.durable_batch_id")?,
+        )
+    }
+
+    /// Query one batch's compact ledger status without loading its outbox payload.
+    pub fn batch_status(
+        &self,
+        batch_id: PersistenceBatchId,
+    ) -> Result<Option<PersistedBatchStatus>, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, payload_digest, state
+             FROM storage_batch_ledger
+             WHERE batch_id = ?1",
+            &[batch_id.as_i64().into()],
+        )?;
+        rows.first()
+            .map(|row| {
+                let tick = checked_u64(
+                    "storage_batch_ledger.tick",
+                    decode(row, 0, "storage_batch_ledger.tick")?,
+                )?;
+                let payload_digest = decode(row, 1, "storage_batch_ledger.payload_digest")?;
+                let state_text: String = decode(row, 2, "storage_batch_ledger.state")?;
+                Ok(PersistedBatchStatus {
+                    batch_id,
+                    tick,
+                    payload_digest,
+                    state: decode_batch_state(&state_text)?,
+                })
+            })
             .transpose()
     }
 
@@ -1064,12 +1547,288 @@ impl Drop for StorageReader {
     }
 }
 
+static STORAGE_PATH_LEASES: OnceLock<Mutex<BTreeSet<StorageLeaseKey>>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum StorageLeaseKey {
+    File(StorageFileIdentity),
+    Path(PathBuf),
+}
+
+struct StoragePathLease {
+    keys: BTreeSet<StorageLeaseKey>,
+}
+
+impl StoragePathLease {
+    fn acquire(path: &str) -> Result<Option<Self>, StorageError> {
+        if path == ":memory:" {
+            return Ok(None);
+        }
+        let path_ref = Path::new(path);
+        let keys = match std::fs::symlink_metadata(path_ref) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(StorageError::InvalidData {
+                        context: "storage.writer_path",
+                        reason: format!("writer requires a non-symlink regular file at {path}"),
+                    });
+                }
+                if storage_file_has_multiple_links(&metadata) {
+                    return Err(StorageError::InvalidData {
+                        context: "storage.writer_path",
+                        reason: format!(
+                            "refusing multiply linked database {path}; writer identity must have one path"
+                        ),
+                    });
+                }
+                let canonical =
+                    std::fs::canonicalize(path_ref).map_err(|source| StorageError::Filesystem {
+                        path: path.to_owned(),
+                        source,
+                    })?;
+                BTreeSet::from([
+                    StorageLeaseKey::File(StorageFileIdentity::from_metadata(&metadata)),
+                    StorageLeaseKey::Path(canonical),
+                ])
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                let absolute =
+                    std::path::absolute(path_ref).map_err(|source| StorageError::Filesystem {
+                        path: path.to_owned(),
+                        source,
+                    })?;
+                let parent = absolute.parent().ok_or(StorageError::InvalidData {
+                    context: "storage.writer_path",
+                    reason: format!("storage path {path} has no parent"),
+                })?;
+                let name = absolute.file_name().ok_or(StorageError::InvalidData {
+                    context: "storage.writer_path",
+                    reason: format!("storage path {path} has no file name"),
+                })?;
+                let canonical_parent =
+                    std::fs::canonicalize(parent).map_err(|source| StorageError::Filesystem {
+                        path: parent.display().to_string(),
+                        source,
+                    })?;
+                BTreeSet::from([StorageLeaseKey::Path(canonical_parent.join(name))])
+            }
+            Err(source) => {
+                return Err(StorageError::Filesystem {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        let leases = STORAGE_PATH_LEASES.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let mut leases = match leases.lock() {
+            Ok(leases) => leases,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(conflict) = keys.iter().find(|key| leases.contains(*key)) {
+            return Err(StorageError::InvalidData {
+                context: "storage.path_lease",
+                reason: format!("another ScriptBots writer still owns {conflict:?}"),
+            });
+        }
+        leases.extend(keys.iter().cloned());
+        Ok(Some(Self { keys }))
+    }
+
+    fn promote_existing(&mut self, path: &str) -> Result<(), StorageError> {
+        if self
+            .keys
+            .iter()
+            .any(|key| matches!(key, StorageLeaseKey::File(_)))
+        {
+            return Ok(());
+        }
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|source| StorageError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || storage_file_has_multiple_links(&metadata)
+        {
+            return Err(StorageError::InvalidData {
+                context: "storage.writer_path",
+                reason: format!("writer path {path} changed during creation"),
+            });
+        }
+        let promoted = StorageLeaseKey::File(StorageFileIdentity::from_metadata(&metadata));
+        let leases = STORAGE_PATH_LEASES.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let mut leases = match leases.lock() {
+            Ok(leases) => leases,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if leases.contains(&promoted) {
+            return Err(StorageError::InvalidData {
+                context: "storage.path_lease",
+                reason: format!("another ScriptBots writer owns {promoted:?}"),
+            });
+        }
+        leases.insert(promoted.clone());
+        self.keys.insert(promoted);
+        Ok(())
+    }
+}
+
+fn storage_file_has_multiple_links(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() > 1
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.number_of_links().is_some_and(|links| links > 1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+impl Drop for StoragePathLease {
+    fn drop(&mut self) {
+        let leases = STORAGE_PATH_LEASES.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let mut leases = match leases.lock() {
+            Ok(leases) => leases,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for key in &self.keys {
+            leases.remove(key);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum StorageFileIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume: Option<u32>,
+        index: Option<u64>,
+    },
+    #[cfg(not(any(unix, windows)))]
+    Portable { length: u64 },
+}
+
+impl StorageFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self::Unix {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            Self::Windows {
+                volume: metadata.volume_serial_number(),
+                index: metadata.file_index(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self::Portable {
+                length: metadata.len(),
+            }
+        }
+    }
+}
+
+struct ExistingStorageLease {
+    _file: std::fs::File,
+    identity: StorageFileIdentity,
+}
+
+impl ExistingStorageLease {
+    fn open(path: &str) -> Result<Self, StorageError> {
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|source| StorageError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_path",
+                reason: format!("recovery requires a non-symlink regular file at {path}"),
+            });
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(path)
+            .map_err(|source| StorageError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        let file_metadata = file.metadata().map_err(|source| StorageError::Filesystem {
+            path: path.to_owned(),
+            source,
+        })?;
+        if !file_metadata.is_file() {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_path",
+                reason: format!("recovery path {path} changed away from a regular file"),
+            });
+        }
+        let lease = Self {
+            _file: file,
+            identity: StorageFileIdentity::from_metadata(&file_metadata),
+        };
+        lease.verify_path(path)?;
+        Ok(lease)
+    }
+
+    fn verify_path(&self, path: &str) -> Result<(), StorageError> {
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|source| StorageError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || StorageFileIdentity::from_metadata(&metadata) != self.identity
+        {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_path",
+                reason: format!("recovery path {path} changed during validated open"),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StorageOpenMode {
+    CreateOrMigrate,
+    RecoverExisting,
+}
+
 /// FrankenSQLite-backed persistence sink with buffered writes.
 pub struct Storage {
     path: String,
     conn: Option<Connection>,
+    _path_lease: Option<StoragePathLease>,
+    _existing_lease: Option<ExistingStorageLease>,
     terminally_failed: bool,
     buffer: StorageBuffer,
+    buffered_outbox_ids: Vec<PersistenceBatchId>,
+    next_batch_id: u64,
     tick_flush_threshold: usize,
     agent_flush_threshold: usize,
     event_flush_threshold: usize,
@@ -1100,13 +1859,57 @@ impl Storage {
         event: usize,
         metric: usize,
     ) -> Result<Self, StorageError> {
-        let conn = Connection::open(path)?;
+        Self::with_thresholds_in_mode(
+            path,
+            tick,
+            agent,
+            event,
+            metric,
+            StorageOpenMode::CreateOrMigrate,
+        )
+    }
+
+    fn with_thresholds_in_mode(
+        path: &str,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+        mode: StorageOpenMode,
+    ) -> Result<Self, StorageError> {
+        let mut path_lease = StoragePathLease::acquire(path)?;
+        let existing_lease = match mode {
+            StorageOpenMode::RecoverExisting => {
+                let lease = ExistingStorageLease::open(path)?;
+                Self::validate_existing_scriptbots_database(path)?;
+                Some(lease)
+            }
+            StorageOpenMode::CreateOrMigrate if path != ":memory:" && Path::new(path).exists() => {
+                Some(ExistingStorageLease::open(path)?)
+            }
+            StorageOpenMode::CreateOrMigrate => None,
+        };
+        let conn = if path == ":memory:" {
+            Connection::open(path)?
+        } else {
+            Connection::open_strict_multi_process(path)?
+        };
+        if let Some(lease) = path_lease.as_mut() {
+            lease.promote_existing(path)?;
+        }
+        if let Some(lease) = &existing_lease {
+            lease.verify_path(path)?;
+        }
         conn.execute("PRAGMA synchronous = FULL;")?;
         let mut storage = Self {
             path: path.to_owned(),
             conn: Some(conn),
+            _path_lease: path_lease,
+            _existing_lease: existing_lease,
             terminally_failed: false,
             buffer: StorageBuffer::default(),
+            buffered_outbox_ids: Vec::new(),
+            next_batch_id: 1,
             tick_flush_threshold: tick,
             agent_flush_threshold: agent,
             event_flush_threshold: event,
@@ -1115,19 +1918,453 @@ impl Storage {
             death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
             replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
         };
-        storage.initialize_schema()?;
+        if matches!(mode, StorageOpenMode::CreateOrMigrate) {
+            if let Err(error) = storage.initialize_schema() {
+                storage.terminally_failed = true;
+                return Err(error);
+            }
+        }
+        if let Err(error) = storage.validate_persistence_invariants() {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        if let Err(error) = storage.recover_outbox() {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        storage.next_batch_id =
+            storage
+                .persistence_watermarks()?
+                .admitted
+                .map_or(Ok(1), |batch_id| {
+                    batch_id
+                        .get()
+                        .checked_add(1)
+                        .ok_or(StorageError::InvalidData {
+                            context: "storage_progress.admitted_batch_id",
+                            reason: "batch id space exhausted".to_owned(),
+                        })
+                })?;
         Ok(storage)
+    }
+
+    fn validate_existing_scriptbots_database(path: &str) -> Result<(), StorageError> {
+        let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let validation = (|| {
+            let migrations = connection.query(
+                "SELECT version, name FROM _schema_migrations
+                 WHERE version IN (1, 2)
+                 ORDER BY version ASC",
+            )?;
+            if migrations.len() != 2 {
+                return Err(StorageError::InvalidData {
+                    context: "storage.recovery_identity",
+                    reason: format!(
+                        "expected two ScriptBots migrations, found {}",
+                        migrations.len()
+                    ),
+                });
+            }
+            let expected = [
+                (1_i64, "create_scriptbots_schema"),
+                (2_i64, "create_durable_persistence_outbox"),
+            ];
+            for (row, (version, name)) in migrations.iter().zip(expected) {
+                let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
+                let actual_name: String = decode(row, 1, "_schema_migrations.name")?;
+                if actual_version != version || actual_name != name {
+                    return Err(StorageError::InvalidData {
+                        context: "storage.recovery_identity",
+                        reason: format!(
+                            "unexpected migration ({actual_version}, {actual_name:?}); expected ({version}, {name:?})"
+                        ),
+                    });
+                }
+            }
+            let progress = connection.query_row(
+                "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+                 FROM storage_progress
+                 WHERE singleton = 1",
+            )?;
+            PersistenceWatermarks::from_raw(
+                decode(&progress, 0, "storage_progress.admitted_batch_id")?,
+                decode(&progress, 1, "storage_progress.applied_batch_id")?,
+                decode(&progress, 2, "storage_progress.durable_batch_id")?,
+            )?;
+            Ok(())
+        })();
+        let close_result = connection
+            .close_without_checkpoint()
+            .map_err(StorageError::from);
+        validation?;
+        close_result
     }
 
     fn initialize_schema(&mut self) -> Result<(), StorageError> {
         MigrationRunner::new()
             .add(1, "create_scriptbots_schema", SCRIPTBOTS_SCHEMA_V1)
+            .add(2, "create_durable_persistence_outbox", SCRIPTBOTS_SCHEMA_V2)
             .run(self.connection()?)?;
+        Ok(())
+    }
+
+    fn validate_persistence_invariants(&self) -> Result<(), StorageError> {
+        let watermarks = self.persistence_watermarks()?;
+        let admitted = watermarks.admitted_raw();
+        let applied = watermarks.applied_raw();
+        let durable = watermarks.durable_raw();
+        let ledger = self.connection()?.query_row(
+            "SELECT COUNT(*), MIN(batch_id), MAX(batch_id), COUNT(DISTINCT tick)
+             FROM storage_batch_ledger",
+        )?;
+        let ledger_count: i64 = decode(&ledger, 0, "storage_batch_ledger.count")?;
+        let ledger_min: Option<i64> = decode(&ledger, 1, "storage_batch_ledger.min_batch_id")?;
+        let ledger_max: Option<i64> = decode(&ledger, 2, "storage_batch_ledger.max_batch_id")?;
+        let distinct_ticks: i64 = decode(&ledger, 3, "storage_batch_ledger.distinct_ticks")?;
+        let expected_min = (admitted > 0).then_some(1);
+        let expected_max = (admitted > 0).then_some(admitted);
+        if ledger_count != admitted
+            || ledger_min != expected_min
+            || ledger_max != expected_max
+            || distinct_ticks != admitted
+        {
+            return Err(StorageError::InvalidData {
+                context: "storage_batch_ledger",
+                reason: format!(
+                    "admitted={admitted} requires count/min/max/distinct_ticks={admitted}/{expected_min:?}/{expected_max:?}/{admitted}, found {ledger_count}/{ledger_min:?}/{ledger_max:?}/{distinct_ticks}"
+                ),
+            });
+        }
+        for (expected_state, lower_exclusive, upper_inclusive) in [
+            ("durable", 0_i64, durable),
+            ("applied", durable, applied),
+            ("admitted", applied, admitted),
+        ] {
+            let mismatches = self.connection()?.query_with_params(
+                "SELECT batch_id, state
+                 FROM storage_batch_ledger
+                 WHERE batch_id > ?1 AND batch_id <= ?2 AND state != ?3
+                 ORDER BY batch_id ASC
+                 LIMIT 1",
+                &[
+                    lower_exclusive.into(),
+                    upper_inclusive.into(),
+                    expected_state.into(),
+                ],
+            )?;
+            if let Some(row) = mismatches.first() {
+                let batch_id: i64 = decode(row, 0, "storage_batch_ledger.batch_id")?;
+                let state: String = decode(row, 1, "storage_batch_ledger.state")?;
+                return Err(StorageError::InvalidData {
+                    context: "storage_batch_ledger.state",
+                    reason: format!(
+                        "batch {batch_id} is {state:?}; watermarks require {expected_state:?}"
+                    ),
+                });
+            }
+        }
+
+        if self.file_backed() {
+            let outbox = self.connection()?.query_row(
+                "SELECT COUNT(*), MIN(batch_id), MAX(batch_id)
+                 FROM storage_outbox",
+            )?;
+            let outbox_count: i64 = decode(&outbox, 0, "storage_outbox.count")?;
+            let outbox_min: Option<i64> = decode(&outbox, 1, "storage_outbox.min_batch_id")?;
+            let outbox_max: Option<i64> = decode(&outbox, 2, "storage_outbox.max_batch_id")?;
+            let expected_count = admitted - durable;
+            let expected_min = (expected_count > 0).then_some(durable + 1);
+            let expected_max = (expected_count > 0).then_some(admitted);
+            if outbox_count != expected_count
+                || outbox_min != expected_min
+                || outbox_max != expected_max
+            {
+                return Err(StorageError::InvalidData {
+                    context: "storage_outbox.batch_id",
+                    reason: format!(
+                        "watermarks require outbox count/min/max={expected_count}/{expected_min:?}/{expected_max:?}, found {outbox_count}/{outbox_min:?}/{outbox_max:?}"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
     fn connection(&self) -> Result<&Connection, StorageError> {
         self.conn.as_ref().ok_or(StorageError::Closed)
+    }
+
+    fn file_backed(&self) -> bool {
+        self.path != ":memory:"
+    }
+
+    /// Return the persisted monotonic admission/application/durability prefixes.
+    pub fn persistence_watermarks(&self) -> Result<PersistenceWatermarks, StorageError> {
+        let row = self.connection()?.query_row(
+            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress
+             WHERE singleton = 1",
+        )?;
+        PersistenceWatermarks::from_raw(
+            decode(&row, 0, "storage_progress.admitted_batch_id")?,
+            decode(&row, 1, "storage_progress.applied_batch_id")?,
+            decode(&row, 2, "storage_progress.durable_batch_id")?,
+        )
+    }
+
+    /// Query one compact batch-ledger entry without exposing the outbox payload.
+    pub fn batch_status(
+        &self,
+        batch_id: PersistenceBatchId,
+    ) -> Result<Option<PersistedBatchStatus>, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, payload_digest, state
+             FROM storage_batch_ledger
+             WHERE batch_id = ?1",
+            &[batch_id.as_i64().into()],
+        )?;
+        rows.first()
+            .map(|row| {
+                let tick = checked_u64(
+                    "storage_batch_ledger.tick",
+                    decode(row, 0, "storage_batch_ledger.tick")?,
+                )?;
+                let payload_digest = decode(row, 1, "storage_batch_ledger.payload_digest")?;
+                let state_text: String = decode(row, 2, "storage_batch_ledger.state")?;
+                Ok(PersistedBatchStatus {
+                    batch_id,
+                    tick,
+                    payload_digest,
+                    state: decode_batch_state(&state_text)?,
+                })
+            })
+            .transpose()
+    }
+
+    fn stage_outbox(
+        &mut self,
+        tick: u64,
+        prepared: &StorageBuffer,
+    ) -> Result<(AdmissionReceipt, bool), StorageError> {
+        let tick_i64 = i64::try_from(tick).map_err(|error| StorageError::InvalidData {
+            context: "storage_batch_ledger.tick",
+            reason: error.to_string(),
+        })?;
+        let (payload, payload_digest) = prepared.encode_outbox(tick)?;
+        let before = self.persistence_watermarks()?;
+        let existing = self.connection()?.query_with_params(
+            "SELECT batch_id, payload_digest
+             FROM storage_batch_ledger
+             WHERE tick = ?1
+             ORDER BY batch_id ASC",
+            &[tick_i64.into()],
+        )?;
+        if let Some(row) = existing.first() {
+            if existing.len() != 1 {
+                return Err(StorageError::InvalidData {
+                    context: "storage_batch_ledger.tick",
+                    reason: format!("tick {tick} has {} ledger entries", existing.len()),
+                });
+            }
+            let batch_id = PersistenceBatchId::new(checked_u64(
+                "storage_batch_ledger.batch_id",
+                decode(row, 0, "storage_batch_ledger.batch_id")?,
+            )?)?;
+            let existing_digest: String = decode(row, 1, "storage_batch_ledger.payload_digest")?;
+            if existing_digest != payload_digest {
+                return Err(StorageError::InvalidData {
+                    context: "storage_batch_ledger.payload_digest",
+                    reason: format!(
+                        "tick {tick} was already admitted as batch {} with a different payload",
+                        batch_id.get()
+                    ),
+                });
+            }
+            return Ok((
+                AdmissionReceipt {
+                    batch_id,
+                    tick,
+                    guarantee: if self.file_backed() {
+                        PersistenceGuarantee::Durable
+                    } else {
+                        PersistenceGuarantee::CommittedVolatile
+                    },
+                    watermarks: before,
+                },
+                false,
+            ));
+        }
+
+        let batch_id = PersistenceBatchId::new(self.next_batch_id)?;
+        let expected_previous = batch_id.as_i64() - 1;
+        if before.admitted_raw() != expected_previous {
+            return Err(StorageError::InvalidData {
+                context: "storage_progress.admitted_batch_id",
+                reason: format!(
+                    "next batch {} does not follow admitted watermark {}",
+                    batch_id.get(),
+                    before.admitted_raw()
+                ),
+            });
+        }
+
+        execute_transaction_with_retry(self.connection()?, |transaction| {
+            let ledger_rows = transaction.execute_with_params(
+                "INSERT INTO storage_batch_ledger (
+                    batch_id, tick, payload_digest, state
+                 ) VALUES (?1, ?2, ?3, 'admitted')",
+                &[
+                    batch_id.as_i64().into(),
+                    tick_i64.into(),
+                    payload_digest.as_str().into(),
+                ],
+            )?;
+            if ledger_rows != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "admission inserted {ledger_rows} ledger rows for batch {}",
+                    batch_id.get()
+                )));
+            }
+            let outbox_rows = transaction.execute_with_params(
+                "INSERT INTO storage_outbox (batch_id, payload) VALUES (?1, ?2)",
+                &[batch_id.as_i64().into(), payload.as_str().into()],
+            )?;
+            if outbox_rows != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "admission inserted {outbox_rows} outbox rows for batch {}",
+                    batch_id.get()
+                )));
+            }
+            let progress_rows = transaction.execute_with_params(
+                "UPDATE storage_progress
+                 SET admitted_batch_id = ?1
+                 WHERE singleton = 1 AND admitted_batch_id = ?2",
+                &[batch_id.as_i64().into(), expected_previous.into()],
+            )?;
+            if progress_rows != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "admission CAS updated {progress_rows} progress rows for batch {}",
+                    batch_id.get()
+                )));
+            }
+            Ok(())
+        })?;
+
+        self.next_batch_id = batch_id
+            .get()
+            .checked_add(1)
+            .ok_or(StorageError::InvalidData {
+                context: "storage_progress.admitted_batch_id",
+                reason: "batch id space exhausted".to_owned(),
+            })?;
+        let watermarks = PersistenceWatermarks {
+            admitted: Some(batch_id),
+            ..before
+        };
+        Ok((
+            AdmissionReceipt {
+                batch_id,
+                tick,
+                guarantee: if self.file_backed() {
+                    PersistenceGuarantee::Durable
+                } else {
+                    PersistenceGuarantee::CommittedVolatile
+                },
+                watermarks,
+            },
+            true,
+        ))
+    }
+
+    fn load_outbox(&self) -> Result<Vec<RecoveredOutboxBatch>, StorageError> {
+        let rows = self.connection()?.query(
+            "SELECT outbox.batch_id, ledger.tick, ledger.payload_digest, outbox.payload
+             FROM storage_outbox AS outbox
+             JOIN storage_batch_ledger AS ledger ON ledger.batch_id = outbox.batch_id
+             ORDER BY outbox.batch_id ASC",
+        )?;
+        let mut batches = Vec::with_capacity(rows.len());
+        for row in rows {
+            let batch_id = PersistenceBatchId::new(checked_u64(
+                "storage_outbox.batch_id",
+                decode(&row, 0, "storage_outbox.batch_id")?,
+            )?)?;
+            let tick = checked_u64(
+                "storage_batch_ledger.tick",
+                decode(&row, 1, "storage_batch_ledger.tick")?,
+            )?;
+            let payload_digest: String = decode(&row, 2, "storage_batch_ledger.payload_digest")?;
+            let payload: String = decode(&row, 3, "storage_outbox.payload")?;
+            let storage = StorageBuffer::decode_outbox(&payload, tick, &payload_digest)?;
+            batches.push(RecoveredOutboxBatch {
+                batch_id,
+                tick,
+                payload_digest,
+                storage,
+            });
+        }
+        Ok(batches)
+    }
+
+    fn recover_outbox(&mut self) -> Result<(), StorageError> {
+        let before = self.persistence_watermarks()?;
+        let batches = self.load_outbox()?;
+        let applied = before.applied_raw();
+        let admitted = before.admitted_raw();
+        let mut next_unapplied = applied + 1;
+        let durable = before.durable_raw();
+        let mut highest_outbox = durable;
+
+        for (offset, batch) in batches.into_iter().enumerate() {
+            let offset = i64::try_from(offset).map_err(|error| StorageError::InvalidData {
+                context: "storage_outbox.batch_id",
+                reason: error.to_string(),
+            })?;
+            let next_outbox = durable
+                .checked_add(offset)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(StorageError::InvalidData {
+                    context: "storage_outbox.batch_id",
+                    reason: "outbox sequence overflow".to_owned(),
+                })?;
+            let raw_id = batch.batch_id.as_i64();
+            if raw_id != next_outbox {
+                return Err(StorageError::InvalidData {
+                    context: "storage_outbox.batch_id",
+                    reason: format!("outbox gap: expected batch {next_outbox}, found {raw_id}"),
+                });
+            }
+            highest_outbox = highest_outbox.max(raw_id);
+            if raw_id <= applied {
+                continue;
+            }
+            if raw_id != next_unapplied {
+                return Err(StorageError::InvalidData {
+                    context: "storage_outbox.batch_id",
+                    reason: format!("outbox gap: expected batch {next_unapplied}, found {raw_id}"),
+                });
+            }
+            debug_assert!(!batch.payload_digest.is_empty());
+            debug_assert_eq!(
+                batch.storage.ticks.last().map(|row| row.tick as u64),
+                Some(batch.tick)
+            );
+            self.buffer.append(batch.storage);
+            self.buffered_outbox_ids.push(batch.batch_id);
+            next_unapplied += 1;
+        }
+
+        if admitted > durable && highest_outbox != admitted {
+            return Err(StorageError::InvalidData {
+                context: "storage_outbox",
+                reason: format!(
+                    "admitted watermark {admitted} has no complete outbox prefix (highest {highest_outbox})"
+                ),
+            });
+        }
+        self.flush()?;
+        self.finalize_applied_outbox()?;
+        Ok(())
     }
 
     fn prepare_batch(payload: &PersistenceBatch) -> Result<StorageBuffer, StorageError> {
@@ -1193,6 +2430,19 @@ impl Storage {
             return Err(StorageError::TerminallyFailed);
         }
         self.buffer.append(prepared);
+        self.maybe_flush()
+    }
+
+    fn enqueue_staged(
+        &mut self,
+        batch_id: PersistenceBatchId,
+        prepared: StorageBuffer,
+    ) -> Result<bool, StorageError> {
+        if self.terminally_failed {
+            return Err(StorageError::TerminallyFailed);
+        }
+        self.buffer.append(prepared);
+        self.buffered_outbox_ids.push(batch_id);
         self.maybe_flush()
     }
 
@@ -1438,6 +2688,7 @@ impl Storage {
     fn flush_attempt(
         connection: &Connection,
         buffer: &StorageBuffer,
+        outbox_ids: &[PersistenceBatchId],
     ) -> Result<(), FlushAttemptError> {
         let mut tx = connection
             .transaction()
@@ -1453,6 +2704,70 @@ impl Storage {
             Self::insert_births(&tx, &buffer.births)?;
             Self::insert_deaths(&tx, &buffer.deaths)?;
             Self::insert_replay_events(&tx, &buffer.replay_events)?;
+            if let Some(last) = outbox_ids.last().copied() {
+                let first = outbox_ids[0];
+                for pair in outbox_ids.windows(2) {
+                    if pair[1].get() != pair[0].get() + 1 {
+                        return Err(FrankenError::Internal(format!(
+                            "non-contiguous outbox application {} then {}",
+                            pair[0].get(),
+                            pair[1].get()
+                        )));
+                    }
+                }
+                let progress = tx.query_row(
+                    "SELECT admitted_batch_id, applied_batch_id FROM storage_progress
+                     WHERE singleton = 1",
+                )?;
+                let admitted = progress
+                    .get_typed::<i64>(0)
+                    .map_err(|error| FrankenError::Internal(error.to_string()))?;
+                let applied = progress
+                    .get_typed::<i64>(1)
+                    .map_err(|error| FrankenError::Internal(error.to_string()))?;
+                if applied != first.as_i64() - 1 || admitted < last.as_i64() {
+                    return Err(FrankenError::Internal(format!(
+                        "outbox application prefix mismatch: admitted={admitted}, applied={applied}, applying={}..={}",
+                        first.get(),
+                        last.get()
+                    )));
+                }
+                for batch_id in outbox_ids {
+                    let ledger = tx.query_row_with_params(
+                        "SELECT state FROM storage_batch_ledger WHERE batch_id = ?1",
+                        &[batch_id.as_i64().into()],
+                    )?;
+                    let state = ledger
+                        .get_typed::<String>(0)
+                        .map_err(|error| FrankenError::Internal(error.to_string()))?;
+                    if state != "admitted" {
+                        return Err(FrankenError::Internal(format!(
+                            "batch {} cannot apply from state {state:?}",
+                            batch_id.get()
+                        )));
+                    }
+                    let updated = tx.execute_with_params(
+                        "UPDATE storage_batch_ledger SET state = 'applied' WHERE batch_id = ?1",
+                        &[batch_id.as_i64().into()],
+                    )?;
+                    if updated != 1 {
+                        return Err(FrankenError::Internal(format!(
+                            "application updated {updated} ledger rows for batch {}",
+                            batch_id.get()
+                        )));
+                    }
+                }
+                let progress_rows = tx.execute_with_params(
+                    "UPDATE storage_progress SET applied_batch_id = ?1 WHERE singleton = 1",
+                    &[last.as_i64().into()],
+                )?;
+                if progress_rows != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "application updated {progress_rows} progress rows through batch {}",
+                        last.get()
+                    )));
+                }
+            }
             tx.commit()?;
             Ok(())
         })();
@@ -1487,15 +2802,17 @@ impl Storage {
         let connection = self.connection()?;
         let mut attempt = 1_u8;
         loop {
-            match Self::flush_attempt(connection, &self.buffer) {
+            match Self::flush_attempt(connection, &self.buffer, &self.buffered_outbox_ids) {
                 Ok(()) => {
                     info!(
                         path = %self.path,
                         attempt,
                         rows = self.buffer.ticks.len(),
+                        batches = self.buffered_outbox_ids.len(),
                         "FrankenSQLite storage transaction committed"
                     );
                     self.buffer.clear();
+                    self.buffered_outbox_ids.clear();
                     return Ok(());
                 }
                 Err(error) if should_retry_transaction(&error, attempt) => {
@@ -1524,6 +2841,73 @@ impl Storage {
         }
     }
 
+    fn finalize_applied_outbox(&mut self) -> Result<PersistenceWatermarks, StorageError> {
+        let before = self.persistence_watermarks()?;
+        let Some(applied) = before.applied else {
+            return Ok(before);
+        };
+        let durable_before = before.durable_raw();
+        let target = applied.as_i64();
+        let file_backed = self.file_backed();
+        execute_transaction_with_retry(self.connection()?, |transaction| {
+            if file_backed && target > durable_before {
+                let rows = transaction.query_with_params(
+                    "SELECT batch_id, state
+                     FROM storage_batch_ledger
+                     WHERE batch_id > ?1 AND batch_id <= ?2
+                     ORDER BY batch_id ASC",
+                    &[durable_before.into(), target.into()],
+                )?;
+                if rows.len() != usize::try_from(target - durable_before).unwrap_or(usize::MAX) {
+                    return Err(FrankenError::Internal(format!(
+                        "durability ledger gap for batches {}..={target}",
+                        durable_before + 1
+                    )));
+                }
+                for row in rows {
+                    let batch_id = row
+                        .get_typed::<i64>(0)
+                        .map_err(|error| FrankenError::Internal(error.to_string()))?;
+                    let state = row
+                        .get_typed::<String>(1)
+                        .map_err(|error| FrankenError::Internal(error.to_string()))?;
+                    if state != "applied" {
+                        return Err(FrankenError::Internal(format!(
+                            "batch {batch_id} cannot become durable from state {state:?}"
+                        )));
+                    }
+                }
+                let expected = usize::try_from(target - durable_before).unwrap_or(usize::MAX);
+                let ledger_rows = transaction.execute_with_params(
+                    "UPDATE storage_batch_ledger
+                     SET state = 'durable'
+                     WHERE batch_id > ?1 AND batch_id <= ?2",
+                    &[durable_before.into(), target.into()],
+                )?;
+                if ledger_rows != expected {
+                    return Err(FrankenError::Internal(format!(
+                        "durability updated {ledger_rows} ledger rows; expected {expected}"
+                    )));
+                }
+                let progress_rows = transaction.execute_with_params(
+                    "UPDATE storage_progress SET durable_batch_id = ?1 WHERE singleton = 1",
+                    &[target.into()],
+                )?;
+                if progress_rows != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "durability updated {progress_rows} progress rows through batch {target}"
+                    )));
+                }
+            }
+            transaction.execute_with_params(
+                "DELETE FROM storage_outbox WHERE batch_id <= ?1",
+                &[target.into()],
+            )?;
+            Ok(())
+        })?;
+        self.persistence_watermarks()
+    }
+
     /// Compact storage after first durably flushing every buffered row.
     pub fn optimize(&mut self) -> Result<(), StorageError> {
         self.flush()?;
@@ -1534,6 +2918,7 @@ impl Storage {
     /// Flush, checkpoint, and explicitly close the FrankenSQLite connection.
     pub fn close(mut self) -> Result<(), StorageError> {
         self.flush()?;
+        self.finalize_applied_outbox()?;
         let connection = self.conn.take().ok_or(StorageError::Closed)?;
         connection.close()?;
         Ok(())
@@ -1542,6 +2927,7 @@ impl Storage {
     /// Dispose of a terminally failed worker without replaying its buffered transaction in Drop.
     fn abandon_after_error(mut self) {
         self.buffer.clear();
+        self.buffered_outbox_ids.clear();
         if let Some(mut connection) = self.conn.take() {
             connection.close_best_effort_in_place();
         }
@@ -1673,6 +3059,39 @@ impl Storage {
         }
         Ok(readings)
     }
+
+    fn latest_pending_analytics(&self) -> Result<Option<PendingAnalytics>, StorageError> {
+        let rows = self
+            .connection()?
+            .query("SELECT tick, agent_count FROM ticks ORDER BY tick DESC LIMIT 1")?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let tick = checked_u64("ticks.tick", decode(row, 0, "ticks.tick")?)?;
+        let agent_count = checked_usize("ticks.agent_count", decode(row, 1, "ticks.agent_count")?)?;
+        let metric_rows = self.connection()?.query_with_params(
+            "SELECT name, value FROM metrics WHERE tick = ?1 ORDER BY name ASC",
+            &[i64::try_from(tick)
+                .map_err(|error| StorageError::InvalidData {
+                    context: "ticks.tick",
+                    reason: error.to_string(),
+                })?
+                .into()],
+        )?;
+        let mut readings = Vec::with_capacity(metric_rows.len());
+        for row in metric_rows {
+            readings.push(MetricReading {
+                tick: tick as i64,
+                name: decode(&row, 0, "metrics.name")?,
+                value: decode(&row, 1, "metrics.value")?,
+            });
+        }
+        Ok(Some(PendingAnalytics {
+            tick,
+            agent_count,
+            readings: Arc::from(readings),
+        }))
+    }
 }
 
 impl Drop for Storage {
@@ -1682,8 +3101,12 @@ impl Drop for Storage {
         }
         if self.terminally_failed {
             self.buffer.clear();
-        } else if let Err(err) = self.flush() {
-            eprintln!("failed to flush persistence buffer on drop: {err}");
+            self.buffered_outbox_ids.clear();
+        } else if let Err(err) = self
+            .flush()
+            .and_then(|()| self.finalize_applied_outbox().map(|_| ()))
+        {
+            eprintln!("failed to finalize persistence buffer on drop: {err}");
         }
         if let Some(mut connection) = self.conn.take() {
             connection.close_best_effort_in_place();
@@ -1702,7 +3125,10 @@ pub struct PredatorStats {
 
 #[derive(Debug)]
 enum StorageCommand {
-    Persist(Box<PreparedPersistenceBatch>),
+    Persist {
+        batch: Box<PreparedPersistenceBatch>,
+        reply: xchan::Sender<Result<AdmissionReceipt, StorageWorkerError>>,
+    },
     Flush {
         reply: xchan::Sender<Result<FlushReceipt, StorageWorkerError>>,
     },
@@ -1714,6 +3140,50 @@ enum StorageCommand {
         entered: xchan::Sender<()>,
         release: xchan::Receiver<()>,
     },
+}
+
+#[cfg(test)]
+struct StartupPause {
+    entered: xchan::Sender<()>,
+    release: xchan::Receiver<()>,
+}
+
+#[cfg(test)]
+static STARTUP_PAUSES: OnceLock<Mutex<BTreeMap<String, StartupPause>>> = OnceLock::new();
+
+#[cfg(test)]
+fn register_startup_pause(path: &str) -> (xchan::Receiver<()>, xchan::Sender<()>) {
+    let (entered_tx, entered_rx) = xchan::bounded(1);
+    let (release_tx, release_rx) = xchan::bounded(1);
+    let pauses = STARTUP_PAUSES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut pauses = match pauses.lock() {
+        Ok(pauses) => pauses,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    pauses.insert(
+        path.to_owned(),
+        StartupPause {
+            entered: entered_tx,
+            release: release_rx,
+        },
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn maybe_pause_storage_startup(path: &str) {
+    let pauses = STARTUP_PAUSES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let pause = {
+        let mut pauses = match pauses.lock() {
+            Ok(pauses) => pauses,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pauses.remove(path)
+    };
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.recv();
+    }
 }
 
 /// Persistence strength associated with an acknowledged commit.
@@ -1731,6 +3201,7 @@ pub enum PersistenceGuarantee {
 pub struct FlushReceipt {
     pub committed_tick: Option<u64>,
     pub guarantee: PersistenceGuarantee,
+    pub watermarks: PersistenceWatermarks,
     pub analytics_revision: u64,
 }
 
@@ -1739,6 +3210,7 @@ pub struct FlushReceipt {
 pub struct ShutdownReceipt {
     pub committed_tick: Option<u64>,
     pub guarantee: PersistenceGuarantee,
+    pub watermarks: PersistenceWatermarks,
     pub analytics_revision: u64,
 }
 
@@ -1747,7 +3219,8 @@ struct WorkerState {
     admitted_tick: Option<u64>,
     committed_tick: Option<u64>,
     guarantee: PersistenceGuarantee,
-    pending_analytics: Option<PendingAnalytics>,
+    watermarks: PersistenceWatermarks,
+    pending_analytics: Vec<(PersistenceBatchId, PendingAnalytics)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1756,6 +3229,54 @@ struct StorageThresholds {
     agent: usize,
     event: usize,
     metric: usize,
+}
+
+/// Bounded controller waits around the synchronous storage worker.
+///
+/// A deadline bounds the caller; it cannot cancel a FrankenSQLite call already executing on the
+/// connection-owning worker thread. Timed-out admissions therefore remain retryable with their
+/// exact payload, while timed-out shutdowns retain worker ownership for retry or supervised reap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageDeadlines {
+    pub startup_ack: Duration,
+    pub command_enqueue: Duration,
+    pub admission_ack: Duration,
+    pub flush_ack: Duration,
+    pub shutdown_ack: Duration,
+}
+
+impl Default for StorageDeadlines {
+    fn default() -> Self {
+        Self {
+            startup_ack: DEFAULT_STARTUP_ACK_TIMEOUT,
+            command_enqueue: DEFAULT_COMMAND_ENQUEUE_TIMEOUT,
+            admission_ack: DEFAULT_ADMISSION_ACK_TIMEOUT,
+            flush_ack: DEFAULT_FLUSH_ACK_TIMEOUT,
+            shutdown_ack: DEFAULT_SHUTDOWN_ACK_TIMEOUT,
+        }
+    }
+}
+
+impl StorageDeadlines {
+    fn validate(self) -> Result<(), StorageError> {
+        for (name, timeout) in [
+            ("startup_ack", self.startup_ack),
+            ("command_enqueue", self.command_enqueue),
+            ("admission_ack", self.admission_ack),
+            ("flush_ack", self.flush_ack),
+            ("shutdown_ack", self.shutdown_ack),
+        ] {
+            if timeout.is_zero() || timeout > MAX_STORAGE_WAIT_TIMEOUT {
+                return Err(StorageError::InvalidData {
+                    context: "storage.deadlines",
+                    reason: format!(
+                        "{name} must be within 1ns..={MAX_STORAGE_WAIT_TIMEOUT:?}, got {timeout:?}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1770,37 +3291,97 @@ pub struct StorageSink {
     analytics: AnalyticsSnapshotProvider,
     admission: Arc<Mutex<AdmissionState>>,
     path: Arc<str>,
+    deadlines: StorageDeadlines,
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionGateWait {
+    operation: StorageOperation,
+    tick: Option<u64>,
+    commit_state: FailureCommitState,
+    deadline: Instant,
+    waited: Duration,
+    recover_poison: bool,
+}
+
+fn lock_admission_gate_until<'a>(
+    admission: &'a Mutex<AdmissionState>,
+    path: &str,
+    wait: AdmissionGateWait,
+) -> Result<std::sync::MutexGuard<'a, AdmissionState>, StorageWorkerError> {
+    loop {
+        match admission.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) if wait.recover_poison => {
+                warn!(operation = ?wait.operation, "recovering poisoned storage admission gate");
+                return Ok(poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(StorageWorkerError::Internal {
+                    operation: wait.operation,
+                    path: path.to_owned(),
+                    tick: wait.tick,
+                    commit_state: wait.commit_state,
+                    detail: format!("storage admission gate is poisoned: {error}"),
+                });
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= wait.deadline {
+                    return Err(StorageWorkerError::Timeout {
+                        operation: wait.operation,
+                        phase: StorageWaitPhase::AdmissionGate,
+                        path: path.to_owned(),
+                        tick: wait.tick,
+                        waited: wait.waited,
+                        commit_state: wait.commit_state,
+                    });
+                }
+                thread::sleep(Duration::from_millis(1).min(wait.deadline.duration_since(now)));
+            }
+        }
+    }
 }
 
 impl StorageSink {
-    /// Admit a persistence batch to the bounded worker queue.
-    pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
+    /// Admit a persistence batch and wait until its exact payload is in the worker outbox.
+    pub fn submit_with_receipt(
+        &self,
+        payload: &PersistenceBatch,
+    ) -> Result<AdmissionReceipt, StorageError> {
+        let tick = payload.summary.tick.0;
         let prepared = PreparedPersistenceBatch::from_batch(payload).inspect_err(|error| {
             let worker_error = StorageWorkerError::Internal {
                 operation: StorageOperation::Admit,
                 path: self.path.to_string(),
-                tick: Some(payload.summary.tick.0),
+                tick: Some(tick),
                 commit_state: FailureCommitState::NotAdmitted,
                 detail: error.to_string(),
             };
             self.analytics.publish_worker_error(&worker_error, false);
         })?;
-        let admission = self.admission.lock().map_err(|error| {
-            let worker_error = StorageWorkerError::Internal {
+        let enqueue_deadline = Instant::now() + self.deadlines.command_enqueue;
+        let admission = lock_admission_gate_until(
+            &self.admission,
+            &self.path,
+            AdmissionGateWait {
                 operation: StorageOperation::Admit,
-                path: self.path.to_string(),
-                tick: Some(payload.summary.tick.0),
+                tick: Some(tick),
                 commit_state: FailureCommitState::NotAdmitted,
-                detail: format!("storage admission gate is poisoned: {error}"),
-            };
-            self.analytics.publish_worker_error(&worker_error, true);
+                deadline: enqueue_deadline,
+                waited: self.deadlines.command_enqueue,
+                recover_poison: false,
+            },
+        )
+        .map_err(|worker_error| {
+            self.analytics.publish_worker_error(&worker_error, false);
             StorageError::Worker(worker_error)
         })?;
         if !admission.open {
             let worker_error = StorageWorkerError::Channel {
                 operation: StorageOperation::Admit,
                 path: self.path.to_string(),
-                tick: Some(payload.summary.tick.0),
+                tick: Some(tick),
                 commit_state: FailureCommitState::NotAdmitted,
                 detail: "storage pipeline is closing or closed".to_owned(),
             };
@@ -1808,27 +3389,239 @@ impl StorageSink {
             return Err(StorageError::Worker(worker_error));
         }
 
-        let send_result = self.tx.send(StorageCommand::Persist(Box::new(prepared)));
+        let (reply_tx, reply_rx) = xchan::bounded(1);
+        let send_result = self.tx.send_deadline(
+            StorageCommand::Persist {
+                batch: Box::new(prepared),
+                reply: reply_tx,
+            },
+            enqueue_deadline,
+        );
         drop(admission);
-        send_result.map_err(|error| {
-            let worker_error = StorageWorkerError::Channel {
-                operation: StorageOperation::Admit,
-                path: self.path.to_string(),
-                tick: Some(payload.summary.tick.0),
-                commit_state: FailureCommitState::NotAdmitted,
-                detail: error.to_string(),
-            };
-            self.analytics.publish_worker_error(&worker_error, true);
-            StorageError::Worker(worker_error)
-        })
+        match send_result {
+            Ok(()) => {}
+            Err(xchan::SendTimeoutError::Timeout(_)) => {
+                let worker_error = StorageWorkerError::Timeout {
+                    operation: StorageOperation::Admit,
+                    phase: StorageWaitPhase::CommandEnqueue,
+                    path: self.path.to_string(),
+                    tick: Some(tick),
+                    waited: self.deadlines.command_enqueue,
+                    commit_state: FailureCommitState::NotAdmitted,
+                };
+                self.analytics.publish_worker_error(&worker_error, false);
+                return Err(StorageError::Worker(worker_error));
+            }
+            Err(xchan::SendTimeoutError::Disconnected(_)) => {
+                let worker_error = StorageWorkerError::Channel {
+                    operation: StorageOperation::Admit,
+                    path: self.path.to_string(),
+                    tick: Some(tick),
+                    commit_state: FailureCommitState::NotAdmitted,
+                    detail: "storage worker command channel is disconnected".to_owned(),
+                };
+                self.analytics.publish_worker_error(&worker_error, true);
+                return Err(StorageError::Worker(worker_error));
+            }
+        }
+        reply_rx
+            .recv_deadline(Instant::now() + self.deadlines.admission_ack)
+            .map_err(|error| {
+                let (worker_error, stopped) = match error {
+                    xchan::RecvTimeoutError::Timeout => (
+                        StorageWorkerError::Timeout {
+                            operation: StorageOperation::Admit,
+                            phase: StorageWaitPhase::Acknowledgement,
+                            path: self.path.to_string(),
+                            tick: Some(tick),
+                            waited: self.deadlines.admission_ack,
+                            commit_state: FailureCommitState::Indeterminate,
+                        },
+                        false,
+                    ),
+                    xchan::RecvTimeoutError::Disconnected => (
+                        StorageWorkerError::Channel {
+                            operation: StorageOperation::Admit,
+                            path: self.path.to_string(),
+                            tick: Some(tick),
+                            commit_state: FailureCommitState::Indeterminate,
+                            detail: "storage worker exited before durable outbox acknowledgement"
+                                .to_owned(),
+                        },
+                        true,
+                    ),
+                };
+                self.analytics.publish_worker_error(&worker_error, stopped);
+                StorageError::Worker(worker_error)
+            })?
+            .map_err(StorageError::Worker)
+    }
+
+    /// Admit a persistence batch while discarding the returned batch identifier.
+    pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
+        self.submit_with_receipt(payload).map(|_| ())
     }
 }
 
 impl WorldPersistence for StorageSink {
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
         self.submit(payload).map_err(|error| {
-            PersistenceAdmissionError::new(payload.summary.tick.0, error.to_string())
+            let state = match &error {
+                StorageError::Worker(worker_error)
+                    if matches!(
+                        worker_error.status().commit_state,
+                        FailureCommitState::Indeterminate | FailureCommitState::Committed
+                    ) =>
+                {
+                    PersistenceAdmissionState::Indeterminate
+                }
+                _ => PersistenceAdmissionState::NotAdmitted,
+            };
+            match state {
+                PersistenceAdmissionState::NotAdmitted => {
+                    PersistenceAdmissionError::new(payload.summary.tick.0, error.to_string())
+                }
+                PersistenceAdmissionState::Indeterminate => {
+                    PersistenceAdmissionError::indeterminate(
+                        payload.summary.tick.0,
+                        error.to_string(),
+                    )
+                }
+            }
         })
+    }
+}
+
+type ShutdownReply = Result<ShutdownReceipt, StorageWorkerError>;
+type ShutdownReplyReceiver = xchan::Receiver<ShutdownReply>;
+
+enum StorageReapRequest {
+    Pipeline {
+        tx: xchan::Sender<StorageCommand>,
+        admission: Arc<Mutex<AdmissionState>>,
+        pending_shutdown: Option<ShutdownReplyReceiver>,
+        handle: thread::JoinHandle<Option<StorageWorkerError>>,
+        path: Arc<str>,
+        analytics: AnalyticsSnapshotProvider,
+    },
+    JoinOnly {
+        handle: thread::JoinHandle<Option<StorageWorkerError>>,
+        path: Arc<str>,
+        analytics: AnalyticsSnapshotProvider,
+    },
+}
+
+fn join_reaped_worker(
+    handle: thread::JoinHandle<Option<StorageWorkerError>>,
+    path: &str,
+    analytics: &AnalyticsSnapshotProvider,
+    response: Option<ShutdownReply>,
+) {
+    match handle.join() {
+        Err(panic) => analytics.publish_worker_error(
+            &StorageWorkerError::Internal {
+                operation: StorageOperation::Join,
+                path: path.to_owned(),
+                tick: None,
+                commit_state: FailureCommitState::Indeterminate,
+                detail: format!("storage worker panicked during supervised reap: {panic:?}"),
+            },
+            true,
+        ),
+        Ok(Some(terminal_error)) => analytics.publish_worker_error(&terminal_error, true),
+        Ok(None) => {
+            if let Some(Err(error)) = response {
+                analytics.publish_worker_error(&error, true);
+            }
+        }
+    }
+}
+
+fn reap_storage_request(request: StorageReapRequest) {
+    match request {
+        StorageReapRequest::JoinOnly {
+            handle,
+            path,
+            analytics,
+        } => join_reaped_worker(handle, &path, &analytics, None),
+        StorageReapRequest::Pipeline {
+            tx,
+            admission,
+            pending_shutdown,
+            handle,
+            path,
+            analytics,
+        } => {
+            let response = pending_shutdown.map_or_else(
+                || {
+                    let mut gate = match admission.lock() {
+                        Ok(gate) => gate,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    gate.open = false;
+                    let (reply, receiver) = xchan::bounded(1);
+                    let send_result = tx.send(StorageCommand::Shutdown { reply });
+                    drop(gate);
+                    match send_result {
+                        Ok(()) => receiver.recv().map_err(|error| StorageWorkerError::Channel {
+                            operation: StorageOperation::Shutdown,
+                            path: path.to_string(),
+                            tick: None,
+                            commit_state: FailureCommitState::Indeterminate,
+                            detail: format!(
+                                "storage worker exited before supervised shutdown acknowledgement: {error}"
+                            ),
+                        })?,
+                        Err(error) => Err(StorageWorkerError::Channel {
+                            operation: StorageOperation::Shutdown,
+                            path: path.to_string(),
+                            tick: None,
+                            commit_state: FailureCommitState::Indeterminate,
+                            detail: format!(
+                                "failed to enqueue supervised storage shutdown: {error}"
+                            ),
+                        }),
+                    }
+                },
+                |receiver| {
+                    receiver.recv().map_err(|error| StorageWorkerError::Channel {
+                        operation: StorageOperation::Shutdown,
+                        path: path.to_string(),
+                        tick: None,
+                        commit_state: FailureCommitState::Indeterminate,
+                        detail: format!(
+                            "storage worker exited before pending shutdown acknowledgement: {error}"
+                        ),
+                    })?
+                },
+            );
+            join_reaped_worker(handle, &path, &analytics, Some(response));
+        }
+    }
+}
+
+fn handoff_storage_reap(request: StorageReapRequest) {
+    let request = Arc::new(Mutex::new(Some(request)));
+    let background = Arc::clone(&request);
+    let spawned = thread::Builder::new()
+        .name("scriptbots-storage-reaper".into())
+        .spawn(move || {
+            let request = match background.lock() {
+                Ok(mut request) => request.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(request) = request {
+                reap_storage_request(request);
+            }
+        });
+    if spawned.is_err() {
+        let request = match request.lock() {
+            Ok(mut request) => request.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(request) = request {
+            reap_storage_request(request);
+        }
     }
 }
 
@@ -1836,6 +3629,7 @@ impl WorldPersistence for StorageSink {
 pub struct StoragePipeline {
     sink: StorageSink,
     handle: Option<thread::JoinHandle<Option<StorageWorkerError>>>,
+    pending_shutdown: Option<ShutdownReplyReceiver>,
 }
 
 impl StoragePipeline {
@@ -1850,6 +3644,19 @@ impl StoragePipeline {
         )
     }
 
+    /// Open a validated existing ScriptBots database, recover its outbox, and own it exclusively.
+    pub fn recover_existing(path: &str) -> Result<Self, StorageError> {
+        Self::with_thresholds_and_deadlines_in_mode(
+            path,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+            StorageDeadlines::default(),
+            StorageOpenMode::RecoverExisting,
+        )
+    }
+
     /// Create an asynchronous pipeline with explicit thresholds.
     pub fn with_thresholds(
         path: &str,
@@ -1858,6 +3665,46 @@ impl StoragePipeline {
         event: usize,
         metric: usize,
     ) -> Result<Self, StorageError> {
+        Self::with_thresholds_and_deadlines(
+            path,
+            tick,
+            agent,
+            event,
+            metric,
+            StorageDeadlines::default(),
+        )
+    }
+
+    /// Create an asynchronous pipeline with explicit buffering and caller wait deadlines.
+    pub fn with_thresholds_and_deadlines(
+        path: &str,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+        deadlines: StorageDeadlines,
+    ) -> Result<Self, StorageError> {
+        Self::with_thresholds_and_deadlines_in_mode(
+            path,
+            tick,
+            agent,
+            event,
+            metric,
+            deadlines,
+            StorageOpenMode::CreateOrMigrate,
+        )
+    }
+
+    fn with_thresholds_and_deadlines_in_mode(
+        path: &str,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+        deadlines: StorageDeadlines,
+        mode: StorageOpenMode,
+    ) -> Result<Self, StorageError> {
+        deadlines.validate()?;
         let (tx, rx) = xchan::bounded::<StorageCommand>(DEFAULT_COMMAND_CAPACITY);
         let (startup_tx, startup_rx) = xchan::bounded::<Result<(), StorageWorkerError>>(1);
         let analytics = AnalyticsSnapshotProvider::empty();
@@ -1874,7 +3721,14 @@ impl StoragePipeline {
         let handle = thread::Builder::new()
             .name("scriptbots-storage-worker".into())
             .spawn(move || {
-                storage_worker(worker_path, thresholds, rx, startup_tx, worker_analytics)
+                storage_worker(
+                    worker_path,
+                    thresholds,
+                    mode,
+                    rx,
+                    startup_tx,
+                    worker_analytics,
+                )
             })
             .map_err(|err| {
                 StorageError::Worker(StorageWorkerError::Internal {
@@ -1886,15 +3740,17 @@ impl StoragePipeline {
                 })
             })?;
 
-        match startup_rx.recv() {
+        match startup_rx.recv_deadline(Instant::now() + deadlines.startup_ack) {
             Ok(Ok(())) => Ok(Self {
                 sink: StorageSink {
                     tx,
                     analytics,
                     admission,
                     path: storage_path.clone(),
+                    deadlines,
                 },
                 handle: Some(handle),
+                pending_shutdown: None,
             }),
             Ok(Err(error)) => match handle.join() {
                 Ok(Some(terminal_error)) => Err(StorageError::Worker(terminal_error)),
@@ -1907,16 +3763,14 @@ impl StoragePipeline {
                     detail: format!("storage worker panicked during startup: {panic:?}"),
                 })),
             },
-            Err(error) => match handle.join() {
+            Err(xchan::RecvTimeoutError::Disconnected) => match handle.join() {
                 Ok(Some(terminal_error)) => Err(StorageError::Worker(terminal_error)),
                 Ok(None) => Err(StorageError::Worker(StorageWorkerError::Channel {
                     operation: StorageOperation::Startup,
                     path: storage_path.to_string(),
                     tick: None,
                     commit_state: FailureCommitState::NotAdmitted,
-                    detail: format!(
-                        "storage worker exited before startup acknowledgement: {error}"
-                    ),
+                    detail: "storage worker exited before startup acknowledgement".to_owned(),
                 })),
                 Err(panic) => Err(StorageError::Worker(StorageWorkerError::Internal {
                     operation: StorageOperation::Join,
@@ -1926,6 +3780,25 @@ impl StoragePipeline {
                     detail: format!("storage worker panicked during startup: {panic:?}"),
                 })),
             },
+            Err(xchan::RecvTimeoutError::Timeout) => {
+                let error = StorageWorkerError::Timeout {
+                    operation: StorageOperation::Startup,
+                    phase: StorageWaitPhase::Acknowledgement,
+                    path: storage_path.to_string(),
+                    tick: None,
+                    waited: deadlines.startup_ack,
+                    commit_state: FailureCommitState::Indeterminate,
+                };
+                analytics.publish_worker_error(&error, false);
+                drop(startup_rx);
+                drop(tx);
+                handoff_storage_reap(StorageReapRequest::JoinOnly {
+                    handle,
+                    path: storage_path,
+                    analytics,
+                });
+                Err(StorageError::Worker(error))
+            }
         }
     }
 
@@ -1946,55 +3819,150 @@ impl StoragePipeline {
         self.sink.submit(payload)
     }
 
+    /// Admit a persistence batch and return its durable-outbox identity.
+    pub fn submit_with_receipt(
+        &self,
+        payload: &PersistenceBatch,
+    ) -> Result<AdmissionReceipt, StorageError> {
+        self.sink.submit_with_receipt(payload)
+    }
+
     /// Flush all previously admitted batches and wait for a durability receipt.
     pub fn flush_and_wait(&self) -> Result<FlushReceipt, StorageError> {
         let (reply_tx, reply_rx) = xchan::bounded(1);
-        let admission = self.sink.admission.lock().map_err(|error| {
-            StorageError::Worker(StorageWorkerError::Internal {
+        let enqueue_deadline = Instant::now() + self.sink.deadlines.command_enqueue;
+        let admission = lock_admission_gate_until(
+            &self.sink.admission,
+            &self.sink.path,
+            AdmissionGateWait {
                 operation: StorageOperation::Flush,
-                path: self.sink.path.to_string(),
                 tick: None,
                 commit_state: FailureCommitState::Indeterminate,
-                detail: format!("storage admission gate is poisoned: {error}"),
-            })
+                deadline: enqueue_deadline,
+                waited: self.sink.deadlines.command_enqueue,
+                recover_poison: false,
+            },
+        )
+        .map_err(|worker_error| {
+            self.sink
+                .analytics
+                .publish_worker_error(&worker_error, false);
+            StorageError::Worker(worker_error)
         })?;
         if !admission.open {
-            return Err(StorageError::Worker(StorageWorkerError::Channel {
+            let error = StorageWorkerError::Channel {
                 operation: StorageOperation::Flush,
                 path: self.sink.path.to_string(),
                 tick: None,
                 commit_state: FailureCommitState::Indeterminate,
                 detail: "storage pipeline is closing or closed".to_owned(),
-            }));
+            };
+            self.sink.analytics.publish_worker_error(&error, true);
+            return Err(StorageError::Worker(error));
         }
-        let send_result = self.sink.tx.send(StorageCommand::Flush { reply: reply_tx });
+        let send_result = self
+            .sink
+            .tx
+            .send_deadline(StorageCommand::Flush { reply: reply_tx }, enqueue_deadline);
         drop(admission);
-        send_result.map_err(|error| {
-            StorageError::Worker(StorageWorkerError::Channel {
-                operation: StorageOperation::Flush,
-                path: self.sink.path.to_string(),
-                tick: None,
-                commit_state: FailureCommitState::Indeterminate,
-                detail: format!("failed to request storage flush: {error}"),
-            })
-        })?;
-        reply_rx
-            .recv()
-            .map_err(|error| {
-                StorageError::Worker(StorageWorkerError::Channel {
+        match send_result {
+            Ok(()) => {}
+            Err(xchan::SendTimeoutError::Timeout(_)) => {
+                let error = StorageWorkerError::Timeout {
+                    operation: StorageOperation::Flush,
+                    phase: StorageWaitPhase::CommandEnqueue,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    waited: self.sink.deadlines.command_enqueue,
+                    commit_state: FailureCommitState::Indeterminate,
+                };
+                self.sink.analytics.publish_worker_error(&error, false);
+                return Err(StorageError::Worker(error));
+            }
+            Err(xchan::SendTimeoutError::Disconnected(_)) => {
+                let error = StorageWorkerError::Channel {
                     operation: StorageOperation::Flush,
                     path: self.sink.path.to_string(),
                     tick: None,
                     commit_state: FailureCommitState::Indeterminate,
-                    detail: format!("storage worker exited before flush acknowledgement: {error}"),
-                })
+                    detail: "storage worker command channel is disconnected".to_owned(),
+                };
+                self.sink.analytics.publish_worker_error(&error, true);
+                return Err(StorageError::Worker(error));
+            }
+        }
+        reply_rx
+            .recv_deadline(Instant::now() + self.sink.deadlines.flush_ack)
+            .map_err(|error| {
+                let (worker_error, stopped) = match error {
+                    xchan::RecvTimeoutError::Timeout => (
+                        StorageWorkerError::Timeout {
+                            operation: StorageOperation::Flush,
+                            phase: StorageWaitPhase::Acknowledgement,
+                            path: self.sink.path.to_string(),
+                            tick: None,
+                            waited: self.sink.deadlines.flush_ack,
+                            commit_state: FailureCommitState::Indeterminate,
+                        },
+                        false,
+                    ),
+                    xchan::RecvTimeoutError::Disconnected => (
+                        StorageWorkerError::Channel {
+                            operation: StorageOperation::Flush,
+                            path: self.sink.path.to_string(),
+                            tick: None,
+                            commit_state: FailureCommitState::Indeterminate,
+                            detail: "storage worker exited before flush acknowledgement".to_owned(),
+                        },
+                        true,
+                    ),
+                };
+                self.sink
+                    .analytics
+                    .publish_worker_error(&worker_error, stopped);
+                StorageError::Worker(worker_error)
             })?
             .map_err(StorageError::Worker)
     }
 
+    fn join_shutdown_worker(
+        &mut self,
+        response: ShutdownReply,
+    ) -> Result<ShutdownReceipt, StorageError> {
+        let Some(handle) = self.handle.take() else {
+            return Err(StorageError::Worker(StorageWorkerError::Internal {
+                operation: StorageOperation::Join,
+                path: self.sink.path.to_string(),
+                tick: None,
+                commit_state: FailureCommitState::Indeterminate,
+                detail: "storage worker ownership was lost before join".to_owned(),
+            }));
+        };
+        match handle.join() {
+            Err(panic) => {
+                let error = StorageWorkerError::Internal {
+                    operation: StorageOperation::Join,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: format!("storage worker thread panicked: {panic:?}"),
+                };
+                self.sink.analytics.publish_worker_error(&error, true);
+                Err(StorageError::Worker(error))
+            }
+            Ok(Some(terminal_error)) => {
+                self.sink
+                    .analytics
+                    .publish_worker_error(&terminal_error, true);
+                Err(StorageError::Worker(terminal_error))
+            }
+            Ok(None) => response.map_err(StorageError::Worker),
+        }
+    }
+
     /// Flush, close, and join the worker, returning an explicit shutdown receipt.
     pub fn shutdown(&mut self) -> Result<ShutdownReceipt, StorageError> {
-        let Some(handle) = self.handle.take() else {
+        if self.handle.is_none() {
             return Err(StorageError::Worker(StorageWorkerError::Internal {
                 operation: StorageOperation::Shutdown,
                 path: self.sink.path.to_string(),
@@ -2002,61 +3970,106 @@ impl StoragePipeline {
                 commit_state: FailureCommitState::Committed,
                 detail: "storage worker has already been shut down".to_owned(),
             }));
-        };
+        }
 
-        let (reply_tx, reply_rx) = xchan::bounded(1);
-        let mut admission = match self.sink.admission.lock() {
-            Ok(admission) => admission,
-            Err(poisoned) => {
-                warn!("recovering poisoned storage admission gate during shutdown");
-                poisoned.into_inner()
-            }
-        };
-        admission.open = false;
-        let send_result = self
-            .sink
-            .tx
-            .send(StorageCommand::Shutdown { reply: reply_tx })
-            .map_err(|error| {
-                StorageError::Worker(StorageWorkerError::Channel {
+        if self.pending_shutdown.is_none() {
+            let enqueue_deadline = Instant::now() + self.sink.deadlines.command_enqueue;
+            let mut admission = lock_admission_gate_until(
+                &self.sink.admission,
+                &self.sink.path,
+                AdmissionGateWait {
                     operation: StorageOperation::Shutdown,
-                    path: self.sink.path.to_string(),
                     tick: None,
                     commit_state: FailureCommitState::Indeterminate,
-                    detail: format!("failed to request storage shutdown: {error}"),
-                })
-            });
-        drop(admission);
-        let response = send_result.and_then(|()| {
-            reply_rx
-                .recv()
-                .map_err(|error| {
-                    StorageError::Worker(StorageWorkerError::Channel {
+                    deadline: enqueue_deadline,
+                    waited: self.sink.deadlines.command_enqueue,
+                    recover_poison: true,
+                },
+            )
+            .map_err(|worker_error| {
+                self.sink
+                    .analytics
+                    .publish_worker_error(&worker_error, false);
+                StorageError::Worker(worker_error)
+            })?;
+            admission.open = false;
+            let (reply_tx, reply_rx) = xchan::bounded(1);
+            let send_result = self.sink.tx.send_deadline(
+                StorageCommand::Shutdown { reply: reply_tx },
+                enqueue_deadline,
+            );
+            drop(admission);
+            match send_result {
+                Ok(()) => self.pending_shutdown = Some(reply_rx),
+                Err(xchan::SendTimeoutError::Timeout(_)) => {
+                    let error = StorageWorkerError::Timeout {
+                        operation: StorageOperation::Shutdown,
+                        phase: StorageWaitPhase::CommandEnqueue,
+                        path: self.sink.path.to_string(),
+                        tick: None,
+                        waited: self.sink.deadlines.command_enqueue,
+                        commit_state: FailureCommitState::Indeterminate,
+                    };
+                    self.sink.analytics.publish_worker_error(&error, false);
+                    return Err(StorageError::Worker(error));
+                }
+                Err(xchan::SendTimeoutError::Disconnected(_)) => {
+                    let error = StorageWorkerError::Channel {
                         operation: StorageOperation::Shutdown,
                         path: self.sink.path.to_string(),
                         tick: None,
                         commit_state: FailureCommitState::Indeterminate,
-                        detail: format!(
-                            "storage worker exited before shutdown acknowledgement: {error}"
-                        ),
-                    })
-                })?
-                .map_err(StorageError::Worker)
-        });
+                        detail: "storage worker command channel disconnected before shutdown"
+                            .to_owned(),
+                    };
+                    self.sink.analytics.publish_worker_error(&error, true);
+                    return self.join_shutdown_worker(Err(error));
+                }
+            }
+        }
 
-        let joined = handle.join().map_err(|panic| {
-            StorageError::Worker(StorageWorkerError::Internal {
-                operation: StorageOperation::Join,
+        let Some(pending_shutdown) = self.pending_shutdown.as_ref() else {
+            let error = StorageWorkerError::Internal {
+                operation: StorageOperation::Shutdown,
                 path: self.sink.path.to_string(),
                 tick: None,
                 commit_state: FailureCommitState::Indeterminate,
-                detail: format!("storage worker thread panicked: {panic:?}"),
-            })
-        });
-        match joined {
-            Err(error) => Err(error),
-            Ok(Some(terminal_error)) => Err(StorageError::Worker(terminal_error)),
-            Ok(None) => response,
+                detail: "shutdown command has no receipt receiver".to_owned(),
+            };
+            self.sink.analytics.publish_worker_error(&error, false);
+            return Err(StorageError::Worker(error));
+        };
+        let response =
+            pending_shutdown.recv_deadline(Instant::now() + self.sink.deadlines.shutdown_ack);
+        match response {
+            Err(xchan::RecvTimeoutError::Timeout) => {
+                let error = StorageWorkerError::Timeout {
+                    operation: StorageOperation::Shutdown,
+                    phase: StorageWaitPhase::Acknowledgement,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    waited: self.sink.deadlines.shutdown_ack,
+                    commit_state: FailureCommitState::Indeterminate,
+                };
+                self.sink.analytics.publish_worker_error(&error, false);
+                Err(StorageError::Worker(error))
+            }
+            Err(xchan::RecvTimeoutError::Disconnected) => {
+                self.pending_shutdown.take();
+                let error = StorageWorkerError::Channel {
+                    operation: StorageOperation::Shutdown,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: "storage worker exited before shutdown acknowledgement".to_owned(),
+                };
+                self.sink.analytics.publish_worker_error(&error, true);
+                self.join_shutdown_worker(Err(error))
+            }
+            Ok(response) => {
+                self.pending_shutdown.take();
+                self.join_shutdown_worker(response)
+            }
         }
     }
 }
@@ -2067,6 +4080,16 @@ impl Drop for StoragePipeline {
             && let Err(error) = self.shutdown()
         {
             eprintln!("failed to shut down storage worker cleanly: {error}");
+            if let Some(handle) = self.handle.take() {
+                handoff_storage_reap(StorageReapRequest::Pipeline {
+                    tx: self.sink.tx.clone(),
+                    admission: Arc::clone(&self.sink.admission),
+                    pending_shutdown: self.pending_shutdown.take(),
+                    handle,
+                    path: Arc::clone(&self.sink.path),
+                    analytics: self.sink.analytics.clone(),
+                });
+            }
         }
     }
 }
@@ -2074,16 +4097,18 @@ impl Drop for StoragePipeline {
 fn storage_worker(
     path: String,
     thresholds: StorageThresholds,
+    mode: StorageOpenMode,
     rx: xchan::Receiver<StorageCommand>,
     startup: xchan::Sender<Result<(), StorageWorkerError>>,
     analytics: AnalyticsSnapshotProvider,
 ) -> Option<StorageWorkerError> {
-    let mut storage = match Storage::with_thresholds(
+    let mut storage = match Storage::with_thresholds_in_mode(
         &path,
         thresholds.tick,
         thresholds.agent,
         thresholds.event,
         thresholds.metric,
+        mode,
     ) {
         Ok(storage) => storage,
         Err(error) => {
@@ -2099,6 +4124,56 @@ fn storage_worker(
             return None;
         }
     };
+    let watermarks = match storage.persistence_watermarks() {
+        Ok(watermarks) => watermarks,
+        Err(error) => {
+            let worker_error = worker_error_from_storage(
+                StorageOperation::Recovery,
+                &path,
+                None,
+                FailureCommitState::Indeterminate,
+                error,
+            );
+            analytics.publish_worker_error(&worker_error, true);
+            let _ = startup.send(Err(worker_error));
+            storage.abandon_after_error();
+            return None;
+        }
+    };
+    let recovered_analytics = match storage.latest_pending_analytics() {
+        Ok(pending) => pending,
+        Err(error) => {
+            let worker_error = worker_error_from_storage(
+                StorageOperation::Recovery,
+                &path,
+                None,
+                FailureCommitState::Indeterminate,
+                error,
+            );
+            analytics.publish_worker_error(&worker_error, true);
+            let _ = startup.send(Err(worker_error));
+            storage.abandon_after_error();
+            return None;
+        }
+    };
+    let mut state = WorkerState {
+        committed_tick: recovered_analytics.as_ref().map(|pending| pending.tick),
+        admitted_tick: recovered_analytics.as_ref().map(|pending| pending.tick),
+        guarantee: if path == ":memory:" {
+            PersistenceGuarantee::CommittedVolatile
+        } else {
+            PersistenceGuarantee::Durable
+        },
+        watermarks,
+        ..WorkerState::default()
+    };
+    if let Some(pending) = recovered_analytics {
+        analytics.publish_committed(pending, watermarks);
+    } else {
+        analytics.publish_progress(watermarks);
+    }
+    #[cfg(test)]
+    maybe_pause_storage_startup(&path);
     if startup.send(Ok(())).is_err() {
         let _ = storage.close();
         let error = StorageWorkerError::Channel {
@@ -2112,41 +4187,65 @@ fn storage_worker(
         return Some(error);
     }
 
-    let mut state = WorkerState {
-        guarantee: if path == ":memory:" {
-            PersistenceGuarantee::CommittedVolatile
-        } else {
-            PersistenceGuarantee::Durable
-        },
-        ..WorkerState::default()
-    };
     while let Ok(command) = rx.recv() {
         match command {
-            StorageCommand::Persist(batch) => {
+            StorageCommand::Persist { batch, reply } => {
                 let PreparedPersistenceBatch {
                     tick,
                     storage: prepared,
                     analytics: pending,
                 } = *batch;
-                match storage.enqueue_prepared(prepared) {
-                    Ok(flushed) => {
-                        state.admitted_tick = Some(tick);
-                        state.pending_analytics = Some(pending);
-                        if flushed {
-                            publish_committed_state(&mut state, &analytics);
+                match storage.stage_outbox(tick, &prepared) {
+                    Ok((receipt, newly_admitted)) => {
+                        state.admitted_tick = Some(
+                            state
+                                .admitted_tick
+                                .map_or(tick, |previous| previous.max(tick)),
+                        );
+                        state.watermarks = receipt.watermarks;
+                        analytics.publish_progress(receipt.watermarks);
+                        let _ = reply.send(Ok(receipt));
+                        if !newly_admitted {
+                            continue;
+                        }
+                        state.pending_analytics.push((receipt.batch_id, pending));
+                        match storage.enqueue_staged(receipt.batch_id, prepared) {
+                            Ok(true) => {
+                                if let Err(error) =
+                                    flush_worker_storage(&mut storage, &mut state, &analytics)
+                                {
+                                    analytics.publish_worker_error(&error, true);
+                                    storage.abandon_after_error();
+                                    return Some(error);
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                let worker_error = worker_error_from_storage(
+                                    StorageOperation::Persist,
+                                    &path,
+                                    Some(tick),
+                                    FailureCommitState::RolledBack,
+                                    error,
+                                );
+                                analytics.publish_worker_error(&worker_error, true);
+                                storage.abandon_after_error();
+                                return Some(worker_error);
+                            }
                         }
                     }
                     Err(error) => {
                         let worker_error = worker_error_from_storage(
-                            StorageOperation::Persist,
+                            StorageOperation::Admit,
                             &path,
                             Some(tick),
-                            FailureCommitState::Indeterminate,
+                            FailureCommitState::NotAdmitted,
                             error,
                         );
                         analytics.publish_worker_error(&worker_error, true);
+                        let _ = reply.send(Err(worker_error));
                         storage.abandon_after_error();
-                        return Some(worker_error);
+                        return None;
                     }
                 }
             }
@@ -2189,9 +4288,21 @@ fn storage_worker(
 }
 
 fn publish_committed_state(state: &mut WorkerState, analytics: &AnalyticsSnapshotProvider) {
-    state.committed_tick = state.admitted_tick;
-    if let Some(pending) = state.pending_analytics.take() {
-        analytics.publish_committed(pending);
+    let applied = state.watermarks.applied.map_or(0, PersistenceBatchId::get);
+    let eligible = state
+        .pending_analytics
+        .partition_point(|(batch_id, _)| batch_id.get() <= applied);
+    if eligible == 0 {
+        analytics.publish_progress(state.watermarks);
+        return;
+    }
+    let mut committed = None;
+    for (_, pending) in state.pending_analytics.drain(..eligible) {
+        committed = Some(pending);
+    }
+    if let Some(pending) = committed {
+        state.committed_tick = Some(pending.tick);
+        analytics.publish_committed(pending, state.watermarks);
     }
 }
 
@@ -2209,10 +4320,38 @@ fn flush_worker_storage(
             error,
         )
     })?;
+    state.watermarks = storage.persistence_watermarks().map_err(|error| {
+        worker_error_from_storage(
+            StorageOperation::Flush,
+            &storage.path,
+            state.admitted_tick,
+            FailureCommitState::Committed,
+            error,
+        )
+    })?;
+    publish_committed_state(state, analytics);
+    state.watermarks = match storage.finalize_applied_outbox() {
+        Ok(watermarks) => watermarks,
+        Err(error) => {
+            if let Ok(watermarks) = storage.persistence_watermarks() {
+                state.watermarks = watermarks;
+                publish_committed_state(state, analytics);
+            }
+            return Err(worker_error_from_storage(
+                StorageOperation::Durability,
+                &storage.path,
+                state.admitted_tick,
+                FailureCommitState::Committed,
+                error,
+            )
+            .with_commit_state(FailureCommitState::Committed));
+        }
+    };
     publish_committed_state(state, analytics);
     Ok(FlushReceipt {
         committed_tick: state.committed_tick,
         guarantee: state.guarantee,
+        watermarks: state.watermarks,
         analytics_revision: analytics.snapshot().revision,
     })
 }
@@ -2240,6 +4379,7 @@ fn shutdown_worker_storage(
     Ok(ShutdownReceipt {
         committed_tick: state.committed_tick,
         guarantee: state.guarantee,
+        watermarks: state.watermarks,
         analytics_revision: analytics.snapshot().revision,
     })
 }
@@ -2640,6 +4780,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        process::Command,
         sync::TryLockError,
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
@@ -2704,6 +4845,622 @@ mod tests {
             deaths: Vec::new(),
             replay_events: Vec::new(),
         }
+    }
+
+    fn short_deadlines() -> StorageDeadlines {
+        StorageDeadlines {
+            startup_ack: Duration::from_secs(2),
+            command_enqueue: Duration::from_millis(100),
+            admission_ack: Duration::from_millis(250),
+            flush_ack: Duration::from_millis(250),
+            shutdown_ack: Duration::from_millis(250),
+        }
+    }
+
+    #[test]
+    fn invalid_deadline_configuration_is_rejected_without_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let deadlines = StorageDeadlines {
+            startup_ack: Duration::MAX,
+            ..StorageDeadlines::default()
+        };
+        let error = match StoragePipeline::with_thresholds_and_deadlines(
+            ":memory:", 64, 4096, 1024, 1024, deadlines,
+        ) {
+            Ok(mut pipeline) => {
+                pipeline.shutdown()?;
+                return Err("invalid deadline unexpectedly created a pipeline".into());
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "storage.deadlines",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_timeout_retains_path_ownership_until_supervised_join()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-startup-timeout-lease");
+        let path_string = path.to_string_lossy().to_string();
+        let (entered, release) = register_startup_pause(&path_string);
+        let deadlines = StorageDeadlines {
+            startup_ack: Duration::from_millis(100),
+            ..short_deadlines()
+        };
+        let first_error = match StoragePipeline::with_thresholds_and_deadlines(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+            deadlines,
+        ) {
+            Ok(mut pipeline) => {
+                pipeline.shutdown()?;
+                return Err("startup pause did not trigger its deadline".into());
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            first_error,
+            StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Startup,
+                phase: StorageWaitPhase::Acknowledgement,
+                ..
+            })
+        ));
+        entered.recv_timeout(Duration::from_secs(2))?;
+
+        let second_error = match StoragePipeline::with_thresholds_and_deadlines(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+            deadlines,
+        ) {
+            Ok(mut pipeline) => {
+                pipeline.shutdown()?;
+                return Err("second writer bypassed the timed-out startup lease".into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            second_error
+                .to_string()
+                .contains("another ScriptBots writer")
+        );
+        release.send(())?;
+
+        let retry_deadline = Instant::now() + Duration::from_secs(5);
+        let retry_deadlines = short_deadlines();
+        loop {
+            match StoragePipeline::with_thresholds_and_deadlines(
+                &path_string,
+                64,
+                4096,
+                1024,
+                1024,
+                retry_deadlines,
+            ) {
+                Ok(mut pipeline) => {
+                    pipeline.shutdown()?;
+                    break;
+                }
+                Err(error) => {
+                    if Instant::now() >= retry_deadline {
+                        return Err(format!(
+                            "supervised startup join never released the path lease: {error}"
+                        )
+                        .into());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn writer_path_lease_rejects_a_second_live_writer_and_releases_on_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-writer-path-lease");
+        let path_string = path.to_string_lossy().to_string();
+        let mut first = StoragePipeline::new(&path_string)?;
+        let error = match StoragePipeline::new(&path_string) {
+            Ok(mut second) => {
+                second.shutdown()?;
+                return Err("second writer unexpectedly acquired the same database".into());
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("another ScriptBots writer"));
+        first.shutdown()?;
+
+        let mut after_shutdown = StoragePipeline::new(&path_string)?;
+        after_shutdown.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recover_existing_refuses_empty_and_unrelated_files_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty = temp_db_path("storage-recover-empty-refusal");
+        fs::write(&empty, b"")?;
+        let empty_string = empty.to_string_lossy().to_string();
+        assert!(StoragePipeline::recover_existing(&empty_string).is_err());
+        assert_eq!(fs::read(&empty)?, b"");
+
+        let unrelated = temp_db_path("storage-recover-unrelated-refusal");
+        let unrelated_string = unrelated.to_string_lossy().to_string();
+        let connection = Connection::open_strict_multi_process(&unrelated_string)?;
+        connection.execute("CREATE TABLE unrelated (value INTEGER NOT NULL)")?;
+        connection.close()?;
+        let before = fs::read(&unrelated)?;
+        assert!(StoragePipeline::recover_existing(&unrelated_string).is_err());
+        assert_eq!(fs::read(&unrelated)?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_refuses_symlink_and_hard_link_aliases() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let original = temp_db_path("storage-writer-alias-original");
+        let original_string = original.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::new(&original_string)?;
+        pipeline.shutdown()?;
+
+        let symlink_path = temp_db_path("storage-writer-alias-symlink");
+        symlink(&original, &symlink_path)?;
+        let symlink_error =
+            match StoragePipeline::recover_existing(symlink_path.to_string_lossy().as_ref()) {
+                Ok(mut pipeline) => {
+                    pipeline.shutdown()?;
+                    return Err("symlink writer path unexpectedly succeeded".into());
+                }
+                Err(error) => error,
+            };
+        assert!(symlink_error.to_string().contains("non-symlink"));
+
+        let hard_link = temp_db_path("storage-writer-alias-hard-link");
+        fs::hard_link(&original, &hard_link)?;
+        let hard_link_error =
+            match StoragePipeline::recover_existing(hard_link.to_string_lossy().as_ref()) {
+                Ok(mut pipeline) => {
+                    pipeline.shutdown()?;
+                    return Err("hard-link writer path unexpectedly succeeded".into());
+                }
+                Err(error) => error,
+            };
+        assert!(hard_link_error.to_string().contains("multiply linked"));
+        assert!(StoragePipeline::recover_existing(&original_string).is_err());
+        Ok(())
+    }
+
+    fn assert_integrity(storage: &Storage) -> Result<(), Box<dyn std::error::Error>> {
+        let result: String = storage
+            .connection()?
+            .query_row("PRAGMA integrity_check")?
+            .get_typed(0)?;
+        assert_eq!(result, "ok", "FrankenSQLite integrity check failed");
+        Ok(())
+    }
+
+    #[test]
+    fn storage_crash_child() -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(boundary) = std::env::var("SCRIPTBOTS_STORAGE_CRASH_CHILD") else {
+            return Ok(());
+        };
+        let path = std::env::var("SCRIPTBOTS_STORAGE_CRASH_PATH")?;
+        let tick = std::env::var("SCRIPTBOTS_STORAGE_CRASH_TICK")?.parse::<u64>()?;
+        let prepared = PreparedPersistenceBatch::from_batch(&sample_batch(tick, tick as f32))?;
+        let mut storage = Storage::with_thresholds(&path, 64, 4096, 1024, 1024)?;
+        let (admission, newly_admitted) = storage.stage_outbox(prepared.tick, &prepared.storage)?;
+        assert!(newly_admitted);
+        match boundary.as_str() {
+            "admitted" => std::process::exit(86),
+            "applied" => {
+                assert!(!storage.enqueue_staged(admission.batch_id, prepared.storage)?);
+                storage.flush()?;
+                std::process::exit(87);
+            }
+            other => return Err(format!("unknown storage crash boundary {other:?}").into()),
+        }
+    }
+
+    #[test]
+    fn abrupt_process_exit_recovers_admitted_and_applied_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (boundary, exit_code, tick) in [("admitted", 86, 71_u64), ("applied", 87, 72)] {
+            let path = temp_db_path(&format!("storage-process-exit-{boundary}"));
+            let path_string = path.to_string_lossy().to_string();
+            let status = Command::new(std::env::current_exe()?)
+                .args(["--exact", "tests::storage_crash_child", "--nocapture"])
+                .env("SCRIPTBOTS_STORAGE_CRASH_CHILD", boundary)
+                .env("SCRIPTBOTS_STORAGE_CRASH_PATH", &path_string)
+                .env("SCRIPTBOTS_STORAGE_CRASH_TICK", tick.to_string())
+                .status()?;
+            assert_eq!(
+                status.code(),
+                Some(exit_code),
+                "child did not exit at the requested {boundary} boundary"
+            );
+
+            let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+            let shutdown = recovered.shutdown()?;
+            assert_eq!(shutdown.committed_tick, Some(tick));
+            assert_eq!(shutdown.watermarks.admitted, shutdown.watermarks.applied);
+            assert_eq!(shutdown.watermarks.applied, shutdown.watermarks.durable);
+            let reader = StorageReader::open(&path_string)?;
+            assert_eq!(reader.run_ledger_summary()?.tick_count, 1);
+            reader.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_outbox_recovers_an_admitted_batch_after_the_worker_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-outbox-admission-recovery");
+        let path_string = path.to_string_lossy().to_string();
+        let batch = sample_batch(21, 2.1);
+        let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
+        let mut interrupted = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let (admission, newly_admitted) =
+            interrupted.stage_outbox(prepared.tick, &prepared.storage)?;
+        assert!(newly_admitted);
+        assert_eq!(
+            interrupted.persistence_watermarks()?,
+            PersistenceWatermarks {
+                admitted: Some(admission.batch_id),
+                applied: None,
+                durable: None,
+            }
+        );
+        interrupted.abandon_after_error();
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        let snapshot = recovered.analytics_provider().snapshot();
+        assert_eq!(snapshot.committed_tick, Some(21));
+        assert_eq!(
+            snapshot.watermarks,
+            PersistenceWatermarks {
+                admitted: Some(admission.batch_id),
+                applied: Some(admission.batch_id),
+                durable: Some(admission.batch_id),
+            }
+        );
+        let shutdown = recovered.shutdown()?;
+        assert_eq!(shutdown.watermarks, snapshot.watermarks);
+
+        let durable = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        assert_eq!(
+            durable
+                .batch_status(admission.batch_id)?
+                .map(|status| status.state),
+            Some(BatchPersistenceState::Durable)
+        );
+        let tick_count: i64 = durable
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 1);
+        assert_integrity(&durable)?;
+        durable.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_after_application_before_durable_marker_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-outbox-applied-recovery");
+        let path_string = path.to_string_lossy().to_string();
+        let batch = sample_batch(31, 3.1);
+        let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
+        let mut interrupted = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let (admission, newly_admitted) =
+            interrupted.stage_outbox(prepared.tick, &prepared.storage)?;
+        assert!(newly_admitted);
+        assert!(!interrupted.enqueue_staged(admission.batch_id, prepared.storage)?);
+        interrupted.flush()?;
+        assert_eq!(
+            interrupted.persistence_watermarks()?,
+            PersistenceWatermarks {
+                admitted: Some(admission.batch_id),
+                applied: Some(admission.batch_id),
+                durable: None,
+            }
+        );
+        interrupted.abandon_after_error();
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        let shutdown = recovered.shutdown()?;
+        assert_eq!(shutdown.watermarks.durable, Some(admission.batch_id));
+        let durable = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let tick_count: i64 = durable
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        let event_count: i64 = durable
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM events")?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 1, "recovery duplicated a tick row");
+        assert_eq!(event_count, 1, "recovery duplicated an event row");
+        assert_integrity(&durable)?;
+        durable.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn applied_watermark_is_published_before_durable_finalization_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-applied-before-finalize-failure");
+        let path_string = path.to_string_lossy().to_string();
+        let PreparedPersistenceBatch {
+            tick,
+            storage: prepared,
+            analytics: pending,
+        } = PreparedPersistenceBatch::from_batch(&sample_batch(32, 3.2))?;
+        let mut storage = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let (admission, newly_admitted) = storage.stage_outbox(tick, &prepared)?;
+        assert!(newly_admitted);
+        assert!(!storage.enqueue_staged(admission.batch_id, prepared)?);
+        storage.connection()?.execute("DROP TABLE storage_outbox")?;
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let mut state = WorkerState {
+            admitted_tick: Some(tick),
+            guarantee: PersistenceGuarantee::Durable,
+            watermarks: admission.watermarks,
+            pending_analytics: vec![(admission.batch_id, pending)],
+            ..WorkerState::default()
+        };
+
+        let error = flush_worker_storage(&mut storage, &mut state, &analytics)
+            .expect_err("missing outbox table must fail durable finalization");
+        assert!(matches!(
+            error,
+            StorageWorkerError::Database {
+                operation: StorageOperation::Durability,
+                commit_state: FailureCommitState::Committed,
+                ..
+            }
+        ));
+        let snapshot = analytics.snapshot();
+        assert_eq!(snapshot.committed_tick, Some(tick));
+        assert_eq!(snapshot.watermarks.admitted, Some(admission.batch_id));
+        assert_eq!(snapshot.watermarks.applied, Some(admission.batch_id));
+        assert_eq!(snapshot.watermarks.durable, None);
+        storage.abandon_after_error();
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_applies_outbox_batches_in_admission_order() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = temp_db_path("storage-outbox-order");
+        let path_string = path.to_string_lossy().to_string();
+        let mut interrupted = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let mut ids = Vec::new();
+        for tick in 1..=3 {
+            let prepared = PreparedPersistenceBatch::from_batch(&sample_batch(tick, tick as f32))?;
+            let (admission, newly_admitted) =
+                interrupted.stage_outbox(prepared.tick, &prepared.storage)?;
+            assert!(newly_admitted);
+            assert!(!interrupted.enqueue_staged(admission.batch_id, prepared.storage)?);
+            ids.push(admission.batch_id);
+        }
+        interrupted.abandon_after_error();
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        let shutdown = recovered.shutdown()?;
+        assert_eq!(shutdown.watermarks.durable, ids.last().copied());
+        let reader = StorageReader::open(&path_string)?;
+        assert_eq!(
+            reader
+                .recent_ticks(None)?
+                .into_iter()
+                .map(|tick| tick.tick)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        for batch_id in ids {
+            assert_eq!(
+                reader.batch_status(batch_id)?.map(|status| status.state),
+                Some(BatchPersistenceState::Durable)
+            );
+        }
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_outbox_gap_fails_startup_without_partial_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-outbox-gap");
+        let path_string = path.to_string_lossy().to_string();
+        let mut interrupted = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let mut ids = Vec::new();
+        for tick in 61..=63 {
+            let prepared = PreparedPersistenceBatch::from_batch(&sample_batch(tick, tick as f32))?;
+            let (admission, newly_admitted) =
+                interrupted.stage_outbox(prepared.tick, &prepared.storage)?;
+            assert!(newly_admitted);
+            assert!(!interrupted.enqueue_staged(admission.batch_id, prepared.storage)?);
+            ids.push(admission.batch_id);
+        }
+        interrupted.abandon_after_error();
+
+        let corruptor = Connection::open(&path_string)?;
+        corruptor.execute_with_params(
+            "DELETE FROM storage_outbox WHERE batch_id = ?1",
+            &[ids[1].as_i64().into()],
+        )?;
+        corruptor.close()?;
+        let error = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)
+            .err()
+            .expect("a gap in the durable outbox must fail startup");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "storage_outbox.batch_id",
+                ..
+            }
+        ));
+
+        let inspector = Connection::open(&path_string)?;
+        let tick_count: i64 = inspector
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        let progress = inspector.query_row(
+            "SELECT applied_batch_id, durable_batch_id FROM storage_progress WHERE singleton = 1",
+        )?;
+        assert_eq!(tick_count, 0, "failed recovery applied a later batch");
+        assert_eq!(progress.get_typed::<i64>(0)?, 0);
+        assert_eq!(progress.get_typed::<i64>(1)?, 0);
+        inspector.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_ledger_state_that_contradicts_durable_watermark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-ledger-state-corruption");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::new(&path_string)?;
+        let admission = pipeline.submit_with_receipt(&sample_batch(64, 6.4))?;
+        pipeline.shutdown()?;
+
+        let corruptor = Connection::open_strict_multi_process(&path_string)?;
+        let updated = corruptor.execute_with_params(
+            "UPDATE storage_batch_ledger SET state = 'applied' WHERE batch_id = ?1",
+            &[admission.batch_id.as_i64().into()],
+        )?;
+        assert_eq!(updated, 1);
+        corruptor.close()?;
+        let error = match StoragePipeline::recover_existing(&path_string) {
+            Ok(mut recovered) => {
+                recovered.shutdown()?;
+                return Err("contradictory durable ledger unexpectedly recovered".into());
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("watermarks require \"durable\""));
+        Ok(())
+    }
+
+    #[test]
+    fn rolled_back_application_keeps_the_exact_outbox_for_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-outbox-rollback-recovery");
+        let path_string = path.to_string_lossy().to_string();
+        let batch = sample_batch(41, 4.1);
+        let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
+        let mut interrupted = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let (admission, newly_admitted) =
+            interrupted.stage_outbox(prepared.tick, &prepared.storage)?;
+        assert!(newly_admitted);
+        assert!(!interrupted.enqueue_staged(admission.batch_id, prepared.storage)?);
+        interrupted.connection()?.execute("DROP TABLE metrics")?;
+        let failure = interrupted
+            .flush()
+            .expect_err("missing table must roll back the scientific-table transaction");
+        assert!(matches!(
+            failure,
+            StorageError::Transaction {
+                commit_state: FailureCommitState::RolledBack,
+                ..
+            }
+        ));
+        let tick_count: i64 = interrupted
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 0);
+        assert_eq!(
+            interrupted.persistence_watermarks()?.applied,
+            None,
+            "rolled-back application advanced its watermark"
+        );
+        interrupted.abandon_after_error();
+
+        let repair = Connection::open(&path_string)?;
+        repair.execute(
+            "CREATE TABLE metrics (
+                tick INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                value REAL NOT NULL,
+                PRIMARY KEY (tick, name)
+            )",
+        )?;
+        repair.close()?;
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        let shutdown = recovered.shutdown()?;
+        assert_eq!(shutdown.watermarks.durable, Some(admission.batch_id));
+        let mut durable = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        assert_eq!(durable.max_tick()?, Some(41));
+        assert_integrity(&durable)?;
+        durable.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_duplicate_admission_reuses_one_batch_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-outbox-duplicate");
+        let path_string = path.to_string_lossy().to_string();
+        let batch = sample_batch(51, 5.1);
+        let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
+        let mut storage = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let (first, first_is_new) = storage.stage_outbox(prepared.tick, &prepared.storage)?;
+        let (duplicate, duplicate_is_new) =
+            storage.stage_outbox(prepared.tick, &prepared.storage)?;
+        assert!(first_is_new);
+        assert!(!duplicate_is_new);
+        assert_eq!(duplicate.batch_id, first.batch_id);
+        assert!(!storage.enqueue_staged(first.batch_id, prepared.storage)?);
+        storage.flush()?;
+        let watermarks = storage.finalize_applied_outbox()?;
+        assert_eq!(watermarks.durable, Some(first.batch_id));
+        let ledger_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(ledger_count, 1);
+
+        assert_integrity(&storage)?;
+        storage.close()?;
+        let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
+        let mut reopened = Storage::with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let (duplicate_after_reopen, duplicate_after_reopen_is_new) =
+            reopened.stage_outbox(prepared.tick, &prepared.storage)?;
+        assert!(!duplicate_after_reopen_is_new);
+        assert_eq!(duplicate_after_reopen.batch_id, first.batch_id);
+
+        let conflicting = Storage::prepare_batch(&sample_batch(51, 99.0))?;
+        assert!(matches!(
+            reopened.stage_outbox(51, &conflicting),
+            Err(StorageError::InvalidData {
+                context: "storage_batch_ledger.payload_digest",
+                ..
+            })
+        ));
+        let ledger_count: i64 = reopened
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(ledger_count, 1);
+        assert_integrity(&reopened)?;
+        reopened.close()?;
+        Ok(())
     }
 
     #[test]
@@ -3086,12 +5843,19 @@ mod tests {
         let sink = pipeline.sink();
         let reader = StorageReader::open(&path_string)?;
 
-        sink.submit(&sample_batch(7, 2.5))?;
+        let admission = sink.submit_with_receipt(&sample_batch(7, 2.5))?;
+        assert_eq!(admission.guarantee, PersistenceGuarantee::Durable);
+        assert_eq!(admission.watermarks.admitted, Some(admission.batch_id));
+        assert_eq!(admission.watermarks.applied, None);
+        assert_eq!(admission.watermarks.durable, None);
         assert_eq!(reader.run_ledger_summary()?.tick_count, 0);
 
         let flush = pipeline.flush_and_wait()?;
         assert_eq!(flush.committed_tick, Some(7));
         assert_eq!(flush.guarantee, PersistenceGuarantee::Durable);
+        assert_eq!(flush.watermarks.applied, Some(admission.batch_id));
+        assert_eq!(flush.watermarks.durable, Some(admission.batch_id));
+        assert_eq!(reader.persistence_watermarks()?, flush.watermarks);
         assert_eq!(reader.run_ledger_summary()?.tick_count, 1);
 
         let shutdown = pipeline.shutdown()?;
@@ -3115,6 +5879,265 @@ mod tests {
     }
 
     #[test]
+    fn world_persistence_preserves_indeterminate_acknowledgement_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, rx) = xchan::bounded(1);
+        let mut sink = StorageSink {
+            tx,
+            analytics: AnalyticsSnapshotProvider::empty(),
+            admission: Arc::new(Mutex::new(AdmissionState { open: true })),
+            path: Arc::from(":memory:"),
+            deadlines: StorageDeadlines::default(),
+        };
+        let worker = thread::spawn(move || -> Result<(), std::io::Error> {
+            match rx
+                .recv()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+            {
+                StorageCommand::Persist { reply, .. } => drop(reply),
+                _ => return Err(std::io::Error::other("unexpected storage command")),
+            }
+            Ok(())
+        });
+
+        let error = sink
+            .on_tick(&sample_batch(81, 8.1))
+            .expect_err("lost worker acknowledgement must remain typed");
+        assert_eq!(error.tick(), 81);
+        assert_eq!(error.state(), PersistenceAdmissionState::Indeterminate);
+        worker
+            .join()
+            .map_err(|panic| std::io::Error::other(format!("worker panicked: {panic:?}")))??;
+        Ok(())
+    }
+
+    #[test]
+    fn full_queue_and_contended_gate_have_bounded_definite_non_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, rx) = xchan::bounded(1);
+        let (dummy_reply, _dummy_receiver) = xchan::bounded(1);
+        tx.send(StorageCommand::Flush { reply: dummy_reply })?;
+        let sink = StorageSink {
+            tx,
+            analytics: AnalyticsSnapshotProvider::empty(),
+            admission: Arc::new(Mutex::new(AdmissionState { open: true })),
+            path: Arc::from(":memory:"),
+            deadlines: short_deadlines(),
+        };
+        let started = Instant::now();
+        let error = sink
+            .submit(&sample_batch(82, 8.2))
+            .expect_err("a full queue must hit its enqueue deadline");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            error,
+            StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Admit,
+                phase: StorageWaitPhase::CommandEnqueue,
+                commit_state: FailureCommitState::NotAdmitted,
+                ..
+            })
+        ));
+        drop(rx);
+
+        let (tx, _rx) = xchan::bounded(1);
+        let mut sink = StorageSink {
+            tx,
+            analytics: AnalyticsSnapshotProvider::empty(),
+            admission: Arc::new(Mutex::new(AdmissionState { open: true })),
+            path: Arc::from(":memory:"),
+            deadlines: short_deadlines(),
+        };
+        let admission = Arc::clone(&sink.admission);
+        let guard = admission.lock().expect("test admission gate");
+        let started = Instant::now();
+        let error = sink
+            .on_tick(&sample_batch(83, 8.3))
+            .expect_err("a contended gate must hit its deadline");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(error.state(), PersistenceAdmissionState::NotAdmitted);
+        assert!(error.detail().contains("AdmissionGate"));
+        drop(guard);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_ack_timeout_is_indeterminate_and_exact_retry_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-admission-timeout-retry");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::with_thresholds_and_deadlines(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+            short_deadlines(),
+        )?;
+        let sink = pipeline.sink();
+        let (entered_tx, entered_rx) = xchan::bounded(1);
+        let (release_tx, release_rx) = xchan::bounded(1);
+        pipeline
+            .sink
+            .tx
+            .send(StorageCommand::PauseForAdmissionRace {
+                entered: entered_tx,
+                release: release_rx,
+            })?;
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+
+        let error = sink
+            .submit_with_receipt(&sample_batch(84, 8.4))
+            .expect_err("paused worker must miss the admission acknowledgement deadline");
+        assert!(matches!(
+            error,
+            StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Admit,
+                phase: StorageWaitPhase::Acknowledgement,
+                commit_state: FailureCommitState::Indeterminate,
+                ..
+            })
+        ));
+        assert!(!pipeline.analytics_provider().snapshot().stopped);
+        release_tx.send(())?;
+
+        let retry = sink.submit_with_receipt(&sample_batch(84, 8.4))?;
+        let flush = pipeline.flush_and_wait()?;
+        assert_eq!(flush.watermarks.durable, Some(retry.batch_id));
+        pipeline.shutdown()?;
+        let reader = StorageReader::open(&path_string)?;
+        assert_eq!(reader.run_ledger_summary()?.tick_count, 1);
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn flush_and_shutdown_timeouts_are_bounded_and_retry_the_original_barrier()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flush_pipeline = StoragePipeline::with_thresholds_and_deadlines(
+            ":memory:",
+            64,
+            4096,
+            1024,
+            1024,
+            short_deadlines(),
+        )?;
+        let (entered_tx, entered_rx) = xchan::bounded(1);
+        let (release_tx, release_rx) = xchan::bounded(1);
+        flush_pipeline
+            .sink
+            .tx
+            .send(StorageCommand::PauseForAdmissionRace {
+                entered: entered_tx,
+                release: release_rx,
+            })?;
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        let error = flush_pipeline
+            .flush_and_wait()
+            .expect_err("paused worker must miss the flush deadline");
+        assert!(matches!(
+            error,
+            StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Flush,
+                phase: StorageWaitPhase::Acknowledgement,
+                ..
+            })
+        ));
+        assert!(!flush_pipeline.analytics_provider().snapshot().stopped);
+        release_tx.send(())?;
+        flush_pipeline.flush_and_wait()?;
+        flush_pipeline.shutdown()?;
+
+        let mut shutdown_pipeline = StoragePipeline::with_thresholds_and_deadlines(
+            ":memory:",
+            64,
+            4096,
+            1024,
+            1024,
+            short_deadlines(),
+        )?;
+        let retained_sink = shutdown_pipeline.sink();
+        let (entered_tx, entered_rx) = xchan::bounded(1);
+        let (release_tx, release_rx) = xchan::bounded(1);
+        shutdown_pipeline
+            .sink
+            .tx
+            .send(StorageCommand::PauseForAdmissionRace {
+                entered: entered_tx,
+                release: release_rx,
+            })?;
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        let error = shutdown_pipeline
+            .shutdown()
+            .expect_err("paused worker must miss the shutdown deadline");
+        assert!(matches!(
+            error,
+            StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Shutdown,
+                phase: StorageWaitPhase::Acknowledgement,
+                ..
+            })
+        ));
+        assert!(shutdown_pipeline.handle.is_some());
+        assert!(shutdown_pipeline.pending_shutdown.is_some());
+        assert!(matches!(
+            retained_sink.submit(&sample_batch(85, 8.5)),
+            Err(StorageError::Worker(StorageWorkerError::Channel {
+                operation: StorageOperation::Admit,
+                commit_state: FailureCommitState::NotAdmitted,
+                ..
+            }))
+        ));
+        release_tx.send(())?;
+        shutdown_pipeline.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn timed_out_shutdown_drop_hands_worker_to_supervised_reaper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-shutdown-reaper");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::with_thresholds_and_deadlines(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+            short_deadlines(),
+        )?;
+        let analytics = pipeline.analytics_provider();
+        let (entered_tx, entered_rx) = xchan::bounded(1);
+        let (release_tx, release_rx) = xchan::bounded(1);
+        pipeline
+            .sink
+            .tx
+            .send(StorageCommand::PauseForAdmissionRace {
+                entered: entered_tx,
+                release: release_rx,
+            })?;
+        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        assert!(pipeline.shutdown().is_err());
+        let started = Instant::now();
+        drop(pipeline);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        release_tx.send(())?;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !analytics.snapshot().stopped {
+            assert!(
+                Instant::now() < deadline,
+                "storage reaper never joined worker"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let reader = StorageReader::open(&path_string)?;
+        assert_eq!(reader.run_ledger_summary()?.tick_count, 0);
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn shutdown_barrier_preserves_every_successful_racing_admission()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-admission-race");
@@ -3133,8 +6156,20 @@ mod tests {
             })?;
         entered_rx.recv_timeout(Duration::from_secs(2))?;
 
+        let mut queued_submits = Vec::with_capacity(DEFAULT_COMMAND_CAPACITY);
         for tick in 1..=DEFAULT_COMMAND_CAPACITY as u64 {
-            pipeline.submit(&sample_batch(tick, tick as f32))?;
+            let sink = pipeline.sink();
+            queued_submits.push(thread::spawn(move || {
+                sink.submit(&sample_batch(tick, tick as f32))
+            }));
+        }
+        let queue_deadline = Instant::now() + Duration::from_secs(2);
+        while pipeline.sink.tx.len() < DEFAULT_COMMAND_CAPACITY {
+            assert!(
+                Instant::now() < queue_deadline,
+                "admission commands never filled the bounded worker queue"
+            );
+            thread::yield_now();
         }
 
         let racing_sink = pipeline.sink();
@@ -3152,7 +6187,10 @@ mod tests {
             match pipeline.sink.admission.try_lock() {
                 Err(TryLockError::WouldBlock) => break,
                 Err(TryLockError::Poisoned(error)) => {
-                    panic!("admission gate poisoned before race: {error}")
+                    return Err(std::io::Error::other(format!(
+                        "admission gate poisoned before race: {error}"
+                    ))
+                    .into());
                 }
                 Ok(guard) => drop(guard),
             }
@@ -3168,6 +6206,13 @@ mod tests {
             pipeline.shutdown()
         });
         release_tx.send(())?;
+
+        for submit in queued_submits {
+            submit
+                .join()
+                .expect("queued submit thread must not panic")
+                .expect("queued submit ordered before shutdown must be admitted");
+        }
 
         let (racing_sink, submit_result) = submit_handle
             .join()
@@ -3212,11 +6257,15 @@ mod tests {
     fn pipeline_acknowledges_startup_flush_and_shutdown() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut pipeline = StoragePipeline::with_thresholds(":memory:", 1, 1, 1, 1)?;
-        pipeline.submit(&sample_batch(7, 2.5))?;
+        let admission = pipeline.submit_with_receipt(&sample_batch(7, 2.5))?;
+        assert_eq!(admission.guarantee, PersistenceGuarantee::CommittedVolatile);
 
         let flush = pipeline.flush_and_wait()?;
         assert_eq!(flush.committed_tick, Some(7));
         assert_eq!(flush.guarantee, PersistenceGuarantee::CommittedVolatile);
+        assert_eq!(flush.watermarks.admitted, Some(admission.batch_id));
+        assert_eq!(flush.watermarks.applied, Some(admission.batch_id));
+        assert_eq!(flush.watermarks.durable, None);
         let committed = pipeline.analytics_provider().snapshot();
         assert_eq!(committed.committed_tick, Some(7));
         assert!(!committed.readings.is_empty());

@@ -42,6 +42,11 @@ fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
 
+    if let Some(path) = cli.recover_storage.as_deref() {
+        recover_storage(path)?;
+        return Ok(());
+    }
+
     // Determinism check child mode: run headless and emit JSON, then exit.
     if let Ok(flag) = env::var("SCRIPTBOTS_DET_RUN")
         && matches!(parse_bool(&flag), Some(true))
@@ -635,6 +640,42 @@ fn reserve_new_run_storage(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn recover_storage(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "cannot recover FrankenSQLite storage {} because it does not exist",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "refusing to recover non-regular FrankenSQLite storage path {}",
+            path.display()
+        );
+    }
+    let path = path.to_str().with_context(|| {
+        format!(
+            "storage recovery path is not valid UTF-8: {}",
+            path.display()
+        )
+    })?;
+    let mut pipeline = StoragePipeline::recover_existing(path)
+        .with_context(|| format!("failed to recover FrankenSQLite storage at {path}"))?;
+    let receipt = pipeline
+        .shutdown()
+        .context("recovered FrankenSQLite worker failed during acknowledged shutdown")?;
+    println!(
+        "{} Recovered storage {} (tick={:?}, admitted={:?}, applied={:?}, durable={:?})",
+        "✔".green().bold(),
+        path.cyan(),
+        receipt.committed_tick,
+        receipt.watermarks.admitted.map(|batch_id| batch_id.get()),
+        receipt.watermarks.applied.map(|batch_id| batch_id.get()),
+        receipt.watermarks.durable.map(|batch_id| batch_id.get()),
+    );
+    Ok(())
+}
+
 fn bootstrap_world(
     config: ScriptBotsConfig,
     storage_mode: StorageMode,
@@ -873,6 +914,14 @@ struct AppCli {
     /// Storage target: file (default) or memory (same engine, no durable file).
     #[arg(long = "storage", value_enum, default_value_t = StorageMode::File)]
     storage: StorageMode,
+    /// Recover and finalize an existing FrankenSQLite outbox, then exit without starting a run.
+    #[arg(
+        long = "recover-storage",
+        value_name = "FILE",
+        env = "SCRIPTBOTS_RECOVER_STORAGE",
+        exclusive = true
+    )]
+    recover_storage: Option<PathBuf>,
     /// Profile headless `world.step()` without persistence for N ticks, then exit.
     #[arg(long = "profile-steps", value_name = "TICKS")]
     profile_steps: Option<u64>,
@@ -2186,6 +2235,95 @@ mod tests {
         assert!(error.to_string().contains("stale FrankenSQLite sidecar"));
         assert!(!path.exists(), "reservation must not create the main file");
         assert_eq!(fs::read(wal).expect("read stale WAL"), b"stale-wal");
+    }
+
+    #[test]
+    fn recovery_cli_parses_an_explicit_existing_database_path() {
+        let cli = AppCli::parse_from([
+            "scriptbots-app",
+            "--recover-storage",
+            "runs/interrupted.sqlite",
+        ]);
+        assert_eq!(
+            cli.recover_storage,
+            Some(PathBuf::from("runs/interrupted.sqlite"))
+        );
+        assert!(
+            AppCli::try_parse_from([
+                "scriptbots-app",
+                "--recover-storage",
+                "runs/interrupted.sqlite",
+                "--profile-steps",
+                "1",
+            ])
+            .is_err(),
+            "repair mode must not silently ignore run-mode arguments"
+        );
+    }
+
+    #[test]
+    fn explicit_storage_recovery_reopens_and_preserves_durable_watermarks() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("interrupted.sqlite");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::with_thresholds(&path_string, 64, 4096, 1024, 1024)
+            .expect("create recovery fixture");
+        let admission = pipeline
+            .submit_with_receipt(&scriptbots_core::PersistenceBatch {
+                summary: TickSummary {
+                    tick: scriptbots_core::Tick(7),
+                    agent_count: 0,
+                    births: 0,
+                    deaths: 0,
+                    total_energy: 0.0,
+                    average_energy: 0.0,
+                    average_health: 0.0,
+                    max_age: 0,
+                    spike_hits: 0,
+                },
+                epoch: 0,
+                closed: false,
+                metrics: Vec::new(),
+                events: Vec::new(),
+                agents: Vec::new(),
+                births: Vec::new(),
+                deaths: Vec::new(),
+                replay_events: Vec::new(),
+            })
+            .expect("admit recovery fixture");
+        pipeline.shutdown().expect("finalize recovery fixture");
+
+        recover_storage(&path).expect("explicit recovery mode");
+        let reader = StorageReader::open(&path_string).expect("open recovered database");
+        let watermarks = reader
+            .persistence_watermarks()
+            .expect("read recovered watermarks");
+        assert_eq!(watermarks.admitted, Some(admission.batch_id));
+        assert_eq!(watermarks.applied, Some(admission.batch_id));
+        assert_eq!(watermarks.durable, Some(admission.batch_id));
+        reader.close().expect("close recovery reader");
+    }
+
+    #[test]
+    fn explicit_storage_recovery_refuses_a_missing_path() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.sqlite");
+        let error = recover_storage(&missing).expect_err("recovery must not create a new run");
+        assert!(error.to_string().contains("does not exist"));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn explicit_storage_recovery_refuses_an_unrecognized_file_without_mutation() {
+        let dir = tempdir().expect("tempdir");
+        let unrelated = dir.path().join("unrelated.sqlite");
+        fs::write(&unrelated, b"not-a-scriptbots-database").expect("write unrelated fixture");
+        let error = recover_storage(&unrelated).expect_err("unrecognized file must be refused");
+        assert!(error.to_string().contains("failed to recover"));
+        assert_eq!(
+            fs::read(&unrelated).expect("read unrelated fixture"),
+            b"not-a-scriptbots-database"
+        );
     }
 
     #[test]

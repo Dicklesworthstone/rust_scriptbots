@@ -124,7 +124,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
 - `scriptbots-brain-neuro`: NeuroFlow-backed brain available behind the `neuro` feature (runtime toggles below).
-- `scriptbots-storage`: the exact FrankenSQLite source is pinned; its ScriptBots workload and production worker have targeted in-memory and file-backed tests. The durable outbox, per-batch applied/durable watermarks, and mock-free recovery gates remain tracked in the active rearchitecture plan.
+- `scriptbots-storage`: the exact FrankenSQLite source is pinned; its bounded worker now has a file-backed durable outbox, stable per-batch identities, monotonic admitted/applied/durable watermarks, ordered startup recovery, bounded controller waits with supervised worker ownership, and real child-process exit/reopen tests at the admitted and applied boundaries. Multi-run schemas, strict-run host policy, and full command/replay journals remain tracked in the active rearchitecture plan.
 
 See the active recovery roadmap in `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md` for staged milestones and acceptance gates. The older GPUI port plan is historical evidence, not current policy.
 
@@ -436,6 +436,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
  - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.
  - `--storage {file|memory}`: select the FrankenSQLite target. `file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a fresh generated run path and refuses existing databases or stale sidecars; `memory` opens volatile `:memory:` through the same engine.
+ - `--recover-storage FILE`: exclusively reopen a validated existing ScriptBots run, replay/finalize its durable outbox, print the admitted/applied/durable watermarks, and exit. This repairs persistence only; it does not reconstruct the in-memory world or resume simulation ticks.
  - Auto-pause (any renderer):
    - `--auto-pause-below COUNT` (or `SCRIPTBOTS_AUTO_PAUSE_BELOW`) pauses when population ≤ COUNT
    - `--auto-pause-age-above AGE` (or `SCRIPTBOTS_AUTO_PAUSE_AGE_ABOVE`) pauses when any agent’s age ≥ AGE
@@ -462,6 +463,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
 - `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
 - `SCRIPTBOTS_STORAGE_PATH` — optional new-run FrankenSQLite file path. Without it, ScriptBots creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`. In either case the app reserves the path with create-new semantics and refuses an existing database or stale `-wal`, `-shm`, `-journal`, `-wal-fec`, or lock sidecar. The selected path is printed as `Run database: ...`; save that exact value for later reads and exports.
+- `SCRIPTBOTS_RECOVER_STORAGE` — existing file-backed run to repair and finalize, equivalent to `--recover-storage FILE`. Recovery exits after persistence repair; it does not resume the simulation because world checkpoint restoration is separate roadmap work.
 
 ### Dual-window mode (GUI)
 - On capable desktops, ScriptBots opens two GPUI windows: a canvas window rendering the world and a HUD window with controls, charts, and inspector. If a second window cannot be created (WM limits/remote desktop), the app falls back to a single-window overlay layout automatically.
@@ -588,9 +590,10 @@ Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baselin
 
 - **One embedded engine:** ScriptBots uses the public `fsqlite` facade from FrankenSQLite with `version = "=0.1.16"`, pinned to immutable revision `cd9990bb16291d8c7c247b75b47faae8d7701adb` at `https://github.com/Dicklesworthstone/frankensqlite`. The current dependency enables `native` with default features disabled.
 - **Two storage targets:** `--storage file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a generated `runs/scriptbots-<unix-ms>-<pid>.sqlite` and prints the selected run database; it refuses reuse or stale sidecars. `--storage memory` opens volatile `:memory:` through the same implementation.
-- **Thread-confined connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. No connection-owning value is shared through `Arc<Mutex<_>>`.
-- **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. A synchronous rejection is definitely `NotAdmitted`; the world retains the exact completed batch, latches the fault, and blocks later science ticks until explicit retry succeeds. Enqueue success proves admission only. A flush or shutdown receipt proves that all earlier admitted transactions committed and reports `CommittedVolatile` for `memory` or `Durable` for `file`.
-- **Open durability gap:** the durable outbox and per-batch applied/durable watermarks are not implemented yet. An asynchronously admitted batch therefore lacks an individual terminal receipt until a later flush/shutdown barrier. The current path must not be described as end-to-end lossless; recovery and crash-boundary proofs remain active Beads work.
+- **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) is the only application path that opens an existing run database for mutation. It requires the exact ScriptBots migration identity, refuses missing, unrelated, symlink, and multiply-linked files without mutation, holds an inode/path lease, and opts into FrankenSQLite strict multi-process refusal before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. It is deliberately a persistence repair command, not a world-resume command.
+- **Thread-confined, single-writer connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. File writers hold process-local path/inode ownership and use `Connection::open_strict_multi_process`; no connection-owning value is shared through `Arc<Mutex<_>>`.
+- **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. Configurable `StorageDeadlines` bound startup, admission-gate, command-enqueue, receipt, flush, and shutdown waits. Validation, closed-gate, queue-send, and rolled-back outbox failures are definitely `NotAdmitted`; the world retains the exact completed batch, latches the fault, and blocks later science ticks until explicit retry succeeds. A lost or timed-out acknowledgement remains typed as `Indeterminate` at the world boundary, but retrying the unchanged canonical payload is idempotent and reuses its stable batch ID; a conflicting payload is rejected by its BLAKE3 identity. Timed-out shutdown retains the exact pending receipt and worker handle for retry; dropping the controller hands both to an independent supervised reaper rather than abandoning connection ownership. `submit_with_receipt` returns the batch ID after the exact payload enters the worker outbox and reports `Durable` for a file database or `CommittedVolatile` for memory. That receipt proves admission, not scientific-table application.
+- **Durable recovery and watermarks:** each file-backed batch advances three monotonic, separately queryable prefixes: `admitted` after the outbox transaction, `applied` in the same transaction as all scientific-table rows, and `durable` in a later marker transaction that permits outbox-payload compaction. Startup replays admitted-but-unapplied payloads in order and finalizes applied-but-not-durable batches without duplicating rows. Exact duplicate retries reuse the original batch identity; a different payload for an already admitted tick is rejected. Flush and shutdown receipts include all three watermarks.
 - **Lock-free frontend reads:** the worker atomically publishes immutable `Arc<AnalyticsSnapshot>` latest-value state. GUI, TUI, and API consumers load it without a mutex and may skip stale snapshots; they never run SQL while rendering.
 
 ### Tables and query examples
@@ -628,7 +631,7 @@ JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. 
 ### Pipeline and maintenance
 
 - A persistence transaction either commits the entire accepted batch or rolls it back; a failed statement may not leave the connection in an active transaction.
-- The published health snapshot exposes revision, last committed tick, committed agent count, structured last failure, and stopped state. GUI/TUI code derives lag from live and committed ticks. Queue depth and per-batch acknowledgement state are not published yet.
+- The published health snapshot exposes revision, last committed tick, committed agent count, admitted/applied/durable batch watermarks, structured last failure, and stopped state. GUI/TUI code derives lag from live and committed ticks without issuing SQL. Queue depth is not published yet.
 - The same-thread `Storage` boundary provides explicit flush, close/checkpoint, and `VACUUM` operations. The asynchronous pipeline currently exposes flush and shutdown barriers; maintenance must stay on the connection-owning worker and never run on a GUI/TUI paint path.
 - The exact-revision file-backed conformance test closes and reopens the database and verifies committed data and integrity. Dedicated durability and concurrent-reader/writer gates must use independent connections rather than sharing one connection across threads.
 
@@ -896,7 +899,7 @@ ScriptBots source is licensed under `MIT OR Apache-2.0` (see the workspace manif
 ## Troubleshooting
 - **MSVC/SDK link errors on Windows**: Ensure VS Build Tools "Desktop development with C++" and Windows 11 SDK are installed. Then run `rustup default stable-x86_64-pc-windows-msvc`.
 - **Blank or crashing window**: Update GPU drivers. On WSL2, update the WSL kernel and try again. Verify that your system supports D3D12 (Windows) or Vulkan/Metal (Linux/macOS).
-- **Storage admission or commit failure**: Compare the live tick with the published committed tick (lag is `unknown` before the first commit) and inspect the structured last error, operation, attempt, and commit state. A definite synchronous `NotAdmitted` fault pauses later science ticks and retains the exact batch for explicit retry. For an admitted batch, use a flush/shutdown receipt as the current commit proof; do not infer per-batch durability from enqueue success.
+- **Storage admission or commit failure**: Compare the live tick with the published committed tick and compare the admitted, applied, and durable batch watermarks. Inspect the structured last error, operation, attempt, and commit state. A definite synchronous `NotAdmitted` fault pauses later science ticks and retains the exact batch for explicit retry. A file admission receipt proves that the exact payload can be recovered; application and terminal durability remain separately visible until the later watermarks advance.
 - **Determinism regressions**: Ensure you haven't introduced unordered parallel reductions; stage results and apply in a stable commit phase.
 
 ## Releases
@@ -914,7 +917,7 @@ ScriptBots source is licensed under `MIT OR Apache-2.0` (see the workspace manif
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
-4. Storage: add the durable outbox and per-batch applied/durable watermarks, then complete the multi-run schema, replay hooks, and mock-free crash/recovery tests around the existing bounded FrankenSQLite worker and immutable analytics snapshots.
+4. Storage: extend the completed durable-outbox and bounded-wait protocol into strict-run pause/fail-closed host policy, the multi-run schema, and complete command/replay journals around the bounded FrankenSQLite worker and immutable analytics snapshots.
 5. Rendering: HUD/overlays/inspector polish; performance diagnostics.
 6. Packaging/CI: release builds, binaries; wasm sibling crate scaffolding (non-invasive).
 
