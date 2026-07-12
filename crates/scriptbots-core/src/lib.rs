@@ -1,6 +1,12 @@
 //! Core types shared across the ScriptBots workspace.
 
+pub mod channels;
 pub mod detect;
+
+pub use channels::{
+    BOOST_THRESHOLD, OutputChannel, OutputsExt, SENSOR_LAYOUT, SensorChannel, SensorKind,
+    SensorsExt,
+};
 
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
@@ -6649,27 +6655,22 @@ impl WorldState {
             give_intent: f32,
         }
 
+        // The one place raw actuator slots become meaning. Every reader goes
+        // through the named channels (channels.rs) — hand-indexing this vector
+        // is how combat spent months reading the green colour slot as "boost".
         fn decode_outputs(outputs: [f32; OUTPUT_SIZE]) -> DecodedOutputs {
-            let [
-                left,
-                right,
-                color_r,
-                color_g,
-                color_b,
-                spike,
-                boost_raw,
-                sound_level,
-                give_intent,
-            ] = outputs;
-
             DecodedOutputs {
-                left: left.clamp(0.0, 1.0),
-                right: right.clamp(0.0, 1.0),
-                color: [clamp01(color_r), clamp01(color_g), clamp01(color_b)],
-                spike_target: spike.clamp(0.0, 1.0),
-                boost: boost_raw > 0.5,
-                sound_level: sound_level.clamp(0.0, 1.0),
-                give_intent: give_intent.clamp(0.0, 1.0),
+                left: outputs.channel_clamped(OutputChannel::WheelLeft),
+                right: outputs.channel_clamped(OutputChannel::WheelRight),
+                color: [
+                    outputs.channel_clamped(OutputChannel::ColorRed),
+                    outputs.channel_clamped(OutputChannel::ColorGreen),
+                    outputs.channel_clamped(OutputChannel::ColorBlue),
+                ],
+                spike_target: outputs.channel_clamped(OutputChannel::SpikeTarget),
+                boost: outputs.boost_engaged(),
+                sound_level: outputs.channel_clamped(OutputChannel::SoundLevel),
+                give_intent: outputs.channel_clamped(OutputChannel::GiveIntent),
             }
         }
 
@@ -7359,18 +7360,10 @@ impl WorldState {
                             let herbivore = clamp01(runtime.herbivore_tendency);
                             let mut intake = 0.0;
                             if herbivore > 0.0 && base_intake > 0.0 {
-                                let left = runtime
-                                    .outputs
-                                    .first()
-                                    .copied()
-                                    .unwrap_or(0.0)
-                                    .clamp(0.0, 1.0);
-                                let right = runtime
-                                    .outputs
-                                    .get(1)
-                                    .copied()
-                                    .unwrap_or(0.0)
-                                    .clamp(0.0, 1.0);
+                                let left =
+                                    runtime.outputs.channel_clamped(OutputChannel::WheelLeft);
+                                let right =
+                                    runtime.outputs.channel_clamped(OutputChannel::WheelRight);
                                 let average_speed = (left.abs() + right.abs()) * 0.5;
                                 let speed_scale = (1.0 - average_speed).clamp(0.0, 1.0) * 0.7 + 0.3;
                                 intake = base_intake * herbivore * speed_scale;
@@ -7832,10 +7825,7 @@ impl WorldState {
 
             let spike_power = attacker_runtime
                 .outputs
-                .get(5)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
+                .channel_clamped(OutputChannel::SpikeTarget);
 
             // Attack eligibility is the physical spike extension, not the
             // "was stabbed this tick" flag that combat writes on victims.
@@ -7865,21 +7855,18 @@ impl WorldState {
             let facing = (heading.cos(), heading.sin());
             let wheel_left = attacker_runtime
                 .outputs
-                .first()
-                .copied()
-                .unwrap_or(0.0)
+                .channel(OutputChannel::WheelLeft)
                 .abs();
             let wheel_right = attacker_runtime
                 .outputs
-                .get(1)
-                .copied()
-                .unwrap_or(0.0)
+                .channel(OutputChannel::WheelRight)
                 .abs();
             let velocity = velocities[idx];
             let speed_mag = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
-            // outputs[6] is the boost channel (outputs[3] is color green);
-            // legacy C++ gates the damage bonus on boost > 0.5.
-            let boost_bonus = if attacker_runtime.outputs.get(6).copied().unwrap_or(0.0) > 0.5 {
+            // Legacy C++ gates the damage bonus on boost. This line once read
+            // the green colour slot instead, rewarding carnivores for being
+            // green; the named channel is what makes that unrepresentable.
+            let boost_bonus = if attacker_runtime.outputs.boost_engaged() {
                 1.0
             } else {
                 0.0
@@ -11613,6 +11600,26 @@ mod tests {
             .filter(|e| e.kind == narrative::EventKind::PopulationCrash)
             .count();
         assert_eq!(crashes, 1, "ten passes over one crash is still one crash");
+    }
+
+    #[test]
+    fn named_channels_decode_exactly_like_the_legacy_slot_order() {
+        // The channel refactor (bd-2z0.2.4) must be a pure rename: same slots,
+        // same clamping, same boost threshold. This pins the mapping against an
+        // independently written positional decode, so a renumbering of the enum
+        // cannot quietly change what a brain's output MEANS.
+        let outputs: [f32; OUTPUT_SIZE] = [0.9, 0.2, 0.11, 0.22, 0.33, 0.7, 0.8, 0.44, 0.55];
+
+        assert!((outputs.channel(OutputChannel::WheelLeft) - outputs[0]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::WheelRight) - outputs[1]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::ColorRed) - outputs[2]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::ColorGreen) - outputs[3]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::ColorBlue) - outputs[4]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::SpikeTarget) - outputs[5]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::Boost) - outputs[6]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::SoundLevel) - outputs[7]).abs() < f32::EPSILON);
+        assert!((outputs.channel(OutputChannel::GiveIntent) - outputs[8]).abs() < f32::EPSILON);
+        assert_eq!(outputs.boost_engaged(), outputs[6] > 0.5);
     }
 
     #[test]
