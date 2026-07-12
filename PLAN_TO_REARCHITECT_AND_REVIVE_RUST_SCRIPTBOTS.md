@@ -1389,6 +1389,8 @@ If a `phase0_run.json` already exists in that workspace, stop and ask whether to
 
 ### 11.2 characterization package
 
+**Status:** [Currently In Progress — Phase 1 recon and enriched census, run `2026-07-12-rust_scriptbots-1`, Codex, 2026-07-12]
+
 Before a mechanical split, capture:
 
 - Git commit, branch, dirty paths, toolchain, target, and features;
