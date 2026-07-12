@@ -1,6 +1,7 @@
 use scriptbots_core::{
     AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, NUM_EYES, OUTPUT_SIZE,
-    Position, ScriptBotsConfig, Tick, TickSummary, TraitModifiers, WorldState,
+    Position, SENSOR_LAYOUT, ScriptBotsConfig, SensorKind, Tick, TickSummary, TraitModifiers,
+    WorldState,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -452,6 +453,217 @@ fn legacy_eye_density_micro_oracle_single_neighbor() {
         .expect("subject runtime should survive the oracle step")
         .sensors[0];
     oracle.assert_close("forward eye density", density);
+}
+
+#[test]
+fn legacy_eye_chunk_boundary_oracle_is_feature_invariant() {
+    const SEED: u64 = 0x51E5_C84F;
+    const SENSE_RADIUS: f32 = 100.0;
+    const GRID_CELL_SIZE: u32 = 200;
+    const GRID_CELL_SIZE_F32: f32 = 200.0;
+    const SUBJECT_HEADING: f32 = 0.35;
+    const EYE_DIRECTION: f32 = 0.25;
+    const EYE_FOV: f32 = 0.75;
+    const EYE_SENSITIVITY: f32 = 0.125;
+    const SUBJECT_POSITION: Position = Position::new(100.0, 100.0);
+
+    #[derive(Clone, Copy)]
+    struct VisibleTarget {
+        distance: f32,
+        angle_offset: f32,
+        color: [f32; 3],
+    }
+
+    // The subject is inserted before each tested prefix of these targets. Every
+    // agent occupies one grid bucket, so 7/8/9 logical neighbors exercise the
+    // 4n-1, 4n, and 4n+1 boundaries around two four-lane SIMD chunks. The
+    // eight-neighbor case has one remainder target after the subject-inclusive
+    // chunks, so the old inverted SIMD falloff cannot pass from that remainder.
+    const TARGETS: [VisibleTarget; 9] = [
+        VisibleTarget {
+            distance: 18.0,
+            angle_offset: -0.30,
+            color: [1.0, 0.0, 0.0],
+        },
+        VisibleTarget {
+            distance: 23.0,
+            angle_offset: -0.20,
+            color: [0.0, 1.0, 0.0],
+        },
+        VisibleTarget {
+            distance: 29.0,
+            angle_offset: -0.10,
+            color: [0.0, 0.0, 1.0],
+        },
+        VisibleTarget {
+            distance: 34.0,
+            angle_offset: -0.03,
+            color: [1.0, 1.0, 0.0],
+        },
+        VisibleTarget {
+            distance: 39.0,
+            angle_offset: 0.04,
+            color: [0.0, 1.0, 1.0],
+        },
+        VisibleTarget {
+            distance: 44.0,
+            angle_offset: 0.12,
+            color: [1.0, 0.0, 1.0],
+        },
+        VisibleTarget {
+            distance: 49.0,
+            angle_offset: 0.22,
+            color: [0.25, 0.5, 0.75],
+        },
+        VisibleTarget {
+            distance: 54.0,
+            angle_offset: 0.32,
+            color: [0.8, 0.2, 0.4],
+        },
+        VisibleTarget {
+            distance: 58.0,
+            angle_offset: -0.27,
+            color: [0.4, 0.9, 0.1],
+        },
+    ];
+
+    for visible_count in [7, 8, 9] {
+        let targets = &TARGETS[..visible_count];
+        let config = ScriptBotsConfig {
+            world_width: 400,
+            world_height: 400,
+            food_cell_size: GRID_CELL_SIZE,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            sense_radius: SENSE_RADIUS,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            reproduction_energy_threshold: 10.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(SEED),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("legacy eye chunk-boundary oracle world");
+        world.set_closed(true);
+
+        let subject = world.spawn_agent(AgentData {
+            position: SUBJECT_POSITION,
+            heading: SUBJECT_HEADING,
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let view_angle = SUBJECT_HEADING + EYE_DIRECTION;
+        let mut target_ids = Vec::with_capacity(targets.len());
+        for &target in targets {
+            let angle = view_angle + target.angle_offset;
+            let position = Position::new(
+                SUBJECT_POSITION.x + target.distance * angle.cos(),
+                SUBJECT_POSITION.y + target.distance * angle.sin(),
+            );
+            assert_eq!(
+                (
+                    (position.x / GRID_CELL_SIZE_F32).floor(),
+                    (position.y / GRID_CELL_SIZE_F32).floor(),
+                ),
+                (
+                    (SUBJECT_POSITION.x / GRID_CELL_SIZE_F32).floor(),
+                    (SUBJECT_POSITION.y / GRID_CELL_SIZE_F32).floor(),
+                ),
+                "the fixture must keep every target in the subject's bucket",
+            );
+            target_ids.push(world.spawn_agent(AgentData {
+                position,
+                heading: 0.0,
+                color: target.color,
+                health: 2.0,
+                ..AgentData::default()
+            }));
+        }
+        let mut all_ids = Vec::with_capacity(targets.len() + 1);
+        all_ids.push(subject);
+        all_ids.extend_from_slice(&target_ids);
+        bind_zero_brain(&mut world, &all_ids);
+
+        let runtime = world
+            .agent_runtime_mut(subject)
+            .expect("eye-oracle subject runtime");
+        runtime.trait_modifiers = TraitModifiers {
+            smell: 0.0,
+            sound: 0.0,
+            hearing: 0.0,
+            eye: EYE_SENSITIVITY,
+            blood: 0.0,
+        };
+        runtime.eye_fov = [EYE_FOV; NUM_EYES];
+        runtime.eye_direction = [
+            EYE_DIRECTION,
+            EYE_DIRECTION + std::f32::consts::FRAC_PI_2,
+            EYE_DIRECTION + std::f32::consts::PI,
+            EYE_DIRECTION - std::f32::consts::FRAC_PI_2,
+        ];
+
+        // This is the independent legacy World.cpp:241-259 oracle: angular and
+        // distance falloff contribute to every eye channel, while density alone
+        // carries the additional distance/radius factor.
+        let mut expected = [0.0_f32; 4];
+        for &target in targets {
+            let angular_factor = (EYE_FOV - target.angle_offset.abs()) / EYE_FOV;
+            let distance_factor = (SENSE_RADIUS - target.distance) / SENSE_RADIUS;
+            let intensity = EYE_SENSITIVITY * angular_factor * distance_factor;
+            expected[0] += intensity * (target.distance / SENSE_RADIUS);
+            expected[1] += intensity * target.color[0];
+            expected[2] += intensity * target.color[1];
+            expected[3] += intensity * target.color[2];
+        }
+        assert!(
+            expected.iter().all(|value| *value < 1.0),
+            "oracle values must remain below sensor clamping"
+        );
+
+        world
+            .step()
+            .expect("legacy eye chunk-boundary oracle should complete one step");
+        let sensors = world
+            .agent_runtime(subject)
+            .expect("eye-oracle subject should survive")
+            .sensors;
+        let expected_kinds = [
+            (SensorKind::EyeDensity, expected[0]),
+            (SensorKind::EyeRed, expected[1]),
+            (SensorKind::EyeGreen, expected[2]),
+            (SensorKind::EyeBlue, expected[3]),
+        ];
+        for (kind, expected_value) in expected_kinds {
+            let channel = SENSOR_LAYOUT
+                .iter()
+                .find(|channel| channel.eye == Some(0) && channel.kind == kind)
+                .expect("canonical eye channel");
+            let actual = sensors[channel.index];
+            assert!(
+                (actual - expected_value).abs() <= 2.0e-6,
+                "{} differs from the {visible_count}-neighbor legacy analytic oracle: expected {expected_value}, got {actual}",
+                channel.name,
+            );
+        }
+        for channel in SENSOR_LAYOUT
+            .iter()
+            .filter(|channel| channel.eye.is_some_and(|eye| eye != 0))
+        {
+            assert_eq!(
+                sensors[channel.index], 0.0,
+                "{} must not see the forward-eye target cohort",
+                channel.name,
+            );
+        }
+    }
 }
 
 fn fixed_seed_blood_sensor_reading(seed: u64, target_angle: f32, target_health: f32) -> f32 {

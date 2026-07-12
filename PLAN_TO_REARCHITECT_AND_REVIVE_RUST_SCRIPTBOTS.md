@@ -1672,14 +1672,17 @@ Phase 0.4 therefore remains in progress. This slice hardens renderer selection, 
 
 ### Phase 1 — Restore Simulation Correctness (`P0`) [Currently In Progress — scientific peer-patch verification and isolated storage/brain reconciliation, CyanDove, 2026-07-12]
 
-#### 1.1 sensing and spatial oracle [Currently In Progress — blood-sensor legacy-parity boundary proof, `bd-2z0.2.2`, Codex, 2026-07-12]
+#### 1.1 sensing and spatial oracle [Completed — eyesight scalar/SIMD chunk-boundary proof, `bd-2z0.2.1`, Codex, 2026-07-12]
 
-- red SIMD chunk vision test;
-- scalar heading test;
+- [Completed — `bd-2z0.2.1`] deterministic legacy-formula eye oracle for 7, 8, and 9
+  visible targets, forcing the `4n-1`, `4n`, and `4n+1` full-chunk/remainder boundaries
+  while checking rotated geometry plus unclamped density and RGB accumulation;
+- [Completed — `bd-2z0.2.1`] the same oracle and full core suite pass in scalar/serial
+  (`--no-default-features`), SIMD/serial (`--no-default-features --features simd_wide`),
+  and default SIMD/Rayon lanes;
 - [Implemented — `bd-2z0.2.2`] blood half-FOV policy, strict just-inside/on/outside boundary
   tests, wounded-target falloff, and fixed-seed determinism;
 - toroidal index duplicate/distance tests;
-- scalar/SIMD and serial/parallel comparisons;
 - fix implementation only after oracle fails correctly.
 
 **Exit:** sensor digests agree across supported feature paths.
