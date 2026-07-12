@@ -13809,14 +13809,24 @@ mod tests {
             }
             world.agent_runtime_mut(receiver).unwrap().energy = 0.5;
 
-            let giver_key = world
-                .brain_registry_mut()
-                .register("test.giver", |_rng| Box::new(SharingBrain { give: 1.0 }));
+            let giver_key = world.brain_registry_mut().register("test.giver", |_rng| {
+                Ok(Box::new(SharingBrain { give: 1.0 }))
+            });
             let receiver_key = world
                 .brain_registry_mut()
-                .register("test.receiver", |_rng| Box::new(SharingBrain { give: 0.0 }));
-            assert!(world.bind_agent_brain(giver, giver_key));
-            assert!(world.bind_agent_brain(receiver, receiver_key));
+                .register("test.receiver", |_rng| {
+                    Ok(Box::new(SharingBrain { give: 0.0 }))
+                });
+            assert!(
+                world
+                    .bind_agent_brain(giver, giver_key)
+                    .expect("giver brain factory")
+            );
+            assert!(
+                world
+                    .bind_agent_brain(receiver, receiver_key)
+                    .expect("receiver brain factory")
+            );
             (world, giver, receiver)
         };
 
