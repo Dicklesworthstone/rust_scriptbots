@@ -29,30 +29,20 @@ struct Simulation {
     mlp_key: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SnapshotFormat {
+    #[default]
     Json,
     Binary,
 }
 
-impl Default for SnapshotFormat {
-    fn default() -> Self {
-        Self::Json
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SeedStrategy {
+    #[default]
     Wander,
     None,
-}
-
-impl Default for SeedStrategy {
-    fn default() -> Self {
-        Self::Wander
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,7 +216,7 @@ impl Default for InitOptions {
 
 impl InitOptions {
     fn into_spec(self) -> SimSpec {
-        let mut config = self.config.unwrap_or_else(ScriptBotsConfig::default);
+        let mut config = self.config.unwrap_or_default();
         if let Some(width) = self.world_width {
             config.world_width = width;
         }
@@ -739,12 +729,14 @@ mod tests {
         ];
 
         for (width, height, population, ticks, seed, strategy, default_brain) in cases {
-            let mut config = ScriptBotsConfig::default();
-            config.world_width = width;
-            config.world_height = height;
-            // Ensure food_cell_size divides world dimensions evenly
-            config.food_cell_size = 20;
-            config.rng_seed = Some(seed);
+            let config = ScriptBotsConfig {
+                world_width: width,
+                world_height: height,
+                // Ensure food_cell_size divides world dimensions evenly.
+                food_cell_size: 20,
+                rng_seed: Some(seed),
+                ..ScriptBotsConfig::default()
+            };
 
             // Native world execution
             let mut native_world = WorldState::new(config.clone()).expect("native world");
