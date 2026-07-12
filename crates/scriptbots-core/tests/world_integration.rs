@@ -454,6 +454,145 @@ fn legacy_eye_density_micro_oracle_single_neighbor() {
     oracle.assert_close("forward eye density", density);
 }
 
+fn fixed_seed_blood_sensor_reading(seed: u64, target_angle: f32, target_health: f32) -> f32 {
+    let config = ScriptBotsConfig {
+        world_width: 400,
+        world_height: 400,
+        food_cell_size: 20,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        sense_radius: 100.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        food_intake_rate: 0.0,
+        food_waste_rate: 0.0,
+        reproduction_energy_threshold: 10.0,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        persistence_interval: 0,
+        rng_seed: Some(seed),
+        ..ScriptBotsConfig::default()
+    };
+    let mut world = WorldState::new(config).expect("legacy blood oracle world");
+    world.set_closed(true);
+
+    let subject_position = Position::new(200.0, 200.0);
+    let target_distance = 40.0;
+    let subject = world.spawn_agent(AgentData {
+        position: subject_position,
+        heading: 0.0,
+        health: 2.0,
+        ..AgentData::default()
+    });
+    let target = world.spawn_agent(AgentData {
+        position: Position::new(
+            subject_position.x + target_distance * target_angle.cos(),
+            subject_position.y + target_distance * target_angle.sin(),
+        ),
+        heading: 0.0,
+        health: target_health,
+        ..AgentData::default()
+    });
+    bind_zero_brain(&mut world, &[subject, target]);
+
+    let runtime = world
+        .agent_runtime_mut(subject)
+        .expect("blood-oracle subject runtime");
+    runtime.trait_modifiers = TraitModifiers {
+        smell: 0.0,
+        sound: 0.0,
+        hearing: 0.0,
+        eye: 0.0,
+        blood: 1.0,
+    };
+
+    world
+        .step()
+        .expect("legacy blood oracle should complete one simulation step");
+    world
+        .agent_runtime(subject)
+        .expect("blood-oracle subject should survive")
+        .sensors[19]
+}
+
+#[test]
+fn legacy_blood_sensor_fov_boundaries_and_wound_scaling_are_deterministic() {
+    const SEED: u64 = 0xB100_DF0B;
+    const LEGACY_HALF_FOV: f32 = std::f32::consts::PI * 3.0 / 16.0;
+    const ANGLE_DELTA: f32 = 1.0e-3;
+    const DISTANCE_FACTOR: f32 = 0.6;
+    const HALF_WOUND_FACTOR: f32 = 0.5;
+
+    let first = [
+        fixed_seed_blood_sensor_reading(SEED, 0.0, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, LEGACY_HALF_FOV - ANGLE_DELTA, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, LEGACY_HALF_FOV, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, LEGACY_HALF_FOV + ANGLE_DELTA, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, 0.0, 2.0),
+    ];
+    let second = [
+        fixed_seed_blood_sensor_reading(SEED, 0.0, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, LEGACY_HALF_FOV - ANGLE_DELTA, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, LEGACY_HALF_FOV, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, LEGACY_HALF_FOV + ANGLE_DELTA, 1.0),
+        fixed_seed_blood_sensor_reading(SEED, 0.0, 2.0),
+    ];
+    assert_eq!(first, second, "fixed-seed blood sensing must be repeatable");
+
+    let expected_just_inside =
+        (ANGLE_DELTA / LEGACY_HALF_FOV) * DISTANCE_FACTOR * HALF_WOUND_FACTOR;
+    let expectations = [
+        NumericExpectation {
+            quantity: "centered half-wounded target",
+            expected: DISTANCE_FACTOR * HALF_WOUND_FACTOR,
+            absolute_tolerance: 1.0e-6,
+        },
+        NumericExpectation {
+            quantity: "target just inside 3pi/16",
+            expected: expected_just_inside,
+            absolute_tolerance: 1.0e-6,
+        },
+        NumericExpectation {
+            quantity: "target on 3pi/16 boundary",
+            expected: 0.0,
+            absolute_tolerance: 1.0e-6,
+        },
+        NumericExpectation {
+            quantity: "target just outside 3pi/16",
+            expected: 0.0,
+            absolute_tolerance: 1.0e-6,
+        },
+        NumericExpectation {
+            quantity: "centered healthy target",
+            expected: 0.0,
+            absolute_tolerance: 1.0e-6,
+        },
+    ];
+    let oracle = LegacyOracleCase {
+        name: "blood sensor 3pi/16 half-FOV and wound scaling",
+        seed: SEED,
+        deterministic_setup: "heading-zero subject at (200,200), target distance 40, radius 100, blood modifier 1",
+        original_file: "original_scriptbots_code_for_reference/World.cpp",
+        original_lines: (193, 271),
+        contract: OracleContract::LegacyParity,
+        expectations: &expectations,
+    };
+
+    for (quantity, actual) in [
+        ("centered half-wounded target", first[0]),
+        ("target just inside 3pi/16", first[1]),
+        ("target on 3pi/16 boundary", first[2]),
+        ("target just outside 3pi/16", first[3]),
+        ("centered healthy target", first[4]),
+    ] {
+        oracle.assert_close(quantity, actual);
+    }
+}
+
 #[test]
 fn sensory_pipeline_populates_expected_channels() {
     let config = ScriptBotsConfig {

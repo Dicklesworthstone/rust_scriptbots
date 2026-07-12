@@ -522,7 +522,16 @@ Required cases:
 
 Use one shared, numerically explicit eye-weight function or equivalent proven formulation. SIMD is an optimization of the scalar meaning, not a separate meaning. Compare both paths to the same oracle.
 
-The blood sensor must receive a separate legacy-parity decision because Rust currently uses `3π/8` while the legacy implementation uses `3π/16`. If the new wider value is intentionally better, name it as a product change and update tests/docs; do not leave it accidental.
+**Blood-sensor policy (`bd-2z0.2.2`): legacy parity.** The preserved implementation defines
+`PI8 = π/16`, `PI38 = 3π/16`, and admits a target only when its absolute forward-angle
+difference is strictly less than that half-FOV (`World.cpp:193-194,263-271`). Rust therefore uses
+the same `3π/16` half-angle, strict boundary, linear angular falloff, linear distance falloff,
+and `1 - health / 2` wound scaling over the model's valid health interval `[0, 2]`. Rust retains a
+defensive clamp outside that valid interval; it does not widen the scientific cone. The former
+`3π/8` value was an accidental two-times widening, not an intentional redesign. Commit
+`e2d9aaa` had already corrected the constant on this baseline; `bd-2z0.2.2` records the missing
+policy decision, centralizes strict-boundary evaluation, and supplies the executable proof rather
+than claiming another retune.
 
 ### 6.3 neural output contract
 
@@ -1663,11 +1672,12 @@ Phase 0.4 therefore remains in progress. This slice hardens renderer selection, 
 
 ### Phase 1 — Restore Simulation Correctness (`P0`) [Currently In Progress — scientific peer-patch verification and isolated storage/brain reconciliation, CyanDove, 2026-07-12]
 
-#### 1.1 sensing and spatial oracle
+#### 1.1 sensing and spatial oracle [Currently In Progress — blood-sensor legacy-parity boundary proof, `bd-2z0.2.2`, Codex, 2026-07-12]
 
 - red SIMD chunk vision test;
 - scalar heading test;
-- FOV/blood policy tests;
+- [Implemented — `bd-2z0.2.2`] blood half-FOV policy, strict just-inside/on/outside boundary
+  tests, wounded-target falloff, and fixed-seed determinism;
 - toroidal index duplicate/distance tests;
 - scalar/SIMD and serial/parallel comparisons;
 - fix implementation only after oracle fails correctly.

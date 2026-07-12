@@ -106,7 +106,10 @@ pub const ACTIVATION_CAPTURE_BUDGET: usize = 8;
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
 const HALF_TURN: f32 = std::f32::consts::PI;
-const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.1875; // 3π/16, PI38 in legacy World.cpp
+// Legacy-parity policy: World.cpp defines PI8 = π/16 and PI38 = 3 * PI8, then admits blood
+// targets only for `diff4 < PI38`. Commit e2d9aaa already corrected the former accidental 3π/8
+// cone on this baseline; the shared contribution function below proves its strict boundary.
+const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.1875;
 
 fn wrap_signed_angle(mut angle: f32) -> f32 {
     if angle.is_nan() {
@@ -208,6 +211,25 @@ fn angle_to(dx: f32, dy: f32) -> f32 {
 fn angle_difference(a: f32, b: f32) -> f32 {
     let diff = wrap_signed_angle(a - b);
     diff.abs()
+}
+
+/// Legacy-parity blood-sensor contribution for one target.
+///
+/// The boundary is deliberately strict, matching `diff4 < PI38` in `World.cpp`. Within the
+/// model's valid health interval `[0, 2]`, the wound term is exactly `1 - health / 2`; clamping is
+/// retained only as a defensive Rust policy for invalid state outside that interval.
+fn blood_sensor_contribution(
+    forward_difference: f32,
+    distance_factor: f32,
+    target_health: f32,
+) -> f32 {
+    if !(0.0..BLOOD_HALF_FOV).contains(&forward_difference) || distance_factor <= 0.0 {
+        return 0.0;
+    }
+
+    let angular_factor = (BLOOD_HALF_FOV - forward_difference) / BLOOD_HALF_FOV;
+    let wound_factor = (1.0 - (target_health * 0.5).clamp(0.0, 1.0)).max(0.0);
+    angular_factor * distance_factor * wound_factor
 }
 
 #[inline]
@@ -6335,10 +6357,11 @@ impl WorldState {
                             if align >= cos_bhf {
                                 let ang = angle_to(dx, dy);
                                 let forward_diff = angle_difference(heading, ang);
-                                let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
-                                let health = healths[other_idx];
-                                let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
-                                blood += bleed * dist_factor * wound;
+                                blood += blood_sensor_contribution(
+                                    forward_diff,
+                                    dist_factor,
+                                    healths[other_idx],
+                                );
                             }
                         }
                     }
@@ -6411,12 +6434,11 @@ impl WorldState {
                             eye_b[3] = out_b[3];
                         }
                         let forward_diff = angle_difference(heading, ang);
-                        if forward_diff < BLOOD_HALF_FOV {
-                            let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
-                            let health = healths[other_idx];
-                            let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
-                            blood += bleed * dist_factor * wound;
-                        }
+                        blood += blood_sensor_contribution(
+                            forward_diff,
+                            dist_factor,
+                            healths[other_idx],
+                        );
                     }
                 }
                 #[cfg(not(feature = "simd_wide"))]
@@ -6465,10 +6487,11 @@ impl WorldState {
                     let align = hx * (dx / dist) + hy * (dy / dist);
                     if align >= cos_bhf {
                         let forward_diff = angle_difference(heading, ang);
-                        let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
-                        let health = healths[other_idx];
-                        let wound = (1.0 - (health * 0.5).clamp(0.0, 1.0)).max(0.0);
-                        blood += bleed * dist_factor * wound;
+                        blood += blood_sensor_contribution(
+                            forward_diff,
+                            dist_factor,
+                            healths[other_idx],
+                        );
                     }
                 }
             });
@@ -10569,6 +10592,38 @@ mod tests {
             age: seed,
             generation: Generation(seed),
         }
+    }
+
+    #[test]
+    fn blood_sensor_cone_uses_strict_legacy_half_fov_boundary() {
+        const ANGLE_EPSILON: f32 = 1.0e-4;
+        const DISTANCE_FACTOR: f32 = 0.75;
+        const TARGET_HEALTH: f32 = 1.0;
+
+        let just_inside = blood_sensor_contribution(
+            BLOOD_HALF_FOV - ANGLE_EPSILON,
+            DISTANCE_FACTOR,
+            TARGET_HEALTH,
+        );
+        let expected_inside =
+            (ANGLE_EPSILON / BLOOD_HALF_FOV) * DISTANCE_FACTOR * (1.0 - TARGET_HEALTH / 2.0);
+
+        assert!(just_inside > 0.0);
+        assert!((just_inside - expected_inside).abs() <= 1.0e-7);
+        assert_eq!(
+            blood_sensor_contribution(BLOOD_HALF_FOV, DISTANCE_FACTOR, TARGET_HEALTH),
+            0.0,
+            "the legacy `diff4 < PI38` boundary excludes an on-edge target"
+        );
+        assert_eq!(
+            blood_sensor_contribution(
+                BLOOD_HALF_FOV + ANGLE_EPSILON,
+                DISTANCE_FACTOR,
+                TARGET_HEALTH,
+            ),
+            0.0,
+            "a target just outside the legacy cone must not contribute"
+        );
     }
 
     fn set_render_tonemap_exposure_bias(config: &mut ScriptBotsConfig, value: f32) {
