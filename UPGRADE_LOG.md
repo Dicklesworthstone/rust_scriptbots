@@ -787,10 +787,11 @@ No version migration in this ledger is authorized merely by being newer.
   also pass. Durable outbox recovery, crash recovery, and meaningful replay
   production remain explicitly open.
 - **Residue boundary:** live manifests, live source, and `Cargo.lock` no longer
-  use DuckDB. Historical prose remains labeled as history. The tracked
-  `ci-baseline.duckdb` binary remains untouched because repository policy
-  forbids deleting any file without the user's explicit written permission; no
-  live code references it.
+  use DuckDB. Historical prose remains labeled as history. After the user gave
+  explicit written permission for the exact command, `git rm --
+  ci-baseline.duckdb` ran at `2026-07-12T01:47:32Z`; commit `a6f0958` records
+  removal of the obsolete 3,158,016-byte replay fixture. No live code,
+  workflow, configuration, or tracked binary artifact now depends on DuckDB.
 - **Result:** the production engine replacement and dependency removal are
   accepted. Bead `bd-2z0.8.9.3` is complete; `bd-2z0.8.9.4` remains the
   authority for the unfinished asynchronous durability gate.
