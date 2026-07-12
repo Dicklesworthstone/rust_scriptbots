@@ -483,7 +483,7 @@ The primary GUI decision is made from live-path correctness, frame-time, memory,
 
 The simulator must become trustworthy before its output is treated as research data. This phase begins with oracle tests for known defects, then makes the smallest semantic fixes, then introduces the new brain/RNG/replay contracts.
 
-### 6.1 legacy micro-oracle harness
+### 6.1 legacy micro-oracle harness [Completed — `bd-2z0.1.7`]
 
 The preserved C++ implementation is not copied wholesale, and every historical behavior is not automatically desirable. It is used as a local oracle for mechanics that the Rust port claims to preserve.
 

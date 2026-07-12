@@ -1,7 +1,127 @@
 use scriptbots_core::{
-    AgentData, BrainRunner, FoodCellProfileSnapshot, NUM_EYES, Position, ScriptBotsConfig, Tick,
-    TickSummary, TraitModifiers, WorldState,
+    AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, NUM_EYES, OUTPUT_SIZE,
+    Position, ScriptBotsConfig, Tick, TickSummary, TraitModifiers, WorldState,
 };
+
+#[derive(Debug, Clone, Copy)]
+enum OracleContract {
+    LegacyParity,
+    DeliberatePolicy(&'static str),
+}
+
+impl OracleContract {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::LegacyParity => "legacy-parity",
+            Self::DeliberatePolicy(_) => "deliberate-rust-policy",
+        }
+    }
+
+    const fn rationale(self) -> &'static str {
+        match self {
+            Self::LegacyParity => "the Rust port claims to preserve this legacy mechanic",
+            Self::DeliberatePolicy(rationale) => rationale,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NumericExpectation {
+    quantity: &'static str,
+    expected: f32,
+    absolute_tolerance: f32,
+}
+
+#[derive(Debug)]
+struct LegacyOracleCase<'a> {
+    name: &'static str,
+    seed: u64,
+    deterministic_setup: &'static str,
+    original_file: &'static str,
+    original_lines: (u32, u32),
+    contract: OracleContract,
+    expectations: &'a [NumericExpectation],
+}
+
+impl LegacyOracleCase<'_> {
+    fn assert_close(&self, quantity: &str, actual: f32) {
+        assert!(!self.name.is_empty(), "oracle case name must not be empty");
+        assert!(
+            !self.deterministic_setup.is_empty(),
+            "oracle '{}' must describe its deterministic setup",
+            self.name
+        );
+        assert!(
+            !self.original_file.is_empty() && self.original_lines.0 <= self.original_lines.1,
+            "oracle '{}' must cite a valid legacy source range",
+            self.name
+        );
+
+        let expectation = self
+            .expectations
+            .iter()
+            .find(|expectation| expectation.quantity == quantity);
+        assert!(
+            expectation.is_some(),
+            "oracle case '{}' has no numeric expectation for '{quantity}'",
+            self.name
+        );
+        let expectation = expectation.expect("oracle expectation existence asserted above");
+        assert!(
+            expectation.expected.is_finite()
+                && expectation.absolute_tolerance.is_finite()
+                && expectation.absolute_tolerance >= 0.0,
+            "oracle '{}' has an invalid numeric expectation for '{}'",
+            self.name,
+            expectation.quantity
+        );
+
+        let absolute_error = (actual - expectation.expected).abs();
+        assert!(
+            actual.is_finite() && absolute_error <= expectation.absolute_tolerance,
+            "oracle '{}' failed: quantity='{}', expected={} +/- {}, actual={}, \
+             absolute_error={}, contract={}, rationale='{}', seed={}, setup='{}', source={}:{}-{}",
+            self.name,
+            expectation.quantity,
+            expectation.expected,
+            expectation.absolute_tolerance,
+            actual,
+            absolute_error,
+            self.contract.label(),
+            self.contract.rationale(),
+            self.seed,
+            self.deterministic_setup,
+            self.original_file,
+            self.original_lines.0,
+            self.original_lines.1,
+        );
+    }
+}
+
+struct ZeroBrain;
+
+impl BrainRunner for ZeroBrain {
+    fn kind(&self) -> &'static str {
+        "test.oracle.zero"
+    }
+
+    fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        [0.0; OUTPUT_SIZE]
+    }
+}
+
+fn bind_zero_brain(world: &mut WorldState, agents: &[AgentId]) {
+    let key = world
+        .brain_registry_mut()
+        .register("test.oracle.zero", |_rng| Box::new(ZeroBrain));
+
+    for &agent in agents {
+        assert!(
+            world.bind_agent_brain(agent, key),
+            "oracle agent should accept the deterministic zero brain"
+        );
+    }
+}
 
 fn default_profile(config: &ScriptBotsConfig) -> FoodCellProfileSnapshot {
     FoodCellProfileSnapshot {
@@ -244,6 +364,87 @@ fn combat_records_carnivore_event_flags() {
 }
 
 #[test]
+fn legacy_eye_density_micro_oracle_single_neighbor() {
+    const SEED: u64 = 0x51E5_EE01;
+    let expectations = [NumericExpectation {
+        quantity: "forward eye density",
+        expected: 0.1875,
+        absolute_tolerance: 1e-6,
+    }];
+    let oracle = LegacyOracleCase {
+        name: "centered single-neighbor eye density",
+        seed: SEED,
+        deterministic_setup: "subject=(100,100), target=(125,100), heading=0, eye0_dir=0, eye_fov=pi/4, sense_radius=100, eye_modifier=1",
+        original_file: "original_scriptbots_code_for_reference/World.cpp",
+        original_lines: (241, 260),
+        contract: OracleContract::LegacyParity,
+        expectations: &expectations,
+    };
+
+    let config = ScriptBotsConfig {
+        world_width: 400,
+        world_height: 400,
+        food_cell_size: 20,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        sense_radius: 100.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        food_intake_rate: 0.0,
+        food_waste_rate: 0.0,
+        reproduction_energy_threshold: 0.0,
+        rng_seed: Some(SEED),
+        ..ScriptBotsConfig::default()
+    };
+    let mut world = WorldState::new(config).expect("legacy eye oracle world");
+    world.set_closed(true);
+
+    let subject = world.spawn_agent(AgentData {
+        position: Position::new(100.0, 100.0),
+        heading: 0.0,
+        ..AgentData::default()
+    });
+    let target = world.spawn_agent(AgentData {
+        position: Position::new(125.0, 100.0),
+        heading: 0.0,
+        health: 2.0,
+        ..AgentData::default()
+    });
+    bind_zero_brain(&mut world, &[subject, target]);
+
+    let runtime = world
+        .agent_runtime_mut(subject)
+        .expect("subject runtime should exist");
+    runtime.trait_modifiers = TraitModifiers {
+        smell: 0.0,
+        sound: 0.0,
+        hearing: 0.0,
+        eye: 1.0,
+        blood: 0.0,
+    };
+    runtime.eye_fov = [std::f32::consts::FRAC_PI_4; NUM_EYES];
+    runtime.eye_direction = [
+        0.0,
+        std::f32::consts::FRAC_PI_2,
+        std::f32::consts::PI,
+        -std::f32::consts::FRAC_PI_2,
+    ];
+
+    world
+        .step()
+        .expect("legacy eye oracle should complete one simulation step");
+    let density = world
+        .agent_runtime(subject)
+        .expect("subject runtime should survive the oracle step")
+        .sensors[0];
+    oracle.assert_close("forward eye density", density);
+}
+
+#[test]
 fn sensory_pipeline_populates_expected_channels() {
     let config = ScriptBotsConfig {
         world_width: 200,
@@ -341,6 +542,137 @@ fn sensory_pipeline_populates_expected_channels() {
     assert!(
         sensors[20] <= 0.1,
         "temperature discomfort low when preference matches"
+    );
+}
+
+#[test]
+fn ground_food_micro_oracle_documents_energy_policy() {
+    const SEED: u64 = 0xF00D_0001;
+    let expectations = [
+        NumericExpectation {
+            quantity: "cell fertility",
+            expected: 0.0,
+            absolute_tolerance: 1e-6,
+        },
+        NumericExpectation {
+            quantity: "nutrient density",
+            expected: 0.3,
+            absolute_tolerance: 1e-6,
+        },
+        NumericExpectation {
+            quantity: "agent energy",
+            expected: 0.5013,
+            absolute_tolerance: 1e-6,
+        },
+        NumericExpectation {
+            quantity: "food balance total",
+            expected: 0.0013,
+            absolute_tolerance: 1e-6,
+        },
+        NumericExpectation {
+            quantity: "reproduction progress",
+            expected: 0.006,
+            absolute_tolerance: 1e-6,
+        },
+        NumericExpectation {
+            quantity: "cell food",
+            expected: 0.199,
+            absolute_tolerance: 1e-6,
+        },
+        NumericExpectation {
+            quantity: "agent health",
+            expected: 1.0,
+            absolute_tolerance: 1e-6,
+        },
+    ];
+    let oracle = LegacyOracleCase {
+        name: "stationary herbivore ground-food policy",
+        seed: SEED,
+        deterministic_setup: "agent=(5,5), cell=(0,0), food=0.2, energy=0.5, herbivore=1, wheels=0, intake=0.002, waste=0.001, nutrient=0.3",
+        original_file: "original_scriptbots_code_for_reference/World.cpp",
+        original_lines: (381, 395),
+        contract: OracleContract::DeliberatePolicy(
+            "Rust converts nutrient-weighted intake into energy and positive reproduction progress; legacy C++ changed health and decremented a countdown",
+        ),
+        expectations: &expectations,
+    };
+
+    let config = ScriptBotsConfig {
+        world_width: 40,
+        world_height: 40,
+        food_cell_size: 10,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        sense_radius: 5.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        food_intake_rate: 0.002,
+        food_waste_rate: 0.001,
+        food_fertility_base: 0.0,
+        food_moisture_weight: 0.0,
+        food_elevation_weight: 0.0,
+        food_slope_weight: 0.0,
+        reproduction_energy_threshold: 0.0,
+        reproduction_food_bonus: 3.0,
+        reproduction_fertility_bonus: 0.5,
+        rng_seed: Some(SEED),
+        ..ScriptBotsConfig::default()
+    };
+    let mut world = WorldState::new(config).expect("ground-food oracle world");
+    world.set_closed(true);
+
+    let agent = world.spawn_agent(AgentData {
+        position: Position::new(5.0, 5.0),
+        health: 1.0,
+        ..AgentData::default()
+    });
+    bind_zero_brain(&mut world, &[agent]);
+    let runtime = world
+        .agent_runtime_mut(agent)
+        .expect("oracle herbivore runtime should exist");
+    runtime.energy = 0.5;
+    runtime.herbivore_tendency = 1.0;
+    runtime.reproduction_counter = 0.0;
+    runtime.food_balance_total = 0.0;
+
+    let profile = world
+        .food_profile(0, 0)
+        .expect("oracle food cell should have a generated profile");
+    oracle.assert_close("cell fertility", profile.fertility);
+    oracle.assert_close("nutrient density", profile.nutrient_density);
+    let cell = world
+        .food_mut()
+        .get_mut(0, 0)
+        .expect("oracle food cell should exist");
+    *cell = 0.2;
+
+    world
+        .step()
+        .expect("ground-food oracle should complete one simulation step");
+    let runtime = world
+        .agent_runtime(agent)
+        .expect("oracle herbivore should survive the step");
+    oracle.assert_close("agent energy", runtime.energy);
+    oracle.assert_close("food balance total", runtime.food_balance_total);
+    oracle.assert_close("reproduction progress", runtime.reproduction_counter);
+    oracle.assert_close(
+        "cell food",
+        world
+            .food()
+            .get(0, 0)
+            .expect("oracle food cell should remain addressable"),
+    );
+    oracle.assert_close(
+        "agent health",
+        world
+            .snapshot_agent(agent)
+            .expect("oracle herbivore snapshot should exist")
+            .data
+            .health,
     );
 }
 
