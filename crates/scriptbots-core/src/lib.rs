@@ -6848,7 +6848,7 @@ impl WorldState {
         let waste_rate = self.config.food_waste_rate.max(0.0);
         let reproduction_bonus = self.config.reproduction_food_bonus.max(0.0);
         let fertility_bonus_scale = self.config.reproduction_fertility_bonus.max(0.0);
-        let healths = self.agents.columns_mut().health_mut();
+        let healths = self.agents.columns().health();
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 // legacy C++ gate: a full agent neither eats nor wastes cell food
@@ -6899,9 +6899,6 @@ impl WorldState {
                                 let nutrient = profile.nutrient_density;
                                 let energy_gain = intake * (0.5 + nutrient * 0.5);
                                 runtime.energy = (runtime.energy + energy_gain).min(2.0);
-                                // Eating restores health as well (legacy: health += itk);
-                                // without this, metabolism drain is a fixed death timer.
-                                healths[idx] = (healths[idx] + energy_gain).min(2.0);
                                 runtime.food_delta += energy_gain;
                                 if reproduction_bonus > 0.0 {
                                     let fertility_multiplier =
@@ -13235,6 +13232,7 @@ mod tests {
             let idx = arena.index_of(agent).unwrap();
             let columns = arena.columns_mut();
             columns.positions_mut()[idx] = Position::new(5.0, 5.0);
+            columns.health_mut()[idx] = 1.0;
         }
         {
             let runtime = world.agent_runtime_mut(agent).unwrap();
@@ -13276,6 +13274,15 @@ mod tests {
             "expected reproduction counter bonus of {:.6}, got {}",
             expected_intake * config.reproduction_food_bonus * fertility_multiplier,
             runtime.reproduction_counter
+        );
+        let health = world
+            .snapshot_agent(agent)
+            .expect("herbivore should remain alive")
+            .data
+            .health;
+        assert!(
+            (health - 1.0).abs() < 1e-6,
+            "ground-food policy should leave health unchanged, got {health:.6}"
         );
         let cell_value = world.food().get(0, 0).unwrap();
         let expected_cell = (0.2 - config.food_waste_rate).max(0.0);
