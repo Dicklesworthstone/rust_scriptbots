@@ -2598,8 +2598,8 @@ read-only commands/modifiers, rejects source overrides and mutation flags, and
 cross-checks BR all/ready state against BV issue, status, blocking-edge, exact
 actionable issue-ID sets, and `data_hash` evidence before emitting a result.
 Every BV next result, plan item, and triage top pick is checked against BR's
-ready set; BR remains the sole claim authority. The live
-239-issue snapshot proves 28 closed, 22 in progress, 189 open, 326 blocking
+ready set; BR remains the sole claim authority. The implementation-time
+239-issue snapshot proved 28 closed, 22 in progress, 189 open, 326 blocking
 edges, 58 actionable issues, and authoritative BV hash `5d1d45dfe541f203`.
 The automated mutation fixture also proves that a stale sibling snapshot gets a
 different hash, all three stored relationship types survive export, only the
