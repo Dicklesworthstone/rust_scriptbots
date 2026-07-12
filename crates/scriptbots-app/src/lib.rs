@@ -737,6 +737,7 @@ mod characterization_tests {
 
 pub mod command;
 pub mod control;
+pub mod lab;
 pub mod servers;
 pub mod terminal;
 
