@@ -1856,7 +1856,7 @@ Executable evidence on source baseline `a4dce8fb9635834d387e0cd353d2d2f6670abf19
 
 **Exit:** core performs one deterministic state transition with no command transport or storage I/O.
 
-#### 2.3 runtime dependency and protocol decision
+#### 2.3 runtime dependency and protocol decision [Completed — `bd-2z0.4.3`]
 
 - confirm whether `scriptbots-runtime` crate is justified;
 - define a synchronous `HostCore`/`SimulationEngine` state machine with injected/manual time;
@@ -1866,6 +1866,35 @@ Executable evidence on source baseline `a4dce8fb9635834d387e0cd353d2d2f6670abf19
 - run a bounded Asupersync MPSC/cancellation/lifecycle spike before choosing native scheduling types;
 - prohibit frontend dependency on mutable world;
 - add null frontend.
+
+Decision from the bounded executable spike:
+
+- create `scriptbots-runtime` after the pure `StepOutcome` seam lands; the crate owns the
+  runtime-neutral synchronous host/protocol plus an optional native driver, and depends on core
+  but never on storage, Axum/Tokio, GPUI, Bevy, FrankenTUI/Ratatui, or application composition;
+- keep the protocol, `HostCore`, and manual/browser driver free of Asupersync types; select exact
+  crates.io `asupersync = "=0.3.6"` with default features disabled for the first optional native
+  driver because FrankenSQLite already locks that checksummed package, avoiding two incompatible
+  runtime/`Cx` type universes;
+- defer the live `90949d62ffd6221873a047ea14c7b6bb0060849f` (`0.3.8` workspace marker)
+  upgrade until the serialized dependency lane can advance FrankenSQLite and the native driver
+  together; the tested primitive subset is green on both sources;
+- use bounded two-phase MPSC for native command ownership, explicit `blocking_threads` when a
+  blocking pool is actually required, structured joins/cancellation, and deterministic lab tests;
+- keep the `!Send + !Sync` FrankenSQLite connection on its dedicated owner thread. A running
+  blocking closure cannot be preempted and the no-pool/lab fallback may execute inline, so
+  Asupersync supervises DTOs, receipts, and shutdown but never owns or hard-cancels the connection;
+- retain Tokio/Axum as an application/server adapter during the first host extraction and retain a
+  manual WASM driver. The whole-workspace migration planner's sole hard blocker, `smol`, comes from
+  `gpui_linux` and is not in the proposed runtime dependency closure.
+
+Executable evidence covered capacity-two exact-envelope overload, ordered Pause/Step/Shutdown,
+cancel-before-commit, permit commit, panic observation, configured blocking-pool isolation,
+same-thread mock storage ownership/drop, strict Clippy, and a no-Asupersync
+`wasm32-unknown-unknown` manual build. Both Asupersync sources passed 4/4 tests; the selected
+`0.3.6` clean all-target check took 3m45s, its clean test link took 6m55s, and its cached all-target
+check took 0.63s wall time. Its isolated normal dependency tree contains no Tokio, Smol,
+frontend, server, or storage edge.
 
 **Exit:** dependency graph enforces that renderers cannot call `WorldState::step`.
 
