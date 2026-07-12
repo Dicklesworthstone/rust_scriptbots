@@ -231,6 +231,16 @@ jobs:
             --ignore RUSTSEC-2026-0194 \
             --ignore RUSTSEC-2026-0195
 
+      - name: Franken family license audit guard (bd-2z0.8.15)
+        run: |
+          bash ci/check_franken_licenses.sh --self-test
+          bash ci/check_franken_licenses.sh
+
+      - name: Asupersync single-version-universe guard (bd-2z0.8.17)
+        run: |
+          bash ci/check_asupersync_universe.sh --self-test
+          bash ci/check_asupersync_universe.sh asupersync
+
   wasm:
     name: Wasm (ubuntu)
     runs-on: ubuntu-24.04
