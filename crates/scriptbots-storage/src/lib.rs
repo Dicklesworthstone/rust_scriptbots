@@ -40,6 +40,7 @@ const DEFAULT_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
 const OUTBOX_PAYLOAD_VERSION: u32 = 1;
+const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
 
 const SCRIPTBOTS_SCHEMA_V1: &str = "
     CREATE TABLE ticks (
@@ -250,6 +251,8 @@ pub enum StorageError {
         #[source]
         source: std::io::Error,
     },
+    #[error("another ScriptBots writer owns database {path} through OS lease {lock_path}")]
+    WriterLeaseHeld { path: String, lock_path: String },
     #[error(transparent)]
     Worker(#[from] StorageWorkerError),
     #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
@@ -333,6 +336,16 @@ pub enum StorageWorkerError {
         tick: Option<u64>,
         commit_state: FailureCommitState,
         detail: String,
+    },
+    #[error(
+        "storage {operation:?} refused a second writer for {path}; OS lease {lock_path} is held (tick={tick:?}, commit_state={commit_state:?})"
+    )]
+    WriterLeaseHeld {
+        operation: StorageOperation,
+        path: String,
+        lock_path: String,
+        tick: Option<u64>,
+        commit_state: FailureCommitState,
     },
 }
 
@@ -429,6 +442,22 @@ impl StorageWorkerError {
                 commit_state: *commit_state,
                 detail: detail.clone(),
             },
+            Self::WriterLeaseHeld {
+                operation,
+                path,
+                lock_path,
+                tick,
+                commit_state,
+            } => StorageFailureStatus {
+                kind: StorageFailureKind::Internal,
+                operation: *operation,
+                path: Some(path.clone()),
+                tick: *tick,
+                attempt: 0,
+                transient: true,
+                commit_state: *commit_state,
+                detail: format!("OS writer lease {lock_path} is held"),
+            },
         }
     }
 
@@ -437,7 +466,8 @@ impl StorageWorkerError {
             Self::Database { commit_state, .. }
             | Self::Timeout { commit_state, .. }
             | Self::Channel { commit_state, .. }
-            | Self::Internal { commit_state, .. } => *commit_state = state,
+            | Self::Internal { commit_state, .. }
+            | Self::WriterLeaseHeld { commit_state, .. } => *commit_state = state,
         }
         self
     }
@@ -473,6 +503,16 @@ fn worker_error_from_storage(
             transient,
             commit_state,
             source,
+        },
+        StorageError::WriterLeaseHeld {
+            path: lease_path,
+            lock_path,
+        } => StorageWorkerError::WriterLeaseHeld {
+            operation,
+            path: lease_path,
+            lock_path,
+            tick,
+            commit_state: default_commit_state,
         },
         StorageError::Worker(error) => error,
         other => StorageWorkerError::Internal {
@@ -1745,6 +1785,110 @@ impl StorageFileIdentity {
     }
 }
 
+fn storage_writer_lock_path(path: &str) -> PathBuf {
+    let mut lock_path = Path::new(path).as_os_str().to_os_string();
+    lock_path.push(STORAGE_WRITER_LOCK_SUFFIX);
+    PathBuf::from(lock_path)
+}
+
+struct StorageWriterLease {
+    // The live descriptor is the lease. The companion path deliberately persists across runs.
+    file: std::fs::File,
+    lock_path: PathBuf,
+}
+
+impl StorageWriterLease {
+    fn acquire(path: &str) -> Result<Option<Self>, StorageError> {
+        if path == ":memory:" {
+            return Ok(None);
+        }
+
+        let lock_path = storage_writer_lock_path(path);
+        let lock_path_display = lock_path.display().to_string();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(&lock_path)
+            .map_err(|source| StorageError::Filesystem {
+                path: lock_path_display.clone(),
+                source,
+            })?;
+        let file_metadata = file.metadata().map_err(|source| StorageError::Filesystem {
+            path: lock_path_display.clone(),
+            source,
+        })?;
+        if !file_metadata.is_file() || storage_file_has_multiple_links(&file_metadata) {
+            return Err(StorageError::InvalidData {
+                context: "storage.writer_lease",
+                reason: format!(
+                    "writer lease must be a singly linked regular file at {lock_path_display}"
+                ),
+            });
+        }
+        let identity = StorageFileIdentity::from_metadata(&file_metadata);
+        Self::verify_path(&lock_path, &lock_path_display, &identity)?;
+
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(StorageError::WriterLeaseHeld {
+                    path: path.to_owned(),
+                    lock_path: lock_path_display,
+                });
+            }
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(StorageError::Filesystem {
+                    path: lock_path_display,
+                    source,
+                });
+            }
+        }
+        Self::verify_path(&lock_path, &lock_path_display, &identity)?;
+
+        Ok(Some(Self { file, lock_path }))
+    }
+
+    fn verify_path(
+        lock_path: &Path,
+        lock_path_display: &str,
+        identity: &StorageFileIdentity,
+    ) -> Result<(), StorageError> {
+        let metadata =
+            std::fs::symlink_metadata(lock_path).map_err(|source| StorageError::Filesystem {
+                path: lock_path_display.to_owned(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || storage_file_has_multiple_links(&metadata)
+            || StorageFileIdentity::from_metadata(&metadata) != *identity
+        {
+            return Err(StorageError::InvalidData {
+                context: "storage.writer_lease",
+                reason: format!("writer lease path {lock_path_display} changed during locked open"),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StorageWriterLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            warn!(
+                path = %self.lock_path.display(),
+                %error,
+                "failed to explicitly release storage writer lease; closing the file will release it"
+            );
+        }
+    }
+}
+
 struct ExistingStorageLease {
     _file: std::fs::File,
     identity: StorageFileIdentity,
@@ -1824,6 +1968,7 @@ pub struct Storage {
     path: String,
     conn: Option<Connection>,
     _path_lease: Option<StoragePathLease>,
+    _writer_lease: Option<StorageWriterLease>,
     _existing_lease: Option<ExistingStorageLease>,
     terminally_failed: bool,
     buffer: StorageBuffer,
@@ -1878,6 +2023,9 @@ impl Storage {
         mode: StorageOpenMode,
     ) -> Result<Self, StorageError> {
         let mut path_lease = StoragePathLease::acquire(path)?;
+        // This OS-backed lease is the cross-process authority. It must precede every recovery
+        // inspection and every writable database open below.
+        let writer_lease = StorageWriterLease::acquire(path)?;
         let existing_lease = match mode {
             StorageOpenMode::RecoverExisting => {
                 let lease = ExistingStorageLease::open(path)?;
@@ -1889,11 +2037,7 @@ impl Storage {
             }
             StorageOpenMode::CreateOrMigrate => None,
         };
-        let conn = if path == ":memory:" {
-            Connection::open(path)?
-        } else {
-            Connection::open_strict_multi_process(path)?
-        };
+        let conn = Connection::open(path)?;
         if let Some(lease) = path_lease.as_mut() {
             lease.promote_existing(path)?;
         }
@@ -1905,6 +2049,7 @@ impl Storage {
             path: path.to_owned(),
             conn: Some(conn),
             _path_lease: path_lease,
+            _writer_lease: writer_lease,
             _existing_lease: existing_lease,
             terminally_failed: false,
             buffer: StorageBuffer::default(),
@@ -1918,11 +2063,11 @@ impl Storage {
             death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
             replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
         };
-        if matches!(mode, StorageOpenMode::CreateOrMigrate) {
-            if let Err(error) = storage.initialize_schema() {
-                storage.terminally_failed = true;
-                return Err(error);
-            }
+        if matches!(mode, StorageOpenMode::CreateOrMigrate)
+            && let Err(error) = storage.initialize_schema()
+        {
+            storage.terminally_failed = true;
+            return Err(error);
         }
         if let Err(error) = storage.validate_persistence_invariants() {
             storage.terminally_failed = true;
@@ -4779,8 +4924,9 @@ mod tests {
     };
     use std::{
         fs,
+        io::{Read, Write},
         path::PathBuf,
-        process::Command,
+        process::{Child, Command, ExitStatus, Stdio},
         sync::TryLockError,
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
@@ -4988,6 +5134,266 @@ mod tests {
         Ok(())
     }
 
+    struct WriterLeaseChild {
+        child: Child,
+    }
+
+    impl WriterLeaseChild {
+        fn wait_until_exit(
+            &mut self,
+            context: &str,
+        ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    self.child.kill()?;
+                    let status = self.child.wait()?;
+                    return Err(format!(
+                        "writer-lease child timed out during {context}; terminated with {status}"
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn force_terminate(&mut self) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            self.child.kill()?;
+            Ok(self.child.wait()?)
+        }
+    }
+
+    impl Drop for WriterLeaseChild {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    fn spawn_writer_lease_child(
+        path: &str,
+        mode: &str,
+        ready_path: Option<&Path>,
+    ) -> Result<WriterLeaseChild, Box<dyn std::error::Error>> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "tests::storage_writer_lease_child",
+                "--nocapture",
+            ])
+            .env("SCRIPTBOTS_STORAGE_WRITER_LEASE_CHILD", mode)
+            .env("SCRIPTBOTS_STORAGE_WRITER_LEASE_PATH", path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(ready_path) = ready_path {
+            command
+                .env("SCRIPTBOTS_STORAGE_WRITER_LEASE_READY", ready_path)
+                .stdin(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null());
+        }
+        Ok(WriterLeaseChild {
+            child: command.spawn()?,
+        })
+    }
+
+    fn wait_for_writer_lease_child(
+        child: &mut WriterLeaseChild,
+        ready_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if ready_path.try_exists()? {
+                return Ok(());
+            }
+            if let Some(status) = child.child.try_wait()? {
+                return Err(format!(
+                    "writer-lease owner exited before readiness with status {status}"
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                let status = child.force_terminate()?;
+                return Err(format!(
+                    "writer-lease owner did not become ready; terminated with status {status}"
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn release_writer_lease_child(
+        child: &mut WriterLeaseChild,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut stdin = child
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("writer-lease child stdin was not piped"))?;
+        stdin.write_all(b"\n")?;
+        drop(stdin);
+        let status = child.wait_until_exit("graceful shutdown")?;
+        if !status.success() {
+            return Err(format!("writer-lease owner failed during shutdown: {status}").into());
+        }
+        Ok(())
+    }
+
+    fn run_writer_lease_child(path: &str, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut child = spawn_writer_lease_child(path, mode, None)?;
+        let status = child.wait_until_exit(mode)?;
+        if !status.success() {
+            return Err(format!("writer-lease child mode {mode:?} failed: {status}").into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn storage_writer_lease_child() -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(mode) = std::env::var("SCRIPTBOTS_STORAGE_WRITER_LEASE_CHILD") else {
+            return Ok(());
+        };
+        let path = std::env::var("SCRIPTBOTS_STORAGE_WRITER_LEASE_PATH")?;
+        match mode.as_str() {
+            "pipeline-owner" => {
+                let mut pipeline = StoragePipeline::recover_existing(&path)?;
+                let ready_path = std::env::var("SCRIPTBOTS_STORAGE_WRITER_LEASE_READY")?;
+                fs::write(ready_path, b"ready")?;
+                std::io::stdin().read_exact(&mut [0_u8])?;
+                pipeline.shutdown()?;
+            }
+            "lease-only-owner" => {
+                let _lease = StorageWriterLease::acquire(&path)?.ok_or_else(|| {
+                    std::io::Error::other("file-backed path did not create a writer lease")
+                })?;
+                let ready_path = std::env::var("SCRIPTBOTS_STORAGE_WRITER_LEASE_READY")?;
+                fs::write(ready_path, b"ready")?;
+                std::io::stdin().read_exact(&mut [0_u8])?;
+            }
+            "expect-refusal" => {
+                let expected_lock_path = storage_writer_lock_path(&path).display().to_string();
+                let error = match StoragePipeline::recover_existing(&path) {
+                    Ok(mut pipeline) => {
+                        pipeline.shutdown()?;
+                        return Err("second process unexpectedly acquired the writer lease".into());
+                    }
+                    Err(error) => error,
+                };
+                match error {
+                    StorageError::Worker(StorageWorkerError::WriterLeaseHeld {
+                        operation,
+                        path: refused_path,
+                        lock_path,
+                        tick,
+                        commit_state,
+                    }) => {
+                        assert_eq!(operation, StorageOperation::Startup);
+                        assert_eq!(refused_path, path);
+                        assert_eq!(lock_path, expected_lock_path);
+                        assert_eq!(tick, None);
+                        assert_eq!(commit_state, FailureCommitState::NotAdmitted);
+                    }
+                    other => {
+                        return Err(format!(
+                            "second writer returned an untyped or unexpected error: {other}"
+                        )
+                        .into());
+                    }
+                }
+            }
+            "expect-open" => {
+                let mut pipeline = StoragePipeline::recover_existing(&path)?;
+                pipeline.shutdown()?;
+            }
+            other => return Err(format!("unknown writer-lease child mode {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn os_writer_lease_refuses_second_process_and_reopens_after_graceful_exit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-os-writer-lease-graceful");
+        let path_string = path.to_string_lossy().to_string();
+        let lock_path = storage_writer_lock_path(&path_string);
+        let mut fixture = StoragePipeline::new(&path_string)?;
+        fixture.shutdown()?;
+        assert!(lock_path.try_exists()?);
+
+        let ready_path = temp_db_path("storage-os-writer-lease-graceful-ready");
+        let mut owner =
+            spawn_writer_lease_child(&path_string, "pipeline-owner", Some(&ready_path))?;
+        wait_for_writer_lease_child(&mut owner, &ready_path)?;
+        run_writer_lease_child(&path_string, "expect-refusal")?;
+        release_writer_lease_child(&mut owner)?;
+
+        assert!(lock_path.try_exists()?, "companion lease file was removed");
+        run_writer_lease_child(&path_string, "expect-open")?;
+        Ok(())
+    }
+
+    #[test]
+    fn os_writer_lease_releases_after_forced_child_termination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-os-writer-lease-forced");
+        let path_string = path.to_string_lossy().to_string();
+        let lock_path = storage_writer_lock_path(&path_string);
+        let mut fixture = StoragePipeline::new(&path_string)?;
+        fixture.shutdown()?;
+
+        let ready_path = temp_db_path("storage-os-writer-lease-forced-ready");
+        let mut owner =
+            spawn_writer_lease_child(&path_string, "pipeline-owner", Some(&ready_path))?;
+        wait_for_writer_lease_child(&mut owner, &ready_path)?;
+        let killed = owner.force_terminate()?;
+        assert!(
+            !killed.success(),
+            "forced child unexpectedly exited successfully"
+        );
+
+        assert!(lock_path.try_exists()?, "companion lease file was removed");
+        run_writer_lease_child(&path_string, "expect-open")?;
+        Ok(())
+    }
+
+    #[test]
+    fn writer_lease_precedes_recovery_validation_and_writable_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-os-writer-lease-before-validation");
+        fs::write(&path, b"not a ScriptBots database")?;
+        let path_string = path.to_string_lossy().to_string();
+        let ready_path = temp_db_path("storage-os-writer-lease-before-validation-ready");
+        let mut owner =
+            spawn_writer_lease_child(&path_string, "lease-only-owner", Some(&ready_path))?;
+        wait_for_writer_lease_child(&mut owner, &ready_path)?;
+
+        run_writer_lease_child(&path_string, "expect-refusal")?;
+        release_writer_lease_child(&mut owner)?;
+        assert!(StoragePipeline::recover_existing(&path_string).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn memory_storage_does_not_participate_in_file_writer_leases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(StorageWriterLease::acquire(":memory:")?.is_none());
+        let mut first = StoragePipeline::new(":memory:")?;
+        let mut second = StoragePipeline::new(":memory:")?;
+        first.shutdown()?;
+        second.shutdown()?;
+        Ok(())
+    }
+
     #[test]
     fn recover_existing_refuses_empty_and_unrelated_files_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5072,7 +5478,7 @@ mod tests {
                 storage.flush()?;
                 std::process::exit(87);
             }
-            other => return Err(format!("unknown storage crash boundary {other:?}").into()),
+            other => Err(format!("unknown storage crash boundary {other:?}").into()),
         }
     }
 
