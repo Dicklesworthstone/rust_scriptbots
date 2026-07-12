@@ -1926,6 +1926,8 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 
 #### 3.11 live visual E2E
 
+**Status:** [Prerequisite Completed — native renderer performance harness `bd-2z0.7.9` now has strict contracts, six-combination dry-run proof, and graceful bounded timeout behavior; real live visual E2E remains open, CobaltPrairie, 2026-07-12]
+
 - tracked actual-render goldens;
 - input/camera tests;
 - platform launch probes;
