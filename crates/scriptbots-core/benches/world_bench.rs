@@ -1,6 +1,7 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use scriptbots_core::ScriptBotsConfig;
-use scriptbots_core::WorldState;
+use scriptbots_core::{
+    RuleBasedMapGenerator, ScriptBotsConfig, TerrainKind, TileSpec, TilesetSpec, WorldState,
+};
 use std::time::Duration;
 
 #[allow(clippy::field_reassign_with_default)]
@@ -126,5 +127,45 @@ fn bench_world_steps(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_world_steps);
+fn bench_hydrology_map_generation(c: &mut Criterion) {
+    let generator = RuleBasedMapGenerator::new(TilesetSpec {
+        id: "hydrology-benchmark".to_owned(),
+        label: None,
+        description: None,
+        tiles: vec![TileSpec {
+            id: "channel".to_owned(),
+            label: None,
+            weight: 1,
+            terrain_kind: TerrainKind::Grass,
+            fertility_bias: Some(0.5),
+            temperature_bias: Some(0.5),
+            elevation: Some(0.5),
+            moisture: Some(0.5),
+            accent: Some(0.5),
+            palette_index: Some(0),
+            permeability: Some(0.35),
+            runoff_bias: Some(0.2),
+            basin_rank: Some(0.55),
+            channel_priority: Some(0.4),
+            swim_cost: Some(1.2),
+        }],
+        adjacency: Vec::new(),
+    })
+    .expect("compile deterministic one-tile benchmark tileset");
+
+    let mut group = c.benchmark_group("hydrology_map_generation");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("single_tile_128x128", |b| {
+        b.iter(|| {
+            generator
+                .generate(128, 128, 1, 0x5eed_cafe)
+                .expect("generate deterministic hydrology benchmark map")
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_world_steps, bench_hydrology_map_generation);
 criterion_main!(benches);

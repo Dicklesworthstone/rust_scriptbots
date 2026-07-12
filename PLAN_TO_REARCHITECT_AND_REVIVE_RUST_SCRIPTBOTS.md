@@ -1702,6 +1702,15 @@ Phase 0.4 therefore remains in progress. This slice hardens renderer selection, 
 
 **Exit:** sensor digests agree across supported feature paths.
 
+#### 1.1a hydrology accumulation [Completed — `bd-2z0.2.10`, Codex, 2026-07-12]
+
+- [Completed] Freeze the pre-rewrite recursive accumulation as a test-only oracle.
+- [Completed] Prove bit-exact accumulation and first-visit-order equivalence across 1xN, Nx1, plateau, basin, seam-cycle, and 96 seeded functional graphs, with four repetitions per bounded fixture.
+- [Completed] Exercise a maximal-length 512x512 meandering channel (262,144 cells) without recursive stack use, across repetitions and ambient Rayon pools of one, two, and four threads.
+- [Evidence] A bounded Criterion whole-map hydrology benchmark measured the unchanged production implementation at `[3.6408 ms, 3.9141 ms, 4.2486 ms]` then `[3.6746 ms, 3.8034 ms, 4.1130 ms]`; Criterion reported no detected change (`p = 0.27`). This is end-to-end map-generation evidence, not an isolated accumulation microbenchmark.
+
+**Exit:** the iterative traversal is exactly oracle-equivalent on bounded fixtures and stack-safe on the large-grid stress fixture.
+
 #### 1.2 output/combat contract
 
 - typed output mapping;

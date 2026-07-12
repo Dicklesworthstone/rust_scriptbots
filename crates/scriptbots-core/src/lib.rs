@@ -5610,6 +5610,8 @@ mod map_sandbox {
         // recursive cycle-guard behavior for back-edges.
         let mut stack: Vec<(usize, usize, f32)> = Vec::new();
         visited[idx] = true;
+        #[cfg(test)]
+        record_accumulation_visit(idx);
         accumulation[idx] = 1.0;
         stack.push((idx, 0, 1.0));
         while let Some(&(node, child_pos, _)) = stack.last() {
@@ -5622,6 +5624,8 @@ mod map_sandbox {
                 }
                 if !visited[child] {
                     visited[child] = true;
+                    #[cfg(test)]
+                    record_accumulation_visit(child);
                     accumulation[child] = 1.0;
                     stack.push((child, 0, 1.0));
                 }
@@ -5635,6 +5639,21 @@ mod map_sandbox {
         accumulation[idx]
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static ACCUMULATION_VISIT_TRACE: std::cell::RefCell<Option<Vec<usize>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    fn record_accumulation_visit(idx: usize) {
+        ACCUMULATION_VISIT_TRACE.with(|trace| {
+            if let Some(visits) = trace.borrow_mut().as_mut() {
+                visits.push(idx);
+            }
+        });
+    }
+
     fn current_epoch_ms() -> u128 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5645,6 +5664,237 @@ mod map_sandbox {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn incoming_from_targets(targets: &[Option<usize>]) -> Vec<Vec<usize>> {
+            let mut incoming = vec![Vec::new(); targets.len()];
+            for (source, target) in targets.iter().enumerate() {
+                if let Some(target) = target {
+                    assert!(*target < targets.len(), "flow target must be in bounds");
+                    incoming[*target].push(source);
+                }
+            }
+            incoming
+        }
+
+        /// Frozen copy of the recursive implementation replaced by `e2d9aaa`.
+        ///
+        /// Keep this deliberately direct: it is an executable characterization
+        /// oracle, not an alternative production implementation.
+        fn recursive_accumulation_oracle(
+            idx: usize,
+            incoming: &[Vec<usize>],
+            accumulation: &mut [f32],
+            visited: &mut [bool],
+            visit_trace: &mut Vec<usize>,
+        ) -> f32 {
+            if visited[idx] {
+                return accumulation[idx];
+            }
+            visited[idx] = true;
+            visit_trace.push(idx);
+            let mut total = 1.0f32;
+            accumulation[idx] = total;
+            for &child in &incoming[idx] {
+                total += recursive_accumulation_oracle(
+                    child,
+                    incoming,
+                    accumulation,
+                    visited,
+                    visit_trace,
+                );
+            }
+            accumulation[idx] = total;
+            total
+        }
+
+        fn run_recursive_oracle(incoming: &[Vec<usize>]) -> (Vec<f32>, Vec<usize>) {
+            let mut accumulation = vec![0.0; incoming.len()];
+            let mut visited = vec![false; incoming.len()];
+            let mut visit_trace = Vec::with_capacity(incoming.len());
+            for idx in 0..incoming.len() {
+                recursive_accumulation_oracle(
+                    idx,
+                    incoming,
+                    &mut accumulation,
+                    &mut visited,
+                    &mut visit_trace,
+                );
+            }
+            (accumulation, visit_trace)
+        }
+
+        fn run_iterative_production(incoming: &[Vec<usize>]) -> (Vec<f32>, Vec<usize>) {
+            ACCUMULATION_VISIT_TRACE.with(|trace| {
+                *trace.borrow_mut() = Some(Vec::with_capacity(incoming.len()));
+            });
+
+            let mut accumulation = vec![0.0; incoming.len()];
+            let mut visited = vec![false; incoming.len()];
+            for idx in 0..incoming.len() {
+                accumulate_flow(idx, incoming, &mut accumulation, &mut visited);
+            }
+
+            let visit_trace = ACCUMULATION_VISIT_TRACE.with(|trace| {
+                trace
+                    .borrow_mut()
+                    .take()
+                    .expect("visit tracing was enabled for this traversal")
+            });
+            (accumulation, visit_trace)
+        }
+
+        fn assert_oracle_equivalent(label: &str, incoming: &[Vec<usize>]) {
+            let (expected_accumulation, expected_trace) = run_recursive_oracle(incoming);
+            let expected_bits = expected_accumulation
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+
+            for repetition in 0..4 {
+                let (actual_accumulation, actual_trace) = run_iterative_production(incoming);
+                let actual_bits = actual_accumulation
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual_bits, expected_bits,
+                    "{label}: accumulation differs on repetition {repetition}"
+                );
+                assert_eq!(
+                    actual_trace, expected_trace,
+                    "{label}: first-visit order differs on repetition {repetition}"
+                );
+            }
+        }
+
+        fn seeded_targets(seed: u64, len: usize) -> Vec<Option<usize>> {
+            let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+            (0..len)
+                .map(|_| {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    let sample = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+                    if sample.is_multiple_of(7) {
+                        None
+                    } else {
+                        Some((sample as usize) % len)
+                    }
+                })
+                .collect()
+        }
+
+        fn meandering_channel(width: usize, height: usize) -> (Vec<Vec<usize>>, Vec<usize>) {
+            let mut path = Vec::with_capacity(width * height);
+            for y in 0..height {
+                if y.is_multiple_of(2) {
+                    path.extend((0..width).map(|x| y * width + x));
+                } else {
+                    path.extend((0..width).rev().map(|x| y * width + x));
+                }
+            }
+
+            let mut targets = vec![None; path.len()];
+            for pair in path.windows(2) {
+                targets[pair[1]] = Some(pair[0]);
+            }
+            (incoming_from_targets(&targets), path)
+        }
+
+        #[test]
+        fn iterative_hydrology_matches_frozen_recursive_oracle_on_shapes_and_seeded_graphs() {
+            let one_by_n = incoming_from_targets(
+                &(0..31)
+                    .map(|idx| (idx > 0).then(|| idx - 1))
+                    .collect::<Vec<_>>(),
+            );
+            assert_oracle_equivalent("1xN descending channel", &one_by_n);
+
+            let n_by_one = incoming_from_targets(
+                &(0..31)
+                    .map(|idx| (idx + 1 < 31).then_some(idx + 1))
+                    .collect::<Vec<_>>(),
+            );
+            assert_oracle_equivalent("Nx1 ascending channel", &n_by_one);
+
+            assert_oracle_equivalent("plateau", &incoming_from_targets(&[None; 36]));
+
+            let basin_center = 12;
+            let basin = incoming_from_targets(
+                &(0..25)
+                    .map(|idx| (idx != basin_center).then_some(basin_center))
+                    .collect::<Vec<_>>(),
+            );
+            assert_oracle_equivalent("basin", &basin);
+
+            let seam_cycle = incoming_from_targets(&[
+                Some(4),
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(0),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(5),
+            ]);
+            assert_oracle_equivalent("wrapped seam cycle", &seam_cycle);
+
+            for seed in 0..96 {
+                let len = 1 + ((seed as usize * 37) % 127);
+                let incoming = incoming_from_targets(&seeded_targets(seed, len));
+                assert_oracle_equivalent(&format!("seeded graph {seed}"), &incoming);
+            }
+        }
+
+        #[test]
+        fn maximal_length_meandering_large_grid_is_stack_safe_and_deterministic() {
+            // 512^2 first visits would require 262,144 nested calls in the
+            // frozen oracle. This bounded fixture is large enough to exceed a
+            // normal test-thread stack while remaining suitable for every CI
+            // lane, so only the production iterative traversal runs here.
+            const SIDE: usize = 512;
+            let (incoming, expected_trace) = meandering_channel(SIDE, SIDE);
+            let expected_accumulation = (0..expected_trace.len())
+                .map(|depth| (expected_trace.len() - depth) as f32)
+                .collect::<Vec<_>>();
+
+            let baseline = run_iterative_production(&incoming);
+            assert_eq!(baseline.1.len(), expected_trace.len());
+            assert!(
+                baseline.1.iter().eq(&expected_trace),
+                "large-grid traversal did not follow the meandering channel"
+            );
+            for (depth, &node) in expected_trace.iter().enumerate() {
+                assert_eq!(
+                    baseline.0[node].to_bits(),
+                    expected_accumulation[depth].to_bits(),
+                    "wrong accumulation at meander depth {depth}"
+                );
+            }
+
+            for repetition in 0..2 {
+                assert_eq!(
+                    run_iterative_production(&incoming),
+                    baseline,
+                    "large-grid traversal changed on repetition {repetition}"
+                );
+            }
+
+            #[cfg(feature = "parallel")]
+            for thread_count in [1, 2, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(thread_count)
+                    .build()
+                    .expect("construct bounded Rayon test pool");
+                let threaded = pool.install(|| run_iterative_production(&incoming));
+                assert_eq!(
+                    threaded, baseline,
+                    "ambient Rayon thread count {thread_count} changed traversal"
+                );
+            }
+        }
 
         #[test]
         fn rule_based_generator_produces_map() {
