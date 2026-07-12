@@ -6936,18 +6936,28 @@ impl WorldState {
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
 
+        // Sharing is a self-contained simulation stage: rebuild from the exact
+        // positions this stage uses rather than relying on `stage_sense` to
+        // have populated an index earlier in the tick. This also prevents an
+        // actuation move or a direct stage invocation from querying stale or
+        // empty buckets.
+        self.work_position_pairs.clear();
+        self.work_position_pairs.reserve(positions.len());
+        for position in positions {
+            self.work_position_pairs.push((position.x, position.y));
+        }
+        if self.index.rebuild(&self.work_position_pairs).is_err() {
+            return;
+        }
+
         // Defer indicator pulses to avoid borrowing conflicts
         let mut indicator_pulses: Vec<(AgentId, f32, [f32; 3])> = Vec::new();
-        // The spatial index still holds the pre-actuation buckets; one tick of
-        // movement is far smaller than a cell, and the +1-cell query margin
-        // absorbs any boundary crossing. Exact distances use live positions.
-        let query_radius = distance + self.index.cell_size;
         let mut recipient_candidates: Vec<usize> = Vec::new();
         for &giver_idx in &sharers {
             let giver_id = handles[giver_idx];
             recipient_candidates.clear();
             self.index
-                .visit_neighbor_buckets(giver_idx, query_radius, &mut |indices| {
+                .visit_neighbor_buckets(giver_idx, distance, &mut |indices| {
                     recipient_candidates.extend_from_slice(indices);
                 });
             // Ascending order matches the previous full-population scan.
@@ -13609,6 +13619,217 @@ mod tests {
             giver_runtime.give_intent > 0.5,
             "give intent should persist for downstream consumers"
         );
+    }
+
+    #[test]
+    fn food_sharing_rebuilds_current_positions_across_toroidal_seam() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_transfer_rate: 0.01,
+            food_sharing_distance: 6.0,
+            rng_seed: Some(203),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let giver = world.spawn_agent(sample_agent(0));
+        let receiver = world.spawn_agent(sample_agent(1));
+
+        {
+            let arena = world.agents_mut();
+            let giver_idx = arena.index_of(giver).unwrap();
+            let receiver_idx = arena.index_of(receiver).unwrap();
+            let positions = arena.columns_mut().positions_mut();
+            positions[giver_idx] = Position::new(30.0, 50.0);
+            positions[receiver_idx] = Position::new(70.0, 50.0);
+        }
+        world.stage_sense();
+        {
+            let arena = world.agents_mut();
+            let giver_idx = arena.index_of(giver).unwrap();
+            let receiver_idx = arena.index_of(receiver).unwrap();
+            let positions = arena.columns_mut().positions_mut();
+            positions[giver_idx] = Position::new(2.0, 50.0);
+            positions[receiver_idx] = Position::new(98.0, 50.0);
+        }
+        {
+            let runtime = world.agent_runtime_mut(giver).unwrap();
+            runtime.energy = 1.0;
+            runtime.give_intent = 1.0;
+        }
+        world.agent_runtime_mut(receiver).unwrap().energy = 0.5;
+
+        world.stage_food();
+
+        assert!(
+            (world.agent_runtime(giver).unwrap().energy - 0.99).abs() < 1e-6,
+            "giver should find the receiver using the stage's current position index"
+        );
+        assert!(
+            (world.agent_runtime(receiver).unwrap().energy - 0.51).abs() < 1e-6,
+            "minimum-image distance should share across the world seam"
+        );
+    }
+
+    #[test]
+    fn food_sharing_sorts_wrapped_bucket_candidates_by_dense_index() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_transfer_rate: 0.01,
+            food_sharing_distance: 5.0,
+            rng_seed: Some(204),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let giver = world.spawn_agent(sample_agent(0));
+        let lower_index_recipient = world.spawn_agent(sample_agent(1));
+        let higher_index_recipient = world.spawn_agent(sample_agent(2));
+
+        {
+            let arena = world.agents_mut();
+            let giver_idx = arena.index_of(giver).unwrap();
+            let lower_idx = arena.index_of(lower_index_recipient).unwrap();
+            let higher_idx = arena.index_of(higher_index_recipient).unwrap();
+            assert!(
+                lower_idx < higher_idx,
+                "fixture must encode dense-index order"
+            );
+            let positions = arena.columns_mut().positions_mut();
+            positions[giver_idx] = Position::new(1.0, 50.0);
+            positions[lower_idx] = Position::new(2.0, 50.0);
+            // Wrapped bucket traversal sees this higher index before the
+            // lower-index recipient in the giver's own bucket.
+            positions[higher_idx] = Position::new(99.0, 50.0);
+        }
+        {
+            let runtime = world.agent_runtime_mut(giver).unwrap();
+            runtime.energy = 0.015;
+            runtime.give_intent = 1.0;
+        }
+        world
+            .agent_runtime_mut(lower_index_recipient)
+            .unwrap()
+            .energy = 0.0;
+        world
+            .agent_runtime_mut(higher_index_recipient)
+            .unwrap()
+            .energy = 0.0;
+
+        world.stage_food();
+
+        assert!(
+            (world.agent_runtime(lower_index_recipient).unwrap().energy - 0.01).abs() < 1e-6,
+            "lower dense index should receive the first full transfer"
+        );
+        assert!(
+            (world.agent_runtime(higher_index_recipient).unwrap().energy - 0.005).abs() < 1e-6,
+            "higher dense index should deterministically receive the remainder"
+        );
+    }
+
+    #[test]
+    fn direct_and_full_tick_food_sharing_agree() {
+        struct SharingBrain {
+            give: f32,
+        }
+
+        impl BrainRunner for SharingBrain {
+            fn kind(&self) -> &'static str {
+                "test.sharing"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                let mut outputs = [0.0; OUTPUT_SIZE];
+                outputs[8] = self.give;
+                outputs
+            }
+        }
+
+        let make_world = || {
+            let config = ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                food_growth_rate: 0.0,
+                food_decay_rate: 0.0,
+                food_diffusion_rate: 0.0,
+                food_intake_rate: 0.0,
+                food_waste_rate: 0.0,
+                food_transfer_rate: 0.01,
+                food_sharing_distance: 5.0,
+                bot_speed: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                metabolism_ramp_rate: 0.0,
+                metabolism_boost_penalty: 0.0,
+                temperature_discomfort_rate: 0.0,
+                reproduction_energy_threshold: 10.0,
+                reproduction_attempt_chance: 0.0,
+                spike_damage: 0.0,
+                spike_energy_cost: 0.0,
+                persistence_interval: 0,
+                rng_seed: Some(205),
+                ..ScriptBotsConfig::default()
+            };
+            let mut world = WorldState::new(config).expect("world");
+            let giver = world.spawn_agent(sample_agent(0));
+            let receiver = world.spawn_agent(sample_agent(1));
+            {
+                let arena = world.agents_mut();
+                let giver_idx = arena.index_of(giver).unwrap();
+                let receiver_idx = arena.index_of(receiver).unwrap();
+                let positions = arena.columns_mut().positions_mut();
+                positions[giver_idx] = Position::new(10.0, 10.0);
+                positions[receiver_idx] = Position::new(12.0, 10.0);
+            }
+            {
+                let runtime = world.agent_runtime_mut(giver).unwrap();
+                runtime.energy = 1.0;
+                runtime.give_intent = 1.0;
+            }
+            world.agent_runtime_mut(receiver).unwrap().energy = 0.5;
+
+            let giver_key = world
+                .brain_registry_mut()
+                .register("test.giver", |_rng| Box::new(SharingBrain { give: 1.0 }));
+            let receiver_key = world
+                .brain_registry_mut()
+                .register("test.receiver", |_rng| Box::new(SharingBrain { give: 0.0 }));
+            assert!(world.bind_agent_brain(giver, giver_key));
+            assert!(world.bind_agent_brain(receiver, receiver_key));
+            (world, giver, receiver)
+        };
+
+        let (mut direct, direct_giver, direct_receiver) = make_world();
+        direct.stage_food();
+        let direct_energies = (
+            direct.agent_runtime(direct_giver).unwrap().energy,
+            direct.agent_runtime(direct_receiver).unwrap().energy,
+        );
+
+        let (mut full_tick, full_giver, full_receiver) = make_world();
+        let events = full_tick.step().expect("full tick");
+        let full_tick_energies = (
+            full_tick.agent_runtime(full_giver).unwrap().energy,
+            full_tick.agent_runtime(full_receiver).unwrap().energy,
+        );
+
+        assert_eq!(events.tick, Tick(1));
+        assert_eq!(full_tick_energies, direct_energies);
+        assert_eq!(direct_energies, (0.99, 0.51));
     }
 
     #[test]
