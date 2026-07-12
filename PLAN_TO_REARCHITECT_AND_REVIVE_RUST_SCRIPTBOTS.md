@@ -190,7 +190,7 @@ The default `ml` feature registers `scriptbots-brain-ml`, whose implementation l
 
 `ReplayEvent` types and storage codecs exist, but no core code pushes into `WorldState::replay_events`. Replay verification can report that zero recorded events match zero simulated events.
 
-`stage_persistence` clears births, deaths, and combat counters on every tick that is not a persistence interval (`crates/scriptbots-core/src/lib.rs:7511-7523`). Events between intervals are discarded rather than accumulated. History is appended only when persistence runs (`8063-8066`), so UI headline metrics can be stale for the default 60-tick interval.
+The original audit found that persistence cadence discarded per-tick lifecycle counters and left UI summaries stale. Recovery work began retaining those records, and `bd-2z0.2.5` completed the separation: every completed tick now accumulates lifecycle/combat totals and records its current summary before persistence runs; persistence only batches accumulated totals; end-of-tick reset clears only the current counters. Multi-event and cross-cadence tests prove that storage/analytics cadence changes batching without changing scientific state or canonical event totals.
 
 ### 3.12 control APIs acknowledge queueing as application
 
@@ -1665,7 +1665,7 @@ The existing `.gitignore` contains unrelated user changes. This bead must reserv
 
 **Exit:** no raw magic indexes outside the centralized conversion hot path.
 
-#### 1.3 persistence cadence
+#### 1.3 persistence cadence [Completed — `bd-2z0.2.5`]
 
 - current per-tick summary independent of persistence;
 - accumulate lifecycle/combat events until flushed;

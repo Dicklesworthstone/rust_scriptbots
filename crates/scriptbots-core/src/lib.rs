@@ -6298,6 +6298,17 @@ impl WorldState {
         }
     }
 
+    fn stage_accumulate_tick_events(&mut self) {
+        self.pending_birth_events = self.pending_birth_events.saturating_add(self.last_births);
+        self.pending_death_events = self.pending_death_events.saturating_add(self.last_deaths);
+        self.pending_spike_attempt_events = self
+            .pending_spike_attempt_events
+            .saturating_add(self.combat_spike_attempts);
+        self.pending_spike_hit_events = self
+            .pending_spike_hit_events
+            .saturating_add(self.combat_spike_hits);
+    }
+
     fn stage_reset_events(&mut self, preserve_persistence_tail: bool) {
         // Reuse the same secondary-map allocation and populate it during the reset pass that we
         // already owe. This preserves a non-cadence-aligned final tick without allocating and
@@ -6319,6 +6330,10 @@ impl WorldState {
                 }
             }
         }
+        self.last_births = 0;
+        self.last_deaths = 0;
+        self.combat_spike_attempts = 0;
+        self.combat_spike_hits = 0;
     }
 
     fn stage_record_history(&mut self, next_tick: Tick) {
@@ -7925,8 +7940,6 @@ impl WorldState {
         force_partial_batch: bool,
     ) -> Result<(), PersistenceAdmissionError> {
         if self.config.persistence_interval == 0 {
-            self.last_births = 0;
-            self.last_deaths = 0;
             self.pending_birth_records.clear();
             self.pending_death_records.clear();
             self.pending_lifecycle_birth_metrics.clear();
@@ -7936,20 +7949,9 @@ impl WorldState {
             self.pending_death_events = 0;
             self.pending_spike_attempt_events = 0;
             self.pending_spike_hit_events = 0;
-            self.combat_spike_attempts = 0;
-            self.combat_spike_hits = 0;
             self.pending_persistence_runtime_tail.clear();
             return Ok(());
         }
-
-        self.pending_birth_events = self.pending_birth_events.saturating_add(self.last_births);
-        self.pending_death_events = self.pending_death_events.saturating_add(self.last_deaths);
-        self.pending_spike_attempt_events = self
-            .pending_spike_attempt_events
-            .saturating_add(self.combat_spike_attempts);
-        self.pending_spike_hit_events = self
-            .pending_spike_hit_events
-            .saturating_add(self.combat_spike_hits);
 
         let analytics = self.config.analytics_stride;
         if !force_partial_batch
@@ -7957,14 +7959,10 @@ impl WorldState {
                 .0
                 .is_multiple_of(self.config.persistence_interval as u64)
         {
-            self.last_births = 0;
-            self.last_deaths = 0;
             if analytics.lifecycle_events == 0 {
                 self.pending_lifecycle_birth_metrics.clear();
                 self.pending_lifecycle_death_metrics.clear();
             }
-            self.combat_spike_attempts = 0;
-            self.combat_spike_hits = 0;
             return Ok(());
         }
 
@@ -8516,16 +8514,12 @@ impl WorldState {
                 Err(error)
             }
         };
-        self.last_births = 0;
-        self.last_deaths = 0;
         self.pending_birth_events = 0;
         self.pending_death_events = 0;
         self.pending_spike_attempt_events = 0;
         self.pending_spike_hit_events = 0;
         self.carcass_health_distributed = 0.0;
         self.carcass_reproduction_bonus = 0.0;
-        self.combat_spike_attempts = 0;
-        self.combat_spike_hits = 0;
         persistence_result
     }
 
@@ -8553,6 +8547,7 @@ impl WorldState {
         self.stage_population(next_tick);
         self.stage_spawn_commit(next_tick);
         self.stage_accumulate_food_balance();
+        self.stage_accumulate_tick_events();
         self.stage_record_history(next_tick);
         let preserve_persistence_tail = self.config.persistence_interval != 0
             && !next_tick
@@ -10079,6 +10074,91 @@ mod tests {
     }
 
     #[test]
+    fn persistence_stage_does_not_own_current_tick_counters() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(82),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("test world");
+        world.last_births = 2;
+        world.last_deaths = 1;
+        world.combat_spike_attempts = 3;
+        world.combat_spike_hits = 2;
+
+        world.stage_accumulate_tick_events();
+        world.stage_record_history(Tick(1));
+
+        world
+            .stage_persistence(Tick(1), false)
+            .expect("non-boundary persistence stage");
+
+        assert_eq!(world.pending_birth_events, 2);
+        assert_eq!(world.pending_death_events, 1);
+        assert_eq!(world.pending_spike_attempt_events, 3);
+        assert_eq!(world.pending_spike_hit_events, 2);
+        assert_eq!(world.last_births, 2);
+        assert_eq!(world.last_deaths, 1);
+        assert_eq!(world.combat_spike_attempts, 3);
+        assert_eq!(world.combat_spike_hits, 2);
+        let summary = world.history().next_back().expect("current summary");
+        assert_eq!(summary.tick, Tick(1));
+        assert_eq!(summary.births, 2);
+        assert_eq!(summary.deaths, 1);
+        assert_eq!(summary.spike_hits, 2);
+
+        world.stage_reset_events(false);
+        assert_eq!(world.last_births, 0);
+        assert_eq!(world.last_deaths, 0);
+        assert_eq!(world.combat_spike_attempts, 0);
+        assert_eq!(world.combat_spike_hits, 0);
+        assert_eq!(world.pending_birth_events, 2);
+        assert_eq!(world.pending_death_events, 1);
+        assert_eq!(world.pending_spike_attempt_events, 3);
+        assert_eq!(world.pending_spike_hit_events, 2);
+    }
+
+    #[test]
+    fn disabled_persistence_keeps_current_summary_honest_without_retaining_batches() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(84),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("test world");
+        world.pending_birth_records.push(lifecycle_birth(1));
+        world.pending_death_records.push(lifecycle_death(1));
+        world.last_births = 1;
+        world.last_deaths = 1;
+        world.combat_spike_attempts = 2;
+        world.combat_spike_hits = 3;
+        world.replay_events.push(replay_marker(0.5));
+
+        world.step().expect("persistence-disabled tick");
+
+        let summary = world.history().next_back().expect("current summary");
+        assert_eq!(summary.tick, Tick(1));
+        assert_eq!(summary.births, 1);
+        assert_eq!(summary.deaths, 1);
+        assert_eq!(summary.spike_hits, 3);
+        assert!(world.pending_birth_records.is_empty());
+        assert!(world.pending_death_records.is_empty());
+        assert!(world.replay_events.is_empty());
+        assert_eq!(world.pending_birth_events, 0);
+        assert_eq!(world.pending_death_events, 0);
+        assert_eq!(world.pending_spike_attempt_events, 0);
+        assert_eq!(world.pending_spike_hit_events, 0);
+        assert_eq!(world.last_births, 0);
+        assert_eq!(world.last_deaths, 0);
+        assert_eq!(world.combat_spike_attempts, 0);
+        assert_eq!(world.combat_spike_hits, 0);
+    }
+
+    #[test]
     fn skipped_persistence_ticks_retain_lifecycle_and_replay_rows() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -10093,29 +10173,158 @@ mod tests {
 
         world.pending_birth_records.push(lifecycle_birth(1));
         world.last_births = 1;
+        world.combat_spike_attempts = 1;
+        world.combat_spike_hits = 2;
         world.replay_events.push(replay_marker(0.1));
         world.step().expect("tick one");
         assert!(logs.lock().unwrap().is_empty());
+        let tick_one = world.history().next_back().expect("tick one summary");
+        assert_eq!(tick_one.tick, Tick(1));
+        assert_eq!(tick_one.births, 1);
+        assert_eq!(tick_one.deaths, 0);
+        assert_eq!(tick_one.spike_hits, 2);
 
+        world.pending_birth_records.push(lifecycle_birth(2));
         world.pending_death_records.push(lifecycle_death(2));
+        world.last_births = 1;
         world.last_deaths = 1;
+        world.combat_spike_attempts = 2;
+        world.combat_spike_hits = 1;
         world.replay_events.push(replay_marker(0.2));
         world.step().expect("tick two");
         assert!(logs.lock().unwrap().is_empty());
+        let tick_two = world.history().next_back().expect("tick two summary");
+        assert_eq!(tick_two.tick, Tick(2));
+        assert_eq!(tick_two.births, 1);
+        assert_eq!(tick_two.deaths, 1);
+        assert_eq!(tick_two.spike_hits, 1);
 
         world.step().expect("tick three persistence boundary");
+        let tick_three = world.history().next_back().expect("tick three summary");
+        assert_eq!(tick_three.tick, Tick(3));
+        assert_eq!(tick_three.births, 0);
+        assert_eq!(tick_three.deaths, 0);
+        assert_eq!(tick_three.spike_hits, 0);
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];
         assert_eq!(batch.summary.tick, Tick(3));
-        assert_eq!(batch.summary.births, 1);
+        assert_eq!(batch.summary.births, 2);
         assert_eq!(batch.summary.deaths, 1);
-        assert_eq!(batch.births, vec![lifecycle_birth(1)]);
+        assert_eq!(batch.summary.spike_hits, 3);
+        assert_eq!(batch.births, vec![lifecycle_birth(1), lifecycle_birth(2)]);
         assert_eq!(batch.deaths, vec![lifecycle_death(2)]);
+        assert!(batch.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                PersistenceEventKind::Custom(name) if name == "spike_attempts"
+            ) && event.count == 3
+        }));
+        assert!(batch.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                PersistenceEventKind::Custom(name) if name == "spike_hits"
+            ) && event.count == 3
+        }));
         assert_eq!(
             batch.replay_events,
             vec![replay_marker(0.1), replay_marker(0.2)]
         );
+    }
+
+    #[test]
+    fn persistence_and_analytics_cadence_preserve_science_and_event_totals() {
+        let run = |persistence_interval: u32, lifecycle_events: u32| {
+            let config = ScriptBotsConfig {
+                persistence_interval,
+                analytics_stride: AnalyticsStride {
+                    lifecycle_events,
+                    ..AnalyticsStride::default()
+                },
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                rng_seed: Some(83),
+                ..ScriptBotsConfig::default()
+            };
+            let spy = SpyPersistence::default();
+            let logs = Arc::clone(&spy.logs);
+            let mut world =
+                WorldState::with_persistence(config, Box::new(spy)).expect("cadence world");
+
+            for tick in 1..=6 {
+                match tick {
+                    1 | 4 => {
+                        let birth = lifecycle_birth(tick);
+                        world.pending_birth_records.push(birth.clone());
+                        world.pending_lifecycle_birth_metrics.push(birth);
+                        world.last_births = 1;
+                    }
+                    2 | 5 => {
+                        let death = lifecycle_death(tick);
+                        world.pending_death_records.push(death.clone());
+                        world.pending_lifecycle_death_metrics.push(death);
+                        world.last_deaths = 1;
+                    }
+                    _ => {}
+                }
+                if matches!(tick, 1 | 2 | 4 | 5) {
+                    world.combat_spike_attempts = 1;
+                    world.combat_spike_hits = 2;
+                }
+                world.step().expect("cadence comparison tick");
+            }
+
+            let entries = logs.lock().unwrap();
+            let mut event_totals = (0usize, 0usize, 0usize, 0usize);
+            for event in entries.iter().flat_map(|batch| &batch.events) {
+                match &event.kind {
+                    PersistenceEventKind::Births => event_totals.0 += event.count,
+                    PersistenceEventKind::Deaths => event_totals.1 += event.count,
+                    PersistenceEventKind::Custom(name) if name == "spike_attempts" => {
+                        event_totals.2 += event.count;
+                    }
+                    PersistenceEventKind::Custom(name) if name == "spike_hits" => {
+                        event_totals.3 += event.count;
+                    }
+                    PersistenceEventKind::Custom(_) => {}
+                }
+            }
+            let summary_totals = entries.iter().fold((0usize, 0usize, 0u32), |total, batch| {
+                (
+                    total.0 + batch.summary.births,
+                    total.1 + batch.summary.deaths,
+                    total.2 + batch.summary.spike_hits,
+                )
+            });
+            let birth_ticks = entries
+                .iter()
+                .flat_map(|batch| &batch.births)
+                .map(|record| record.tick)
+                .collect::<Vec<_>>();
+            let death_ticks = entries
+                .iter()
+                .flat_map(|batch| &batch.deaths)
+                .map(|record| record.tick)
+                .collect::<Vec<_>>();
+            (
+                world.history().cloned().collect::<Vec<_>>(),
+                world.food().cells().to_vec(),
+                world.tick(),
+                world.agent_count(),
+                event_totals,
+                summary_totals,
+                birth_ticks,
+                death_ticks,
+            )
+        };
+
+        let every_two_ticks = run(2, 5);
+        let every_three_ticks = run(3, 4);
+        assert_eq!(every_two_ticks, every_three_ticks);
+        assert_eq!(every_two_ticks.4, (2, 2, 4, 8));
+        assert_eq!(every_two_ticks.5, (2, 2, 8));
+        assert_eq!(every_two_ticks.6, vec![Tick(1), Tick(4)]);
+        assert_eq!(every_two_ticks.7, vec![Tick(2), Tick(5)]);
     }
 
     #[test]
@@ -11032,6 +11241,7 @@ mod tests {
 
         world.pending_deaths.push(victim);
         world.stage_death_cleanup(Tick::zero());
+        world.stage_accumulate_tick_events();
         world
             .stage_persistence(Tick(1), false)
             .expect("carcass metrics should be admitted");
