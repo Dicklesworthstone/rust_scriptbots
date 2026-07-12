@@ -576,6 +576,22 @@ For each tick, debug/test instrumentation can explain total resource delta withi
 
 Default ecology changes are evaluated as a coherent model, not by copying legacy constants blindly. The product must state whether health and energy are separate resources, how food affects each, and what selection pressure reproduction consumes.
 
+**Resource-ledger policy:** [Completed — explicit per-tick and cumulative food,
+energy, and health accounting, `bd-2z0.2.8`, Codex, 2026-07-12]
+
+The kernel retains the deliberate two-resource ecology: grazing removes ground
+food and creates nutrient-weighted energy plus reproduction progress, but never
+health. Agent giving is a zero-net energy transfer. Reproduction records both
+the parent's debit and the child's configured allocation. Food respawn/regrowth,
+population injection, scenario blooms, and carcass rewards are named external
+inputs rather than disguised conservation. Decay, metabolism, movement, boost,
+combat, aging, temperature stress, dead-agent removal, and capacity rejection
+remain separately attributable. Opt-in diagnostics publish immutable latest and
+cumulative reports; each completed tick declares an absolute `1e-5` plus relative
+`1e-6` reconciliation tolerance over independently observed opening and closing
+pools. Ledger state is outside characterization/digest, replay, persistence, RNG,
+and scientific decisions.
+
 ### 6.5 brain genome/evaluator-state separation
 
 The current `Brain`/`BrainRunner` bridge loses the operations required by evolution. Replace trait-object cloning with versioned heritable data **and** separately versioned dynamic evaluator state. Evaluator state is not universally ephemeral: recurrent MLP/DWRAON node state and Assembly working cells can affect future outputs and must survive checkpoints when the family contract says so.
@@ -1810,7 +1826,9 @@ This is a protocol bead. Separate child beads implement each family and integrat
 - [Completed — `bd-2z0.2.13`] Preserve the deliberate pre-ledger ground-food policy:
   nutrient-weighted energy, reproduction progress, food balance, and cell waste
   change when grazing; health does not.
-- explicit resource source/transfer/sink ledger;
+- [Completed — `bd-2z0.2.8`, Codex, 2026-07-12] explicit resource
+  source/transfer/sink ledger with deterministic reconciliation and immutable
+  per-tick/cumulative reports;
 - tune meadow only with honest brain inheritance, stable streams, and canonical digests;
 - run a seed cohort rather than one attractive seed;
 - declare viability/extinction/equilibrium envelopes;

@@ -1820,10 +1820,26 @@ pub struct ActiveEffect {
 struct ActuationResult {
     delta: Option<ActuationDelta>,
     energy: f32,
+    drain: ActuationDrain,
     color: [f32; 3],
     spike_length: f32,
     sound_level: f32,
     give_intent: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ActuationDrain {
+    basal: f32,
+    movement: f32,
+    ramp: f32,
+    boost: f32,
+    topography: f32,
+}
+
+impl ActuationDrain {
+    fn total(self) -> f32 {
+        self.basal + self.movement + self.ramp + self.boost + self.topography
+    }
 }
 
 /// Compact per-agent copy of the only runtime fields combat reads; cloning
@@ -1859,6 +1875,20 @@ struct DamageBucket {
     herbivore: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct FoodResourceActivity {
+    shared_energy: f64,
+    sharing_delta_energy: f64,
+    rejected_energy: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DeathResourceActivity {
+    carcass_delta: ResourceAmounts,
+    removal_delta: ResourceAmounts,
+    rejected: ResourceAmounts,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct SpawnOrder {
@@ -1875,6 +1905,327 @@ struct PopulationSpawnReceipt {
     inserted: Vec<AgentId>,
     arena_checkpoint: (SlotMap<AgentId, usize>, usize),
     rng_before: SmallRng,
+}
+
+/// Absolute error floor used by resource-ledger reconciliation.
+///
+/// Resource state is stored as `f32`, while the ledger accumulates observations
+/// as `f64`. The floor covers the rounding introduced when independently
+/// summing many `f32` cells and agents at adjacent stage boundaries.
+pub const RESOURCE_LEDGER_ABSOLUTE_TOLERANCE: f64 = 1.0e-5;
+
+/// Scale-dependent part of the resource-ledger reconciliation tolerance.
+pub const RESOURCE_LEDGER_RELATIVE_TOLERANCE: f64 = 1.0e-6;
+
+/// The three conserved/accounted resource pools in the simulation kernel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceAmounts {
+    /// Food stored in the ground grid.
+    pub food: f64,
+    /// Energy held by living agents.
+    pub energy: f64,
+    /// Health held by living agents.
+    pub health: f64,
+}
+
+impl ResourceAmounts {
+    fn delta_from(self, before: Self) -> Self {
+        Self {
+            food: self.food - before.food,
+            energy: self.energy - before.energy,
+            health: self.health - before.health,
+        }
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.food += other.food;
+        self.energy += other.energy;
+        self.health += other.health;
+    }
+
+    fn subtract(self, other: Self) -> Self {
+        Self {
+            food: self.food - other.food,
+            energy: self.energy - other.energy,
+            health: self.health - other.health,
+        }
+    }
+
+    fn scale(self) -> f64 {
+        self.food
+            .abs()
+            .max(self.energy.abs())
+            .max(self.health.abs())
+    }
+
+    fn within(self, tolerance: f64) -> bool {
+        self.food.abs() <= tolerance
+            && self.energy.abs() <= tolerance
+            && self.health.abs() <= tolerance
+    }
+}
+
+/// Stable attribution categories for every food, energy, and health mutation.
+///
+/// Positive deltas add a resource to the measured world; negative deltas
+/// remove it. Transfers additionally publish a positive `activity` magnitude
+/// even when their world-wide delta is zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceFlowKind {
+    /// Queued bloom and meteor interventions.
+    ScenarioIntervention,
+    /// Scheduled food respawn, growth, decay, and diffusion as one exact field update.
+    FoodDynamics,
+    /// Age-dependent health and energy decay.
+    Aging,
+    /// Baseline per-tick metabolism.
+    BasalMetabolism,
+    /// Wheel-speed-dependent movement cost.
+    Movement,
+    /// Energy-level-dependent metabolism ramp.
+    MetabolismRamp,
+    /// Additional boost cost.
+    Boost,
+    /// Uphill cost or downhill relief.
+    Topography,
+    /// Temperature mismatch cost.
+    TemperatureStress,
+    /// Ground-food removal and nutrient-weighted energy conversion.
+    GroundFoodConversion,
+    /// Agent-to-agent energy giving; its net delta is zero.
+    EnergySharing,
+    /// Spike energy cost and victim health damage.
+    Combat,
+    /// Manufactured health/energy rewards from a carcass.
+    CarcassReward,
+    /// Resources removed with dead agents.
+    DeathRemoval,
+    /// Parent energy debit, rollback, and child resource allocation.
+    ReproductionAllocation,
+    /// Open-world population-floor and scheduled injection.
+    PopulationInjection,
+    /// Requested source/transfer magnitude rejected by a resource cap.
+    CapacityRejection,
+}
+
+impl ResourceFlowKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::ScenarioIntervention => 0,
+            Self::FoodDynamics => 1,
+            Self::Aging => 2,
+            Self::BasalMetabolism => 3,
+            Self::Movement => 4,
+            Self::MetabolismRamp => 5,
+            Self::Boost => 6,
+            Self::Topography => 7,
+            Self::TemperatureStress => 8,
+            Self::GroundFoodConversion => 9,
+            Self::EnergySharing => 10,
+            Self::Combat => 11,
+            Self::CarcassReward => 12,
+            Self::DeathRemoval => 13,
+            Self::ReproductionAllocation => 14,
+            Self::PopulationInjection => 15,
+            Self::CapacityRejection => 16,
+        }
+    }
+}
+
+const RESOURCE_FLOW_KINDS: [ResourceFlowKind; 17] = [
+    ResourceFlowKind::ScenarioIntervention,
+    ResourceFlowKind::FoodDynamics,
+    ResourceFlowKind::Aging,
+    ResourceFlowKind::BasalMetabolism,
+    ResourceFlowKind::Movement,
+    ResourceFlowKind::MetabolismRamp,
+    ResourceFlowKind::Boost,
+    ResourceFlowKind::Topography,
+    ResourceFlowKind::TemperatureStress,
+    ResourceFlowKind::GroundFoodConversion,
+    ResourceFlowKind::EnergySharing,
+    ResourceFlowKind::Combat,
+    ResourceFlowKind::CarcassReward,
+    ResourceFlowKind::DeathRemoval,
+    ResourceFlowKind::ReproductionAllocation,
+    ResourceFlowKind::PopulationInjection,
+    ResourceFlowKind::CapacityRejection,
+];
+
+/// One attributed resource flow.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResourceFlow {
+    /// Stable category for this flow.
+    pub kind: ResourceFlowKind,
+    /// Signed world-wide resource change attributed to this category.
+    pub delta: ResourceAmounts,
+    /// Positive gross activity (for transfers and rejected capacity).
+    pub activity: ResourceAmounts,
+}
+
+impl ResourceFlow {
+    const fn empty(kind: ResourceFlowKind) -> Self {
+        Self {
+            kind,
+            delta: ResourceAmounts {
+                food: 0.0,
+                energy: 0.0,
+                health: 0.0,
+            },
+            activity: ResourceAmounts {
+                food: 0.0,
+                energy: 0.0,
+                health: 0.0,
+            },
+        }
+    }
+}
+
+/// Conservation proof attached to a completed ledger tick.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResourceReconciliation {
+    /// Closing pools minus opening pools.
+    pub observed_delta: ResourceAmounts,
+    /// Sum of every attributed flow delta.
+    pub attributed_delta: ResourceAmounts,
+    /// `observed_delta - attributed_delta`; expected to be zero within tolerance.
+    pub unexplained_delta: ResourceAmounts,
+    /// Declared absolute-plus-relative tolerance for this tick.
+    pub tolerance: f64,
+    /// Whether every unexplained pool delta is within `tolerance`.
+    pub reconciled: bool,
+}
+
+/// Immutable accounting report for one completed simulation tick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceLedgerTick {
+    /// Tick whose completed boundary this report describes.
+    pub tick: Tick,
+    /// Resource pools at the start of the tick.
+    pub opening: ResourceAmounts,
+    /// Resource pools at the completed tick boundary.
+    pub closing: ResourceAmounts,
+    /// Stable enum order, including zero-valued categories.
+    pub flows: Vec<ResourceFlow>,
+    /// Conservation proof comparing observed and attributed deltas.
+    pub reconciliation: ResourceReconciliation,
+}
+
+/// Immutable latest and cumulative resource accounting read model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceLedgerReport {
+    /// Number of instrumented ticks retained in cumulative totals.
+    pub completed_ticks: u64,
+    /// Most recently completed instrumented tick.
+    pub latest: Option<ResourceLedgerTick>,
+    /// Stable enum order, including categories not yet observed.
+    pub cumulative: Vec<ResourceFlow>,
+}
+
+impl Default for ResourceLedgerReport {
+    fn default() -> Self {
+        Self {
+            completed_ticks: 0,
+            latest: None,
+            cumulative: RESOURCE_FLOW_KINDS
+                .into_iter()
+                .map(ResourceFlow::empty)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorkingResourceLedger {
+    tick: Tick,
+    opening: ResourceAmounts,
+    flows: Vec<ResourceFlow>,
+}
+
+#[derive(Debug, Default)]
+struct ResourceLedgerState {
+    enabled: bool,
+    working: Option<WorkingResourceLedger>,
+    report: ResourceLedgerReport,
+}
+
+impl ResourceLedgerState {
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.working = None;
+        }
+    }
+
+    fn begin_tick(&mut self, tick: Tick, opening: ResourceAmounts) {
+        if self.enabled {
+            self.working = Some(WorkingResourceLedger {
+                tick,
+                opening,
+                flows: RESOURCE_FLOW_KINDS
+                    .into_iter()
+                    .map(ResourceFlow::empty)
+                    .collect(),
+            });
+        }
+    }
+
+    fn record(
+        &mut self,
+        kind: ResourceFlowKind,
+        delta: ResourceAmounts,
+        activity: ResourceAmounts,
+    ) {
+        let Some(working) = self.working.as_mut() else {
+            return;
+        };
+        let index = kind.index();
+        working.flows[index].delta.add_assign(delta);
+        working.flows[index].activity.add_assign(activity);
+    }
+
+    fn record_change(
+        &mut self,
+        kind: ResourceFlowKind,
+        before: ResourceAmounts,
+        after: ResourceAmounts,
+    ) {
+        self.record(kind, after.delta_from(before), ResourceAmounts::default());
+    }
+
+    fn finish_tick(&mut self, closing: ResourceAmounts) {
+        let Some(working) = self.working.take() else {
+            return;
+        };
+        let mut attributed_delta = ResourceAmounts::default();
+        for flow in &working.flows {
+            attributed_delta.add_assign(flow.delta);
+        }
+        let observed_delta = closing.delta_from(working.opening);
+        let unexplained_delta = observed_delta.subtract(attributed_delta);
+        let tolerance = RESOURCE_LEDGER_ABSOLUTE_TOLERANCE
+            + RESOURCE_LEDGER_RELATIVE_TOLERANCE * working.opening.scale().max(closing.scale());
+        let reconciliation = ResourceReconciliation {
+            observed_delta,
+            attributed_delta,
+            unexplained_delta,
+            tolerance,
+            reconciled: unexplained_delta.within(tolerance),
+        };
+        for (cumulative, flow) in self.report.cumulative.iter_mut().zip(&working.flows) {
+            cumulative.delta.add_assign(flow.delta);
+            cumulative.activity.add_assign(flow.activity);
+        }
+        self.report.completed_ticks = self.report.completed_ticks.saturating_add(1);
+        self.report.latest = Some(ResourceLedgerTick {
+            tick: working.tick,
+            opening: working.opening,
+            closing,
+            flows: working.flows,
+            reconciliation,
+        });
+    }
 }
 
 /// Events emitted after processing a world tick.
@@ -6985,6 +7336,7 @@ pub struct WorldState {
     combat_spike_hits: u32,
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
+    resource_ledger: ResourceLedgerState,
     activation_probe: Option<AgentId>,
     simulation_commands: Vec<SimulationCommand>,
 }
@@ -7107,9 +7459,46 @@ impl WorldState {
             combat_spike_hits: 0,
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
+            resource_ledger: ResourceLedgerState::default(),
             activation_probe: None,
             simulation_commands: Vec::new(),
         })
+    }
+
+    fn resource_amounts(&self) -> ResourceAmounts {
+        ResourceAmounts {
+            food: self
+                .food
+                .cells()
+                .iter()
+                .map(|value| f64::from(*value))
+                .sum(),
+            energy: self
+                .runtime
+                .values()
+                .map(|runtime| f64::from(runtime.energy))
+                .sum(),
+            health: self
+                .agents
+                .columns()
+                .health()
+                .iter()
+                .map(|value| f64::from(*value))
+                .sum(),
+        }
+    }
+
+    fn capture_resource_amounts(&self) -> Option<ResourceAmounts> {
+        self.resource_ledger
+            .enabled
+            .then(|| self.resource_amounts())
+    }
+
+    fn record_resource_change(&mut self, kind: ResourceFlowKind, before: Option<ResourceAmounts>) {
+        if let Some(before) = before {
+            let after = self.resource_amounts();
+            self.resource_ledger.record_change(kind, before, after);
+        }
     }
 
     fn stage_aging(&mut self) {
@@ -8469,13 +8858,19 @@ impl WorldState {
                     let movement_penalty =
                         movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
                     let mut drain = metabolism_drain + movement_penalty;
+                    let mut ramp_penalty = 0.0;
                     if ramp_rate > 0.0 {
                         let active_energy = (rt.energy - ramp_floor).max(0.0);
-                        drain += active_energy * ramp_rate;
+                        ramp_penalty = active_energy * ramp_rate;
+                        drain += ramp_penalty;
                     }
-                    if decoded.boost && boost_penalty > 0.0 {
-                        drain += boost_penalty;
-                    }
+                    let boost_drain = if decoded.boost && boost_penalty > 0.0 {
+                        boost_penalty
+                    } else {
+                        0.0
+                    };
+                    drain += boost_drain;
+                    let before_topography = drain;
                     if topo_enabled && topo_penalty > 0.0 {
                         if slope_along > 0.0 {
                             drain += slope_along * topo_penalty;
@@ -8483,6 +8878,13 @@ impl WorldState {
                             drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
                         }
                     }
+                    let drain_breakdown = ActuationDrain {
+                        basal: metabolism_drain,
+                        movement: movement_penalty,
+                        ramp: ramp_penalty,
+                        boost: boost_drain,
+                        topography: drain - before_topography,
+                    };
                     let health_delta = -drain;
                     let energy = (rt.energy - drain).max(0.0);
 
@@ -8500,6 +8902,7 @@ impl WorldState {
                             health_delta,
                         }),
                         energy,
+                        drain: drain_breakdown,
                         color: decoded.color,
                         spike_length,
                         sound_level: decoded.sound_level,
@@ -8561,13 +8964,19 @@ impl WorldState {
                 let movement_penalty =
                     movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
                 let mut drain = metabolism_drain + movement_penalty;
+                let mut ramp_penalty = 0.0;
                 if ramp_rate > 0.0 {
                     let active_energy = (runtime.energy - ramp_floor).max(0.0);
-                    drain += active_energy * ramp_rate;
+                    ramp_penalty = active_energy * ramp_rate;
+                    drain += ramp_penalty;
                 }
-                if decoded.boost && boost_penalty > 0.0 {
-                    drain += boost_penalty;
-                }
+                let boost_drain = if decoded.boost && boost_penalty > 0.0 {
+                    boost_penalty
+                } else {
+                    0.0
+                };
+                drain += boost_drain;
+                let before_topography = drain;
                 if topo_enabled && topo_penalty > 0.0 {
                     if slope_along > 0.0 {
                         drain += slope_along * topo_penalty;
@@ -8575,6 +8984,13 @@ impl WorldState {
                         drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
                     }
                 }
+                let drain_breakdown = ActuationDrain {
+                    basal: metabolism_drain,
+                    movement: movement_penalty,
+                    ramp: ramp_penalty,
+                    boost: boost_drain,
+                    topography: drain - before_topography,
+                };
                 let health_delta = -drain;
                 let energy = (runtime.energy - drain).max(0.0);
                 let mut spike_length = spike_lengths_snapshot[idx];
@@ -8591,6 +9007,7 @@ impl WorldState {
                         health_delta,
                     }),
                     energy,
+                    drain: drain_breakdown,
                     color: decoded.color,
                     spike_length,
                     sound_level: decoded.sound_level,
@@ -8651,13 +9068,19 @@ impl WorldState {
                 let movement_penalty =
                     movement_drain * (left_speed.abs() + right_speed.abs()) * 0.5;
                 let mut drain = metabolism_drain + movement_penalty;
+                let mut ramp_penalty = 0.0;
                 if ramp_rate > 0.0 {
                     let active_energy = (runtime.energy - ramp_floor).max(0.0);
-                    drain += active_energy * ramp_rate;
+                    ramp_penalty = active_energy * ramp_rate;
+                    drain += ramp_penalty;
                 }
-                if decoded.boost && boost_penalty > 0.0 {
-                    drain += boost_penalty;
-                }
+                let boost_drain = if decoded.boost && boost_penalty > 0.0 {
+                    boost_penalty
+                } else {
+                    0.0
+                };
+                drain += boost_drain;
+                let before_topography = drain;
                 if topo_enabled && topo_penalty > 0.0 {
                     if slope_along > 0.0 {
                         drain += slope_along * topo_penalty;
@@ -8665,6 +9088,13 @@ impl WorldState {
                         drain = (drain + slope_along * topo_penalty * 0.5).max(0.0);
                     }
                 }
+                let drain_breakdown = ActuationDrain {
+                    basal: metabolism_drain,
+                    movement: movement_penalty,
+                    ramp: ramp_penalty,
+                    boost: boost_drain,
+                    topography: drain - before_topography,
+                };
                 let health_delta = -drain;
                 let energy = (runtime.energy - drain).max(0.0);
 
@@ -8682,6 +9112,7 @@ impl WorldState {
                         health_delta,
                     }),
                     energy,
+                    drain: drain_breakdown,
                     color: decoded.color,
                     spike_length,
                     sound_level: decoded.sound_level,
@@ -8691,6 +9122,50 @@ impl WorldState {
                 ActuationResult::default()
             }
         });
+
+        if self.resource_ledger.enabled {
+            let mut deltas = [ResourceAmounts::default(); 5];
+            let healths = self.agents.columns().health();
+            for (idx, agent_id) in handles.iter().enumerate() {
+                let Some(runtime) = self.runtime.get(*agent_id) else {
+                    continue;
+                };
+                let total = results[idx].drain.total();
+                if total <= f32::EPSILON {
+                    continue;
+                }
+                let energy_loss = (runtime.energy - results[idx].energy).max(0.0);
+                let health_after = (healths[idx]
+                    + results[idx].delta.as_ref().map_or(0.0, |d| d.health_delta))
+                .clamp(0.0, 2.0);
+                let health_loss = (healths[idx] - health_after).max(0.0);
+                let components = [
+                    results[idx].drain.basal,
+                    results[idx].drain.movement,
+                    results[idx].drain.ramp,
+                    results[idx].drain.boost,
+                    results[idx].drain.topography,
+                ];
+                for (flow, component) in deltas.iter_mut().zip(components) {
+                    let share = f64::from(component / total);
+                    flow.energy -= f64::from(energy_loss) * share;
+                    flow.health -= f64::from(health_loss) * share;
+                }
+            }
+            for (kind, delta) in [
+                ResourceFlowKind::BasalMetabolism,
+                ResourceFlowKind::Movement,
+                ResourceFlowKind::MetabolismRamp,
+                ResourceFlowKind::Boost,
+                ResourceFlowKind::Topography,
+            ]
+            .into_iter()
+            .zip(deltas)
+            {
+                self.resource_ledger
+                    .record(kind, delta, ResourceAmounts::default());
+            }
+        }
 
         let columns = self.agents.columns_mut();
         {
@@ -9020,7 +9495,8 @@ impl WorldState {
     ///
     /// Applied in queue order, which is the order they were enqueued: the same
     /// command sequence against the same seed produces the same world.
-    fn stage_interventions(&mut self) {
+    fn stage_interventions(&mut self) -> ResourceAmounts {
+        let mut rejected = ResourceAmounts::default();
         let queued = std::mem::take(&mut self.pending_interventions);
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
@@ -9051,7 +9527,9 @@ impl WorldState {
                             if region.contains(px, py, world_width, world_height)
                                 && let Some(cell) = self.food.get_mut(cx, cy)
                             {
+                                let before = *cell;
                                 *cell = (*cell + amount).min(cap);
+                                rejected.food += f64::from((amount - (*cell - before)).max(0.0));
                             }
                         }
                     }
@@ -9079,7 +9557,10 @@ impl WorldState {
                         let healths = columns.health_mut();
                         for (idx, position) in positions.iter().enumerate() {
                             if region.contains(position.x, position.y, world_width, world_height) {
+                                let before = healths[idx];
                                 healths[idx] = (healths[idx] - lethality).max(0.0);
+                                rejected.health +=
+                                    f64::from((lethality - (before - healths[idx])).max(0.0));
                             }
                         }
                     }
@@ -9097,6 +9578,7 @@ impl WorldState {
         }
         self.active_effects
             .retain(|effect| effect.ticks_remaining > 0);
+        rejected
     }
 
     /// Run the narrative detectors over the tick history and append any newly
@@ -9120,7 +9602,8 @@ impl WorldState {
         self.narrative.events()
     }
 
-    fn stage_food(&mut self) {
+    fn stage_food(&mut self) -> FoodResourceActivity {
+        let mut activity = FoodResourceActivity::default();
         let cell_size = self.config.food_cell_size as f32;
         // Reuse buffers: positions, handles, sharers
         self.work_positions.clear();
@@ -9135,7 +9618,7 @@ impl WorldState {
         let mut sharers: Vec<usize> = Vec::new();
         let food_width = self.food.width() as usize;
         if food_width == 0 || self.food.height() == 0 {
-            return;
+            return activity;
         }
 
         let intake_rate = self.config.food_intake_rate.max(0.0);
@@ -9184,7 +9667,11 @@ impl WorldState {
                             if intake > 0.0 {
                                 let nutrient = profile.nutrient_density;
                                 let energy_gain = intake * (0.5 + nutrient * 0.5);
+                                let energy_before = runtime.energy;
                                 runtime.energy = (runtime.energy + energy_gain).min(2.0);
+                                activity.rejected_energy += f64::from(
+                                    (energy_gain - (runtime.energy - energy_before)).max(0.0),
+                                );
                                 runtime.food_delta += energy_gain;
                                 if reproduction_bonus > 0.0 {
                                     let fertility_multiplier =
@@ -9203,12 +9690,12 @@ impl WorldState {
         }
 
         if sharers.is_empty() {
-            return;
+            return activity;
         }
 
         let transfer_rate = self.config.food_transfer_rate;
         if transfer_rate <= 0.0 {
-            return;
+            return activity;
         }
         let distance = if self.config.food_sharing_distance > 0.0 {
             self.config.food_sharing_distance
@@ -9230,7 +9717,7 @@ impl WorldState {
             self.work_position_pairs.push((position.x, position.y));
         }
         if self.index.rebuild(&self.work_position_pairs).is_err() {
-            return;
+            return activity;
         }
 
         // Defer indicator pulses to avoid borrowing conflicts
@@ -9282,10 +9769,18 @@ impl WorldState {
                 if capacity <= 0.0 {
                     continue;
                 }
-                let actual_transfer = transfer_rate.min(giver_energy).min(capacity);
+                let requested_transfer = transfer_rate.min(giver_energy);
+                let actual_transfer = requested_transfer.min(capacity);
                 if actual_transfer <= 0.0 {
                     continue;
                 }
+                activity.rejected_energy +=
+                    f64::from((requested_transfer - actual_transfer).max(0.0));
+                activity.shared_energy += f64::from(actual_transfer);
+                let giver_after = (giver_energy - actual_transfer).max(0.0);
+                let recipient_after = (recipient_energy + actual_transfer).min(2.0);
+                activity.sharing_delta_energy +=
+                    f64::from(giver_after + recipient_after - giver_energy - recipient_energy);
                 {
                     if let Some(giver_runtime) = self.runtime.get_mut(giver_id) {
                         giver_runtime.energy = (giver_runtime.energy - actual_transfer).max(0.0);
@@ -9306,6 +9801,7 @@ impl WorldState {
         for (id, intensity, color) in indicator_pulses {
             self.pulse_indicator(id, intensity, color);
         }
+        activity
     }
     fn spawn_crossover_agent(&mut self) -> Result<Option<AgentId>, BrainSpawnError> {
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
@@ -9939,20 +10435,21 @@ impl WorldState {
         self.combat_spike_hits = self.combat_spike_hits.saturating_add(hits);
     }
 
-    fn distribute_carcass_rewards(&mut self, dead: &[(usize, AgentId)]) {
+    fn distribute_carcass_rewards(&mut self, dead: &[(usize, AgentId)]) -> ResourceAmounts {
+        let mut rejected = ResourceAmounts::default();
         if dead.is_empty() {
-            return;
+            return rejected;
         }
         let radius = self.config.carcass_distribution_radius;
         let health_base = self.config.carcass_health_reward;
         let reproduction_base = self.config.carcass_reproduction_reward;
         if radius <= 0.0 || (health_base <= 0.0 && reproduction_base <= 0.0) {
-            return;
+            return rejected;
         }
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         if handles.is_empty() {
-            return;
+            return rejected;
         }
 
         let positions: Vec<Position> = self.agents.columns().positions().to_vec();
@@ -10105,7 +10602,9 @@ impl WorldState {
             let healths_mut = columns.health_mut();
             for (idx, add) in health_add.iter().enumerate() {
                 if *add > 0.0 {
+                    let before = healths_mut[idx];
                     healths_mut[idx] = (healths_mut[idx] + *add).min(2.0);
+                    rejected.health += f64::from((*add - (healths_mut[idx] - before)).max(0.0));
                 }
             }
         }
@@ -10118,7 +10617,9 @@ impl WorldState {
                 if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                     let energy = energy_add[idx];
                     if energy > 0.0 {
+                        let before = runtime.energy;
                         runtime.energy = (runtime.energy + energy).min(2.0);
+                        rejected.energy += f64::from((energy - (runtime.energy - before)).max(0.0));
                         runtime.food_delta += energy;
                     }
                     let repro = reproduction_bonus[idx];
@@ -10134,9 +10635,10 @@ impl WorldState {
                 }
             }
         }
+        rejected
     }
 
-    fn stage_death_cleanup(&mut self, tick: Tick) {
+    fn stage_death_cleanup(&mut self, tick: Tick) -> DeathResourceActivity {
         // Health exhaustion is fatal no matter which stage drained it; the
         // legacy sim erases every health<=0 agent each tick. Without this
         // sweep, agents drained by actuation/metabolism linger as zombies.
@@ -10152,7 +10654,7 @@ impl WorldState {
             self.pending_deaths.extend(exhausted);
         }
         if self.pending_deaths.is_empty() {
-            return;
+            return DeathResourceActivity::default();
         }
         let mut seen = HashSet::new();
         let mut dead = Vec::new();
@@ -10166,7 +10668,7 @@ impl WorldState {
         }
         if dead.is_empty() {
             self.last_deaths = 0;
-            return;
+            return DeathResourceActivity::default();
         }
 
         let death_records: Vec<DeathRecord> = {
@@ -10214,7 +10716,10 @@ impl WorldState {
         }
 
         dead.sort_by_key(|(idx, _)| *idx);
-        self.distribute_carcass_rewards(&dead);
+        let before_carcass = self.capture_resource_amounts();
+        let rejected = self.distribute_carcass_rewards(&dead);
+        let after_carcass = before_carcass.map(|_| self.resource_amounts());
+        let before_removal = after_carcass;
         let mut removed = 0usize;
         for (_, agent_id) in dead.into_iter().rev() {
             if self.remove_agent(agent_id).is_some() {
@@ -10222,6 +10727,18 @@ impl WorldState {
             }
         }
         self.last_deaths = removed;
+        let after_removal = before_removal.map(|_| self.resource_amounts());
+        DeathResourceActivity {
+            carcass_delta: match (before_carcass, after_carcass) {
+                (Some(before), Some(after)) => after.delta_from(before),
+                _ => ResourceAmounts::default(),
+            },
+            removal_delta: match (before_removal, after_removal) {
+                (Some(before), Some(after)) => after.delta_from(before),
+                _ => ResourceAmounts::default(),
+            },
+            rejected,
+        }
     }
     fn stage_reproduction(&mut self) {
         if self.config.reproduction_energy_threshold <= 0.0 {
@@ -11497,31 +12014,115 @@ impl WorldState {
         let next_tick = self.tick.next();
         let previous_epoch = self.epoch;
 
-        self.stage_interventions();
-        if self.cadence.should_age(next_tick) {
-            self.stage_aging();
+        if self.resource_ledger.enabled {
+            let opening = self.resource_amounts();
+            self.resource_ledger.begin_tick(next_tick, opening);
         }
+
+        let before = self.capture_resource_amounts();
+        let intervention_rejection = self.stage_interventions();
+        self.record_resource_change(ResourceFlowKind::ScenarioIntervention, before);
+        self.resource_ledger.record(
+            ResourceFlowKind::CapacityRejection,
+            ResourceAmounts::default(),
+            intervention_rejection,
+        );
+        if self.cadence.should_age(next_tick) {
+            let before = self.capture_resource_amounts();
+            self.stage_aging();
+            self.record_resource_change(ResourceFlowKind::Aging, before);
+        }
+        let before = self.capture_resource_amounts();
         let food_respawned = self.stage_food_dynamics(next_tick);
+        self.record_resource_change(ResourceFlowKind::FoodDynamics, before);
         self.stage_sense();
         self.stage_brains();
         self.stage_actuation();
+        let before = self.capture_resource_amounts();
         self.stage_temperature_discomfort();
-        self.stage_food();
-        self.stage_combat();
-        self.stage_death_cleanup(next_tick);
-        self.stage_reproduction();
-        let brain_result = match self.stage_population(next_tick) {
-            Ok(population_receipt) => match self.stage_spawn_commit(next_tick) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    if let Some(receipt) = population_receipt {
-                        self.rollback_population_spawns(receipt);
-                    }
-                    Err(error)
-                }
+        self.record_resource_change(ResourceFlowKind::TemperatureStress, before);
+        let before = self.capture_resource_amounts();
+        let food_activity = self.stage_food();
+        if let Some(before) = before {
+            let mut ground_delta = self.resource_amounts().delta_from(before);
+            ground_delta.energy -= food_activity.sharing_delta_energy;
+            self.resource_ledger.record(
+                ResourceFlowKind::GroundFoodConversion,
+                ground_delta,
+                ResourceAmounts::default(),
+            );
+        }
+        self.resource_ledger.record(
+            ResourceFlowKind::EnergySharing,
+            ResourceAmounts {
+                energy: food_activity.sharing_delta_energy,
+                ..ResourceAmounts::default()
             },
+            ResourceAmounts {
+                energy: food_activity.shared_energy,
+                ..ResourceAmounts::default()
+            },
+        );
+        self.resource_ledger.record(
+            ResourceFlowKind::CapacityRejection,
+            ResourceAmounts::default(),
+            ResourceAmounts {
+                energy: food_activity.rejected_energy,
+                ..ResourceAmounts::default()
+            },
+        );
+        let before = self.capture_resource_amounts();
+        self.stage_combat();
+        self.record_resource_change(ResourceFlowKind::Combat, before);
+        let death_activity = self.stage_death_cleanup(next_tick);
+        self.resource_ledger.record(
+            ResourceFlowKind::CarcassReward,
+            death_activity.carcass_delta,
+            ResourceAmounts::default(),
+        );
+        self.resource_ledger.record(
+            ResourceFlowKind::DeathRemoval,
+            death_activity.removal_delta,
+            ResourceAmounts::default(),
+        );
+        self.resource_ledger.record(
+            ResourceFlowKind::CapacityRejection,
+            ResourceAmounts::default(),
+            death_activity.rejected,
+        );
+        let reproduction_before = self.capture_resource_amounts();
+        self.stage_reproduction();
+        self.record_resource_change(
+            ResourceFlowKind::ReproductionAllocation,
+            reproduction_before,
+        );
+        let population_before = self.capture_resource_amounts();
+        let population_result = self.stage_population(next_tick);
+        self.record_resource_change(ResourceFlowKind::PopulationInjection, population_before);
+        let brain_result = match population_result {
+            Ok(population_receipt) => {
+                let spawn_before = self.capture_resource_amounts();
+                let spawn_result = self.stage_spawn_commit(next_tick);
+                self.record_resource_change(ResourceFlowKind::ReproductionAllocation, spawn_before);
+                match spawn_result {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        if let Some(receipt) = population_receipt {
+                            let rollback_before = self.capture_resource_amounts();
+                            self.rollback_population_spawns(receipt);
+                            self.record_resource_change(
+                                ResourceFlowKind::PopulationInjection,
+                                rollback_before,
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
             Err(error) => {
+                let abort_before = self.capture_resource_amounts();
                 self.abort_pending_spawns();
+                self.record_resource_change(ResourceFlowKind::ReproductionAllocation, abort_before);
                 Err(error)
             }
         };
@@ -11543,6 +12144,10 @@ impl WorldState {
         };
 
         self.stage_reset_events(preserve_persistence_tail);
+        if self.resource_ledger.enabled {
+            let closing = self.resource_amounts();
+            self.resource_ledger.finish_tick(closing);
+        }
         self.advance_tick();
         events.tick = self.tick;
         events.epoch_rolled = self.epoch != previous_epoch;
@@ -11564,6 +12169,27 @@ impl WorldState {
     #[must_use]
     pub fn config(&self) -> &ScriptBotsConfig {
         &self.config
+    }
+
+    /// Enable or disable per-stage resource accounting for future ticks.
+    ///
+    /// The report accumulated before disabling is retained. Accounting state
+    /// is diagnostic-only: it is excluded from characterization and world
+    /// digests, persistence, replay, RNG use, and every simulation decision.
+    pub fn set_resource_ledger_enabled(&mut self, enabled: bool) {
+        self.resource_ledger.set_enabled(enabled);
+    }
+
+    /// Whether future ticks will produce resource-ledger reports.
+    #[must_use]
+    pub const fn resource_ledger_enabled(&self) -> bool {
+        self.resource_ledger.enabled
+    }
+
+    /// Latest and cumulative immutable resource accounting.
+    #[must_use]
+    pub const fn resource_ledger(&self) -> &ResourceLedgerReport {
+        &self.resource_ledger.report
     }
 
     /// Fingerprint deterministic science state at a quiescent tick boundary.
@@ -17938,5 +18564,341 @@ mod tests {
         let pending = world.drain_simulation_commands();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].speed_multiplier, Some(32.0));
+    }
+
+    fn ledger_flow(world: &WorldState, kind: ResourceFlowKind) -> ResourceFlow {
+        *world
+            .resource_ledger()
+            .latest
+            .as_ref()
+            .expect("resource ledger should contain a completed tick")
+            .flows
+            .iter()
+            .find(|flow| flow.kind == kind)
+            .expect("every stable resource category should be present")
+    }
+
+    fn assert_latest_ledger_reconciles(world: &WorldState) {
+        let reconciliation = world
+            .resource_ledger()
+            .latest
+            .as_ref()
+            .expect("resource ledger should contain a completed tick")
+            .reconciliation;
+        assert!(
+            reconciliation.reconciled,
+            "unexplained resource delta {:?} exceeds tolerance {}",
+            reconciliation.unexplained_delta, reconciliation.tolerance
+        );
+    }
+
+    struct LedgerAggressorBrain;
+
+    impl BrainRunner for LedgerAggressorBrain {
+        fn kind(&self) -> &'static str {
+            "test.resource-ledger-aggressor"
+        }
+
+        fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+            let mut outputs = [0.0; OUTPUT_SIZE];
+            outputs[0] = 0.6;
+            outputs[1] = 0.8;
+            outputs[5] = 1.0;
+            outputs[6] = 1.0;
+            outputs[8] = 1.0;
+            outputs
+        }
+    }
+
+    struct LedgerIdleBrain;
+
+    impl BrainRunner for LedgerIdleBrain {
+        fn kind(&self) -> &'static str {
+            "test.resource-ledger-idle"
+        }
+
+        fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+            [0.0; OUTPUT_SIZE]
+        }
+    }
+
+    #[test]
+    fn resource_ledger_attributes_ecology_combat_and_interventions() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.95,
+            food_max: 1.0,
+            food_respawn_interval: 1,
+            food_respawn_amount: 0.02,
+            food_growth_rate: 0.01,
+            food_decay_rate: 0.002,
+            food_diffusion_rate: 0.05,
+            food_intake_rate: 0.02,
+            food_waste_rate: 0.02,
+            food_transfer_rate: 0.04,
+            food_sharing_distance: 20.0,
+            bot_speed: 0.5,
+            movement_drain: 0.01,
+            metabolism_drain: 0.01,
+            metabolism_ramp_floor: 0.2,
+            metabolism_ramp_rate: 0.01,
+            metabolism_boost_penalty: 0.02,
+            temperature_discomfort_rate: 0.01,
+            temperature_comfort_band: 0.0,
+            temperature_discomfort_exponent: 1.0,
+            aging_tick_interval: 1,
+            aging_health_decay_start: 0,
+            aging_health_decay_rate: 0.005,
+            aging_health_decay_max: 0.02,
+            aging_energy_penalty_rate: 0.5,
+            reproduction_energy_threshold: 10.0,
+            reproduction_attempt_chance: 0.0,
+            spike_radius: 20.0,
+            spike_damage: 0.5,
+            spike_energy_cost: 0.02,
+            spike_min_length: 0.1,
+            spike_alignment_cosine: 0.1,
+            spike_speed_damage_bonus: 0.0,
+            spike_length_damage_bonus: 0.0,
+            carcass_distribution_radius: 30.0,
+            carcass_health_reward: 0.4,
+            carcass_reproduction_reward: 0.0,
+            carcass_neighbor_exponent: 1.0,
+            carcass_maturity_age: 1,
+            carcass_energy_share_rate: 0.5,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            persistence_interval: 0,
+            rng_seed: Some(2_808),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("resource-ledger ecology world");
+        let attacker = world.spawn_agent(sample_agent(0));
+        let victim = world.spawn_agent(sample_agent(1));
+        let attacker_brain = world
+            .brain_registry_mut()
+            .register("test.resource-ledger-aggressor", |_rng| {
+                Ok(Box::new(LedgerAggressorBrain))
+            });
+        let idle_brain = world
+            .brain_registry_mut()
+            .register("test.resource-ledger-idle", |_rng| {
+                Ok(Box::new(LedgerIdleBrain))
+            });
+        assert!(
+            world
+                .bind_agent_brain(attacker, attacker_brain)
+                .expect("aggressor brain")
+        );
+        assert!(
+            world
+                .bind_agent_brain(victim, idle_brain)
+                .expect("idle brain")
+        );
+        {
+            let attacker_idx = world.agents.index_of(attacker).expect("attacker index");
+            let victim_idx = world.agents.index_of(victim).expect("victim index");
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[attacker_idx] = Position::new(10.0, 10.0);
+            columns.positions_mut()[victim_idx] = Position::new(15.0, 10.0);
+            columns.headings_mut()[attacker_idx] = 0.0;
+            columns.headings_mut()[victim_idx] = 0.0;
+            columns.health_mut()[attacker_idx] = 1.0;
+            columns.health_mut()[victim_idx] = 0.08;
+            columns.ages_mut()[attacker_idx] = 5;
+            columns.ages_mut()[victim_idx] = 5;
+            columns.spike_lengths_mut()[attacker_idx] = 1.0;
+        }
+        {
+            let runtime = world.agent_runtime_mut(attacker).expect("attacker runtime");
+            runtime.energy = 1.0;
+            runtime.herbivore_tendency = 0.0;
+            runtime.temperature_preference = 0.0;
+        }
+        {
+            let runtime = world.agent_runtime_mut(victim).expect("victim runtime");
+            runtime.energy = 0.2;
+            runtime.herbivore_tendency = 1.0;
+            runtime.temperature_preference = 0.0;
+        }
+        world
+            .enqueue_intervention(Intervention::Bloom {
+                region: Region::All,
+                amount: 0.2,
+            })
+            .expect("bounded bloom");
+        world
+            .enqueue_intervention(Intervention::Meteor {
+                region: Region::All,
+                lethality: 0.01,
+                scorch: 0.1,
+            })
+            .expect("bounded meteor");
+        world.set_resource_ledger_enabled(true);
+        world.step().expect("resource-ledger ecology tick");
+
+        assert_latest_ledger_reconciles(&world);
+        for kind in [
+            ResourceFlowKind::ScenarioIntervention,
+            ResourceFlowKind::FoodDynamics,
+            ResourceFlowKind::Aging,
+            ResourceFlowKind::BasalMetabolism,
+            ResourceFlowKind::Movement,
+            ResourceFlowKind::MetabolismRamp,
+            ResourceFlowKind::Boost,
+            ResourceFlowKind::TemperatureStress,
+            ResourceFlowKind::GroundFoodConversion,
+            ResourceFlowKind::Combat,
+            ResourceFlowKind::CarcassReward,
+            ResourceFlowKind::DeathRemoval,
+        ] {
+            assert!(
+                ledger_flow(&world, kind).delta.scale() > 0.0,
+                "expected a non-zero {kind:?} attribution"
+            );
+        }
+        assert!(
+            ledger_flow(&world, ResourceFlowKind::EnergySharing)
+                .activity
+                .energy
+                > 0.0,
+            "giving must report its gross transfer despite zero net energy delta"
+        );
+        assert!(
+            ledger_flow(&world, ResourceFlowKind::CapacityRejection)
+                .activity
+                .scale()
+                > 0.0,
+            "the capped bloom must report rejected source capacity"
+        );
+    }
+
+    #[test]
+    fn resource_ledger_reconciles_reproduction_and_population_injection() {
+        let reproduction_config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.2,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
+            reproduction_rate_herbivore: 1.0,
+            reproduction_rate_carnivore: 1.0,
+            reproduction_child_energy: 0.4,
+            reproduction_partner_chance: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            persistence_interval: 0,
+            rng_seed: Some(2_809),
+            ..ScriptBotsConfig::default()
+        };
+        let mut reproduction_world =
+            WorldState::new(reproduction_config).expect("reproduction ledger world");
+        let parent = reproduction_world.spawn_agent(sample_agent(0));
+        reproduction_world
+            .agent_runtime_mut(parent)
+            .expect("parent runtime")
+            .energy = 1.0;
+        reproduction_world.set_resource_ledger_enabled(true);
+        reproduction_world
+            .step()
+            .expect("resource-ledger reproduction tick");
+        assert_latest_ledger_reconciles(&reproduction_world);
+        let reproduction = ledger_flow(
+            &reproduction_world,
+            ResourceFlowKind::ReproductionAllocation,
+        );
+        assert!(reproduction.delta.energy.abs() > 0.0);
+        assert!(reproduction.delta.health > 0.0);
+
+        let population_config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            reproduction_energy_threshold: 10.0,
+            reproduction_attempt_chance: 0.0,
+            population_minimum: 2,
+            population_spawn_interval: 0,
+            closed: false,
+            persistence_interval: 0,
+            rng_seed: Some(2_810),
+            ..ScriptBotsConfig::default()
+        };
+        let mut population_world =
+            WorldState::new(population_config).expect("population ledger world");
+        population_world.set_resource_ledger_enabled(true);
+        population_world
+            .step()
+            .expect("resource-ledger population tick");
+        assert_latest_ledger_reconciles(&population_world);
+        let injection = ledger_flow(&population_world, ResourceFlowKind::PopulationInjection);
+        assert_eq!(population_world.agent_count(), 2);
+        assert!(injection.delta.health > 0.0);
+        assert!(injection.delta.energy > 0.0);
+    }
+
+    #[test]
+    fn enabling_resource_ledger_does_not_change_characterization_digest() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.4,
+            food_respawn_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            persistence_interval: 0,
+            rng_seed: Some(2_811),
+            ..ScriptBotsConfig::default()
+        };
+        let mut uninstrumented = WorldState::new(config.clone()).expect("control world");
+        let mut instrumented = WorldState::new(config).expect("instrumented world");
+        instrumented.set_resource_ledger_enabled(true);
+
+        for _ in 0..4 {
+            uninstrumented.step().expect("control tick");
+            instrumented.step().expect("instrumented tick");
+            assert_latest_ledger_reconciles(&instrumented);
+            assert_eq!(
+                uninstrumented
+                    .characterization_digest_v0()
+                    .expect("control digest"),
+                instrumented
+                    .characterization_digest_v0()
+                    .expect("instrumented digest")
+            );
+        }
+        assert_eq!(instrumented.resource_ledger().completed_ticks, 4);
+        assert_eq!(uninstrumented.resource_ledger().completed_ticks, 0);
     }
 }
