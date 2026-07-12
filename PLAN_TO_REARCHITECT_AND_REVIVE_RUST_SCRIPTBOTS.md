@@ -1683,7 +1683,7 @@ Phase 0.4 therefore remains in progress. This slice hardens renderer selection, 
 
 ### Phase 1 — Restore Simulation Correctness (`P0`) [Currently In Progress — scientific peer-patch verification and isolated storage/brain reconciliation, CyanDove, 2026-07-12]
 
-#### 1.1 sensing and spatial oracle [Completed — eyesight scalar/SIMD chunk-boundary proof, `bd-2z0.2.1`, Codex, 2026-07-12]
+#### 1.1 sensing and spatial oracle [Completed — `bd-2z0.2.1`, `bd-2z0.2.2`, and `bd-2z0.2.3`, 2026-07-12]
 
 - [Completed — `bd-2z0.2.1`] deterministic legacy-formula eye oracle for 7, 8, and 9
   visible targets, forcing the `4n-1`, `4n`, and `4n+1` full-chunk/remainder boundaries
@@ -1697,7 +1697,7 @@ Phase 0.4 therefore remains in progress. This slice hardens renderer selection, 
   forced sparse grid agree with an independent minimum-image oracle across query, bucket,
   scratch, and count surfaces; wrapped translations preserve IDs and distances; `f32::MAX`
   radii terminate with duplicate-free delivery in every 1x1 through 4x4 tiny world;
-- scalar/SIMD and serial/parallel comparisons;
+- [Completed — `bd-2z0.2.1`] scalar/SIMD and serial/Rayon comparisons;
 - fix implementation only after oracle fails correctly.
 
 **Exit:** sensor digests agree across supported feature paths.
