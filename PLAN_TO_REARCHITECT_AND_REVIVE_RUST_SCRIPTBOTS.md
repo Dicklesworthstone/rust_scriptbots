@@ -2833,13 +2833,42 @@ blocked behind their family beads.
 
 ## Appendix B — Sibling Repository Study and Safety Decision
 
-The sibling repositories were inspected read-only. No stash, pull, checkout, reset, deletion, or tracked mutation was performed.
+Remote refs were refreshed again on 2026-07-12 under the user's explicit
+stash-and-fast-forward instruction. Tracked sibling work was preserved in
+dated stashes before dirty checkouts moved; untracked files and all pre-existing
+stashes were retained. No stash was dropped or reapplied, and no reset, clean,
+or manual file deletion was used.
 
-- `frankentui`: local/upstream/remote commit `fccff2a7e51d39a927bced882877a45aef5c8d39`; unrelated `.gitignore` and untracked files preserved. It is current, so no pull was needed.
-- `asupersync`: bounded MPSC, blocking bridge, cancellation, and deterministic lab APIs were inspected. Use selectively around runtime/storage lifecycle, not as a scheduler for simulation math.
-- `franken_numpy`: checkout is 433 commits behind and has a modified fuzz seed, but the relevant `fnp-random` source was verified identical to current `origin/main`; no pull was needed to evaluate it.
-- `franken_networkx`: suitable for optional post-run lineage/interaction graph analysis, not the hot loop.
-- `frankenpandas`: contains extensive existing working-tree changes and is too large/eager for the runtime; use external reporting handoff only.
-- `frankenscipy`: contains extensive existing working-tree changes; selected statistics/FFT/clustering are optional post-run candidates with known caveats.
+- `frankentui`: local and `origin/main` remain at immutable candidate
+  `fccff2a7e51d39a927bced882877a45aef5c8d39`; unrelated `.gitignore` and
+  untracked files remain untouched.
+- `asupersync`: clean `main` fast-forwarded to
+  `90949d62ffd6221873a047ea14c7b6bb0060849f`. Use its bounded MPSC,
+  cancellation, blocking bridge, and deterministic test APIs selectively
+  around runtime/storage lifecycle, never as the scheduler for simulation
+  math.
+- `franken_numpy`: the original case-insensitive macOS checkout cannot
+  fast-forward because its old tree tracks both `seed_M` and `seed_m`. Both
+  local representations are preserved in dated stashes; a separate detached
+  read-only worktree provides current `origin/main` at
+  `6ac1c65d`. Only the focused `fnp-random` adapter remains a direct candidate.
+- `franken_networkx`: clean `main` fast-forwarded to `ce7fe7c3`; it remains an
+  optional post-run lineage/interaction graph engine, not a tick-loop
+  dependency.
+- `frankenpandas`: tracked deletions were preserved in stash
+  `11168dfccdbd779ab64f88ceef28e21130c62412`; `main` fast-forwarded to
+  `c77088b9`. It remains an external reporting/columnar handoff candidate, not
+  the primary in-process query engine.
+- `frankenscipy`: tracked deletions were preserved in stash
+  `d68aa9dcec0ba4b316a90fe41942482a545c7880`; `main` fast-forwarded to
+  `691ef47c`. Selected statistics, FFT, bootstrap, and clustering stay behind
+  an offline-only conformance/build-cost decision.
+- `frankensqlite`: clean tracked `main` fast-forwarded from the product's
+  current pin `cd9990bb` to sibling head `a293a252`; untracked stash-analysis
+  material was retained. ScriptBots does not silently move its immutable pin:
+  the newer revision must pass the full SQL, durability, error-taxonomy,
+  feature-closure, compile-size, and platform qualification gate first.
 
-Remote-content inspection supplied the needed current API evidence without disturbing valuable sibling work. Any future pinned dependency adoption uses an immutable source/revision and its own build/license/conformance bead.
+Any product dependency adoption still uses an immutable revision and its own
+license, behavior, build, and rollback evidence. Updating a sibling checkout is
+not permission to bypass the serialized `Cargo.lock` lane.
