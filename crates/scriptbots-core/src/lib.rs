@@ -1,5 +1,7 @@
 //! Core types shared across the ScriptBots workspace.
 
+pub mod detect;
+
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -90,6 +92,17 @@ pub const INPUT_SIZE: usize = 25;
 pub const OUTPUT_SIZE: usize = 9;
 /// Number of directional eyes each agent possesses.
 pub const NUM_EYES: usize = 4;
+
+/// Maximum number of *selected* agents whose brain activations are captured per
+/// tick, on top of the always-captured activation probe.
+///
+/// Activation snapshots allocate per-agent layer buffers (a Neuroflow brain
+/// serializes its whole network), so capture must be bounded, not merely
+/// demand-driven: without this cap a single "select all" from a frontend would
+/// reinstate population-wide capture every tick. Inspectors show one agent at a
+/// time; a small budget covers every real use while keeping the cost
+/// population-independent.
+pub const ACTIVATION_CAPTURE_BUDGET: usize = 8;
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
 const HALF_TURN: f32 = std::f32::consts::PI;
@@ -6122,13 +6135,28 @@ impl WorldState {
         }
 
         let probe = self.activation_probe;
+        // Activation capture is demand-driven AND bounded. Selection alone must
+        // never authorize population-wide capture: a single "select all" would
+        // otherwise reinstate the per-agent, per-tick layer allocations this
+        // gate exists to remove. The probed agent is always captured; selected
+        // agents are captured in stable handle order until the budget is spent.
+        let mut capture_budget = ACTIVATION_CAPTURE_BUDGET;
         // Pull each runner out of its binding so evaluation can run
         // data-parallel (independent networks, no RNG); results are written
         // back serially in handle order, keeping the stage deterministic.
         let mut jobs: Vec<BrainJob> = Vec::with_capacity(self.agents.len());
         for agent_id in self.agents.iter_handles() {
             if let Some(runtime) = self.runtime.get_mut(agent_id) {
-                let capture = probe == Some(agent_id) || runtime.selection != SelectionState::None;
+                let probed = probe == Some(agent_id);
+                let selected = runtime.selection != SelectionState::None;
+                let capture = if probed {
+                    true
+                } else if selected && capture_budget > 0 {
+                    capture_budget -= 1;
+                    true
+                } else {
+                    false
+                };
                 jobs.push(BrainJob {
                     agent_id,
                     runner: runtime.brain.runner.take(),
@@ -11097,6 +11125,87 @@ mod tests {
         let position = world.agents().columns().positions()[0];
         assert!(position.x != 0.0 || position.y != 0.0);
         assert!(runtime.energy < 1.0);
+    }
+
+    #[test]
+    fn activation_capture_is_bounded_even_when_every_agent_is_selected() {
+        // Regression guard: a frontend "select all" must not reinstate
+        // population-wide activation capture. Capture is demand-driven AND
+        // bounded; the probed agent is always captured, selected agents only
+        // up to the budget.
+        #[derive(Debug)]
+        struct ChattyBrain;
+        impl BrainRunner for ChattyBrain {
+            fn kind(&self) -> &'static str {
+                "chatty"
+            }
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+            fn snapshot_activations(&self) -> Option<BrainActivations> {
+                Some(BrainActivations {
+                    layers: vec![ActivationLayer {
+                        name: "layer".to_owned(),
+                        width: 1,
+                        height: 1,
+                        values: vec![0.5],
+                    }],
+                    connections: Vec::new(),
+                })
+            }
+        }
+
+        let population = ACTIVATION_CAPTURE_BUDGET * 4;
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(21),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let key = world
+            .brain_registry_mut()
+            .register("chatty", |_rng| Ok(Box::new(ChattyBrain)));
+
+        let mut ids = Vec::new();
+        for seed in 0..population {
+            let id = world.spawn_agent(sample_agent(seed as u32));
+            world
+                .bind_agent_brain(id, key)
+                .expect("chatty brain factory");
+            ids.push(id);
+        }
+
+        // Simulate a "select all" from a frontend.
+        for id in &ids {
+            if let Some(runtime) = world.agent_runtime_mut(*id) {
+                runtime.selection = SelectionState::Selected;
+            }
+        }
+        // The inspector is focused on an agent well past the budget cutoff.
+        let probed = ids[population - 1];
+        world.set_activation_probe(Some(probed));
+
+        world.stage_brains();
+
+        let captured = ids
+            .iter()
+            .filter(|id| {
+                world
+                    .agent_runtime(**id)
+                    .is_some_and(|rt| rt.brain_activations.is_some())
+            })
+            .count();
+        assert!(
+            captured <= ACTIVATION_CAPTURE_BUDGET + 1,
+            "select-all captured {captured} activations; budget is {ACTIVATION_CAPTURE_BUDGET} (+1 probe)"
+        );
+        assert!(
+            world
+                .agent_runtime(probed)
+                .expect("probed runtime")
+                .brain_activations
+                .is_some(),
+            "the probed agent must always be captured, even beyond the budget"
+        );
     }
 
     #[test]
