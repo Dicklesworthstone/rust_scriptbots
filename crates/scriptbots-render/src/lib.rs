@@ -15,9 +15,9 @@ use scriptbots_core::PresetKind;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
     BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, NUM_EYES,
-    OutputChannel, OutputsExt, Position, RenderTonemapMode, ScriptBotsConfig, SelectionState,
-    SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers,
-    Velocity, WorldState,
+    OutputChannel, OutputsExt, Position, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
+    SelectionState, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
+    TraitModifiers, Velocity, WorldState,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -7729,27 +7729,46 @@ impl SimulationView {
     }
 }
 
+/// Render an agent's sensor or actuator vector as labelled bars.
+///
+/// The labels come from the canonical channel layout in `scriptbots-core`, not
+/// from a list retyped here: an inspector that says "s0: 0.42" tells you nothing,
+/// and an inspector that invents its own names eventually disagrees with the
+/// simulation about what a slot means. That disagreement is exactly how combat
+/// spent months treating the green colour channel as "boost".
+///
+/// Every channel is shown. The old version truncated sensors to the first eight,
+/// which silently hid blood, temperature, and the whole of eye 3 — the channels a
+/// user is most likely to be hunting for when an agent behaves strangely.
 fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
     let mut rows: Vec<Div> = Vec::new();
-    let max_show = if is_sensor { 8 } else { 6 };
     let max_val = values
         .iter()
         .copied()
         .fold(0.0_f32, |m, v| m.max(v.abs()))
         .max(1e-3);
-    for (idx, v) in values.iter().copied().take(max_show).enumerate() {
+    for (idx, v) in values.iter().copied().enumerate() {
+        let name = if is_sensor {
+            SENSOR_LAYOUT
+                .get(idx)
+                .map_or_else(|| format!("s{idx}"), |channel| channel.name.to_owned())
+        } else {
+            OutputChannel::ALL
+                .get(idx)
+                .map_or_else(|| format!("o{idx}"), |channel| channel.name().to_owned())
+        };
         let width = (v.abs() / max_val).clamp(0.0, 1.0);
         let color = if is_sensor {
             rgb(0x60a5fa)
         } else {
             rgb(0xf59e0b)
         };
-        let bar = div().w(px(160.0 * width)).h(px(8.0)).bg(color).rounded_sm();
+        let bar = div().w(px(120.0 * width)).h(px(8.0)).bg(color).rounded_sm();
         let label = div()
             .text_xs()
             .text_color(rgb(0x94a3b8))
-            .w(px(32.0))
-            .child(format!("{}{}", if is_sensor { "s" } else { "o" }, idx));
+            .w(px(84.0))
+            .child(name);
         rows.push(
             div()
                 .flex()
