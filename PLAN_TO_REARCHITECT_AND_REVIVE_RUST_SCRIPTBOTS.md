@@ -1653,7 +1653,7 @@ Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
 
 **Exit:** pre-fix behavior has a reproducible before/after oracle; Phase 4 packages later artifacts rather than inventing manifest/digest concepts.
 
-### Phase 1 — Restore Simulation Correctness (`P0`)
+### Phase 1 — Restore Simulation Correctness (`P0`) [Currently In Progress — scientific peer-patch verification and isolated storage/brain reconciliation, CyanDove, 2026-07-12]
 
 #### 1.1 sensing and spatial oracle
 
