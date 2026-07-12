@@ -1671,7 +1671,9 @@ Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
 - typed output mapping;
 - green-versus-boost damage regression;
 - replay/render use same accessors;
-- finite/range validation.
+- finite/range validation [Completed — `bd-2z0.2.6`].
+  - The broader mutable agent/food/terrain/hydrology ingress audit is owned by `bd-2z0.2.11`.
+  - Fallible finite construction for public NeuroFlow `f64` learning-rate and momentum values is owned by `bd-2z0.3.11`.
 
 **Exit:** no raw magic indexes outside the centralized conversion hot path.
 

@@ -725,6 +725,9 @@ fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
     if cli.auto_pause_on_spike {
         config.control.auto_pause_on_spike_hit = true;
     }
+    config
+        .validate()
+        .context("invalid composed ScriptBots configuration")?;
     Ok(config)
 }
 
@@ -908,7 +911,7 @@ fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<Scr
         return Ok(base);
     }
 
-    let mut merged = serde_json::to_value(&base).expect("serialize base config");
+    let mut merged = serde_json::to_value(&base).context("failed to serialize base config")?;
     for path in layers {
         let layer_value = load_config_layer(path)?;
         info!(
@@ -918,8 +921,17 @@ fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<Scr
         merge_layer(&mut merged, layer_value);
     }
 
-    serde_json::from_value(merged)
-        .map_err(|err| anyhow::anyhow!("failed to deserialize merged configuration: {err}"))
+    let json = serde_json::to_string(&merged).context("failed to encode merged configuration")?;
+    let mut deserializer = serde_json::Deserializer::from_str(&json);
+    serde_path_to_error::deserialize::<_, ScriptBotsConfig>(&mut deserializer).map_err(
+        |error: serde_path_to_error::Error<serde_json::Error>| {
+            anyhow::anyhow!(
+                "failed to deserialize merged configuration at {}: {}",
+                error.path(),
+                error.inner()
+            )
+        },
+    )
 }
 
 fn load_config_layer(path: &Path) -> Result<JsonValue> {
@@ -2305,6 +2317,41 @@ activation = "Sigmoid"
         assert_eq!(
             layered.neuroflow.activation,
             NeuroflowActivationKind::Sigmoid
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cli_config_layer_rejects_invalid_finite_float_with_field_path() {
+        let dir = tempdir().expect("tempdir");
+        let layer = dir.path().join("invalid.toml");
+        fs::write(&layer, "food_growth_rate = -1.0\n").expect("write config layer");
+        let mut cli = default_cli();
+        cli.config_layers.push(layer);
+        cli.config_only = true;
+
+        let error = compose_config(&cli).expect_err("invalid config-only input must fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("food_growth_rate"),
+            "CLI error did not identify field: {rendered}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cli_config_layer_rejects_float_outside_f32_domain_with_field_path() {
+        let dir = tempdir().expect("tempdir");
+        let layer = dir.path().join("unrepresentable.toml");
+        fs::write(&layer, "food_growth_rate = 1e40\n").expect("write config layer");
+        let mut cli = default_cli();
+        cli.config_layers.push(layer);
+
+        let error = compose_config(&cli).expect_err("unrepresentable f32 input must fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("food_growth_rate"),
+            "CLI deserialization error did not identify field: {rendered}"
         );
     }
 

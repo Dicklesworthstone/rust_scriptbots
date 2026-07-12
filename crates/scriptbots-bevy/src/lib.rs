@@ -4226,11 +4226,13 @@ fn spawn_simulation_driver(
                         state.auto_pause_reason = Some(reason.clone());
                         state.step_requested = false;
                     });
-                    world_guard.enqueue_simulation_command(SimulationCommand {
+                    if let Err(error) = world_guard.enqueue_simulation_command(SimulationCommand {
                         paused: Some(true),
                         speed_multiplier: Some(0.0),
                         step_once: false,
-                    });
+                    }) {
+                        warn!(%error, "failed to queue Bevy auto-pause command");
+                    }
                     if persistence_failed {
                         warn!(%reason, "Bevy simulation paused after persistence failure");
                     } else {

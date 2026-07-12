@@ -216,21 +216,44 @@ pub struct SimulationCommand {
     pub step_once: bool,
 }
 
+impl SimulationCommand {
+    /// Validate values supplied by renderer and control front-ends before queue admission.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        if let Some(speed) = self.speed_multiplier
+            && !speed.is_finite()
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "speed_multiplier must be finite",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ControlCommand {
+    /// Validate state-changing input without mutating the world or admitting queue work.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        match self {
+            Self::UpdateConfig(config) => config.validate(),
+            Self::UpdateSelection(_) => Ok(()),
+            Self::UpdateSimulation(command) => command.validate(),
+        }
+    }
+}
+
 /// Apply a control command to the world state.
 pub fn apply_control_command(
     world: &mut WorldState,
     command: ControlCommand,
 ) -> Result<(), WorldStateError> {
+    command.validate()?;
     match command {
         ControlCommand::UpdateConfig(config) => world.apply_config_update(*config),
         ControlCommand::UpdateSelection(update) => {
             world.apply_selection_update(update);
             Ok(())
         }
-        ControlCommand::UpdateSimulation(update) => {
-            world.enqueue_simulation_command(update);
-            Ok(())
-        }
+        ControlCommand::UpdateSimulation(update) => world.enqueue_simulation_command(update),
     }
 }
 
@@ -2693,234 +2716,597 @@ pub enum NeuroflowActivationKind {
     Relu,
 }
 impl ScriptBotsConfig {
-    /// Validates the configuration, returning derived grid dimensions.
+    /// Validate every public configuration invariant without mutating runtime state.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        macro_rules! reject_unless {
+            ($condition:expr, $message:expr) => {
+                if $condition {
+                } else {
+                    return Err(WorldStateError::InvalidConfig($message));
+                }
+            };
+        }
+
+        reject_unless!(self.world_width != 0, "world_width must be non-zero");
+        reject_unless!(self.world_height != 0, "world_height must be non-zero");
+        reject_unless!(self.food_cell_size != 0, "food_cell_size must be non-zero");
+        reject_unless!(
+            self.world_width.is_multiple_of(self.food_cell_size),
+            "world_width must be divisible by food_cell_size"
+        );
+        reject_unless!(
+            self.world_height.is_multiple_of(self.food_cell_size),
+            "world_height must be divisible by food_cell_size"
+        );
+
+        let finite_fields: [(f32, &'static str); 70] = [
+            (self.initial_food, "initial_food must be finite"),
+            (
+                self.food_respawn_amount,
+                "food_respawn_amount must be finite",
+            ),
+            (self.food_max, "food_max must be finite"),
+            (self.food_growth_rate, "food_growth_rate must be finite"),
+            (self.food_decay_rate, "food_decay_rate must be finite"),
+            (
+                self.food_diffusion_rate,
+                "food_diffusion_rate must be finite",
+            ),
+            (self.sense_radius, "sense_radius must be finite"),
+            (
+                self.sense_max_neighbors,
+                "sense_max_neighbors must be finite",
+            ),
+            (self.bot_speed, "bot_speed must be finite"),
+            (self.bot_radius, "bot_radius must be finite"),
+            (self.boost_multiplier, "boost_multiplier must be finite"),
+            (self.spike_growth_rate, "spike_growth_rate must be finite"),
+            (self.metabolism_drain, "metabolism_drain must be finite"),
+            (self.movement_drain, "movement_drain must be finite"),
+            (
+                self.metabolism_ramp_floor,
+                "metabolism_ramp_floor must be finite",
+            ),
+            (
+                self.metabolism_ramp_rate,
+                "metabolism_ramp_rate must be finite",
+            ),
+            (
+                self.metabolism_boost_penalty,
+                "metabolism_boost_penalty must be finite",
+            ),
+            (
+                self.temperature_discomfort_rate,
+                "temperature_discomfort_rate must be finite",
+            ),
+            (
+                self.temperature_comfort_band,
+                "temperature_comfort_band must be finite",
+            ),
+            (
+                self.temperature_gradient_exponent,
+                "temperature_gradient_exponent must be finite",
+            ),
+            (
+                self.temperature_discomfort_exponent,
+                "temperature_discomfort_exponent must be finite",
+            ),
+            (self.food_intake_rate, "food_intake_rate must be finite"),
+            (self.food_waste_rate, "food_waste_rate must be finite"),
+            (
+                self.food_fertility_base,
+                "food_fertility_base must be finite",
+            ),
+            (
+                self.food_moisture_weight,
+                "food_moisture_weight must be finite",
+            ),
+            (
+                self.food_elevation_weight,
+                "food_elevation_weight must be finite",
+            ),
+            (self.food_slope_weight, "food_slope_weight must be finite"),
+            (self.food_capacity_base, "food_capacity_base must be finite"),
+            (
+                self.food_capacity_fertility,
+                "food_capacity_fertility must be finite",
+            ),
+            (
+                self.food_growth_fertility,
+                "food_growth_fertility must be finite",
+            ),
+            (
+                self.food_decay_infertility,
+                "food_decay_infertility must be finite",
+            ),
+            (
+                self.food_sharing_radius,
+                "food_sharing_radius must be finite",
+            ),
+            (self.food_sharing_rate, "food_sharing_rate must be finite"),
+            (self.food_transfer_rate, "food_transfer_rate must be finite"),
+            (
+                self.food_sharing_distance,
+                "food_sharing_distance must be finite",
+            ),
+            (
+                self.reproduction_energy_threshold,
+                "reproduction_energy_threshold must be finite",
+            ),
+            (
+                self.reproduction_energy_cost,
+                "reproduction_energy_cost must be finite",
+            ),
+            (
+                self.reproduction_attempt_chance,
+                "reproduction_attempt_chance must be finite",
+            ),
+            (
+                self.reproduction_rate_herbivore,
+                "reproduction_rate_herbivore must be finite",
+            ),
+            (
+                self.reproduction_rate_carnivore,
+                "reproduction_rate_carnivore must be finite",
+            ),
+            (
+                self.reproduction_food_bonus,
+                "reproduction_food_bonus must be finite",
+            ),
+            (
+                self.reproduction_fertility_bonus,
+                "reproduction_fertility_bonus must be finite",
+            ),
+            (
+                self.reproduction_child_energy,
+                "reproduction_child_energy must be finite",
+            ),
+            (
+                self.reproduction_spawn_jitter,
+                "reproduction_spawn_jitter must be finite",
+            ),
+            (
+                self.reproduction_color_jitter,
+                "reproduction_color_jitter must be finite",
+            ),
+            (
+                self.reproduction_mutation_scale,
+                "reproduction_mutation_scale must be finite",
+            ),
+            (
+                self.reproduction_partner_chance,
+                "reproduction_partner_chance must be finite",
+            ),
+            (
+                self.reproduction_spawn_back_distance,
+                "reproduction_spawn_back_distance must be finite",
+            ),
+            (
+                self.reproduction_meta_mutation_chance,
+                "reproduction_meta_mutation_chance must be finite",
+            ),
+            (
+                self.reproduction_meta_mutation_scale,
+                "reproduction_meta_mutation_scale must be finite",
+            ),
+            (
+                self.aging_health_decay_rate,
+                "aging_health_decay_rate must be finite",
+            ),
+            (
+                self.aging_health_decay_max,
+                "aging_health_decay_max must be finite",
+            ),
+            (
+                self.aging_energy_penalty_rate,
+                "aging_energy_penalty_rate must be finite",
+            ),
+            (
+                self.carcass_distribution_radius,
+                "carcass_distribution_radius must be finite",
+            ),
+            (
+                self.carcass_health_reward,
+                "carcass_health_reward must be finite",
+            ),
+            (
+                self.carcass_reproduction_reward,
+                "carcass_reproduction_reward must be finite",
+            ),
+            (
+                self.carcass_neighbor_exponent,
+                "carcass_neighbor_exponent must be finite",
+            ),
+            (
+                self.carcass_energy_share_rate,
+                "carcass_energy_share_rate must be finite",
+            ),
+            (
+                self.carcass_indicator_scale,
+                "carcass_indicator_scale must be finite",
+            ),
+            (
+                self.topography_speed_gain,
+                "topography_speed_gain must be finite",
+            ),
+            (
+                self.topography_energy_penalty,
+                "topography_energy_penalty must be finite",
+            ),
+            (
+                self.population_crossover_chance,
+                "population_crossover_chance must be finite",
+            ),
+            (self.spike_radius, "spike_radius must be finite"),
+            (self.spike_damage, "spike_damage must be finite"),
+            (self.spike_energy_cost, "spike_energy_cost must be finite"),
+            (self.spike_min_length, "spike_min_length must be finite"),
+            (
+                self.spike_alignment_cosine,
+                "spike_alignment_cosine must be finite",
+            ),
+            (
+                self.spike_speed_damage_bonus,
+                "spike_speed_damage_bonus must be finite",
+            ),
+            (
+                self.spike_length_damage_bonus,
+                "spike_length_damage_bonus must be finite",
+            ),
+            (
+                self.carnivore_threshold,
+                "carnivore_threshold must be finite",
+            ),
+        ];
+        for (value, message) in finite_fields {
+            reject_unless!(value.is_finite(), message);
+        }
+
+        if let Some(value) = self.render.tonemap_exposure_bias {
+            reject_unless!(
+                value.is_finite(),
+                "render.tonemap_exposure_bias must be finite"
+            );
+        }
+        if let Some(auto_exposure) = &self.render.auto_exposure {
+            if let Some(value) = auto_exposure.speed_brighten {
+                reject_unless!(
+                    value.is_finite(),
+                    "render.auto_exposure.speed_brighten must be finite"
+                );
+                reject_unless!(
+                    value >= 0.0,
+                    "render.auto_exposure.speed_brighten must be non-negative"
+                );
+            }
+            if let Some(value) = auto_exposure.speed_darken {
+                reject_unless!(
+                    value.is_finite(),
+                    "render.auto_exposure.speed_darken must be finite"
+                );
+                reject_unless!(
+                    value >= 0.0,
+                    "render.auto_exposure.speed_darken must be non-negative"
+                );
+            }
+        }
+
+        reject_unless!(
+            self.initial_food >= 0.0,
+            "initial_food must be non-negative"
+        );
+        reject_unless!(self.food_max > 0.0, "food_max must be positive");
+        reject_unless!(
+            self.food_respawn_amount >= 0.0,
+            "food_respawn_amount must be non-negative"
+        );
+        reject_unless!(
+            self.initial_food <= self.food_max,
+            "initial_food cannot exceed food_max"
+        );
+        reject_unless!(
+            self.food_respawn_amount <= self.food_max,
+            "food_respawn_amount cannot exceed food_max"
+        );
+        reject_unless!(
+            self.food_growth_rate >= 0.0,
+            "food_growth_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_decay_rate >= 0.0,
+            "food_decay_rate must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=0.25).contains(&self.food_diffusion_rate),
+            "food_diffusion_rate must be within [0, 0.25]"
+        );
+        reject_unless!(self.sense_radius > 0.0, "sense_radius must be positive");
+        reject_unless!(
+            self.sense_max_neighbors > 0.0,
+            "sense_max_neighbors must be positive"
+        );
+        reject_unless!(self.bot_speed >= 0.0, "bot_speed must be non-negative");
+        reject_unless!(self.bot_radius > 0.0, "bot_radius must be positive");
+        reject_unless!(
+            self.boost_multiplier >= 1.0,
+            "boost_multiplier must be at least 1.0"
+        );
+        reject_unless!(
+            self.spike_growth_rate >= 0.0,
+            "spike_growth_rate must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_drain >= 0.0,
+            "metabolism_drain must be non-negative"
+        );
+        reject_unless!(
+            self.movement_drain >= 0.0,
+            "movement_drain must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_ramp_floor >= 0.0,
+            "metabolism_ramp_floor must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_ramp_rate >= 0.0,
+            "metabolism_ramp_rate must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_boost_penalty >= 0.0,
+            "metabolism_boost_penalty must be non-negative"
+        );
+        reject_unless!(
+            self.temperature_discomfort_rate >= 0.0,
+            "temperature_discomfort_rate must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.temperature_comfort_band),
+            "temperature_comfort_band must be within [0, 1]"
+        );
+        reject_unless!(
+            self.temperature_gradient_exponent > 0.0,
+            "temperature_gradient_exponent must be positive"
+        );
+        reject_unless!(
+            self.temperature_discomfort_exponent > 0.0,
+            "temperature_discomfort_exponent must be positive"
+        );
+        reject_unless!(
+            self.food_intake_rate >= 0.0,
+            "food_intake_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_waste_rate >= 0.0,
+            "food_waste_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_waste_rate <= self.food_max,
+            "food_waste_rate cannot exceed food_max"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.food_fertility_base),
+            "food_fertility_base must be within [0, 1]"
+        );
+        reject_unless!(
+            self.food_moisture_weight >= 0.0,
+            "food_moisture_weight must be non-negative"
+        );
+        reject_unless!(
+            self.food_elevation_weight >= 0.0,
+            "food_elevation_weight must be non-negative"
+        );
+        reject_unless!(
+            self.food_slope_weight >= 0.0,
+            "food_slope_weight must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.food_capacity_base),
+            "food_capacity_base must be within [0, 1]"
+        );
+        reject_unless!(
+            self.food_capacity_fertility >= 0.0,
+            "food_capacity_fertility must be non-negative"
+        );
+        reject_unless!(
+            self.food_growth_fertility >= 0.0,
+            "food_growth_fertility must be non-negative"
+        );
+        reject_unless!(
+            self.food_decay_infertility >= 0.0,
+            "food_decay_infertility must be non-negative"
+        );
+        reject_unless!(
+            self.food_capacity_base + self.food_capacity_fertility <= 1.0,
+            "food_capacity_base + food_capacity_fertility must be <= 1.0"
+        );
+        reject_unless!(
+            self.food_sharing_radius > 0.0,
+            "food_sharing_radius must be positive"
+        );
+        reject_unless!(
+            self.food_sharing_rate >= 0.0,
+            "food_sharing_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_transfer_rate >= 0.0,
+            "food_transfer_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_sharing_distance > 0.0,
+            "food_sharing_distance must be positive"
+        );
+        reject_unless!(
+            self.reproduction_energy_threshold >= 0.0,
+            "reproduction_energy_threshold must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_energy_cost >= 0.0,
+            "reproduction_energy_cost must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_energy_cost <= self.reproduction_energy_threshold,
+            "reproduction_energy_cost cannot exceed reproduction_energy_threshold"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.reproduction_attempt_chance),
+            "reproduction_attempt_chance must be within [0, 1]"
+        );
+        reject_unless!(
+            self.reproduction_rate_herbivore > 0.0,
+            "reproduction_rate_herbivore must be positive"
+        );
+        reject_unless!(
+            self.reproduction_rate_carnivore > 0.0,
+            "reproduction_rate_carnivore must be positive"
+        );
+        reject_unless!(
+            self.reproduction_food_bonus >= 0.0,
+            "reproduction_food_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_fertility_bonus >= 0.0,
+            "reproduction_fertility_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_child_energy >= 0.0,
+            "reproduction_child_energy must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_spawn_jitter >= 0.0,
+            "reproduction_spawn_jitter must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_color_jitter >= 0.0,
+            "reproduction_color_jitter must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_mutation_scale >= 0.0,
+            "reproduction_mutation_scale must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.reproduction_partner_chance),
+            "reproduction_partner_chance must be within [0, 1]"
+        );
+        reject_unless!(
+            self.reproduction_spawn_back_distance >= 0.0,
+            "reproduction_spawn_back_distance must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.reproduction_meta_mutation_chance),
+            "reproduction_meta_mutation_chance must be within [0, 1]"
+        );
+        reject_unless!(
+            self.reproduction_meta_mutation_scale >= 0.0,
+            "reproduction_meta_mutation_scale must be non-negative"
+        );
+        reject_unless!(
+            self.aging_tick_interval != 0,
+            "aging_tick_interval must be at least 1"
+        );
+        reject_unless!(
+            self.aging_health_decay_rate >= 0.0,
+            "aging_health_decay_rate must be non-negative"
+        );
+        reject_unless!(
+            self.aging_health_decay_max >= 0.0,
+            "aging_health_decay_max must be non-negative"
+        );
+        reject_unless!(
+            self.aging_health_decay_rate == 0.0
+                || self.aging_health_decay_max >= self.aging_health_decay_rate,
+            "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled"
+        );
+        reject_unless!(
+            self.aging_energy_penalty_rate >= 0.0,
+            "aging_energy_penalty_rate must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_distribution_radius >= 0.0,
+            "carcass_distribution_radius must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_health_reward >= 0.0,
+            "carcass_health_reward must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_reproduction_reward >= 0.0,
+            "carcass_reproduction_reward must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_neighbor_exponent > 0.0,
+            "carcass_neighbor_exponent must be positive"
+        );
+        reject_unless!(
+            self.carcass_maturity_age != 0,
+            "carcass_maturity_age must be at least 1"
+        );
+        reject_unless!(
+            self.carcass_energy_share_rate >= 0.0,
+            "carcass_energy_share_rate must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_indicator_scale >= 0.0,
+            "carcass_indicator_scale must be non-negative"
+        );
+        reject_unless!(
+            self.topography_speed_gain >= 0.0,
+            "topography_speed_gain must be non-negative"
+        );
+        reject_unless!(
+            self.topography_energy_penalty >= 0.0,
+            "topography_energy_penalty must be non-negative"
+        );
+        reject_unless!(
+            self.population_spawn_count != 0,
+            "population_spawn_count must be at least 1"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.population_crossover_chance),
+            "population_crossover_chance must be within [0, 1]"
+        );
+        reject_unless!(self.spike_radius > 0.0, "spike_radius must be positive");
+        reject_unless!(
+            self.spike_damage >= 0.0,
+            "spike_damage must be non-negative"
+        );
+        reject_unless!(
+            self.spike_energy_cost >= 0.0,
+            "spike_energy_cost must be non-negative"
+        );
+        reject_unless!(
+            self.spike_min_length >= 0.0,
+            "spike_min_length must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.spike_alignment_cosine) && self.spike_alignment_cosine > 0.0,
+            "spike_alignment_cosine must be within (0, 1]"
+        );
+        reject_unless!(
+            self.spike_speed_damage_bonus >= 0.0,
+            "spike_speed_damage_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.spike_length_damage_bonus >= 0.0,
+            "spike_length_damage_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.carnivore_threshold > 0.0 && self.carnivore_threshold < 1.0,
+            "carnivore_threshold must be within (0, 1)"
+        );
+        reject_unless!(
+            self.history_capacity != 0,
+            "history_capacity must be at least 1"
+        );
+        Ok(())
+    }
+
+    /// Validate the configuration and return its derived food-grid dimensions.
     pub fn food_dimensions(&self) -> Result<(u32, u32), WorldStateError> {
-        if self.world_width == 0 || self.world_height == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "world dimensions must be non-zero",
-            ));
-        }
-        if self.food_cell_size == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_cell_size must be non-zero",
-            ));
-        }
-        if !self.world_width.is_multiple_of(self.food_cell_size)
-            || !self.world_height.is_multiple_of(self.food_cell_size)
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "world dimensions must be divisible by food_cell_size",
-            ));
-        }
-        let dims = (
+        self.validate()?;
+        Ok((
             self.world_width / self.food_cell_size,
             self.world_height / self.food_cell_size,
-        );
-        if self.initial_food < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "initial_food must be non-negative",
-            ));
-        }
-        if self.food_max <= 0.0 {
-            return Err(WorldStateError::InvalidConfig("food_max must be positive"));
-        }
-        if self.food_respawn_amount < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_respawn_amount must be non-negative",
-            ));
-        }
-        if self.initial_food > self.food_max {
-            return Err(WorldStateError::InvalidConfig(
-                "initial_food cannot exceed food_max",
-            ));
-        }
-        if self.food_respawn_amount > self.food_max {
-            return Err(WorldStateError::InvalidConfig(
-                "food_respawn_amount cannot exceed food_max",
-            ));
-        }
-        if self.food_waste_rate < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_waste_rate must be non-negative",
-            ));
-        }
-        if self.food_waste_rate > self.food_max {
-            return Err(WorldStateError::InvalidConfig(
-                "food_waste_rate cannot exceed food_max",
-            ));
-        }
-        if self.food_growth_rate < 0.0
-            || self.food_decay_rate < 0.0
-            || self.food_diffusion_rate < 0.0
-            || self.food_diffusion_rate > 0.25
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "food growth/decay must be non-negative and diffusion in [0, 0.25]",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.reproduction_partner_chance) {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_partner_chance must be within [0, 1]",
-            ));
-        }
-        if self.reproduction_spawn_back_distance < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_spawn_back_distance must be non-negative",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.reproduction_meta_mutation_chance) {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_meta_mutation_chance must be within [0, 1]",
-            ));
-        }
-        if self.reproduction_meta_mutation_scale < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_meta_mutation_scale must be non-negative",
-            ));
-        }
-        if self.metabolism_drain < 0.0
-            || self.movement_drain < 0.0
-            || self.metabolism_ramp_floor < 0.0
-            || self.metabolism_ramp_rate < 0.0
-            || self.metabolism_boost_penalty < 0.0
-            || self.food_intake_rate < 0.0
-            || self.food_waste_rate < 0.0
-            || self.food_fertility_base < 0.0
-            || self.food_fertility_base > 1.0
-            || self.food_moisture_weight < 0.0
-            || self.food_elevation_weight < 0.0
-            || self.food_slope_weight < 0.0
-            || self.food_capacity_base < 0.0
-            || self.food_capacity_base > 1.0
-            || self.food_capacity_fertility < 0.0
-            || self.food_growth_fertility < 0.0
-            || self.food_decay_infertility < 0.0
-            || self.reproduction_food_bonus < 0.0
-            || self.reproduction_fertility_bonus < 0.0
-            || self.food_sharing_radius <= 0.0
-            || self.food_sharing_rate < 0.0
-            || self.food_transfer_rate < 0.0
-            || self.food_sharing_distance <= 0.0
-            || self.reproduction_energy_threshold < 0.0
-            || self.reproduction_energy_cost < 0.0
-            || self.reproduction_child_energy < 0.0
-            || self.reproduction_spawn_jitter < 0.0
-            || self.reproduction_color_jitter < 0.0
-            || self.reproduction_mutation_scale < 0.0
-            || !(0.0..=1.0).contains(&self.reproduction_attempt_chance)
-            || self.reproduction_rate_herbivore <= 0.0
-            || self.reproduction_rate_carnivore <= 0.0
-            || self.spike_radius <= 0.0
-            || self.spike_damage < 0.0
-            || self.spike_energy_cost < 0.0
-            || self.spike_min_length < 0.0
-            || self.spike_alignment_cosine <= 0.0
-            || self.spike_alignment_cosine > 1.0
-            || self.spike_speed_damage_bonus < 0.0
-            || self.spike_length_damage_bonus < 0.0
-            || self.carnivore_threshold <= 0.0
-            || self.carnivore_threshold >= 1.0
-            || self.history_capacity == 0
-            || self.temperature_discomfort_rate < 0.0
-            || self.aging_tick_interval == 0
-            || self.aging_health_decay_rate < 0.0
-            || self.aging_health_decay_max < 0.0
-            || self.aging_energy_penalty_rate < 0.0
-            || self.carcass_distribution_radius < 0.0
-            || self.carcass_health_reward < 0.0
-            || self.carcass_reproduction_reward < 0.0
-            || self.carcass_energy_share_rate < 0.0
-            || self.carcass_indicator_scale < 0.0
-            || self.topography_speed_gain < 0.0
-            || self.topography_energy_penalty < 0.0
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "metabolism, reproduction, sharing, and history parameters must be non-negative; spike and diet thresholds must be within valid ranges",
-            ));
-        }
-        if self.food_capacity_base + self.food_capacity_fertility > 1.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_capacity_base + food_capacity_fertility must be <= 1.0",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.temperature_comfort_band) {
-            return Err(WorldStateError::InvalidConfig(
-                "temperature_comfort_band must be within [0, 1]",
-            ));
-        }
-        if self.temperature_gradient_exponent <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "temperature_gradient_exponent must be positive",
-            ));
-        }
-        if self.temperature_discomfort_exponent <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "temperature_discomfort_exponent must be positive",
-            ));
-        }
-        if self.aging_health_decay_rate > 0.0
-            && self.aging_health_decay_max < self.aging_health_decay_rate
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled",
-            ));
-        }
-        if self.carcass_neighbor_exponent <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "carcass_neighbor_exponent must be positive",
-            ));
-        }
-        if self.carcass_maturity_age == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "carcass_maturity_age must be at least 1",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.population_crossover_chance) {
-            return Err(WorldStateError::InvalidConfig(
-                "population_crossover_chance must be within [0, 1]",
-            ));
-        }
-        if self.population_spawn_count == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "population_spawn_count must be at least 1",
-            ));
-        }
-        if self.reproduction_energy_cost > self.reproduction_energy_threshold {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_energy_cost cannot exceed reproduction_energy_threshold",
-            ));
-        }
-        if self.sense_radius <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "sense_radius must be positive",
-            ));
-        }
-        if self.sense_max_neighbors <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "sense_max_neighbors must be positive",
-            ));
-        }
-        if self.bot_radius <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "bot_radius must be positive",
-            ));
-        }
-        if self.bot_speed < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "bot_speed must be non-negative",
-            ));
-        }
-        if self.boost_multiplier < 1.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "boost_multiplier must be at least 1.0",
-            ));
-        }
-        if self.spike_growth_rate < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "spike_growth_rate must be non-negative",
-            ));
-        }
-        Ok(dims)
+        ))
     }
 
     /// Returns the configured RNG seed, generating one from entropy if absent.
@@ -8747,15 +9133,16 @@ impl WorldState {
     }
 
     /// Queue a simulation control request for external renderers.
-    pub fn enqueue_simulation_command(&mut self, mut command: SimulationCommand) {
+    pub fn enqueue_simulation_command(
+        &mut self,
+        mut command: SimulationCommand,
+    ) -> Result<(), WorldStateError> {
+        command.validate()?;
         if let Some(speed) = command.speed_multiplier.as_mut() {
-            if speed.is_finite() {
-                *speed = speed.clamp(0.0, 32.0);
-            } else {
-                *speed = 1.0;
-            }
+            *speed = speed.clamp(0.0, 32.0);
         }
         self.simulation_commands.push(command);
+        Ok(())
     }
 
     /// Drain pending simulation control requests (clearing the queue).
@@ -8766,12 +9153,6 @@ impl WorldState {
         } else {
             std::mem::take(&mut self.simulation_commands)
         }
-    }
-
-    /// Mutable access to the configuration (for hot edits).
-    #[must_use]
-    pub fn config_mut(&mut self) -> &mut ScriptBotsConfig {
-        &mut self.config
     }
 
     /// Apply a new configuration, refreshing derived caches while preserving runtime state.
@@ -9331,6 +9712,34 @@ mod tests {
         }
     }
 
+    fn set_render_tonemap_exposure_bias(config: &mut ScriptBotsConfig, value: f32) {
+        config.render.tonemap_exposure_bias = Some(value);
+    }
+
+    fn set_render_auto_exposure_speed_brighten(config: &mut ScriptBotsConfig, value: f32) {
+        let settings = config
+            .render
+            .auto_exposure
+            .get_or_insert(RenderAutoExposureSettings {
+                enabled: true,
+                speed_brighten: None,
+                speed_darken: None,
+            });
+        settings.speed_brighten = Some(value);
+    }
+
+    fn set_render_auto_exposure_speed_darken(config: &mut ScriptBotsConfig, value: f32) {
+        let settings = config
+            .render
+            .auto_exposure
+            .get_or_insert(RenderAutoExposureSettings {
+                enabled: true,
+                speed_brighten: None,
+                speed_darken: None,
+            });
+        settings.speed_darken = Some(value);
+    }
+
     #[test]
     fn insert_allocates_unique_handles() {
         let mut arena = AgentArena::new();
@@ -9389,6 +9798,597 @@ mod tests {
     fn default_config_constructs_world() {
         let config = ScriptBotsConfig::default();
         WorldState::new(config).expect("default config should be valid");
+    }
+
+    #[test]
+    fn every_public_config_float_rejects_non_finite_values_with_its_field_path() {
+        fn collect_float_paths(
+            prefix: &str,
+            value: &serde_json::Value,
+            paths: &mut std::collections::BTreeSet<String>,
+        ) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        collect_float_paths(&path, child, paths);
+                    }
+                }
+                serde_json::Value::Number(number) if number.is_f64() => {
+                    paths.insert(prefix.to_owned());
+                }
+                _ => {}
+            }
+        }
+
+        type Setter = fn(&mut ScriptBotsConfig, f32);
+        let fields: [(&str, Setter); 73] = [
+            ("initial_food", |config, value| config.initial_food = value),
+            ("food_respawn_amount", |config, value| {
+                config.food_respawn_amount = value;
+            }),
+            ("food_max", |config, value| config.food_max = value),
+            ("food_growth_rate", |config, value| {
+                config.food_growth_rate = value;
+            }),
+            ("food_decay_rate", |config, value| {
+                config.food_decay_rate = value;
+            }),
+            ("food_diffusion_rate", |config, value| {
+                config.food_diffusion_rate = value;
+            }),
+            ("sense_radius", |config, value| config.sense_radius = value),
+            ("sense_max_neighbors", |config, value| {
+                config.sense_max_neighbors = value;
+            }),
+            ("bot_speed", |config, value| config.bot_speed = value),
+            ("bot_radius", |config, value| config.bot_radius = value),
+            ("boost_multiplier", |config, value| {
+                config.boost_multiplier = value;
+            }),
+            ("spike_growth_rate", |config, value| {
+                config.spike_growth_rate = value;
+            }),
+            ("metabolism_drain", |config, value| {
+                config.metabolism_drain = value;
+            }),
+            ("movement_drain", |config, value| {
+                config.movement_drain = value;
+            }),
+            ("metabolism_ramp_floor", |config, value| {
+                config.metabolism_ramp_floor = value;
+            }),
+            ("metabolism_ramp_rate", |config, value| {
+                config.metabolism_ramp_rate = value;
+            }),
+            ("metabolism_boost_penalty", |config, value| {
+                config.metabolism_boost_penalty = value;
+            }),
+            ("temperature_discomfort_rate", |config, value| {
+                config.temperature_discomfort_rate = value;
+            }),
+            ("temperature_comfort_band", |config, value| {
+                config.temperature_comfort_band = value;
+            }),
+            ("temperature_gradient_exponent", |config, value| {
+                config.temperature_gradient_exponent = value;
+            }),
+            ("temperature_discomfort_exponent", |config, value| {
+                config.temperature_discomfort_exponent = value;
+            }),
+            ("food_intake_rate", |config, value| {
+                config.food_intake_rate = value;
+            }),
+            ("food_waste_rate", |config, value| {
+                config.food_waste_rate = value;
+            }),
+            ("food_fertility_base", |config, value| {
+                config.food_fertility_base = value;
+            }),
+            ("food_moisture_weight", |config, value| {
+                config.food_moisture_weight = value;
+            }),
+            ("food_elevation_weight", |config, value| {
+                config.food_elevation_weight = value;
+            }),
+            ("food_slope_weight", |config, value| {
+                config.food_slope_weight = value;
+            }),
+            ("food_capacity_base", |config, value| {
+                config.food_capacity_base = value;
+            }),
+            ("food_capacity_fertility", |config, value| {
+                config.food_capacity_fertility = value;
+            }),
+            ("food_growth_fertility", |config, value| {
+                config.food_growth_fertility = value;
+            }),
+            ("food_decay_infertility", |config, value| {
+                config.food_decay_infertility = value;
+            }),
+            ("food_sharing_radius", |config, value| {
+                config.food_sharing_radius = value;
+            }),
+            ("food_sharing_rate", |config, value| {
+                config.food_sharing_rate = value;
+            }),
+            ("food_transfer_rate", |config, value| {
+                config.food_transfer_rate = value;
+            }),
+            ("food_sharing_distance", |config, value| {
+                config.food_sharing_distance = value;
+            }),
+            ("reproduction_energy_threshold", |config, value| {
+                config.reproduction_energy_threshold = value;
+            }),
+            ("reproduction_energy_cost", |config, value| {
+                config.reproduction_energy_cost = value;
+            }),
+            ("reproduction_attempt_chance", |config, value| {
+                config.reproduction_attempt_chance = value;
+            }),
+            ("reproduction_rate_herbivore", |config, value| {
+                config.reproduction_rate_herbivore = value;
+            }),
+            ("reproduction_rate_carnivore", |config, value| {
+                config.reproduction_rate_carnivore = value;
+            }),
+            ("reproduction_food_bonus", |config, value| {
+                config.reproduction_food_bonus = value;
+            }),
+            ("reproduction_fertility_bonus", |config, value| {
+                config.reproduction_fertility_bonus = value;
+            }),
+            ("reproduction_child_energy", |config, value| {
+                config.reproduction_child_energy = value;
+            }),
+            ("reproduction_spawn_jitter", |config, value| {
+                config.reproduction_spawn_jitter = value;
+            }),
+            ("reproduction_color_jitter", |config, value| {
+                config.reproduction_color_jitter = value;
+            }),
+            ("reproduction_mutation_scale", |config, value| {
+                config.reproduction_mutation_scale = value;
+            }),
+            ("reproduction_partner_chance", |config, value| {
+                config.reproduction_partner_chance = value;
+            }),
+            ("reproduction_spawn_back_distance", |config, value| {
+                config.reproduction_spawn_back_distance = value;
+            }),
+            ("reproduction_meta_mutation_chance", |config, value| {
+                config.reproduction_meta_mutation_chance = value;
+            }),
+            ("reproduction_meta_mutation_scale", |config, value| {
+                config.reproduction_meta_mutation_scale = value;
+            }),
+            ("aging_health_decay_rate", |config, value| {
+                config.aging_health_decay_rate = value;
+            }),
+            ("aging_health_decay_max", |config, value| {
+                config.aging_health_decay_max = value;
+            }),
+            ("aging_energy_penalty_rate", |config, value| {
+                config.aging_energy_penalty_rate = value;
+            }),
+            ("carcass_distribution_radius", |config, value| {
+                config.carcass_distribution_radius = value;
+            }),
+            ("carcass_health_reward", |config, value| {
+                config.carcass_health_reward = value;
+            }),
+            ("carcass_reproduction_reward", |config, value| {
+                config.carcass_reproduction_reward = value;
+            }),
+            ("carcass_neighbor_exponent", |config, value| {
+                config.carcass_neighbor_exponent = value;
+            }),
+            ("carcass_energy_share_rate", |config, value| {
+                config.carcass_energy_share_rate = value;
+            }),
+            ("carcass_indicator_scale", |config, value| {
+                config.carcass_indicator_scale = value;
+            }),
+            ("topography_speed_gain", |config, value| {
+                config.topography_speed_gain = value;
+            }),
+            ("topography_energy_penalty", |config, value| {
+                config.topography_energy_penalty = value;
+            }),
+            ("population_crossover_chance", |config, value| {
+                config.population_crossover_chance = value;
+            }),
+            ("spike_radius", |config, value| config.spike_radius = value),
+            ("spike_damage", |config, value| config.spike_damage = value),
+            ("spike_energy_cost", |config, value| {
+                config.spike_energy_cost = value;
+            }),
+            ("spike_min_length", |config, value| {
+                config.spike_min_length = value;
+            }),
+            ("spike_alignment_cosine", |config, value| {
+                config.spike_alignment_cosine = value;
+            }),
+            ("spike_speed_damage_bonus", |config, value| {
+                config.spike_speed_damage_bonus = value;
+            }),
+            ("spike_length_damage_bonus", |config, value| {
+                config.spike_length_damage_bonus = value;
+            }),
+            ("carnivore_threshold", |config, value| {
+                config.carnivore_threshold = value;
+            }),
+            (
+                "render.tonemap_exposure_bias",
+                set_render_tonemap_exposure_bias,
+            ),
+            (
+                "render.auto_exposure.speed_brighten",
+                set_render_auto_exposure_speed_brighten,
+            ),
+            (
+                "render.auto_exposure.speed_darken",
+                set_render_auto_exposure_speed_darken,
+            ),
+        ];
+
+        let expected_paths = fields
+            .iter()
+            .map(|(field, _)| (*field).to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            expected_paths.len(),
+            fields.len(),
+            "config float inventory contains a duplicate field path"
+        );
+        let mut schema_probe = ScriptBotsConfig::default();
+        for (_, setter) in fields {
+            setter(&mut schema_probe, 0.5);
+        }
+        let serialized = serde_json::to_value(schema_probe).expect("serialize schema probe");
+        let mut serialized_paths = std::collections::BTreeSet::new();
+        collect_float_paths("", &serialized, &mut serialized_paths);
+        assert_eq!(
+            serialized_paths, expected_paths,
+            "table must mechanically cover every serialized public config float exactly once"
+        );
+
+        for (field, setter) in fields {
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut config = ScriptBotsConfig::default();
+                setter(&mut config, value);
+                let WorldStateError::InvalidConfig(message) = config
+                    .validate()
+                    .expect_err("every non-finite public config float must be rejected");
+                assert!(
+                    message.starts_with(field),
+                    "{field}={value:?} produced unrelated validation error: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_bounded_public_config_float_rejects_a_finite_out_of_range_value() {
+        type Setter = fn(&mut ScriptBotsConfig, f32);
+        let fields: [(&str, f32, Setter); 72] = [
+            ("initial_food", -1.0, |config, value| {
+                config.initial_food = value
+            }),
+            ("food_respawn_amount", -1.0, |config, value| {
+                config.food_respawn_amount = value;
+            }),
+            ("food_max", 0.0, |config, value| config.food_max = value),
+            ("food_growth_rate", -1.0, |config, value| {
+                config.food_growth_rate = value;
+            }),
+            ("food_decay_rate", -1.0, |config, value| {
+                config.food_decay_rate = value;
+            }),
+            ("food_diffusion_rate", 0.26, |config, value| {
+                config.food_diffusion_rate = value;
+            }),
+            ("sense_radius", 0.0, |config, value| {
+                config.sense_radius = value
+            }),
+            ("sense_max_neighbors", 0.0, |config, value| {
+                config.sense_max_neighbors = value;
+            }),
+            ("bot_speed", -1.0, |config, value| config.bot_speed = value),
+            ("bot_radius", 0.0, |config, value| config.bot_radius = value),
+            ("boost_multiplier", 0.99, |config, value| {
+                config.boost_multiplier = value;
+            }),
+            ("spike_growth_rate", -1.0, |config, value| {
+                config.spike_growth_rate = value;
+            }),
+            ("metabolism_drain", -1.0, |config, value| {
+                config.metabolism_drain = value;
+            }),
+            ("movement_drain", -1.0, |config, value| {
+                config.movement_drain = value;
+            }),
+            ("metabolism_ramp_floor", -1.0, |config, value| {
+                config.metabolism_ramp_floor = value;
+            }),
+            ("metabolism_ramp_rate", -1.0, |config, value| {
+                config.metabolism_ramp_rate = value;
+            }),
+            ("metabolism_boost_penalty", -1.0, |config, value| {
+                config.metabolism_boost_penalty = value;
+            }),
+            ("temperature_discomfort_rate", -1.0, |config, value| {
+                config.temperature_discomfort_rate = value;
+            }),
+            ("temperature_comfort_band", -0.1, |config, value| {
+                config.temperature_comfort_band = value;
+            }),
+            ("temperature_gradient_exponent", 0.0, |config, value| {
+                config.temperature_gradient_exponent = value;
+            }),
+            ("temperature_discomfort_exponent", 0.0, |config, value| {
+                config.temperature_discomfort_exponent = value;
+            }),
+            ("food_intake_rate", -1.0, |config, value| {
+                config.food_intake_rate = value;
+            }),
+            ("food_waste_rate", -1.0, |config, value| {
+                config.food_waste_rate = value;
+            }),
+            ("food_fertility_base", -0.1, |config, value| {
+                config.food_fertility_base = value;
+            }),
+            ("food_moisture_weight", -1.0, |config, value| {
+                config.food_moisture_weight = value;
+            }),
+            ("food_elevation_weight", -1.0, |config, value| {
+                config.food_elevation_weight = value;
+            }),
+            ("food_slope_weight", -1.0, |config, value| {
+                config.food_slope_weight = value;
+            }),
+            ("food_capacity_base", -0.1, |config, value| {
+                config.food_capacity_base = value;
+            }),
+            ("food_capacity_fertility", -0.1, |config, value| {
+                config.food_capacity_fertility = value;
+            }),
+            ("food_growth_fertility", -1.0, |config, value| {
+                config.food_growth_fertility = value;
+            }),
+            ("food_decay_infertility", -1.0, |config, value| {
+                config.food_decay_infertility = value;
+            }),
+            ("food_sharing_radius", 0.0, |config, value| {
+                config.food_sharing_radius = value;
+            }),
+            ("food_sharing_rate", -1.0, |config, value| {
+                config.food_sharing_rate = value;
+            }),
+            ("food_transfer_rate", -1.0, |config, value| {
+                config.food_transfer_rate = value;
+            }),
+            ("food_sharing_distance", 0.0, |config, value| {
+                config.food_sharing_distance = value;
+            }),
+            ("reproduction_energy_threshold", -1.0, |config, value| {
+                config.reproduction_energy_threshold = value;
+            }),
+            ("reproduction_energy_cost", -1.0, |config, value| {
+                config.reproduction_energy_cost = value;
+            }),
+            ("reproduction_attempt_chance", -0.1, |config, value| {
+                config.reproduction_attempt_chance = value;
+            }),
+            ("reproduction_rate_herbivore", 0.0, |config, value| {
+                config.reproduction_rate_herbivore = value;
+            }),
+            ("reproduction_rate_carnivore", 0.0, |config, value| {
+                config.reproduction_rate_carnivore = value;
+            }),
+            ("reproduction_food_bonus", -1.0, |config, value| {
+                config.reproduction_food_bonus = value;
+            }),
+            ("reproduction_fertility_bonus", -1.0, |config, value| {
+                config.reproduction_fertility_bonus = value;
+            }),
+            ("reproduction_child_energy", -1.0, |config, value| {
+                config.reproduction_child_energy = value;
+            }),
+            ("reproduction_spawn_jitter", -1.0, |config, value| {
+                config.reproduction_spawn_jitter = value;
+            }),
+            ("reproduction_color_jitter", -1.0, |config, value| {
+                config.reproduction_color_jitter = value;
+            }),
+            ("reproduction_mutation_scale", -1.0, |config, value| {
+                config.reproduction_mutation_scale = value;
+            }),
+            ("reproduction_partner_chance", -0.1, |config, value| {
+                config.reproduction_partner_chance = value;
+            }),
+            ("reproduction_spawn_back_distance", -1.0, |config, value| {
+                config.reproduction_spawn_back_distance = value;
+            }),
+            (
+                "reproduction_meta_mutation_chance",
+                -0.1,
+                |config, value| {
+                    config.reproduction_meta_mutation_chance = value;
+                },
+            ),
+            ("reproduction_meta_mutation_scale", -1.0, |config, value| {
+                config.reproduction_meta_mutation_scale = value;
+            }),
+            ("aging_health_decay_rate", -1.0, |config, value| {
+                config.aging_health_decay_rate = value;
+            }),
+            ("aging_health_decay_max", -1.0, |config, value| {
+                config.aging_health_decay_max = value;
+            }),
+            ("aging_energy_penalty_rate", -1.0, |config, value| {
+                config.aging_energy_penalty_rate = value;
+            }),
+            ("carcass_distribution_radius", -1.0, |config, value| {
+                config.carcass_distribution_radius = value;
+            }),
+            ("carcass_health_reward", -1.0, |config, value| {
+                config.carcass_health_reward = value;
+            }),
+            ("carcass_reproduction_reward", -1.0, |config, value| {
+                config.carcass_reproduction_reward = value;
+            }),
+            ("carcass_neighbor_exponent", 0.0, |config, value| {
+                config.carcass_neighbor_exponent = value;
+            }),
+            ("carcass_energy_share_rate", -1.0, |config, value| {
+                config.carcass_energy_share_rate = value;
+            }),
+            ("carcass_indicator_scale", -1.0, |config, value| {
+                config.carcass_indicator_scale = value;
+            }),
+            ("topography_speed_gain", -1.0, |config, value| {
+                config.topography_speed_gain = value;
+            }),
+            ("topography_energy_penalty", -1.0, |config, value| {
+                config.topography_energy_penalty = value;
+            }),
+            ("population_crossover_chance", -0.1, |config, value| {
+                config.population_crossover_chance = value;
+            }),
+            ("spike_radius", 0.0, |config, value| {
+                config.spike_radius = value
+            }),
+            ("spike_damage", -1.0, |config, value| {
+                config.spike_damage = value
+            }),
+            ("spike_energy_cost", -1.0, |config, value| {
+                config.spike_energy_cost = value;
+            }),
+            ("spike_min_length", -1.0, |config, value| {
+                config.spike_min_length = value;
+            }),
+            ("spike_alignment_cosine", 0.0, |config, value| {
+                config.spike_alignment_cosine = value;
+            }),
+            ("spike_speed_damage_bonus", -1.0, |config, value| {
+                config.spike_speed_damage_bonus = value;
+            }),
+            ("spike_length_damage_bonus", -1.0, |config, value| {
+                config.spike_length_damage_bonus = value;
+            }),
+            ("carnivore_threshold", 0.0, |config, value| {
+                config.carnivore_threshold = value;
+            }),
+            (
+                "render.auto_exposure.speed_brighten",
+                -1.0,
+                set_render_auto_exposure_speed_brighten,
+            ),
+            (
+                "render.auto_exposure.speed_darken",
+                -1.0,
+                set_render_auto_exposure_speed_darken,
+            ),
+        ];
+
+        for (field, value, setter) in fields {
+            let mut config = ScriptBotsConfig::default();
+            setter(&mut config, value);
+            let result = config.validate();
+            assert!(
+                result.is_err(),
+                "{field} accepted invalid finite value {value:?}"
+            );
+            let Err(WorldStateError::InvalidConfig(message)) = result else {
+                continue;
+            };
+            assert!(
+                message.starts_with(field),
+                "{field}={value:?} produced unrelated validation error: {message}"
+            );
+        }
+
+        let mut config = ScriptBotsConfig::default();
+        config.render.tonemap_exposure_bias = Some(f32::MAX);
+        config
+            .validate()
+            .expect("tonemap exposure bias accepts every finite f32");
+    }
+
+    #[test]
+    fn finite_boundaries_and_coupled_constraints_preserve_existing_behavior() {
+        let mut config = ScriptBotsConfig {
+            initial_food: 0.0,
+            food_respawn_amount: 0.0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.25,
+            bot_speed: 0.0,
+            boost_multiplier: 1.0,
+            temperature_comfort_band: 1.0,
+            food_capacity_base: 0.4,
+            food_capacity_fertility: 0.6,
+            reproduction_energy_threshold: 0.65,
+            reproduction_energy_cost: 0.65,
+            reproduction_attempt_chance: 1.0,
+            reproduction_partner_chance: 0.0,
+            reproduction_meta_mutation_chance: 1.0,
+            aging_health_decay_rate: 0.01,
+            aging_health_decay_max: 0.01,
+            population_crossover_chance: 1.0,
+            spike_alignment_cosine: 1.0,
+            carnivore_threshold: f32::EPSILON,
+            ..ScriptBotsConfig::default()
+        };
+        set_render_auto_exposure_speed_brighten(&mut config, 0.0);
+        set_render_auto_exposure_speed_darken(&mut config, 0.0);
+        config
+            .validate()
+            .expect("documented inclusive boundaries must remain valid");
+
+        let capacity = ScriptBotsConfig {
+            food_capacity_base: 0.6,
+            food_capacity_fertility: 0.5,
+            ..ScriptBotsConfig::default()
+        };
+        let WorldStateError::InvalidConfig(message) = capacity
+            .validate()
+            .expect_err("capacity fractions above one must be rejected");
+        assert_eq!(
+            message,
+            "food_capacity_base + food_capacity_fertility must be <= 1.0"
+        );
+
+        let reproduction = ScriptBotsConfig {
+            reproduction_energy_cost: 0.66,
+            ..ScriptBotsConfig::default()
+        };
+        let WorldStateError::InvalidConfig(message) = reproduction
+            .validate()
+            .expect_err("reproduction cost above threshold must be rejected");
+        assert_eq!(
+            message,
+            "reproduction_energy_cost cannot exceed reproduction_energy_threshold"
+        );
+
+        let aging = ScriptBotsConfig {
+            aging_health_decay_rate: 0.02,
+            aging_health_decay_max: 0.01,
+            ..ScriptBotsConfig::default()
+        };
+        let WorldStateError::InvalidConfig(message) = aging
+            .validate()
+            .expect_err("enabled aging decay must fit within its cap");
+        assert_eq!(
+            message,
+            "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled"
+        );
     }
 
     #[test]
@@ -12033,11 +13033,13 @@ mod tests {
     #[test]
     fn characterization_v0_rejects_queued_control_work() {
         let (mut world, _) = characterization_world(7);
-        world.enqueue_simulation_command(SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: None,
-            step_once: false,
-        });
+        world
+            .enqueue_simulation_command(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: false,
+            })
+            .expect("valid simulation command");
         assert!(matches!(
             world.characterization_digest_v0(),
             Err(CharacterizationError::NonQuiescent {
@@ -12068,5 +13070,56 @@ mod tests {
         assert_eq!(pending[0].speed_multiplier, Some(0.0));
         assert!(!pending[0].step_once);
         assert!(world.drain_simulation_commands().is_empty());
+    }
+
+    #[test]
+    fn invalid_config_update_is_atomic() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let before_config = serde_json::to_value(world.config()).expect("serialize config");
+        let before_food = world.food().cells().to_vec();
+        let before_audit_len = world.config_audit().len();
+
+        let mut invalid = world.config().clone();
+        invalid.food_growth_rate = f32::NAN;
+        let WorldStateError::InvalidConfig(message) = world
+            .apply_config_update(invalid)
+            .expect_err("non-finite runtime update must be rejected");
+        assert_eq!(message, "food_growth_rate must be finite");
+        assert_eq!(
+            serde_json::to_value(world.config()).expect("serialize unchanged config"),
+            before_config
+        );
+        assert_eq!(world.food().cells(), before_food);
+        assert_eq!(world.config_audit().len(), before_audit_len);
+    }
+
+    #[test]
+    fn simulation_command_rejects_non_finite_speed_without_queueing() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let command = SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: Some(f32::NAN),
+            step_once: false,
+        };
+        let WorldStateError::InvalidConfig(message) = world
+            .enqueue_simulation_command(command)
+            .expect_err("non-finite speed must be rejected");
+        assert_eq!(message, "speed_multiplier must be finite");
+        assert!(world.drain_simulation_commands().is_empty());
+    }
+
+    #[test]
+    fn simulation_command_preserves_finite_clamp_semantics() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        world
+            .enqueue_simulation_command(SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(128.0),
+                step_once: false,
+            })
+            .expect("finite speed remains admissible");
+        let pending = world.drain_simulation_commands();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].speed_multiplier, Some(32.0));
     }
 }

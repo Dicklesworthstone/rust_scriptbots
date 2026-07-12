@@ -455,6 +455,9 @@ impl ControlHandle {
     }
 
     fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {
+        command
+            .validate()
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_msg)) => Err(ControlError::CommandQueueFull),
@@ -862,6 +865,115 @@ mod tests {
             }
             other => panic!("expected InvalidPatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_finite_knob_update_is_field_specific_and_not_admitted() {
+        let (handle, receiver) = handle();
+        let err = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_growth_rate".into(),
+                value: Value::String("NaN".into()),
+            }])
+            .expect_err("non-finite string coercion must fail");
+        assert!(
+            matches!(&err, ControlError::InvalidPatch(_)),
+            "expected InvalidPatch, got {err:?}"
+        );
+        let ControlError::InvalidPatch(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("food_growth_rate"),
+            "error did not identify field: {message}"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+        let value = handle
+            .snapshot()
+            .expect("snapshot")
+            .config
+            .get("food_growth_rate")
+            .and_then(Value::as_f64)
+            .expect("food_growth_rate");
+        assert!(
+            (value - f64::from(ScriptBotsConfig::default().food_growth_rate)).abs() < f64::EPSILON,
+            "rejected update changed food_growth_rate to {value}"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_nested_float_reports_exact_path_without_partial_admission() {
+        let (handle, receiver) = handle();
+        let err = handle
+            .apply_updates(&[
+                KnobUpdate {
+                    path: "food_max".into(),
+                    value: Value::from(0.6),
+                },
+                KnobUpdate {
+                    path: "render.auto_exposure.enabled".into(),
+                    value: Value::from(true),
+                },
+                KnobUpdate {
+                    path: "render.auto_exposure.speed_brighten".into(),
+                    value: Value::from(1.0e40_f64),
+                },
+            ])
+            .expect_err("f64 value outside the f32 domain must fail");
+        assert!(
+            matches!(&err, ControlError::InvalidPatch(_)),
+            "expected InvalidPatch, got {err:?}"
+        );
+        let ControlError::InvalidPatch(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("render.auto_exposure.speed_brighten"),
+            "error did not identify nested field: {message}"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            handle.snapshot().expect("snapshot").config.get("food_max"),
+            Some(&Value::from(0.5))
+        );
+    }
+
+    #[test]
+    fn full_command_queue_returns_no_optimistic_config_snapshot() {
+        let (handle, receiver) = handle();
+        for _ in 0..4 {
+            handle
+                .update_selection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: Vec::new(),
+                    state: SelectionState::None,
+                })
+                .expect("fill bounded command queue");
+        }
+
+        let error = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_max".into(),
+                value: Value::from(0.6),
+            }])
+            .expect_err("full queue must reject config update");
+        assert!(matches!(error, ControlError::CommandQueueFull));
+        assert_eq!(
+            handle.snapshot().expect("snapshot").config.get("food_max"),
+            Some(&Value::from(0.5))
+        );
+
+        let mut queued = 0;
+        while receiver.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 4, "invalid optimistic config command reached queue");
     }
 
     #[test]

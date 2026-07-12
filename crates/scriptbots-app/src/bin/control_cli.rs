@@ -928,6 +928,22 @@ mod tests {
     use scriptbots_storage::{RunLedgerSummary, Storage};
     use tempfile::tempdir;
 
+    #[test]
+    fn non_finite_and_unrepresentable_float_text_is_not_silently_normalized() {
+        assert_eq!(
+            parse_value("NaN").expect("parse NaN token"),
+            Value::String("NaN".into())
+        );
+        assert_eq!(
+            parse_value("Infinity").expect("parse infinity token"),
+            Value::String("Infinity".into())
+        );
+        assert_eq!(
+            parse_value("1e400").expect("parse out-of-range token"),
+            Value::String("1e400".into())
+        );
+    }
+
     fn fixture_batch(tick: u16) -> PersistenceBatch {
         let average_health = match tick {
             10 => 0.5,

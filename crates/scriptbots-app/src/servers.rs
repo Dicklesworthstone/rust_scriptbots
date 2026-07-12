@@ -1295,3 +1295,67 @@ fn map_control_error(err: ControlError) -> McpError {
         ControlError::CommandQueueClosed => McpError::Internal("command queue is closed".into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptbots_core::{ScriptBotsConfig, WorldState};
+
+    fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let (sender, receiver) = create_command_bus(2);
+        let handle = ControlHandle::new(Arc::new(std::sync::Mutex::new(world)), sender);
+        (handle, receiver)
+    }
+
+    #[tokio::test]
+    async fn rest_patch_rejects_non_finite_value_with_field_path_before_admission() {
+        let (handle, receiver) = handle();
+        let state = ApiState { handle };
+        let result = patch_config(
+            State(state.clone()),
+            Json(ConfigPatchRequest {
+                patch: json!({"food_growth_rate": "NaN"}),
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "REST patch accepted non-finite input");
+        let Err(error) = result else {
+            return;
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            error.message.contains("food_growth_rate"),
+            "REST error did not identify field: {}",
+            error.message
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_patch_rejects_non_finite_value_with_field_path_before_admission() {
+        let (handle, receiver) = handle();
+        let tool = ControlTool {
+            handle,
+            kind: ControlToolKind::ApplyPatch,
+        };
+        let arguments =
+            HashMap::from([("patch".to_owned(), json!({"food_growth_rate": "Infinity"}))]);
+        let error = tool
+            .call(arguments)
+            .await
+            .expect_err("MCP patch accepted non-finite input");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("food_growth_rate"),
+            "MCP error did not identify field: {rendered}"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+    }
+}

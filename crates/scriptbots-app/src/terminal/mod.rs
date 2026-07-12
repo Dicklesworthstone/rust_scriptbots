@@ -3225,6 +3225,37 @@ mod tests {
     }
 
     #[test]
+    fn terminal_numeric_ingress_rejects_non_finite_speed_before_queue_admission() {
+        let world = Arc::new(std::sync::Mutex::new(
+            WorldState::new(ScriptBotsConfig::default()).expect("world"),
+        ));
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let app = TerminalApp::new(&renderer, ctx);
+
+        app.submit_simulation_command(SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: Some(f32::NAN),
+            step_once: false,
+        });
+
+        let mut world = world.lock().expect("world lock");
+        (app.command_drain)(&mut world);
+        assert!(
+            world.drain_simulation_commands().is_empty(),
+            "terminal admitted a non-finite speed command"
+        );
+    }
+
+    #[test]
     fn auto_pause_on_spike_hits() {
         let mut config = ScriptBotsConfig::default();
         config.control.auto_pause_on_spike_hit = true;

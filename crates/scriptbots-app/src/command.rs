@@ -38,8 +38,12 @@ pub fn make_command_drain(receiver: CommandReceiver) -> CommandDrain {
 
 pub fn make_command_submit(sender: CommandSender) -> CommandSubmit {
     let sender = Arc::new(sender);
-    Arc::new(
-        move |command: ControlCommand| match sender.try_send(command) {
+    Arc::new(move |command: ControlCommand| {
+        if let Err(error) = command.validate() {
+            warn!(%error, "rejected invalid control command before queue admission");
+            return false;
+        }
+        match sender.try_send(command) {
             Ok(()) => true,
             Err(TrySendError::Full(cmd)) => {
                 warn!(?cmd, "control command queue full; dropping command");
@@ -49,6 +53,45 @@ pub fn make_command_submit(sender: CommandSender) -> CommandSubmit {
                 warn!(?cmd, "control command queue disconnected");
                 false
             }
-        },
-    )
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptbots_core::{ScriptBotsConfig, SimulationCommand};
+
+    #[test]
+    fn submit_rejects_non_finite_speed_before_queue_admission() {
+        let (sender, receiver) = create_command_bus(1);
+        let submit = make_command_submit(sender);
+        assert!(!(submit)(ControlCommand::UpdateSimulation(
+            SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(f32::NAN),
+                step_once: false,
+            }
+        )));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn finite_speed_is_admitted_and_clamped_when_applied() {
+        let (sender, receiver) = create_command_bus(1);
+        let submit = make_command_submit(sender);
+        assert!((submit)(ControlCommand::UpdateSimulation(
+            SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(128.0),
+                step_once: false,
+            }
+        )));
+
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        drain_pending_commands(&receiver, &mut world);
+        let pending = world.drain_simulation_commands();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].speed_multiplier, Some(32.0));
+    }
 }
