@@ -699,21 +699,27 @@ mod characterization_tests {
         assert_eq!(
             sequence(&trace_a),
             [
-                "5ba6a5eadd4b4fc5",
-                "2083069c81fd583a",
-                "e9cb6ffa5625c446",
-                "171a2cc87f6f6ba8",
-                "b982aaf96d371d8f",
+                // Re-pinned when the characterization digest was extended to
+                // cover ACTIVE INTERVENTIONS (bd-16g.10.1). A digest that ignored
+                // a drought in force would certify two runs as identical while
+                // one of them was in the middle of a famine, and every replay
+                // proof built on it would be hollow. The trajectory itself is
+                // unchanged: no intervention is active in this trace.
+                "12ffd8903f2588f4",
+                "57dadbd0dc0ef3bb",
+                "093aada106046e77",
+                "ccc3dc999e2dbd45",
+                "77bf36ffad164f62",
             ]
         );
         assert_eq!(
             sequence(&trace_c),
             [
-                "537688c799f28323",
-                "16b95268087ffd7f",
-                "79b188f01032a9cb",
-                "6a453e63f2d69958",
-                "368e8315c2a61c36",
+                "1daf2c9601805056",
+                "34862afcc3524912",
+                "efbb642bc81acede",
+                "43e8f2f64a481ff5",
+                "360f4818949324a7",
             ]
         );
 

@@ -1593,6 +1593,164 @@ pub fn knob_range(path: &str) -> Option<&'static KnobRange> {
     KNOB_RANGES.iter().find(|range| range.path == path)
 }
 
+/// A region of the world, measured with the same toroidal metric the simulation
+/// uses everywhere else.
+///
+/// The world is a torus. A region that measures distance naively selects the
+/// wrong agents near the seam — an agent at x=5 and one at x=995 in a 1000-wide
+/// world are 10 apart, not 990 — and the bug is invisible until someone drops a
+/// meteor near an edge and watches the wrong things die.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "snake_case")]
+pub enum Region {
+    /// The entire world.
+    All,
+    /// A disc, wrapped across the seam.
+    Disc {
+        /// Centre x.
+        x: f32,
+        /// Centre y.
+        y: f32,
+        /// Radius.
+        radius: f32,
+    },
+}
+
+impl Region {
+    /// Whether a point lies inside this region on the torus.
+    #[must_use]
+    pub fn contains(&self, px: f32, py: f32, world_width: f32, world_height: f32) -> bool {
+        match *self {
+            Self::All => true,
+            Self::Disc { x, y, radius } => {
+                let dx = toroidal_delta(px, x, world_width);
+                let dy = toroidal_delta(py, y, world_height);
+                dx.mul_add(dx, dy * dy) <= radius * radius
+            }
+        }
+    }
+
+    fn validate(&self) -> Result<(), WorldStateError> {
+        match *self {
+            Self::All => Ok(()),
+            Self::Disc { x, y, radius } => {
+                if !x.is_finite() || !y.is_finite() || !radius.is_finite() || radius <= 0.0 {
+                    return Err(WorldStateError::InvalidConfig(
+                        "disc region needs finite coordinates and a positive radius",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A deliberate perturbation of the world.
+///
+/// Interventions are the difference between watching an ecosystem and doing
+/// experiments on one. They are also the actuator the paired intervention
+/// studies need: that bead cannot run a drought study if nothing can cause a
+/// drought.
+///
+/// Every intervention is QUEUED and applied inside the tick loop, never straight
+/// from a host thread. An intervention applied immediately lands on whichever
+/// tick the world mutex happened to be free, which is nondeterminism walking in
+/// through the front door — and it would make a "replayable session" a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Intervention {
+    /// Suppress food regrowth in a region for a while.
+    Drought {
+        /// Where.
+        region: Region,
+        /// How long, in ticks.
+        ticks: u32,
+        /// Multiplier applied to the growth rate (0 = total).
+        growth_scale: f32,
+    },
+    /// Add food to every cell in a region, right now.
+    Bloom {
+        /// Where.
+        region: Region,
+        /// How much to add per cell.
+        amount: f32,
+    },
+    /// Damage every agent in a region and scorch the food under them.
+    Meteor {
+        /// Where.
+        region: Region,
+        /// Health removed from each agent inside.
+        lethality: f32,
+        /// Fraction of each cell's food destroyed, in `[0, 1]`.
+        scorch: f32,
+    },
+}
+
+impl Intervention {
+    /// Reject an intervention that cannot be honoured, rather than clamping it
+    /// into a different experiment than the one that was asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldStateError::InvalidConfig`] for a non-finite or negative
+    /// magnitude, or an unusable region.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        match *self {
+            Self::Drought {
+                region,
+                growth_scale,
+                ..
+            } => {
+                region.validate()?;
+                if !(0.0..=1.0).contains(&growth_scale) {
+                    return Err(WorldStateError::InvalidConfig(
+                        "drought growth_scale must lie in [0, 1]",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Bloom { region, amount } => {
+                region.validate()?;
+                if !amount.is_finite() || amount < 0.0 {
+                    return Err(WorldStateError::InvalidConfig(
+                        "bloom amount must be finite and non-negative",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Meteor {
+                region,
+                lethality,
+                scorch,
+            } => {
+                region.validate()?;
+                if !lethality.is_finite() || lethality < 0.0 {
+                    return Err(WorldStateError::InvalidConfig(
+                        "meteor lethality must be finite and non-negative",
+                    ));
+                }
+                if !(0.0..=1.0).contains(&scorch) {
+                    return Err(WorldStateError::InvalidConfig(
+                        "meteor scorch must lie in [0, 1]",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A timed intervention still in force.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ActiveEffect {
+    /// Where it applies.
+    pub region: Region,
+    /// Ticks left before it lapses.
+    pub ticks_remaining: u32,
+    /// Growth multiplier applied inside the region.
+    pub growth_scale: f32,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ActuationResult {
     delta: Option<ActuationDelta>,
@@ -5856,6 +6014,8 @@ pub struct WorldState {
     last_max_age: u32,
     history: VecDeque<TickSummary>,
     narrative: narrative::RunNarrative,
+    pending_interventions: Vec<Intervention>,
+    active_effects: Vec<ActiveEffect>,
     #[allow(dead_code)]
     carcass_health_distributed: f32,
     #[allow(dead_code)]
@@ -5978,6 +6138,8 @@ impl WorldState {
             last_max_age: 0,
             history: VecDeque::with_capacity(history_capacity),
             narrative: narrative::RunNarrative::default(),
+            pending_interventions: Vec::new(),
+            active_effects: Vec::new(),
             carcass_health_distributed: 0.0,
             carcass_reproduction_bonus: 0.0,
             combat_spike_attempts: 0,
@@ -6102,6 +6264,29 @@ impl WorldState {
         respawned
     }
 
+    /// Growth multiplier for one food cell, given the droughts currently in force.
+    ///
+    /// A drought that did not actually suppress regrowth would be theatre: the
+    /// event log would say "drought" and the ecosystem would carry on as if
+    /// nothing had happened.
+    fn drought_scale_for_cell(&self, cell_x: usize, cell_y: usize) -> f32 {
+        if self.active_effects.is_empty() {
+            return 1.0;
+        }
+        let cell_size = self.config.food_cell_size as f32;
+        let px = (cell_x as f32 + 0.5) * cell_size;
+        let py = (cell_y as f32 + 0.5) * cell_size;
+        let world_width = self.config.world_width as f32;
+        let world_height = self.config.world_height as f32;
+        let mut scale = 1.0f32;
+        for effect in &self.active_effects {
+            if effect.region.contains(px, py, world_width, world_height) {
+                scale *= effect.growth_scale;
+            }
+        }
+        scale
+    }
+
     fn apply_food_regrowth(&mut self) {
         let growth = self.config.food_growth_rate;
         let decay = self.config.food_decay_rate;
@@ -6109,6 +6294,21 @@ impl WorldState {
         if growth <= 0.0 && decay <= 0.0 && diffusion <= 0.0 {
             return;
         }
+
+        // Droughts scale regrowth per cell. Built once per tick, and only when an
+        // effect is actually in force, so the common case costs nothing.
+        let drought: Option<Vec<f32>> = if self.active_effects.is_empty() {
+            None
+        } else {
+            let (w, h) = (self.food.width() as usize, self.food.height() as usize);
+            let mut scales = Vec::with_capacity(w * h);
+            for y in 0..h {
+                for x in 0..w {
+                    scales.push(self.drought_scale_for_cell(x, y));
+                }
+            }
+            Some(scales)
+        };
 
         let width = self.food.width() as usize;
         let height = self.food.height() as usize;
@@ -6123,7 +6323,24 @@ impl WorldState {
         }
 
         let previous = &self.food_scratch;
-        let profiles = &self.food_profiles;
+        // A drought is expressed by scaling the cell's growth multiplier, so all
+        // three regrowth paths (SIMD chunk, SIMD remainder, scalar) honour it
+        // without any of them having to know droughts exist.
+        let droughted_profiles: Vec<FoodCellProfile>;
+        let profiles: &[FoodCellProfile] = if let Some(scales) = drought.as_ref() {
+            droughted_profiles = self
+                .food_profiles
+                .iter()
+                .zip(scales.iter())
+                .map(|(profile, scale)| FoodCellProfile {
+                    growth_multiplier: profile.growth_multiplier * scale,
+                    ..*profile
+                })
+                .collect();
+            &droughted_profiles
+        } else {
+            &self.food_profiles
+        };
         let food_max = self.config.food_max;
         let cells_mut = self.food.cells_mut();
 
@@ -7804,6 +8021,121 @@ impl WorldState {
         self.history.push_back(summary);
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = max_age;
+    }
+
+    /// Queue a deliberate perturbation of the world.
+    ///
+    /// The intervention is applied at the top of the next tick, inside the
+    /// pipeline — never immediately from the caller's thread. Immediate
+    /// application would land on whichever tick the world mutex happened to be
+    /// free, and a session recorded that way could never be replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldStateError::InvalidConfig`] when the intervention is not
+    /// honourable as asked. It is rejected, never silently clamped into a
+    /// different experiment.
+    pub fn enqueue_intervention(
+        &mut self,
+        intervention: Intervention,
+    ) -> Result<(), WorldStateError> {
+        intervention.validate()?;
+        self.pending_interventions.push(intervention);
+        Ok(())
+    }
+
+    /// Timed interventions still in force.
+    #[must_use]
+    pub fn active_effects(&self) -> &[ActiveEffect] {
+        &self.active_effects
+    }
+
+    /// Apply queued interventions and age the timed ones.
+    ///
+    /// Runs at the TOP of the tick, before food dynamics and sensing, so a
+    /// drought scales this tick's regrowth and a meteor's craters are visible to
+    /// every agent's senses on the tick it lands. No agent ever acts on a
+    /// half-applied world.
+    ///
+    /// Applied in queue order, which is the order they were enqueued: the same
+    /// command sequence against the same seed produces the same world.
+    fn stage_interventions(&mut self) {
+        let queued = std::mem::take(&mut self.pending_interventions);
+        let world_width = self.config.world_width as f32;
+        let world_height = self.config.world_height as f32;
+        let cell_size = self.config.food_cell_size as f32;
+
+        for intervention in queued {
+            match intervention {
+                Intervention::Drought {
+                    region,
+                    ticks,
+                    growth_scale,
+                } => {
+                    if ticks > 0 {
+                        self.active_effects.push(ActiveEffect {
+                            region,
+                            ticks_remaining: ticks,
+                            growth_scale,
+                        });
+                    }
+                }
+                Intervention::Bloom { region, amount } => {
+                    let cap = self.config.food_max;
+                    let (width, height) = (self.food.width(), self.food.height());
+                    for cy in 0..height {
+                        for cx in 0..width {
+                            let (px, py) =
+                                ((cx as f32 + 0.5) * cell_size, (cy as f32 + 0.5) * cell_size);
+                            if region.contains(px, py, world_width, world_height)
+                                && let Some(cell) = self.food.get_mut(cx, cy)
+                            {
+                                *cell = (*cell + amount).min(cap);
+                            }
+                        }
+                    }
+                }
+                Intervention::Meteor {
+                    region,
+                    lethality,
+                    scorch,
+                } => {
+                    let (width, height) = (self.food.width(), self.food.height());
+                    for cy in 0..height {
+                        for cx in 0..width {
+                            let (px, py) =
+                                ((cx as f32 + 0.5) * cell_size, (cy as f32 + 0.5) * cell_size);
+                            if region.contains(px, py, world_width, world_height)
+                                && let Some(cell) = self.food.get_mut(cx, cy)
+                            {
+                                *cell *= 1.0 - scorch;
+                            }
+                        }
+                    }
+                    if lethality > 0.0 {
+                        let columns = self.agents.columns_mut();
+                        let positions: Vec<Position> = columns.positions().to_vec();
+                        let healths = columns.health_mut();
+                        for (idx, position) in positions.iter().enumerate() {
+                            if region.contains(position.x, position.y, world_width, world_height) {
+                                healths[idx] = (healths[idx] - lethality).max(0.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Age timed effects AFTER applying this tick's queue, so an effect that
+        // lands with N ticks to live is in force for exactly N ticks. Ageing
+        // first would give a freshly-queued N-tick drought N+1 ticks of life —
+        // an off-by-one that a caller could never see, and that would quietly
+        // corrupt every duration in every study.
+        for effect in &mut self.active_effects {
+            effect.ticks_remaining = effect.ticks_remaining.saturating_sub(1);
+        }
+        self.active_effects
+            .retain(|effect| effect.ticks_remaining > 0);
     }
 
     /// Run the narrative detectors over the tick history and append any newly
@@ -10204,6 +10536,7 @@ impl WorldState {
         let next_tick = self.tick.next();
         let previous_epoch = self.epoch;
 
+        self.stage_interventions();
         if self.cadence.should_age(next_tick) {
             self.stage_aging();
         }
@@ -10290,11 +10623,16 @@ impl WorldState {
         if !self.pending_deaths.is_empty()
             || !self.pending_spawns.is_empty()
             || !self.simulation_commands.is_empty()
+            // A queued intervention is undelivered science: digesting now would
+            // fingerprint a world that is about to change for reasons the digest
+            // cannot see.
+            || !self.pending_interventions.is_empty()
         {
             return Err(CharacterizationError::NonQuiescent {
                 pending_deaths: self.pending_deaths.len(),
                 pending_spawns: self.pending_spawns.len(),
-                simulation_commands: self.simulation_commands.len(),
+                simulation_commands: self.simulation_commands.len()
+                    + self.pending_interventions.len(),
             });
         }
 
@@ -10416,6 +10754,27 @@ impl WorldState {
         }
         let brain_registry = brain_encoder.finish();
 
+        // Interventions in force are science state: a drought changes what the
+        // world does next. A digest that ignored them would certify two runs as
+        // identical while one of them was in the middle of a famine, and any
+        // replay proof built on it would be hollow.
+        let mut effects_encoder = CharacterizationEncoderV0::new("effects");
+        effects_encoder.usize(self.active_effects.len());
+        for effect in &self.active_effects {
+            match effect.region {
+                Region::All => effects_encoder.u8(0),
+                Region::Disc { x, y, radius } => {
+                    effects_encoder.u8(1);
+                    effects_encoder.f32(x);
+                    effects_encoder.f32(y);
+                    effects_encoder.f32(radius);
+                }
+            }
+            effects_encoder.u32(effect.ticks_remaining);
+            effects_encoder.f32(effect.growth_scale);
+        }
+        let effects = effects_encoder.finish();
+
         let mut overall_encoder = CharacterizationEncoderV0::new("overall");
         overall_encoder.u64(self.tick.0);
         overall_encoder.u64(self.epoch);
@@ -10426,6 +10785,7 @@ impl WorldState {
         overall_encoder.option_string(hydrology.as_deref());
         overall_encoder.string(&rng_probe);
         overall_encoder.string(&brain_registry);
+        overall_encoder.string(&effects);
         let overall = overall_encoder.finish();
 
         Ok(CharacterizationDigestV0 {
@@ -12324,6 +12684,287 @@ mod tests {
     /// The proof: explain what the agent perceives now, then step the world once
     /// (stage_sense runs before anything moves, so it senses exactly the world we
     /// just explained) and require core's sensors to match what we predicted.
+    #[test]
+    fn a_meteor_selects_agents_across_the_toroidal_seam() {
+        // The world is a TORUS. A region that measured distance naively would
+        // select the wrong agents near an edge — an agent at x=5 and one at
+        // x=195 in a 200-wide world are 10 apart, not 190 — and nobody would
+        // notice until they dropped a meteor near a seam and watched the wrong
+        // things die.
+        // Zero the metabolic drains: the meteor must be the ONLY thing that can
+        // change an agent's health, or the test measures starvation and calls it
+        // a crater.
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            rng_seed: Some(5),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        // Two agents straddling the x=0 seam, and one far away in the middle.
+        let near_left = world.spawn_agent(AgentData {
+            position: Position::new(5.0, 100.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let near_right = world.spawn_agent(AgentData {
+            position: Position::new(195.0, 100.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+        let far = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            health: 2.0,
+            ..AgentData::default()
+        });
+
+        world
+            .enqueue_intervention(Intervention::Meteor {
+                region: Region::Disc {
+                    x: 0.0,
+                    y: 100.0,
+                    radius: 12.0,
+                },
+                lethality: 0.5,
+                scorch: 1.0,
+            })
+            .expect("valid meteor");
+        world.step().expect("step");
+
+        let health_of = |id| {
+            let idx = world.agents().index_of(id).expect("alive");
+            world.agents().columns().health()[idx]
+        };
+        assert!(
+            (health_of(near_left) - 1.5).abs() < 1e-5,
+            "the agent just inside the seam must take exactly the meteor's damage, got {}",
+            health_of(near_left)
+        );
+        assert!(
+            (health_of(near_right) - 1.5).abs() < 1e-5,
+            "the agent on the OTHER side of the seam is 5 units away, not 195, so it \
+             must take the same damage; got {}",
+            health_of(near_right)
+        );
+        assert!(
+            (health_of(far) - 2.0).abs() < 1e-5,
+            "an agent 100 units away must be untouched, got {}",
+            health_of(far)
+        );
+    }
+
+    #[test]
+    fn a_drought_actually_suppresses_regrowth_and_then_lapses() {
+        // A drought that did not suppress regrowth would be theatre: the event
+        // log would say "drought" and the ecosystem would carry on regardless.
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.1,
+            food_growth_rate: 0.05,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_respawn_interval: 0,
+            rng_seed: Some(11),
+            ..ScriptBotsConfig::default()
+        };
+
+        let total_food = |world: &WorldState| -> f32 { world.food().cells().iter().sum() };
+
+        // Control: no drought.
+        let mut control = WorldState::new(config.clone()).expect("world");
+        for _ in 0..10 {
+            control.step().expect("step");
+        }
+
+        // Same world, world-wide drought for 5 ticks.
+        let mut droughted = WorldState::new(config).expect("world");
+        droughted
+            .enqueue_intervention(Intervention::Drought {
+                region: Region::All,
+                ticks: 5,
+                growth_scale: 0.0,
+            })
+            .expect("valid drought");
+        for _ in 0..5 {
+            droughted.step().expect("step");
+        }
+        let during = total_food(&droughted);
+        assert!(
+            during < total_food(&control) * 0.9,
+            "five ticks of total drought must visibly starve the world"
+        );
+        assert!(
+            droughted.active_effects().is_empty(),
+            "a 5-tick drought must lapse after 5 ticks"
+        );
+
+        // ...and once it lapses, the world recovers.
+        for _ in 0..5 {
+            droughted.step().expect("step");
+        }
+        assert!(
+            total_food(&droughted) > during,
+            "regrowth must resume once the drought lapses"
+        );
+    }
+
+    #[test]
+    fn interventions_are_rejected_not_silently_clamped() {
+        // Clamping would hand the caller a DIFFERENT experiment than the one
+        // they asked for, and they would never know.
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        assert!(
+            world
+                .enqueue_intervention(Intervention::Drought {
+                    region: Region::All,
+                    ticks: 10,
+                    growth_scale: 5.0,
+                })
+                .is_err(),
+            "a growth_scale above 1.0 is not a drought"
+        );
+        assert!(
+            world
+                .enqueue_intervention(Intervention::Meteor {
+                    region: Region::Disc {
+                        x: 0.0,
+                        y: 0.0,
+                        radius: -1.0
+                    },
+                    lethality: 1.0,
+                    scorch: 0.5,
+                })
+                .is_err(),
+            "a negative radius is not a region"
+        );
+        assert!(
+            world
+                .enqueue_intervention(Intervention::Bloom {
+                    region: Region::All,
+                    amount: f32::NAN,
+                })
+                .is_err(),
+            "a NaN bloom would poison every downstream reduction"
+        );
+    }
+
+    #[test]
+    fn the_same_intervention_script_produces_the_same_world() {
+        // This is what makes a hand-played session an experiment rather than
+        // vandalism: replay the command sequence, get the same world.
+        let script = |world: &mut WorldState| {
+            world
+                .enqueue_intervention(Intervention::Meteor {
+                    region: Region::Disc {
+                        x: 60.0,
+                        y: 60.0,
+                        radius: 30.0,
+                    },
+                    lethality: 0.4,
+                    scorch: 0.8,
+                })
+                .expect("valid");
+            world
+                .enqueue_intervention(Intervention::Drought {
+                    region: Region::All,
+                    ticks: 20,
+                    growth_scale: 0.25,
+                })
+                .expect("valid");
+        };
+
+        let run = || {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 20,
+                rng_seed: Some(0xBEEF),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("world");
+            for seed in 0..10 {
+                world.spawn_agent(sample_agent(seed));
+            }
+            for tick in 0..40 {
+                if tick == 5 {
+                    script(&mut world);
+                }
+                world.step().expect("step");
+            }
+            world
+                .characterization_digest_v0()
+                .expect("quiescent")
+                .overall
+        };
+        assert_eq!(run(), run(), "same script, same seed, same world");
+    }
+
+    #[test]
+    fn an_intervention_that_matches_nothing_changes_nothing() {
+        // A meteor in an empty corner must not perturb the simulation at all —
+        // no RNG draws, no agent state, no food. If it did, the intervention
+        // system would be injecting hidden nondeterminism into every study.
+        let build = || {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 20,
+                initial_food: 0.0,
+                food_growth_rate: 0.0,
+                food_respawn_interval: 0,
+                rng_seed: Some(0xFEED),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("world");
+            for seed in 0..6 {
+                world.spawn_agent(sample_agent(seed));
+            }
+            world
+        };
+
+        let mut untouched = build();
+        for _ in 0..20 {
+            untouched.step().expect("step");
+        }
+
+        let mut poked = build();
+        poked
+            .enqueue_intervention(Intervention::Meteor {
+                // Every agent from sample_agent() sits near the origin, so a
+                // meteor way out here can hit nothing.
+                region: Region::Disc {
+                    x: 150.0,
+                    y: 150.0,
+                    radius: 5.0,
+                },
+                lethality: 1.0,
+                scorch: 1.0,
+            })
+            .expect("valid");
+        for _ in 0..20 {
+            poked.step().expect("step");
+        }
+
+        assert_eq!(
+            untouched
+                .characterization_digest_v0()
+                .expect("quiescent")
+                .agents,
+            poked
+                .characterization_digest_v0()
+                .expect("quiescent")
+                .agents,
+            "a meteor that hits nothing must change nothing"
+        );
+    }
+
     #[test]
     fn knob_ranges_reject_the_absurd_and_admit_the_hostile() {
         // The hole this closes: ScriptBotsConfig::validate() proves admissibility
