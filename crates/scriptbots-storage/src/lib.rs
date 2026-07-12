@@ -3,7 +3,7 @@
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use fsqlite::{
-    Connection, FrankenError, Row, SqliteValue,
+    Connection, FileIdentity, FrankenError, Row, SqliteValue,
     compat::{FromSqliteValue, OpenFlags, RowExt, Transaction, TransactionExt, open_with_flags},
     migrate::MigrationRunner,
 };
@@ -190,6 +190,92 @@ const SCRIPTBOTS_SCHEMA_V2: &str = "
         payload TEXT NOT NULL
     );
 ";
+
+#[derive(Debug, PartialEq, Eq)]
+struct SchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: Option<String>,
+}
+
+impl SchemaObject {
+    fn summary(&self) -> String {
+        let sql_fingerprint = self.sql.as_deref().map_or_else(
+            || "none".to_owned(),
+            |sql| blake3::hash(sql.as_bytes()).to_hex().to_string(),
+        );
+        format!(
+            "type={:?}, name={:?}, table={:?}, sql=blake3:{sql_fingerprint}",
+            self.object_type, self.name, self.table_name
+        )
+    }
+}
+
+fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
+    MigrationRunner::new()
+        .add(1, "create_scriptbots_schema", SCRIPTBOTS_SCHEMA_V1)
+        .add(2, "create_durable_persistence_outbox", SCRIPTBOTS_SCHEMA_V2)
+        .run(connection)?;
+    Ok(())
+}
+
+fn read_schema_objects(connection: &Connection) -> Result<Vec<SchemaObject>, StorageError> {
+    connection
+        .query(
+            "SELECT type, name, tbl_name, sql
+             FROM sqlite_schema
+             ORDER BY type ASC, name ASC, tbl_name ASC, sql ASC",
+        )?
+        .into_iter()
+        .map(|row| {
+            Ok(SchemaObject {
+                object_type: decode(&row, 0, "sqlite_schema.type")?,
+                name: decode(&row, 1, "sqlite_schema.name")?,
+                table_name: decode(&row, 2, "sqlite_schema.tbl_name")?,
+                sql: decode(&row, 3, "sqlite_schema.sql")?,
+            })
+        })
+        .collect()
+}
+
+fn schema_fingerprint(objects: &[SchemaObject]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for object in objects {
+        for field in [
+            Some(object.object_type.as_str()),
+            Some(object.name.as_str()),
+            Some(object.table_name.as_str()),
+            object.sql.as_deref(),
+        ] {
+            match field {
+                Some(field) => {
+                    hasher.update(b"S");
+                    hasher.update(&field.len().to_le_bytes());
+                    hasher.update(field.as_bytes());
+                }
+                None => {
+                    hasher.update(b"N");
+                }
+            }
+        }
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn canonical_schema_objects() -> Result<Vec<SchemaObject>, StorageError> {
+    let connection = Connection::open(":memory:")?;
+    let result = (|| {
+        install_scriptbots_schema(&connection)?;
+        read_schema_objects(&connection)
+    })();
+    let close_result = connection
+        .close_without_checkpoint()
+        .map_err(StorageError::from);
+    let objects = result?;
+    close_result?;
+    Ok(objects)
+}
 
 const AGENT_COLUMNS: &[&str] = &[
     "tick",
@@ -456,7 +542,7 @@ pub enum StorageWorkerError {
         transient: bool,
         commit_state: FailureCommitState,
         #[source]
-        source: FrankenError,
+        source: Box<FrankenError>,
     },
     #[error(
         "storage {operation:?} timed out during {phase:?} at {path} after {waited:?} (tick={tick:?}, commit_state={commit_state:?})"
@@ -640,7 +726,7 @@ fn worker_error_from_storage(
             attempt: 1,
             transient: source.is_transient(),
             commit_state: default_commit_state,
-            source,
+            source: Box::new(source),
         },
         StorageError::Transaction {
             attempts,
@@ -654,7 +740,7 @@ fn worker_error_from_storage(
             attempt: attempts,
             transient,
             commit_state,
-            source,
+            source: Box::new(source),
         },
         StorageError::WriterLeaseHeld {
             path: lease_path,
@@ -700,7 +786,7 @@ fn duplicate_worker_error(error: &StorageWorkerError) -> StorageWorkerError {
             attempt: *attempt,
             transient: *transient,
             commit_state: *commit_state,
-            source: FrankenError::Internal(source.to_string()),
+            source: Box::new(FrankenError::Internal(source.to_string())),
         },
         StorageWorkerError::Timeout {
             operation,
@@ -2176,7 +2262,8 @@ impl Drop for StorageWriterLease {
 
 struct ExistingStorageLease {
     _file: std::fs::File,
-    identity: StorageFileIdentity,
+    path_identity: StorageFileIdentity,
+    connection_identity: Option<FileIdentity>,
 }
 
 impl ExistingStorageLease {
@@ -2218,12 +2305,48 @@ impl ExistingStorageLease {
                 reason: format!("recovery path {path} changed away from a regular file"),
             });
         }
+        let connection_identity =
+            FileIdentity::from_file(&file).map_err(|source| StorageError::Filesystem {
+                operation: "identify opened recovery database",
+                path: PathBuf::from(path),
+                source,
+            })?;
         let lease = Self {
             _file: file,
-            identity: StorageFileIdentity::from_metadata(&file_metadata),
+            path_identity: StorageFileIdentity::from_metadata(&file_metadata),
+            connection_identity,
         };
         lease.verify_path(path)?;
         Ok(lease)
+    }
+
+    fn bind_connection(&self, connection: &Connection, path: &str) -> Result<(), StorageError> {
+        let leased_identity = self.required_connection_identity()?;
+        let connection_identity = connection
+            .file_identity()?
+            .ok_or(StorageError::InvalidData {
+                context: "storage.recovery_identity",
+                reason:
+                    "the FrankenSQLite VFS cannot prove the identity of its open database handle"
+                        .to_owned(),
+            })?;
+        if connection_identity != leased_identity {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_identity",
+                reason: format!(
+                    "FrankenSQLite opened a different filesystem object than the leased recovery database at {path}"
+                ),
+            });
+        }
+        self.verify_path(path)
+    }
+
+    fn required_connection_identity(&self) -> Result<FileIdentity, StorageError> {
+        self.connection_identity.ok_or(StorageError::InvalidData {
+            context: "storage.recovery_identity",
+            reason: "the platform cannot prove the identity of the leased database descriptor"
+                .to_owned(),
+        })
     }
 
     fn verify_path(&self, path: &str) -> Result<(), StorageError> {
@@ -2235,7 +2358,8 @@ impl ExistingStorageLease {
             })?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || StorageFileIdentity::from_metadata(&metadata) != self.identity
+            || storage_file_has_multiple_links(&metadata)
+            || StorageFileIdentity::from_metadata(&metadata) != self.path_identity
         {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_path",
@@ -2317,6 +2441,17 @@ impl Storage {
         event: usize,
         metric: usize,
     ) -> Result<Self, StorageError> {
+        Self::with_target_before_recovery_writer_open(target, tick, agent, event, metric, |_| {})
+    }
+
+    fn with_target_before_recovery_writer_open(
+        target: StorageTarget,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+        before_recovery_writer_open: impl FnOnce(&str),
+    ) -> Result<Self, StorageError> {
         target.prepare_for_open()?;
         let path = target.path().to_owned();
         let recover_existing = matches!(target, StorageTarget::RecoverExisting(_));
@@ -2331,10 +2466,57 @@ impl Storage {
                 Some(ExistingStorageLease::open(&path)?)
             }
         };
+        let recovery_identity = if recover_existing {
+            let validation_connection = open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let validation = existing_lease
+                .as_ref()
+                .ok_or(StorageError::InvalidData {
+                    context: "storage.recovery_identity",
+                    reason: "recovery opened without an identity lease".to_owned(),
+                })
+                .and_then(|lease| lease.bind_connection(&validation_connection, &path))
+                .and_then(|()| Self::validate_existing_scriptbots_database(&validation_connection));
+            let close_result = validation_connection
+                .close_without_checkpoint()
+                .map_err(StorageError::from);
+            validation?;
+            close_result?;
+            let identity_lease = existing_lease.as_ref().ok_or(StorageError::InvalidData {
+                context: "storage.recovery_identity",
+                reason: "recovery opened without an identity lease".to_owned(),
+            })?;
+            identity_lease.verify_path(&path)?;
+            let expected_identity = identity_lease.required_connection_identity()?;
+            before_recovery_writer_open(&path);
+            Some(expected_identity)
+        } else {
+            None
+        };
+        let conn = if let Some(expected_identity) = recovery_identity {
+            Connection::open_existing_with_expected_identity(&path, expected_identity)?
+        } else {
+            Connection::open(&path)?
+        };
         if recover_existing {
-            Self::validate_existing_scriptbots_database(&path)?;
+            let validation = existing_lease
+                .as_ref()
+                .ok_or(StorageError::InvalidData {
+                    context: "storage.recovery_identity",
+                    reason: "recovery opened without an identity lease".to_owned(),
+                })
+                .and_then(|lease| lease.bind_connection(&conn, &path))
+                .and_then(|()| Self::validate_existing_scriptbots_database(&conn));
+            if let Err(error) = validation {
+                if let Err(close_error) = conn.close_without_checkpoint() {
+                    warn!(
+                        path,
+                        %close_error,
+                        "failed to close refused recovery connection without checkpoint"
+                    );
+                }
+                return Err(error);
+            }
         }
-        let conn = Connection::open(&path)?;
         if let Some(lease) = path_lease.as_mut() {
             lease.promote_existing(&path)?;
         }
@@ -2388,63 +2570,85 @@ impl Storage {
         Ok(storage)
     }
 
-    fn validate_existing_scriptbots_database(path: &str) -> Result<(), StorageError> {
-        let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let validation = (|| {
-            let migrations = connection.query(
-                "SELECT version, name FROM _schema_migrations
-                 ORDER BY version ASC",
-            )?;
-            if migrations.len() != 2 {
+    fn validate_existing_scriptbots_database(connection: &Connection) -> Result<(), StorageError> {
+        let migrations = connection.query(
+            "SELECT version, name FROM _schema_migrations
+             ORDER BY version ASC",
+        )?;
+        if migrations.len() != 2 {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_schema",
+                reason: format!(
+                    "expected exactly two ScriptBots migrations, found {}",
+                    migrations.len()
+                ),
+            });
+        }
+        let expected_migrations = [
+            (1_i64, "create_scriptbots_schema"),
+            (2_i64, "create_durable_persistence_outbox"),
+        ];
+        for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
+            let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
+            let actual_name: String = decode(row, 1, "_schema_migrations.name")?;
+            if actual_version != version || actual_name != name {
                 return Err(StorageError::InvalidData {
-                    context: "storage.recovery_identity",
+                    context: "storage.recovery_schema",
                     reason: format!(
-                        "expected two ScriptBots migrations, found {}",
-                        migrations.len()
+                        "unexpected migration ({actual_version}, {actual_name:?}); expected ({version}, {name:?})"
                     ),
                 });
             }
-            let expected = [
-                (1_i64, "create_scriptbots_schema"),
-                (2_i64, "create_durable_persistence_outbox"),
-            ];
-            for (row, (version, name)) in migrations.iter().zip(expected) {
-                let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
-                let actual_name: String = decode(row, 1, "_schema_migrations.name")?;
-                if actual_version != version || actual_name != name {
-                    return Err(StorageError::InvalidData {
-                        context: "storage.recovery_identity",
-                        reason: format!(
-                            "unexpected migration ({actual_version}, {actual_name:?}); expected ({version}, {name:?})"
-                        ),
-                    });
-                }
-            }
-            let progress = connection.query_row(
-                "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
-                 FROM storage_progress
-                 WHERE singleton = 1",
-            )?;
-            PersistenceWatermarks::from_raw(
-                decode(&progress, 0, "storage_progress.admitted_batch_id")?,
-                decode(&progress, 1, "storage_progress.applied_batch_id")?,
-                decode(&progress, 2, "storage_progress.durable_batch_id")?,
-            )?;
-            Ok(())
-        })();
-        let close_result = connection
-            .close_without_checkpoint()
-            .map_err(StorageError::from);
-        validation?;
-        close_result
+        }
+
+        let expected_schema = canonical_schema_objects()?;
+        let actual_schema = read_schema_objects(connection)?;
+        if actual_schema != expected_schema {
+            let first_difference = expected_schema
+                .iter()
+                .zip(&actual_schema)
+                .position(|(expected, actual)| expected != actual);
+            let difference = first_difference.map_or_else(
+                || {
+                    format!(
+                        "object count differs: expected {}, found {}",
+                        expected_schema.len(),
+                        actual_schema.len()
+                    )
+                },
+                |index| {
+                    format!(
+                        "first difference at object {index}: expected [{}], found [{}]",
+                        expected_schema[index].summary(),
+                        actual_schema[index].summary()
+                    )
+                },
+            );
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_schema",
+                reason: format!(
+                    "schema fingerprint mismatch: expected {}, found {}; {difference}",
+                    schema_fingerprint(&expected_schema),
+                    schema_fingerprint(&actual_schema)
+                ),
+            });
+        }
+
+        let progress = connection.query_row(
+            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress
+             WHERE singleton = 1",
+        )?;
+        PersistenceWatermarks::from_raw(
+            decode(&progress, 0, "storage_progress.admitted_batch_id")?,
+            decode(&progress, 1, "storage_progress.applied_batch_id")?,
+            decode(&progress, 2, "storage_progress.durable_batch_id")?,
+        )?;
+        Ok(())
     }
 
     fn initialize_schema(&mut self) -> Result<(), StorageError> {
-        MigrationRunner::new()
-            .add(1, "create_scriptbots_schema", SCRIPTBOTS_SCHEMA_V1)
-            .add(2, "create_durable_persistence_outbox", SCRIPTBOTS_SCHEMA_V2)
-            .run(self.connection()?)?;
-        Ok(())
+        install_scriptbots_schema(self.connection()?)
     }
 
     fn validate_persistence_invariants(&self) -> Result<(), StorageError> {
@@ -5882,6 +6086,248 @@ mod tests {
         Ok(())
     }
 
+    fn assert_recovery_refused_without_database_mutation(
+        path: &Path,
+        expected_error_fragment: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let before = fs::read(path)?;
+        let path_string = path.to_string_lossy().to_string();
+        let error = match recover_file_storage(&path_string) {
+            Ok(storage) => {
+                storage.close()?;
+                return Err(format!(
+                    "recovery unexpectedly accepted malformed database at {}",
+                    path.display()
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected recovery error: {error}"
+        );
+        assert_eq!(
+            fs::read(path)?,
+            before,
+            "refused recovery mutated {}",
+            path.display()
+        );
+        Ok(())
+    }
+
+    fn create_valid_database(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = StoragePipeline::create_new_file(&path_string)?;
+        storage.shutdown()?;
+        Ok(())
+    }
+
+    fn add_schema_object(path: &Path, sql: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(path.to_string_lossy().as_ref())?;
+        connection.execute(sql)?;
+        connection.close()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_binds_validation_and_writes_to_the_leased_open_file_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = temp_db_path("storage-recovery-identity-original");
+        let replacement = temp_db_path("storage-recovery-identity-replacement");
+        let parked_original = temp_db_path("storage-recovery-identity-parked");
+        create_valid_database(&original)?;
+        create_valid_database(&replacement)?;
+        let original_before = fs::read(&original)?;
+        let replacement_before = fs::read(&replacement)?;
+        let original_string = original.to_string_lossy().to_string();
+
+        let error = match Storage::with_target_before_recovery_writer_open(
+            StorageTarget::RecoverExisting(original_string),
+            64,
+            4096,
+            1024,
+            1024,
+            |_| {
+                fs::rename(&original, &parked_original).expect("park leased original");
+                fs::rename(&replacement, &original).expect("swap replacement into pathname");
+            },
+        ) {
+            Ok(storage) => {
+                storage.close()?;
+                return Err("path-swapped recovery unexpectedly succeeded".into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, StorageError::Database(_)));
+        assert_eq!(fs::read(&parked_original)?, original_before);
+        assert_eq!(fs::read(&original)?, replacement_before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_writer_open_does_not_initialize_a_swapped_empty_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = temp_db_path("storage-recovery-empty-swap-original");
+        let replacement = temp_db_path("storage-recovery-empty-swap-replacement");
+        let parked_original = temp_db_path("storage-recovery-empty-swap-parked");
+        create_valid_database(&original)?;
+        fs::write(&replacement, b"")?;
+        let original_before = fs::read(&original)?;
+        let replacement_before = fs::read(&replacement)?;
+        let original_string = original.to_string_lossy().to_string();
+
+        let error = match Storage::with_target_before_recovery_writer_open(
+            StorageTarget::RecoverExisting(original_string),
+            64,
+            4096,
+            1024,
+            1024,
+            |_| {
+                fs::rename(&original, &parked_original).expect("park leased original");
+                fs::rename(&replacement, &original).expect("swap empty file into pathname");
+            },
+        ) {
+            Ok(storage) => {
+                storage.close()?;
+                return Err("empty path-swapped recovery unexpectedly succeeded".into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, StorageError::Database(_)),
+            "unexpected swapped-empty recovery error: {error}"
+        );
+        assert_eq!(fs::read(&parked_original)?, original_before);
+        assert_eq!(
+            fs::read(&original)?,
+            replacement_before,
+            "recovery writer open initialized the swapped empty path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_requires_the_exact_supported_migration_set_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let future = temp_db_path("storage-recovery-future-migration");
+        create_valid_database(&future)?;
+        add_schema_object(
+            &future,
+            "INSERT INTO _schema_migrations (version, name) VALUES (3, 'future_schema')",
+        )?;
+        assert_recovery_refused_without_database_mutation(&future, "exactly two")?;
+
+        let weak_v1 = temp_db_path("storage-recovery-weak-v1");
+        let weak_connection = Connection::open(weak_v1.to_string_lossy().as_ref())?;
+        MigrationRunner::new()
+            .add(1, "create_scriptbots_schema", SCRIPTBOTS_SCHEMA_V1)
+            .run(&weak_connection)?;
+        weak_connection.close()?;
+        assert_recovery_refused_without_database_mutation(&weak_v1, "exactly two")?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_forged_lookalike_schema_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let forged = temp_db_path("storage-recovery-forged-lookalike");
+        let connection = Connection::open(forged.to_string_lossy().as_ref())?;
+        connection.execute(
+            "CREATE TABLE _schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+             );
+             INSERT INTO _schema_migrations (version, name, applied_at)
+             VALUES (1, 'create_scriptbots_schema', 'forged');
+             INSERT INTO _schema_migrations (version, name, applied_at)
+             VALUES (2, 'create_durable_persistence_outbox', 'forged');
+             CREATE TABLE storage_progress (
+                singleton INTEGER PRIMARY KEY,
+                admitted_batch_id INTEGER NOT NULL,
+                applied_batch_id INTEGER NOT NULL,
+                durable_batch_id INTEGER NOT NULL
+             );
+             INSERT INTO storage_progress VALUES (1, 0, 0, 0);",
+        )?;
+        connection.close()?;
+
+        assert_recovery_refused_without_database_mutation(&forged, "schema fingerprint mismatch")?;
+
+        let weakened_constraint = temp_db_path("storage-recovery-weakened-check");
+        create_valid_database(&weakened_constraint)?;
+        let connection = Connection::open(weakened_constraint.to_string_lossy().as_ref())?;
+        connection.execute(
+            "DROP TABLE metrics;
+             CREATE TABLE metrics (
+                tick INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                value REAL NOT NULL,
+                PRIMARY KEY (tick, name)
+             )",
+        )?;
+        connection.close()?;
+        assert_recovery_refused_without_database_mutation(
+            &weakened_constraint,
+            "schema fingerprint mismatch",
+        )
+    }
+
+    #[test]
+    fn recovery_rejects_every_unexpected_schema_object_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "extra-table",
+                "CREATE TABLE unexpected_table (value INTEGER NOT NULL)",
+            ),
+            (
+                "extra-index",
+                "CREATE INDEX unexpected_metric_index ON metrics(name)",
+            ),
+            (
+                "extra-view",
+                "CREATE VIEW unexpected_progress_view AS
+                 SELECT singleton FROM storage_progress",
+            ),
+            (
+                "extra-trigger",
+                "CREATE TRIGGER unexpected_tick_trigger AFTER INSERT ON ticks
+                 BEGIN SELECT 1; END",
+            ),
+        ];
+        for (label, sql) in cases {
+            let path = temp_db_path(&format!("storage-recovery-{label}"));
+            create_valid_database(&path)?;
+            add_schema_object(&path, sql)?;
+            assert_recovery_refused_without_database_mutation(
+                &path,
+                "schema fingerprint mismatch",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_schema_database_recovers_through_the_identity_bound_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-recovery-exact-schema-happy");
+        create_valid_database(&path)?;
+        let path_string = path.to_string_lossy().to_string();
+        let storage = recover_file_storage(&path_string)?;
+        assert_eq!(
+            read_schema_objects(storage.connection()?)?,
+            canonical_schema_objects()?
+        );
+        storage.close()?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn writer_refuses_symlink_and_hard_link_aliases() -> Result<(), Box<dyn std::error::Error>> {
@@ -6243,6 +6689,13 @@ mod tests {
             interrupted.stage_outbox(prepared.tick, &prepared.storage)?;
         assert!(newly_admitted);
         assert!(!interrupted.enqueue_staged(admission.batch_id, prepared.storage)?);
+        let canonical_metrics_sql: String = interrupted
+            .connection()?
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'metrics'",
+            )?
+            .get_typed(0)?;
         interrupted.connection()?.execute("DROP TABLE metrics")?;
         let failure = interrupted
             .flush()
@@ -6267,14 +6720,7 @@ mod tests {
         interrupted.abandon_after_error();
 
         let repair = Connection::open(&path_string)?;
-        repair.execute(
-            "CREATE TABLE metrics (
-                tick INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                value REAL NOT NULL,
-                PRIMARY KEY (tick, name)
-            )",
-        )?;
+        repair.execute(&canonical_metrics_sql)?;
         repair.close()?;
         let mut recovered = StoragePipeline::recover_existing(&path_string)?;
         let shutdown = recovered.shutdown()?;
