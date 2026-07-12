@@ -17,6 +17,7 @@ use scriptbots_core::{
 use crate::SharedWorld;
 use crate::command::CommandSender;
 use scriptbots_core::ConfigAuditEntry;
+use scriptbots_core::check_knob_ranges;
 #[cfg(feature = "gui")]
 use scriptbots_render::render_png_offscreen;
 use slotmap::Key; // offscreen PNG renderer
@@ -477,6 +478,23 @@ impl ControlHandle {
         let current_tick = world.tick();
         let mut config_value =
             serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
+        // Range-check the REQUESTED knobs before merging them. `validate()`
+        // proves admissibility (finite, non-negative) but declares no upper
+        // bounds, so `food_regrowth_rate = 1e9` used to sail through from REST,
+        // from MCP, and therefore from any agent driving them. Every violation
+        // is reported at once: a caller who has to fix one knob per round trip
+        // gives up, and an autonomous one burns its entire budget doing it.
+        let requested = flatten_numeric_assignments(&patch);
+        let violations = check_knob_ranges(&requested);
+        if !violations.is_empty() {
+            let detail = violations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ControlError::InvalidPatch(detail));
+        }
+
         let mut path = SmallVec::<[&str; 8]>::new();
         merge_value(&mut config_value, &patch, &mut path)?;
         let json_str = serde_json::to_string(&config_value).map_err(ControlError::serialization)?;
@@ -822,6 +840,36 @@ fn partial_top_k<T, F: Fn(&T, &T) -> std::cmp::Ordering>(v: &mut Vec<T>, k: usiz
     v.sort_by(cmp);
 }
 
+/// Flatten a JSON patch into dotted-path numeric assignments for range checking.
+///
+/// Only numbers are collected: strings, booleans and structural values are left
+/// to serde, which already rejects type mismatches with a precise path.
+fn flatten_numeric_assignments(patch: &Value) -> Vec<(String, f64)> {
+    fn walk(prefix: &str, value: &Value, out: &mut Vec<(String, f64)>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(&path, child, out);
+                }
+            }
+            Value::Number(number) => {
+                if let Some(as_f64) = number.as_f64() {
+                    out.push((prefix.to_owned(), as_f64));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk("", patch, &mut out);
+    out
+}
+
 fn flatten_value(prefix: &mut String, value: &Value, entries: &mut Vec<KnobEntry>) {
     match value {
         Value::Object(map) => {
@@ -924,6 +972,70 @@ mod tests {
             projected_food_max, observed_food_max,
             "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
         );
+    }
+
+    #[test]
+    fn absurd_knob_values_are_rejected_at_the_control_boundary() {
+        // The end-to-end proof that the hole is closed: this exact request used
+        // to be ACCEPTED. ScriptBotsConfig::validate() checks that values are
+        // finite and non-negative but declares no upper bounds, so a growth rate
+        // of one billion was admissible from REST, from MCP, and therefore from
+        // any agent driving them.
+        let (handle, _receiver) = handle();
+        let err = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_growth_rate".into(),
+                value: Value::from(1e9),
+            }])
+            .expect_err("an absurd growth rate must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("food_growth_rate") && message.contains("range"),
+            "the rejection must name the knob and its range, got: {message}"
+        );
+    }
+
+    #[test]
+    fn every_violation_in_one_patch_is_reported_at_once() {
+        // A caller who must fix one knob per round trip gives up; an autonomous
+        // one burns its whole budget doing it.
+        let (handle, _receiver) = handle();
+        let err = handle
+            .apply_updates(&[
+                KnobUpdate {
+                    path: "food_growth_rate".into(),
+                    value: Value::from(1e9),
+                },
+                KnobUpdate {
+                    path: "metabolism_drain".into(),
+                    value: Value::from(50.0),
+                },
+            ])
+            .expect_err("both knobs are out of range");
+        let message = err.to_string();
+        assert!(message.contains("food_growth_rate"), "{message}");
+        assert!(message.contains("metabolism_drain"), "{message}");
+    }
+
+    #[test]
+    fn a_harsh_but_sane_world_is_still_expressible() {
+        // The bounds exist to reject the absurd, not to enforce taste: a
+        // researcher must still be able to build a brutal world.
+        let (handle, receiver) = handle();
+        handle
+            .apply_updates(&[
+                KnobUpdate {
+                    path: "metabolism_drain".into(),
+                    value: Value::from(0.9),
+                },
+                KnobUpdate {
+                    path: "spike_damage".into(),
+                    value: Value::from(9.0),
+                },
+            ])
+            .expect("a hostile world is a legitimate experiment");
+        let mut world = handle.lock_world().expect("world lock");
+        crate::command::drain_pending_commands(&receiver, &mut world);
     }
 
     #[test]

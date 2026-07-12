@@ -1438,6 +1438,161 @@ pub struct SensorAttribution {
     pub truncated: usize,
 }
 
+/// The admissible range of one externally-settable configuration knob.
+///
+/// # Why ranges exist at all
+///
+/// `ScriptBotsConfig::validate` checks *admissibility* — finite, non-negative,
+/// non-zero where required — but it has no upper bounds. `food_regrowth_rate =
+/// 1e9` passes today, from the REST API, from MCP, and therefore from any agent
+/// driving them. The safety story for an autonomous experimenter ("a confused
+/// model can only request what a human could request") is not true until
+/// somebody writes the ranges down. This is that list.
+///
+/// The bounds are deliberately GENEROUS: they exist to reject the absurd, not to
+/// enforce taste. A researcher must still be able to build a hostile world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KnobRange {
+    /// Dotted knob path, as produced by flattening the config.
+    pub path: &'static str,
+    /// Smallest accepted value.
+    pub min: f64,
+    /// Largest accepted value.
+    pub max: f64,
+    /// Whether changing this knob requires a fresh world.
+    ///
+    /// Dimensions cannot be changed on a live world (`apply_config_update`
+    /// rejects them), so a sweep over them has to construct new worlds. An
+    /// experiment planner that does not know this will generate specs that are
+    /// rejected at apply time, one run at a time, and blame the simulation.
+    pub fresh_world_only: bool,
+}
+
+impl KnobRange {
+    const fn live(path: &'static str, min: f64, max: f64) -> Self {
+        Self {
+            path,
+            min,
+            max,
+            fresh_world_only: false,
+        }
+    }
+
+    const fn fresh(path: &'static str, min: f64, max: f64) -> Self {
+        Self {
+            path,
+            min,
+            max,
+            fresh_world_only: true,
+        }
+    }
+}
+
+/// Admissible ranges for the numeric knobs external surfaces may set.
+///
+/// A knob absent from this table is not range-checked; it is still subject to
+/// `ScriptBotsConfig::validate`. Absence is a gap, not a licence — add ranges as
+/// knobs are exposed.
+pub const KNOB_RANGES: &[KnobRange] = &[
+    // World geometry: fresh worlds only.
+    KnobRange::fresh("world_width", 32.0, 20_000.0),
+    KnobRange::fresh("world_height", 32.0, 20_000.0),
+    KnobRange::fresh("food_cell_size", 1.0, 500.0),
+    // Food economy.
+    KnobRange::live("food_max", 0.001, 100.0),
+    KnobRange::live("initial_food", 0.0, 100.0),
+    KnobRange::live("food_growth_rate", 0.0, 1.0),
+    KnobRange::live("food_decay_rate", 0.0, 1.0),
+    KnobRange::live("food_diffusion_rate", 0.0, 0.25),
+    KnobRange::live("food_intake_rate", 0.0, 1.0),
+    KnobRange::live("food_waste_rate", 0.0, 1.0),
+    KnobRange::live("food_transfer_rate", 0.0, 1.0),
+    // Metabolism and locomotion.
+    KnobRange::live("metabolism_drain", 0.0, 1.0),
+    KnobRange::live("movement_drain", 0.0, 1.0),
+    KnobRange::live("bot_speed", 0.0, 100.0),
+    KnobRange::live("boost_multiplier", 1.0, 50.0),
+    KnobRange::live("sense_radius", 1.0, 5_000.0),
+    // Combat.
+    KnobRange::live("spike_damage", 0.0, 10.0),
+    KnobRange::live("spike_radius", 0.0, 1_000.0),
+    KnobRange::live("spike_energy_cost", 0.0, 10.0),
+    // Climate.
+    KnobRange::live("temperature_discomfort_rate", 0.0, 10.0),
+    // Evolution.
+    KnobRange::live("mutation.primary", 0.0, 1.0),
+    KnobRange::live("mutation.secondary", 0.0, 10.0),
+    KnobRange::live("reproduction_energy_threshold", 0.0, 2.0),
+    KnobRange::live("reproduction_energy_cost", 0.0, 2.0),
+    // Population.
+    KnobRange::live("population_minimum", 0.0, 100_000.0),
+    KnobRange::live("population_spawn_interval", 0.0, 1_000_000.0),
+];
+
+/// One rejected knob assignment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnobViolation {
+    /// Which knob.
+    pub path: String,
+    /// What was requested.
+    pub value: f64,
+    /// Smallest accepted value.
+    pub min: f64,
+    /// Largest accepted value.
+    pub max: f64,
+}
+
+impl fmt::Display for KnobViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} = {} is outside the accepted range [{}, {}]",
+            self.path, self.value, self.min, self.max
+        )
+    }
+}
+
+/// Check a flattened knob assignment against [`KNOB_RANGES`].
+///
+/// Reports EVERY violation rather than the first: a caller fixing a rejected
+/// experiment one knob per round trip is a caller who gives up, and an
+/// autonomous one burns its whole budget doing it.
+///
+/// Non-finite values are always rejected, even for unlisted knobs — a `NaN`
+/// silently poisons every downstream reduction it touches.
+#[must_use]
+pub fn check_knob_ranges(assignments: &[(String, f64)]) -> Vec<KnobViolation> {
+    let mut violations = Vec::new();
+    for (path, value) in assignments {
+        if !value.is_finite() {
+            violations.push(KnobViolation {
+                path: path.clone(),
+                value: *value,
+                min: f64::NEG_INFINITY,
+                max: f64::INFINITY,
+            });
+            continue;
+        }
+        if let Some(range) = KNOB_RANGES.iter().find(|range| range.path == path)
+            && (*value < range.min || *value > range.max)
+        {
+            violations.push(KnobViolation {
+                path: path.clone(),
+                value: *value,
+                min: range.min,
+                max: range.max,
+            });
+        }
+    }
+    violations
+}
+
+/// Look up a knob's declared range, if it has one.
+#[must_use]
+pub fn knob_range(path: &str) -> Option<&'static KnobRange> {
+    KNOB_RANGES.iter().find(|range| range.path == path)
+}
+
 #[derive(Debug, Clone, Default)]
 struct ActuationResult {
     delta: Option<ActuationDelta>,
@@ -12169,6 +12324,76 @@ mod tests {
     /// The proof: explain what the agent perceives now, then step the world once
     /// (stage_sense runs before anything moves, so it senses exactly the world we
     /// just explained) and require core's sensors to match what we predicted.
+    #[test]
+    fn knob_ranges_reject_the_absurd_and_admit_the_hostile() {
+        // The hole this closes: ScriptBotsConfig::validate() proves admissibility
+        // (finite, non-negative) but declares NO upper bounds, so a value like
+        // food_growth_rate = 1e9 sailed through from REST, from MCP, and
+        // therefore from any agent driving them. The "a confused model can only
+        // request what a human could" safety argument was simply not true.
+        let absurd = vec![
+            ("food_growth_rate".to_owned(), 1e9),
+            ("metabolism_drain".to_owned(), 50.0),
+            ("mutation.primary".to_owned(), 4.0),
+        ];
+        let violations = check_knob_ranges(&absurd);
+        assert_eq!(
+            violations.len(),
+            3,
+            "every violation must be reported at once: a caller fixing one knob \
+             per round trip gives up, and an autonomous one burns its budget"
+        );
+        assert!(violations[0].to_string().contains("food_growth_rate"));
+
+        // ...but a researcher must still be able to build a hostile world. These
+        // are bounds against the absurd, not against taste.
+        let harsh = vec![
+            ("metabolism_drain".to_owned(), 0.9),
+            ("spike_damage".to_owned(), 9.0),
+            ("food_growth_rate".to_owned(), 0.0),
+            ("temperature_discomfort_rate".to_owned(), 5.0),
+        ];
+        assert!(
+            check_knob_ranges(&harsh).is_empty(),
+            "a brutal-but-sane world must remain expressible: {:?}",
+            check_knob_ranges(&harsh)
+        );
+    }
+
+    #[test]
+    fn knob_ranges_reject_non_finite_values_even_for_unlisted_knobs() {
+        // A NaN silently poisons every reduction it reaches, so it is refused
+        // whether or not the knob carries a declared range.
+        let poison = vec![
+            ("some_unlisted_knob".to_owned(), f64::NAN),
+            ("another_unlisted".to_owned(), f64::INFINITY),
+        ];
+        assert_eq!(check_knob_ranges(&poison).len(), 2);
+
+        // An unlisted, finite knob is not range-checked here; validate() still
+        // governs it. Absence from the table is a gap, not a licence.
+        let unlisted = vec![("some_unlisted_knob".to_owned(), 1234.0)];
+        assert!(check_knob_ranges(&unlisted).is_empty());
+    }
+
+    #[test]
+    fn dimension_knobs_are_marked_fresh_world_only() {
+        // apply_config_update rejects live dimension changes, so an experiment
+        // planner that does not know this generates specs that die at apply
+        // time, one run at a time, and blames the simulation.
+        for path in ["world_width", "world_height", "food_cell_size"] {
+            let range = knob_range(path).expect("dimension knobs are declared");
+            assert!(
+                range.fresh_world_only,
+                "{path} cannot be changed on a live world"
+            );
+        }
+        assert!(
+            !knob_range("food_max").expect("declared").fresh_world_only,
+            "food_max is settable live"
+        );
+    }
+
     #[test]
     fn explain_sensors_reproduces_the_sensors_core_itself_computes() {
         // Freeze the food economy so sensor[4] cannot drift between the
