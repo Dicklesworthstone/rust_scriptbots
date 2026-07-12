@@ -236,7 +236,12 @@ impl Brain for MlpBrain {
         result
     }
 
-    fn mutate(&mut self, rng: &mut dyn RngCore, rate: f32, scale: f32) {
+    fn mutate(
+        &mut self,
+        rng: &mut dyn RngCore,
+        rate: f32,
+        scale: f32,
+    ) -> Result<(), crate::BrainMutationError> {
         let sigma = scale.max(1e-5);
         for params in &mut self.nodes {
             if rng.random::<f32>() < rate {
@@ -262,6 +267,7 @@ impl Brain for MlpBrain {
                 params.targets[idx] = rng.random_range(0..BRAIN_SIZE);
             }
         }
+        Ok(())
     }
 
     fn crossover(&self, other: &dyn Brain, rng: &mut dyn RngCore) -> Option<Box<dyn Brain>> {
@@ -280,8 +286,8 @@ impl Brain for MlpBrain {
         Some(Box::new(child))
     }
 
-    fn clone_box(&self) -> Box<dyn Brain> {
-        Box::new(self.clone())
+    fn clone_box(&self) -> Result<Box<dyn Brain>, crate::BrainCloneError> {
+        Ok(Box::new(self.clone()))
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
@@ -328,7 +334,9 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(456);
         let mut brain = MlpBrain::random(&mut rng);
         let original = brain.nodes[10].bias;
-        brain.mutate(&mut rng, 1.0, 0.5);
+        brain
+            .mutate(&mut rng, 1.0, 0.5)
+            .expect("MLP mutation is infallible");
         assert_ne!(brain.nodes[10].bias, original);
     }
 

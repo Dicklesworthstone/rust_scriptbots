@@ -133,7 +133,7 @@ impl Simulation {
         for step_index in 0..steps {
             self.world.step().with_context(|| {
                 format!(
-                    "persistence rejected WASM simulation step {} of {steps}",
+                    "simulation failed during WASM step {} of {steps}",
                     step_index + 1
                 )
             })?;
@@ -162,16 +162,22 @@ impl Simulation {
         let key = self
             .world
             .brain_registry_mut()
-            .register(MlpBrain::KIND.as_str(), |rng| MlpBrain::runner(rng));
+            .register(MlpBrain::KIND.as_str(), |rng| Ok(MlpBrain::runner(rng)));
         self.mlp_key = Some(key);
         Ok(key)
     }
 
-    fn bind_brain_to_all(&mut self, key: u64) {
+    fn bind_brain_to_all(&mut self, key: u64) -> Result<()> {
         let handles: Vec<_> = self.world.agents().iter_handles().collect();
         for id in handles {
-            let _ = self.world.bind_agent_brain(id, key);
+            ensure!(
+                self.world
+                    .bind_agent_brain(id, key)
+                    .with_context(|| format!("failed to construct brain {key} for agent {id:?}"))?,
+                "registered brain key {key} disappeared before binding agent {id:?}"
+            );
         }
+        Ok(())
     }
 
     fn apply_wander_to_all(&mut self) {
@@ -396,7 +402,7 @@ impl SimHandle {
                 let key = simulation.ensure_mlp_key().map_err(js_error)?;
                 simulation.spec.default_brain = Some(BrainPreset::Mlp);
                 simulation.spec.seed_strategy = SeedStrategy::None;
-                simulation.bind_brain_to_all(key);
+                simulation.bind_brain_to_all(key).map_err(js_error)?;
                 Ok(())
             }
             "wander" => {
@@ -456,7 +462,7 @@ fn seed_agents(
             None => {
                 let key = world
                     .brain_registry_mut()
-                    .register(MlpBrain::KIND.as_str(), |rng| MlpBrain::runner(rng));
+                    .register(MlpBrain::KIND.as_str(), |rng| Ok(MlpBrain::runner(rng)));
                 *mlp_key_cache = Some(key);
                 key
             }
@@ -495,7 +501,12 @@ fn seed_agents(
 
         let id = world.spawn_agent(agent);
         if let Some(key) = mlp_key {
-            let _ = world.bind_agent_brain(id, key);
+            ensure!(
+                world
+                    .bind_agent_brain(id, key)
+                    .with_context(|| format!("failed to construct MLP brain for agent {id:?}"))?,
+                "registered MLP brain disappeared before binding agent {id:?}"
+            );
         } else if matches!(strategy, SeedStrategy::Wander) {
             bind_wander_brain(world, id, wander_seed)?;
         }

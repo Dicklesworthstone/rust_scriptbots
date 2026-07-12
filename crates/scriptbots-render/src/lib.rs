@@ -1367,6 +1367,7 @@ struct SimulationView {
     analytics_cache: Option<HudAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: StorageUiStatus,
+    simulation_fault: Option<String>,
     #[cfg(feature = "audio")]
     audio: Option<AudioState>,
     // When true, render a minimal canvas-focused layout (used in the dedicated world window).
@@ -1414,6 +1415,7 @@ impl SimulationView {
             analytics_cache: None,
             analytics_revision: None,
             analytics_status: StorageUiStatus::default(),
+            simulation_fault: None,
             #[cfg(feature = "audio")]
             audio: AudioState::new()
                 .map_err(|err| {
@@ -1443,12 +1445,11 @@ impl SimulationView {
             .unwrap_or_default()
     }
 
-    fn pause_for_persistence_failure(&mut self, detail: String) {
+    fn pause_for_simulation_failure(&mut self, detail: String) {
         self.controls.paused = true;
         self.sim_accumulator = 0.0;
-        self.analytics_status.last_error = Some(detail.clone());
-        self.analytics_status.stopped = true;
-        warn!(error = %detail, "Simulation paused at persistence admission boundary");
+        self.simulation_fault = Some(detail.clone());
+        warn!(error = %detail, "Simulation paused after a terminal step failure");
     }
 
     #[allow(clippy::collapsible_if)]
@@ -1457,13 +1458,13 @@ impl SimulationView {
         let last = self.last_sim_instant.unwrap_or(now);
         self.last_sim_instant = Some(now);
 
-        let latched_fault = self.world.lock().ok().and_then(|world| {
-            world
-                .persistence_fault()
-                .map(std::string::ToString::to_string)
-        });
+        let latched_fault = self
+            .world
+            .lock()
+            .ok()
+            .and_then(|world| world.latched_step_error().map(|error| error.to_string()));
         if let Some(error) = latched_fault {
-            self.pause_for_persistence_failure(error);
+            self.pause_for_simulation_failure(error);
             return;
         }
 
@@ -1532,27 +1533,25 @@ impl SimulationView {
 
         self.sim_accumulator -= step_interval * steps as f32;
 
-        let mut persistence_error = None;
+        let mut step_error = None;
         if let Ok(mut world) = self.world.lock() {
-            if world.persistence_fault().is_some() {
-                persistence_error = world
-                    .persistence_fault()
-                    .map(std::string::ToString::to_string);
+            if let Some(error) = world.latched_step_error() {
+                step_error = Some(error.to_string());
             } else {
                 (self.command_drain.as_ref())(&mut world);
             }
             for _ in 0..steps {
-                if persistence_error.is_some() {
+                if step_error.is_some() {
                     break;
                 }
                 if let Err(error) = world.step() {
-                    persistence_error = Some(error.to_string());
+                    step_error = Some(error.to_string());
                     break;
                 }
             }
         }
-        if let Some(error) = persistence_error {
-            self.pause_for_persistence_failure(error);
+        if let Some(error) = step_error {
+            self.pause_for_simulation_failure(error);
         }
     }
 
@@ -1950,6 +1949,7 @@ impl SimulationView {
 
         snapshot.analytics = self.analytics_cache.clone();
         snapshot.storage = self.analytics_status.clone();
+        snapshot.simulation_fault.clone_from(&self.simulation_fault);
 
         snapshot.perf = self.last_perf;
         snapshot.controls = self.controls.snapshot();
@@ -2312,14 +2312,26 @@ impl SimulationView {
             .text_xs()
             .text_color(rgb(storage_color))
             .child(status_text);
+        let simulation_bar = snapshot.simulation_fault.as_ref().map(|error| {
+            div()
+                .text_xs()
+                .text_color(rgb(0xf87171))
+                .child(format!("Simulation fault · {error}"))
+        });
 
         let Some(analytics) = snapshot.analytics.as_ref() else {
-            return div().flex().flex_col().gap_2().child(storage_bar).child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(theme.text_subtle))
-                    .child("Analytics warming up; waiting for the first durable commit."),
-            );
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(simulation_bar)
+                .child(storage_bar)
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(theme.text_subtle))
+                        .child("Analytics warming up; waiting for the first durable commit."),
+                );
         };
 
         let total_agents = snapshot
@@ -2651,6 +2663,7 @@ impl SimulationView {
             .flex()
             .flex_col()
             .gap_4()
+            .children(simulation_bar)
             .child(storage_bar)
             .child(meta_bar)
             .child(trophic_row)
@@ -3186,8 +3199,8 @@ impl SimulationView {
         cx: &mut Context<Self>,
     ) {
         if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.persistence_fault() {
-                warn!(error = %error, "Mutation-rate edit blocked by persistence failure");
+            if let Some(error) = world.latched_step_error() {
+                warn!(error = %error, "Mutation-rate edit blocked by terminal simulation failure");
                 return;
             }
             let Some(runtime) = world.runtime_mut().get_mut(agent_id) else {
@@ -3982,8 +3995,8 @@ impl SimulationView {
         }
     }
     fn spawn_agent_with_bias_internal(&self, world: &mut WorldState, herbivore_bias: f32) -> bool {
-        if let Some(error) = world.persistence_fault() {
-            warn!(error = %error, "Agent spawn blocked by persistence failure");
+        if let Some(error) = world.latched_step_error() {
+            warn!(error = %error, "Agent spawn blocked by terminal simulation failure");
             return false;
         }
         let width = world.config().world_width as f32;
@@ -4022,8 +4035,8 @@ impl SimulationView {
     fn spawn_crossover_agent(&mut self, cx: &mut Context<Self>) {
         let mut spawned = false;
         if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.persistence_fault() {
-                warn!(error = %error, "Crossover spawn blocked by persistence failure");
+            if let Some(error) = world.latched_step_error() {
+                warn!(error = %error, "Crossover spawn blocked by terminal simulation failure");
                 return;
             }
             let selected: Vec<AgentId> = {
@@ -4089,8 +4102,8 @@ impl SimulationView {
 
     fn toggle_closed_environment(&mut self, cx: &mut Context<Self>) {
         let next = if let Ok(world) = self.world.lock() {
-            if let Some(error) = world.persistence_fault() {
-                warn!(error = %error, "Environment mutation blocked by persistence failure");
+            if let Some(error) = world.latched_step_error() {
+                warn!(error = %error, "Environment mutation blocked by terminal simulation failure");
                 return;
             }
             !world.is_closed()
@@ -5123,20 +5136,20 @@ impl SimulationView {
         });
         let open_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             if let Ok(mut world) = this.world.lock() {
-                if world.persistence_fault().is_none() {
+                if world.latched_step_error().is_none() {
                     world.set_closed(false);
                 } else {
-                    warn!("Open-world action blocked by persistence failure");
+                    warn!("Open-world action blocked by terminal simulation failure");
                 }
             }
             cx.notify();
         });
         let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             if let Ok(mut world) = this.world.lock() {
-                if world.persistence_fault().is_none() {
+                if world.latched_step_error().is_none() {
                     world.set_closed(true);
                 } else {
-                    warn!("Close-world action blocked by persistence failure");
+                    warn!("Close-world action blocked by terminal simulation failure");
                 }
             }
             cx.notify();
@@ -8428,6 +8441,7 @@ struct HudSnapshot {
     summary: Option<HudMetrics>,
     analytics: Option<HudAnalytics>,
     storage: StorageUiStatus,
+    simulation_fault: Option<String>,
     recent_history: Vec<HudHistoryEntry>,
     render_frame: Option<RenderFrame>,
     inspector: InspectorSnapshot,
@@ -13003,5 +13017,24 @@ mod command_characterization_tests {
             (0, 0),
             "KNOWN DEFECT bd-2z0.4.1: GPUI leaves playback in the inner world queue"
         );
+    }
+
+    #[test]
+    fn simulation_fault_survives_storage_health_refresh() {
+        let world = command_characterization_world();
+        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let mut view = simulation_view(world, drain);
+        view.pause_for_simulation_failure("deliberate brain construction failure".to_owned());
+
+        view.maybe_refresh_analytics(0, 0);
+        let snapshot = view.snapshot();
+
+        assert_eq!(
+            snapshot.simulation_fault.as_deref(),
+            Some("deliberate brain construction failure")
+        );
+        assert!(snapshot.storage.last_error.is_none());
+        assert!(!snapshot.storage.stopped);
+        assert!(snapshot.controls.paused);
     }
 }

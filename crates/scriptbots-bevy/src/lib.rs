@@ -4122,11 +4122,12 @@ fn spawn_simulation_driver(
                 dt = 0.25;
             }
 
-            let mut latched_persistence_failure = None;
+            let mut latched_step_failure = None;
             if let Ok(mut world_guard) = world.lock() {
-                if let Some(error) = world_guard.persistence_fault() {
-                    latched_persistence_failure =
-                        Some(format!("Persistence stopped the simulation: {error}"));
+                if let Some(error) = world_guard.latched_step_error() {
+                    latched_step_failure = Some(format!(
+                        "Simulation stopped after a terminal step failure: {error}"
+                    ));
                 } else {
                     (command_drain.as_ref())(&mut world_guard);
                     let pending = world_guard.drain_simulation_commands();
@@ -4138,7 +4139,7 @@ fn spawn_simulation_driver(
                     }
                 }
             }
-            if let Some(reason) = latched_persistence_failure {
+            if let Some(reason) = latched_step_failure {
                 controls.update(|state| {
                     state.paused = true;
                     state.auto_pause_reason = Some(reason.clone());
@@ -4199,11 +4200,12 @@ fn spawn_simulation_driver(
                     steps = 1;
                 }
 
-                let mut persistence_failure = None;
+                let mut step_failure = None;
                 for _ in 0..steps {
                     if let Err(error) = world_guard.step() {
-                        persistence_failure =
-                            Some(format!("Persistence stopped the simulation: {error}"));
+                        step_failure = Some(format!(
+                            "Simulation stopped after a terminal step failure: {error}"
+                        ));
                         break;
                     }
                 }
@@ -4213,8 +4215,8 @@ fn spawn_simulation_driver(
                 let max_age = world_guard.last_max_age();
                 let spike_hits = world_guard.last_spike_hits();
 
-                let persistence_failed = persistence_failure.is_some();
-                let mut reason = persistence_failure;
+                let step_failed = step_failure.is_some();
+                let mut reason = step_failure;
                 if reason.is_none() {
                     if control.auto_pause_on_spike_hit && spike_hits > 0 {
                         reason = Some(format!("Spike hits detected ({spike_hits})"));
@@ -4235,15 +4237,18 @@ fn spawn_simulation_driver(
                         state.auto_pause_reason = Some(reason.clone());
                         state.step_requested = false;
                     });
-                    if let Err(error) = world_guard.enqueue_simulation_command(SimulationCommand {
-                        paused: Some(true),
-                        speed_multiplier: Some(0.0),
-                        step_once: false,
-                    }) {
+                    if !step_failed
+                        && let Err(error) =
+                            world_guard.enqueue_simulation_command(SimulationCommand {
+                                paused: Some(true),
+                                speed_multiplier: Some(0.0),
+                                step_once: false,
+                            })
+                    {
                         warn!(%error, "failed to queue Bevy auto-pause command");
                     }
-                    if persistence_failed {
-                        warn!(%reason, "Bevy simulation paused after persistence failure");
+                    if step_failed {
+                        warn!(%reason, "Bevy simulation paused after terminal step failure");
                     } else {
                         info!(%reason, "Bevy simulation auto-paused");
                     }

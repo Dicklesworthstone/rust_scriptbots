@@ -617,19 +617,20 @@ impl BrainBinding {
     }
 
     /// Instantiate a brain from the registry and bind it to the agent.
-    #[must_use]
     pub fn from_registry(
         registry: &BrainRegistry,
         rng: &mut dyn RngCore,
         key: u64,
-    ) -> Option<Self> {
-        let runner = registry.spawn(rng, key)?;
+    ) -> Result<Option<Self>, BrainSpawnError> {
+        let Some(runner) = registry.spawn(rng, key)? else {
+            return Ok(None);
+        };
         let kind = registry.kind(key).map(str::to_string);
-        Some(Self {
+        Ok(Some(Self {
             runner: Some(runner),
             registry_key: Some(key),
             kind,
-        })
+        }))
     }
 
     /// Attach an inherited runner while preserving the family registry key,
@@ -710,13 +711,21 @@ pub trait BrainRunner: Send + Sync {
     /// Duplicate this runner including all evolved parameters.
     ///
     /// `None` marks the family as non-heritable; reproduction then falls back
-    /// to spawning a fresh runner from the registry.
-    fn clone_runner(&self) -> Option<Box<dyn BrainRunner>> {
-        None
+    /// to spawning a fresh runner from the registry. An exact-snapshot failure
+    /// is returned as an error and must never be normalized into `None`.
+    fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+        Ok(None)
     }
 
     /// Perturb parameters in place using the agent's mutation rates.
-    fn mutate(&mut self, _rng: &mut dyn RngCore, _rate: f32, _scale: f32) {}
+    fn mutate(
+        &mut self,
+        _rng: &mut dyn RngCore,
+        _rate: f32,
+        _scale: f32,
+    ) -> Result<(), BrainSpawnError> {
+        Ok(())
+    }
 
     /// Produce an offspring runner by recombining with a same-kind partner.
     fn crossover(
@@ -734,7 +743,60 @@ pub trait BrainRunner: Send + Sync {
     }
 }
 
-type BrainSpawner = Box<dyn Fn(&mut dyn RngCore) -> Box<dyn BrainRunner> + Send + Sync + 'static>;
+/// Typed failure returned by a registered brain factory.
+#[derive(Debug, Clone)]
+pub struct BrainSpawnError {
+    kind: Cow<'static, str>,
+    source: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for BrainSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "brain factory `{}` failed: {}", self.kind, self.source)
+    }
+}
+
+impl std::error::Error for BrainSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl BrainSpawnError {
+    /// Attach a concrete adapter error to its registered brain-family label.
+    pub fn new<E>(kind: impl Into<Cow<'static, str>>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self {
+            kind: kind.into(),
+            source: std::sync::Arc::new(source),
+        }
+    }
+
+    /// Brain-family label whose factory failed.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.kind.as_ref()
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("brain registry key {key} disappeared before offspring construction")]
+struct MissingBrainFactory {
+    key: u64,
+}
+
+#[derive(Debug, Error)]
+#[error("bound parent has no exact heritable snapshot and no registry fallback")]
+struct MissingHeritableBrain;
+
+type BrainSpawner = Box<
+    dyn Fn(&mut dyn RngCore) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 struct BrainEntry {
     kind: Cow<'static, str>,
@@ -763,10 +825,13 @@ impl BrainRegistry {
         Self::default()
     }
 
-    /// Registers a new brain factory, returning its registry key.
+    /// Registers a fallible brain factory, returning its registry key.
     pub fn register<F>(&mut self, kind: impl Into<Cow<'static, str>>, factory: F) -> u64
     where
-        F: Fn(&mut dyn RngCore) -> Box<dyn BrainRunner> + Send + Sync + 'static,
+        F: Fn(&mut dyn RngCore) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+            + Send
+            + Sync
+            + 'static,
     {
         let key = self.next_key;
         self.next_key += 1;
@@ -786,8 +851,14 @@ impl BrainRegistry {
     }
 
     /// Instantiate a new brain runner using the factory referenced by `key`.
-    pub fn spawn(&self, rng: &mut dyn RngCore, key: u64) -> Option<Box<dyn BrainRunner>> {
-        self.entries.get(&key).map(|entry| (entry.spawner)(rng))
+    pub fn spawn(
+        &self,
+        rng: &mut dyn RngCore,
+        key: u64,
+    ) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+        self.entries
+            .get(&key)
+            .map_or(Ok(None), |entry| (entry.spawner)(rng).map(Some))
     }
 
     /// Retrieve the descriptive identifier associated with a registry entry.
@@ -1263,8 +1334,16 @@ struct SpawnOrder {
     parent_index: usize,
     parent_id: AgentId,
     partner_id: Option<AgentId>,
+    parent_energy_before_debit: f32,
+    parent_reproduction_counter_before_reset: f32,
     data: AgentData,
     runtime: AgentRuntime,
+}
+
+struct PopulationSpawnReceipt {
+    inserted: Vec<AgentId>,
+    arena_checkpoint: (SlotMap<AgentId, usize>, usize),
+    rng_before: SmallRng,
 }
 
 /// Events emitted after processing a world tick.
@@ -1603,6 +1682,25 @@ impl PersistenceAdmissionError {
     pub fn detail(&self) -> &str {
         &self.detail
     }
+}
+
+/// Failure while executing a simulation tick.
+#[derive(Debug, Clone, Error)]
+pub enum WorldStepError {
+    /// A registered brain factory could not construct a runner.
+    #[error(transparent)]
+    BrainSpawn(#[from] BrainSpawnError),
+    /// The completed tick could not be admitted to persistence.
+    #[error(transparent)]
+    Persistence(#[from] PersistenceAdmissionError),
+    /// Brain construction and persistence admission both failed at the same completed boundary.
+    #[error(
+        "brain construction failed while the completed tick was also rejected by persistence: {brain}; {persistence}"
+    )]
+    BrainAndPersistence {
+        brain: BrainSpawnError,
+        persistence: PersistenceAdmissionError,
+    },
 }
 
 /// No-op persistence sink.
@@ -2325,6 +2423,28 @@ impl AgentArena {
         let id = self.slots.insert(index);
         self.handles.push(id);
         id
+    }
+
+    /// Capture the allocator and dense length before an append-only transaction.
+    ///
+    /// Restoring this checkpoint preserves both live rows and the otherwise
+    /// invisible `SlotMap` generation/free-list state when fallible preparation
+    /// forces recently appended agents to roll back.
+    fn append_checkpoint(&self) -> (SlotMap<AgentId, usize>, usize) {
+        (self.slots.clone(), self.columns.len())
+    }
+
+    /// Roll back agents appended after `checkpoint` without advancing handle
+    /// generations or perturbing the pre-existing dense order.
+    fn restore_append_checkpoint(&mut self, checkpoint: (SlotMap<AgentId, usize>, usize)) {
+        let (slots, len) = checkpoint;
+        debug_assert!(len <= self.columns.len());
+        self.slots = slots;
+        self.handles.truncate(len);
+        self.columns.truncate(len);
+        self.columns.debug_assert_coherent();
+        debug_assert_eq!(self.handles.len(), len);
+        debug_assert_eq!(self.slots.len(), len);
     }
 
     /// Remove `id` returning its scalar data if it was present.
@@ -4982,6 +5102,7 @@ pub struct WorldState {
     persistence: Box<dyn WorldPersistence>,
     pending_persistence_batch: Option<PersistenceBatch>,
     persistence_fault: Option<PersistenceAdmissionError>,
+    brain_fault: Option<BrainSpawnError>,
     last_admitted_persistence_tick: Option<Tick>,
     pending_persistence_runtime_tail: AgentMap<PersistenceRuntimeTail>,
     pending_birth_events: usize,
@@ -5103,6 +5224,7 @@ impl WorldState {
             persistence,
             pending_persistence_batch: None,
             persistence_fault: None,
+            brain_fault: None,
             last_admitted_persistence_tick: None,
             pending_persistence_runtime_tail: AgentMap::new(),
             pending_birth_events: 0,
@@ -6892,11 +7014,11 @@ impl WorldState {
             self.pulse_indicator(id, intensity, color);
         }
     }
-    fn spawn_crossover_agent(&mut self) -> bool {
+    fn spawn_crossover_agent(&mut self) -> Result<Option<AgentId>, BrainSpawnError> {
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let count = handles.len();
         if count < 2 {
-            return false;
+            return Ok(None);
         }
 
         let (idx1, idx2) = {
@@ -6924,7 +7046,7 @@ impl WorldState {
             if first == second {
                 second = (second + 1) % count;
                 if second == first {
-                    return false;
+                    return Ok(None);
                 }
             }
             (first, second)
@@ -6943,27 +7065,20 @@ impl WorldState {
         };
         let parent_runtime = match self.runtime.get(parent_id).cloned() {
             Some(rt) => rt,
-            None => return false,
+            None => return Ok(None),
         };
         let partner_runtime = self.runtime.get(partner_id).cloned();
 
         // Species barrier: require matching brain kinds for sexual reproduction
         if let Some(ref partner_rt) = partner_runtime {
-            let pk1 = parent_runtime.brain.registry_key();
-            let pk2 = partner_rt.brain.registry_key();
-            let kind_match = match (pk1, pk2) {
-                (Some(k1), Some(k2)) => {
-                    let a = self.brain_registry.kind(k1);
-                    let b = self.brain_registry.kind(k2);
-                    a.is_some() && a == b
-                }
-                _ => false,
-            };
+            let parent_kind = parent_runtime.brain.kind();
+            let partner_kind = partner_rt.brain.kind();
+            let kind_match = parent_kind.is_some() && parent_kind == partner_kind;
             if !kind_match {
-                return false; // fall back to random spawn in caller
+                return Ok(None); // fall back to random spawn in caller
             }
         } else {
-            return false;
+            return Ok(None);
         }
 
         let width = self.config.world_width as f32;
@@ -6977,7 +7092,7 @@ impl WorldState {
             width,
             height,
         );
-        let child_runtime = self.build_child_runtime(
+        let mut child_runtime = self.build_child_runtime(
             &parent_runtime,
             partner_runtime.as_ref(),
             self.config.reproduction_gene_log_capacity,
@@ -6985,18 +7100,18 @@ impl WorldState {
             Some(partner_id),
         );
 
-        let child_id = self.spawn_agent(child_data);
-        let child_rates = child_runtime.mutation_rates;
-        if let Some(runtime) = self.runtime.get_mut(child_id) {
-            *runtime = child_runtime;
-        } else {
-            return false;
-        }
+        // Preserve the historical RNG position of `spawn_agent`, whose random runtime was
+        // immediately replaced below, while constructing any fallible fallback brain before
+        // insertion so a factory error cannot leave a partially inserted child.
+        let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
 
-        // Real brain crossover (same kind already enforced above); fall back
-        // to a fresh registry spawn of the parent's family when the runners
-        // cannot recombine.
+        let child_rates = child_runtime.mutation_rates;
         let inherited_key = parent_runtime.brain.registry_key();
+        let parent_was_bound = self
+            .runtime
+            .get(parent_id)
+            .is_some_and(|runtime| runtime.brain.is_bound());
+        let parent_kind = parent_runtime.brain.kind().unwrap_or("unknown").to_owned();
         let inherited_runner: Option<Box<dyn BrainRunner>> = {
             let parent_runner = self.runtime.get(parent_id).and_then(|rt| rt.brain.runner());
             let partner_runner = self
@@ -7004,62 +7119,106 @@ impl WorldState {
                 .get(partner_id)
                 .and_then(|rt| rt.brain.runner());
             match (parent_runner, partner_runner) {
-                (Some(parent), Some(partner)) => parent
-                    .crossover(partner, &mut self.rng)
-                    .or_else(|| parent.clone_runner()),
-                (Some(parent), None) => parent.clone_runner(),
+                (Some(parent), Some(partner)) => {
+                    if let Some(runner) = parent.crossover(partner, &mut self.rng) {
+                        Some(runner)
+                    } else {
+                        parent.clone_runner()?
+                    }
+                }
+                (Some(parent), None) => parent.clone_runner()?,
                 _ => None,
             }
         };
         if let Some(mut runner) = inherited_runner {
-            runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary);
-            if let Some(rt) = self.runtime.get_mut(child_id) {
-                rt.brain = BrainBinding::inherited(runner, inherited_key);
-            }
+            runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary)?;
+            child_runtime.brain = BrainBinding::inherited(runner, inherited_key);
         } else if let Some(key) = inherited_key {
-            let _ = self.bind_agent_brain(child_id, key);
+            let Some(binding) =
+                BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+            else {
+                return Err(BrainSpawnError::new(
+                    parent_kind.clone(),
+                    MissingBrainFactory { key },
+                ));
+            };
+            child_runtime.brain = binding;
+        } else if parent_was_bound {
+            return Err(BrainSpawnError::new(parent_kind, MissingHeritableBrain));
         }
-        true
+
+        let child_id = self.agents.insert(child_data);
+        self.runtime.insert(child_id, child_runtime);
+        Ok(Some(child_id))
     }
 
-    fn stage_population(&mut self, next_tick: Tick) {
+    fn rollback_population_spawns(&mut self, receipt: PopulationSpawnReceipt) {
+        for id in receipt.inserted {
+            let removed = self.runtime.remove(id);
+            debug_assert!(removed.is_some());
+        }
+        self.agents
+            .restore_append_checkpoint(receipt.arena_checkpoint);
+        self.rng = receipt.rng_before;
+    }
+
+    fn stage_population(
+        &mut self,
+        next_tick: Tick,
+    ) -> Result<Option<PopulationSpawnReceipt>, BrainSpawnError> {
         if self.closed {
-            return;
+            return Ok(None);
         }
 
         let minimum = self.config.population_minimum;
-        if minimum > 0 {
-            while self.agents.len() < minimum {
-                self.spawn_random_agent();
-            }
-        }
-
         let interval = self.config.population_spawn_interval;
-        if interval == 0 {
-            return;
-        }
-        if !next_tick.0.is_multiple_of(interval as u64) {
-            return;
+        let minimum_requires_spawn = minimum > 0 && self.agents.len() < minimum;
+        let scheduled_spawn = interval != 0 && next_tick.0.is_multiple_of(interval as u64);
+        if !minimum_requires_spawn && !scheduled_spawn {
+            return Ok(None);
         }
 
-        let spawn_count = self.config.population_spawn_count.max(1);
-        let crossover_chance = self.config.population_crossover_chance.clamp(0.0, 1.0);
-        for _ in 0..spawn_count {
-            let use_crossover = self.agents.len() >= 2
-                && crossover_chance > 0.0
-                && self.rng.random_range(0.0..1.0) < crossover_chance;
-            let spawned = if use_crossover {
-                self.spawn_crossover_agent()
-            } else {
-                false
-            };
-            if !spawned {
-                self.spawn_random_agent();
+        let mut receipt = PopulationSpawnReceipt {
+            inserted: Vec::new(),
+            arena_checkpoint: self.agents.append_checkpoint(),
+            rng_before: self.rng.clone(),
+        };
+        let result: Result<(), BrainSpawnError> = (|| {
+            while self.agents.len() < minimum {
+                receipt.inserted.push(self.spawn_random_agent()?);
+            }
+
+            if scheduled_spawn {
+                let spawn_count = self.config.population_spawn_count.max(1);
+                let crossover_chance = self.config.population_crossover_chance.clamp(0.0, 1.0);
+                for _ in 0..spawn_count {
+                    let use_crossover = self.agents.len() >= 2
+                        && crossover_chance > 0.0
+                        && self.rng.random_range(0.0..1.0) < crossover_chance;
+                    let spawned = if use_crossover {
+                        self.spawn_crossover_agent()?
+                    } else {
+                        None
+                    };
+                    if let Some(id) = spawned {
+                        receipt.inserted.push(id);
+                    } else {
+                        receipt.inserted.push(self.spawn_random_agent()?);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(Some(receipt)),
+            Err(error) => {
+                self.rollback_population_spawns(receipt);
+                Err(error)
             }
         }
     }
 
-    fn spawn_random_agent(&mut self) {
+    fn spawn_random_agent(&mut self) -> Result<AgentId, BrainSpawnError> {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
         let position = Position::new(
@@ -7085,10 +7244,21 @@ impl WorldState {
             0,
             Generation::default(),
         );
-        let id = self.spawn_agent(data);
-        if let Some(key) = self.brain_registry.random_key(&mut self.rng) {
-            let _ = self.bind_agent_brain(id, key);
+        // `spawn_agent` historically initialized runtime traits before choosing a registry key.
+        // Build the same runtime first so fallible brain construction preserves seeded behavior
+        // without leaving a partially inserted agent on error.
+        let mut runtime = AgentRuntime::new_random(&mut self.rng);
+        let binding = if let Some(key) = self.brain_registry.random_key(&mut self.rng) {
+            BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+        } else {
+            None
+        };
+        if let Some(binding) = binding {
+            runtime.brain = binding;
         }
+        let id = self.agents.insert(data);
+        self.runtime.insert(id, runtime);
+        Ok(id)
     }
     fn pulse_indicator(&mut self, id: AgentId, intensity: f32, color: [f32; 3]) {
         if let Some(runtime) = self.runtime.get_mut(id) {
@@ -7796,7 +7966,6 @@ impl WorldState {
         let reproduction_chance = self.cadence.reproduction_chance();
 
         for (idx, agent_id) in handles.iter().enumerate() {
-            let parent_runtime_snapshot;
             {
                 let runtime = match self.runtime.get_mut(*agent_id) {
                     Some(rt) => rt,
@@ -7826,18 +7995,24 @@ impl WorldState {
                 continue;
             }
 
-            {
+            let (
+                parent_runtime_snapshot,
+                parent_energy_before_debit,
+                parent_reproduction_counter_before_reset,
+            ) = {
                 let runtime = match self.runtime.get_mut(*agent_id) {
                     Some(rt) => rt,
                     None => continue,
                 };
+                let energy_before_debit = runtime.energy;
+                let reproduction_counter_before_reset = runtime.reproduction_counter;
                 runtime.energy -= self.config.reproduction_energy_cost;
                 runtime.reproduction_counter = 0.0;
-                parent_runtime_snapshot = Some(runtime.clone());
-            }
-
-            let Some(parent_runtime_snapshot) = parent_runtime_snapshot else {
-                continue;
+                (
+                    runtime.clone(),
+                    energy_before_debit,
+                    reproduction_counter_before_reset,
+                )
             };
 
             let partner_index =
@@ -7867,6 +8042,8 @@ impl WorldState {
                 parent_index: idx,
                 parent_id: *agent_id,
                 partner_id: partner_index.map(|j| handles[j]),
+                parent_energy_before_debit,
+                parent_reproduction_counter_before_reset,
                 data: child_data,
                 runtime: child_runtime,
             });
@@ -7903,54 +8080,111 @@ impl WorldState {
         best.map(|(idx, _)| idx)
     }
 
-    fn stage_spawn_commit(&mut self, tick: Tick) {
+    fn refund_spawn_orders(&mut self, orders: &[SpawnOrder]) {
+        for order in orders {
+            debug_assert!(
+                self.runtime.contains_key(order.parent_id),
+                "queued birth parent disappeared before refund"
+            );
+            if let Some(parent) = self.runtime.get_mut(order.parent_id) {
+                parent.energy = order.parent_energy_before_debit;
+                parent.reproduction_counter = order.parent_reproduction_counter_before_reset;
+            }
+        }
+    }
+
+    fn abort_pending_spawns(&mut self) {
+        let orders = std::mem::take(&mut self.pending_spawns);
+        self.refund_spawn_orders(&orders);
+        self.last_births = 0;
+    }
+
+    fn stage_spawn_commit(&mut self, tick: Tick) -> Result<(), BrainSpawnError> {
         if self.pending_spawns.is_empty() {
-            return;
+            return Ok(());
         }
         let mut orders = std::mem::take(&mut self.pending_spawns);
         orders.sort_by_key(|order| order.parent_index);
+
+        // Construct every offspring brain before inserting any child. This keeps a fallible
+        // registry factory from leaving a partially committed birth set. The discarded runtime
+        // preserves the historical RNG position of `spawn_agent`, which used to create one and
+        // immediately overwrite it for every queued birth.
+        let rng_before = self.rng.clone();
+        let preparation = (|| -> Result<(), BrainSpawnError> {
+            for order in &mut orders {
+                let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
+                let inherited_key = order.runtime.brain.registry_key();
+                let child_rates = order.runtime.mutation_rates;
+                let parent_was_bound = self
+                    .runtime
+                    .get(order.parent_id)
+                    .is_some_and(|runtime| runtime.brain.is_bound());
+                let parent_kind = self
+                    .runtime
+                    .get(order.parent_id)
+                    .and_then(|runtime| runtime.brain.kind())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let inherited_runner: Option<Box<dyn BrainRunner>> = {
+                    let parent_runner = self
+                        .runtime
+                        .get(order.parent_id)
+                        .and_then(|runtime| runtime.brain.runner());
+                    if let Some(parent_runner) = parent_runner {
+                        let partner_runner = order
+                            .partner_id
+                            .and_then(|partner_id| self.runtime.get(partner_id))
+                            .and_then(|runtime| runtime.brain.runner())
+                            .filter(|partner| partner.kind() == parent_runner.kind());
+                        if let Some(runner) = partner_runner
+                            .and_then(|partner| parent_runner.crossover(partner, &mut self.rng))
+                        {
+                            Some(runner)
+                        } else {
+                            parent_runner.clone_runner()?
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(mut runner) = inherited_runner {
+                    runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary)?;
+                    order.runtime.brain = BrainBinding::inherited(runner, inherited_key);
+                } else if let Some(key) = inherited_key {
+                    let kind = order.runtime.brain.kind().unwrap_or("unknown").to_owned();
+                    let Some(binding) =
+                        BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+                    else {
+                        return Err(BrainSpawnError::new(kind, MissingBrainFactory { key }));
+                    };
+                    order.runtime.brain = binding;
+                } else if parent_was_bound {
+                    return Err(BrainSpawnError::new(parent_kind, MissingHeritableBrain));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = preparation {
+            self.rng = rng_before;
+            self.refund_spawn_orders(&orders);
+            self.last_births = 0;
+            return Err(error);
+        }
+
         self.last_births = orders.len();
         for order in orders {
             let SpawnOrder {
                 parent_index: _,
                 parent_id,
                 partner_id,
+                parent_energy_before_debit: _,
+                parent_reproduction_counter_before_reset: _,
                 data,
                 runtime,
             } = order;
-            let child_id = self.spawn_agent(data);
-            let inherited_key = runtime.brain.registry_key();
-            let child_rates = runtime.mutation_rates;
+            let child_id = self.agents.insert(data);
             self.runtime.insert(child_id, runtime);
-
-            // Brain heredity (legacy: child receives parent weights, then
-            // mutates): crossover when both parents are live and same-kind,
-            // else clone the parent, else respawn the family from the
-            // registry as a last resort.
-            let inherited_runner: Option<Box<dyn BrainRunner>> = {
-                let parent_runner = self.runtime.get(parent_id).and_then(|rt| rt.brain.runner());
-                parent_runner
-                    .map(|parent_runner| {
-                        let partner_runner = partner_id
-                            .and_then(|pid| self.runtime.get(pid))
-                            .and_then(|rt| rt.brain.runner())
-                            .filter(|partner| partner.kind() == parent_runner.kind());
-                        (parent_runner, partner_runner)
-                    })
-                    .and_then(|(parent_runner, partner_runner)| {
-                        partner_runner
-                            .and_then(|partner| parent_runner.crossover(partner, &mut self.rng))
-                            .or_else(|| parent_runner.clone_runner())
-                    })
-            };
-            if let Some(mut runner) = inherited_runner {
-                runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary);
-                if let Some(rt) = self.runtime.get_mut(child_id) {
-                    rt.brain = BrainBinding::inherited(runner, inherited_key);
-                }
-            } else if let Some(key) = inherited_key {
-                self.bind_agent_brain(child_id, key);
-            }
 
             if let (Some(child_runtime), Some(idx)) =
                 (self.runtime.get(child_id), self.agents.index_of(child_id))
@@ -7974,6 +8208,7 @@ impl WorldState {
                 self.pending_birth_records.push(record);
             }
         }
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     fn build_child_data(
@@ -8958,9 +9193,18 @@ impl WorldState {
     }
 
     /// Execute one simulation tick pipeline returning emitted events.
-    pub fn step(&mut self) -> Result<TickEvents, PersistenceAdmissionError> {
-        if let Some(error) = &self.persistence_fault {
-            return Err(error.clone());
+    ///
+    /// A returned error can describe a tick that has already reached its completed boundary. A
+    /// persistence rejection retains that exact completed batch for explicit retry and sets
+    /// [`Self::persistence_fault`]. A brain-construction failure rolls back population inserts and
+    /// refuses a partial queued-birth commit, completes the remaining tick bookkeeping and
+    /// persistence boundary, advances `tick`, and sets [`Self::brain_fault`]. If both fail, both faults are retained and
+    /// [`WorldStepError::BrainAndPersistence`] reports them together. In every case, a latched fault
+    /// blocks later science ticks without mutation; callers must not retry `step` as though the
+    /// failed return meant the current tick was unapplied.
+    pub fn step(&mut self) -> Result<TickEvents, WorldStepError> {
+        if let Some(error) = self.latched_step_error() {
+            return Err(error);
         }
 
         let next_tick = self.tick.next();
@@ -8978,8 +9222,21 @@ impl WorldState {
         self.stage_combat();
         self.stage_death_cleanup(next_tick);
         self.stage_reproduction();
-        self.stage_population(next_tick);
-        self.stage_spawn_commit(next_tick);
+        let brain_result = match self.stage_population(next_tick) {
+            Ok(population_receipt) => match self.stage_spawn_commit(next_tick) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    if let Some(receipt) = population_receipt {
+                        self.rollback_population_spawns(receipt);
+                    }
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                self.abort_pending_spawns();
+                Err(error)
+            }
+        };
         self.stage_accumulate_food_balance();
         self.stage_accumulate_tick_events();
         self.stage_record_history(next_tick);
@@ -9000,8 +9257,18 @@ impl WorldState {
         self.advance_tick();
         events.tick = self.tick;
         events.epoch_rolled = self.epoch != previous_epoch;
-        persistence_result?;
-        Ok(events)
+        match (brain_result, persistence_result) {
+            (Ok(()), Ok(())) => Ok(events),
+            (Ok(()), Err(persistence)) => Err(persistence.into()),
+            (Err(brain), Ok(())) => {
+                self.brain_fault = Some(brain.clone());
+                Err(brain.into())
+            }
+            (Err(brain), Err(persistence)) => {
+                self.brain_fault = Some(brain.clone());
+                Err(WorldStepError::BrainAndPersistence { brain, persistence })
+            }
+        }
     }
 
     /// Returns an immutable reference to configuration.
@@ -9348,6 +9615,26 @@ impl WorldState {
         self.persistence_fault.as_ref()
     }
 
+    /// Latched brain-construction error that prevents any later science tick from starting.
+    #[must_use]
+    pub const fn brain_fault(&self) -> Option<&BrainSpawnError> {
+        self.brain_fault.as_ref()
+    }
+
+    /// Combined typed view of any terminal fault that prevents a later science tick.
+    #[must_use]
+    pub fn latched_step_error(&self) -> Option<WorldStepError> {
+        match (&self.brain_fault, &self.persistence_fault) {
+            (Some(brain), Some(persistence)) => Some(WorldStepError::BrainAndPersistence {
+                brain: brain.clone(),
+                persistence: persistence.clone(),
+            }),
+            (Some(brain), None) => Some(WorldStepError::BrainSpawn(brain.clone())),
+            (None, Some(persistence)) => Some(WorldStepError::Persistence(persistence.clone())),
+            (None, None) => None,
+        }
+    }
+
     /// Current simulation tick.
     #[must_use]
     pub const fn tick(&self) -> Tick {
@@ -9540,18 +9827,28 @@ impl WorldState {
     }
 
     /// Bind a brain from the registry to the specified agent. Returns `true` on success.
-    pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> bool {
+    pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> Result<bool, BrainSpawnError> {
         if !self.agents.contains(id) {
-            return false;
+            return Ok(false);
         }
-        if let Some(runtime) = self.runtime.get_mut(id)
-            && let Some(binding) =
-                BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)
-        {
-            runtime.brain = binding;
-            return true;
-        }
-        false
+        let rng_before = self.rng.clone();
+        let binding = match BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                self.rng = rng_before;
+                return Ok(false);
+            }
+            Err(error) => {
+                self.rng = rng_before;
+                return Err(error);
+            }
+        };
+        let Some(runtime) = self.runtime.get_mut(id) else {
+            self.rng = rng_before;
+            return Ok(false);
+        };
+        runtime.brain = binding;
+        Ok(true)
     }
 
     /// Immutable access to per-agent runtime metadata.
@@ -10752,8 +11049,8 @@ mod tests {
         let id = world.spawn_agent(sample_agent(0));
         let key = world
             .brain_registry_mut()
-            .register("stub", |_rng| Box::new(StubBrain));
-        assert!(world.bind_agent_brain(id, key));
+            .register("stub", |_rng| Ok(Box::new(StubBrain)));
+        assert!(world.bind_agent_brain(id, key).expect("stub brain factory"));
 
         let events = world.step().expect("registered brain step");
         assert_eq!(events.tick, Tick(1));
@@ -10762,6 +11059,477 @@ mod tests {
         let position = world.agents().columns().positions()[0];
         assert!(position.x != 0.0 || position.y != 0.0);
         assert!(runtime.energy < 1.0);
+    }
+
+    #[test]
+    fn brain_factory_errors_propagate_through_bind_and_world_step() {
+        #[derive(Debug, Error)]
+        #[error("deliberate adapter construction failure")]
+        struct DeliberateFactoryError;
+
+        let mut bind_world = WorldState::new(ScriptBotsConfig::default()).expect("bind world");
+        let bind_key = bind_world
+            .brain_registry_mut()
+            .register("test.fallible", |rng| {
+                let _ = rng.next_u64();
+                Err(BrainSpawnError::new(
+                    "test.fallible",
+                    DeliberateFactoryError,
+                ))
+            });
+        let agent = bind_world.spawn_agent(sample_agent(0));
+        let before_failed_bind = bind_world
+            .characterization_digest_v0()
+            .expect("pre-bind digest");
+        let bind_error = bind_world
+            .bind_agent_brain(agent, bind_key)
+            .expect_err("binding must preserve the factory error");
+        assert_eq!(bind_error.kind(), "test.fallible");
+        assert!(
+            std::error::Error::source(&bind_error)
+                .and_then(|source| source.downcast_ref::<DeliberateFactoryError>())
+                .is_some()
+        );
+        assert_eq!(
+            bind_world
+                .characterization_digest_v0()
+                .expect("post-bind digest"),
+            before_failed_bind,
+            "failed binding must restore RNG and leave agent state untouched"
+        );
+
+        let config = ScriptBotsConfig {
+            population_minimum: 3,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut identity_reference =
+            WorldState::new(config.clone()).expect("identity reference world");
+        let reference_existing = identity_reference.spawn_agent(sample_agent(1));
+        let expected_next_agent = identity_reference.spawn_agent(sample_agent(2));
+
+        let mut step_world = WorldState::new(config).expect("step world");
+        let stable_key = step_world
+            .brain_registry_mut()
+            .register("test.stable", |_rng| Ok(Box::new(StubBrain)));
+        let existing_agent = step_world.spawn_agent(sample_agent(1));
+        assert_eq!(existing_agent, reference_existing);
+        assert!(
+            step_world
+                .bind_agent_brain(existing_agent, stable_key)
+                .expect("stable brain factory")
+        );
+        assert!(step_world.brain_registry_mut().unregister(stable_key));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_attempts = std::sync::Arc::clone(&attempts);
+        step_world
+            .brain_registry_mut()
+            .register("test.fallible", move |_rng| {
+                if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(Box::new(StubBrain))
+                } else {
+                    Err(BrainSpawnError::new(
+                        "test.fallible",
+                        DeliberateFactoryError,
+                    ))
+                }
+            });
+        let step_error = step_world
+            .step()
+            .expect_err("population spawn must preserve the factory error");
+        assert!(matches!(&step_error, WorldStepError::BrainSpawn(_)));
+        let WorldStepError::BrainSpawn(step_error) = step_error else {
+            return;
+        };
+        assert_eq!(step_error.kind(), "test.fallible");
+        assert_eq!(step_world.tick(), Tick(1));
+        assert_eq!(step_world.agents().len(), 1);
+        assert!(
+            step_world
+                .agent_runtime(existing_agent)
+                .expect("existing runtime survives rollback")
+                .brain
+                .is_bound(),
+            "rollback must not strip a pre-existing live brain runner"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            step_world.brain_fault().map(BrainSpawnError::kind),
+            Some("test.fallible")
+        );
+        let actual_next_agent = step_world.spawn_agent(sample_agent(2));
+        assert_eq!(
+            actual_next_agent, expected_next_agent,
+            "failed population construction must restore SlotMap generations and free-list state"
+        );
+        let completed_digest = step_world
+            .characterization_digest_v0()
+            .expect("brain-fault tick must finish at a coherent boundary");
+        let repeated_error = step_world
+            .step()
+            .expect_err("latched brain failure must block the next tick");
+        assert!(matches!(&repeated_error, WorldStepError::BrainSpawn(_)));
+        let WorldStepError::BrainSpawn(repeated_error) = repeated_error else {
+            return;
+        };
+        assert_eq!(repeated_error.kind(), "test.fallible");
+        assert_eq!(step_world.tick(), Tick(1));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            step_world
+                .characterization_digest_v0()
+                .expect("latched fault digest"),
+            completed_digest
+        );
+    }
+
+    #[test]
+    fn population_factory_failure_aborts_and_refunds_queued_births() {
+        #[derive(Debug, Error)]
+        #[error("deliberate population construction failure")]
+        struct DeliberatePopulationFailure;
+
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            population_minimum: 2,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.25,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 0,
+            reproduction_attempt_chance: 1.0,
+            reproduction_rate_herbivore: f32::MIN_POSITIVE,
+            reproduction_rate_carnivore: f32::MIN_POSITIVE,
+            reproduction_partner_chance: 0.0,
+            rng_seed: Some(0xB17A_0B0A),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let parent = world.spawn_agent(sample_agent(0));
+        {
+            let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+            runtime.energy = 1.0;
+            runtime.reproduction_counter = 1.0;
+        }
+        world
+            .brain_registry_mut()
+            .register("test.population-failure", |_rng| {
+                Err(BrainSpawnError::new(
+                    "test.population-failure",
+                    DeliberatePopulationFailure,
+                ))
+            });
+
+        let error = world
+            .step()
+            .expect_err("population construction must fail after queuing a natural birth");
+        assert!(matches!(&error, WorldStepError::BrainSpawn(_)));
+        let WorldStepError::BrainSpawn(error) = error else {
+            return;
+        };
+        assert_eq!(error.kind(), "test.population-failure");
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(world.agents.len(), 1);
+        assert!(world.pending_spawns.is_empty());
+        assert_eq!(world.last_births, 0);
+        let parent_runtime = world
+            .agent_runtime(parent)
+            .expect("surviving parent runtime");
+        assert!((parent_runtime.energy - 1.0).abs() < f32::EPSILON);
+        assert!((parent_runtime.reproduction_counter - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn offspring_snapshot_and_mutation_failures_are_terminal_and_refunded() {
+        #[derive(Clone, Copy)]
+        enum FailureMode {
+            Snapshot,
+            Mutation,
+        }
+
+        #[derive(Debug, Error)]
+        #[error("deliberate inherited-brain operation failure")]
+        struct DeliberateHeritageFailure;
+
+        struct FailingHeritageRunner {
+            mode: FailureMode,
+        }
+
+        impl BrainRunner for FailingHeritageRunner {
+            fn kind(&self) -> &'static str {
+                match self.mode {
+                    FailureMode::Snapshot => "test.snapshot-failure",
+                    FailureMode::Mutation => "test.mutation-failure",
+                }
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+
+            fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+                match self.mode {
+                    FailureMode::Snapshot => {
+                        Err(BrainSpawnError::new(self.kind(), DeliberateHeritageFailure))
+                    }
+                    FailureMode::Mutation => Ok(Some(Box::new(Self { mode: self.mode }))),
+                }
+            }
+
+            fn mutate(
+                &mut self,
+                _rng: &mut dyn RngCore,
+                _rate: f32,
+                _scale: f32,
+            ) -> Result<(), BrainSpawnError> {
+                match self.mode {
+                    FailureMode::Snapshot => Ok(()),
+                    FailureMode::Mutation => {
+                        Err(BrainSpawnError::new(self.kind(), DeliberateHeritageFailure))
+                    }
+                }
+            }
+        }
+
+        for mode in [FailureMode::Snapshot, FailureMode::Mutation] {
+            let config = ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                food_growth_rate: 0.0,
+                food_decay_rate: 0.0,
+                food_diffusion_rate: 0.0,
+                food_intake_rate: 0.0,
+                food_waste_rate: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                metabolism_ramp_rate: 0.0,
+                metabolism_boost_penalty: 0.0,
+                temperature_discomfort_rate: 0.0,
+                population_minimum: 2,
+                population_spawn_interval: 0,
+                reproduction_energy_threshold: 0.5,
+                reproduction_energy_cost: 0.25,
+                reproduction_cooldown: 1,
+                reproduction_attempt_interval: 0,
+                reproduction_attempt_chance: 1.0,
+                reproduction_rate_herbivore: f32::MIN_POSITIVE,
+                reproduction_rate_carnivore: f32::MIN_POSITIVE,
+                reproduction_partner_chance: 0.0,
+                persistence_interval: 0,
+                rng_seed: Some(0xF411_1B1E),
+                ..ScriptBotsConfig::default()
+            };
+            let mut identity_reference =
+                WorldState::new(config.clone()).expect("identity reference world");
+            identity_reference.spawn_agent(sample_agent(0));
+            let expected_next_agent = identity_reference.spawn_agent(sample_agent(1));
+
+            let mut world = WorldState::new(config).expect("world");
+            let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = Arc::clone(&factory_calls);
+            let kind = match mode {
+                FailureMode::Snapshot => "test.snapshot-failure",
+                FailureMode::Mutation => "test.mutation-failure",
+            };
+            let key = world.brain_registry_mut().register(kind, move |_rng| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(FailingHeritageRunner { mode }))
+            });
+            let parent = world.spawn_agent(sample_agent(0));
+            assert!(
+                world
+                    .bind_agent_brain(parent, key)
+                    .expect("initial parent brain construction")
+            );
+            {
+                let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+                runtime.energy = 1.0;
+                runtime.reproduction_counter = 1.0;
+            }
+
+            let error = world
+                .step()
+                .expect_err("failed inherited-brain operation must terminate the tick");
+            assert!(matches!(&error, WorldStepError::BrainSpawn(_)));
+            let WorldStepError::BrainSpawn(error) = error else {
+                return;
+            };
+            assert_eq!(error.kind(), kind);
+            assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(world.tick(), Tick(1));
+            assert_eq!(world.agents.len(), 1);
+            assert_eq!(world.runtime.len(), world.agents.len());
+            assert!(world.pending_spawns.is_empty());
+            assert_eq!(world.last_births, 0);
+            let parent_runtime = world
+                .agent_runtime(parent)
+                .expect("surviving parent runtime");
+            assert!((parent_runtime.energy - 1.0).abs() < f32::EPSILON);
+            assert!((parent_runtime.reproduction_counter - 1.0).abs() < f32::EPSILON);
+            let actual_next_agent = world.spawn_agent(sample_agent(1));
+            assert_eq!(actual_next_agent, expected_next_agent);
+        }
+    }
+
+    #[test]
+    fn scheduled_crossover_refuses_bound_nonheritable_parents_without_registry_fallback() {
+        struct NonHeritableRunner;
+
+        impl BrainRunner for NonHeritableRunner {
+            fn kind(&self) -> &'static str {
+                "test.non-heritable"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+        }
+
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 1,
+            population_spawn_count: 1,
+            population_crossover_chance: 1.0,
+            reproduction_energy_threshold: 0.0,
+            persistence_interval: 0,
+            rng_seed: Some(0xC205_50A3),
+            ..ScriptBotsConfig::default()
+        };
+        for stale_registry_key in [false, true] {
+            let mut world = WorldState::new(config.clone()).expect("world");
+            let registry_key = stale_registry_key.then(|| {
+                world
+                    .brain_registry_mut()
+                    .register("test.non-heritable", |_rng| {
+                        Ok(Box::new(NonHeritableRunner))
+                    })
+            });
+            for seed in 0..2 {
+                let id = world.spawn_agent(sample_agent(seed));
+                if let Some(key) = registry_key {
+                    assert!(
+                        world
+                            .bind_agent_brain(id, key)
+                            .expect("initial non-heritable runner")
+                    );
+                } else {
+                    world.agent_runtime_mut(id).expect("runtime").brain =
+                        BrainBinding::with_runner(Box::new(NonHeritableRunner));
+                }
+            }
+            if let Some(key) = registry_key {
+                assert!(world.brain_registry_mut().unregister(key));
+            }
+
+            let error = world
+                .step()
+                .expect_err("non-heritable bound parents must not normalize to random offspring");
+            assert!(matches!(&error, WorldStepError::BrainSpawn(_)));
+            let WorldStepError::BrainSpawn(error) = error else {
+                return;
+            };
+            assert_eq!(error.kind(), "test.non-heritable");
+            assert_eq!(world.tick(), Tick(1));
+            assert_eq!(world.agents.len(), 2);
+            assert!(world.pending_spawns.is_empty());
+        }
+    }
+
+    #[test]
+    fn fallible_random_spawn_preserves_the_seeded_rng_order() {
+        fn register_rng_consuming_brains(world: &mut WorldState) {
+            for kind in ["test.rng-a", "test.rng-b"] {
+                world.brain_registry_mut().register(kind, move |rng| {
+                    let _ = rng.next_u64();
+                    Ok(Box::new(StubBrain))
+                });
+            }
+        }
+
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x5EED),
+            ..ScriptBotsConfig::default()
+        };
+        let mut fallible_world = WorldState::new(config.clone()).expect("fallible world");
+        let mut reference_world = WorldState::new(config).expect("reference world");
+        register_rng_consuming_brains(&mut fallible_world);
+        register_rng_consuming_brains(&mut reference_world);
+
+        fallible_world
+            .spawn_random_agent()
+            .expect("fallible random spawn");
+
+        let width = reference_world.config.world_width as f32;
+        let height = reference_world.config.world_height as f32;
+        let data = AgentData::new(
+            Position::new(
+                reference_world.rng.random_range(0.0..width),
+                reference_world.rng.random_range(0.0..height),
+            ),
+            Velocity::default(),
+            reference_world
+                .rng
+                .random_range(-std::f32::consts::PI..std::f32::consts::PI),
+            1.0,
+            [
+                reference_world.rng.random_range(0.0..1.0),
+                reference_world.rng.random_range(0.0..1.0),
+                reference_world.rng.random_range(0.0..1.0),
+            ],
+            0.0,
+            false,
+            0,
+            Generation::default(),
+        );
+        let id = reference_world.spawn_agent(data);
+        if let Some(key) = reference_world
+            .brain_registry
+            .random_key(&mut reference_world.rng)
+        {
+            assert!(
+                reference_world
+                    .bind_agent_brain(id, key)
+                    .expect("reference brain factory")
+            );
+        }
+
+        assert_eq!(
+            fallible_world
+                .characterization_digest_v0()
+                .expect("fallible digest"),
+            reference_world
+                .characterization_digest_v0()
+                .expect("reference digest"),
+            "introducing fallible construction must not perturb seeded spawn behavior"
+        );
     }
 
     fn run_seeded_history(
@@ -11017,6 +11785,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn simultaneous_brain_and_persistence_failures_are_both_latched() {
+        #[derive(Debug, Error)]
+        #[error("deliberate population factory failure")]
+        struct DeliberatePopulationFactoryError;
+
+        let config = ScriptBotsConfig {
+            population_minimum: 3,
+            population_spawn_interval: 0,
+            persistence_interval: 1,
+            rng_seed: Some(0x0BAD_5EED),
+            ..ScriptBotsConfig::default()
+        };
+        let persistence_logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence = RejectOncePersistence {
+            logs: Arc::clone(&persistence_logs),
+            reject_next: true,
+        };
+        let mut world =
+            WorldState::with_persistence(config, Box::new(persistence)).expect("test world");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_attempts = Arc::clone(&attempts);
+        world
+            .brain_registry_mut()
+            .register("test.double-fault", move |_rng| {
+                if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(Box::new(StubBrain))
+                } else {
+                    Err(BrainSpawnError::new(
+                        "test.double-fault",
+                        DeliberatePopulationFactoryError,
+                    ))
+                }
+            });
+
+        let first_error = world
+            .step()
+            .expect_err("both terminal failures must be reported at the completed boundary");
+        assert!(matches!(
+            &first_error,
+            WorldStepError::BrainAndPersistence { .. }
+        ));
+        let WorldStepError::BrainAndPersistence { brain, persistence } = first_error else {
+            return;
+        };
+        assert_eq!(brain.kind(), "test.double-fault");
+        assert_eq!(persistence.tick(), 1);
+        assert_eq!(world.tick(), Tick(1));
+        assert!(
+            world.agents().is_empty(),
+            "population inserts must roll back"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(persistence_logs.lock().unwrap().len(), 1);
+        assert_eq!(
+            world.brain_fault().map(BrainSpawnError::kind),
+            Some("test.double-fault")
+        );
+        assert_eq!(world.persistence_fault(), Some(&persistence));
+
+        let completed_digest = world
+            .characterization_digest_v0()
+            .expect("double-fault tick must finish at a coherent boundary");
+        assert!(matches!(
+            world.step(),
+            Err(WorldStepError::BrainAndPersistence { .. })
+        ));
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(persistence_logs.lock().unwrap().len(), 1);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("latched double fault digest"),
+            completed_digest,
+            "repeated step must not mutate after a combined terminal fault"
+        );
+    }
+
     fn lifecycle_birth(tick: u64) -> BirthRecord {
         BirthRecord {
             tick: Tick(tick),
@@ -11089,6 +11936,10 @@ mod tests {
         let first_error = world
             .step()
             .expect_err("definite persistence rejection must fail the completed tick");
+        assert!(matches!(&first_error, WorldStepError::Persistence(_)));
+        let WorldStepError::Persistence(first_error) = first_error else {
+            return;
+        };
         assert_eq!(first_error.tick(), 1);
         assert_eq!(world.tick(), Tick(1));
         assert!(world.has_pending_persistence_batch());
@@ -11101,6 +11952,10 @@ mod tests {
         let repeated_error = world
             .step()
             .expect_err("a latched failure must prevent tick two from starting");
+        assert!(matches!(&repeated_error, WorldStepError::Persistence(_)));
+        let WorldStepError::Persistence(repeated_error) = repeated_error else {
+            return;
+        };
         assert_eq!(repeated_error, first_error);
         assert_eq!(world.tick(), Tick(1));
         assert_eq!(rejected_logs.lock().unwrap().len(), rejected_call_count);
@@ -12010,8 +12865,12 @@ mod tests {
 
         let idle_key = world
             .brain_registry_mut()
-            .register("test.idle", |_rng| Box::new(IdleBrain));
-        assert!(world.bind_agent_brain(parent, idle_key));
+            .register("test.idle", |_rng| Ok(Box::new(IdleBrain)));
+        assert!(
+            world
+                .bind_agent_brain(parent, idle_key)
+                .expect("idle brain factory")
+        );
 
         world.step().expect("child placement step");
 
@@ -13081,7 +13940,7 @@ mod tests {
         let (mut registry_world, _) = characterization_world(42);
         registry_world
             .brain_registry_mut()
-            .register("stub", |_rng| Box::new(StubBrain));
+            .register("stub", |_rng| Ok(Box::new(StubBrain)));
         let changed = registry_world
             .characterization_digest_v0()
             .expect("brain registry digest");

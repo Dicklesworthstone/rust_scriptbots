@@ -113,11 +113,13 @@ impl BrainRunner for ZeroBrain {
 fn bind_zero_brain(world: &mut WorldState, agents: &[AgentId]) {
     let key = world
         .brain_registry_mut()
-        .register("test.oracle.zero", |_rng| Box::new(ZeroBrain));
+        .register("test.oracle.zero", |_rng| Ok(Box::new(ZeroBrain)));
 
     for &agent in agents {
         assert!(
-            world.bind_agent_brain(agent, key),
+            world
+                .bind_agent_brain(agent, key)
+                .expect("zero-brain factory"),
             "oracle agent should accept the deterministic zero brain"
         );
     }
@@ -265,11 +267,15 @@ fn registry_executes_custom_brain() {
     let key = world
         .brain_registry_mut()
         .register("test.constant", |_rng| {
-            Box::new(ConstantBrain { value: 0.75 })
+            Ok(Box::new(ConstantBrain { value: 0.75 }))
         });
 
     let agent_id = world.spawn_agent(AgentData::default());
-    assert!(world.bind_agent_brain(agent_id, key));
+    assert!(
+        world
+            .bind_agent_brain(agent_id, key)
+            .expect("constant-brain factory")
+    );
 
     world
         .step()
@@ -333,8 +339,12 @@ fn combat_records_carnivore_event_flags() {
 
     let spike_key = world
         .brain_registry_mut()
-        .register("test.spike", |_rng| Box::new(SpikeBrain));
-    assert!(world.bind_agent_brain(attacker_id, spike_key));
+        .register("test.spike", |_rng| Ok(Box::new(SpikeBrain)));
+    assert!(
+        world
+            .bind_agent_brain(attacker_id, spike_key)
+            .expect("spike-brain factory")
+    );
     if let Some(runtime) = world.agent_runtime_mut(attacker_id) {
         runtime.herbivore_tendency = 0.1;
     }

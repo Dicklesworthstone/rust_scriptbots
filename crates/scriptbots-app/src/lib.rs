@@ -356,7 +356,7 @@ pub enum CharacterizationTraceErrorV0 {
     #[error(transparent)]
     Characterization(#[from] CharacterizationError),
     #[error(transparent)]
-    Persistence(#[from] scriptbots_core::PersistenceAdmissionError),
+    Step(#[from] scriptbots_core::WorldStepError),
     #[error("failed to encode characterization artifact: {0}")]
     Serialization(#[from] serde_json::Error),
 }

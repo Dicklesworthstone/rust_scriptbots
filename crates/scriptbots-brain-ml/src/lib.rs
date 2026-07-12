@@ -60,12 +60,18 @@ impl Brain for MlBrain {
         outputs
     }
 
-    fn mutate(&mut self, _rng: &mut dyn rand::RngCore, _rate: f32, _scale: f32) {
+    fn mutate(
+        &mut self,
+        _rng: &mut dyn rand::RngCore,
+        _rate: f32,
+        _scale: f32,
+    ) -> Result<(), scriptbots_brain::BrainMutationError> {
         // Mutation behavior will be implemented per-backend as we integrate models.
+        Ok(())
     }
 
-    fn clone_box(&self) -> Box<dyn Brain> {
-        Box::new(self.clone())
+    fn clone_box(&self) -> Result<Box<dyn Brain>, scriptbots_brain::BrainCloneError> {
+        Ok(Box::new(self.clone()))
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {

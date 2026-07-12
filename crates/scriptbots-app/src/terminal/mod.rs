@@ -229,6 +229,7 @@ struct TerminalApp<'a> {
     analytics: Option<TerminalAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: AnalyticsStatus,
+    simulation_fault: Option<Arc<str>>,
     expanded: bool,
     // When true, the user has explicitly toggled expanded panels; honor self.expanded
     // instead of auto-expanding on wide terminals.
@@ -276,6 +277,7 @@ impl<'a> TerminalApp<'a> {
             analytics: None,
             analytics_revision: None,
             analytics_status: AnalyticsStatus::default(),
+            simulation_fault: None,
             expanded: false,
             expanded_user_override: false,
             focused_agent_cursor: 0,
@@ -326,10 +328,10 @@ impl<'a> TerminalApp<'a> {
         self.last_tick = now;
 
         let mut force_step = single_step;
-        let mut persistence_fault = None;
+        let mut latched_fault = None;
         let pending_commands = if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.persistence_fault() {
-                persistence_fault = Some(Arc::<str>::from(error.to_string()));
+            if let Some(error) = world.latched_step_error() {
+                latched_fault = Some(Arc::<str>::from(error.to_string()));
                 None
             } else {
                 (self.command_drain.as_ref())(&mut world);
@@ -338,11 +340,10 @@ impl<'a> TerminalApp<'a> {
         } else {
             None
         };
-        if let Some(error) = persistence_fault {
+        if let Some(error) = latched_fault {
             self.paused = true;
             self.sim_accumulator = 0.0;
-            self.analytics_status.last_error = Some(error);
-            self.analytics_status.stopped = true;
+            self.simulation_fault = Some(error);
             self.refresh_snapshot();
             return;
         }
@@ -400,8 +401,7 @@ impl<'a> TerminalApp<'a> {
         if let Some(error) = step_error {
             self.paused = true;
             self.sim_accumulator = 0.0;
-            self.analytics_status.last_error = Some(error);
-            self.analytics_status.stopped = true;
+            self.simulation_fault = Some(error);
         }
     }
 
@@ -929,6 +929,12 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
         let mut lines: Vec<Line> = Vec::new();
+        if let Some(error) = &self.simulation_fault {
+            lines.push(Line::from(vec![
+                Span::styled("Simulation ", self.palette.header_style()),
+                Span::styled(format!("fault: {error}"), Style::default().fg(Color::Red)),
+            ]));
+        }
         let committed = self
             .analytics_status
             .committed_tick
@@ -3381,6 +3387,30 @@ mod tests {
             world.drain_simulation_commands().is_empty(),
             "terminal admitted a non-finite speed command"
         );
+    }
+
+    #[test]
+    fn simulation_fault_survives_storage_health_refresh() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world,
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        let fault = Arc::<str>::from("deliberate brain construction failure");
+        app.simulation_fault = Some(Arc::clone(&fault));
+
+        app.maybe_refresh_analytics();
+
+        assert_eq!(app.simulation_fault.as_deref(), Some(fault.as_ref()));
+        assert!(app.analytics_status.last_error.is_none());
+        assert!(!app.analytics_status.stopped);
     }
 
     #[test]

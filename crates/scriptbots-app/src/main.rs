@@ -402,8 +402,8 @@ fn init_tracing() {
 
 fn run_characterization_v0(cli: &AppCli, config: ScriptBotsConfig, ticks: u64) -> Result<()> {
     let mut world = WorldState::new(config)?;
-    let brain_keys = install_brains(&mut world);
-    seed_agents(&mut world, &brain_keys);
+    let brain_keys = install_brains(&mut world)?;
+    seed_agents(&mut world, &brain_keys)?;
 
     let scenario_id = if cli.config_layers.is_empty() {
         "legacy_app_default_v0"
@@ -738,6 +738,9 @@ fn bootstrap_world(
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
 ) -> Result<(SharedWorld, SharedAnalytics, StoragePipeline)> {
+    #[cfg(feature = "neuro")]
+    let _ = validated_neuroflow_config(&config)?;
+
     let storage_path = storage_path_from_env();
     if matches!(storage_mode, StorageMode::File) {
         reserve_new_run_storage(&storage_path)?;
@@ -779,9 +782,9 @@ fn bootstrap_world(
     }
     let analytics = pipeline.analytics_provider();
     let mut world = WorldState::with_persistence(config, Box::new(pipeline.sink()))?;
-    let brain_keys = install_brains(&mut world);
+    let brain_keys = install_brains(&mut world)?;
 
-    seed_agents(&mut world, &brain_keys);
+    seed_agents(&mut world, &brain_keys)?;
 
     for _ in 0..120 {
         world.step()?;
@@ -1501,8 +1504,8 @@ struct ReplayRun {
 fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
-    let brain_keys = install_brains(&mut world);
-    seed_agents(&mut world, &brain_keys);
+    let brain_keys = install_brains(&mut world)?;
+    seed_agents(&mut world, &brain_keys)?;
 
     for _ in 0..tick_limit {
         world.step()?;
@@ -1541,8 +1544,8 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
 fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
     let (collector, _handle) = ReplayCollector::new();
     let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
-    let brain_keys = install_brains(&mut world);
-    seed_agents(&mut world, &brain_keys);
+    let brain_keys = install_brains(&mut world)?;
+    seed_agents(&mut world, &brain_keys)?;
 
     let start = Instant::now();
     for _ in 0..tick_limit {
@@ -1567,6 +1570,9 @@ fn profile_world_steps_with_storage(
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
 ) -> Result<()> {
+    #[cfg(feature = "neuro")]
+    let _ = validated_neuroflow_config(config)?;
+
     let storage_path = storage_path_from_env();
     if matches!(storage_mode, StorageMode::File) {
         reserve_new_run_storage(&storage_path)?;
@@ -1594,8 +1600,8 @@ fn profile_world_steps_with_storage(
     };
 
     let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
-    let brain_keys = install_brains(&mut world);
-    seed_agents(&mut world, &brain_keys);
+    let brain_keys = install_brains(&mut world)?;
+    seed_agents(&mut world, &brain_keys)?;
 
     let start = Instant::now();
     for _ in 0..tick_limit {
@@ -2050,13 +2056,32 @@ fn print_event_counts(
     }
 }
 
-fn install_brains(world: &mut WorldState) -> Vec<u64> {
+#[cfg(feature = "neuro")]
+fn validated_neuroflow_config(
+    config: &ScriptBotsConfig,
+) -> Result<Option<scriptbots_brain_neuro::NeuroflowBrainConfig>> {
+    use scriptbots_brain_neuro::NeuroflowBrainConfig;
+
+    if !config.neuroflow.enabled {
+        return Ok(None);
+    }
+    let adapter = NeuroflowBrainConfig::from_settings(&config.neuroflow);
+    adapter
+        .validate()
+        .context("failed to validate configured NeuroFlow brain")?;
+    Ok(Some(adapter))
+}
+
+fn install_brains(world: &mut WorldState) -> Result<Vec<u64>> {
+    #[cfg(feature = "neuro")]
+    let neuro_config = validated_neuroflow_config(world.config())?;
+
     let mut keys = Vec::new();
 
     let mlp_key = world
         .brain_registry_mut()
         .register(MlpBrain::KIND.as_str(), |seed_rng| {
-            MlpBrain::runner(seed_rng)
+            Ok(MlpBrain::runner(seed_rng))
         });
     keys.push(mlp_key);
 
@@ -2068,22 +2093,21 @@ fn install_brains(world: &mut WorldState) -> Vec<u64> {
         };
         let key = world
             .brain_registry_mut()
-            .register(label, |_seed_rng| scriptbots_brain_ml::runner());
+            .register(label, |_seed_rng| Ok(scriptbots_brain_ml::runner()));
         keys.push(key);
     }
 
     #[cfg(feature = "neuro")]
     {
-        use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig};
-        let settings = world.config().neuroflow.clone();
-        if settings.enabled {
-            let config = NeuroflowBrainConfig::from_settings(&settings);
-            let key = NeuroflowBrain::register(world, config);
+        use scriptbots_brain_neuro::NeuroflowBrain;
+        if let Some(config) = neuro_config {
+            let key = NeuroflowBrain::register(world, config)
+                .context("failed to register configured NeuroFlow brain")?;
             keys.push(key);
         }
     }
 
-    keys
+    Ok(keys)
 }
 
 fn apply_env_overrides(config: &mut ScriptBotsConfig) {
@@ -2239,7 +2263,10 @@ fn parse_png_size(raw: &str) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
+fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) -> Result<()> {
+    if brain_keys.is_empty() {
+        bail!("cannot seed the scenario without at least one registered brain");
+    }
     let mut agent = AgentData::default();
     let spacing = 120.0;
     for row in 0..4 {
@@ -2249,13 +2276,20 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) {
             agent.heading = 0.0;
             agent.spike_length = 10.0;
             let id = world.spawn_agent(agent);
-            if let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len())
-                && !world.bind_agent_brain(id, key)
-            {
-                warn!(agent = ?id, key, "Failed to bind brain to seeded agent");
+            let Some(&key) = brain_keys.get((row * 4 + col) % brain_keys.len()) else {
+                bail!("registered-brain selection invariant failed while seeding agent {id:?}");
+            };
+            let bound = world.bind_agent_brain(id, key).with_context(|| {
+                format!("failed to construct registered brain {key} for seeded agent {id:?}")
+            })?;
+            if !bound {
+                bail!(
+                    "registered brain {key} disappeared while binding seeded agent {id:?}; refusing an unbound fallback"
+                );
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2497,8 +2531,8 @@ activation = "Sigmoid"
                 StoragePipeline::with_thresholds(&db_str, 1, 1, 1, 1).expect("pipeline");
             let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))
                 .expect("world");
-            let keys = install_brains(&mut world);
-            seed_agents(&mut world, &keys);
+            let keys = install_brains(&mut world).expect("install replay-fixture brains");
+            seed_agents(&mut world, &keys).expect("seed replay-fixture brains");
             for _ in 0..16 {
                 world.step().expect("durable replay fixture step");
             }
@@ -2642,12 +2676,103 @@ activation = "Sigmoid"
 
     #[cfg(feature = "neuro")]
     #[test]
+    fn neuroflow_installation_propagates_typed_configuration_error() {
+        let mut config = ScriptBotsConfig::default();
+        config.neuroflow.enabled = true;
+        config.neuroflow.hidden_layers = vec![4, 0, 2];
+        let mut world = WorldState::new(config).expect("world accepts adapter-owned settings");
+        let before = world.brain_registry().descriptors();
+
+        let error = install_brains(&mut world)
+            .expect_err("invalid NeuroFlow dimensions must fail scenario registration");
+        let source = error
+            .downcast_ref::<scriptbots_brain_neuro::NeuroflowBrainError>()
+            .expect("typed NeuroFlow error must remain in the startup error chain");
+        assert_eq!(source.field(), Some("hidden_layers[1]"));
+        assert!(format!("{error:#}").contains("failed to validate configured"));
+        assert_eq!(world.brain_registry().descriptors(), before);
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    #[serial]
+    fn invalid_neuroflow_configuration_precedes_storage_reservation() {
+        with_env_lock(|| {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("must-not-be-reserved.sqlite");
+            let previous = std::env::var("SCRIPTBOTS_STORAGE_PATH").ok();
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_STORAGE_PATH", &path);
+            }
+
+            let mut config = ScriptBotsConfig::default();
+            config.neuroflow.enabled = true;
+            config.neuroflow.hidden_layers = vec![4, 0, 2];
+            let error = bootstrap_world(config, StorageMode::File, ThresholdsOverride::default())
+                .err()
+                .expect("adapter validation must fail before storage setup");
+            let path_exists = path.exists();
+            restore_env("SCRIPTBOTS_STORAGE_PATH", previous);
+
+            assert!(
+                error
+                    .downcast_ref::<scriptbots_brain_neuro::NeuroflowBrainError>()
+                    .is_some(),
+                "typed NeuroFlow error must survive bootstrap context: {error:#}"
+            );
+            assert!(
+                !path_exists,
+                "invalid adapter configuration must not reserve the requested run database"
+            );
+        });
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    #[serial]
+    fn invalid_neuroflow_configuration_precedes_profile_storage_reservation() {
+        with_env_lock(|| {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("profile-must-not-be-reserved.sqlite");
+            let previous = std::env::var("SCRIPTBOTS_STORAGE_PATH").ok();
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_STORAGE_PATH", &path);
+            }
+
+            let mut config = ScriptBotsConfig::default();
+            config.neuroflow.enabled = true;
+            config.neuroflow.hidden_layers = vec![4, 0, 2];
+            let error = profile_world_steps_with_storage(
+                &config,
+                1,
+                StorageMode::File,
+                ThresholdsOverride::default(),
+            )
+            .expect_err("adapter validation must fail before profiling storage setup");
+            let path_exists = path.exists();
+            restore_env("SCRIPTBOTS_STORAGE_PATH", previous);
+
+            assert!(
+                error
+                    .downcast_ref::<scriptbots_brain_neuro::NeuroflowBrainError>()
+                    .is_some(),
+                "typed NeuroFlow error must survive profiling context: {error:#}"
+            );
+            assert!(
+                !path_exists,
+                "invalid adapter configuration must not reserve a profiling run database"
+            );
+        });
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
     fn neuroflow_installation_respects_toggle() {
         let expected_base = if cfg!(feature = "ml") { 2 } else { 1 };
         let mut config = ScriptBotsConfig::default();
         config.neuroflow.enabled = false;
         let mut world = WorldState::new(config).expect("world");
-        let keys = install_brains(&mut world);
+        let keys = install_brains(&mut world).expect("install baseline brains");
         assert_eq!(
             keys.len(),
             expected_base,
@@ -2660,7 +2785,8 @@ activation = "Sigmoid"
         config_enabled.neuroflow.activation = NeuroflowActivationKind::Sigmoid;
         config_enabled.rng_seed = Some(99);
         let mut world_enabled = WorldState::new(config_enabled.clone()).expect("world");
-        let keys_enabled = install_brains(&mut world_enabled);
+        let keys_enabled =
+            install_brains(&mut world_enabled).expect("install enabled NeuroFlow brain");
         assert_eq!(
             keys_enabled.len(),
             expected_base + 1,
@@ -2669,18 +2795,27 @@ activation = "Sigmoid"
 
         let neuro_key = *keys_enabled.last().expect("neuro key");
         let agent_id = world_enabled.spawn_agent(AgentData::default());
-        assert!(world_enabled.bind_agent_brain(agent_id, neuro_key));
+        assert!(
+            world_enabled
+                .bind_agent_brain(agent_id, neuro_key)
+                .expect("construct enabled NeuroFlow runner")
+        );
         world_enabled
             .step()
             .expect("enabled NeuroFlow simulation step");
         let outputs_one = world_enabled.agent_runtime(agent_id).unwrap().outputs;
 
         let mut world_repeat = WorldState::new(config_enabled).expect("world");
-        let keys_repeat = install_brains(&mut world_repeat);
+        let keys_repeat =
+            install_brains(&mut world_repeat).expect("install repeat NeuroFlow brain");
         assert_eq!(keys_repeat.len(), expected_base + 1);
         let neuro_repeat = *keys_repeat.last().unwrap();
         let agent_repeat = world_repeat.spawn_agent(AgentData::default());
-        assert!(world_repeat.bind_agent_brain(agent_repeat, neuro_repeat));
+        assert!(
+            world_repeat
+                .bind_agent_brain(agent_repeat, neuro_repeat)
+                .expect("construct repeat NeuroFlow runner")
+        );
         world_repeat
             .step()
             .expect("repeat NeuroFlow simulation step");
