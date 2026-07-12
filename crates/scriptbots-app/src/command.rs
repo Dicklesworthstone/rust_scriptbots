@@ -58,7 +58,7 @@ pub fn make_command_submit(sender: CommandSender) -> CommandSubmit {
 }
 
 #[cfg(test)]
-mod tests {
+mod validation_tests {
     use super::*;
     use scriptbots_core::{ScriptBotsConfig, SimulationCommand};
 
