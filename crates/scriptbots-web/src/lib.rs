@@ -1,4 +1,4 @@
-#![cfg(target_arch = "wasm32")]
+#![cfg(any(target_arch = "wasm32", test))]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -633,6 +633,86 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn postcard_snapshot_wire_golden_round_trips() {
+        let snapshot = SimulationSnapshot {
+            tick: 300,
+            epoch: 2,
+            world: SnapshotWorld {
+                width: 640,
+                height: 480,
+                closed: true,
+            },
+            summary: SnapshotSummary {
+                agent_count: 1,
+                births: 2,
+                deaths: 3,
+                total_energy: 4.5,
+                average_energy: 4.5,
+                average_health: 0.75,
+            },
+            agents: vec![AgentSnapshot {
+                id: 7,
+                position: [1.25, -2.5],
+                velocity: [0.5, -0.25],
+                heading: 3.0,
+                health: 1.5,
+                energy: 4.5,
+                color: [0.1, 0.2, 0.3],
+                spike_length: 0.75,
+                boost: true,
+            }],
+        };
+
+        let encoded = to_allocvec(&snapshot).expect("encode postcard snapshot");
+        assert_eq!(
+            encoded,
+            [
+                172, 2, 2, 128, 5, 224, 3, 1, 1, 2, 3, 0, 0, 144, 64, 0, 0, 144, 64, 0, 0, 64, 63,
+                1, 7, 0, 0, 160, 63, 0, 0, 32, 192, 0, 0, 0, 63, 0, 0, 128, 190, 0, 0, 64, 64, 0,
+                0, 192, 63, 0, 0, 144, 64, 205, 204, 204, 61, 205, 204, 76, 62, 154, 153, 153, 62,
+                0, 0, 64, 63, 1,
+            ],
+            "Postcard is positional: changing these bytes requires a versioned snapshot schema"
+        );
+        let decoded: SimulationSnapshot = from_bytes(&encoded).expect("decode postcard snapshot");
+        assert_eq!(decoded.tick, snapshot.tick);
+        assert_eq!(decoded.epoch, snapshot.epoch);
+        assert_eq!(decoded.world.width, snapshot.world.width);
+        assert_eq!(decoded.world.height, snapshot.world.height);
+        assert_eq!(decoded.world.closed, snapshot.world.closed);
+        assert_eq!(decoded.summary.agent_count, snapshot.summary.agent_count);
+        assert_eq!(decoded.summary.births, snapshot.summary.births);
+        assert_eq!(decoded.summary.deaths, snapshot.summary.deaths);
+        assert_eq!(decoded.summary.total_energy, snapshot.summary.total_energy);
+        assert_eq!(
+            decoded.summary.average_energy,
+            snapshot.summary.average_energy
+        );
+        assert_eq!(
+            decoded.summary.average_health,
+            snapshot.summary.average_health
+        );
+        assert_eq!(decoded.agents.len(), 1);
+        assert_eq!(decoded.agents[0].id, snapshot.agents[0].id);
+        assert_eq!(decoded.agents[0].position, snapshot.agents[0].position);
+        assert_eq!(decoded.agents[0].velocity, snapshot.agents[0].velocity);
+        assert_eq!(decoded.agents[0].heading, snapshot.agents[0].heading);
+        assert_eq!(decoded.agents[0].health, snapshot.agents[0].health);
+        assert_eq!(decoded.agents[0].energy, snapshot.agents[0].energy);
+        assert_eq!(decoded.agents[0].color, snapshot.agents[0].color);
+        assert_eq!(
+            decoded.agents[0].spike_length,
+            snapshot.agents[0].spike_length
+        );
+        assert_eq!(decoded.agents[0].boost, snapshot.agents[0].boost);
+        assert_eq!(
+            to_allocvec(&decoded).expect("re-encode postcard snapshot"),
+            encoded
+        );
+    }
 
     #[wasm_bindgen_test]
     fn wasm_harness_matches_native_world() {

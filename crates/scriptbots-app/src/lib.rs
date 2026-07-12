@@ -577,6 +577,37 @@ mod characterization_tests {
         let encoded = manifest.canonical_json_bytes().expect("manifest JSON");
         let decoded: RunManifestV0 = serde_json::from_slice(&encoded).expect("round trip");
         assert_eq!(manifest, decoded);
+        let encoded_value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("manifest schema");
+        let encoded_object = encoded_value.as_object().expect("manifest object");
+        assert_eq!(
+            encoded_object
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "brain_roster",
+                "build",
+                "config_digest",
+                "config_digest_encoding",
+                "limitations",
+                "normalized_config",
+                "purpose",
+                "reproducible",
+                "root_seed",
+                "scenario",
+                "schema",
+                "schema_version",
+                "warnings",
+            ]
+        );
+        assert_eq!(encoded_value["schema"], RUN_MANIFEST_V0_SCHEMA);
+        assert_eq!(encoded_value["schema_version"], 0);
+        assert_eq!(
+            manifest_digest("run-manifest-v0-wire-golden", &encoded),
+            "fnv1a64:19088384726fe309",
+            "manifest wire changes require a versioned schema boundary"
+        );
     }
 
     #[test]

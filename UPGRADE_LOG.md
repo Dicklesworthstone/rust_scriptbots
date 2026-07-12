@@ -969,3 +969,61 @@ No version migration in this ledger is authorized merely by being newer.
   record disagree, printing every discovered rev with file context.
 - **Future advancement** (e.g. to `a293a252…`) remains gated by
   bd-2z0.8.9.11's qualification protocol, now from an unambiguous baseline.
+
+## 2026-07-12 — Raise the Serde/Postcard serialization-family floors
+
+- **Bead:** `bd-2z0.8.3`
+- **Change class:** one coupled serialization-family target-floor update plus
+  executable wire-compatibility fixtures
+- **Before declarations:** `serde 1.0.210` with `derive`, `serde_json
+  1.0.132`, and `postcard 1.0.8` with default features disabled and only
+  `alloc,use-std`
+- **Before resolution:** the committed lock already selected `serde`,
+  `serde_core`, and `serde_derive` 1.0.228, `serde_json` 1.0.150, and
+  `postcard` 1.1.3. The update therefore raises truthful workspace floors; it
+  does not change the executing serialization implementation.
+- **Target declarations:** `serde 1.0.228`, `serde_json 1.0.150`, and
+  `postcard 1.1.3`, retaining the exact prior feature policy. These were the
+  crates.io `max_stable_version` values on 2026-07-12 and were not yanked.
+- **Primary release research:** [Serde
+  1.0.228](https://github.com/serde-rs/serde/releases/tag/v1.0.228),
+  [serde_json
+  1.0.150](https://github.com/serde-rs/json/releases/tag/v1.0.150), and
+  [Postcard
+  1.1.3](https://github.com/jamesmunns/postcard/releases/tag/postcard/v1.1.3).
+  Serde 1.0.220 introduced the `serde_core` split already present in the lock;
+  serde_json 1.0.145 raised its Serde floor to 1.0.220 and 1.0.150 rejects
+  non-string enum object keys; Postcard 1.1.2 fixed premature EOF handling and
+  1.1.3 made Serde renames effective. ScriptBots' persisted JSON objects use
+  string keys, while its Postcard snapshot is positional, so neither change
+  authorizes a schema mutation.
+- **MSRV and license:** Serde declares Rust 1.56, serde_json declares Rust
+  1.71, and Postcard does not declare `rust-version`; all three declare `MIT
+  OR Apache-2.0`. The workspace requires Rust 1.89 and pins a newer dated
+  nightly, so no stated MSRV or license boundary moves.
+- **Security:** each exact target returned no RustSec advisory in the current
+  advisory database, no repository security advisory, and no OSV result on
+  2026-07-12. The whole-lock vulnerability set cannot change in this update
+  because no package tuple, source, checksum, or feature changed.
+- **Exact lock delta:** byte-identical to the rebased authoritative baseline at
+  SHA-256
+  `bb52a2a93ed71a0b3e25aa3bc13041ffb4569328081178988ce88f86de042e55`.
+  This preserves both reqwest's `futures-channel` repair and the state-ingress
+  slice's `scriptbots-core` Postcard development edge; this family update adds,
+  removes, or retargets no lock record.
+- **Wire/schema proof:** the canonical `RunManifestV0` top-level key set,
+  schema/version, JSON round trip, and wire digest are frozen at
+  `fnv1a64:19088384726fe309`; the browser snapshot's Postcard representation is
+  frozen as a 69-byte positional golden and decode/re-encode idempotence test;
+  replay action payload JSON is frozen with an exact decode/encode round trip.
+  Any future byte drift must cross a named version boundary instead of being
+  silently blessed by a dependency bump.
+- **Checkpoint/recovery boundary:** the state-ingress fixture round-trips an
+  untrusted `MapArtifact` through Postcard before exact-path atomic rejection;
+  the NeuroFlow exact evaluator clone/reconstruction test passes; and the
+  durable storage outbox recovers an admitted JSON payload across the worker
+  boundary. Full-world checkpoint envelopes remain planned work and are not
+  misrepresented as implemented by this dependency update.
+- **Rollback:** manually restore only the three root workspace declaration
+  floors and these fixture/log/plan additions. `Cargo.lock` needs no rollback;
+  do not overwrite its independently landed reqwest or core-Postcard edges.

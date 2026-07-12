@@ -6893,6 +6893,15 @@ mod tests {
                 give_intent: 0.125,
             },
         });
+        let encoded_row = replay_row_from_event(&batch.replay_events[0], 6, 0)?;
+        assert_eq!(encoded_row.scope, "agent:action");
+        assert_eq!(encoded_row.event_type, "action");
+        assert_eq!(
+            encoded_row.payload,
+            r#"{"left_wheel":-0.25,"right_wheel":0.75,"boost":true,"spike_target":12884901889,"sound_level":0.5,"give_intent":0.125}"#,
+            "replay payload changes require a versioned schema boundary"
+        );
+        assert_eq!(replay_event_from_row(&encoded_row)?, batch.replay_events[0]);
         storage.persist(&batch)?;
         storage.flush()?;
 

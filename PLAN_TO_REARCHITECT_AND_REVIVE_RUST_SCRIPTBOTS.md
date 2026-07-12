@@ -1287,6 +1287,10 @@ CI tests declared products, not the combinatorial powerset of nonsensical featur
 
 ### 10.9 registry-verified candidate target floors
 
+**Serialization family:** [Completed — `serde`, `serde_json`, and `postcard`
+stable target floors with byte-stable wire-compatibility proof,
+`bd-2z0.8.3`, Codex, 2026-07-12]
+
 These candidates were checked against live crates.io records on 2026-07-11. Registry metadata establishes a candidate version, not its migration risk. Release notes, changelog, repository, features, and security research are still required before the bead becomes actionable. They are manifest lower-bound candidates plus a committed lock, not universal exact `=version` requirements.
 
 | Group | Researched stable targets |
