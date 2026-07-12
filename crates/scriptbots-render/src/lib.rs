@@ -1002,11 +1002,6 @@ fn use_wgpu_renderer() -> bool {
     })
 }
 
-#[cfg(not(feature = "world_wgpu"))]
-fn use_wgpu_renderer() -> bool {
-    false
-}
-
 #[cfg(feature = "world_wgpu")]
 fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     use scriptbots_world_gfx::WorldSnapshot as GfxSnapshot;
@@ -1208,9 +1203,6 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         paint_frame(state, bounds, window);
     }
 }
-
-#[cfg(not(feature = "world_wgpu"))]
-fn paint_world_with_wgpu(_state: &CanvasState, _bounds: Bounds<Pixels>, _window: &mut Window) {}
 
 fn toroidal_delta(origin: f32, target: f32, extent: f32) -> f32 {
     let mut delta = target - origin;
@@ -12932,6 +12924,7 @@ fn agent_color(agent: &AgentRenderData, shade: f32) -> Rgba {
     color
 }
 
+#[cfg(feature = "world_wgpu")]
 fn build_gpu_agent_instance(
     frame: &RenderFrame,
     agent: &AgentRenderData,

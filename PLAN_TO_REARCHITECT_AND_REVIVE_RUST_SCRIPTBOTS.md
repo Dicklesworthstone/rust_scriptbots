@@ -1431,9 +1431,10 @@ complete for both hard-threshold monoliths:
   0.601, five unit plus one golden test passing, 5.35% unique monolith
   source-line coverage, and five open seam findings (three must-split, two
   should-split);
-- the renderer's no-default-feature lane is honestly recorded as born-red with
-  E0433 at its unconditional `scriptbots_world_gfx::AgentInstance` uses and is
-  tracked by `bd-2z0.7.10` rather than being hidden by the campaign;
+- [Completed — `bd-2z0.7.10`] the renderer's no-default-feature lane gates the
+  GPU-only helper and call surface behind `world_wgpu`; the no-default tests
+  and strict Clippy lane pass without a `scriptbots-world-gfx`/WGPU dependency
+  edge, while the default GPU behavior remains unchanged;
 - Phase 3 now owns behavior, API, dependency, performance, compile-resource,
   binary-size, and whole-project coverage baselines. No extraction is authorized
   until those baselines and the later experiment/quiet-round gates are sealed.
