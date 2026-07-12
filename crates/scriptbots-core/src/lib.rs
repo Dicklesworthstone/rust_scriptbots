@@ -2,6 +2,7 @@
 
 pub mod channels;
 pub mod detect;
+pub mod sense_fixed;
 
 pub use channels::{
     BOOST_THRESHOLD, OutputChannel, OutputsExt, SENSOR_LAYOUT, SensorChannel, SensorKind,
