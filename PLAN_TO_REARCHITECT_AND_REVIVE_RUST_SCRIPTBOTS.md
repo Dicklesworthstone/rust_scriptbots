@@ -1389,7 +1389,7 @@ If a `phase0_run.json` already exists in that workspace, stop and ask whether to
 
 ### 11.2 characterization package
 
-**Status:** [Currently In Progress — Phase 1 recon and enriched census, run `2026-07-12-rust_scriptbots-1`, Codex, 2026-07-12]
+**Status:** [Currently In Progress — Phase 3 dynamic baselines, run `2026-07-12-rust_scriptbots-1`, Codex, 2026-07-12]
 
 Before a mechanical split, capture:
 
@@ -1406,6 +1406,27 @@ Before a mechanical split, capture:
 - cfg/feature matrix;
 - monolith declaration/impl/test census;
 - import/dependency graph and likely seams.
+
+The immutable canonical source for this run is commit
+`a80bc0ac8d6a480af0d2faf54e0ff3875931914f` in
+`/Users/jemanuel/projects/rust_scriptbots__demonolith_canonical_source`; all
+campaign artifacts live in the separate
+`/Users/jemanuel/projects/rust_scriptbots__demonolith_workspace`. Phase 2 is
+complete for both hard-threshold monoliths:
+
+- `scriptbots-core/src/lib.rs`: 180 graph nodes, 18 communities, modularity
+  0.523, 60/60 canonical tests passing, 85.16% unique source-line coverage,
+  and nine open seam findings (two must-split, seven should-split);
+- `scriptbots-render/src/lib.rs`: 151 graph nodes, 14 communities, modularity
+  0.601, five unit plus one golden test passing, 5.35% unique monolith
+  source-line coverage, and five open seam findings (three must-split, two
+  should-split);
+- the renderer's no-default-feature lane is honestly recorded as born-red with
+  E0433 at its unconditional `scriptbots_world_gfx::AgentInstance` uses and is
+  tracked by `bd-2z0.7.10` rather than being hidden by the campaign;
+- Phase 3 now owns behavior, API, dependency, performance, compile-resource,
+  binary-size, and whole-project coverage baselines. No extraction is authorized
+  until those baselines and the later experiment/quiet-round gates are sealed.
 
 ### 11.3 Standard-mode review rounds
 
