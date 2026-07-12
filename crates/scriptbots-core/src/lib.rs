@@ -18884,11 +18884,26 @@ mod tests {
         let mut uninstrumented = WorldState::new(config.clone()).expect("control world");
         let mut instrumented = WorldState::new(config).expect("instrumented world");
         instrumented.set_resource_ledger_enabled(true);
+        let mut expected_cumulative: Vec<ResourceFlow> = RESOURCE_FLOW_KINDS
+            .into_iter()
+            .map(ResourceFlow::empty)
+            .collect();
 
         for _ in 0..4 {
             uninstrumented.step().expect("control tick");
             instrumented.step().expect("instrumented tick");
             assert_latest_ledger_reconciles(&instrumented);
+            for (expected, actual) in expected_cumulative.iter_mut().zip(
+                &instrumented
+                    .resource_ledger()
+                    .latest
+                    .as_ref()
+                    .expect("instrumented tick report")
+                    .flows,
+            ) {
+                expected.delta.add_assign(actual.delta);
+                expected.activity.add_assign(actual.activity);
+            }
             assert_eq!(
                 uninstrumented
                     .characterization_digest_v0()
@@ -18899,6 +18914,10 @@ mod tests {
             );
         }
         assert_eq!(instrumented.resource_ledger().completed_ticks, 4);
+        assert_eq!(
+            instrumented.resource_ledger().cumulative,
+            expected_cumulative
+        );
         assert_eq!(uninstrumented.resource_ledger().completed_ticks, 0);
     }
 }
