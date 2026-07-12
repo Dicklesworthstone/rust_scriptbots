@@ -1757,6 +1757,12 @@ This is a protocol bead. Separate child beads implement each family and integrat
 
 #### 1.10 resource ledger and meadow tuning
 
+- [Completed — `bd-2z0.2.12`] Make food sharing stage-independent by rebuilding its
+  spatial query from live positions while preserving toroidal exact-distance checks
+  and deterministic dense-index recipient order.
+- [Completed — `bd-2z0.2.13`] Preserve the deliberate pre-ledger ground-food policy:
+  nutrient-weighted energy, reproduction progress, food balance, and cell waste
+  change when grazing; health does not.
 - explicit resource source/transfer/sink ledger;
 - tune meadow only with honest brain inheritance, stable streams, and canonical digests;
 - run a seed cohort rather than one attractive seed;

@@ -679,24 +679,26 @@ mod characterization_tests {
         assert_eq!(trace_a.points[4].tick, 4);
         assert_eq!(sequence(&trace_a), sequence(&trace_b));
         assert_ne!(sequence(&trace_a), sequence(&trace_c));
+        // These post-tick digests freeze the explicit energy-only ground-food
+        // policy: eating changes energy and reproduction progress, not health.
         assert_eq!(
             sequence(&trace_a),
             [
                 "5ba6a5eadd4b4fc5",
-                "498bf488d51b63b6",
-                "9c17ee4a19ae4c5d",
-                "3f02366b10d3c780",
-                "e43612606fad2b22",
+                "2083069c81fd583a",
+                "e9cb6ffa5625c446",
+                "171a2cc87f6f6ba8",
+                "b982aaf96d371d8f",
             ]
         );
         assert_eq!(
             sequence(&trace_c),
             [
                 "537688c799f28323",
-                "0b4098ed1b6c5564",
-                "4ec3d74ab87eae19",
-                "84ece2db7832e08a",
-                "eee7a03d6554dce1",
+                "16b95268087ffd7f",
+                "79b188f01032a9cb",
+                "6a453e63f2d69958",
+                "368e8315c2a61c36",
             ]
         );
 
