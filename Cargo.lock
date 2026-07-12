@@ -10070,6 +10070,7 @@ dependencies = [
  "direction",
  "getrandom 0.3.4",
  "num_cpus",
+ "postcard",
  "rand 0.8.7",
  "rand 0.9.5",
  "rayon",
