@@ -8,6 +8,7 @@ use scriptbots_core::{
     TickEvents, WorldState,
 };
 use scriptbots_storage::AnalyticsSnapshotProvider;
+pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -20,20 +21,6 @@ pub const RUN_MANIFEST_V0_SCHEMA: &str = "scriptbots.run-manifest";
 pub const CHARACTERIZATION_TRACE_V0_SCHEMA: &str = "scriptbots.characterization-trace";
 /// Safety bound for the temporary characterization runner.
 pub const MAX_CHARACTERIZATION_TICKS_V0: u64 = 256;
-/// Files that may belong to a live or interrupted FrankenSQLite database.
-///
-/// Every path guard that reserves or exports alongside a database must use this single list so
-/// a CSV can never be created where the engine expects a lock or journal sidecar.
-pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
-    "-wal",
-    "-shm",
-    "-journal",
-    "-wal-fec",
-    "-lock-shared",
-    "-lock-reserved",
-    "-lock-pending",
-];
-
 const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 const RUST_TOOLCHAIN_BYTES: &[u8] = include_bytes!("../../../rust-toolchain.toml");
 const RUST_TOOLCHAIN_TEXT: &str = include_str!("../../../rust-toolchain.toml");
@@ -356,7 +343,7 @@ pub enum CharacterizationTraceErrorV0 {
     #[error(transparent)]
     Characterization(#[from] CharacterizationError),
     #[error(transparent)]
-    Persistence(#[from] scriptbots_core::PersistenceAdmissionError),
+    Step(#[from] scriptbots_core::WorldStepError),
     #[error("failed to encode characterization artifact: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -679,24 +666,26 @@ mod characterization_tests {
         assert_eq!(trace_a.points[4].tick, 4);
         assert_eq!(sequence(&trace_a), sequence(&trace_b));
         assert_ne!(sequence(&trace_a), sequence(&trace_c));
+        // These post-tick digests freeze the explicit energy-only ground-food
+        // policy: eating changes energy and reproduction progress, not health.
         assert_eq!(
             sequence(&trace_a),
             [
-                "38f7452ccda6bcba",
-                "34b0a76c99269b47",
-                "7d0464f81092c907",
-                "5538f487ce073b93",
-                "7f09761b265ce657",
+                "5ba6a5eadd4b4fc5",
+                "2083069c81fd583a",
+                "e9cb6ffa5625c446",
+                "171a2cc87f6f6ba8",
+                "b982aaf96d371d8f",
             ]
         );
         assert_eq!(
             sequence(&trace_c),
             [
-                "f024060ee12a9fd0",
-                "9dbc3883e0bf1973",
-                "fda69e3aa36a88c4",
-                "9f536f95875cfac5",
-                "4b004298efa2cafa",
+                "537688c799f28323",
+                "16b95268087ffd7f",
+                "79b188f01032a9cb",
+                "6a453e63f2d69958",
+                "368e8315c2a61c36",
             ]
         );
 

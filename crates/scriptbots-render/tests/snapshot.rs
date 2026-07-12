@@ -23,7 +23,7 @@ fn register_brains(world: &mut WorldState) -> u64 {
     world
         .brain_registry_mut()
         .register(MlpBrain::KIND.as_str(), |seed_rng| {
-            MlpBrain::runner(seed_rng)
+            Ok(MlpBrain::runner(seed_rng))
         })
 }
 
@@ -37,7 +37,11 @@ fn seed_agents(world: &mut WorldState, brain_key: u64) {
             agent.heading = 0.0;
             agent.spike_length = 10.0;
             let id = world.spawn_agent(agent);
-            let _ = world.bind_agent_brain(id, brain_key);
+            assert!(
+                world
+                    .bind_agent_brain(id, brain_key)
+                    .expect("snapshot MLP factory")
+            );
         }
     }
 }

@@ -130,12 +130,18 @@ impl Brain for AssemblyBrain {
         outputs
     }
 
-    fn mutate(&mut self, rng: &mut dyn RngCore, rate: f32, _scale: f32) {
+    fn mutate(
+        &mut self,
+        rng: &mut dyn RngCore,
+        rate: f32,
+        _scale: f32,
+    ) -> Result<(), crate::BrainMutationError> {
         for cell in &mut self.cells {
             if rng.random::<f32>() < rate {
                 *cell = rng.random_range(-3.0..3.0);
             }
         }
+        Ok(())
     }
 
     fn crossover(&self, other: &dyn Brain, rng: &mut dyn RngCore) -> Option<Box<dyn Brain>> {
@@ -153,6 +159,10 @@ impl Brain for AssemblyBrain {
         }
 
         Some(Box::new(child))
+    }
+
+    fn clone_box(&self) -> Result<Box<dyn Brain>, crate::BrainCloneError> {
+        Ok(Box::new(self.clone()))
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
@@ -191,7 +201,9 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(1717);
         let mut brain = AssemblyBrain::random(&mut rng);
         let before = brain.cells[10];
-        brain.mutate(&mut rng, 1.0, 0.5);
+        brain
+            .mutate(&mut rng, 1.0, 0.5)
+            .expect("assembly mutation is infallible");
         assert_ne!(brain.cells[10], before);
     }
 

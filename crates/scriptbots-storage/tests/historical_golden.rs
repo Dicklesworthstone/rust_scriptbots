@@ -87,7 +87,7 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
 {
     let path = temp_db_path("storage-golden");
     let path_str = path.to_string_lossy().to_string();
-    let mut storage = Storage::with_thresholds(&path_str, 1, 1, 1, 1)?;
+    let mut storage = Storage::create_new_file_with_thresholds(&path_str, 1, 1, 1, 1)?;
 
     let batches = vec![
         make_batch(

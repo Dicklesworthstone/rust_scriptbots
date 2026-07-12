@@ -3998,7 +3998,7 @@ fn agent_colors(agent: &AgentVisual, palette: ColorPaletteMode) -> (Color, Color
     rgb.y = rgb.y.clamp(0.0, 1.0);
     rgb.z = rgb.z.clamp(0.0, 1.0);
 
-    let health_factor = (agent.health / 100.0).clamp(0.45, 1.0);
+    let health_factor = (agent.health / 2.0).clamp(0.45, 1.0);
     let base_rgb = Vec3::new(
         rgb.x * health_factor,
         rgb.y * health_factor,
@@ -4020,8 +4020,17 @@ fn agent_colors(agent: &AgentVisual, palette: ColorPaletteMode) -> (Color, Color
     (base, emissive)
 }
 
-fn close_on_esc(mut exit_events: MessageWriter<AppExit>, keyboard: Res<ButtonInput<KeyCode>>) {
+fn close_on_esc(
+    mut exit_events: MessageWriter<AppExit>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    state: Res<SnapshotState>,
+) {
     if keyboard.just_pressed(KeyCode::Escape) {
+        // Escape first clears an active selection (handled by
+        // `handle_selection_input`); only exit when nothing is selected.
+        if state.selection_center.is_some() {
+            return;
+        }
         exit_events.write(AppExit::Success);
     }
 }
@@ -4113,11 +4122,12 @@ fn spawn_simulation_driver(
                 dt = 0.25;
             }
 
-            let mut latched_persistence_failure = None;
+            let mut latched_step_failure = None;
             if let Ok(mut world_guard) = world.lock() {
-                if let Some(error) = world_guard.persistence_fault() {
-                    latched_persistence_failure =
-                        Some(format!("Persistence stopped the simulation: {error}"));
+                if let Some(error) = world_guard.latched_step_error() {
+                    latched_step_failure = Some(format!(
+                        "Simulation stopped after a terminal step failure: {error}"
+                    ));
                 } else {
                     (command_drain.as_ref())(&mut world_guard);
                     let pending = world_guard.drain_simulation_commands();
@@ -4129,7 +4139,7 @@ fn spawn_simulation_driver(
                     }
                 }
             }
-            if let Some(reason) = latched_persistence_failure {
+            if let Some(reason) = latched_step_failure {
                 controls.update(|state| {
                     state.paused = true;
                     state.auto_pause_reason = Some(reason.clone());
@@ -4190,11 +4200,12 @@ fn spawn_simulation_driver(
                     steps = 1;
                 }
 
-                let mut persistence_failure = None;
+                let mut step_failure = None;
                 for _ in 0..steps {
                     if let Err(error) = world_guard.step() {
-                        persistence_failure =
-                            Some(format!("Persistence stopped the simulation: {error}"));
+                        step_failure = Some(format!(
+                            "Simulation stopped after a terminal step failure: {error}"
+                        ));
                         break;
                     }
                 }
@@ -4204,8 +4215,8 @@ fn spawn_simulation_driver(
                 let max_age = world_guard.last_max_age();
                 let spike_hits = world_guard.last_spike_hits();
 
-                let persistence_failed = persistence_failure.is_some();
-                let mut reason = persistence_failure;
+                let step_failed = step_failure.is_some();
+                let mut reason = step_failure;
                 if reason.is_none() {
                     if control.auto_pause_on_spike_hit && spike_hits > 0 {
                         reason = Some(format!("Spike hits detected ({spike_hits})"));
@@ -4226,13 +4237,18 @@ fn spawn_simulation_driver(
                         state.auto_pause_reason = Some(reason.clone());
                         state.step_requested = false;
                     });
-                    world_guard.enqueue_simulation_command(SimulationCommand {
-                        paused: Some(true),
-                        speed_multiplier: Some(0.0),
-                        step_once: false,
-                    });
-                    if persistence_failed {
-                        warn!(%reason, "Bevy simulation paused after persistence failure");
+                    if !step_failed
+                        && let Err(error) =
+                            world_guard.enqueue_simulation_command(SimulationCommand {
+                                paused: Some(true),
+                                speed_multiplier: Some(0.0),
+                                step_once: false,
+                            })
+                    {
+                        warn!(%error, "failed to queue Bevy auto-pause command");
+                    }
+                    if step_failed {
+                        warn!(%reason, "Bevy simulation paused after terminal step failure");
                     } else {
                         info!(%reason, "Bevy simulation auto-paused");
                     }
@@ -4413,6 +4429,58 @@ mod tests {
         assert!(
             snapshot.paused,
             "spacebar shortcut should toggle pause state to true"
+        );
+    }
+
+    fn consume_driver_step_request(state: &mut SimControlData) -> usize {
+        if state.step_requested {
+            state.step_requested = false;
+            state.paused = true;
+            state.auto_pause_reason = None;
+            1
+        } else {
+            0
+        }
+    }
+
+    fn current_bevy_step_count(queued_command_arrives_before_driver: bool) -> usize {
+        let mut state = SimControlData {
+            paused: true,
+            step_requested: true,
+            ..SimControlData::default()
+        };
+        // Both Bevy playback handlers optimistically set local state before submitting the same
+        // request through CommandSubmitter.
+        let queued = SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: true,
+        };
+
+        if queued_command_arrives_before_driver {
+            apply_simulation_command_to_state(&mut state, &queued);
+        }
+        let mut steps = consume_driver_step_request(&mut state);
+        if !queued_command_arrives_before_driver {
+            apply_simulation_command_to_state(&mut state, &queued);
+            steps += consume_driver_step_request(&mut state);
+        }
+        steps
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: Bevy step advances once or twice by interleaving"
+    )]
+    fn target_bevy_step_is_exactly_once_for_every_queue_interleaving() {
+        let observed = [
+            current_bevy_step_count(true),
+            current_bevy_step_count(false),
+        ];
+        assert_eq!(
+            observed,
+            [1, 1],
+            "KNOWN DEFECT bd-2z0.4.1: Bevy step advances once or twice by interleaving"
         );
     }
 

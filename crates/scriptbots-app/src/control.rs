@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
-    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, Tick,
-    WorldState,
+    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind,
+    Tick, WorldState,
 };
 
 use crate::SharedWorld;
@@ -178,7 +178,7 @@ impl From<PoisonError<MutexGuard<'_, WorldState>>> for ControlError {
     }
 }
 
-type KnobsCache = std::sync::Arc<Mutex<Option<(usize, Vec<KnobEntry>)>>>;
+type KnobsCache = std::sync::Arc<Mutex<Option<(u64, Vec<KnobEntry>)>>>;
 
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
 #[derive(Clone)]
@@ -275,7 +275,7 @@ impl ControlHandle {
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
         let rev = {
             let world = self.lock_world()?;
-            world.config_audit().len()
+            world.config_revision()
         };
         if let Some((cached_rev, cached)) = self.knobs_cache.lock().unwrap().as_ref()
             && *cached_rev == rev
@@ -284,7 +284,7 @@ impl ControlHandle {
         }
         let (rev2, config_value) = {
             let world = self.lock_world()?;
-            let rev2 = world.config_audit().len();
+            let rev2 = world.config_revision();
             let value =
                 serde_json::to_value(world.config()).map_err(ControlError::serialization)?;
             (rev2, value)
@@ -309,6 +309,9 @@ impl ControlHandle {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        // The limit arrives unclamped from the query string; cap it so a hostile
+        // request cannot reserve unbounded memory (history yields ≤3 events/tick).
+        let limit = limit.min(world.history().count().saturating_mul(3).max(1));
         let mut events = Vec::with_capacity(limit);
         for summary in world.history().rev() {
             if summary.births > 0 {
@@ -343,6 +346,62 @@ impl ControlHandle {
             }
         }
         Ok(events)
+    }
+
+    /// Render a coarse ASCII map of terrain, food, and agents — the server-side
+    /// equivalent of the terminal renderer's saved snapshots.
+    pub fn ascii_map(&self) -> Result<String, ControlError> {
+        let world = self.lock_world()?;
+        let food = world.food();
+        let terrain = world.terrain();
+        let grid_w = food.width().max(1) as usize;
+        let grid_h = food.height().max(1) as usize;
+        let width = grid_w.clamp(16, 96);
+        let height = grid_h.clamp(8, 48);
+        let food_max = world.config().food_max.max(f32::EPSILON);
+        let world_w = (world.config().world_width as f32).max(1.0);
+        let world_h = (world.config().world_height as f32).max(1.0);
+        let tiles = terrain.tiles();
+        let cells = food.cells();
+
+        let mut rows = vec![vec![' '; width]; height];
+        for (y, row) in rows.iter_mut().enumerate() {
+            for (x, slot) in row.iter_mut().enumerate() {
+                let cell_x = (x * grid_w) / width;
+                let cell_y = (y * grid_h) / height;
+                let idx = cell_y * grid_w + cell_x;
+                let kind = tiles.get(idx).map(|tile| tile.kind);
+                let food_level = cells.get(idx).copied().unwrap_or(0.0) / food_max;
+                let base = match kind {
+                    Some(TerrainKind::DeepWater) => '~',
+                    Some(TerrainKind::ShallowWater) => '=',
+                    Some(TerrainKind::Sand) => '.',
+                    Some(TerrainKind::Grass) => ',',
+                    Some(TerrainKind::Bloom) => '*',
+                    Some(TerrainKind::Rock) => '^',
+                    None => ' ',
+                };
+                *slot = if food_level > 0.66 {
+                    '#'
+                } else if food_level > 0.33 {
+                    '+'
+                } else {
+                    base
+                };
+            }
+        }
+        for pos in world.agents().columns().positions() {
+            let x = (((pos.x / world_w) * width as f32) as usize).min(width - 1);
+            let y = (((pos.y / world_h) * height as f32) as usize).min(height - 1);
+            rows[y][x] = '@';
+        }
+
+        let mut out = format!("ScriptBots tick {}\n", world.tick().0);
+        for row in rows {
+            out.extend(row);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// Compute scoreboard snapshots: top predators (carnivores) by energy and oldest living agents.
@@ -432,7 +491,12 @@ impl ControlHandle {
             .food_dimensions()
             .map_err(|err| ControlError::InvalidPatch(err.to_string()))?;
         let current_dims = (world.food().width(), world.food().height());
-        if current_dims != (food_w, food_h) {
+        let current = world.config();
+        if current_dims != (food_w, food_h)
+            || new_config.world_width != current.world_width
+            || new_config.world_height != current.world_height
+            || new_config.food_cell_size != current.food_cell_size
+        {
             return Err(ControlError::InvalidPatch(
                 "changing world dimensions at runtime is not supported; restart the simulation with the new configuration"
                     .into(),
@@ -455,6 +519,9 @@ impl ControlHandle {
     }
 
     fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {
+        command
+            .validate()
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_msg)) => Err(ControlError::CommandQueueFull),
@@ -832,6 +899,34 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
+    )]
+    fn target_config_response_reports_only_applied_state() {
+        let (handle, _receiver) = handle();
+        let projected = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_max".to_owned(),
+                value: Value::from(0.6),
+            }])
+            .expect("accepted config patch");
+        let observed = handle.snapshot().expect("current config snapshot");
+        let projected_food_max = projected.config["food_max"]
+            .as_f64()
+            .expect("projected food_max");
+        let observed_food_max = observed.config["food_max"]
+            .as_f64()
+            .expect("observed food_max");
+
+        assert!((projected_food_max - 0.6).abs() < 1.0e-6);
+        assert!((observed_food_max - 0.6).abs() > 1.0e-6);
+        assert_eq!(
+            projected_food_max, observed_food_max,
+            "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
+        );
+    }
+
+    #[test]
     fn unknown_path_errors() {
         let (handle, _receiver) = handle();
         let err = handle
@@ -862,6 +957,115 @@ mod tests {
             }
             other => panic!("expected InvalidPatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_finite_knob_update_is_field_specific_and_not_admitted() {
+        let (handle, receiver) = handle();
+        let err = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_growth_rate".into(),
+                value: Value::String("NaN".into()),
+            }])
+            .expect_err("non-finite string coercion must fail");
+        assert!(
+            matches!(&err, ControlError::InvalidPatch(_)),
+            "expected InvalidPatch, got {err:?}"
+        );
+        let ControlError::InvalidPatch(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("food_growth_rate"),
+            "error did not identify field: {message}"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+        let value = handle
+            .snapshot()
+            .expect("snapshot")
+            .config
+            .get("food_growth_rate")
+            .and_then(Value::as_f64)
+            .expect("food_growth_rate");
+        assert!(
+            (value - f64::from(ScriptBotsConfig::default().food_growth_rate)).abs() < f64::EPSILON,
+            "rejected update changed food_growth_rate to {value}"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_nested_float_reports_exact_path_without_partial_admission() {
+        let (handle, receiver) = handle();
+        let err = handle
+            .apply_updates(&[
+                KnobUpdate {
+                    path: "food_max".into(),
+                    value: Value::from(0.6),
+                },
+                KnobUpdate {
+                    path: "render.auto_exposure.enabled".into(),
+                    value: Value::from(true),
+                },
+                KnobUpdate {
+                    path: "render.auto_exposure.speed_brighten".into(),
+                    value: Value::from(1.0e40_f64),
+                },
+            ])
+            .expect_err("f64 value outside the f32 domain must fail");
+        assert!(
+            matches!(&err, ControlError::InvalidPatch(_)),
+            "expected InvalidPatch, got {err:?}"
+        );
+        let ControlError::InvalidPatch(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("render.auto_exposure.speed_brighten"),
+            "error did not identify nested field: {message}"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            handle.snapshot().expect("snapshot").config.get("food_max"),
+            Some(&Value::from(0.5))
+        );
+    }
+
+    #[test]
+    fn full_command_queue_returns_no_optimistic_config_snapshot() {
+        let (handle, receiver) = handle();
+        for _ in 0..4 {
+            handle
+                .update_selection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: Vec::new(),
+                    state: SelectionState::None,
+                })
+                .expect("fill bounded command queue");
+        }
+
+        let error = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_max".into(),
+                value: Value::from(0.6),
+            }])
+            .expect_err("full queue must reject config update");
+        assert!(matches!(error, ControlError::CommandQueueFull));
+        assert_eq!(
+            handle.snapshot().expect("snapshot").config.get("food_max"),
+            Some(&Value::from(0.5))
+        );
+
+        let mut queued = 0;
+        while receiver.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 4, "invalid optimistic config command reached queue");
     }
 
     #[test]

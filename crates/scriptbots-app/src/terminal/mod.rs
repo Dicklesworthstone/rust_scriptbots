@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -94,6 +94,18 @@ impl Renderer for TerminalRenderer {
         enable_raw_mode().context("failed to enable raw mode")?;
         execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
 
+        // A panic inside the event loop must not leave the user's shell in raw
+        // mode inside the alternate screen; restore before the message prints.
+        struct RawModeGuard;
+        impl Drop for RawModeGuard {
+            fn drop(&mut self) {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = execute!(io::stdout(), crossterm::cursor::Show);
+            }
+        }
+        let guard = RawModeGuard;
+
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("failed to build terminal backend")?;
         terminal.hide_cursor().ok();
@@ -101,12 +113,7 @@ impl Renderer for TerminalRenderer {
         let result = run_event_loop(self, &mut terminal, ctx);
 
         terminal.show_cursor().ok();
-        if let Err(err) = disable_raw_mode() {
-            tracing::error!(?err, "failed to disable raw mode");
-        }
-        if let Err(err) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
-            tracing::error!(?err, "failed to leave alternate screen");
-        }
+        drop(guard);
 
         result
     }
@@ -137,6 +144,7 @@ fn run_event_loop(
 
         if event::poll(sleep_for)?
             && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
             && app.handle_key(key)?
         {
             break;
@@ -148,11 +156,18 @@ fn run_event_loop(
 
 impl TerminalRenderer {
     fn run_headless(&self, ctx: RendererContext<'_>) -> Result<HeadlessReport> {
+        self.run_headless_frames(ctx, self.headless_frame_budget())
+    }
+
+    fn run_headless_frames(
+        &self,
+        ctx: RendererContext<'_>,
+        frames: usize,
+    ) -> Result<HeadlessReport> {
         let backend = ratatui::backend::TestBackend::new(80, 36);
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
         let mut report = HeadlessReport::new(app.snapshot().clone());
-        let frames = self.headless_frame_budget();
 
         for _ in 0..frames {
             app.step_once();
@@ -214,6 +229,7 @@ struct TerminalApp<'a> {
     analytics: Option<TerminalAnalytics>,
     analytics_revision: Option<u64>,
     analytics_status: AnalyticsStatus,
+    simulation_fault: Option<Arc<str>>,
     expanded: bool,
     // When true, the user has explicitly toggled expanded panels; honor self.expanded
     // instead of auto-expanding on wide terminals.
@@ -261,6 +277,7 @@ impl<'a> TerminalApp<'a> {
             analytics: None,
             analytics_revision: None,
             analytics_status: AnalyticsStatus::default(),
+            simulation_fault: None,
             expanded: false,
             expanded_user_override: false,
             focused_agent_cursor: 0,
@@ -311,10 +328,10 @@ impl<'a> TerminalApp<'a> {
         self.last_tick = now;
 
         let mut force_step = single_step;
-        let mut persistence_fault = None;
+        let mut latched_fault = None;
         let pending_commands = if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.persistence_fault() {
-                persistence_fault = Some(Arc::<str>::from(error.to_string()));
+            if let Some(error) = world.latched_step_error() {
+                latched_fault = Some(Arc::<str>::from(error.to_string()));
                 None
             } else {
                 (self.command_drain.as_ref())(&mut world);
@@ -323,11 +340,10 @@ impl<'a> TerminalApp<'a> {
         } else {
             None
         };
-        if let Some(error) = persistence_fault {
+        if let Some(error) = latched_fault {
             self.paused = true;
             self.sim_accumulator = 0.0;
-            self.analytics_status.last_error = Some(error);
-            self.analytics_status.stopped = true;
+            self.simulation_fault = Some(error);
             self.refresh_snapshot();
             return;
         }
@@ -385,8 +401,7 @@ impl<'a> TerminalApp<'a> {
         if let Some(error) = step_error {
             self.paused = true;
             self.sim_accumulator = 0.0;
-            self.analytics_status.last_error = Some(error);
-            self.analytics_status.stopped = true;
+            self.simulation_fault = Some(error);
         }
     }
 
@@ -914,6 +929,12 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
         let mut lines: Vec<Line> = Vec::new();
+        if let Some(error) = &self.simulation_fault {
+            lines.push(Line::from(vec![
+                Span::styled("Simulation ", self.palette.header_style()),
+                Span::styled(format!("fault: {error}"), Style::default().fg(Color::Red)),
+            ]));
+        }
         let committed = self
             .analytics_status
             .committed_tick
@@ -1265,11 +1286,17 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" Narrow:  width-1 symbols: ≈ ~ · \" * ^; agents h/H, o/O, c/C; groups @"),
         ];
 
-        // Compute a suitable height based on content and available space
+        // Compute a suitable height based on content and available space.
+        // Every dimension must stay within the frame: on tiny terminals the
+        // old `.max(8)` floor exceeded size.height and the centering math
+        // underflowed u16, producing a Rect far outside the buffer.
         let desired_height = (help_lines.len() as u16).saturating_add(2);
-        let help_height = desired_height.min(size.height.saturating_sub(2).max(8));
-        let help_x = size.x + (size.width - help_width) / 2;
-        let help_y = size.y + (size.height - help_height) / 2;
+        let help_height = desired_height
+            .min(size.height.saturating_sub(2))
+            .clamp(1, size.height.max(1));
+        let help_width = help_width.clamp(1, size.width.max(1));
+        let help_x = size.x + size.width.saturating_sub(help_width) / 2;
+        let help_y = size.y + size.height.saturating_sub(help_height) / 2;
         let area = Rect::new(help_x, help_y, help_width, help_height);
 
         // Ensure the help area fully clears underlying content so background doesn't bleed
@@ -1536,7 +1563,7 @@ impl<'a> TerminalApp<'a> {
 
     fn refresh_snapshot(&mut self) {
         let new_snapshot = match self.world.lock() {
-            Ok(world) => {
+            Ok(mut world) => {
                 let mut snap = Snapshot::from_world(&world);
                 // Determine focused agent id
                 let agent_id_opt = match self.focus_lock {
@@ -1563,6 +1590,9 @@ impl<'a> TerminalApp<'a> {
                             .find(|h| h.data().as_ffi() == e.label)
                     }),
                 };
+                // Activations are captured lazily: tell the world which agent
+                // the console heatmap follows so the next ticks snapshot it.
+                world.set_activation_probe(agent_id_opt);
                 if let Some(agent_id) = agent_id_opt
                     && let Some(rt) = world.runtime().get(agent_id)
                     && let Some(act) = rt.brain_activations.as_ref()
@@ -3210,6 +3240,110 @@ mod tests {
     use super::*;
     use scriptbots_core::{AgentData, ScriptBotsConfig};
 
+    fn command_characterization_world() -> SharedWorld {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        Arc::new(std::sync::Mutex::new(
+            WorldState::new(config).expect("characterization world"),
+        ))
+    }
+
+    #[test]
+    fn live_tui_single_step_advances_exactly_once_and_stays_paused() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        let before = world.lock().expect("world lock").tick().0;
+
+        let exit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("single-step key");
+
+        let mut guard = world.lock().expect("world lock");
+        assert!(!exit);
+        assert_eq!(guard.tick().0, before + 1);
+        assert!(guard.drain_simulation_commands().is_empty());
+        assert!(app.paused);
+        assert_eq!(app.speed_multiplier, 0.0);
+    }
+
+    #[test]
+    fn headless_tui_single_frame_advances_exactly_once() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+
+        let report = renderer
+            .run_headless_frames(ctx, 1)
+            .expect("one headless frame");
+
+        assert_eq!(report.summary.frame_count, 1);
+        assert_eq!(report.summary.ticks_simulated, 1);
+        assert_eq!(report.summary.final_tick, report.initial.tick + 1);
+        assert_eq!(
+            world.lock().expect("world lock").tick().0,
+            report.initial.tick + 1
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: rejected TUI command leaves optimistic playback state"
+    )]
+    fn target_queue_full_rejection_does_not_change_tui_playback_state() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, _unused_drain, _unused_submit) = crate::servers::ControlRuntime::dummy();
+        let (sender, receiver) = crate::command::create_command_bus(1);
+        sender
+            .try_send(ControlCommand::UpdateSimulation(
+                SimulationCommand::default(),
+            ))
+            .expect("fill command queue");
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world,
+            analytics,
+            control_runtime: &runtime,
+            command_drain: crate::command::make_command_drain(receiver),
+            command_submit: crate::command::make_command_submit(sender),
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        assert!(!app.paused);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("pause key");
+
+        assert!(
+            !app.paused,
+            "KNOWN DEFECT bd-2z0.4.1: rejected TUI command leaves optimistic playback state"
+        );
+    }
+
     #[test]
     fn snapshot_reflects_world_state() {
         let config = ScriptBotsConfig::default();
@@ -3222,6 +3356,61 @@ mod tests {
         assert_eq!(snapshot.tick, world.tick().0);
         assert_eq!(snapshot.agents.len(), world.agent_count());
         assert_eq!(snapshot.world_size.0, world.config().world_width);
+    }
+
+    #[test]
+    fn terminal_numeric_ingress_rejects_non_finite_speed_before_queue_admission() {
+        let world = Arc::new(std::sync::Mutex::new(
+            WorldState::new(ScriptBotsConfig::default()).expect("world"),
+        ));
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let app = TerminalApp::new(&renderer, ctx);
+
+        app.submit_simulation_command(SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: Some(f32::NAN),
+            step_once: false,
+        });
+
+        let mut world = world.lock().expect("world lock");
+        (app.command_drain)(&mut world);
+        assert!(
+            world.drain_simulation_commands().is_empty(),
+            "terminal admitted a non-finite speed command"
+        );
+    }
+
+    #[test]
+    fn simulation_fault_survives_storage_health_refresh() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world,
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        let fault = Arc::<str>::from("deliberate brain construction failure");
+        app.simulation_fault = Some(Arc::clone(&fault));
+
+        app.maybe_refresh_analytics();
+
+        assert_eq!(app.simulation_fault.as_deref(), Some(fault.as_ref()));
+        assert!(app.analytics_status.last_error.is_none());
+        assert!(!app.analytics_status.stopped);
     }
 
     #[test]

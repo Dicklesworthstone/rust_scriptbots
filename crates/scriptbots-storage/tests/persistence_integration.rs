@@ -2,7 +2,7 @@ use scriptbots_core::{
     AgentData, PersistenceBatch, ReplayEvent, ReplayEventKind, ScriptBotsConfig, Tick, TickSummary,
     WorldState,
 };
-use scriptbots_storage::{Storage, StoragePipeline};
+use scriptbots_storage::{StoragePipeline, StorageReader};
 use std::{
     fs,
     time::{SystemTime, UNIX_EPOCH},
@@ -21,7 +21,8 @@ fn storage_persists_metrics_roundtrip() {
     ));
 
     let path_str = path.to_str().expect("utf8 path");
-    let mut pipeline = StoragePipeline::with_thresholds(path_str, 1, 1, 1, 1).expect("pipeline");
+    let mut pipeline =
+        StoragePipeline::create_new_file_with_thresholds(path_str, 1, 1, 1, 1).expect("pipeline");
     let analytics = pipeline.analytics_provider();
     pipeline
         .submit(&PersistenceBatch {
@@ -93,7 +94,7 @@ fn storage_persists_metrics_roundtrip() {
     );
     assert!(snapshot.stopped, "shutdown should be visible to readers");
 
-    let mut storage = Storage::open(path_str).expect("reopen storage after pipeline shutdown");
+    let storage = StorageReader::open(path_str).expect("open storage after pipeline shutdown");
 
     let predators = storage.top_predators(4).expect("top predators query");
     assert!(
@@ -116,6 +117,6 @@ fn storage_persists_metrics_roundtrip() {
         "expected replay event counts to be populated"
     );
 
-    storage.close().expect("close reopened storage explicitly");
+    storage.close().expect("close storage reader explicitly");
     let _ = fs::remove_file(&path);
 }

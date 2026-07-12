@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -46,7 +46,7 @@ struct Cli {
     #[arg(
         long,
         env = "SCRIPTBOTS_CONTROL_URL",
-        default_value = "http://127.0.0.1:8080"
+        default_value = "http://127.0.0.1:8088"
     )]
     base_url: String,
 
@@ -493,10 +493,10 @@ fn watch_blocking(client: Client, base_url: String, interval: Duration) -> Resul
     let mut previous: HashMap<String, Value> = HashMap::new();
     let mut rows: Vec<WatchRow> = Vec::new();
     let mut last_error: Option<String> = None;
-    let mut last_refresh = Instant::now() - interval;
+    let mut last_refresh: Option<Instant> = None;
 
     loop {
-        if last_refresh.elapsed() >= interval {
+        if last_refresh.is_none_or(|at| at.elapsed() >= interval) {
             match handle.block_on(fetch_knobs(&client, &base_url)) {
                 Ok(entries) => {
                     rows = build_rows(&entries, &previous);
@@ -510,7 +510,7 @@ fn watch_blocking(client: Client, base_url: String, interval: Duration) -> Resul
                     last_error = Some(err.to_string());
                 }
             }
-            last_refresh = Instant::now();
+            last_refresh = Some(Instant::now());
         }
 
         terminal
@@ -521,12 +521,13 @@ fn watch_blocking(client: Client, base_url: String, interval: Duration) -> Resul
             event::poll(Duration::from_millis(100)).context("failed to poll terminal events")?;
         if event_ready
             && let Event::Key(key) = event::read().context("failed to read terminal event")?
+            && key.kind == KeyEventKind::Press
         {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('r') => {
                     // Force refresh on demand.
-                    last_refresh = Instant::now() - interval;
+                    last_refresh = None;
                 }
                 _ => {}
             }
@@ -899,18 +900,13 @@ fn value_to_string(value: &Value, max_len: usize) -> String {
         return String::new();
     }
 
-    let chars = raw.chars();
-    let mut truncated = String::new();
-
-    for (count, ch) in chars.enumerate() {
-        if count + 1 >= max_len {
-            truncated.push('…');
-            return truncated;
-        }
-        truncated.push(ch);
+    if raw.chars().count() <= max_len {
+        return raw;
     }
 
-    raw
+    let mut truncated: String = raw.chars().take(max_len.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn json_pointer(path: &str) -> String {
@@ -927,6 +923,22 @@ mod tests {
     use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
     use scriptbots_storage::{RunLedgerSummary, Storage};
     use tempfile::tempdir;
+
+    #[test]
+    fn non_finite_and_unrepresentable_float_text_is_not_silently_normalized() {
+        assert_eq!(
+            parse_value("NaN").expect("parse NaN token"),
+            Value::String("NaN".into())
+        );
+        assert_eq!(
+            parse_value("Infinity").expect("parse infinity token"),
+            Value::String("Infinity".into())
+        );
+        assert_eq!(
+            parse_value("1e400").expect("parse out-of-range token"),
+            Value::String("1e400".into())
+        );
+    }
 
     fn fixture_batch(tick: u16) -> PersistenceBatch {
         let average_health = match tick {
@@ -970,7 +982,7 @@ mod tests {
         let database = path
             .to_str()
             .context("temporary database path was not valid UTF-8")?;
-        let mut storage = Storage::open(database)?;
+        let mut storage = Storage::create_new_file(database)?;
 
         // Persist deliberately out of order so the export contract, rather than insertion
         // order, proves chronological output.

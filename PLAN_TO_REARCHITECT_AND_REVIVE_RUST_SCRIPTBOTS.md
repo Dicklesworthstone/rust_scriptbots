@@ -794,7 +794,7 @@ Empty-versus-empty is reported as `NoEvidence`, never “matched.”
 
 ### 7.5 bounded storage worker
 
-**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, strict single-writer/validated repair mode, ordered/idempotent recovery, bounded controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs implemented under `bd-2z0.8.9.4`; queue telemetry and strict-run pause/fail-closed host policy remain under `bd-2z0.4.10`, Codex, 2026-07-12]
+**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact identity/schema proof (`bd-2z0.8.9.4.2`), remaining direct-write/root-cause unification (`bd-2z0.8.9.4.4`), queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open, Codex, 2026-07-12]
 
 The current unbounded storage channel carrying cloned full batches can exhaust memory. The new worker uses:
 
@@ -1655,7 +1655,7 @@ Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
 
 **Exit:** pre-fix behavior has a reproducible before/after oracle; Phase 4 packages later artifacts rather than inventing manifest/digest concepts.
 
-### Phase 1 — Restore Simulation Correctness (`P0`)
+### Phase 1 — Restore Simulation Correctness (`P0`) [Currently In Progress — scientific peer-patch verification and isolated storage/brain reconciliation, CyanDove, 2026-07-12]
 
 #### 1.1 sensing and spatial oracle
 
@@ -1673,7 +1673,9 @@ Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
 - typed output mapping;
 - green-versus-boost damage regression;
 - replay/render use same accessors;
-- finite/range validation.
+- finite/range validation [Completed — `bd-2z0.2.6`].
+  - The broader mutable agent/food/terrain/hydrology ingress audit is owned by `bd-2z0.2.11`.
+  - [Completed — `bd-2z0.3.11`] Fallible finite construction for public NeuroFlow `f64` learning-rate and momentum values.
 
 **Exit:** no raw magic indexes outside the centralized conversion hot path.
 
@@ -1757,6 +1759,12 @@ This is a protocol bead. Separate child beads implement each family and integrat
 
 #### 1.10 resource ledger and meadow tuning
 
+- [Completed — `bd-2z0.2.12`] Make food sharing stage-independent by rebuilding its
+  spatial query from live positions while preserving toroidal exact-distance checks
+  and deterministic dense-index recipient order.
+- [Completed — `bd-2z0.2.13`] Preserve the deliberate pre-ledger ground-food policy:
+  nutrient-weighted energy, reproduction progress, food balance, and cell waste
+  change when grazing; health does not.
 - explicit resource source/transfer/sink ledger;
 - tune meadow only with honest brain inheritance, stable streams, and canonical digests;
 - run a seed cohort rather than one attractive seed;
@@ -1767,7 +1775,7 @@ This is a protocol bead. Separate child beads implement each family and integrat
 
 ### Phase 2 — One Authoritative Runtime (`P0`)
 
-#### 2.1 characterize command semantics
+#### 2.1 characterize command semantics [Completed]
 
 - pause/resume/speed/step truth table;
 - choose one-step policy: a step request atomically pauses, advances exactly one tick, and remains paused even if received while running;
@@ -1777,7 +1785,74 @@ This is a protocol bead. Separate child beads implement each family and integrat
 - shutdown/flush behavior;
 - tests covering more than 32 commands.
 
+Target policy frozen by `bd-2z0.4.1`:
+
+- All commands use one bounded `CommandEnvelope` stream. The host assigns one monotonic
+  `AdmissionSequence` to each admitted envelope and applies admitted envelopes strictly in that
+  order. There is no hidden playback subqueue, command-class reorder, silent drop, or coalescing.
+- `ControlRevision` advances exactly once for each successfully applied playback, mutating,
+  synthetic auto-pause, or shutdown envelope. Validation, expected-revision conflict, overload,
+  and duplicate lookup do not advance it. `ScientificRevision`, `ConfigRevision`, snapshot
+  revision, and event sequence remain separate domains.
+- `Step` atomically pauses, performs exactly one scientific transition at its ordered position,
+  suppresses the implicit cadence tick for that boundary, and stays paused unless a later admitted
+  envelope resumes it. Multiple admitted `Step` envelopes each advance once.
+- Application and journal state are independent. `Applied` does not imply journal commit.
+  `ModeCommit` below means `CommittedVolatile` for memory mode or `Durable` for file mode. A
+  rejection before admission is queryable for the live run but has `JournalState::NotRequired` and
+  no `AdmissionSequence`; it is not advertised as crash-durable.
+- Playback and presentation-only selection need no science journal record. `Step`, config changes,
+  disconnected-but-admitted mutations, and shutdown begin journal-pending and reach `ModeCommit`
+  only through acknowledgement. Auto-pause is a synthetic ordered Pause envelope with its own
+  identity and status. Duplicate `CommandId` returns the original two-axis status and never
+  reapplies.
+- Shutdown is an ordered, idempotent envelope. All older admitted work is applied or terminally
+  rejected in sequence before shutdown completes; later admission is closed explicitly. Completion
+  includes the shutdown journal/flush outcome, so no pending command is stranded behind a
+  successful shutdown return.
+
+The checked copy of this table lives in `crates/scriptbots-app/src/command.rs`. Burst rows are Step
+envelopes submitted into an unserviced capacity-32 admission window. An overload rejection is a
+terminal result for that `CommandId`; a later admission attempt uses a new ID after capacity becomes
+available.
+
+| Case / ordered envelopes | Start → final | Δ ControlRevision | Science at frozen boundary | Terminal application status | Journal status |
+|---|---:|---:|---:|---|---|
+| Pause | Running → Paused | 1 | 0 | `Applied(1)` | `NotRequired(1)` |
+| Resume | Paused → Running | 1 | 0; cadence may run only after time advances | `Applied(1)` | `NotRequired(1)` |
+| Speed | Running → Running | 1 | 0; new speed affects later cadence only | `Applied(1)` | `NotRequired(1)` |
+| Step | Running → Paused | 1 | exactly 1; no implicit cadence tick | `Applied(1)` | `Pending(1) → ModeCommit(1)` |
+| Step, Resume | Running → Running | 2 | exactly 1 | `Applied(2)` in order | Step pending/committed; Resume not required |
+| Resume, Step | Paused → Paused | 2 | exactly 1 | `Applied(2)` in order | Resume not required; Step pending/committed |
+| Config | Paused → Paused | 1 | 0 | `Applied(1)` | `Pending(1) → ModeCommit(1)` |
+| Selection | Paused → Paused | 1 | 0 | `Applied(1)` | `NotRequired(1)` |
+| Auto-pause trigger | Running → Paused | 1 | triggering tick may complete; no later tick | synthetic `Applied(1)` | `NotRequired(1)` |
+| Duplicate applied `CommandId` | Paused → Paused | 0 | 0 additional | existing status; no reapply | existing journal status |
+| Expected `ControlRevision` conflict | Paused → Paused | 0 | 0 | `Rejected(conflict)` | `NotRequired(1)` |
+| Client disconnect after admitted Config | Paused → Paused | 1 | 0 | `Applied(1)`, queryable after disconnect | `Pending(1) → ModeCommit(1)` |
+| Unserviced Step burst 1 / capacity 32 | Running → Paused | 1 | exactly 1 | 1 applied, 0 rejected | 1 pending/committed |
+| Unserviced Step burst 32 / capacity 32 | Running → Paused | 32 | exactly 32 | 32 applied, 0 rejected | 32 pending/committed |
+| Unserviced Step burst 33 / capacity 32 | Running → Paused | 32 | exactly 32 | 32 applied, 1 overload rejection | 32 pending/committed; 1 not required |
+| Unserviced Step burst 1,000 / capacity 32 | Running → Paused | 32 | exactly 32 | 32 applied, 968 overload rejections | 32 pending/committed; 968 not required |
+| Shutdown with empty queue | Paused → Stopped | 1 | 0 | shutdown `Applied(1)` | `Pending(1) → ModeCommit(1)` |
+| pending Step, Config, Shutdown | Running → Stopped | 3 | exactly 1 | all 3 applied in admission order | all 3 pending then mode-committed |
+
 **Exit:** current broken behavior is captured where intended to change, and target behavior is explicit.
+
+Executable evidence on source baseline `a4dce8fb9635834d387e0cd353d2d2f6670abf19`:
+
+- Live TUI `s` and one headless frame are green controls: each advances exactly one tick, and the
+  live path stays paused without leaving an inner simulation command.
+- The current capacity-32 bus admits the first 32 envelopes and rejects the 33rd explicitly.
+- Named target assertions are retained as specific expected-failure tests, never ignored: GPUI's
+  two views produce tick 2 instead of 1; a GPUI pause produces `(tick, pending) = (1, 1)` instead
+  of `(0, 0)`; Bevy's two queue/driver interleavings produce `[1, 2]` steps instead of `[1, 1]`;
+  mixed command classes defer playback behind later config application; a rejected TUI pause
+  remains optimistically visible; an accepted config response projects `0.6` while the applied
+  world still reports `0.5`; and control-runtime shutdown returns before its pending config is
+  applied.
+- `target_command_truth_table_is_complete_and_self_consistent` checks every row above, including
+  Step/Resume order, revision deltas, application counts, and journal counts.
 
 #### 2.2 extract core side effects
 
@@ -1789,7 +1864,7 @@ This is a protocol bead. Separate child beads implement each family and integrat
 
 **Exit:** core performs one deterministic state transition with no command transport or storage I/O.
 
-#### 2.3 runtime dependency and protocol decision
+#### 2.3 runtime dependency and protocol decision [Completed — `bd-2z0.4.3`]
 
 - confirm whether `scriptbots-runtime` crate is justified;
 - define a synchronous `HostCore`/`SimulationEngine` state machine with injected/manual time;
@@ -1799,6 +1874,35 @@ This is a protocol bead. Separate child beads implement each family and integrat
 - run a bounded Asupersync MPSC/cancellation/lifecycle spike before choosing native scheduling types;
 - prohibit frontend dependency on mutable world;
 - add null frontend.
+
+Decision from the bounded executable spike:
+
+- create `scriptbots-runtime` after the pure `StepOutcome` seam lands; the crate owns the
+  runtime-neutral synchronous host/protocol plus an optional native driver, and depends on core
+  but never on storage, Axum/Tokio, GPUI, Bevy, FrankenTUI/Ratatui, or application composition;
+- keep the protocol, `HostCore`, and manual/browser driver free of Asupersync types; select exact
+  crates.io `asupersync = "=0.3.6"` with default features disabled for the first optional native
+  driver because FrankenSQLite already locks that checksummed package, avoiding two incompatible
+  runtime/`Cx` type universes;
+- defer the live `90949d62ffd6221873a047ea14c7b6bb0060849f` (`0.3.8` workspace marker)
+  upgrade until the serialized dependency lane can advance FrankenSQLite and the native driver
+  together; the tested primitive subset is green on both sources;
+- use bounded two-phase MPSC for native command ownership, explicit `blocking_threads` when a
+  blocking pool is actually required, structured joins/cancellation, and deterministic lab tests;
+- keep the `!Send + !Sync` FrankenSQLite connection on its dedicated owner thread. A running
+  blocking closure cannot be preempted and the no-pool/lab fallback may execute inline, so
+  Asupersync supervises DTOs, receipts, and shutdown but never owns or hard-cancels the connection;
+- retain Tokio/Axum as an application/server adapter during the first host extraction and retain a
+  manual WASM driver. The whole-workspace migration planner's sole hard blocker, `smol`, comes from
+  `gpui_linux` and is not in the proposed runtime dependency closure.
+
+Executable evidence covered capacity-two exact-envelope overload, ordered Pause/Step/Shutdown,
+cancel-before-commit, permit commit, panic observation, configured blocking-pool isolation,
+same-thread mock storage ownership/drop, strict Clippy, and a no-Asupersync
+`wasm32-unknown-unknown` manual build. Both Asupersync sources passed 4/4 tests; the selected
+`0.3.6` clean all-target check took 3m45s, its clean test link took 6m55s, and its cached all-target
+check took 0.63s wall time. Its isolated normal dependency tree contains no Tokio, Smol,
+frontend, server, or storage edge.
 
 **Exit:** dependency graph enforces that renderers cannot call `WorldState::step`.
 
@@ -1845,6 +1949,10 @@ This is a protocol bead. Separate child beads implement each family and integrat
 **Exit:** paused/no-renderer server applies and acknowledges commands.
 
 #### 2.8 storage lifecycle migration
+
+**Status:** [Currently In Progress — checked encodings, exact retained-batch
+shutdown retry, and storage-owned path guards, `bd-2z0.8.9.4.3`, CyanDove,
+2026-07-12]
 
 - blocking FrankenSQLite boundary with one worker-owned connection;
 - bounded lossless command/lifecycle journal queue;
@@ -2690,8 +2798,8 @@ repaired.
 
 - GPUI two-window repaint stepping;
 - GPUI command queue never drained;
-- TUI direct-plus-queued double step;
-- headless TUI command queue never drained;
+- TUI queue-full rejection leaves optimistic local playback state;
+- control config responses project unapplied future state;
 - SIMD eye chunk factor inverted;
 - scalar eye heading double-added;
 - offspring brain unbound;

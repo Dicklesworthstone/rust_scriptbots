@@ -15,7 +15,7 @@ pub enum MlBackendKind {
 }
 
 /// Placeholder structure that will host the chosen ML model.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MlBrain {
     kind: MlBackendKind,
 }
@@ -46,13 +46,10 @@ impl MlBrain {
 
 impl Brain for MlBrain {
     fn kind(&self) -> BrainKind {
-        let name = match self.kind {
-            MlBackendKind::Candle => "ml.candle",
-            MlBackendKind::Tract => "ml.tract-onnx",
-            MlBackendKind::Tch => "ml.tch",
-            MlBackendKind::None => "ml.placeholder",
-        };
-        BrainKind::new(name)
+        // Honest labeling: no backend loads or executes a model yet, so a
+        // backend-specific name would report fake inference in analytics.
+        // `backend()` still exposes which feature compiled in for probes.
+        BrainKind::new("ml.placeholder")
     }
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
@@ -63,8 +60,18 @@ impl Brain for MlBrain {
         outputs
     }
 
-    fn mutate(&mut self, _rng: &mut dyn rand::RngCore, _rate: f32, _scale: f32) {
+    fn mutate(
+        &mut self,
+        _rng: &mut dyn rand::RngCore,
+        _rate: f32,
+        _scale: f32,
+    ) -> Result<(), scriptbots_brain::BrainMutationError> {
         // Mutation behavior will be implemented per-backend as we integrate models.
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Result<Box<dyn Brain>, scriptbots_brain::BrainCloneError> {
+        Ok(Box::new(self.clone()))
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {

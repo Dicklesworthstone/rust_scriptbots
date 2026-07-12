@@ -27,7 +27,7 @@ use scriptbots_core::PresetKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{convert::Infallible, time::Duration};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, watch};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -98,10 +98,14 @@ impl ControlServerConfig {
         }
 
         if let Ok(flag) = env::var("SCRIPTBOTS_CONTROL_REST_ENABLED") {
-            config.rest_enabled = matches!(
-                flag.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
+            match flag.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => config.rest_enabled = true,
+                "0" | "false" | "no" | "off" => config.rest_enabled = false,
+                other => warn!(
+                    value = %other,
+                    "unrecognized SCRIPTBOTS_CONTROL_REST_ENABLED; keeping default"
+                ),
+            }
         }
 
         let mut http_override = None;
@@ -207,8 +211,13 @@ impl McpTransportConfig {
 }
 
 /// Runtime guard for background control servers.
+///
+/// Shutdown is a level-triggered `watch` flag rather than `Notify`:
+/// `notify_waiters` wakes only already-registered waiters, so a shutdown
+/// issued before the server tasks reach their await would be lost and the
+/// join below would hang forever.
 pub struct ControlRuntime {
-    shutdown: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -221,8 +230,7 @@ impl ControlRuntime {
         let (command_tx, command_rx) = create_command_bus(32);
         let command_drain = make_command_drain(command_rx);
         let command_submit = make_command_submit(command_tx.clone());
-        let shutdown = Arc::new(Notify::new());
-        let shutdown_clone = shutdown.clone();
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let handle = ControlHandle::new(world.clone(), command_tx.clone());
 
         let thread = thread::Builder::new()
@@ -234,9 +242,7 @@ impl ControlRuntime {
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(async move {
-                        if let Err(err) =
-                            run_control_servers(handle, config, shutdown_clone.clone()).await
-                        {
+                        if let Err(err) = run_control_servers(handle, config, shutdown_rx).await {
                             error!(?err, "control servers terminated with error");
                         }
                     }),
@@ -256,7 +262,7 @@ impl ControlRuntime {
 
     /// Trigger a graceful shutdown and block until the background thread exits.
     pub fn shutdown(mut self) -> Result<()> {
-        self.shutdown.notify_waiters();
+        let _ = self.shutdown.send(true);
         if let Some(handle) = self.thread.take() {
             handle
                 .join()
@@ -274,7 +280,7 @@ impl ControlRuntime {
         let command_drain = make_command_drain(command_rx);
         let command_submit = make_command_submit(command_tx);
         let runtime = Self {
-            shutdown: Arc::new(Notify::new()),
+            shutdown: watch::channel(false).0,
             thread: None,
         };
         (runtime, command_drain, command_submit)
@@ -283,7 +289,7 @@ impl ControlRuntime {
 
 impl Drop for ControlRuntime {
     fn drop(&mut self) {
-        self.shutdown.notify_waiters();
+        let _ = self.shutdown.send(true);
         if let Some(handle) = self.thread.take()
             && let Err(err) = handle.join()
         {
@@ -295,7 +301,7 @@ impl Drop for ControlRuntime {
 async fn run_control_servers(
     handle: ControlHandle,
     config: ControlServerConfig,
-    shutdown: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut rest_handle = None;
     let mut mcp_handle = None;
@@ -327,7 +333,9 @@ async fn run_control_servers(
         info!("MCP control server disabled via configuration");
     }
 
-    shutdown.notified().await;
+    // wait_for returns immediately if the flag is already true, and treats a
+    // dropped sender as shutdown, so a pre-startup shutdown cannot be lost.
+    let _ = shutdown.wait_for(|stop| *stop).await;
 
     if let Some(handle) = rest_handle
         && let Err(err) = handle.await
@@ -695,13 +703,10 @@ async fn stream_ticks_sse(
     responses((status = 200, description = "ASCII screenshot", content_type = "text/plain"))
 )]
 async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, AppError> {
-    let snapshot = state
+    let text = state
         .handle
-        .latest_summary()
+        .ascii_map()
         .map_err::<AppError, _>(|e| e.into())?;
-    // crude ASCII banner with tick; actual ASCII map is saved client-side by terminal renderer, but
-    // provide a minimal server-side textual artifact to support CLI writes
-    let text = format!("ScriptBots snapshot t{}\n", snapshot.tick.0);
     Ok((StatusCode::OK, text).into_response())
 }
 
@@ -984,7 +989,7 @@ async fn apply_preset(
 async fn run_rest_server(
     handle: ControlHandle,
     config: &ControlServerConfig,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let state = ApiState { handle };
     let swagger_path_static: &'static str = Box::leak(config.swagger_path.clone().into_boxed_str());
@@ -1026,10 +1031,10 @@ async fn run_rest_server(
 
     info!(address = %config.rest_address, "REST control server listening");
 
-    let shutdown_signal = shutdown.clone();
+    let mut shutdown_signal = shutdown.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown_signal.notified().await;
+            let _ = shutdown_signal.wait_for(|stop| *stop).await;
         })
         .await
         .context("REST control server errored")
@@ -1038,7 +1043,7 @@ async fn run_rest_server(
 async fn run_mcp_server(
     handle: ControlHandle,
     transport: McpTransportConfig,
-    shutdown: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     match transport {
         McpTransportConfig::Disabled => Ok(()),
@@ -1153,7 +1158,7 @@ async fn run_mcp_server(
                 .context("failed to start MCP HTTP server")?;
 
             info!(address = %bind_address, "MCP HTTP server listening");
-            shutdown.notified().await;
+            let _ = shutdown.wait_for(|stop| *stop).await;
             http_server
                 .stop()
                 .await
@@ -1293,5 +1298,69 @@ fn map_control_error(err: ControlError) -> McpError {
             McpError::Internal("command queue is full; retry shortly".into())
         }
         ControlError::CommandQueueClosed => McpError::Internal("command queue is closed".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptbots_core::{ScriptBotsConfig, WorldState};
+
+    fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let (sender, receiver) = create_command_bus(2);
+        let handle = ControlHandle::new(Arc::new(std::sync::Mutex::new(world)), sender);
+        (handle, receiver)
+    }
+
+    #[tokio::test]
+    async fn rest_patch_rejects_non_finite_value_with_field_path_before_admission() {
+        let (handle, receiver) = handle();
+        let state = ApiState { handle };
+        let result = patch_config(
+            State(state.clone()),
+            Json(ConfigPatchRequest {
+                patch: json!({"food_growth_rate": "NaN"}),
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "REST patch accepted non-finite input");
+        let Err(error) = result else {
+            return;
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            error.message.contains("food_growth_rate"),
+            "REST error did not identify field: {}",
+            error.message
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_patch_rejects_non_finite_value_with_field_path_before_admission() {
+        let (handle, receiver) = handle();
+        let tool = ControlTool {
+            handle,
+            kind: ControlToolKind::ApplyPatch,
+        };
+        let arguments =
+            HashMap::from([("patch".to_owned(), json!({"food_growth_rate": "Infinity"}))]);
+        let error = tool
+            .call(arguments)
+            .await
+            .expect_err("MCP patch accepted non-finite input");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("food_growth_rate"),
+            "MCP error did not identify field: {rendered}"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossfire::TryRecvError::Empty)
+        ));
     }
 }

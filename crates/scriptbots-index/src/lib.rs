@@ -1,7 +1,6 @@
 //! Spatial indexing abstractions for agent neighborhood queries.
 
 use ordered_float::OrderedFloat;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -39,25 +38,17 @@ pub trait NeighborhoodIndex {
 }
 
 /// Baseline uniform grid index backing neighbor queries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct UniformGridIndex {
     /// Edge length of each grid cell used for bucketing agents.
     pub cell_size: f32,
-    #[serde(skip)]
     width: f32,
-    #[serde(skip)]
     height: f32,
-    #[serde(skip)]
     inv_cell_size: f32,
-    #[serde(skip)]
     cells_x: i32,
-    #[serde(skip)]
     cells_y: i32,
-    #[serde(skip)]
     buckets: Buckets,
-    #[serde(skip)]
     agent_cells: Vec<(i32, i32)>,
-    #[serde(skip)]
     positions: Vec<(f32, f32)>,
 }
 
@@ -122,11 +113,13 @@ impl UniformGridIndex {
         }
         let (cell_x, cell_y) = self.agent_cells[agent_idx];
         let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
+        let span_x = Self::wrapped_span(cell_radius, self.cells_x);
+        let span_y = Self::wrapped_span(cell_radius, self.cells_y);
 
-        for dx in -cell_radius..=cell_radius {
-            for dy in -cell_radius..=cell_radius {
-                let nx = Self::wrap(cell_x + dx, self.cells_x);
-                let ny = Self::wrap(cell_y + dy, self.cells_y);
+        for step_x in 0..span_x {
+            for step_y in 0..span_y {
+                let nx = Self::wrap(cell_x - cell_radius + step_x, self.cells_x);
+                let ny = Self::wrap(cell_y - cell_radius + step_y, self.cells_y);
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
@@ -170,6 +163,25 @@ impl UniformGridIndex {
     #[inline]
     const fn wrap(value: i32, max: i32) -> i32 {
         ((value % max) + max) % max
+    }
+
+    /// Number of cells to scan along one axis so each wrapped cell is visited at most once.
+    #[inline]
+    const fn wrapped_span(cell_radius: i32, cells: i32) -> i32 {
+        let span = cell_radius.saturating_mul(2).saturating_add(1);
+        if span < cells { span } else { cells }
+    }
+
+    /// Minimum-image delta between two coordinates on a toroidal axis of the given extent.
+    #[inline]
+    const fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
+        let mut delta = a - b;
+        if delta > extent * 0.5 {
+            delta -= extent;
+        } else if delta < -extent * 0.5 {
+            delta += extent;
+        }
+        delta
     }
 
     #[inline]
@@ -289,11 +301,13 @@ impl NeighborhoodIndex for UniformGridIndex {
         let (cell_x, cell_y) = self.agent_cells[agent_idx];
         let radius = radius_sq.sqrt();
         let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
+        let span_x = Self::wrapped_span(cell_radius, self.cells_x);
+        let span_y = Self::wrapped_span(cell_radius, self.cells_y);
 
-        for dx in -cell_radius..=cell_radius {
-            for dy in -cell_radius..=cell_radius {
-                let nx = Self::wrap(cell_x + dx, self.cells_x);
-                let ny = Self::wrap(cell_y + dy, self.cells_y);
+        for step_x in 0..span_x {
+            for step_y in 0..span_y {
+                let nx = Self::wrap(cell_x - cell_radius + step_x, self.cells_x);
+                let ny = Self::wrap(cell_y - cell_radius + step_y, self.cells_y);
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
@@ -303,8 +317,8 @@ impl NeighborhoodIndex for UniformGridIndex {
                                 continue;
                             }
                             let (ox, oy) = self.positions[other_idx];
-                            let dx = ox - ax;
-                            let dy = oy - ay;
+                            let dx = Self::toroidal_delta(ox, ax, self.width);
+                            let dy = Self::toroidal_delta(oy, ay, self.height);
                             let dist_sq = dx.mul_add(dx, dy * dy);
                             if dist_sq <= radius_sq {
                                 visitor(other_idx, OrderedFloat(dist_sq));
@@ -318,8 +332,8 @@ impl NeighborhoodIndex for UniformGridIndex {
                                     continue;
                                 }
                                 let (ox, oy) = self.positions[other_idx];
-                                let dx = ox - ax;
-                                let dy = oy - ay;
+                                let dx = Self::toroidal_delta(ox, ax, self.width);
+                                let dy = Self::toroidal_delta(oy, ay, self.height);
                                 let dist_sq = dx.mul_add(dx, dy * dy);
                                 if dist_sq <= radius_sq {
                                     visitor(other_idx, OrderedFloat(dist_sq));
@@ -344,11 +358,13 @@ impl NeighborhoodIndex for UniformGridIndex {
         let (_ax, _ay) = self.positions[agent_idx];
         let (cell_x, cell_y) = self.agent_cells[agent_idx];
         let cell_radius = Self::discretize_positive(radius * self.inv_cell_size);
+        let span_x = Self::wrapped_span(cell_radius, self.cells_x);
+        let span_y = Self::wrapped_span(cell_radius, self.cells_y);
 
-        for dx in -cell_radius..=cell_radius {
-            for dy in -cell_radius..=cell_radius {
-                let nx = Self::wrap(cell_x + dx, self.cells_x);
-                let ny = Self::wrap(cell_y + dy, self.cells_y);
+        for step_x in 0..span_x {
+            for step_y in 0..span_y {
+                let nx = Self::wrap(cell_x - cell_radius + step_x, self.cells_x);
+                let ny = Self::wrap(cell_y - cell_radius + step_y, self.cells_y);
                 match &self.buckets {
                     Buckets::Dense(b) => {
                         let lin = self.linear_index(nx, ny);
@@ -366,6 +382,135 @@ impl NeighborhoodIndex for UniformGridIndex {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_index(
+        cell_size: f32,
+        width: f32,
+        height: f32,
+        positions: &[(f32, f32)],
+    ) -> UniformGridIndex {
+        let mut index = UniformGridIndex::new(cell_size, width, height);
+        index.rebuild(positions).expect("rebuild should succeed");
+        index
+    }
+
+    #[test]
+    fn full_world_radius_visits_each_neighbor_exactly_once() {
+        // 4x4 grid of cells; the query radius spans the whole world many times over,
+        // so an unclamped scan would revisit every wrapped cell repeatedly.
+        let positions = [
+            (5.0, 5.0),
+            (15.0, 5.0),
+            (25.0, 15.0),
+            (35.0, 35.0),
+            (5.0, 25.0),
+        ];
+        let index = build_index(10.0, 40.0, 40.0, &positions);
+        assert!(matches!(index.buckets, Buckets::Dense(_)));
+
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        index.neighbors_within(0, 10_000.0, &mut |idx, _| {
+            *counts.entry(idx).or_insert(0) += 1;
+        });
+
+        assert_eq!(counts.len(), positions.len() - 1);
+        for (idx, count) in counts {
+            assert_eq!(count, 1, "neighbor {idx} visited {count} times");
+        }
+    }
+
+    #[test]
+    fn full_world_radius_surfaces_each_bucket_entry_exactly_once() {
+        let positions = [
+            (5.0, 5.0),
+            (15.0, 5.0),
+            (25.0, 15.0),
+            (35.0, 35.0),
+            (5.0, 25.0),
+        ];
+        let index = build_index(10.0, 40.0, 40.0, &positions);
+
+        let mut bucket_counts: HashMap<usize, usize> = HashMap::new();
+        index.visit_neighbor_buckets(0, 100.0, &mut |indices| {
+            for &idx in indices {
+                *bucket_counts.entry(idx).or_insert(0) += 1;
+            }
+        });
+        assert_eq!(bucket_counts.len(), positions.len());
+        for (idx, count) in bucket_counts {
+            assert_eq!(count, 1, "agent {idx} surfaced {count} times");
+        }
+
+        let mut scratch_x = Vec::new();
+        let mut scratch_y = Vec::new();
+        let mut soa_counts: HashMap<usize, usize> = HashMap::new();
+        index.visit_neighbor_bucket_positions_with_scratch(
+            0,
+            100.0,
+            &mut scratch_x,
+            &mut scratch_y,
+            &mut |xs, ys, indices| {
+                assert_eq!(xs.len(), indices.len());
+                assert_eq!(ys.len(), indices.len());
+                for &idx in indices {
+                    *soa_counts.entry(idx).or_insert(0) += 1;
+                }
+            },
+        );
+        assert_eq!(soa_counts.len(), positions.len());
+        for (idx, count) in soa_counts {
+            assert_eq!(count, 1, "agent {idx} surfaced {count} times");
+        }
+    }
+
+    #[test]
+    fn neighbors_within_finds_pairs_across_the_world_seam() {
+        // Dense bucket layout: 10x10 cells in a 100x100 world.
+        let positions = [(1.0, 50.0), (99.0, 50.0)];
+        let index = build_index(10.0, 100.0, 100.0, &positions);
+        assert!(matches!(index.buckets, Buckets::Dense(_)));
+
+        for (agent_idx, expected) in [(0_usize, 1_usize), (1, 0)] {
+            let mut found = Vec::new();
+            index.neighbors_within(agent_idx, 25.0, &mut |idx, dist_sq| {
+                found.push((idx, dist_sq));
+            });
+            assert_eq!(found.len(), 1, "agent {agent_idx} should see one neighbor");
+            let (idx, dist_sq) = found[0];
+            assert_eq!(idx, expected);
+            assert!(
+                (dist_sq.into_inner() - 4.0).abs() < 1e-4,
+                "seam distance should be 2 units, got dist_sq {dist_sq}"
+            );
+        }
+    }
+
+    #[test]
+    fn neighbors_within_finds_seam_pairs_in_sparse_buckets() {
+        // 1200x1200 cells exceeds the dense-bucket cap, forcing the sparse path.
+        let positions = [(1.0, 300.0), (599.0, 300.0)];
+        let index = build_index(0.5, 600.0, 600.0, &positions);
+        assert!(matches!(index.buckets, Buckets::Sparse(_)));
+
+        for (agent_idx, expected) in [(0_usize, 1_usize), (1, 0)] {
+            let mut found = Vec::new();
+            index.neighbors_within(agent_idx, 25.0, &mut |idx, dist_sq| {
+                found.push((idx, dist_sq));
+            });
+            assert_eq!(found.len(), 1, "agent {agent_idx} should see one neighbor");
+            let (idx, dist_sq) = found[0];
+            assert_eq!(idx, expected);
+            assert!(
+                (dist_sq.into_inner() - 4.0).abs() < 1e-4,
+                "seam distance should be 2 units, got dist_sq {dist_sq}"
+            );
         }
     }
 }

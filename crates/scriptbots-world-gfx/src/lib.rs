@@ -70,6 +70,10 @@ pub struct WorldRenderer {
     cam_offset: (f32, f32),
     start_time: Instant,
     post: Option<PostFx>,
+    /// Whether the post pass actually ran during the most recent `render()`.
+    /// `post` staying `Some` only means the resources exist; env flags can
+    /// disable the pass at runtime, and readback must not copy a stale target.
+    post_ran: bool,
     #[cfg(feature = "perf_counters")]
     last_render_ms: f32,
     #[cfg(feature = "perf_counters")]
@@ -112,6 +116,7 @@ impl WorldRenderer {
             cam_offset: (0.0, 0.0),
             start_time: Instant::now(),
             post: None,
+            post_ran: false,
             #[cfg(feature = "perf_counters")]
             last_render_ms: 0.0,
             #[cfg(feature = "perf_counters")]
@@ -226,6 +231,7 @@ impl WorldRenderer {
             "wgpu visible instances"
         );
         // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
+        self.post_ran = false;
         if self.ensure_post()
             && let Some(p) = self.post.as_mut()
         {
@@ -236,6 +242,7 @@ impl WorldRenderer {
                 &self.color_view,
                 self.size,
             );
+            self.post_ran = true;
         }
         self.queue.submit(Some(encoder.finish()));
         #[cfg(feature = "perf_counters")]
@@ -248,10 +255,9 @@ impl WorldRenderer {
     pub fn copy_to_readback(&mut self, _frame: &RenderFrame) -> Result<(), String> {
         #[cfg(feature = "perf_counters")]
         let t0 = Instant::now();
-        let src_tex: &wgpu::Texture = if let Some(post) = self.post.as_ref() {
-            &post.target
-        } else {
-            &self.color
+        let src_tex: &wgpu::Texture = match self.post.as_ref() {
+            Some(post) if self.post_ran => &post.target,
+            _ => &self.color,
         };
         self.readback
             .copy(&self.device, &self.queue, src_tex)
@@ -1525,9 +1531,10 @@ struct PostFx {
     bloom_blur_pipeline: wgpu::RenderPipeline,
     bloom_src_layout: wgpu::BindGroupLayout, // single texture + sampler
     bloom_src_bg: wgpu::BindGroup,
-    blur_params_layout: wgpu::BindGroupLayout,
-    blur_params_bg: wgpu::BindGroup,
-    blur_params_buf: wgpu::Buffer,
+    blur_params_h_bg: wgpu::BindGroup,
+    blur_params_h_buf: wgpu::Buffer,
+    blur_params_v_bg: wgpu::BindGroup,
+    blur_params_v_buf: wgpu::Buffer,
     bloom_a: Option<wgpu::Texture>,
     bloom_a_view: Option<wgpu::TextureView>,
     bloom_b: Option<wgpu::Texture>,
@@ -1746,18 +1753,35 @@ impl PostFx {
                     count: None,
                 }],
             });
-        let blur_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bloom.blur_params_buf"),
+        // Separate uniform buffers for the horizontal and vertical blur
+        // directions: queue.write_buffer ordering means a single shared
+        // buffer would make both passes sample the last-written direction.
+        let blur_params_h_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bloom.blur_params_h_buf"),
             size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let blur_params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bloom.blur_params_bg"),
+        let blur_params_h_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bloom.blur_params_h_bg"),
             layout: &blur_params_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: blur_params_buf.as_entire_binding(),
+                resource: blur_params_h_buf.as_entire_binding(),
+            }],
+        });
+        let blur_params_v_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bloom.blur_params_v_buf"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let blur_params_v_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bloom.blur_params_v_bg"),
+            layout: &blur_params_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: blur_params_v_buf.as_entire_binding(),
             }],
         });
         // Extract pipeline: src -> bloom_a (half res)
@@ -1839,9 +1863,10 @@ impl PostFx {
             bloom_blur_pipeline,
             bloom_src_layout,
             bloom_src_bg,
-            blur_params_layout,
-            blur_params_bg,
-            blur_params_buf,
+            blur_params_h_bg,
+            blur_params_h_buf,
+            blur_params_v_bg,
+            blur_params_v_buf,
             bloom_a: None,
             bloom_a_view: None,
             bloom_b: None,
@@ -1976,9 +2001,12 @@ impl PostFx {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(self.env_vignette);
             self.env_tonemap = match std::env::var("SB_WGPU_TONEMAP").ok().as_deref() {
-                Some("filmic") => 1u32,
+                Some("off") | Some("none") | Some("0") => 0u32,
+                Some("aces") | Some("filmic") => 1u32,
                 Some("reinhard") => 2u32,
-                _ => 0u32,
+                // Unset or unrecognized: keep the current value (constructor
+                // default is 1 = aces), matching `wants_post()`.
+                _ => self.env_tonemap,
             };
             self.env_fxaa = std::env::var("SB_WGPU_FXAA")
                 .ok()
@@ -2098,15 +2126,7 @@ impl PostFx {
             }
             // Blur A -> B (horizontal)
             let dir_h: [f32; 4] = [1.0 / (size.0.max(1) as f32 * 0.5), 0.0, 0.0, 0.0];
-            queue.write_buffer(&self.blur_params_buf, 0, bytemuck::bytes_of(&dir_h));
-            self.blur_params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("bloom.blur_params_bg.rebind"),
-                layout: &self.blur_params_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.blur_params_buf.as_entire_binding(),
-                }],
-            });
+            queue.write_buffer(&self.blur_params_h_buf, 0, bytemuck::bytes_of(&dir_h));
             self.bind_bloom_src(device, &a_view_local);
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2126,20 +2146,12 @@ impl PostFx {
                 });
                 pass.set_pipeline(&self.bloom_blur_pipeline);
                 pass.set_bind_group(0, &self.bloom_src_bg, &[]);
-                pass.set_bind_group(1, &self.blur_params_bg, &[]);
+                pass.set_bind_group(1, &self.blur_params_h_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
             // Blur B -> A (vertical)
             let dir_v: [f32; 4] = [0.0, 1.0 / (size.1.max(1) as f32 * 0.5), 0.0, 0.0];
-            queue.write_buffer(&self.blur_params_buf, 0, bytemuck::bytes_of(&dir_v));
-            self.blur_params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("bloom.blur_params_bg.rebind"),
-                layout: &self.blur_params_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.blur_params_buf.as_entire_binding(),
-                }],
-            });
+            queue.write_buffer(&self.blur_params_v_buf, 0, bytemuck::bytes_of(&dir_v));
             self.bind_bloom_src(device, &b_view_local);
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2159,7 +2171,7 @@ impl PostFx {
                 });
                 pass.set_pipeline(&self.bloom_blur_pipeline);
                 pass.set_bind_group(0, &self.bloom_src_bg, &[]);
-                pass.set_bind_group(1, &self.blur_params_bg, &[]);
+                pass.set_bind_group(1, &self.blur_params_v_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
             bloom_view_opt = Some(a_view_local);
@@ -2202,9 +2214,11 @@ fn wants_post() -> bool {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0)
             != 0;
-        let tonemap = std::env::var("SB_WGPU_TONEMAP")
-            .map(|v| !v.is_empty())
-            .unwrap_or(true);
+        // Unset defaults to aces (matches the PostFx constructor default).
+        let tonemap = !matches!(
+            std::env::var("SB_WGPU_TONEMAP").ok().as_deref(),
+            Some("off") | Some("none") | Some("0") | Some("")
+        );
         let bloom = std::env::var("SB_WGPU_BLOOM")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -2247,6 +2261,10 @@ fn aces_tonemap(c: vec3<f32>) -> vec3<f32> {
   return clamp(numerator / denom, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+fn reinhard_tonemap(c: vec3<f32>) -> vec3<f32> {
+  return clamp(c / (vec3<f32>(1.0) + c), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let tex_size = vec2<f32>(textureDimensions(src_tex));
@@ -2254,8 +2272,15 @@ fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let uv01 = pos.xy / tex_size;
   var col = textureSampleLevel(src_tex, src_smp, uv01, 0.0);
   // FXAA stub: none (placeholder for later)
-  // ACES tonemap + mild vignette
-  var rgb = aces_tonemap(col.rgb * params.exposure);
+  // Tonemap (0 = passthrough, 1 = aces, 2 = reinhard) + mild vignette
+  var rgb = col.rgb * params.exposure;
+  if (params.tonemap == 1u) {
+    rgb = aces_tonemap(rgb);
+  } else if (params.tonemap == 2u) {
+    rgb = reinhard_tonemap(rgb);
+  } else {
+    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+  }
   let p = uv01 * 2.0 - 1.0;
   let vign = clamp(1.0 - dot(p, p) * params.vignette, 0.85, 1.0);
   rgb *= vign;

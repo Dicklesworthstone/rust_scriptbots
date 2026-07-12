@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
 use serde::{Deserialize, Serialize};
 use slotmap::{Key, KeyData, SecondaryMap, SlotMap, new_key_type};
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -92,7 +93,7 @@ pub const NUM_EYES: usize = 4;
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
 const HALF_TURN: f32 = std::f32::consts::PI;
-const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.375; // 3π/8
+const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.1875; // 3π/16, PI38 in legacy World.cpp
 
 fn wrap_signed_angle(mut angle: f32) -> f32 {
     if angle.is_nan() {
@@ -216,21 +217,44 @@ pub struct SimulationCommand {
     pub step_once: bool,
 }
 
+impl SimulationCommand {
+    /// Validate values supplied by renderer and control front-ends before queue admission.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        if let Some(speed) = self.speed_multiplier
+            && !speed.is_finite()
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "speed_multiplier must be finite",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ControlCommand {
+    /// Validate state-changing input without mutating the world or admitting queue work.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        match self {
+            Self::UpdateConfig(config) => config.validate(),
+            Self::UpdateSelection(_) => Ok(()),
+            Self::UpdateSimulation(command) => command.validate(),
+        }
+    }
+}
+
 /// Apply a control command to the world state.
 pub fn apply_control_command(
     world: &mut WorldState,
     command: ControlCommand,
 ) -> Result<(), WorldStateError> {
+    command.validate()?;
     match command {
         ControlCommand::UpdateConfig(config) => world.apply_config_update(*config),
         ControlCommand::UpdateSelection(update) => {
             world.apply_selection_update(update);
             Ok(())
         }
-        ControlCommand::UpdateSimulation(update) => {
-            world.enqueue_simulation_command(update);
-            Ok(())
-        }
+        ControlCommand::UpdateSimulation(update) => world.enqueue_simulation_command(update),
     }
 }
 
@@ -593,19 +617,38 @@ impl BrainBinding {
     }
 
     /// Instantiate a brain from the registry and bind it to the agent.
-    #[must_use]
     pub fn from_registry(
         registry: &BrainRegistry,
         rng: &mut dyn RngCore,
         key: u64,
-    ) -> Option<Self> {
-        let runner = registry.spawn(rng, key)?;
+    ) -> Result<Option<Self>, BrainSpawnError> {
+        let Some(runner) = registry.spawn(rng, key)? else {
+            return Ok(None);
+        };
         let kind = registry.kind(key).map(str::to_string);
-        Some(Self {
+        Ok(Some(Self {
             runner: Some(runner),
             registry_key: Some(key),
             kind,
-        })
+        }))
+    }
+
+    /// Attach an inherited runner while preserving the family registry key,
+    /// so later generations can still fall back to the registry factory.
+    #[must_use]
+    pub fn inherited(runner: Box<dyn BrainRunner>, registry_key: Option<u64>) -> Self {
+        let kind = Some(runner.kind().to_string());
+        Self {
+            runner: Some(runner),
+            registry_key,
+            kind,
+        }
+    }
+
+    /// Borrow the live runner, if any.
+    #[must_use]
+    pub fn runner(&self) -> Option<&dyn BrainRunner> {
+        self.runner.as_deref()
     }
 
     /// Return the registry key, if any, associated with this binding.
@@ -664,9 +707,96 @@ pub trait BrainRunner: Send + Sync {
     fn snapshot_activations(&self) -> Option<BrainActivations> {
         None
     }
+
+    /// Duplicate this runner including all evolved parameters.
+    ///
+    /// `None` marks the family as non-heritable; reproduction then falls back
+    /// to spawning a fresh runner from the registry. An exact-snapshot failure
+    /// is returned as an error and must never be normalized into `None`.
+    fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+        Ok(None)
+    }
+
+    /// Perturb parameters in place using the agent's mutation rates.
+    fn mutate(
+        &mut self,
+        _rng: &mut dyn RngCore,
+        _rate: f32,
+        _scale: f32,
+    ) -> Result<(), BrainSpawnError> {
+        Ok(())
+    }
+
+    /// Produce an offspring runner by recombining with a same-kind partner.
+    fn crossover(
+        &self,
+        _partner: &dyn BrainRunner,
+        _rng: &mut dyn RngCore,
+    ) -> Option<Box<dyn BrainRunner>> {
+        None
+    }
+
+    /// Downcast hook so cross-crate `crossover` implementations can identify
+    /// same-family partners behind the trait object.
+    fn as_any(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
 }
 
-type BrainSpawner = Box<dyn Fn(&mut dyn RngCore) -> Box<dyn BrainRunner> + Send + Sync + 'static>;
+/// Typed failure returned by a registered brain factory.
+#[derive(Debug, Clone)]
+pub struct BrainSpawnError {
+    kind: Cow<'static, str>,
+    source: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for BrainSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "brain factory `{}` failed: {}", self.kind, self.source)
+    }
+}
+
+impl std::error::Error for BrainSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl BrainSpawnError {
+    /// Attach a concrete adapter error to its registered brain-family label.
+    pub fn new<E>(kind: impl Into<Cow<'static, str>>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self {
+            kind: kind.into(),
+            source: std::sync::Arc::new(source),
+        }
+    }
+
+    /// Brain-family label whose factory failed.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.kind.as_ref()
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("brain registry key {key} disappeared before offspring construction")]
+struct MissingBrainFactory {
+    key: u64,
+}
+
+#[derive(Debug, Error)]
+#[error("bound parent has no exact heritable snapshot and no registry fallback")]
+struct MissingHeritableBrain;
+
+type BrainSpawner = Box<
+    dyn Fn(&mut dyn RngCore) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 struct BrainEntry {
     kind: Cow<'static, str>,
@@ -695,10 +825,13 @@ impl BrainRegistry {
         Self::default()
     }
 
-    /// Registers a new brain factory, returning its registry key.
+    /// Registers a fallible brain factory, returning its registry key.
     pub fn register<F>(&mut self, kind: impl Into<Cow<'static, str>>, factory: F) -> u64
     where
-        F: Fn(&mut dyn RngCore) -> Box<dyn BrainRunner> + Send + Sync + 'static,
+        F: Fn(&mut dyn RngCore) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+            + Send
+            + Sync
+            + 'static,
     {
         let key = self.next_key;
         self.next_key += 1;
@@ -718,8 +851,14 @@ impl BrainRegistry {
     }
 
     /// Instantiate a new brain runner using the factory referenced by `key`.
-    pub fn spawn(&self, rng: &mut dyn RngCore, key: u64) -> Option<Box<dyn BrainRunner>> {
-        self.entries.get(&key).map(|entry| (entry.spawner)(rng))
+    pub fn spawn(
+        &self,
+        rng: &mut dyn RngCore,
+        key: u64,
+    ) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+        self.entries
+            .get(&key)
+            .map_or(Ok(None), |entry| (entry.spawner)(rng).map(Some))
     }
 
     /// Retrieve the descriptive identifier associated with a registry entry.
@@ -1154,7 +1293,15 @@ struct ActuationResult {
     spike_length: f32,
     sound_level: f32,
     give_intent: f32,
-    spiked: bool,
+}
+
+/// Compact per-agent copy of the only runtime fields combat reads; cloning
+/// whole `AgentRuntime`s (logs, sensor arrays) per tick dwarfed the stage.
+#[derive(Debug, Clone, Copy, Default)]
+struct CombatAgentView {
+    herbivore_tendency: f32,
+    energy: f32,
+    outputs: [f32; OUTPUT_SIZE],
 }
 
 #[derive(Debug, Default)]
@@ -1187,8 +1334,16 @@ struct SpawnOrder {
     parent_index: usize,
     parent_id: AgentId,
     partner_id: Option<AgentId>,
+    parent_energy_before_debit: f32,
+    parent_reproduction_counter_before_reset: f32,
     data: AgentData,
     runtime: AgentRuntime,
+}
+
+struct PopulationSpawnReceipt {
+    inserted: Vec<AgentId>,
+    arena_checkpoint: (SlotMap<AgentId, usize>, usize),
+    rng_before: SmallRng,
 }
 
 /// Events emitted after processing a world tick.
@@ -1556,6 +1711,25 @@ impl PersistenceAdmissionError {
     pub fn detail(&self) -> &str {
         &self.detail
     }
+}
+
+/// Failure while executing a simulation tick.
+#[derive(Debug, Clone, Error)]
+pub enum WorldStepError {
+    /// A registered brain factory could not construct a runner.
+    #[error(transparent)]
+    BrainSpawn(#[from] BrainSpawnError),
+    /// The completed tick could not be admitted to persistence.
+    #[error(transparent)]
+    Persistence(#[from] PersistenceAdmissionError),
+    /// Brain construction and persistence admission both failed at the same completed boundary.
+    #[error(
+        "brain construction failed while the completed tick was also rejected by persistence: {brain}; {persistence}"
+    )]
+    BrainAndPersistence {
+        brain: BrainSpawnError,
+        persistence: PersistenceAdmissionError,
+    },
 }
 
 /// No-op persistence sink.
@@ -2280,6 +2454,28 @@ impl AgentArena {
         id
     }
 
+    /// Capture the allocator and dense length before an append-only transaction.
+    ///
+    /// Restoring this checkpoint preserves both live rows and the otherwise
+    /// invisible `SlotMap` generation/free-list state when fallible preparation
+    /// forces recently appended agents to roll back.
+    fn append_checkpoint(&self) -> (SlotMap<AgentId, usize>, usize) {
+        (self.slots.clone(), self.columns.len())
+    }
+
+    /// Roll back agents appended after `checkpoint` without advancing handle
+    /// generations or perturbing the pre-existing dense order.
+    fn restore_append_checkpoint(&mut self, checkpoint: (SlotMap<AgentId, usize>, usize)) {
+        let (slots, len) = checkpoint;
+        debug_assert!(len <= self.columns.len());
+        self.slots = slots;
+        self.handles.truncate(len);
+        self.columns.truncate(len);
+        self.columns.debug_assert_coherent();
+        debug_assert_eq!(self.handles.len(), len);
+        debug_assert_eq!(self.slots.len(), len);
+    }
+
     /// Remove `id` returning its scalar data if it was present.
     pub fn remove(&mut self, id: AgentId) -> Option<AgentData> {
         let index = self.slots.remove(id)?;
@@ -2611,7 +2807,7 @@ impl Default for ScriptBotsConfig {
             bot_radius: 10.0,
             boost_multiplier: 2.0,
             spike_growth_rate: 0.005,
-            metabolism_drain: 0.002,
+            metabolism_drain: 0.0002,
             movement_drain: 0.005,
             metabolism_ramp_floor: 1.0,
             metabolism_ramp_rate: 0.0,
@@ -2722,234 +2918,597 @@ pub enum NeuroflowActivationKind {
     Relu,
 }
 impl ScriptBotsConfig {
-    /// Validates the configuration, returning derived grid dimensions.
+    /// Validate every public configuration invariant without mutating runtime state.
+    pub fn validate(&self) -> Result<(), WorldStateError> {
+        macro_rules! reject_unless {
+            ($condition:expr, $message:expr) => {
+                if $condition {
+                } else {
+                    return Err(WorldStateError::InvalidConfig($message));
+                }
+            };
+        }
+
+        reject_unless!(self.world_width != 0, "world_width must be non-zero");
+        reject_unless!(self.world_height != 0, "world_height must be non-zero");
+        reject_unless!(self.food_cell_size != 0, "food_cell_size must be non-zero");
+        reject_unless!(
+            self.world_width.is_multiple_of(self.food_cell_size),
+            "world_width must be divisible by food_cell_size"
+        );
+        reject_unless!(
+            self.world_height.is_multiple_of(self.food_cell_size),
+            "world_height must be divisible by food_cell_size"
+        );
+
+        let finite_fields: [(f32, &'static str); 70] = [
+            (self.initial_food, "initial_food must be finite"),
+            (
+                self.food_respawn_amount,
+                "food_respawn_amount must be finite",
+            ),
+            (self.food_max, "food_max must be finite"),
+            (self.food_growth_rate, "food_growth_rate must be finite"),
+            (self.food_decay_rate, "food_decay_rate must be finite"),
+            (
+                self.food_diffusion_rate,
+                "food_diffusion_rate must be finite",
+            ),
+            (self.sense_radius, "sense_radius must be finite"),
+            (
+                self.sense_max_neighbors,
+                "sense_max_neighbors must be finite",
+            ),
+            (self.bot_speed, "bot_speed must be finite"),
+            (self.bot_radius, "bot_radius must be finite"),
+            (self.boost_multiplier, "boost_multiplier must be finite"),
+            (self.spike_growth_rate, "spike_growth_rate must be finite"),
+            (self.metabolism_drain, "metabolism_drain must be finite"),
+            (self.movement_drain, "movement_drain must be finite"),
+            (
+                self.metabolism_ramp_floor,
+                "metabolism_ramp_floor must be finite",
+            ),
+            (
+                self.metabolism_ramp_rate,
+                "metabolism_ramp_rate must be finite",
+            ),
+            (
+                self.metabolism_boost_penalty,
+                "metabolism_boost_penalty must be finite",
+            ),
+            (
+                self.temperature_discomfort_rate,
+                "temperature_discomfort_rate must be finite",
+            ),
+            (
+                self.temperature_comfort_band,
+                "temperature_comfort_band must be finite",
+            ),
+            (
+                self.temperature_gradient_exponent,
+                "temperature_gradient_exponent must be finite",
+            ),
+            (
+                self.temperature_discomfort_exponent,
+                "temperature_discomfort_exponent must be finite",
+            ),
+            (self.food_intake_rate, "food_intake_rate must be finite"),
+            (self.food_waste_rate, "food_waste_rate must be finite"),
+            (
+                self.food_fertility_base,
+                "food_fertility_base must be finite",
+            ),
+            (
+                self.food_moisture_weight,
+                "food_moisture_weight must be finite",
+            ),
+            (
+                self.food_elevation_weight,
+                "food_elevation_weight must be finite",
+            ),
+            (self.food_slope_weight, "food_slope_weight must be finite"),
+            (self.food_capacity_base, "food_capacity_base must be finite"),
+            (
+                self.food_capacity_fertility,
+                "food_capacity_fertility must be finite",
+            ),
+            (
+                self.food_growth_fertility,
+                "food_growth_fertility must be finite",
+            ),
+            (
+                self.food_decay_infertility,
+                "food_decay_infertility must be finite",
+            ),
+            (
+                self.food_sharing_radius,
+                "food_sharing_radius must be finite",
+            ),
+            (self.food_sharing_rate, "food_sharing_rate must be finite"),
+            (self.food_transfer_rate, "food_transfer_rate must be finite"),
+            (
+                self.food_sharing_distance,
+                "food_sharing_distance must be finite",
+            ),
+            (
+                self.reproduction_energy_threshold,
+                "reproduction_energy_threshold must be finite",
+            ),
+            (
+                self.reproduction_energy_cost,
+                "reproduction_energy_cost must be finite",
+            ),
+            (
+                self.reproduction_attempt_chance,
+                "reproduction_attempt_chance must be finite",
+            ),
+            (
+                self.reproduction_rate_herbivore,
+                "reproduction_rate_herbivore must be finite",
+            ),
+            (
+                self.reproduction_rate_carnivore,
+                "reproduction_rate_carnivore must be finite",
+            ),
+            (
+                self.reproduction_food_bonus,
+                "reproduction_food_bonus must be finite",
+            ),
+            (
+                self.reproduction_fertility_bonus,
+                "reproduction_fertility_bonus must be finite",
+            ),
+            (
+                self.reproduction_child_energy,
+                "reproduction_child_energy must be finite",
+            ),
+            (
+                self.reproduction_spawn_jitter,
+                "reproduction_spawn_jitter must be finite",
+            ),
+            (
+                self.reproduction_color_jitter,
+                "reproduction_color_jitter must be finite",
+            ),
+            (
+                self.reproduction_mutation_scale,
+                "reproduction_mutation_scale must be finite",
+            ),
+            (
+                self.reproduction_partner_chance,
+                "reproduction_partner_chance must be finite",
+            ),
+            (
+                self.reproduction_spawn_back_distance,
+                "reproduction_spawn_back_distance must be finite",
+            ),
+            (
+                self.reproduction_meta_mutation_chance,
+                "reproduction_meta_mutation_chance must be finite",
+            ),
+            (
+                self.reproduction_meta_mutation_scale,
+                "reproduction_meta_mutation_scale must be finite",
+            ),
+            (
+                self.aging_health_decay_rate,
+                "aging_health_decay_rate must be finite",
+            ),
+            (
+                self.aging_health_decay_max,
+                "aging_health_decay_max must be finite",
+            ),
+            (
+                self.aging_energy_penalty_rate,
+                "aging_energy_penalty_rate must be finite",
+            ),
+            (
+                self.carcass_distribution_radius,
+                "carcass_distribution_radius must be finite",
+            ),
+            (
+                self.carcass_health_reward,
+                "carcass_health_reward must be finite",
+            ),
+            (
+                self.carcass_reproduction_reward,
+                "carcass_reproduction_reward must be finite",
+            ),
+            (
+                self.carcass_neighbor_exponent,
+                "carcass_neighbor_exponent must be finite",
+            ),
+            (
+                self.carcass_energy_share_rate,
+                "carcass_energy_share_rate must be finite",
+            ),
+            (
+                self.carcass_indicator_scale,
+                "carcass_indicator_scale must be finite",
+            ),
+            (
+                self.topography_speed_gain,
+                "topography_speed_gain must be finite",
+            ),
+            (
+                self.topography_energy_penalty,
+                "topography_energy_penalty must be finite",
+            ),
+            (
+                self.population_crossover_chance,
+                "population_crossover_chance must be finite",
+            ),
+            (self.spike_radius, "spike_radius must be finite"),
+            (self.spike_damage, "spike_damage must be finite"),
+            (self.spike_energy_cost, "spike_energy_cost must be finite"),
+            (self.spike_min_length, "spike_min_length must be finite"),
+            (
+                self.spike_alignment_cosine,
+                "spike_alignment_cosine must be finite",
+            ),
+            (
+                self.spike_speed_damage_bonus,
+                "spike_speed_damage_bonus must be finite",
+            ),
+            (
+                self.spike_length_damage_bonus,
+                "spike_length_damage_bonus must be finite",
+            ),
+            (
+                self.carnivore_threshold,
+                "carnivore_threshold must be finite",
+            ),
+        ];
+        for (value, message) in finite_fields {
+            reject_unless!(value.is_finite(), message);
+        }
+
+        if let Some(value) = self.render.tonemap_exposure_bias {
+            reject_unless!(
+                value.is_finite(),
+                "render.tonemap_exposure_bias must be finite"
+            );
+        }
+        if let Some(auto_exposure) = &self.render.auto_exposure {
+            if let Some(value) = auto_exposure.speed_brighten {
+                reject_unless!(
+                    value.is_finite(),
+                    "render.auto_exposure.speed_brighten must be finite"
+                );
+                reject_unless!(
+                    value >= 0.0,
+                    "render.auto_exposure.speed_brighten must be non-negative"
+                );
+            }
+            if let Some(value) = auto_exposure.speed_darken {
+                reject_unless!(
+                    value.is_finite(),
+                    "render.auto_exposure.speed_darken must be finite"
+                );
+                reject_unless!(
+                    value >= 0.0,
+                    "render.auto_exposure.speed_darken must be non-negative"
+                );
+            }
+        }
+
+        reject_unless!(
+            self.initial_food >= 0.0,
+            "initial_food must be non-negative"
+        );
+        reject_unless!(self.food_max > 0.0, "food_max must be positive");
+        reject_unless!(
+            self.food_respawn_amount >= 0.0,
+            "food_respawn_amount must be non-negative"
+        );
+        reject_unless!(
+            self.initial_food <= self.food_max,
+            "initial_food cannot exceed food_max"
+        );
+        reject_unless!(
+            self.food_respawn_amount <= self.food_max,
+            "food_respawn_amount cannot exceed food_max"
+        );
+        reject_unless!(
+            self.food_growth_rate >= 0.0,
+            "food_growth_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_decay_rate >= 0.0,
+            "food_decay_rate must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=0.25).contains(&self.food_diffusion_rate),
+            "food_diffusion_rate must be within [0, 0.25]"
+        );
+        reject_unless!(self.sense_radius > 0.0, "sense_radius must be positive");
+        reject_unless!(
+            self.sense_max_neighbors > 0.0,
+            "sense_max_neighbors must be positive"
+        );
+        reject_unless!(self.bot_speed >= 0.0, "bot_speed must be non-negative");
+        reject_unless!(self.bot_radius > 0.0, "bot_radius must be positive");
+        reject_unless!(
+            self.boost_multiplier >= 1.0,
+            "boost_multiplier must be at least 1.0"
+        );
+        reject_unless!(
+            self.spike_growth_rate >= 0.0,
+            "spike_growth_rate must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_drain >= 0.0,
+            "metabolism_drain must be non-negative"
+        );
+        reject_unless!(
+            self.movement_drain >= 0.0,
+            "movement_drain must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_ramp_floor >= 0.0,
+            "metabolism_ramp_floor must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_ramp_rate >= 0.0,
+            "metabolism_ramp_rate must be non-negative"
+        );
+        reject_unless!(
+            self.metabolism_boost_penalty >= 0.0,
+            "metabolism_boost_penalty must be non-negative"
+        );
+        reject_unless!(
+            self.temperature_discomfort_rate >= 0.0,
+            "temperature_discomfort_rate must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.temperature_comfort_band),
+            "temperature_comfort_band must be within [0, 1]"
+        );
+        reject_unless!(
+            self.temperature_gradient_exponent > 0.0,
+            "temperature_gradient_exponent must be positive"
+        );
+        reject_unless!(
+            self.temperature_discomfort_exponent > 0.0,
+            "temperature_discomfort_exponent must be positive"
+        );
+        reject_unless!(
+            self.food_intake_rate >= 0.0,
+            "food_intake_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_waste_rate >= 0.0,
+            "food_waste_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_waste_rate <= self.food_max,
+            "food_waste_rate cannot exceed food_max"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.food_fertility_base),
+            "food_fertility_base must be within [0, 1]"
+        );
+        reject_unless!(
+            self.food_moisture_weight >= 0.0,
+            "food_moisture_weight must be non-negative"
+        );
+        reject_unless!(
+            self.food_elevation_weight >= 0.0,
+            "food_elevation_weight must be non-negative"
+        );
+        reject_unless!(
+            self.food_slope_weight >= 0.0,
+            "food_slope_weight must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.food_capacity_base),
+            "food_capacity_base must be within [0, 1]"
+        );
+        reject_unless!(
+            self.food_capacity_fertility >= 0.0,
+            "food_capacity_fertility must be non-negative"
+        );
+        reject_unless!(
+            self.food_growth_fertility >= 0.0,
+            "food_growth_fertility must be non-negative"
+        );
+        reject_unless!(
+            self.food_decay_infertility >= 0.0,
+            "food_decay_infertility must be non-negative"
+        );
+        reject_unless!(
+            self.food_capacity_base + self.food_capacity_fertility <= 1.0,
+            "food_capacity_base + food_capacity_fertility must be <= 1.0"
+        );
+        reject_unless!(
+            self.food_sharing_radius > 0.0,
+            "food_sharing_radius must be positive"
+        );
+        reject_unless!(
+            self.food_sharing_rate >= 0.0,
+            "food_sharing_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_transfer_rate >= 0.0,
+            "food_transfer_rate must be non-negative"
+        );
+        reject_unless!(
+            self.food_sharing_distance > 0.0,
+            "food_sharing_distance must be positive"
+        );
+        reject_unless!(
+            self.reproduction_energy_threshold >= 0.0,
+            "reproduction_energy_threshold must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_energy_cost >= 0.0,
+            "reproduction_energy_cost must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_energy_cost <= self.reproduction_energy_threshold,
+            "reproduction_energy_cost cannot exceed reproduction_energy_threshold"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.reproduction_attempt_chance),
+            "reproduction_attempt_chance must be within [0, 1]"
+        );
+        reject_unless!(
+            self.reproduction_rate_herbivore > 0.0,
+            "reproduction_rate_herbivore must be positive"
+        );
+        reject_unless!(
+            self.reproduction_rate_carnivore > 0.0,
+            "reproduction_rate_carnivore must be positive"
+        );
+        reject_unless!(
+            self.reproduction_food_bonus >= 0.0,
+            "reproduction_food_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_fertility_bonus >= 0.0,
+            "reproduction_fertility_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_child_energy >= 0.0,
+            "reproduction_child_energy must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_spawn_jitter >= 0.0,
+            "reproduction_spawn_jitter must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_color_jitter >= 0.0,
+            "reproduction_color_jitter must be non-negative"
+        );
+        reject_unless!(
+            self.reproduction_mutation_scale >= 0.0,
+            "reproduction_mutation_scale must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.reproduction_partner_chance),
+            "reproduction_partner_chance must be within [0, 1]"
+        );
+        reject_unless!(
+            self.reproduction_spawn_back_distance >= 0.0,
+            "reproduction_spawn_back_distance must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.reproduction_meta_mutation_chance),
+            "reproduction_meta_mutation_chance must be within [0, 1]"
+        );
+        reject_unless!(
+            self.reproduction_meta_mutation_scale >= 0.0,
+            "reproduction_meta_mutation_scale must be non-negative"
+        );
+        reject_unless!(
+            self.aging_tick_interval != 0,
+            "aging_tick_interval must be at least 1"
+        );
+        reject_unless!(
+            self.aging_health_decay_rate >= 0.0,
+            "aging_health_decay_rate must be non-negative"
+        );
+        reject_unless!(
+            self.aging_health_decay_max >= 0.0,
+            "aging_health_decay_max must be non-negative"
+        );
+        reject_unless!(
+            self.aging_health_decay_rate == 0.0
+                || self.aging_health_decay_max >= self.aging_health_decay_rate,
+            "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled"
+        );
+        reject_unless!(
+            self.aging_energy_penalty_rate >= 0.0,
+            "aging_energy_penalty_rate must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_distribution_radius >= 0.0,
+            "carcass_distribution_radius must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_health_reward >= 0.0,
+            "carcass_health_reward must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_reproduction_reward >= 0.0,
+            "carcass_reproduction_reward must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_neighbor_exponent > 0.0,
+            "carcass_neighbor_exponent must be positive"
+        );
+        reject_unless!(
+            self.carcass_maturity_age != 0,
+            "carcass_maturity_age must be at least 1"
+        );
+        reject_unless!(
+            self.carcass_energy_share_rate >= 0.0,
+            "carcass_energy_share_rate must be non-negative"
+        );
+        reject_unless!(
+            self.carcass_indicator_scale >= 0.0,
+            "carcass_indicator_scale must be non-negative"
+        );
+        reject_unless!(
+            self.topography_speed_gain >= 0.0,
+            "topography_speed_gain must be non-negative"
+        );
+        reject_unless!(
+            self.topography_energy_penalty >= 0.0,
+            "topography_energy_penalty must be non-negative"
+        );
+        reject_unless!(
+            self.population_spawn_count != 0,
+            "population_spawn_count must be at least 1"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.population_crossover_chance),
+            "population_crossover_chance must be within [0, 1]"
+        );
+        reject_unless!(self.spike_radius > 0.0, "spike_radius must be positive");
+        reject_unless!(
+            self.spike_damage >= 0.0,
+            "spike_damage must be non-negative"
+        );
+        reject_unless!(
+            self.spike_energy_cost >= 0.0,
+            "spike_energy_cost must be non-negative"
+        );
+        reject_unless!(
+            self.spike_min_length >= 0.0,
+            "spike_min_length must be non-negative"
+        );
+        reject_unless!(
+            (0.0..=1.0).contains(&self.spike_alignment_cosine) && self.spike_alignment_cosine > 0.0,
+            "spike_alignment_cosine must be within (0, 1]"
+        );
+        reject_unless!(
+            self.spike_speed_damage_bonus >= 0.0,
+            "spike_speed_damage_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.spike_length_damage_bonus >= 0.0,
+            "spike_length_damage_bonus must be non-negative"
+        );
+        reject_unless!(
+            self.carnivore_threshold > 0.0 && self.carnivore_threshold < 1.0,
+            "carnivore_threshold must be within (0, 1)"
+        );
+        reject_unless!(
+            self.history_capacity != 0,
+            "history_capacity must be at least 1"
+        );
+        Ok(())
+    }
+
+    /// Validate the configuration and return its derived food-grid dimensions.
     pub fn food_dimensions(&self) -> Result<(u32, u32), WorldStateError> {
-        if self.world_width == 0 || self.world_height == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "world dimensions must be non-zero",
-            ));
-        }
-        if self.food_cell_size == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_cell_size must be non-zero",
-            ));
-        }
-        if !self.world_width.is_multiple_of(self.food_cell_size)
-            || !self.world_height.is_multiple_of(self.food_cell_size)
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "world dimensions must be divisible by food_cell_size",
-            ));
-        }
-        let dims = (
+        self.validate()?;
+        Ok((
             self.world_width / self.food_cell_size,
             self.world_height / self.food_cell_size,
-        );
-        if self.initial_food < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "initial_food must be non-negative",
-            ));
-        }
-        if self.food_max <= 0.0 {
-            return Err(WorldStateError::InvalidConfig("food_max must be positive"));
-        }
-        if self.food_respawn_amount < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_respawn_amount must be non-negative",
-            ));
-        }
-        if self.initial_food > self.food_max {
-            return Err(WorldStateError::InvalidConfig(
-                "initial_food cannot exceed food_max",
-            ));
-        }
-        if self.food_respawn_amount > self.food_max {
-            return Err(WorldStateError::InvalidConfig(
-                "food_respawn_amount cannot exceed food_max",
-            ));
-        }
-        if self.food_waste_rate < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_waste_rate must be non-negative",
-            ));
-        }
-        if self.food_waste_rate > self.food_max {
-            return Err(WorldStateError::InvalidConfig(
-                "food_waste_rate cannot exceed food_max",
-            ));
-        }
-        if self.food_growth_rate < 0.0
-            || self.food_decay_rate < 0.0
-            || self.food_diffusion_rate < 0.0
-            || self.food_diffusion_rate > 0.25
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "food growth/decay must be non-negative and diffusion in [0, 0.25]",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.reproduction_partner_chance) {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_partner_chance must be within [0, 1]",
-            ));
-        }
-        if self.reproduction_spawn_back_distance < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_spawn_back_distance must be non-negative",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.reproduction_meta_mutation_chance) {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_meta_mutation_chance must be within [0, 1]",
-            ));
-        }
-        if self.reproduction_meta_mutation_scale < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_meta_mutation_scale must be non-negative",
-            ));
-        }
-        if self.metabolism_drain < 0.0
-            || self.movement_drain < 0.0
-            || self.metabolism_ramp_floor < 0.0
-            || self.metabolism_ramp_rate < 0.0
-            || self.metabolism_boost_penalty < 0.0
-            || self.food_intake_rate < 0.0
-            || self.food_waste_rate < 0.0
-            || self.food_fertility_base < 0.0
-            || self.food_fertility_base > 1.0
-            || self.food_moisture_weight < 0.0
-            || self.food_elevation_weight < 0.0
-            || self.food_slope_weight < 0.0
-            || self.food_capacity_base < 0.0
-            || self.food_capacity_base > 1.0
-            || self.food_capacity_fertility < 0.0
-            || self.food_growth_fertility < 0.0
-            || self.food_decay_infertility < 0.0
-            || self.reproduction_food_bonus < 0.0
-            || self.reproduction_fertility_bonus < 0.0
-            || self.food_sharing_radius <= 0.0
-            || self.food_sharing_rate < 0.0
-            || self.food_transfer_rate < 0.0
-            || self.food_sharing_distance <= 0.0
-            || self.reproduction_energy_threshold < 0.0
-            || self.reproduction_energy_cost < 0.0
-            || self.reproduction_child_energy < 0.0
-            || self.reproduction_spawn_jitter < 0.0
-            || self.reproduction_color_jitter < 0.0
-            || self.reproduction_mutation_scale < 0.0
-            || !(0.0..=1.0).contains(&self.reproduction_attempt_chance)
-            || self.reproduction_rate_herbivore <= 0.0
-            || self.reproduction_rate_carnivore <= 0.0
-            || self.spike_radius <= 0.0
-            || self.spike_damage < 0.0
-            || self.spike_energy_cost < 0.0
-            || self.spike_min_length < 0.0
-            || self.spike_alignment_cosine <= 0.0
-            || self.spike_alignment_cosine > 1.0
-            || self.spike_speed_damage_bonus < 0.0
-            || self.spike_length_damage_bonus < 0.0
-            || self.carnivore_threshold <= 0.0
-            || self.carnivore_threshold >= 1.0
-            || self.history_capacity == 0
-            || self.temperature_discomfort_rate < 0.0
-            || self.aging_tick_interval == 0
-            || self.aging_health_decay_rate < 0.0
-            || self.aging_health_decay_max < 0.0
-            || self.aging_energy_penalty_rate < 0.0
-            || self.carcass_distribution_radius < 0.0
-            || self.carcass_health_reward < 0.0
-            || self.carcass_reproduction_reward < 0.0
-            || self.carcass_energy_share_rate < 0.0
-            || self.carcass_indicator_scale < 0.0
-            || self.topography_speed_gain < 0.0
-            || self.topography_energy_penalty < 0.0
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "metabolism, reproduction, sharing, and history parameters must be non-negative; spike and diet thresholds must be within valid ranges",
-            ));
-        }
-        if self.food_capacity_base + self.food_capacity_fertility > 1.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "food_capacity_base + food_capacity_fertility must be <= 1.0",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.temperature_comfort_band) {
-            return Err(WorldStateError::InvalidConfig(
-                "temperature_comfort_band must be within [0, 1]",
-            ));
-        }
-        if self.temperature_gradient_exponent <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "temperature_gradient_exponent must be positive",
-            ));
-        }
-        if self.temperature_discomfort_exponent <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "temperature_discomfort_exponent must be positive",
-            ));
-        }
-        if self.aging_health_decay_rate > 0.0
-            && self.aging_health_decay_max < self.aging_health_decay_rate
-        {
-            return Err(WorldStateError::InvalidConfig(
-                "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled",
-            ));
-        }
-        if self.carcass_neighbor_exponent <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "carcass_neighbor_exponent must be positive",
-            ));
-        }
-        if self.carcass_maturity_age == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "carcass_maturity_age must be at least 1",
-            ));
-        }
-        if !(0.0..=1.0).contains(&self.population_crossover_chance) {
-            return Err(WorldStateError::InvalidConfig(
-                "population_crossover_chance must be within [0, 1]",
-            ));
-        }
-        if self.population_spawn_count == 0 {
-            return Err(WorldStateError::InvalidConfig(
-                "population_spawn_count must be at least 1",
-            ));
-        }
-        if self.reproduction_energy_cost > self.reproduction_energy_threshold {
-            return Err(WorldStateError::InvalidConfig(
-                "reproduction_energy_cost cannot exceed reproduction_energy_threshold",
-            ));
-        }
-        if self.sense_radius <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "sense_radius must be positive",
-            ));
-        }
-        if self.sense_max_neighbors <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "sense_max_neighbors must be positive",
-            ));
-        }
-        if self.bot_radius <= 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "bot_radius must be positive",
-            ));
-        }
-        if self.bot_speed < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "bot_speed must be non-negative",
-            ));
-        }
-        if self.boost_multiplier < 1.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "boost_multiplier must be at least 1.0",
-            ));
-        }
-        if self.spike_growth_rate < 0.0 {
-            return Err(WorldStateError::InvalidConfig(
-                "spike_growth_rate must be non-negative",
-            ));
-        }
-        Ok(dims)
+        ))
     }
 
     /// Returns the configured RNG seed, generating one from entropy if absent.
@@ -3095,7 +3654,7 @@ impl TerrainLayer {
                 };
 
                 let fertility_bias = default_tile_fertility_bias(kind, elevation, moisture);
-                let temperature_bias = default_tile_temperature_bias(fy);
+                let temperature_bias = default_tile_temperature_bias(fx);
                 let palette_index = default_tile_palette_index(kind);
 
                 tiles.push(TerrainTile {
@@ -3235,8 +3794,10 @@ fn default_tile_fertility_bias(kind: TerrainKind, elevation: f32, moisture: f32)
     (kind_bonus + 0.5 + moisture_term - elevation_term).clamp(0.0, 1.0)
 }
 
-fn default_tile_temperature_bias(normalized_y: f32) -> f32 {
-    (1.0 - normalized_y).clamp(0.0, 1.0)
+fn default_tile_temperature_bias(normalized_x: f32) -> f32 {
+    // Must track sample_temperature's west→east gradient (distance from the
+    // vertical equator), or temperature overlays contradict what agents feel.
+    ((normalized_x - 0.5).abs() * 2.0).clamp(0.0, 1.0)
 }
 
 fn default_tile_palette_index(kind: TerrainKind) -> u16 {
@@ -4171,14 +4732,36 @@ mod map_sandbox {
         if visited[idx] {
             return accumulation[idx];
         }
+        // Iterative post-order: upstream chains can span the whole map, and
+        // one recursion frame per cell overflows the stack on large maps.
+        // Frames are (cell, next-child cursor, running total); a node's
+        // accumulation stays at 1.0 until its subtree completes, matching the
+        // recursive cycle-guard behavior for back-edges.
+        let mut stack: Vec<(usize, usize, f32)> = Vec::new();
         visited[idx] = true;
-        let mut total = 1.0f32;
-        accumulation[idx] = total;
-        for &child in &incoming[idx] {
-            total += accumulate_flow(child, incoming, accumulation, visited);
+        accumulation[idx] = 1.0;
+        stack.push((idx, 0, 1.0));
+        while let Some(&(node, child_pos, _)) = stack.last() {
+            if let Some(&child) = incoming[node].get(child_pos) {
+                if let Some(frame) = stack.last_mut() {
+                    frame.1 += 1;
+                    if visited[child] {
+                        frame.2 += accumulation[child];
+                    }
+                }
+                if !visited[child] {
+                    visited[child] = true;
+                    accumulation[child] = 1.0;
+                    stack.push((child, 0, 1.0));
+                }
+            } else if let Some((finished, _, total)) = stack.pop() {
+                accumulation[finished] = total;
+                if let Some(parent) = stack.last_mut() {
+                    parent.2 += total;
+                }
+            }
         }
-        accumulation[idx] = total;
-        total
+        accumulation[idx]
     }
 
     fn current_epoch_ms() -> u128 {
@@ -4523,7 +5106,6 @@ pub struct WorldState {
     work_eye_fov: Vec<[f32; NUM_EYES]>,
     work_eye_view_dirs: Vec<[f32; NUM_EYES]>,
     work_eye_fov_clamped: Vec<[f32; NUM_EYES]>,
-    work_eye_fov_cos: Vec<[f32; NUM_EYES]>,
     work_clocks: Vec<[f32; 2]>,
     work_temperature_preferences: Vec<f32>,
     work_sound_emitters: Vec<f32>,
@@ -4534,7 +5116,7 @@ pub struct WorldState {
     work_spike_lengths: Vec<f32>,
     work_velocities: Vec<Velocity>,
     work_speed_norm: Vec<f32>,
-    work_runtime_snapshot: Vec<AgentRuntime>,
+    work_combat_views: Vec<CombatAgentView>,
     work_penalties: Vec<f32>,
     pending_deaths: Vec<AgentId>,
     #[allow(dead_code)]
@@ -4549,6 +5131,7 @@ pub struct WorldState {
     persistence: Box<dyn WorldPersistence>,
     pending_persistence_batch: Option<PersistenceBatch>,
     persistence_fault: Option<PersistenceAdmissionError>,
+    brain_fault: Option<BrainSpawnError>,
     last_admitted_persistence_tick: Option<Tick>,
     pending_persistence_runtime_tail: AgentMap<PersistenceRuntimeTail>,
     pending_birth_events: usize,
@@ -4567,6 +5150,8 @@ pub struct WorldState {
     combat_spike_attempts: u32,
     combat_spike_hits: u32,
     config_audit: Vec<ConfigAuditEntry>,
+    config_revision: u64,
+    activation_probe: Option<AgentId>,
     simulation_commands: Vec<SimulationCommand>,
 }
 
@@ -4606,8 +5191,10 @@ impl WorldState {
     ) -> Result<Self, WorldStateError> {
         configure_parallelism();
         let (food_w, food_h) = config.food_dimensions()?;
-        let rng = config.seeded_rng();
-        let mut terrain_rng = rng.clone();
+        let mut rng = config.seeded_rng();
+        // Decorrelate terrain noise from the world RNG stream: a plain clone
+        // replays identical draws for terrain and the first agent spawns.
+        let mut terrain_rng = SmallRng::seed_from_u64(rng.next_u64());
         let terrain =
             TerrainLayer::generate(food_w, food_h, config.food_cell_size, &mut terrain_rng)?;
         let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
@@ -4643,7 +5230,6 @@ impl WorldState {
             work_eye_fov: Vec::new(),
             work_eye_view_dirs: Vec::new(),
             work_eye_fov_clamped: Vec::new(),
-            work_eye_fov_cos: Vec::new(),
             work_clocks: Vec::new(),
             work_temperature_preferences: Vec::new(),
             work_sound_emitters: Vec::new(),
@@ -4654,7 +5240,7 @@ impl WorldState {
             work_spike_lengths: Vec::new(),
             work_velocities: Vec::new(),
             work_speed_norm: Vec::new(),
-            work_runtime_snapshot: Vec::new(),
+            work_combat_views: Vec::new(),
             work_penalties: Vec::new(),
             pending_deaths: Vec::new(),
             pending_spawns: Vec::new(),
@@ -4667,6 +5253,7 @@ impl WorldState {
             persistence,
             pending_persistence_batch: None,
             persistence_fault: None,
+            brain_fault: None,
             last_admitted_persistence_tick: None,
             pending_persistence_runtime_tail: AgentMap::new(),
             pending_birth_events: 0,
@@ -4683,6 +5270,8 @@ impl WorldState {
             combat_spike_attempts: 0,
             combat_spike_hits: 0,
             config_audit: Vec::with_capacity(32),
+            config_revision: 0,
+            activation_probe: None,
             simulation_commands: Vec::new(),
         })
     }
@@ -4893,45 +5482,18 @@ impl WorldState {
                                 let neigh = (left_v + right_v + up_v + down_v) * f32x4::splat(0.25);
                                 val_v += f32x4::splat(diffusion) * (neigh - prev_v);
                             }
-                            let cap_arr = idxs.map(|i| {
-                                profiles
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(FoodCellProfile {
-                                        capacity: food_max,
-                                        growth_multiplier: 1.0,
-                                        decay_multiplier: 1.0,
-                                        fertility: 0.0,
-                                        nutrient_density: 0.3,
-                                    })
-                                    .capacity
+                            let lane_profiles = idxs.map(|i| {
+                                profiles.get(i).copied().unwrap_or(FoodCellProfile {
+                                    capacity: food_max,
+                                    growth_multiplier: 1.0,
+                                    decay_multiplier: 1.0,
+                                    fertility: 0.0,
+                                    nutrient_density: 0.3,
+                                })
                             });
-                            let grow_arr = idxs.map(|i| {
-                                profiles
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(FoodCellProfile {
-                                        capacity: food_max,
-                                        growth_multiplier: 1.0,
-                                        decay_multiplier: 1.0,
-                                        fertility: 0.0,
-                                        nutrient_density: 0.3,
-                                    })
-                                    .growth_multiplier
-                            });
-                            let decay_arr = idxs.map(|i| {
-                                profiles
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(FoodCellProfile {
-                                        capacity: food_max,
-                                        growth_multiplier: 1.0,
-                                        decay_multiplier: 1.0,
-                                        fertility: 0.0,
-                                        nutrient_density: 0.3,
-                                    })
-                                    .decay_multiplier
-                            });
+                            let cap_arr = lane_profiles.map(|p| p.capacity);
+                            let grow_arr = lane_profiles.map(|p| p.growth_multiplier);
+                            let decay_arr = lane_profiles.map(|p| p.decay_multiplier);
                             let cap_v = f32x4::new(cap_arr);
                             let grow_v = f32x4::new(grow_arr);
                             let decay_v = f32x4::new(decay_arr);
@@ -5130,7 +5692,6 @@ impl WorldState {
         self.work_eye_view_dirs.resize(agent_count, [0.0; NUM_EYES]);
         self.work_eye_fov_clamped
             .resize(agent_count, [1.0; NUM_EYES]);
-        self.work_eye_fov_cos.resize(agent_count, [0.0; NUM_EYES]);
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
         self.work_temperature_preferences.resize(agent_count, 0.5);
         self.work_sound_emitters.resize(agent_count, 0.0);
@@ -5143,16 +5704,13 @@ impl WorldState {
                 // Precompute per-eye view directions and clamped FOV once per agent
                 let mut views = [0.0; NUM_EYES];
                 let mut fovc = [1.0; NUM_EYES];
-                let mut fovcos = [0.0; NUM_EYES];
                 let base_heading = headings[idx];
                 for e in 0..NUM_EYES {
                     views[e] = wrap_signed_angle(base_heading + rt.eye_direction[e]);
                     fovc[e] = rt.eye_fov[e].max(0.01);
-                    fovcos[e] = fovc[e].cos();
                 }
                 self.work_eye_view_dirs[idx] = views;
                 self.work_eye_fov_clamped[idx] = fovc;
-                self.work_eye_fov_cos[idx] = fovcos;
                 self.work_clocks[idx] = rt.clocks;
                 self.work_temperature_preferences[idx] = rt.temperature_preference;
                 self.work_sound_emitters[idx] = rt.sound_multiplier;
@@ -5236,7 +5794,6 @@ impl WorldState {
             let traits = trait_modifiers[idx];
             let eyes_dir = &self.work_eye_view_dirs[idx];
             let eyes_fov = &self.work_eye_fov_clamped[idx];
-            let eyes_fov_cos = &self.work_eye_fov_cos[idx];
 
             index.visit_neighbor_buckets(idx, radius, &mut |indices| {
                 #[cfg(feature = "simd_wide")]
@@ -5304,52 +5861,33 @@ impl WorldState {
                             // Neighbor unit dir
                             let nx = dx / dist;
                             let ny = dy / dist;
-                            #[cfg(feature = "simd_wide")]
                             {
-                                // Dot against per-eye view directions; threshold by cos(FOV)
-                                let eye_dirs_x = [
-                                    eyes_dir[0].cos(),
-                                    eyes_dir[1].cos(),
-                                    eyes_dir[2].cos(),
-                                    eyes_dir[3].cos(),
-                                ];
-                                let eye_dirs_y = [
-                                    eyes_dir[0].sin(),
-                                    eyes_dir[1].sin(),
-                                    eyes_dir[2].sin(),
-                                    eyes_dir[3].sin(),
-                                ];
-                                let dot_v = f32x4::new([
-                                    eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
-                                    eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
-                                    eye_dirs_x[2] * nx + eye_dirs_y[2] * ny,
-                                    eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
+                                // Same falloff as the scalar path and legacy C++:
+                                // (fov - diff)/fov * (radius - dist)/radius.
+                                let ang = angle_to(dx, dy);
+                                let diff_v = f32x4::new([
+                                    angle_difference(eyes_dir[0], ang),
+                                    angle_difference(eyes_dir[1], ang),
+                                    angle_difference(eyes_dir[2], ang),
+                                    angle_difference(eyes_dir[3], ang),
                                 ]);
-                                let cos_fov_v = f32x4::new([
-                                    eyes_fov_cos[0],
-                                    eyes_fov_cos[1],
-                                    eyes_fov_cos[2],
-                                    eyes_fov_cos[3],
+                                let fov_v = f32x4::new([
+                                    eyes_fov[0],
+                                    eyes_fov[1],
+                                    eyes_fov[2],
+                                    eyes_fov[3],
                                 ]);
-                                let mask_v = f32x4::new([
-                                    (dot_v.to_array()[0] >= cos_fov_v.to_array()[0]) as i32 as f32,
-                                    (dot_v.to_array()[1] >= cos_fov_v.to_array()[1]) as i32 as f32,
-                                    (dot_v.to_array()[2] >= cos_fov_v.to_array()[2]) as i32 as f32,
-                                    (dot_v.to_array()[3] >= cos_fov_v.to_array()[3]) as i32 as f32,
-                                ]);
-                                // fov_factor ~ (cos_fov - dot)/cos_fov, clamped to [0,1]
-                                let fov_factor =
-                                    ((cos_fov_v - dot_v) / cos_fov_v).max(f32x4::splat(0.0));
-                                let intensity_v = fov_factor
-                                    * f32x4::splat(traits.eye * dist_factor * (dist / radius))
-                                    * mask_v;
+                                let fov_factor = ((fov_v - diff_v) / fov_v).max(f32x4::splat(0.0));
+                                let intensity_v =
+                                    fov_factor * f32x4::splat(traits.eye * dist_factor);
                                 let color = colors[other_idx];
                                 let mut dens =
                                     f32x4::new([density[0], density[1], density[2], density[3]]);
                                 let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
                                 let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
                                 let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                                dens += intensity_v;
+                                // legacy C++: proximity channel carries an extra d/DIST
+                                dens += intensity_v * f32x4::splat(dist / radius);
                                 r += intensity_v * f32x4::splat(color[0]);
                                 g += intensity_v * f32x4::splat(color[1]);
                                 b += intensity_v * f32x4::splat(color[2]);
@@ -5373,29 +5911,6 @@ impl WorldState {
                                 eye_b[1] = out_b[1];
                                 eye_b[2] = out_b[2];
                                 eye_b[3] = out_b[3];
-                            }
-                            #[cfg(not(feature = "simd_wide"))]
-                            {
-                                for eye in 0..NUM_EYES {
-                                    // Dot mask vs. cos(FOV)
-                                    let vx = eyes_dir[eye].cos();
-                                    let vy = eyes_dir[eye].sin();
-                                    let dot = vx * nx + vy * ny;
-                                    if dot >= eyes_fov_cos[eye] {
-                                        // approximate fov_factor via dot/cos_fov
-                                        let fov = eyes_fov[eye];
-                                        let diff =
-                                            angle_difference(eyes_dir[eye], angle_to(dx, dy));
-                                        let fov_factor = ((fov - diff) / fov).max(0.0);
-                                        let intensity =
-                                            traits.eye * fov_factor * dist_factor * (dist / radius);
-                                        density[eye] += intensity;
-                                        let color = colors[other_idx];
-                                        eye_r[eye] += intensity * color[0];
-                                        eye_g[eye] += intensity * color[1];
-                                        eye_b[eye] += intensity * color[2];
-                                    }
-                                }
                             }
                             // Blood via dot threshold to prune; magnitude via angle diff
                             let align = hx * nx + hy * ny;
@@ -5443,7 +5958,7 @@ impl WorldState {
                             let fov_v = f32x4::new(fov);
                             let mut fov_factor = (fov_v - diff_v) / fov_v;
                             fov_factor = fov_factor.max(f32x4::splat(0.0));
-                            let scalar = traits.eye * dist_factor * (dist / radius);
+                            let scalar = traits.eye * dist_factor;
                             let intensity_v = fov_factor * f32x4::splat(scalar);
                             let color = colors[other_idx];
                             let mut dens =
@@ -5451,7 +5966,8 @@ impl WorldState {
                             let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
                             let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
                             let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                            dens += intensity_v;
+                            // legacy C++: proximity channel carries an extra d/DIST
+                            dens += intensity_v * f32x4::splat(dist / radius);
                             r += intensity_v * f32x4::splat(color[0]);
                             g += intensity_v * f32x4::splat(color[1]);
                             b += intensity_v * f32x4::splat(color[2]);
@@ -5475,23 +5991,6 @@ impl WorldState {
                             eye_b[1] = out_b[1];
                             eye_b[2] = out_b[2];
                             eye_b[3] = out_b[3];
-                        }
-                        #[cfg(not(feature = "simd_wide"))]
-                        {
-                            for eye in 0..NUM_EYES {
-                                let diff = angle_difference(eyes_dir[eye], ang);
-                                let fov = eyes_fov[eye];
-                                if diff < fov {
-                                    let fov_factor = ((fov - diff) / fov).max(0.0);
-                                    let intensity =
-                                        traits.eye * fov_factor * dist_factor * (dist / radius);
-                                    density[eye] += intensity;
-                                    let color = colors[other_idx];
-                                    eye_r[eye] += intensity * color[0];
-                                    eye_g[eye] += intensity * color[1];
-                                    eye_b[eye] += intensity * color[2];
-                                }
-                            }
                         }
                         let forward_diff = angle_difference(heading, ang);
                         if forward_diff < BLOOD_HALF_FOV {
@@ -5523,110 +6022,29 @@ impl WorldState {
                         continue;
                     }
 
-                    #[cfg(feature = "simd_wide")]
-                    {
-                        // Compute neighbor unit direction
-                        let nx = dx / dist;
-                        let ny = dy / dist;
-                        // Precompute eye unit vectors from view angles
-                        let eye_dirs_x = [
-                            eyes_dir[0].cos(),
-                            eyes_dir[1].cos(),
-                            eyes_dir[2].cos(),
-                            eyes_dir[3].cos(),
-                        ];
-                        let eye_dirs_y = [
-                            eyes_dir[0].sin(),
-                            eyes_dir[1].sin(),
-                            eyes_dir[2].sin(),
-                            eyes_dir[3].sin(),
-                        ];
-                        let dot_v = f32x4::new([
-                            eye_dirs_x[0] * nx + eye_dirs_y[0] * ny,
-                            eye_dirs_x[1] * nx + eye_dirs_y[1] * ny,
-                            eye_dirs_x[2] * nx + eye_dirs_y[2] * ny,
-                            eye_dirs_x[3] * nx + eye_dirs_y[3] * ny,
-                        ]);
-                        let cos_fov_v = f32x4::new([
-                            eyes_fov_cos[0],
-                            eyes_fov_cos[1],
-                            eyes_fov_cos[2],
-                            eyes_fov_cos[3],
-                        ]);
-                        // mask = dot >= cos(fov)
-                        let mask = [
-                            (dot_v.to_array()[0] >= cos_fov_v.to_array()[0]) as i32 as f32,
-                            (dot_v.to_array()[1] >= cos_fov_v.to_array()[1]) as i32 as f32,
-                            (dot_v.to_array()[2] >= cos_fov_v.to_array()[2]) as i32 as f32,
-                            (dot_v.to_array()[3] >= cos_fov_v.to_array()[3]) as i32 as f32,
-                        ];
-                        let mask_v = f32x4::new(mask);
-                        // intensity = traits.eye * dist_factor * (dist/radius) * ((cos_fov - dot)/cos_fov) approximated by mask * (cos_fov - dot)/cos_fov
-                        let fov_factor = (cos_fov_v - dot_v) / cos_fov_v;
-                        let fov_factor = fov_factor.max(f32x4::splat(0.0));
-                        let intensity_v = fov_factor
-                            * f32x4::splat(traits.eye * dist_factor * (dist / radius))
-                            * mask_v;
-                        let color = colors[other_idx];
-                        let mut dens = f32x4::new([density[0], density[1], density[2], density[3]]);
-                        let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
-                        let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
-                        let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                        dens = dens + intensity_v;
-                        r = r + intensity_v * f32x4::splat(color[0]);
-                        g = g + intensity_v * f32x4::splat(color[1]);
-                        b = b + intensity_v * f32x4::splat(color[2]);
-                        let out_d = dens.to_array();
-                        let out_r = r.to_array();
-                        let out_g = g.to_array();
-                        let out_b = b.to_array();
-                        density[0] = out_d[0];
-                        density[1] = out_d[1];
-                        density[2] = out_d[2];
-                        density[3] = out_d[3];
-                        eye_r[0] = out_r[0];
-                        eye_r[1] = out_r[1];
-                        eye_r[2] = out_r[2];
-                        eye_r[3] = out_r[3];
-                        eye_g[0] = out_g[0];
-                        eye_g[1] = out_g[1];
-                        eye_g[2] = out_g[2];
-                        eye_g[3] = out_g[3];
-                        eye_b[0] = out_b[0];
-                        eye_b[1] = out_b[1];
-                        eye_b[2] = out_b[2];
-                        eye_b[3] = out_b[3];
-                    }
-                    #[cfg(not(feature = "simd_wide"))]
-                    {
-                        for eye in 0..NUM_EYES {
-                            let view_dir = wrap_signed_angle(heading + eyes_dir[eye]);
-                            let diff = angle_difference(view_dir, ang);
-                            let fov = eyes_fov[eye].max(0.01);
-                            if diff < fov {
-                                let fov_factor = ((fov - diff) / fov).max(0.0);
-                                let intensity =
-                                    traits.eye * fov_factor * dist_factor * (dist / radius);
-                                density[eye] += intensity;
-                                let color = colors[other_idx];
-                                eye_r[eye] += intensity * color[0];
-                                eye_g[eye] += intensity * color[1];
-                                eye_b[eye] += intensity * color[2];
-                            }
+                    for eye in 0..NUM_EYES {
+                        // eyes_dir already includes the agent heading (see work_eye_view_dirs)
+                        let diff = angle_difference(eyes_dir[eye], ang);
+                        let fov = eyes_fov[eye];
+                        if diff < fov {
+                            let fov_factor = ((fov - diff) / fov).max(0.0);
+                            let intensity = traits.eye * fov_factor * dist_factor;
+                            // legacy C++: proximity channel carries an extra d/DIST
+                            density[eye] += intensity * (dist / radius);
+                            let color = colors[other_idx];
+                            eye_r[eye] += intensity * color[0];
+                            eye_g[eye] += intensity * color[1];
+                            eye_b[eye] += intensity * color[2];
                         }
                     }
 
                     smell += dist_factor;
 
-                    let velocity = velocities[other_idx];
                     sound += dist_factor * self.work_speed_norm[other_idx];
                     hearing += dist_factor * sound_emitters[other_idx];
 
                     // Blood via dot(heading_dir, n) >= cos(BLOOD_HALF_FOV)
-                    let hx = heading.cos();
-                    let hy = heading.sin();
                     let align = hx * (dx / dist) + hy * (dy / dist);
-                    let cos_bhf = (BLOOD_HALF_FOV).cos();
                     if align >= cos_bhf {
                         let forward_diff = angle_difference(heading, ang);
                         let bleed = (BLOOD_HALF_FOV - forward_diff) / BLOOD_HALF_FOV;
@@ -5694,16 +6112,57 @@ impl WorldState {
     }
 
     fn stage_brains(&mut self) {
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
-        for agent_id in handles {
+        struct BrainJob {
+            agent_id: AgentId,
+            runner: Option<Box<dyn BrainRunner>>,
+            sensors: [f32; INPUT_SIZE],
+            capture: bool,
+            outputs: [f32; OUTPUT_SIZE],
+            activations: Option<BrainActivations>,
+        }
+
+        let probe = self.activation_probe;
+        // Pull each runner out of its binding so evaluation can run
+        // data-parallel (independent networks, no RNG); results are written
+        // back serially in handle order, keeping the stage deterministic.
+        let mut jobs: Vec<BrainJob> = Vec::with_capacity(self.agents.len());
+        for agent_id in self.agents.iter_handles() {
             if let Some(runtime) = self.runtime.get_mut(agent_id) {
-                let outputs = runtime
-                    .brain
-                    .tick(&runtime.sensors)
-                    .unwrap_or_else(|| Self::default_outputs(&runtime.sensors));
-                runtime.outputs = outputs;
-                // Capture activations if available
-                runtime.brain_activations = runtime.brain.snapshot_activations();
+                let capture = probe == Some(agent_id) || runtime.selection != SelectionState::None;
+                jobs.push(BrainJob {
+                    agent_id,
+                    runner: runtime.brain.runner.take(),
+                    sensors: runtime.sensors,
+                    capture,
+                    outputs: [0.0; OUTPUT_SIZE],
+                    activations: None,
+                });
+            }
+        }
+
+        let evaluate = |job: &mut BrainJob| {
+            if let Some(runner) = job.runner.as_mut() {
+                job.outputs = runner.tick(&job.sensors);
+                // Activation snapshots feed inspector UIs only; capturing
+                // them for every agent allocates layer buffers across the
+                // whole population every tick.
+                if job.capture {
+                    job.activations = runner.snapshot_activations();
+                }
+            } else {
+                job.outputs = Self::default_outputs(&job.sensors);
+            }
+        };
+        #[cfg(feature = "parallel")]
+        jobs.par_iter_mut().for_each(evaluate);
+        #[cfg(not(feature = "parallel"))]
+        jobs.iter_mut().for_each(evaluate);
+
+        for job in jobs {
+            if let Some(runtime) = self.runtime.get_mut(job.agent_id) {
+                runtime.brain.runner = job.runner;
+                runtime.outputs = job.outputs;
+                runtime.brain_activations = job.activations;
             }
         }
     }
@@ -5904,8 +6363,6 @@ impl WorldState {
                     } else if spike_length > decoded.spike_target {
                         spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                     }
-                    let spiked = spike_length > 0.5;
-
                     results[idx] = ActuationResult {
                         delta: Some(ActuationDelta {
                             heading,
@@ -5918,7 +6375,6 @@ impl WorldState {
                         spike_length,
                         sound_level: decoded.sound_level,
                         give_intent: decoded.give_intent,
-                        spiked,
                     };
                 }
 
@@ -5998,7 +6454,6 @@ impl WorldState {
                 } else if spike_length > decoded.spike_target {
                     spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                 }
-                let spiked = spike_length > 0.5;
                 results[idx] = ActuationResult {
                     delta: Some(ActuationDelta {
                         heading,
@@ -6011,7 +6466,6 @@ impl WorldState {
                     spike_length,
                     sound_level: decoded.sound_level,
                     give_intent: decoded.give_intent,
-                    spiked,
                 };
             }
         }
@@ -6091,8 +6545,6 @@ impl WorldState {
                 } else if spike_length > decoded.spike_target {
                     spike_length = (spike_length - spike_growth).max(decoded.spike_target);
                 }
-                let spiked = spike_length > 0.5;
-
                 ActuationResult {
                     delta: Some(ActuationDelta {
                         heading,
@@ -6105,7 +6557,6 @@ impl WorldState {
                     spike_length,
                     sound_level: decoded.sound_level,
                     give_intent: decoded.give_intent,
-                    spiked,
                 }
             } else {
                 ActuationResult::default()
@@ -6161,7 +6612,6 @@ impl WorldState {
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 runtime.energy = results[idx].energy;
-                runtime.spiked = results[idx].spiked;
                 runtime.sound_output = results[idx].sound_level;
                 runtime.sound_multiplier = results[idx].sound_level;
                 runtime.give_intent = results[idx].give_intent;
@@ -6427,9 +6877,11 @@ impl WorldState {
         let waste_rate = self.config.food_waste_rate.max(0.0);
         let reproduction_bonus = self.config.reproduction_food_bonus.max(0.0);
         let fertility_bonus_scale = self.config.reproduction_fertility_bonus.max(0.0);
+        let healths = self.agents.columns().health();
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                if intake_rate > 0.0 || waste_rate > 0.0 {
+                // legacy C++ gate: a full agent neither eats nor wastes cell food
+                if (intake_rate > 0.0 || waste_rate > 0.0) && healths[idx] < 2.0 {
                     let pos = positions[idx];
                     let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
                     let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
@@ -6510,14 +6962,38 @@ impl WorldState {
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
 
+        // Sharing is a self-contained simulation stage: rebuild from the exact
+        // positions this stage uses rather than relying on `stage_sense` to
+        // have populated an index earlier in the tick. This also prevents an
+        // actuation move or a direct stage invocation from querying stale or
+        // empty buckets.
+        self.work_position_pairs.clear();
+        self.work_position_pairs.reserve(positions.len());
+        for position in positions {
+            self.work_position_pairs.push((position.x, position.y));
+        }
+        if self.index.rebuild(&self.work_position_pairs).is_err() {
+            return;
+        }
+
         // Defer indicator pulses to avoid borrowing conflicts
         let mut indicator_pulses: Vec<(AgentId, f32, [f32; 3])> = Vec::new();
+        let mut recipient_candidates: Vec<usize> = Vec::new();
         for &giver_idx in &sharers {
             let giver_id = handles[giver_idx];
-            for (recipient_idx, recipient_id) in handles.iter().enumerate() {
-                if recipient_idx == giver_idx {
+            recipient_candidates.clear();
+            self.index
+                .visit_neighbor_buckets(giver_idx, distance, &mut |indices| {
+                    recipient_candidates.extend_from_slice(indices);
+                });
+            // Ascending order matches the previous full-population scan.
+            recipient_candidates.sort_unstable();
+            recipient_candidates.dedup();
+            for &recipient_idx in &recipient_candidates {
+                if recipient_idx == giver_idx || recipient_idx >= handles.len() {
                     continue;
                 }
+                let recipient_id = &handles[recipient_idx];
                 let dx = toroidal_delta(
                     positions[recipient_idx].x,
                     positions[giver_idx].x,
@@ -6574,11 +7050,11 @@ impl WorldState {
             self.pulse_indicator(id, intensity, color);
         }
     }
-    fn spawn_crossover_agent(&mut self) -> bool {
+    fn spawn_crossover_agent(&mut self) -> Result<Option<AgentId>, BrainSpawnError> {
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         let count = handles.len();
         if count < 2 {
-            return false;
+            return Ok(None);
         }
 
         let (idx1, idx2) = {
@@ -6606,7 +7082,7 @@ impl WorldState {
             if first == second {
                 second = (second + 1) % count;
                 if second == first {
-                    return false;
+                    return Ok(None);
                 }
             }
             (first, second)
@@ -6625,27 +7101,20 @@ impl WorldState {
         };
         let parent_runtime = match self.runtime.get(parent_id).cloned() {
             Some(rt) => rt,
-            None => return false,
+            None => return Ok(None),
         };
         let partner_runtime = self.runtime.get(partner_id).cloned();
 
         // Species barrier: require matching brain kinds for sexual reproduction
         if let Some(ref partner_rt) = partner_runtime {
-            let pk1 = parent_runtime.brain.registry_key();
-            let pk2 = partner_rt.brain.registry_key();
-            let kind_match = match (pk1, pk2) {
-                (Some(k1), Some(k2)) => {
-                    let a = self.brain_registry.kind(k1);
-                    let b = self.brain_registry.kind(k2);
-                    a.is_some() && a == b
-                }
-                _ => false,
-            };
+            let parent_kind = parent_runtime.brain.kind();
+            let partner_kind = partner_rt.brain.kind();
+            let kind_match = parent_kind.is_some() && parent_kind == partner_kind;
             if !kind_match {
-                return false; // fall back to random spawn in caller
+                return Ok(None); // fall back to random spawn in caller
             }
         } else {
-            return false;
+            return Ok(None);
         }
 
         let width = self.config.world_width as f32;
@@ -6659,7 +7128,7 @@ impl WorldState {
             width,
             height,
         );
-        let child_runtime = self.build_child_runtime(
+        let mut child_runtime = self.build_child_runtime(
             &parent_runtime,
             partner_runtime.as_ref(),
             self.config.reproduction_gene_log_capacity,
@@ -6667,57 +7136,125 @@ impl WorldState {
             Some(partner_id),
         );
 
-        let child_id = self.spawn_agent(child_data);
-        if let Some(runtime) = self.runtime.get_mut(child_id) {
-            *runtime = child_runtime;
-            // Inherit parent brain binding (same kind already enforced)
-            if let Some(key) = parent_runtime.brain.registry_key() {
-                let _ = self.bind_agent_brain(child_id, key);
+        // Preserve the historical RNG position of `spawn_agent`, whose random runtime was
+        // immediately replaced below, while constructing any fallible fallback brain before
+        // insertion so a factory error cannot leave a partially inserted child.
+        let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
+
+        let child_rates = child_runtime.mutation_rates;
+        let inherited_key = parent_runtime.brain.registry_key();
+        let parent_was_bound = self
+            .runtime
+            .get(parent_id)
+            .is_some_and(|runtime| runtime.brain.is_bound());
+        let parent_kind = parent_runtime.brain.kind().unwrap_or("unknown").to_owned();
+        let inherited_runner: Option<Box<dyn BrainRunner>> = {
+            let parent_runner = self.runtime.get(parent_id).and_then(|rt| rt.brain.runner());
+            let partner_runner = self
+                .runtime
+                .get(partner_id)
+                .and_then(|rt| rt.brain.runner());
+            match (parent_runner, partner_runner) {
+                (Some(parent), Some(partner)) => {
+                    if let Some(runner) = parent.crossover(partner, &mut self.rng) {
+                        Some(runner)
+                    } else {
+                        parent.clone_runner()?
+                    }
+                }
+                (Some(parent), None) => parent.clone_runner()?,
+                _ => None,
             }
-            true
-        } else {
-            false
+        };
+        if let Some(mut runner) = inherited_runner {
+            runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary)?;
+            child_runtime.brain = BrainBinding::inherited(runner, inherited_key);
+        } else if let Some(key) = inherited_key {
+            let Some(binding) =
+                BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+            else {
+                return Err(BrainSpawnError::new(
+                    parent_kind.clone(),
+                    MissingBrainFactory { key },
+                ));
+            };
+            child_runtime.brain = binding;
+        } else if parent_was_bound {
+            return Err(BrainSpawnError::new(parent_kind, MissingHeritableBrain));
         }
+
+        let child_id = self.agents.insert(child_data);
+        self.runtime.insert(child_id, child_runtime);
+        Ok(Some(child_id))
     }
 
-    fn stage_population(&mut self, next_tick: Tick) {
+    fn rollback_population_spawns(&mut self, receipt: PopulationSpawnReceipt) {
+        for id in receipt.inserted {
+            let removed = self.runtime.remove(id);
+            debug_assert!(removed.is_some());
+        }
+        self.agents
+            .restore_append_checkpoint(receipt.arena_checkpoint);
+        self.rng = receipt.rng_before;
+    }
+
+    fn stage_population(
+        &mut self,
+        next_tick: Tick,
+    ) -> Result<Option<PopulationSpawnReceipt>, BrainSpawnError> {
         if self.closed {
-            return;
+            return Ok(None);
         }
 
         let minimum = self.config.population_minimum;
-        if minimum > 0 {
-            while self.agents.len() < minimum {
-                self.spawn_random_agent();
-            }
-        }
-
         let interval = self.config.population_spawn_interval;
-        if interval == 0 {
-            return;
-        }
-        if !next_tick.0.is_multiple_of(interval as u64) {
-            return;
+        let minimum_requires_spawn = minimum > 0 && self.agents.len() < minimum;
+        let scheduled_spawn = interval != 0 && next_tick.0.is_multiple_of(interval as u64);
+        if !minimum_requires_spawn && !scheduled_spawn {
+            return Ok(None);
         }
 
-        let spawn_count = self.config.population_spawn_count.max(1);
-        let crossover_chance = self.config.population_crossover_chance.clamp(0.0, 1.0);
-        for _ in 0..spawn_count {
-            let use_crossover = self.agents.len() >= 2
-                && crossover_chance > 0.0
-                && self.rng.random_range(0.0..1.0) < crossover_chance;
-            let spawned = if use_crossover {
-                self.spawn_crossover_agent()
-            } else {
-                false
-            };
-            if !spawned {
-                self.spawn_random_agent();
+        let mut receipt = PopulationSpawnReceipt {
+            inserted: Vec::new(),
+            arena_checkpoint: self.agents.append_checkpoint(),
+            rng_before: self.rng.clone(),
+        };
+        let result: Result<(), BrainSpawnError> = (|| {
+            while self.agents.len() < minimum {
+                receipt.inserted.push(self.spawn_random_agent()?);
+            }
+
+            if scheduled_spawn {
+                let spawn_count = self.config.population_spawn_count.max(1);
+                let crossover_chance = self.config.population_crossover_chance.clamp(0.0, 1.0);
+                for _ in 0..spawn_count {
+                    let use_crossover = self.agents.len() >= 2
+                        && crossover_chance > 0.0
+                        && self.rng.random_range(0.0..1.0) < crossover_chance;
+                    let spawned = if use_crossover {
+                        self.spawn_crossover_agent()?
+                    } else {
+                        None
+                    };
+                    if let Some(id) = spawned {
+                        receipt.inserted.push(id);
+                    } else {
+                        receipt.inserted.push(self.spawn_random_agent()?);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(Some(receipt)),
+            Err(error) => {
+                self.rollback_population_spawns(receipt);
+                Err(error)
             }
         }
     }
 
-    fn spawn_random_agent(&mut self) {
+    fn spawn_random_agent(&mut self) -> Result<AgentId, BrainSpawnError> {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
         let position = Position::new(
@@ -6743,10 +7280,21 @@ impl WorldState {
             0,
             Generation::default(),
         );
-        let id = self.spawn_agent(data);
-        if let Some(key) = self.brain_registry.random_key(&mut self.rng) {
-            let _ = self.bind_agent_brain(id, key);
+        // `spawn_agent` historically initialized runtime traits before choosing a registry key.
+        // Build the same runtime first so fallible brain construction preserves seeded behavior
+        // without leaving a partially inserted agent on error.
+        let mut runtime = AgentRuntime::new_random(&mut self.rng);
+        let binding = if let Some(key) = self.brain_registry.random_key(&mut self.rng) {
+            BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+        } else {
+            None
+        };
+        if let Some(binding) = binding {
+            runtime.brain = binding;
         }
+        let id = self.agents.insert(data);
+        self.runtime.insert(id, runtime);
+        Ok(id)
     }
     fn pulse_indicator(&mut self, id: AgentId, intensity: f32, color: [f32; 3]) {
         if let Some(runtime) = self.runtime.get_mut(id) {
@@ -6794,19 +7342,31 @@ impl WorldState {
         for p in positions.iter() {
             self.work_position_pairs.push((p.x, p.y));
         }
-        let _ = self.index.rebuild(&self.work_position_pairs);
+        if self.index.rebuild(&self.work_position_pairs).is_err() {
+            // Same policy as stage_sense: never run queries against an index
+            // whose membership reflects a previous tick.
+            return;
+        }
 
         let spike_damage = self.config.spike_damage;
         let spike_energy_cost = self.config.spike_energy_cost;
         let index = &self.index;
-        // Reuse runtime snapshot buffer
-        self.work_runtime_snapshot.clear();
-        self.work_runtime_snapshot.reserve(handles.len());
+        // Reuse the compact combat view buffer
+        self.work_combat_views.clear();
+        self.work_combat_views.reserve(handles.len());
         for id in handles.iter() {
-            self.work_runtime_snapshot
-                .push(self.runtime.get(*id).cloned().unwrap_or_default());
+            let view = self
+                .runtime
+                .get(*id)
+                .map(|rt| CombatAgentView {
+                    herbivore_tendency: rt.herbivore_tendency,
+                    energy: rt.energy,
+                    outputs: rt.outputs,
+                })
+                .unwrap_or_default();
+            self.work_combat_views.push(view);
         }
-        let runtime_snapshot = &self.work_runtime_snapshot;
+        let runtime_snapshot = &self.work_combat_views;
 
         let results: Vec<CombatResult> = collect_handles!(handles, |idx, _handle| {
             let mut result = CombatResult::default();
@@ -6823,7 +7383,9 @@ impl WorldState {
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
 
-            if !attacker_runtime.spiked {
+            // Attack eligibility is the physical spike extension, not the
+            // "was stabbed this tick" flag that combat writes on victims.
+            if spike_lengths[idx] <= 0.5 {
                 result.energy = energy_before;
                 return result;
             }
@@ -6861,17 +7423,18 @@ impl WorldState {
                 .abs();
             let velocity = velocities[idx];
             let speed_mag = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
-            let boost = attacker_runtime
-                .outputs
-                .get(3)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
+            // outputs[6] is the boost channel (outputs[3] is color green);
+            // legacy C++ gates the damage bonus on boost > 0.5.
+            let boost_bonus = if attacker_runtime.outputs.get(6).copied().unwrap_or(0.0) > 0.5 {
+                1.0
+            } else {
+                0.0
+            };
 
             let base_power = spike_damage * spike_power;
             let length_factor = 1.0 + spike_length * length_bonus;
             let speed_factor =
-                1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost;
+                1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost_bonus;
             let base_damage = base_power * length_factor * speed_factor;
 
             let origin = positions[idx];
@@ -7323,6 +7886,20 @@ impl WorldState {
     }
 
     fn stage_death_cleanup(&mut self, tick: Tick) {
+        // Health exhaustion is fatal no matter which stage drained it; the
+        // legacy sim erases every health<=0 agent each tick. Without this
+        // sweep, agents drained by actuation/metabolism linger as zombies.
+        {
+            let healths = self.agents.columns().health();
+            let exhausted: Vec<AgentId> = self
+                .agents
+                .iter_handles()
+                .enumerate()
+                .filter(|(idx, _)| healths[*idx] <= 0.0)
+                .map(|(_, id)| id)
+                .collect();
+            self.pending_deaths.extend(exhausted);
+        }
         if self.pending_deaths.is_empty() {
             return;
         }
@@ -7421,15 +7998,10 @@ impl WorldState {
             .map(|idx| columns.snapshot(idx))
             .collect();
         let ages: Vec<u32> = columns.ages().to_vec();
-        let runtime_snapshots: Vec<AgentRuntime> = handles
-            .iter()
-            .map(|id| self.runtime.get(*id).cloned().unwrap_or_default())
-            .collect();
         let reproduction_window = self.cadence.reproduction_window(self.tick.next());
         let reproduction_chance = self.cadence.reproduction_chance();
 
         for (idx, agent_id) in handles.iter().enumerate() {
-            let parent_runtime_snapshot;
             {
                 let runtime = match self.runtime.get_mut(*agent_id) {
                     Some(rt) => rt,
@@ -7459,24 +8031,32 @@ impl WorldState {
                 continue;
             }
 
-            {
+            let (
+                parent_runtime_snapshot,
+                parent_energy_before_debit,
+                parent_reproduction_counter_before_reset,
+            ) = {
                 let runtime = match self.runtime.get_mut(*agent_id) {
                     Some(rt) => rt,
                     None => continue,
                 };
+                let energy_before_debit = runtime.energy;
+                let reproduction_counter_before_reset = runtime.reproduction_counter;
                 runtime.energy -= self.config.reproduction_energy_cost;
                 runtime.reproduction_counter = 0.0;
-                parent_runtime_snapshot = Some(runtime.clone());
-            }
-
-            let Some(parent_runtime_snapshot) = parent_runtime_snapshot else {
-                continue;
+                (
+                    runtime.clone(),
+                    energy_before_debit,
+                    reproduction_counter_before_reset,
+                )
             };
 
             let partner_index =
                 self.select_partner_index(idx, &ages, partner_chance, handles.len());
             let partner_data = partner_index.map(|j| parent_snapshots[j]);
-            let partner_runtime = partner_index.map(|j| runtime_snapshots[j].clone());
+            // Cloning an AgentRuntime is deep (logs, sensor arrays); do it only
+            // for the one partner of an actual birth, not the whole population.
+            let partner_runtime = partner_index.and_then(|j| self.runtime.get(handles[j]).cloned());
 
             let child_data = self.build_child_data(
                 &parent_snapshots[idx],
@@ -7498,6 +8078,8 @@ impl WorldState {
                 parent_index: idx,
                 parent_id: *agent_id,
                 partner_id: partner_index.map(|j| handles[j]),
+                parent_energy_before_debit,
+                parent_reproduction_counter_before_reset,
                 data: child_data,
                 runtime: child_runtime,
             });
@@ -7534,22 +8116,110 @@ impl WorldState {
         best.map(|(idx, _)| idx)
     }
 
-    fn stage_spawn_commit(&mut self, tick: Tick) {
+    fn refund_spawn_orders(&mut self, orders: &[SpawnOrder]) {
+        for order in orders {
+            debug_assert!(
+                self.runtime.contains_key(order.parent_id),
+                "queued birth parent disappeared before refund"
+            );
+            if let Some(parent) = self.runtime.get_mut(order.parent_id) {
+                parent.energy = order.parent_energy_before_debit;
+                parent.reproduction_counter = order.parent_reproduction_counter_before_reset;
+            }
+        }
+    }
+
+    fn abort_pending_spawns(&mut self) {
+        let orders = std::mem::take(&mut self.pending_spawns);
+        self.refund_spawn_orders(&orders);
+        self.last_births = 0;
+    }
+
+    fn stage_spawn_commit(&mut self, tick: Tick) -> Result<(), BrainSpawnError> {
         if self.pending_spawns.is_empty() {
-            return;
+            return Ok(());
         }
         let mut orders = std::mem::take(&mut self.pending_spawns);
         orders.sort_by_key(|order| order.parent_index);
+
+        // Construct every offspring brain before inserting any child. This keeps a fallible
+        // registry factory from leaving a partially committed birth set. The discarded runtime
+        // preserves the historical RNG position of `spawn_agent`, which used to create one and
+        // immediately overwrite it for every queued birth.
+        let rng_before = self.rng.clone();
+        let preparation = (|| -> Result<(), BrainSpawnError> {
+            for order in &mut orders {
+                let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
+                let inherited_key = order.runtime.brain.registry_key();
+                let child_rates = order.runtime.mutation_rates;
+                let parent_was_bound = self
+                    .runtime
+                    .get(order.parent_id)
+                    .is_some_and(|runtime| runtime.brain.is_bound());
+                let parent_kind = self
+                    .runtime
+                    .get(order.parent_id)
+                    .and_then(|runtime| runtime.brain.kind())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let inherited_runner: Option<Box<dyn BrainRunner>> = {
+                    let parent_runner = self
+                        .runtime
+                        .get(order.parent_id)
+                        .and_then(|runtime| runtime.brain.runner());
+                    if let Some(parent_runner) = parent_runner {
+                        let partner_runner = order
+                            .partner_id
+                            .and_then(|partner_id| self.runtime.get(partner_id))
+                            .and_then(|runtime| runtime.brain.runner())
+                            .filter(|partner| partner.kind() == parent_runner.kind());
+                        if let Some(runner) = partner_runner
+                            .and_then(|partner| parent_runner.crossover(partner, &mut self.rng))
+                        {
+                            Some(runner)
+                        } else {
+                            parent_runner.clone_runner()?
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(mut runner) = inherited_runner {
+                    runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary)?;
+                    order.runtime.brain = BrainBinding::inherited(runner, inherited_key);
+                } else if let Some(key) = inherited_key {
+                    let kind = order.runtime.brain.kind().unwrap_or("unknown").to_owned();
+                    let Some(binding) =
+                        BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+                    else {
+                        return Err(BrainSpawnError::new(kind, MissingBrainFactory { key }));
+                    };
+                    order.runtime.brain = binding;
+                } else if parent_was_bound {
+                    return Err(BrainSpawnError::new(parent_kind, MissingHeritableBrain));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = preparation {
+            self.rng = rng_before;
+            self.refund_spawn_orders(&orders);
+            self.last_births = 0;
+            return Err(error);
+        }
+
         self.last_births = orders.len();
         for order in orders {
             let SpawnOrder {
                 parent_index: _,
                 parent_id,
                 partner_id,
+                parent_energy_before_debit: _,
+                parent_reproduction_counter_before_reset: _,
                 data,
                 runtime,
             } = order;
-            let child_id = self.spawn_agent(data);
+            let child_id = self.agents.insert(data);
             self.runtime.insert(child_id, runtime);
 
             if let (Some(child_runtime), Some(idx)) =
@@ -7574,6 +8244,7 @@ impl WorldState {
                 self.pending_birth_records.push(record);
             }
         }
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     fn build_child_data(
@@ -7646,7 +8317,12 @@ impl WorldState {
         runtime.indicator = IndicatorState::default();
         runtime.selection = SelectionState::None;
         runtime.mutation_log.clear();
-        runtime.brain = BrainBinding::default();
+        // parent.clone() keeps registry_key/kind with runner=None; stage_spawn_commit
+        // rebinds a live runner from the registry using that key. Without a key no
+        // runner can be rehydrated, so drop the stale kind instead of claiming one.
+        if runtime.brain.registry_key().is_none() {
+            runtime.brain = BrainBinding::default();
+        }
         runtime.lineage = [Some(parent_id), partner_id];
 
         if let Some(partner_runtime) = partner {
@@ -8553,9 +9229,18 @@ impl WorldState {
     }
 
     /// Execute one simulation tick pipeline returning emitted events.
-    pub fn step(&mut self) -> Result<TickEvents, PersistenceAdmissionError> {
-        if let Some(error) = &self.persistence_fault {
-            return Err(error.clone());
+    ///
+    /// A returned error can describe a tick that has already reached its completed boundary. A
+    /// persistence rejection retains that exact completed batch for explicit retry and sets
+    /// [`Self::persistence_fault`]. A brain-construction failure rolls back population inserts and
+    /// refuses a partial queued-birth commit, completes the remaining tick bookkeeping and
+    /// persistence boundary, advances `tick`, and sets [`Self::brain_fault`]. If both fail, both faults are retained and
+    /// [`WorldStepError::BrainAndPersistence`] reports them together. In every case, a latched fault
+    /// blocks later science ticks without mutation; callers must not retry `step` as though the
+    /// failed return meant the current tick was unapplied.
+    pub fn step(&mut self) -> Result<TickEvents, WorldStepError> {
+        if let Some(error) = self.latched_step_error() {
+            return Err(error);
         }
 
         let next_tick = self.tick.next();
@@ -8573,8 +9258,21 @@ impl WorldState {
         self.stage_combat();
         self.stage_death_cleanup(next_tick);
         self.stage_reproduction();
-        self.stage_population(next_tick);
-        self.stage_spawn_commit(next_tick);
+        let brain_result = match self.stage_population(next_tick) {
+            Ok(population_receipt) => match self.stage_spawn_commit(next_tick) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    if let Some(receipt) = population_receipt {
+                        self.rollback_population_spawns(receipt);
+                    }
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                self.abort_pending_spawns();
+                Err(error)
+            }
+        };
         self.stage_accumulate_food_balance();
         self.stage_accumulate_tick_events();
         self.stage_record_history(next_tick);
@@ -8595,8 +9293,18 @@ impl WorldState {
         self.advance_tick();
         events.tick = self.tick;
         events.epoch_rolled = self.epoch != previous_epoch;
-        persistence_result?;
-        Ok(events)
+        match (brain_result, persistence_result) {
+            (Ok(()), Ok(())) => Ok(events),
+            (Ok(()), Err(persistence)) => Err(persistence.into()),
+            (Err(brain), Ok(())) => {
+                self.brain_fault = Some(brain.clone());
+                Err(brain.into())
+            }
+            (Err(brain), Err(persistence)) => {
+                self.brain_fault = Some(brain.clone());
+                Err(WorldStepError::BrainAndPersistence { brain, persistence })
+            }
+        }
     }
 
     /// Returns an immutable reference to configuration.
@@ -8776,15 +9484,16 @@ impl WorldState {
     }
 
     /// Queue a simulation control request for external renderers.
-    pub fn enqueue_simulation_command(&mut self, mut command: SimulationCommand) {
+    pub fn enqueue_simulation_command(
+        &mut self,
+        mut command: SimulationCommand,
+    ) -> Result<(), WorldStateError> {
+        command.validate()?;
         if let Some(speed) = command.speed_multiplier.as_mut() {
-            if speed.is_finite() {
-                *speed = speed.clamp(0.0, 32.0);
-            } else {
-                *speed = 1.0;
-            }
+            *speed = speed.clamp(0.0, 32.0);
         }
         self.simulation_commands.push(command);
+        Ok(())
     }
 
     /// Drain pending simulation control requests (clearing the queue).
@@ -8797,12 +9506,6 @@ impl WorldState {
         }
     }
 
-    /// Mutable access to the configuration (for hot edits).
-    #[must_use]
-    pub fn config_mut(&mut self) -> &mut ScriptBotsConfig {
-        &mut self.config
-    }
-
     /// Apply a new configuration, refreshing derived caches while preserving runtime state.
     pub fn apply_config_update(
         &mut self,
@@ -8810,7 +9513,13 @@ impl WorldState {
     ) -> Result<(), WorldStateError> {
         let (food_w, food_h) = new_config.food_dimensions()?;
         let current_dims = (self.food.width(), self.food.height());
-        if (food_w, food_h) != current_dims {
+        // Compare the raw geometry too: proportional width/cell_size changes
+        // keep the derived food dims identical while rescaling the world.
+        if (food_w, food_h) != current_dims
+            || new_config.world_width != self.config.world_width
+            || new_config.world_height != self.config.world_height
+            || new_config.food_cell_size != self.config.food_cell_size
+        {
             return Err(WorldStateError::InvalidConfig(
                 "changing world dimensions at runtime is not supported; restart with the new configuration",
             ));
@@ -8864,7 +9573,22 @@ impl WorldState {
         self.food_profiles = food_profiles;
         self.index = new_index;
         self.cadence = TickCadence::from_config(&self.config);
+        self.config_revision = self.config_revision.saturating_add(1);
         Ok(())
+    }
+
+    /// Monotonic count of applied configuration updates. Unlike the capped
+    /// audit log length, this never plateaus, so caches can key off it.
+    #[must_use]
+    pub const fn config_revision(&self) -> u64 {
+        self.config_revision
+    }
+
+    /// Ask the next ticks to capture brain activations for `agent` (in
+    /// addition to any hovered/selected agents). Frontends set this for the
+    /// agent their inspector is focused on; `None` disables the extra probe.
+    pub fn set_activation_probe(&mut self, agent: Option<AgentId>) {
+        self.activation_probe = agent;
     }
 
     /// Replace the persistence sink.
@@ -8927,6 +9651,26 @@ impl WorldState {
     #[must_use]
     pub const fn persistence_fault(&self) -> Option<&PersistenceAdmissionError> {
         self.persistence_fault.as_ref()
+    }
+
+    /// Latched brain-construction error that prevents any later science tick from starting.
+    #[must_use]
+    pub const fn brain_fault(&self) -> Option<&BrainSpawnError> {
+        self.brain_fault.as_ref()
+    }
+
+    /// Combined typed view of any terminal fault that prevents a later science tick.
+    #[must_use]
+    pub fn latched_step_error(&self) -> Option<WorldStepError> {
+        match (&self.brain_fault, &self.persistence_fault) {
+            (Some(brain), Some(persistence)) => Some(WorldStepError::BrainAndPersistence {
+                brain: brain.clone(),
+                persistence: persistence.clone(),
+            }),
+            (Some(brain), None) => Some(WorldStepError::BrainSpawn(brain.clone())),
+            (None, Some(persistence)) => Some(WorldStepError::Persistence(persistence.clone())),
+            (None, None) => None,
+        }
     }
 
     /// Current simulation tick.
@@ -9121,18 +9865,28 @@ impl WorldState {
     }
 
     /// Bind a brain from the registry to the specified agent. Returns `true` on success.
-    pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> bool {
+    pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> Result<bool, BrainSpawnError> {
         if !self.agents.contains(id) {
-            return false;
+            return Ok(false);
         }
-        if let Some(runtime) = self.runtime.get_mut(id)
-            && let Some(binding) =
-                BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)
-        {
-            runtime.brain = binding;
-            return true;
-        }
-        false
+        let rng_before = self.rng.clone();
+        let binding = match BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                self.rng = rng_before;
+                return Ok(false);
+            }
+            Err(error) => {
+                self.rng = rng_before;
+                return Err(error);
+            }
+        };
+        let Some(runtime) = self.runtime.get_mut(id) else {
+            self.rng = rng_before;
+            return Ok(false);
+        };
+        runtime.brain = binding;
+        Ok(true)
     }
 
     /// Immutable access to per-agent runtime metadata.
@@ -9362,6 +10116,34 @@ mod tests {
         }
     }
 
+    fn set_render_tonemap_exposure_bias(config: &mut ScriptBotsConfig, value: f32) {
+        config.render.tonemap_exposure_bias = Some(value);
+    }
+
+    fn set_render_auto_exposure_speed_brighten(config: &mut ScriptBotsConfig, value: f32) {
+        let settings = config
+            .render
+            .auto_exposure
+            .get_or_insert(RenderAutoExposureSettings {
+                enabled: true,
+                speed_brighten: None,
+                speed_darken: None,
+            });
+        settings.speed_brighten = Some(value);
+    }
+
+    fn set_render_auto_exposure_speed_darken(config: &mut ScriptBotsConfig, value: f32) {
+        let settings = config
+            .render
+            .auto_exposure
+            .get_or_insert(RenderAutoExposureSettings {
+                enabled: true,
+                speed_brighten: None,
+                speed_darken: None,
+            });
+        settings.speed_darken = Some(value);
+    }
+
     #[test]
     fn insert_allocates_unique_handles() {
         let mut arena = AgentArena::new();
@@ -9420,6 +10202,597 @@ mod tests {
     fn default_config_constructs_world() {
         let config = ScriptBotsConfig::default();
         WorldState::new(config).expect("default config should be valid");
+    }
+
+    #[test]
+    fn every_public_config_float_rejects_non_finite_values_with_its_field_path() {
+        fn collect_float_paths(
+            prefix: &str,
+            value: &serde_json::Value,
+            paths: &mut std::collections::BTreeSet<String>,
+        ) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        collect_float_paths(&path, child, paths);
+                    }
+                }
+                serde_json::Value::Number(number) if number.is_f64() => {
+                    paths.insert(prefix.to_owned());
+                }
+                _ => {}
+            }
+        }
+
+        type Setter = fn(&mut ScriptBotsConfig, f32);
+        let fields: [(&str, Setter); 73] = [
+            ("initial_food", |config, value| config.initial_food = value),
+            ("food_respawn_amount", |config, value| {
+                config.food_respawn_amount = value;
+            }),
+            ("food_max", |config, value| config.food_max = value),
+            ("food_growth_rate", |config, value| {
+                config.food_growth_rate = value;
+            }),
+            ("food_decay_rate", |config, value| {
+                config.food_decay_rate = value;
+            }),
+            ("food_diffusion_rate", |config, value| {
+                config.food_diffusion_rate = value;
+            }),
+            ("sense_radius", |config, value| config.sense_radius = value),
+            ("sense_max_neighbors", |config, value| {
+                config.sense_max_neighbors = value;
+            }),
+            ("bot_speed", |config, value| config.bot_speed = value),
+            ("bot_radius", |config, value| config.bot_radius = value),
+            ("boost_multiplier", |config, value| {
+                config.boost_multiplier = value;
+            }),
+            ("spike_growth_rate", |config, value| {
+                config.spike_growth_rate = value;
+            }),
+            ("metabolism_drain", |config, value| {
+                config.metabolism_drain = value;
+            }),
+            ("movement_drain", |config, value| {
+                config.movement_drain = value;
+            }),
+            ("metabolism_ramp_floor", |config, value| {
+                config.metabolism_ramp_floor = value;
+            }),
+            ("metabolism_ramp_rate", |config, value| {
+                config.metabolism_ramp_rate = value;
+            }),
+            ("metabolism_boost_penalty", |config, value| {
+                config.metabolism_boost_penalty = value;
+            }),
+            ("temperature_discomfort_rate", |config, value| {
+                config.temperature_discomfort_rate = value;
+            }),
+            ("temperature_comfort_band", |config, value| {
+                config.temperature_comfort_band = value;
+            }),
+            ("temperature_gradient_exponent", |config, value| {
+                config.temperature_gradient_exponent = value;
+            }),
+            ("temperature_discomfort_exponent", |config, value| {
+                config.temperature_discomfort_exponent = value;
+            }),
+            ("food_intake_rate", |config, value| {
+                config.food_intake_rate = value;
+            }),
+            ("food_waste_rate", |config, value| {
+                config.food_waste_rate = value;
+            }),
+            ("food_fertility_base", |config, value| {
+                config.food_fertility_base = value;
+            }),
+            ("food_moisture_weight", |config, value| {
+                config.food_moisture_weight = value;
+            }),
+            ("food_elevation_weight", |config, value| {
+                config.food_elevation_weight = value;
+            }),
+            ("food_slope_weight", |config, value| {
+                config.food_slope_weight = value;
+            }),
+            ("food_capacity_base", |config, value| {
+                config.food_capacity_base = value;
+            }),
+            ("food_capacity_fertility", |config, value| {
+                config.food_capacity_fertility = value;
+            }),
+            ("food_growth_fertility", |config, value| {
+                config.food_growth_fertility = value;
+            }),
+            ("food_decay_infertility", |config, value| {
+                config.food_decay_infertility = value;
+            }),
+            ("food_sharing_radius", |config, value| {
+                config.food_sharing_radius = value;
+            }),
+            ("food_sharing_rate", |config, value| {
+                config.food_sharing_rate = value;
+            }),
+            ("food_transfer_rate", |config, value| {
+                config.food_transfer_rate = value;
+            }),
+            ("food_sharing_distance", |config, value| {
+                config.food_sharing_distance = value;
+            }),
+            ("reproduction_energy_threshold", |config, value| {
+                config.reproduction_energy_threshold = value;
+            }),
+            ("reproduction_energy_cost", |config, value| {
+                config.reproduction_energy_cost = value;
+            }),
+            ("reproduction_attempt_chance", |config, value| {
+                config.reproduction_attempt_chance = value;
+            }),
+            ("reproduction_rate_herbivore", |config, value| {
+                config.reproduction_rate_herbivore = value;
+            }),
+            ("reproduction_rate_carnivore", |config, value| {
+                config.reproduction_rate_carnivore = value;
+            }),
+            ("reproduction_food_bonus", |config, value| {
+                config.reproduction_food_bonus = value;
+            }),
+            ("reproduction_fertility_bonus", |config, value| {
+                config.reproduction_fertility_bonus = value;
+            }),
+            ("reproduction_child_energy", |config, value| {
+                config.reproduction_child_energy = value;
+            }),
+            ("reproduction_spawn_jitter", |config, value| {
+                config.reproduction_spawn_jitter = value;
+            }),
+            ("reproduction_color_jitter", |config, value| {
+                config.reproduction_color_jitter = value;
+            }),
+            ("reproduction_mutation_scale", |config, value| {
+                config.reproduction_mutation_scale = value;
+            }),
+            ("reproduction_partner_chance", |config, value| {
+                config.reproduction_partner_chance = value;
+            }),
+            ("reproduction_spawn_back_distance", |config, value| {
+                config.reproduction_spawn_back_distance = value;
+            }),
+            ("reproduction_meta_mutation_chance", |config, value| {
+                config.reproduction_meta_mutation_chance = value;
+            }),
+            ("reproduction_meta_mutation_scale", |config, value| {
+                config.reproduction_meta_mutation_scale = value;
+            }),
+            ("aging_health_decay_rate", |config, value| {
+                config.aging_health_decay_rate = value;
+            }),
+            ("aging_health_decay_max", |config, value| {
+                config.aging_health_decay_max = value;
+            }),
+            ("aging_energy_penalty_rate", |config, value| {
+                config.aging_energy_penalty_rate = value;
+            }),
+            ("carcass_distribution_radius", |config, value| {
+                config.carcass_distribution_radius = value;
+            }),
+            ("carcass_health_reward", |config, value| {
+                config.carcass_health_reward = value;
+            }),
+            ("carcass_reproduction_reward", |config, value| {
+                config.carcass_reproduction_reward = value;
+            }),
+            ("carcass_neighbor_exponent", |config, value| {
+                config.carcass_neighbor_exponent = value;
+            }),
+            ("carcass_energy_share_rate", |config, value| {
+                config.carcass_energy_share_rate = value;
+            }),
+            ("carcass_indicator_scale", |config, value| {
+                config.carcass_indicator_scale = value;
+            }),
+            ("topography_speed_gain", |config, value| {
+                config.topography_speed_gain = value;
+            }),
+            ("topography_energy_penalty", |config, value| {
+                config.topography_energy_penalty = value;
+            }),
+            ("population_crossover_chance", |config, value| {
+                config.population_crossover_chance = value;
+            }),
+            ("spike_radius", |config, value| config.spike_radius = value),
+            ("spike_damage", |config, value| config.spike_damage = value),
+            ("spike_energy_cost", |config, value| {
+                config.spike_energy_cost = value;
+            }),
+            ("spike_min_length", |config, value| {
+                config.spike_min_length = value;
+            }),
+            ("spike_alignment_cosine", |config, value| {
+                config.spike_alignment_cosine = value;
+            }),
+            ("spike_speed_damage_bonus", |config, value| {
+                config.spike_speed_damage_bonus = value;
+            }),
+            ("spike_length_damage_bonus", |config, value| {
+                config.spike_length_damage_bonus = value;
+            }),
+            ("carnivore_threshold", |config, value| {
+                config.carnivore_threshold = value;
+            }),
+            (
+                "render.tonemap_exposure_bias",
+                set_render_tonemap_exposure_bias,
+            ),
+            (
+                "render.auto_exposure.speed_brighten",
+                set_render_auto_exposure_speed_brighten,
+            ),
+            (
+                "render.auto_exposure.speed_darken",
+                set_render_auto_exposure_speed_darken,
+            ),
+        ];
+
+        let expected_paths = fields
+            .iter()
+            .map(|(field, _)| (*field).to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            expected_paths.len(),
+            fields.len(),
+            "config float inventory contains a duplicate field path"
+        );
+        let mut schema_probe = ScriptBotsConfig::default();
+        for (_, setter) in fields {
+            setter(&mut schema_probe, 0.5);
+        }
+        let serialized = serde_json::to_value(schema_probe).expect("serialize schema probe");
+        let mut serialized_paths = std::collections::BTreeSet::new();
+        collect_float_paths("", &serialized, &mut serialized_paths);
+        assert_eq!(
+            serialized_paths, expected_paths,
+            "table must mechanically cover every serialized public config float exactly once"
+        );
+
+        for (field, setter) in fields {
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut config = ScriptBotsConfig::default();
+                setter(&mut config, value);
+                let WorldStateError::InvalidConfig(message) = config
+                    .validate()
+                    .expect_err("every non-finite public config float must be rejected");
+                assert!(
+                    message.starts_with(field),
+                    "{field}={value:?} produced unrelated validation error: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_bounded_public_config_float_rejects_a_finite_out_of_range_value() {
+        type Setter = fn(&mut ScriptBotsConfig, f32);
+        let fields: [(&str, f32, Setter); 72] = [
+            ("initial_food", -1.0, |config, value| {
+                config.initial_food = value
+            }),
+            ("food_respawn_amount", -1.0, |config, value| {
+                config.food_respawn_amount = value;
+            }),
+            ("food_max", 0.0, |config, value| config.food_max = value),
+            ("food_growth_rate", -1.0, |config, value| {
+                config.food_growth_rate = value;
+            }),
+            ("food_decay_rate", -1.0, |config, value| {
+                config.food_decay_rate = value;
+            }),
+            ("food_diffusion_rate", 0.26, |config, value| {
+                config.food_diffusion_rate = value;
+            }),
+            ("sense_radius", 0.0, |config, value| {
+                config.sense_radius = value
+            }),
+            ("sense_max_neighbors", 0.0, |config, value| {
+                config.sense_max_neighbors = value;
+            }),
+            ("bot_speed", -1.0, |config, value| config.bot_speed = value),
+            ("bot_radius", 0.0, |config, value| config.bot_radius = value),
+            ("boost_multiplier", 0.99, |config, value| {
+                config.boost_multiplier = value;
+            }),
+            ("spike_growth_rate", -1.0, |config, value| {
+                config.spike_growth_rate = value;
+            }),
+            ("metabolism_drain", -1.0, |config, value| {
+                config.metabolism_drain = value;
+            }),
+            ("movement_drain", -1.0, |config, value| {
+                config.movement_drain = value;
+            }),
+            ("metabolism_ramp_floor", -1.0, |config, value| {
+                config.metabolism_ramp_floor = value;
+            }),
+            ("metabolism_ramp_rate", -1.0, |config, value| {
+                config.metabolism_ramp_rate = value;
+            }),
+            ("metabolism_boost_penalty", -1.0, |config, value| {
+                config.metabolism_boost_penalty = value;
+            }),
+            ("temperature_discomfort_rate", -1.0, |config, value| {
+                config.temperature_discomfort_rate = value;
+            }),
+            ("temperature_comfort_band", -0.1, |config, value| {
+                config.temperature_comfort_band = value;
+            }),
+            ("temperature_gradient_exponent", 0.0, |config, value| {
+                config.temperature_gradient_exponent = value;
+            }),
+            ("temperature_discomfort_exponent", 0.0, |config, value| {
+                config.temperature_discomfort_exponent = value;
+            }),
+            ("food_intake_rate", -1.0, |config, value| {
+                config.food_intake_rate = value;
+            }),
+            ("food_waste_rate", -1.0, |config, value| {
+                config.food_waste_rate = value;
+            }),
+            ("food_fertility_base", -0.1, |config, value| {
+                config.food_fertility_base = value;
+            }),
+            ("food_moisture_weight", -1.0, |config, value| {
+                config.food_moisture_weight = value;
+            }),
+            ("food_elevation_weight", -1.0, |config, value| {
+                config.food_elevation_weight = value;
+            }),
+            ("food_slope_weight", -1.0, |config, value| {
+                config.food_slope_weight = value;
+            }),
+            ("food_capacity_base", -0.1, |config, value| {
+                config.food_capacity_base = value;
+            }),
+            ("food_capacity_fertility", -0.1, |config, value| {
+                config.food_capacity_fertility = value;
+            }),
+            ("food_growth_fertility", -1.0, |config, value| {
+                config.food_growth_fertility = value;
+            }),
+            ("food_decay_infertility", -1.0, |config, value| {
+                config.food_decay_infertility = value;
+            }),
+            ("food_sharing_radius", 0.0, |config, value| {
+                config.food_sharing_radius = value;
+            }),
+            ("food_sharing_rate", -1.0, |config, value| {
+                config.food_sharing_rate = value;
+            }),
+            ("food_transfer_rate", -1.0, |config, value| {
+                config.food_transfer_rate = value;
+            }),
+            ("food_sharing_distance", 0.0, |config, value| {
+                config.food_sharing_distance = value;
+            }),
+            ("reproduction_energy_threshold", -1.0, |config, value| {
+                config.reproduction_energy_threshold = value;
+            }),
+            ("reproduction_energy_cost", -1.0, |config, value| {
+                config.reproduction_energy_cost = value;
+            }),
+            ("reproduction_attempt_chance", -0.1, |config, value| {
+                config.reproduction_attempt_chance = value;
+            }),
+            ("reproduction_rate_herbivore", 0.0, |config, value| {
+                config.reproduction_rate_herbivore = value;
+            }),
+            ("reproduction_rate_carnivore", 0.0, |config, value| {
+                config.reproduction_rate_carnivore = value;
+            }),
+            ("reproduction_food_bonus", -1.0, |config, value| {
+                config.reproduction_food_bonus = value;
+            }),
+            ("reproduction_fertility_bonus", -1.0, |config, value| {
+                config.reproduction_fertility_bonus = value;
+            }),
+            ("reproduction_child_energy", -1.0, |config, value| {
+                config.reproduction_child_energy = value;
+            }),
+            ("reproduction_spawn_jitter", -1.0, |config, value| {
+                config.reproduction_spawn_jitter = value;
+            }),
+            ("reproduction_color_jitter", -1.0, |config, value| {
+                config.reproduction_color_jitter = value;
+            }),
+            ("reproduction_mutation_scale", -1.0, |config, value| {
+                config.reproduction_mutation_scale = value;
+            }),
+            ("reproduction_partner_chance", -0.1, |config, value| {
+                config.reproduction_partner_chance = value;
+            }),
+            ("reproduction_spawn_back_distance", -1.0, |config, value| {
+                config.reproduction_spawn_back_distance = value;
+            }),
+            (
+                "reproduction_meta_mutation_chance",
+                -0.1,
+                |config, value| {
+                    config.reproduction_meta_mutation_chance = value;
+                },
+            ),
+            ("reproduction_meta_mutation_scale", -1.0, |config, value| {
+                config.reproduction_meta_mutation_scale = value;
+            }),
+            ("aging_health_decay_rate", -1.0, |config, value| {
+                config.aging_health_decay_rate = value;
+            }),
+            ("aging_health_decay_max", -1.0, |config, value| {
+                config.aging_health_decay_max = value;
+            }),
+            ("aging_energy_penalty_rate", -1.0, |config, value| {
+                config.aging_energy_penalty_rate = value;
+            }),
+            ("carcass_distribution_radius", -1.0, |config, value| {
+                config.carcass_distribution_radius = value;
+            }),
+            ("carcass_health_reward", -1.0, |config, value| {
+                config.carcass_health_reward = value;
+            }),
+            ("carcass_reproduction_reward", -1.0, |config, value| {
+                config.carcass_reproduction_reward = value;
+            }),
+            ("carcass_neighbor_exponent", 0.0, |config, value| {
+                config.carcass_neighbor_exponent = value;
+            }),
+            ("carcass_energy_share_rate", -1.0, |config, value| {
+                config.carcass_energy_share_rate = value;
+            }),
+            ("carcass_indicator_scale", -1.0, |config, value| {
+                config.carcass_indicator_scale = value;
+            }),
+            ("topography_speed_gain", -1.0, |config, value| {
+                config.topography_speed_gain = value;
+            }),
+            ("topography_energy_penalty", -1.0, |config, value| {
+                config.topography_energy_penalty = value;
+            }),
+            ("population_crossover_chance", -0.1, |config, value| {
+                config.population_crossover_chance = value;
+            }),
+            ("spike_radius", 0.0, |config, value| {
+                config.spike_radius = value
+            }),
+            ("spike_damage", -1.0, |config, value| {
+                config.spike_damage = value
+            }),
+            ("spike_energy_cost", -1.0, |config, value| {
+                config.spike_energy_cost = value;
+            }),
+            ("spike_min_length", -1.0, |config, value| {
+                config.spike_min_length = value;
+            }),
+            ("spike_alignment_cosine", 0.0, |config, value| {
+                config.spike_alignment_cosine = value;
+            }),
+            ("spike_speed_damage_bonus", -1.0, |config, value| {
+                config.spike_speed_damage_bonus = value;
+            }),
+            ("spike_length_damage_bonus", -1.0, |config, value| {
+                config.spike_length_damage_bonus = value;
+            }),
+            ("carnivore_threshold", 0.0, |config, value| {
+                config.carnivore_threshold = value;
+            }),
+            (
+                "render.auto_exposure.speed_brighten",
+                -1.0,
+                set_render_auto_exposure_speed_brighten,
+            ),
+            (
+                "render.auto_exposure.speed_darken",
+                -1.0,
+                set_render_auto_exposure_speed_darken,
+            ),
+        ];
+
+        for (field, value, setter) in fields {
+            let mut config = ScriptBotsConfig::default();
+            setter(&mut config, value);
+            let result = config.validate();
+            assert!(
+                result.is_err(),
+                "{field} accepted invalid finite value {value:?}"
+            );
+            let Err(WorldStateError::InvalidConfig(message)) = result else {
+                continue;
+            };
+            assert!(
+                message.starts_with(field),
+                "{field}={value:?} produced unrelated validation error: {message}"
+            );
+        }
+
+        let mut config = ScriptBotsConfig::default();
+        config.render.tonemap_exposure_bias = Some(f32::MAX);
+        config
+            .validate()
+            .expect("tonemap exposure bias accepts every finite f32");
+    }
+
+    #[test]
+    fn finite_boundaries_and_coupled_constraints_preserve_existing_behavior() {
+        let mut config = ScriptBotsConfig {
+            initial_food: 0.0,
+            food_respawn_amount: 0.0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.25,
+            bot_speed: 0.0,
+            boost_multiplier: 1.0,
+            temperature_comfort_band: 1.0,
+            food_capacity_base: 0.4,
+            food_capacity_fertility: 0.6,
+            reproduction_energy_threshold: 0.65,
+            reproduction_energy_cost: 0.65,
+            reproduction_attempt_chance: 1.0,
+            reproduction_partner_chance: 0.0,
+            reproduction_meta_mutation_chance: 1.0,
+            aging_health_decay_rate: 0.01,
+            aging_health_decay_max: 0.01,
+            population_crossover_chance: 1.0,
+            spike_alignment_cosine: 1.0,
+            carnivore_threshold: f32::EPSILON,
+            ..ScriptBotsConfig::default()
+        };
+        set_render_auto_exposure_speed_brighten(&mut config, 0.0);
+        set_render_auto_exposure_speed_darken(&mut config, 0.0);
+        config
+            .validate()
+            .expect("documented inclusive boundaries must remain valid");
+
+        let capacity = ScriptBotsConfig {
+            food_capacity_base: 0.6,
+            food_capacity_fertility: 0.5,
+            ..ScriptBotsConfig::default()
+        };
+        let WorldStateError::InvalidConfig(message) = capacity
+            .validate()
+            .expect_err("capacity fractions above one must be rejected");
+        assert_eq!(
+            message,
+            "food_capacity_base + food_capacity_fertility must be <= 1.0"
+        );
+
+        let reproduction = ScriptBotsConfig {
+            reproduction_energy_cost: 0.66,
+            ..ScriptBotsConfig::default()
+        };
+        let WorldStateError::InvalidConfig(message) = reproduction
+            .validate()
+            .expect_err("reproduction cost above threshold must be rejected");
+        assert_eq!(
+            message,
+            "reproduction_energy_cost cannot exceed reproduction_energy_threshold"
+        );
+
+        let aging = ScriptBotsConfig {
+            aging_health_decay_rate: 0.02,
+            aging_health_decay_max: 0.01,
+            ..ScriptBotsConfig::default()
+        };
+        let WorldStateError::InvalidConfig(message) = aging
+            .validate()
+            .expect_err("enabled aging decay must fit within its cap");
+        assert_eq!(
+            message,
+            "aging_health_decay_max must be >= aging_health_decay_rate when decay is enabled"
+        );
     }
 
     #[test]
@@ -9714,8 +11087,8 @@ mod tests {
         let id = world.spawn_agent(sample_agent(0));
         let key = world
             .brain_registry_mut()
-            .register("stub", |_rng| Box::new(StubBrain));
-        assert!(world.bind_agent_brain(id, key));
+            .register("stub", |_rng| Ok(Box::new(StubBrain)));
+        assert!(world.bind_agent_brain(id, key).expect("stub brain factory"));
 
         let events = world.step().expect("registered brain step");
         assert_eq!(events.tick, Tick(1));
@@ -9724,6 +11097,477 @@ mod tests {
         let position = world.agents().columns().positions()[0];
         assert!(position.x != 0.0 || position.y != 0.0);
         assert!(runtime.energy < 1.0);
+    }
+
+    #[test]
+    fn brain_factory_errors_propagate_through_bind_and_world_step() {
+        #[derive(Debug, Error)]
+        #[error("deliberate adapter construction failure")]
+        struct DeliberateFactoryError;
+
+        let mut bind_world = WorldState::new(ScriptBotsConfig::default()).expect("bind world");
+        let bind_key = bind_world
+            .brain_registry_mut()
+            .register("test.fallible", |rng| {
+                let _ = rng.next_u64();
+                Err(BrainSpawnError::new(
+                    "test.fallible",
+                    DeliberateFactoryError,
+                ))
+            });
+        let agent = bind_world.spawn_agent(sample_agent(0));
+        let before_failed_bind = bind_world
+            .characterization_digest_v0()
+            .expect("pre-bind digest");
+        let bind_error = bind_world
+            .bind_agent_brain(agent, bind_key)
+            .expect_err("binding must preserve the factory error");
+        assert_eq!(bind_error.kind(), "test.fallible");
+        assert!(
+            std::error::Error::source(&bind_error)
+                .and_then(|source| source.downcast_ref::<DeliberateFactoryError>())
+                .is_some()
+        );
+        assert_eq!(
+            bind_world
+                .characterization_digest_v0()
+                .expect("post-bind digest"),
+            before_failed_bind,
+            "failed binding must restore RNG and leave agent state untouched"
+        );
+
+        let config = ScriptBotsConfig {
+            population_minimum: 3,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut identity_reference =
+            WorldState::new(config.clone()).expect("identity reference world");
+        let reference_existing = identity_reference.spawn_agent(sample_agent(1));
+        let expected_next_agent = identity_reference.spawn_agent(sample_agent(2));
+
+        let mut step_world = WorldState::new(config).expect("step world");
+        let stable_key = step_world
+            .brain_registry_mut()
+            .register("test.stable", |_rng| Ok(Box::new(StubBrain)));
+        let existing_agent = step_world.spawn_agent(sample_agent(1));
+        assert_eq!(existing_agent, reference_existing);
+        assert!(
+            step_world
+                .bind_agent_brain(existing_agent, stable_key)
+                .expect("stable brain factory")
+        );
+        assert!(step_world.brain_registry_mut().unregister(stable_key));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_attempts = std::sync::Arc::clone(&attempts);
+        step_world
+            .brain_registry_mut()
+            .register("test.fallible", move |_rng| {
+                if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(Box::new(StubBrain))
+                } else {
+                    Err(BrainSpawnError::new(
+                        "test.fallible",
+                        DeliberateFactoryError,
+                    ))
+                }
+            });
+        let step_error = step_world
+            .step()
+            .expect_err("population spawn must preserve the factory error");
+        assert!(matches!(&step_error, WorldStepError::BrainSpawn(_)));
+        let WorldStepError::BrainSpawn(step_error) = step_error else {
+            return;
+        };
+        assert_eq!(step_error.kind(), "test.fallible");
+        assert_eq!(step_world.tick(), Tick(1));
+        assert_eq!(step_world.agents().len(), 1);
+        assert!(
+            step_world
+                .agent_runtime(existing_agent)
+                .expect("existing runtime survives rollback")
+                .brain
+                .is_bound(),
+            "rollback must not strip a pre-existing live brain runner"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            step_world.brain_fault().map(BrainSpawnError::kind),
+            Some("test.fallible")
+        );
+        let actual_next_agent = step_world.spawn_agent(sample_agent(2));
+        assert_eq!(
+            actual_next_agent, expected_next_agent,
+            "failed population construction must restore SlotMap generations and free-list state"
+        );
+        let completed_digest = step_world
+            .characterization_digest_v0()
+            .expect("brain-fault tick must finish at a coherent boundary");
+        let repeated_error = step_world
+            .step()
+            .expect_err("latched brain failure must block the next tick");
+        assert!(matches!(&repeated_error, WorldStepError::BrainSpawn(_)));
+        let WorldStepError::BrainSpawn(repeated_error) = repeated_error else {
+            return;
+        };
+        assert_eq!(repeated_error.kind(), "test.fallible");
+        assert_eq!(step_world.tick(), Tick(1));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            step_world
+                .characterization_digest_v0()
+                .expect("latched fault digest"),
+            completed_digest
+        );
+    }
+
+    #[test]
+    fn population_factory_failure_aborts_and_refunds_queued_births() {
+        #[derive(Debug, Error)]
+        #[error("deliberate population construction failure")]
+        struct DeliberatePopulationFailure;
+
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            population_minimum: 2,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.25,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 0,
+            reproduction_attempt_chance: 1.0,
+            reproduction_rate_herbivore: f32::MIN_POSITIVE,
+            reproduction_rate_carnivore: f32::MIN_POSITIVE,
+            reproduction_partner_chance: 0.0,
+            rng_seed: Some(0xB17A_0B0A),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let parent = world.spawn_agent(sample_agent(0));
+        {
+            let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+            runtime.energy = 1.0;
+            runtime.reproduction_counter = 1.0;
+        }
+        world
+            .brain_registry_mut()
+            .register("test.population-failure", |_rng| {
+                Err(BrainSpawnError::new(
+                    "test.population-failure",
+                    DeliberatePopulationFailure,
+                ))
+            });
+
+        let error = world
+            .step()
+            .expect_err("population construction must fail after queuing a natural birth");
+        assert!(matches!(&error, WorldStepError::BrainSpawn(_)));
+        let WorldStepError::BrainSpawn(error) = error else {
+            return;
+        };
+        assert_eq!(error.kind(), "test.population-failure");
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(world.agents.len(), 1);
+        assert!(world.pending_spawns.is_empty());
+        assert_eq!(world.last_births, 0);
+        let parent_runtime = world
+            .agent_runtime(parent)
+            .expect("surviving parent runtime");
+        assert!((parent_runtime.energy - 1.0).abs() < f32::EPSILON);
+        assert!((parent_runtime.reproduction_counter - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn offspring_snapshot_and_mutation_failures_are_terminal_and_refunded() {
+        #[derive(Clone, Copy)]
+        enum FailureMode {
+            Snapshot,
+            Mutation,
+        }
+
+        #[derive(Debug, Error)]
+        #[error("deliberate inherited-brain operation failure")]
+        struct DeliberateHeritageFailure;
+
+        struct FailingHeritageRunner {
+            mode: FailureMode,
+        }
+
+        impl BrainRunner for FailingHeritageRunner {
+            fn kind(&self) -> &'static str {
+                match self.mode {
+                    FailureMode::Snapshot => "test.snapshot-failure",
+                    FailureMode::Mutation => "test.mutation-failure",
+                }
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+
+            fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+                match self.mode {
+                    FailureMode::Snapshot => {
+                        Err(BrainSpawnError::new(self.kind(), DeliberateHeritageFailure))
+                    }
+                    FailureMode::Mutation => Ok(Some(Box::new(Self { mode: self.mode }))),
+                }
+            }
+
+            fn mutate(
+                &mut self,
+                _rng: &mut dyn RngCore,
+                _rate: f32,
+                _scale: f32,
+            ) -> Result<(), BrainSpawnError> {
+                match self.mode {
+                    FailureMode::Snapshot => Ok(()),
+                    FailureMode::Mutation => {
+                        Err(BrainSpawnError::new(self.kind(), DeliberateHeritageFailure))
+                    }
+                }
+            }
+        }
+
+        for mode in [FailureMode::Snapshot, FailureMode::Mutation] {
+            let config = ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                food_growth_rate: 0.0,
+                food_decay_rate: 0.0,
+                food_diffusion_rate: 0.0,
+                food_intake_rate: 0.0,
+                food_waste_rate: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                metabolism_ramp_rate: 0.0,
+                metabolism_boost_penalty: 0.0,
+                temperature_discomfort_rate: 0.0,
+                population_minimum: 2,
+                population_spawn_interval: 0,
+                reproduction_energy_threshold: 0.5,
+                reproduction_energy_cost: 0.25,
+                reproduction_cooldown: 1,
+                reproduction_attempt_interval: 0,
+                reproduction_attempt_chance: 1.0,
+                reproduction_rate_herbivore: f32::MIN_POSITIVE,
+                reproduction_rate_carnivore: f32::MIN_POSITIVE,
+                reproduction_partner_chance: 0.0,
+                persistence_interval: 0,
+                rng_seed: Some(0xF411_1B1E),
+                ..ScriptBotsConfig::default()
+            };
+            let mut identity_reference =
+                WorldState::new(config.clone()).expect("identity reference world");
+            identity_reference.spawn_agent(sample_agent(0));
+            let expected_next_agent = identity_reference.spawn_agent(sample_agent(1));
+
+            let mut world = WorldState::new(config).expect("world");
+            let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = Arc::clone(&factory_calls);
+            let kind = match mode {
+                FailureMode::Snapshot => "test.snapshot-failure",
+                FailureMode::Mutation => "test.mutation-failure",
+            };
+            let key = world.brain_registry_mut().register(kind, move |_rng| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(FailingHeritageRunner { mode }))
+            });
+            let parent = world.spawn_agent(sample_agent(0));
+            assert!(
+                world
+                    .bind_agent_brain(parent, key)
+                    .expect("initial parent brain construction")
+            );
+            {
+                let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+                runtime.energy = 1.0;
+                runtime.reproduction_counter = 1.0;
+            }
+
+            let error = world
+                .step()
+                .expect_err("failed inherited-brain operation must terminate the tick");
+            assert!(matches!(&error, WorldStepError::BrainSpawn(_)));
+            let WorldStepError::BrainSpawn(error) = error else {
+                return;
+            };
+            assert_eq!(error.kind(), kind);
+            assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(world.tick(), Tick(1));
+            assert_eq!(world.agents.len(), 1);
+            assert_eq!(world.runtime.len(), world.agents.len());
+            assert!(world.pending_spawns.is_empty());
+            assert_eq!(world.last_births, 0);
+            let parent_runtime = world
+                .agent_runtime(parent)
+                .expect("surviving parent runtime");
+            assert!((parent_runtime.energy - 1.0).abs() < f32::EPSILON);
+            assert!((parent_runtime.reproduction_counter - 1.0).abs() < f32::EPSILON);
+            let actual_next_agent = world.spawn_agent(sample_agent(1));
+            assert_eq!(actual_next_agent, expected_next_agent);
+        }
+    }
+
+    #[test]
+    fn scheduled_crossover_refuses_bound_nonheritable_parents_without_registry_fallback() {
+        struct NonHeritableRunner;
+
+        impl BrainRunner for NonHeritableRunner {
+            fn kind(&self) -> &'static str {
+                "test.non-heritable"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+        }
+
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 1,
+            population_spawn_count: 1,
+            population_crossover_chance: 1.0,
+            reproduction_energy_threshold: 0.0,
+            persistence_interval: 0,
+            rng_seed: Some(0xC205_50A3),
+            ..ScriptBotsConfig::default()
+        };
+        for stale_registry_key in [false, true] {
+            let mut world = WorldState::new(config.clone()).expect("world");
+            let registry_key = stale_registry_key.then(|| {
+                world
+                    .brain_registry_mut()
+                    .register("test.non-heritable", |_rng| {
+                        Ok(Box::new(NonHeritableRunner))
+                    })
+            });
+            for seed in 0..2 {
+                let id = world.spawn_agent(sample_agent(seed));
+                if let Some(key) = registry_key {
+                    assert!(
+                        world
+                            .bind_agent_brain(id, key)
+                            .expect("initial non-heritable runner")
+                    );
+                } else {
+                    world.agent_runtime_mut(id).expect("runtime").brain =
+                        BrainBinding::with_runner(Box::new(NonHeritableRunner));
+                }
+            }
+            if let Some(key) = registry_key {
+                assert!(world.brain_registry_mut().unregister(key));
+            }
+
+            let error = world
+                .step()
+                .expect_err("non-heritable bound parents must not normalize to random offspring");
+            assert!(matches!(&error, WorldStepError::BrainSpawn(_)));
+            let WorldStepError::BrainSpawn(error) = error else {
+                return;
+            };
+            assert_eq!(error.kind(), "test.non-heritable");
+            assert_eq!(world.tick(), Tick(1));
+            assert_eq!(world.agents.len(), 2);
+            assert!(world.pending_spawns.is_empty());
+        }
+    }
+
+    #[test]
+    fn fallible_random_spawn_preserves_the_seeded_rng_order() {
+        fn register_rng_consuming_brains(world: &mut WorldState) {
+            for kind in ["test.rng-a", "test.rng-b"] {
+                world.brain_registry_mut().register(kind, move |rng| {
+                    let _ = rng.next_u64();
+                    Ok(Box::new(StubBrain))
+                });
+            }
+        }
+
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x5EED),
+            ..ScriptBotsConfig::default()
+        };
+        let mut fallible_world = WorldState::new(config.clone()).expect("fallible world");
+        let mut reference_world = WorldState::new(config).expect("reference world");
+        register_rng_consuming_brains(&mut fallible_world);
+        register_rng_consuming_brains(&mut reference_world);
+
+        fallible_world
+            .spawn_random_agent()
+            .expect("fallible random spawn");
+
+        let width = reference_world.config.world_width as f32;
+        let height = reference_world.config.world_height as f32;
+        let data = AgentData::new(
+            Position::new(
+                reference_world.rng.random_range(0.0..width),
+                reference_world.rng.random_range(0.0..height),
+            ),
+            Velocity::default(),
+            reference_world
+                .rng
+                .random_range(-std::f32::consts::PI..std::f32::consts::PI),
+            1.0,
+            [
+                reference_world.rng.random_range(0.0..1.0),
+                reference_world.rng.random_range(0.0..1.0),
+                reference_world.rng.random_range(0.0..1.0),
+            ],
+            0.0,
+            false,
+            0,
+            Generation::default(),
+        );
+        let id = reference_world.spawn_agent(data);
+        if let Some(key) = reference_world
+            .brain_registry
+            .random_key(&mut reference_world.rng)
+        {
+            assert!(
+                reference_world
+                    .bind_agent_brain(id, key)
+                    .expect("reference brain factory")
+            );
+        }
+
+        assert_eq!(
+            fallible_world
+                .characterization_digest_v0()
+                .expect("fallible digest"),
+            reference_world
+                .characterization_digest_v0()
+                .expect("reference digest"),
+            "introducing fallible construction must not perturb seeded spawn behavior"
+        );
     }
 
     fn run_seeded_history(
@@ -9979,6 +11823,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn simultaneous_brain_and_persistence_failures_are_both_latched() {
+        #[derive(Debug, Error)]
+        #[error("deliberate population factory failure")]
+        struct DeliberatePopulationFactoryError;
+
+        let config = ScriptBotsConfig {
+            population_minimum: 3,
+            population_spawn_interval: 0,
+            persistence_interval: 1,
+            rng_seed: Some(0x0BAD_5EED),
+            ..ScriptBotsConfig::default()
+        };
+        let persistence_logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence = RejectOncePersistence {
+            logs: Arc::clone(&persistence_logs),
+            reject_next: true,
+        };
+        let mut world =
+            WorldState::with_persistence(config, Box::new(persistence)).expect("test world");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_attempts = Arc::clone(&attempts);
+        world
+            .brain_registry_mut()
+            .register("test.double-fault", move |_rng| {
+                if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(Box::new(StubBrain))
+                } else {
+                    Err(BrainSpawnError::new(
+                        "test.double-fault",
+                        DeliberatePopulationFactoryError,
+                    ))
+                }
+            });
+
+        let first_error = world
+            .step()
+            .expect_err("both terminal failures must be reported at the completed boundary");
+        assert!(matches!(
+            &first_error,
+            WorldStepError::BrainAndPersistence { .. }
+        ));
+        let WorldStepError::BrainAndPersistence { brain, persistence } = first_error else {
+            return;
+        };
+        assert_eq!(brain.kind(), "test.double-fault");
+        assert_eq!(persistence.tick(), 1);
+        assert_eq!(world.tick(), Tick(1));
+        assert!(
+            world.agents().is_empty(),
+            "population inserts must roll back"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(persistence_logs.lock().unwrap().len(), 1);
+        assert_eq!(
+            world.brain_fault().map(BrainSpawnError::kind),
+            Some("test.double-fault")
+        );
+        assert_eq!(world.persistence_fault(), Some(&persistence));
+
+        let completed_digest = world
+            .characterization_digest_v0()
+            .expect("double-fault tick must finish at a coherent boundary");
+        assert!(matches!(
+            world.step(),
+            Err(WorldStepError::BrainAndPersistence { .. })
+        ));
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(persistence_logs.lock().unwrap().len(), 1);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("latched double fault digest"),
+            completed_digest,
+            "repeated step must not mutate after a combined terminal fault"
+        );
+    }
+
     fn lifecycle_birth(tick: u64) -> BirthRecord {
         BirthRecord {
             tick: Tick(tick),
@@ -10051,6 +11974,10 @@ mod tests {
         let first_error = world
             .step()
             .expect_err("definite persistence rejection must fail the completed tick");
+        assert!(matches!(&first_error, WorldStepError::Persistence(_)));
+        let WorldStepError::Persistence(first_error) = first_error else {
+            return;
+        };
         assert_eq!(first_error.tick(), 1);
         assert_eq!(first_error.state(), PersistenceAdmissionState::NotAdmitted);
         assert_eq!(world.tick(), Tick(1));
@@ -10064,6 +11991,10 @@ mod tests {
         let repeated_error = world
             .step()
             .expect_err("a latched failure must prevent tick two from starting");
+        assert!(matches!(&repeated_error, WorldStepError::Persistence(_)));
+        let WorldStepError::Persistence(repeated_error) = repeated_error else {
+            return;
+        };
         assert_eq!(repeated_error, first_error);
         assert_eq!(world.tick(), Tick(1));
         assert_eq!(rejected_logs.lock().unwrap().len(), rejected_call_count);
@@ -10973,8 +12904,12 @@ mod tests {
 
         let idle_key = world
             .brain_registry_mut()
-            .register("test.idle", |_rng| Box::new(IdleBrain));
-        assert!(world.bind_agent_brain(parent, idle_key));
+            .register("test.idle", |_rng| Ok(Box::new(IdleBrain)));
+        assert!(
+            world
+                .bind_agent_brain(parent, idle_key)
+                .expect("idle brain factory")
+        );
 
         world.step().expect("child placement step");
 
@@ -11329,6 +13264,7 @@ mod tests {
             let idx = arena.index_of(agent).unwrap();
             let columns = arena.columns_mut();
             columns.positions_mut()[idx] = Position::new(5.0, 5.0);
+            columns.health_mut()[idx] = 1.0;
         }
         {
             let runtime = world.agent_runtime_mut(agent).unwrap();
@@ -11371,6 +13307,15 @@ mod tests {
             expected_intake * config.reproduction_food_bonus * fertility_multiplier,
             runtime.reproduction_counter
         );
+        let health = world
+            .snapshot_agent(agent)
+            .expect("herbivore should remain alive")
+            .data
+            .health;
+        assert!(
+            (health - 1.0).abs() < 1e-6,
+            "ground-food policy should leave health unchanged, got {health:.6}"
+        );
         let cell_value = world.food().get(0, 0).unwrap();
         let expected_cell = (0.2 - config.food_waste_rate).max(0.0);
         assert!(
@@ -11402,6 +13347,8 @@ mod tests {
             let idx = arena.index_of(agent).unwrap();
             let columns = arena.columns_mut();
             columns.positions_mut()[idx] = Position::new(15.0, 5.0);
+            // below the health cap so the intake/waste gate stays open
+            columns.health_mut()[idx] = 1.0;
         }
         {
             let runtime = world.agent_runtime_mut(agent).unwrap();
@@ -11606,6 +13553,9 @@ mod tests {
             let columns = arena.columns_mut();
             columns.positions_mut()[fertile_slot] = fertile_pos;
             columns.positions_mut()[infertile_slot] = infertile_pos;
+            // below the health cap so the intake/waste gate stays open
+            columns.health_mut()[fertile_slot] = 1.0;
+            columns.health_mut()[infertile_slot] = 1.0;
         }
         for agent in [fertile_agent, infertile_agent] {
             if let Some(runtime) = world.agent_runtime_mut(agent) {
@@ -11708,6 +13658,227 @@ mod tests {
             giver_runtime.give_intent > 0.5,
             "give intent should persist for downstream consumers"
         );
+    }
+
+    #[test]
+    fn food_sharing_rebuilds_current_positions_across_toroidal_seam() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_transfer_rate: 0.01,
+            food_sharing_distance: 6.0,
+            rng_seed: Some(203),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let giver = world.spawn_agent(sample_agent(0));
+        let receiver = world.spawn_agent(sample_agent(1));
+
+        {
+            let arena = world.agents_mut();
+            let giver_idx = arena.index_of(giver).unwrap();
+            let receiver_idx = arena.index_of(receiver).unwrap();
+            let positions = arena.columns_mut().positions_mut();
+            positions[giver_idx] = Position::new(30.0, 50.0);
+            positions[receiver_idx] = Position::new(70.0, 50.0);
+        }
+        world.stage_sense();
+        {
+            let arena = world.agents_mut();
+            let giver_idx = arena.index_of(giver).unwrap();
+            let receiver_idx = arena.index_of(receiver).unwrap();
+            let positions = arena.columns_mut().positions_mut();
+            positions[giver_idx] = Position::new(2.0, 50.0);
+            positions[receiver_idx] = Position::new(98.0, 50.0);
+        }
+        {
+            let runtime = world.agent_runtime_mut(giver).unwrap();
+            runtime.energy = 1.0;
+            runtime.give_intent = 1.0;
+        }
+        world.agent_runtime_mut(receiver).unwrap().energy = 0.5;
+
+        world.stage_food();
+
+        assert!(
+            (world.agent_runtime(giver).unwrap().energy - 0.99).abs() < 1e-6,
+            "giver should find the receiver using the stage's current position index"
+        );
+        assert!(
+            (world.agent_runtime(receiver).unwrap().energy - 0.51).abs() < 1e-6,
+            "minimum-image distance should share across the world seam"
+        );
+    }
+
+    #[test]
+    fn food_sharing_sorts_wrapped_bucket_candidates_by_dense_index() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_transfer_rate: 0.01,
+            food_sharing_distance: 5.0,
+            rng_seed: Some(204),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut world = WorldState::new(config).expect("world");
+        let giver = world.spawn_agent(sample_agent(0));
+        let lower_index_recipient = world.spawn_agent(sample_agent(1));
+        let higher_index_recipient = world.spawn_agent(sample_agent(2));
+
+        {
+            let arena = world.agents_mut();
+            let giver_idx = arena.index_of(giver).unwrap();
+            let lower_idx = arena.index_of(lower_index_recipient).unwrap();
+            let higher_idx = arena.index_of(higher_index_recipient).unwrap();
+            assert!(
+                lower_idx < higher_idx,
+                "fixture must encode dense-index order"
+            );
+            let positions = arena.columns_mut().positions_mut();
+            positions[giver_idx] = Position::new(1.0, 50.0);
+            positions[lower_idx] = Position::new(2.0, 50.0);
+            // Wrapped bucket traversal sees this higher index before the
+            // lower-index recipient in the giver's own bucket.
+            positions[higher_idx] = Position::new(99.0, 50.0);
+        }
+        {
+            let runtime = world.agent_runtime_mut(giver).unwrap();
+            runtime.energy = 0.015;
+            runtime.give_intent = 1.0;
+        }
+        world
+            .agent_runtime_mut(lower_index_recipient)
+            .unwrap()
+            .energy = 0.0;
+        world
+            .agent_runtime_mut(higher_index_recipient)
+            .unwrap()
+            .energy = 0.0;
+
+        world.stage_food();
+
+        assert!(
+            (world.agent_runtime(lower_index_recipient).unwrap().energy - 0.01).abs() < 1e-6,
+            "lower dense index should receive the first full transfer"
+        );
+        assert!(
+            (world.agent_runtime(higher_index_recipient).unwrap().energy - 0.005).abs() < 1e-6,
+            "higher dense index should deterministically receive the remainder"
+        );
+    }
+
+    #[test]
+    fn direct_and_full_tick_food_sharing_agree() {
+        struct SharingBrain {
+            give: f32,
+        }
+
+        impl BrainRunner for SharingBrain {
+            fn kind(&self) -> &'static str {
+                "test.sharing"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                let mut outputs = [0.0; OUTPUT_SIZE];
+                outputs[8] = self.give;
+                outputs
+            }
+        }
+
+        let make_world = || {
+            let config = ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                food_growth_rate: 0.0,
+                food_decay_rate: 0.0,
+                food_diffusion_rate: 0.0,
+                food_intake_rate: 0.0,
+                food_waste_rate: 0.0,
+                food_transfer_rate: 0.01,
+                food_sharing_distance: 5.0,
+                bot_speed: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                metabolism_ramp_rate: 0.0,
+                metabolism_boost_penalty: 0.0,
+                temperature_discomfort_rate: 0.0,
+                reproduction_energy_threshold: 10.0,
+                reproduction_attempt_chance: 0.0,
+                spike_damage: 0.0,
+                spike_energy_cost: 0.0,
+                persistence_interval: 0,
+                rng_seed: Some(205),
+                ..ScriptBotsConfig::default()
+            };
+            let mut world = WorldState::new(config).expect("world");
+            let giver = world.spawn_agent(sample_agent(0));
+            let receiver = world.spawn_agent(sample_agent(1));
+            {
+                let arena = world.agents_mut();
+                let giver_idx = arena.index_of(giver).unwrap();
+                let receiver_idx = arena.index_of(receiver).unwrap();
+                let positions = arena.columns_mut().positions_mut();
+                positions[giver_idx] = Position::new(10.0, 10.0);
+                positions[receiver_idx] = Position::new(12.0, 10.0);
+            }
+            {
+                let runtime = world.agent_runtime_mut(giver).unwrap();
+                runtime.energy = 1.0;
+                runtime.give_intent = 1.0;
+            }
+            world.agent_runtime_mut(receiver).unwrap().energy = 0.5;
+
+            let giver_key = world.brain_registry_mut().register("test.giver", |_rng| {
+                Ok(Box::new(SharingBrain { give: 1.0 }))
+            });
+            let receiver_key = world
+                .brain_registry_mut()
+                .register("test.receiver", |_rng| {
+                    Ok(Box::new(SharingBrain { give: 0.0 }))
+                });
+            assert!(
+                world
+                    .bind_agent_brain(giver, giver_key)
+                    .expect("giver brain factory")
+            );
+            assert!(
+                world
+                    .bind_agent_brain(receiver, receiver_key)
+                    .expect("receiver brain factory")
+            );
+            (world, giver, receiver)
+        };
+
+        let (mut direct, direct_giver, direct_receiver) = make_world();
+        direct.stage_food();
+        let direct_energies = (
+            direct.agent_runtime(direct_giver).unwrap().energy,
+            direct.agent_runtime(direct_receiver).unwrap().energy,
+        );
+
+        let (mut full_tick, full_giver, full_receiver) = make_world();
+        let events = full_tick.step().expect("full tick");
+        let full_tick_energies = (
+            full_tick.agent_runtime(full_giver).unwrap().energy,
+            full_tick.agent_runtime(full_receiver).unwrap().energy,
+        );
+
+        assert_eq!(events.tick, Tick(1));
+        assert_eq!(full_tick_energies, direct_energies);
+        assert_eq!(direct_energies, (0.99, 0.51));
     }
 
     #[test]
@@ -12039,7 +14210,7 @@ mod tests {
         let (mut registry_world, _) = characterization_world(42);
         registry_world
             .brain_registry_mut()
-            .register("stub", |_rng| Box::new(StubBrain));
+            .register("stub", |_rng| Ok(Box::new(StubBrain)));
         let changed = registry_world
             .characterization_digest_v0()
             .expect("brain registry digest");
@@ -12065,11 +14236,13 @@ mod tests {
     #[test]
     fn characterization_v0_rejects_queued_control_work() {
         let (mut world, _) = characterization_world(7);
-        world.enqueue_simulation_command(SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: None,
-            step_once: false,
-        });
+        world
+            .enqueue_simulation_command(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: false,
+            })
+            .expect("valid simulation command");
         assert!(matches!(
             world.characterization_digest_v0(),
             Err(CharacterizationError::NonQuiescent {
@@ -12100,5 +14273,56 @@ mod tests {
         assert_eq!(pending[0].speed_multiplier, Some(0.0));
         assert!(!pending[0].step_once);
         assert!(world.drain_simulation_commands().is_empty());
+    }
+
+    #[test]
+    fn invalid_config_update_is_atomic() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let before_config = serde_json::to_value(world.config()).expect("serialize config");
+        let before_food = world.food().cells().to_vec();
+        let before_audit_len = world.config_audit().len();
+
+        let mut invalid = world.config().clone();
+        invalid.food_growth_rate = f32::NAN;
+        let WorldStateError::InvalidConfig(message) = world
+            .apply_config_update(invalid)
+            .expect_err("non-finite runtime update must be rejected");
+        assert_eq!(message, "food_growth_rate must be finite");
+        assert_eq!(
+            serde_json::to_value(world.config()).expect("serialize unchanged config"),
+            before_config
+        );
+        assert_eq!(world.food().cells(), before_food);
+        assert_eq!(world.config_audit().len(), before_audit_len);
+    }
+
+    #[test]
+    fn simulation_command_rejects_non_finite_speed_without_queueing() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let command = SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: Some(f32::NAN),
+            step_once: false,
+        };
+        let WorldStateError::InvalidConfig(message) = world
+            .enqueue_simulation_command(command)
+            .expect_err("non-finite speed must be rejected");
+        assert_eq!(message, "speed_multiplier must be finite");
+        assert!(world.drain_simulation_commands().is_empty());
+    }
+
+    #[test]
+    fn simulation_command_preserves_finite_clamp_semantics() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        world
+            .enqueue_simulation_command(SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(128.0),
+                step_once: false,
+            })
+            .expect("finite speed remains admissible");
+        let pending = world.drain_simulation_commands();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].speed_multiplier, Some(32.0));
     }
 }
