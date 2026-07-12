@@ -1914,7 +1914,11 @@ impl SimulationView {
 
         let analytics_trigger = {
             let mut trigger: Option<(u64, usize)> = None;
-            if let Ok(world) = self.world.lock() {
+            if let Ok(mut world) = self.world.lock() {
+                // Activation capture is bounded (ACTIVATION_CAPTURE_BUDGET), so a
+                // bulk selection cannot guarantee the inspected agent is captured.
+                // Point the probe at whichever agent the inspector is focused on.
+                world.set_activation_probe(inspector_state.focused_agent);
                 snapshot.tick = world.tick().0;
                 snapshot.epoch = world.epoch();
                 snapshot.is_closed = world.is_closed();
