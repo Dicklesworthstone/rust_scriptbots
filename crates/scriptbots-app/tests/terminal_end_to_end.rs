@@ -367,7 +367,7 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
     config.food_transfer_rate = 0.002;
 
     let mut world = WorldState::new(config.clone())?;
-    let mut pipeline = StoragePipeline::with_thresholds(
+    let mut pipeline = StoragePipeline::create_new_file_with_thresholds(
         storage_path
             .to_str()
             .expect("temporary storage path should be utf-8"),

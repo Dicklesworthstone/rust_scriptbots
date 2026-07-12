@@ -1948,6 +1948,10 @@ frontend, server, or storage edge.
 
 #### 2.8 storage lifecycle migration
 
+**Status:** [Currently In Progress — checked encodings, exact retained-batch
+shutdown retry, and storage-owned path guards, `bd-2z0.8.9.4.3`, CyanDove,
+2026-07-12]
+
 - blocking FrankenSQLite boundary with one worker-owned connection;
 - bounded lossless command/lifecycle journal queue;
 - pause-before-overflow and fail-closed timeout policy when storage remains unavailable;

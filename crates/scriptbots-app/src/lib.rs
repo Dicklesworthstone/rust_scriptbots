@@ -8,6 +8,7 @@ use scriptbots_core::{
     TickEvents, WorldState,
 };
 use scriptbots_storage::AnalyticsSnapshotProvider;
+pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -20,20 +21,6 @@ pub const RUN_MANIFEST_V0_SCHEMA: &str = "scriptbots.run-manifest";
 pub const CHARACTERIZATION_TRACE_V0_SCHEMA: &str = "scriptbots.characterization-trace";
 /// Safety bound for the temporary characterization runner.
 pub const MAX_CHARACTERIZATION_TICKS_V0: u64 = 256;
-/// Files that may belong to a live or interrupted FrankenSQLite database.
-///
-/// Every path guard that reserves or exports alongside a database must use this single list so
-/// a CSV can never be created where the engine expects a lock or journal sidecar.
-pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
-    "-wal",
-    "-shm",
-    "-journal",
-    "-wal-fec",
-    "-lock-shared",
-    "-lock-reserved",
-    "-lock-pending",
-];
-
 const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 const RUST_TOOLCHAIN_BYTES: &[u8] = include_bytes!("../../../rust-toolchain.toml");
 const RUST_TOOLCHAIN_TEXT: &str = include_str!("../../../rust-toolchain.toml");

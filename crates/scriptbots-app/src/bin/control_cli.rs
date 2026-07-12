@@ -982,7 +982,7 @@ mod tests {
         let database = path
             .to_str()
             .context("temporary database path was not valid UTF-8")?;
-        let mut storage = Storage::open(database)?;
+        let mut storage = Storage::create_new_file(database)?;
 
         // Persist deliberately out of order so the export contract, rather than insertion
         // order, proves chronological output.

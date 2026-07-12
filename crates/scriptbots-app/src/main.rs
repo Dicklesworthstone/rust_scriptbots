@@ -3,8 +3,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    CharacterizationTraceV0, ControlRuntime, ControlServerConfig, STORAGE_SIDECAR_SUFFIXES,
-    ScenarioIdentityV0, SharedAnalytics, SharedWorld,
+    CharacterizationTraceV0, ControlRuntime, ControlServerConfig, ScenarioIdentityV0,
+    SharedAnalytics, SharedWorld,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -184,173 +184,220 @@ fn main() -> Result<()> {
     let (world, analytics, mut storage_pipeline) =
         bootstrap_world(config, cli.storage, thresholds)?;
 
-    // Optional: dump a PNG snapshot and exit (no UI launched).
-    if let Some(path) = cli.dump_png.as_ref() {
-        #[cfg(feature = "gui")]
-        {
+    // Capture every ordinary post-bootstrap exit so the exact retained tail is
+    // finalized and the worker is acknowledged before this function returns.
+    let runtime_result = (|| -> Result<()> {
+        // Optional: dump a PNG snapshot and exit (no UI launched).
+        if let Some(path) = cli.dump_png.as_ref() {
+            #[cfg(feature = "gui")]
+            {
+                let (w, h) = cli
+                    .png_size
+                    .as_deref()
+                    .and_then(parse_png_size)
+                    .unwrap_or((1600, 900));
+
+                let bytes = {
+                    let guard = world.lock().map_err(|error| {
+                        anyhow::anyhow!("world mutex poisoned while rendering PNG: {error}")
+                    })?;
+                    // Prefer wgpu compositor path if requested via env; otherwise fallback CPU raster
+                    if matches!(
+                        std::env::var("SB_WGPU_DUMP").ok().as_deref(),
+                        Some("1" | "true" | "yes" | "on")
+                    ) {
+                        scriptbots_render::world_compositor::render_wgpu_png_offscreen(&guard, w, h)
+                    } else {
+                        render_png_offscreen(&guard, w, h)
+                    }
+                };
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, &bytes)?;
+                println!(
+                    "{} Wrote snapshot {} ({}x{})",
+                    "✔".green().bold(),
+                    path.display(),
+                    w,
+                    h
+                );
+                return Ok(());
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                // Avoid unused-variable warning when GUI is not enabled.
+                let _ = path;
+                bail!("--dump-png requires GUI feature; recompile with --features gui");
+            }
+        }
+        #[cfg(feature = "bevy_render")]
+        if let Some(path) = cli.dump_bevy_png.as_ref() {
             let (w, h) = cli
                 .png_size
                 .as_deref()
                 .and_then(parse_png_size)
                 .unwrap_or((1600, 900));
-
             let bytes = {
-                let guard = world.lock().expect("world mutex poisoned");
-                // Prefer wgpu compositor path if requested via env; otherwise fallback CPU raster
-                let bytes = if matches!(
-                    std::env::var("SB_WGPU_DUMP").ok().as_deref(),
-                    Some("1" | "true" | "yes" | "on")
-                ) {
-                    scriptbots_render::world_compositor::render_wgpu_png_offscreen(&guard, w, h)
-                } else {
-                    render_png_offscreen(&guard, w, h)
-                };
-                bytes
+                let guard = world.lock().map_err(|error| {
+                    anyhow::anyhow!("world mutex poisoned while rendering Bevy PNG: {error}")
+                })?;
+                render_bevy_png(&guard, w, h)?
             };
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 fs::create_dir_all(parent)?;
             }
             fs::write(path, &bytes)?;
             println!(
-                "{} Wrote snapshot {} ({}x{})",
+                "{} Wrote Bevy snapshot {} ({}x{})",
                 "✔".green().bold(),
                 path.display(),
                 w,
                 h
             );
-            finalize_and_shutdown_storage(&world, &mut storage_pipeline)?;
             return Ok(());
         }
-        #[cfg(not(feature = "gui"))]
-        {
-            // Avoid unused-variable warning when GUI is not enabled
-            let _ = path;
-            finalize_and_shutdown_storage(&world, &mut storage_pipeline)?;
-            bail!("--dump-png requires GUI feature; recompile with --features gui");
-        }
-    }
-    #[cfg(feature = "bevy_render")]
-    if let Some(path) = cli.dump_bevy_png.as_ref() {
-        let (w, h) = cli
-            .png_size
-            .as_deref()
-            .and_then(parse_png_size)
-            .unwrap_or((1600, 900));
-        let bytes = {
-            let guard = world.lock().expect("world mutex poisoned");
-            render_bevy_png(&guard, w, h)?
-        };
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, &bytes)?;
-        println!(
-            "{} Wrote Bevy snapshot {} ({}x{})",
-            "✔".green().bold(),
-            path.display(),
-            w,
-            h
+
+        // Resolve first so a future fallible renderer probe cannot strand a
+        // control runtime that has already started.
+        let (active_mode, renderer) = resolve_renderer(cli.mode)?;
+        let control_config = ControlServerConfig::from_env();
+        let (control_runtime, command_drain, command_submit) =
+            ControlRuntime::launch(world.clone(), control_config)?;
+        info!(
+            requested_mode = cli.mode.as_str(),
+            active_mode = active_mode.as_str(),
+            renderer = renderer.name(),
+            "Starting ScriptBots simulation shell"
         );
-        finalize_and_shutdown_storage(&world, &mut storage_pipeline)?;
-        return Ok(());
-    }
-    let control_config = ControlServerConfig::from_env();
-    let (control_runtime, command_drain, command_submit) =
-        ControlRuntime::launch(world.clone(), control_config)?;
-    let (active_mode, renderer) = resolve_renderer(cli.mode)?;
-    info!(
-        requested_mode = cli.mode.as_str(),
-        active_mode = active_mode.as_str(),
-        renderer = renderer.name(),
-        "Starting ScriptBots simulation shell"
-    );
-    let context = RendererContext {
-        world: Arc::clone(&world),
-        analytics: analytics.clone(),
-        control_runtime: &control_runtime,
-        command_drain,
-        command_submit,
-    };
-    let render_result = renderer.run(context);
-    let control_result = control_runtime.shutdown();
-    let storage_result = finalize_and_shutdown_storage(&world, &mut storage_pipeline);
-    if let Err(storage_error) = storage_result {
-        let mut concurrent = Vec::new();
-        if let Err(render_error) = &render_result {
-            concurrent.push(format!("renderer also failed: {render_error:#}"));
-        }
-        if let Err(control_error) = &control_result {
-            concurrent.push(format!("control runtime also failed: {control_error:#}"));
-        }
-        let context = if concurrent.is_empty() {
-            "storage shutdown was the terminal runtime failure".to_owned()
-        } else {
-            concurrent.join("; ")
+        let context = RendererContext {
+            world: Arc::clone(&world),
+            analytics: analytics.clone(),
+            control_runtime: &control_runtime,
+            command_drain,
+            command_submit,
         };
-        return Err(storage_error).context(context);
-    }
-    render_result?;
-    control_result?;
-    Ok(())
+        let render_result = renderer.run(context);
+        let control_result = control_runtime.shutdown();
+        match (render_result, control_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(render_error), Ok(())) => Err(render_error),
+            (Ok(()), Err(control_error)) => Err(control_error),
+            (Err(render_error), Err(control_error)) => Err(render_error).context(format!(
+                "control runtime shutdown also failed: {control_error:#}"
+            )),
+        }
+    })();
+    let storage_result = finalize_and_shutdown_storage(&world, &mut storage_pipeline);
+    prefer_storage_failure(runtime_result, storage_result, "runtime")
 }
 
-fn shutdown_storage(pipeline: &mut StoragePipeline) -> Result<()> {
-    let receipt = pipeline
+fn prefer_storage_failure<T>(
+    operation: Result<T>,
+    storage: Result<()>,
+    operation_name: &str,
+) -> Result<T> {
+    match (operation, storage) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Ok(_), Err(storage_error)) => Err(storage_error),
+        (Err(operation_error), Err(storage_error)) => {
+            Err(storage_error).context(format!("{operation_name} also failed: {operation_error:#}"))
+        }
+    }
+}
+
+fn shutdown_storage(pipeline: &mut StoragePipeline) -> Result<scriptbots_storage::ShutdownReceipt> {
+    pipeline
         .shutdown()
-        .context("FrankenSQLite worker failed during acknowledged shutdown")?;
-    info!(
-        committed_tick = ?receipt.committed_tick,
-        guarantee = ?receipt.guarantee,
-        analytics_revision = receipt.analytics_revision,
-        "FrankenSQLite worker shut down with an explicit persistence receipt"
-    );
-    Ok(())
+        .context("FrankenSQLite worker failed during acknowledged shutdown")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StorageFinalization {
+    admitted_tail: bool,
+    required_tick: Option<u64>,
+}
+
+fn finalize_world_persistence(world: &mut WorldState) -> Result<StorageFinalization> {
+    let mut admitted_tail = false;
+    if world.persistence_fault().is_some() {
+        admitted_tail |= world
+            .retry_pending_persistence()
+            .context("failed to re-admit the retained persistence batch before shutdown")?;
+    }
+
+    match world.finalize_persistence() {
+        Ok(admitted) => admitted_tail |= admitted,
+        Err(first_error) => {
+            // Finalization itself can create the retained batch. Retry that
+            // exact batch before closing worker admission; never reconstruct it.
+            let retried = world.retry_pending_persistence().with_context(|| {
+                format!(
+                    "failed to re-admit the final partial persistence batch after its first rejection: {first_error}"
+                )
+            })?;
+            if !retried {
+                bail!(
+                    "final persistence admission failed without retaining an exact retry batch: {first_error}"
+                );
+            }
+            admitted_tail = true;
+        }
+    }
+
+    if world.persistence_fault().is_some() || world.has_pending_persistence_batch() {
+        bail!("storage finalization left an unresolved retained persistence batch");
+    }
+
+    Ok(StorageFinalization {
+        admitted_tail,
+        required_tick: (world.config().persistence_interval != 0
+            && world.tick() != scriptbots_core::Tick::zero())
+        .then_some(world.tick().0),
+    })
 }
 
 fn finalize_and_shutdown_storage(
     world: &Arc<Mutex<WorldState>>,
     pipeline: &mut StoragePipeline,
 ) -> Result<()> {
-    let finalization = (|| -> Result<bool> {
+    let finalization = (|| -> Result<StorageFinalization> {
         let mut world = world
             .lock()
             .map_err(|error| anyhow::anyhow!("world mutex poisoned during shutdown: {error}"))?;
-        // A latched NotAdmitted fault retains the exact rejected batch so it
-        // can be re-admitted; without this retry the retained batch would be
-        // dropped with the world and that tick's data silently lost.
-        if world.persistence_fault().is_some() {
-            match world.retry_pending_persistence() {
-                Ok(readmitted) => {
-                    if readmitted {
-                        info!("Re-admitted the retained persistence batch during shutdown");
-                    }
-                }
-                Err(error) => {
-                    warn!(%error, "retained persistence batch could not be re-admitted at shutdown");
-                }
-            }
-        }
-        world
-            .finalize_persistence()
-            .context("failed to admit the final partial persistence batch")
+        finalize_world_persistence(&mut world)
     })();
     finalize_then_shutdown_storage(finalization, pipeline)
 }
 
 fn finalize_then_shutdown_storage(
-    finalization: Result<bool>,
+    finalization: Result<StorageFinalization>,
     pipeline: &mut StoragePipeline,
 ) -> Result<()> {
     let shutdown = shutdown_storage(pipeline);
 
     match (finalization, shutdown) {
-        (Ok(admitted_tail), Ok(())) => {
-            if admitted_tail {
+        (Ok(finalization), Ok(receipt)) => {
+            if receipt.committed_tick != finalization.required_tick {
+                bail!(
+                    "FrankenSQLite shutdown receipt covered tick {:?}, but finalized world requires {:?}",
+                    receipt.committed_tick,
+                    finalization.required_tick
+                );
+            }
+            if finalization.admitted_tail {
                 info!("Admitted and committed final partial persistence batch");
             }
+            info!(
+                committed_tick = ?receipt.committed_tick,
+                guarantee = ?receipt.guarantee,
+                analytics_revision = receipt.analytics_revision,
+                "FrankenSQLite worker shut down with an explicit persistence receipt"
+            );
             Ok(())
         }
-        (Err(finalization_error), Ok(())) => Err(finalization_error),
+        (Err(finalization_error), Ok(_)) => Err(finalization_error),
         (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
         (Err(finalization_error), Err(shutdown_error)) => Err(finalization_error).context(format!(
             "FrankenSQLite worker shutdown also failed: {shutdown_error:#}"
@@ -634,103 +681,24 @@ fn thresholds_from_cli(cli: &AppCli) -> ThresholdsOverride {
     ThresholdsOverride::default()
 }
 
-fn storage_path_from_env() -> String {
-    env::var("SCRIPTBOTS_STORAGE_PATH").unwrap_or_else(|_| {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_millis());
-        format!("runs/scriptbots-{timestamp}-{}.sqlite", std::process::id())
-    })
-}
-
-fn prepare_storage_parent(path: &str) -> Result<()> {
-    if let Some(parent) = Path::new(path)
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create storage directory {}", parent.display()))?;
-    }
-    Ok(())
-}
-
-fn storage_sidecar_paths(path: &Path) -> Vec<PathBuf> {
-    STORAGE_SIDECAR_SUFFIXES
-        .into_iter()
-        .map(|suffix| {
-            let mut sidecar = path.as_os_str().to_owned();
-            sidecar.push(suffix);
-            PathBuf::from(sidecar)
-        })
-        .collect()
-}
-
-/// Reject path shapes that FrankenSQLite treats as volatile or non-file engines.
-/// File mode must never "reserve" these: `:memory:` selects the in-memory
-/// engine (a literal file named `:memory:` would be created but never used),
-/// and `file:` URIs bypass plain filesystem path semantics.
-fn ensure_durable_storage_path(path: &str) -> Result<()> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        bail!(
-            "SCRIPTBOTS_STORAGE_PATH is empty; set it to a durable file path, or use --storage memory for a volatile run"
-        );
-    }
-    if trimmed == ":memory:" {
-        bail!(
-            "SCRIPTBOTS_STORAGE_PATH=\":memory:\" selects the volatile in-memory engine and cannot back a durable file run; use --storage memory instead"
-        );
-    }
-    if trimmed.starts_with("file:") {
-        bail!(
-            "SCRIPTBOTS_STORAGE_PATH {path:?} uses the file: URI form, which is not supported for durable file runs; set a plain filesystem path, or use --storage memory"
-        );
-    }
-    Ok(())
-}
-
-fn ensure_no_stale_sidecars(path: &Path) -> Result<()> {
-    for sidecar in storage_sidecar_paths(path) {
-        if sidecar
-            .try_exists()
-            .with_context(|| format!("failed to inspect storage sidecar {}", sidecar.display()))?
-        {
+fn storage_path_from_env() -> Result<String> {
+    match env::var("SCRIPTBOTS_STORAGE_PATH") {
+        Ok(path) => Ok(path),
+        Err(env::VarError::NotPresent) => {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_millis());
+            Ok(format!(
+                "runs/scriptbots-{timestamp}-{}.sqlite",
+                std::process::id()
+            ))
+        }
+        Err(env::VarError::NotUnicode(_)) => {
             bail!(
-                "refusing new run at {} because stale FrankenSQLite sidecar {} exists",
-                path.display(),
-                sidecar.display()
-            );
+                "SCRIPTBOTS_STORAGE_PATH is not valid Unicode; refusing to choose a different run database silently"
+            )
         }
     }
-    Ok(())
-}
-
-fn reserve_new_run_storage(path: &str) -> Result<()> {
-    ensure_durable_storage_path(path)?;
-    prepare_storage_parent(path)?;
-    let path = Path::new(path);
-    ensure_no_stale_sidecars(path)?;
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "refusing to reuse existing single-run storage path {}; choose a new SCRIPTBOTS_STORAGE_PATH",
-                path.display()
-            )
-        })?;
-    // Re-check after the atomic reservation: a sidecar that appeared between
-    // the sweep above and create_new means another process is racing us on
-    // this path. Undo our just-created empty reservation file and fail.
-    if let Err(error) = ensure_no_stale_sidecars(path) {
-        let _ = fs::remove_file(path);
-        return Err(error.context(format!(
-            "storage sidecar appeared while reserving {}; removed the empty reservation file",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 fn bootstrap_world(
@@ -741,66 +709,79 @@ fn bootstrap_world(
     #[cfg(feature = "neuro")]
     let _ = validated_neuroflow_config(&config)?;
 
-    let storage_path = storage_path_from_env();
-    if matches!(storage_mode, StorageMode::File) {
-        reserve_new_run_storage(&storage_path)?;
-    }
-
-    let pipeline = match storage_mode {
-        StorageMode::File => match (
-            thresholds.tick,
-            thresholds.agent,
-            thresholds.event,
-            thresholds.metric,
-        ) {
-            (Some(t), Some(a), Some(e), Some(m)) => {
-                StoragePipeline::with_thresholds(&storage_path, t, a, e, m)
-            }
-            _ => StoragePipeline::new(&storage_path),
-        }
-        .with_context(|| format!("failed to initialize FrankenSQLite storage at {storage_path}"))?,
-        StorageMode::Memory => StoragePipeline::with_thresholds(
-            ":memory:",
-            thresholds.tick.unwrap_or(64),
-            thresholds.agent.unwrap_or(2048),
-            thresholds.event.unwrap_or(512),
-            thresholds.metric.unwrap_or(512),
-        )?,
-    };
-    match storage_mode {
+    let (mut pipeline, storage_path) = match storage_mode {
         StorageMode::File => {
-            info!(path = %storage_path, "Selected unique FrankenSQLite run database");
-            println!(
-                "{} Run database: {}",
-                "◆".bright_blue().bold(),
-                storage_path.cyan()
-            );
+            let storage_path = storage_path_from_env()?;
+            let pipeline = match (
+                thresholds.tick,
+                thresholds.agent,
+                thresholds.event,
+                thresholds.metric,
+            ) {
+                (Some(t), Some(a), Some(e), Some(m)) => {
+                    StoragePipeline::create_new_file_with_thresholds(&storage_path, t, a, e, m)
+                }
+                _ => StoragePipeline::create_new_file(&storage_path),
+            }
+            .with_context(|| {
+                format!("failed to initialize FrankenSQLite storage at {storage_path}")
+            })?;
+            (pipeline, Some(storage_path))
         }
-        StorageMode::Memory => {
-            info!("Selected volatile in-memory FrankenSQLite storage");
-        }
-    }
-    let analytics = pipeline.analytics_provider();
-    let mut world = WorldState::with_persistence(config, Box::new(pipeline.sink()))?;
-    let brain_keys = install_brains(&mut world)?;
-
-    seed_agents(&mut world, &brain_keys)?;
-
-    for _ in 0..120 {
-        world.step()?;
-    }
-
-    if let Some(summary) = world.history().last() {
-        info!(
-            tick = summary.tick.0,
-            agents = summary.agent_count,
-            births = summary.births,
-            deaths = summary.deaths,
-            avg_energy = summary.average_energy,
-            "Primed world and persisted initial summary",
+        StorageMode::Memory => (
+            StoragePipeline::memory_with_thresholds(
+                thresholds.tick.unwrap_or(64),
+                thresholds.agent.unwrap_or(2048),
+                thresholds.event.unwrap_or(512),
+                thresholds.metric.unwrap_or(512),
+            )?,
+            None,
+        ),
+    };
+    if let Some(storage_path) = storage_path {
+        info!(path = %storage_path, "Selected unique FrankenSQLite run database");
+        println!(
+            "{} Run database: {}",
+            "◆".bright_blue().bold(),
+            storage_path.cyan()
         );
     } else {
-        warn!("World bootstrap completed without persistence summaries");
+        info!("Selected volatile in-memory FrankenSQLite storage");
+    }
+    let analytics = pipeline.analytics_provider();
+    let mut world = match WorldState::with_persistence(config, Box::new(pipeline.sink())) {
+        Ok(world) => world,
+        Err(error) => {
+            let shutdown = shutdown_storage(&mut pipeline).map(|_| ());
+            return prefer_storage_failure(Err(error.into()), shutdown, "world construction");
+        }
+    };
+    let bootstrap_result = (|| -> Result<()> {
+        let brain_keys = install_brains(&mut world)?;
+        seed_agents(&mut world, &brain_keys)?;
+
+        for _ in 0..120 {
+            world.step()?;
+        }
+
+        if let Some(summary) = world.history().last() {
+            info!(
+                tick = summary.tick.0,
+                agents = summary.agent_count,
+                births = summary.births,
+                deaths = summary.deaths,
+                avg_energy = summary.average_energy,
+                "Primed world and persisted initial summary",
+            );
+        } else {
+            warn!("World bootstrap completed without persistence summaries");
+        }
+        Ok(())
+    })();
+    if let Err(error) = bootstrap_result {
+        let finalization = finalize_world_persistence(&mut world);
+        let storage = finalize_then_shutdown_storage(finalization, &mut pipeline);
+        return prefer_storage_failure(Err(error), storage, "world bootstrap");
     }
 
     Ok((Arc::new(Mutex::new(world)), analytics, pipeline))
@@ -1573,25 +1554,25 @@ fn profile_world_steps_with_storage(
     #[cfg(feature = "neuro")]
     let _ = validated_neuroflow_config(config)?;
 
-    let storage_path = storage_path_from_env();
-    if matches!(storage_mode, StorageMode::File) {
-        reserve_new_run_storage(&storage_path)?;
-    }
     let mut pipeline = match storage_mode {
-        StorageMode::File => match (
-            thresholds.tick,
-            thresholds.agent,
-            thresholds.event,
-            thresholds.metric,
-        ) {
-            (Some(t), Some(a), Some(e), Some(m)) => {
-                StoragePipeline::with_thresholds(&storage_path, t, a, e, m)
+        StorageMode::File => {
+            let storage_path = storage_path_from_env()?;
+            match (
+                thresholds.tick,
+                thresholds.agent,
+                thresholds.event,
+                thresholds.metric,
+            ) {
+                (Some(t), Some(a), Some(e), Some(m)) => {
+                    StoragePipeline::create_new_file_with_thresholds(&storage_path, t, a, e, m)
+                }
+                _ => StoragePipeline::create_new_file(&storage_path),
             }
-            _ => StoragePipeline::new(&storage_path),
+            .with_context(|| {
+                format!("failed to initialize FrankenSQLite storage at {storage_path}")
+            })?
         }
-        .with_context(|| format!("failed to initialize FrankenSQLite storage at {storage_path}"))?,
-        StorageMode::Memory => StoragePipeline::with_thresholds(
-            ":memory:",
+        StorageMode::Memory => StoragePipeline::memory_with_thresholds(
             thresholds.tick.unwrap_or(64),
             thresholds.agent.unwrap_or(2048),
             thresholds.event.unwrap_or(512),
@@ -1599,18 +1580,29 @@ fn profile_world_steps_with_storage(
         )?,
     };
 
-    let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
-    let brain_keys = install_brains(&mut world)?;
-    seed_agents(&mut world, &brain_keys)?;
-
+    let mut world = match WorldState::with_persistence(config.clone(), Box::new(pipeline.sink())) {
+        Ok(world) => world,
+        Err(error) => {
+            let shutdown = shutdown_storage(&mut pipeline).map(|_| ());
+            return prefer_storage_failure(
+                Err(error.into()),
+                shutdown,
+                "profile world construction",
+            );
+        }
+    };
     let start = Instant::now();
-    for _ in 0..tick_limit {
-        world.step()?;
-    }
-    let finalization = world
-        .finalize_persistence()
-        .context("failed to admit the final partial persistence batch");
-    finalize_then_shutdown_storage(finalization, &mut pipeline)?;
+    let profile_result = (|| -> Result<()> {
+        let brain_keys = install_brains(&mut world)?;
+        seed_agents(&mut world, &brain_keys)?;
+        for _ in 0..tick_limit {
+            world.step()?;
+        }
+        Ok(())
+    })();
+    let finalization = finalize_world_persistence(&mut world);
+    let storage = finalize_then_shutdown_storage(finalization, &mut pipeline);
+    prefer_storage_failure(profile_result, storage, "storage profiling")?;
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
     let tps = tick_limit as f64 / secs;
@@ -2309,11 +2301,11 @@ mod tests {
     fn new_run_reservation_refuses_existing_main_file() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("run.sqlite");
-        reserve_new_run_storage(path.to_str().expect("utf8 test path")).expect("first reservation");
-        fs::write(&path, b"existing-run").expect("mark reserved run");
+        fs::write(&path, b"existing-run").expect("create existing run fixture");
 
-        let error = reserve_new_run_storage(path.to_str().expect("utf8 test path"))
-            .expect_err("existing run path must be rejected");
+        let error = StoragePipeline::create_new_file(path.to_str().expect("utf8 test path"))
+            .err()
+            .expect("existing run path must be rejected");
         assert!(error.to_string().contains("refusing to reuse"));
         assert_eq!(fs::read(&path).expect("read existing run"), b"existing-run");
     }
@@ -2325,8 +2317,9 @@ mod tests {
         let wal = PathBuf::from(format!("{}-wal", path.display()));
         fs::write(&wal, b"stale-wal").expect("write stale WAL fixture");
 
-        let error = reserve_new_run_storage(path.to_str().expect("utf8 test path"))
-            .expect_err("orphaned WAL must prevent run reuse");
+        let error = StoragePipeline::create_new_file(path.to_str().expect("utf8 test path"))
+            .err()
+            .expect("orphaned WAL must prevent run reuse");
         assert!(error.to_string().contains("stale FrankenSQLite sidecar"));
         assert!(!path.exists(), "reservation must not create the main file");
         assert_eq!(fs::read(wal).expect("read stale WAL"), b"stale-wal");
@@ -2334,24 +2327,29 @@ mod tests {
 
     #[test]
     fn new_run_reservation_rejects_volatile_and_uri_path_shapes() {
-        let error = reserve_new_run_storage(":memory:")
-            .expect_err("file mode must reject the in-memory engine path");
-        assert!(error.to_string().contains("--storage memory"));
+        let error = StoragePipeline::create_new_file(":memory:")
+            .err()
+            .expect("file mode must reject the in-memory engine path");
+        assert!(error.to_string().contains("StoragePipeline::memory"));
         assert!(
             !Path::new(":memory:").exists(),
             "reservation must not create a literal :memory: file"
         );
 
-        let error = reserve_new_run_storage("").expect_err("file mode must reject an empty path");
-        assert!(error.to_string().contains("--storage memory"));
+        let error = StoragePipeline::create_new_file("")
+            .err()
+            .expect("file mode must reject an empty path");
+        assert!(error.to_string().contains("non-empty path"));
 
-        let error = reserve_new_run_storage("   \t")
-            .expect_err("file mode must reject a whitespace-only path");
-        assert!(error.to_string().contains("--storage memory"));
+        let error = StoragePipeline::create_new_file("   \t")
+            .err()
+            .expect("file mode must reject a whitespace-only path");
+        assert!(error.to_string().contains("non-empty path"));
 
-        let error = reserve_new_run_storage("file:run.sqlite?mode=memory")
-            .expect_err("file mode must reject file: URI paths");
-        assert!(error.to_string().contains("--storage memory"));
+        let error = StoragePipeline::create_new_file("file:run.sqlite?mode=memory")
+            .err()
+            .expect("file mode must reject file: URI paths");
+        assert!(error.to_string().contains("file: URI"));
     }
 
     #[test]
@@ -2528,7 +2526,8 @@ activation = "Sigmoid"
 
         {
             let mut pipeline =
-                StoragePipeline::with_thresholds(&db_str, 1, 1, 1, 1).expect("pipeline");
+                StoragePipeline::create_new_file_with_thresholds(&db_str, 1, 1, 1, 1)
+                    .expect("pipeline");
             let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))
                 .expect("world");
             let keys = install_brains(&mut world).expect("install replay-fixture brains");
@@ -2536,14 +2535,9 @@ activation = "Sigmoid"
             for _ in 0..16 {
                 world.step().expect("durable replay fixture step");
             }
-            assert!(
-                world
-                    .finalize_persistence()
-                    .expect("admit non-aligned durable replay tail")
-            );
-            pipeline
-                .shutdown()
-                .expect("durable replay fixture shutdown");
+            let finalization = finalize_world_persistence(&mut world);
+            finalize_then_shutdown_storage(finalization, &mut pipeline)
+                .expect("durable replay fixture finalization and shutdown");
         }
 
         let storage = StorageReader::open(&db_str).expect("open storage read-only");
@@ -2571,6 +2565,89 @@ activation = "Sigmoid"
             diff.is_none(),
             "empty event-stream plumbing should remain stable"
         );
+    }
+
+    #[test]
+    fn shutdown_finalization_retries_a_newly_rejected_exact_tail() {
+        struct RejectingPersistence {
+            remaining_rejections: Arc<std::sync::atomic::AtomicUsize>,
+            batches: Arc<Mutex<Vec<scriptbots_core::PersistenceBatch>>>,
+        }
+
+        impl WorldPersistence for RejectingPersistence {
+            fn on_tick(
+                &mut self,
+                payload: &scriptbots_core::PersistenceBatch,
+            ) -> std::result::Result<(), scriptbots_core::PersistenceAdmissionError> {
+                self.batches
+                    .lock()
+                    .expect("batch log")
+                    .push(payload.clone());
+                let remaining = self
+                    .remaining_rejections
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if remaining > 0 {
+                    self.remaining_rejections
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(scriptbots_core::PersistenceAdmissionError::new(
+                        payload.summary.tick.0,
+                        "injected final-tail rejection",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let make_world = |rejections, batches: Arc<Mutex<Vec<_>>>| {
+            let config = ScriptBotsConfig {
+                persistence_interval: 5,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                rng_seed: Some(0xD00D),
+                ..ScriptBotsConfig::default()
+            };
+            WorldState::with_persistence(
+                config,
+                Box::new(RejectingPersistence {
+                    remaining_rejections: Arc::new(std::sync::atomic::AtomicUsize::new(rejections)),
+                    batches,
+                }),
+            )
+            .expect("world")
+        };
+
+        let accepted_batches = Arc::new(Mutex::new(Vec::new()));
+        let mut accepted = make_world(1, Arc::clone(&accepted_batches));
+        accepted.step().expect("non-boundary tick");
+        let finalization = finalize_world_persistence(&mut accepted)
+            .expect("exact retained final tail should succeed on bounded retry");
+        assert!(finalization.admitted_tail);
+        assert_eq!(finalization.required_tick, Some(1));
+        assert!(!accepted.has_pending_persistence_batch());
+        assert!(accepted.persistence_fault().is_none());
+        let batches = accepted_batches.lock().expect("accepted batch log");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].summary, batches[1].summary);
+        assert_eq!(batches[0].metrics, batches[1].metrics);
+        assert_eq!(batches[0].events, batches[1].events);
+        assert_eq!(batches[0].replay_events, batches[1].replay_events);
+        drop(batches);
+
+        let rejected_batches = Arc::new(Mutex::new(Vec::new()));
+        let mut rejected = make_world(2, Arc::clone(&rejected_batches));
+        rejected.step().expect("non-boundary tick");
+        let error = finalize_world_persistence(&mut rejected)
+            .expect_err("second rejection must be terminal and honest");
+        assert!(error.to_string().contains("failed to re-admit"));
+        assert!(rejected.has_pending_persistence_batch());
+        assert!(rejected.persistence_fault().is_some());
+        let batches = rejected_batches.lock().expect("rejected batch log");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].summary, batches[1].summary);
+        assert_eq!(batches[0].metrics, batches[1].metrics);
+        assert_eq!(batches[0].events, batches[1].events);
+        assert_eq!(batches[0].replay_events, batches[1].replay_events);
     }
 
     #[test]
