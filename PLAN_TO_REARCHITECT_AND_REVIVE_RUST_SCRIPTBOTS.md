@@ -1767,7 +1767,7 @@ This is a protocol bead. Separate child beads implement each family and integrat
 
 ### Phase 2 — One Authoritative Runtime (`P0`)
 
-#### 2.1 characterize command semantics
+#### 2.1 characterize command semantics [Completed]
 
 - pause/resume/speed/step truth table;
 - choose one-step policy: a step request atomically pauses, advances exactly one tick, and remains paused even if received while running;
@@ -1777,7 +1777,74 @@ This is a protocol bead. Separate child beads implement each family and integrat
 - shutdown/flush behavior;
 - tests covering more than 32 commands.
 
+Target policy frozen by `bd-2z0.4.1`:
+
+- All commands use one bounded `CommandEnvelope` stream. The host assigns one monotonic
+  `AdmissionSequence` to each admitted envelope and applies admitted envelopes strictly in that
+  order. There is no hidden playback subqueue, command-class reorder, silent drop, or coalescing.
+- `ControlRevision` advances exactly once for each successfully applied playback, mutating,
+  synthetic auto-pause, or shutdown envelope. Validation, expected-revision conflict, overload,
+  and duplicate lookup do not advance it. `ScientificRevision`, `ConfigRevision`, snapshot
+  revision, and event sequence remain separate domains.
+- `Step` atomically pauses, performs exactly one scientific transition at its ordered position,
+  suppresses the implicit cadence tick for that boundary, and stays paused unless a later admitted
+  envelope resumes it. Multiple admitted `Step` envelopes each advance once.
+- Application and journal state are independent. `Applied` does not imply journal commit.
+  `ModeCommit` below means `CommittedVolatile` for memory mode or `Durable` for file mode. A
+  rejection before admission is queryable for the live run but has `JournalState::NotRequired` and
+  no `AdmissionSequence`; it is not advertised as crash-durable.
+- Playback and presentation-only selection need no science journal record. `Step`, config changes,
+  disconnected-but-admitted mutations, and shutdown begin journal-pending and reach `ModeCommit`
+  only through acknowledgement. Auto-pause is a synthetic ordered Pause envelope with its own
+  identity and status. Duplicate `CommandId` returns the original two-axis status and never
+  reapplies.
+- Shutdown is an ordered, idempotent envelope. All older admitted work is applied or terminally
+  rejected in sequence before shutdown completes; later admission is closed explicitly. Completion
+  includes the shutdown journal/flush outcome, so no pending command is stranded behind a
+  successful shutdown return.
+
+The checked copy of this table lives in `crates/scriptbots-app/src/command.rs`. Burst rows are Step
+envelopes submitted into an unserviced capacity-32 admission window. An overload rejection is a
+terminal result for that `CommandId`; a later admission attempt uses a new ID after capacity becomes
+available.
+
+| Case / ordered envelopes | Start → final | Δ ControlRevision | Science at frozen boundary | Terminal application status | Journal status |
+|---|---:|---:|---:|---|---|
+| Pause | Running → Paused | 1 | 0 | `Applied(1)` | `NotRequired(1)` |
+| Resume | Paused → Running | 1 | 0; cadence may run only after time advances | `Applied(1)` | `NotRequired(1)` |
+| Speed | Running → Running | 1 | 0; new speed affects later cadence only | `Applied(1)` | `NotRequired(1)` |
+| Step | Running → Paused | 1 | exactly 1; no implicit cadence tick | `Applied(1)` | `Pending(1) → ModeCommit(1)` |
+| Step, Resume | Running → Running | 2 | exactly 1 | `Applied(2)` in order | Step pending/committed; Resume not required |
+| Resume, Step | Paused → Paused | 2 | exactly 1 | `Applied(2)` in order | Resume not required; Step pending/committed |
+| Config | Paused → Paused | 1 | 0 | `Applied(1)` | `Pending(1) → ModeCommit(1)` |
+| Selection | Paused → Paused | 1 | 0 | `Applied(1)` | `NotRequired(1)` |
+| Auto-pause trigger | Running → Paused | 1 | triggering tick may complete; no later tick | synthetic `Applied(1)` | `NotRequired(1)` |
+| Duplicate applied `CommandId` | Paused → Paused | 0 | 0 additional | existing status; no reapply | existing journal status |
+| Expected `ControlRevision` conflict | Paused → Paused | 0 | 0 | `Rejected(conflict)` | `NotRequired(1)` |
+| Client disconnect after admitted Config | Paused → Paused | 1 | 0 | `Applied(1)`, queryable after disconnect | `Pending(1) → ModeCommit(1)` |
+| Unserviced Step burst 1 / capacity 32 | Running → Paused | 1 | exactly 1 | 1 applied, 0 rejected | 1 pending/committed |
+| Unserviced Step burst 32 / capacity 32 | Running → Paused | 32 | exactly 32 | 32 applied, 0 rejected | 32 pending/committed |
+| Unserviced Step burst 33 / capacity 32 | Running → Paused | 32 | exactly 32 | 32 applied, 1 overload rejection | 32 pending/committed; 1 not required |
+| Unserviced Step burst 1,000 / capacity 32 | Running → Paused | 32 | exactly 32 | 32 applied, 968 overload rejections | 32 pending/committed; 968 not required |
+| Shutdown with empty queue | Paused → Stopped | 1 | 0 | shutdown `Applied(1)` | `Pending(1) → ModeCommit(1)` |
+| pending Step, Config, Shutdown | Running → Stopped | 3 | exactly 1 | all 3 applied in admission order | all 3 pending then mode-committed |
+
 **Exit:** current broken behavior is captured where intended to change, and target behavior is explicit.
+
+Executable evidence on source baseline `a4dce8fb9635834d387e0cd353d2d2f6670abf19`:
+
+- Live TUI `s` and one headless frame are green controls: each advances exactly one tick, and the
+  live path stays paused without leaving an inner simulation command.
+- The current capacity-32 bus admits the first 32 envelopes and rejects the 33rd explicitly.
+- Named target assertions are retained as specific expected-failure tests, never ignored: GPUI's
+  two views produce tick 2 instead of 1; a GPUI pause produces `(tick, pending) = (1, 1)` instead
+  of `(0, 0)`; Bevy's two queue/driver interleavings produce `[1, 2]` steps instead of `[1, 1]`;
+  mixed command classes defer playback behind later config application; a rejected TUI pause
+  remains optimistically visible; an accepted config response projects `0.6` while the applied
+  world still reports `0.5`; and control-runtime shutdown returns before its pending config is
+  applied.
+- `target_command_truth_table_is_complete_and_self_consistent` checks every row above, including
+  Step/Resume order, revision deltas, application counts, and journal counts.
 
 #### 2.2 extract core side effects
 
@@ -2690,8 +2757,8 @@ repaired.
 
 - GPUI two-window repaint stepping;
 - GPUI command queue never drained;
-- TUI direct-plus-queued double step;
-- headless TUI command queue never drained;
+- TUI queue-full rejection leaves optimistic local playback state;
+- control config responses project unapplied future state;
 - SIMD eye chunk factor inverted;
 - scalar eye heading double-added;
 - offspring brain unbound;

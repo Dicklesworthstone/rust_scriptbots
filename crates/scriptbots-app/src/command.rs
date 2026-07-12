@@ -95,3 +95,478 @@ mod tests {
         assert_eq!(pending[0].speed_multiplier, Some(32.0));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scriptbots_core::{ScriptBotsConfig, SimulationCommand};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TargetRunState {
+        Running,
+        Paused,
+        Stopped,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TargetScienceTicks {
+        NoneAtFrozenBoundary,
+        Exactly(u16),
+        TriggeringTickThenStop,
+        NoAdditionalTick,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TargetApplicationState {
+        Applied {
+            count: u16,
+        },
+        AppliedAfterDisconnect {
+            count: u16,
+        },
+        ExistingStatus,
+        Rejected {
+            count: u16,
+            reason: &'static str,
+        },
+        AppliedAndRejected {
+            applied: u16,
+            rejected: u16,
+            reason: &'static str,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TargetJournalState {
+        NotRequired {
+            count: u16,
+        },
+        PendingThenModeCommit {
+            count: u16,
+        },
+        Mixed {
+            not_required: u16,
+            pending_then_mode_commit: u16,
+        },
+        ExistingStatus,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TargetCommandCase {
+        name: &'static str,
+        envelope_count: u16,
+        initial: TargetRunState,
+        final_state: TargetRunState,
+        control_revision_delta: u16,
+        science_ticks: TargetScienceTicks,
+        application: TargetApplicationState,
+        journal: TargetJournalState,
+    }
+
+    // This is the checked Phase 2.1 contract, not an implementation of HostCore. Queue burst
+    // rows describe an unserviced capacity-32 admission window containing Step envelopes. An
+    // overload rejection is terminal and queryable, but it has no AdmissionSequence and requires
+    // no journal record. "Mode commit" means CommittedVolatile in memory mode or Durable in file
+    // mode; application and journal progress remain independent axes.
+    const TARGET_COMMAND_TRUTH_TABLE: &[TargetCommandCase] = &[
+        TargetCommandCase {
+            name: "pause",
+            envelope_count: 1,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::NotRequired { count: 1 },
+        },
+        TargetCommandCase {
+            name: "resume",
+            envelope_count: 1,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Running,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::NotRequired { count: 1 },
+        },
+        TargetCommandCase {
+            name: "speed",
+            envelope_count: 1,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Running,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::NotRequired { count: 1 },
+        },
+        TargetCommandCase {
+            name: "step",
+            envelope_count: 1,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::Exactly(1),
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::PendingThenModeCommit { count: 1 },
+        },
+        TargetCommandCase {
+            name: "step_then_resume",
+            envelope_count: 2,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Running,
+            control_revision_delta: 2,
+            science_ticks: TargetScienceTicks::Exactly(1),
+            application: TargetApplicationState::Applied { count: 2 },
+            journal: TargetJournalState::Mixed {
+                not_required: 1,
+                pending_then_mode_commit: 1,
+            },
+        },
+        TargetCommandCase {
+            name: "resume_then_step",
+            envelope_count: 2,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 2,
+            science_ticks: TargetScienceTicks::Exactly(1),
+            application: TargetApplicationState::Applied { count: 2 },
+            journal: TargetJournalState::Mixed {
+                not_required: 1,
+                pending_then_mode_commit: 1,
+            },
+        },
+        TargetCommandCase {
+            name: "config",
+            envelope_count: 1,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::PendingThenModeCommit { count: 1 },
+        },
+        TargetCommandCase {
+            name: "selection",
+            envelope_count: 1,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::NotRequired { count: 1 },
+        },
+        TargetCommandCase {
+            name: "auto_pause",
+            envelope_count: 1,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::TriggeringTickThenStop,
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::NotRequired { count: 1 },
+        },
+        TargetCommandCase {
+            name: "duplicate_command_id",
+            envelope_count: 1,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 0,
+            science_ticks: TargetScienceTicks::NoAdditionalTick,
+            application: TargetApplicationState::ExistingStatus,
+            journal: TargetJournalState::ExistingStatus,
+        },
+        TargetCommandCase {
+            name: "expected_revision_conflict",
+            envelope_count: 1,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 0,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::Rejected {
+                count: 1,
+                reason: "expected_control_revision_conflict",
+            },
+            journal: TargetJournalState::NotRequired { count: 1 },
+        },
+        TargetCommandCase {
+            name: "disconnected_client",
+            envelope_count: 1,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::AppliedAfterDisconnect { count: 1 },
+            journal: TargetJournalState::PendingThenModeCommit { count: 1 },
+        },
+        TargetCommandCase {
+            name: "unserviced_step_burst_1_capacity_32",
+            envelope_count: 1,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::Exactly(1),
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::PendingThenModeCommit { count: 1 },
+        },
+        TargetCommandCase {
+            name: "unserviced_step_burst_32_capacity_32",
+            envelope_count: 32,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 32,
+            science_ticks: TargetScienceTicks::Exactly(32),
+            application: TargetApplicationState::Applied { count: 32 },
+            journal: TargetJournalState::PendingThenModeCommit { count: 32 },
+        },
+        TargetCommandCase {
+            name: "unserviced_step_burst_33_capacity_32",
+            envelope_count: 33,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 32,
+            science_ticks: TargetScienceTicks::Exactly(32),
+            application: TargetApplicationState::AppliedAndRejected {
+                applied: 32,
+                rejected: 1,
+                reason: "overloaded_before_admission",
+            },
+            journal: TargetJournalState::Mixed {
+                not_required: 1,
+                pending_then_mode_commit: 32,
+            },
+        },
+        TargetCommandCase {
+            name: "unserviced_step_burst_1000_capacity_32",
+            envelope_count: 1_000,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Paused,
+            control_revision_delta: 32,
+            science_ticks: TargetScienceTicks::Exactly(32),
+            application: TargetApplicationState::AppliedAndRejected {
+                applied: 32,
+                rejected: 968,
+                reason: "overloaded_before_admission",
+            },
+            journal: TargetJournalState::Mixed {
+                not_required: 968,
+                pending_then_mode_commit: 32,
+            },
+        },
+        TargetCommandCase {
+            name: "shutdown_empty",
+            envelope_count: 1,
+            initial: TargetRunState::Paused,
+            final_state: TargetRunState::Stopped,
+            control_revision_delta: 1,
+            science_ticks: TargetScienceTicks::NoneAtFrozenBoundary,
+            application: TargetApplicationState::Applied { count: 1 },
+            journal: TargetJournalState::PendingThenModeCommit { count: 1 },
+        },
+        TargetCommandCase {
+            name: "shutdown_after_pending_step_and_config",
+            envelope_count: 3,
+            initial: TargetRunState::Running,
+            final_state: TargetRunState::Stopped,
+            control_revision_delta: 3,
+            science_ticks: TargetScienceTicks::Exactly(1),
+            application: TargetApplicationState::Applied { count: 3 },
+            journal: TargetJournalState::PendingThenModeCommit { count: 3 },
+        },
+    ];
+
+    fn application_counts(expectation: TargetApplicationState) -> (u16, u16, u16) {
+        match expectation {
+            TargetApplicationState::Applied { count }
+            | TargetApplicationState::AppliedAfterDisconnect { count } => (count, 0, 0),
+            TargetApplicationState::ExistingStatus => (0, 0, 1),
+            TargetApplicationState::Rejected { count, reason } => {
+                assert!(!reason.is_empty());
+                (0, count, 0)
+            }
+            TargetApplicationState::AppliedAndRejected {
+                applied,
+                rejected,
+                reason,
+            } => {
+                assert!(!reason.is_empty());
+                (applied, rejected, 0)
+            }
+        }
+    }
+
+    fn journal_counts(expectation: TargetJournalState) -> (u16, u16, u16) {
+        match expectation {
+            TargetJournalState::NotRequired { count } => (count, 0, 0),
+            TargetJournalState::PendingThenModeCommit { count } => (0, count, 0),
+            TargetJournalState::Mixed {
+                not_required,
+                pending_then_mode_commit,
+            } => (not_required, pending_then_mode_commit, 0),
+            TargetJournalState::ExistingStatus => (0, 0, 1),
+        }
+    }
+
+    #[test]
+    fn target_command_truth_table_is_complete_and_self_consistent() {
+        const REQUIRED_CASES: &[&str] = &[
+            "pause",
+            "resume",
+            "speed",
+            "step",
+            "step_then_resume",
+            "resume_then_step",
+            "config",
+            "selection",
+            "auto_pause",
+            "duplicate_command_id",
+            "expected_revision_conflict",
+            "disconnected_client",
+            "unserviced_step_burst_1_capacity_32",
+            "unserviced_step_burst_32_capacity_32",
+            "unserviced_step_burst_33_capacity_32",
+            "unserviced_step_burst_1000_capacity_32",
+            "shutdown_empty",
+            "shutdown_after_pending_step_and_config",
+        ];
+
+        assert_eq!(
+            TARGET_COMMAND_TRUTH_TABLE
+                .iter()
+                .map(|case| case.name)
+                .collect::<Vec<_>>(),
+            REQUIRED_CASES
+        );
+
+        for case in TARGET_COMMAND_TRUTH_TABLE {
+            let (applied, rejected, existing) = application_counts(case.application);
+            let (not_required, pending, existing_journal) = journal_counts(case.journal);
+            assert_eq!(
+                applied + rejected + existing,
+                case.envelope_count,
+                "every envelope needs one terminal application result for {}",
+                case.name
+            );
+            assert_eq!(
+                not_required + pending + existing_journal,
+                case.envelope_count,
+                "every envelope needs an explicit journal result for {}",
+                case.name
+            );
+            assert_eq!(
+                case.control_revision_delta, applied,
+                "ControlRevision changes once per successfully applied envelope for {}",
+                case.name
+            );
+            assert!(
+                !matches!(case.initial, TargetRunState::Stopped),
+                "no case starts after shutdown"
+            );
+        }
+
+        let case = |name| {
+            TARGET_COMMAND_TRUTH_TABLE
+                .iter()
+                .find(|case| case.name == name)
+                .expect("required target command case")
+        };
+        assert_eq!(
+            (
+                case("step_then_resume").final_state,
+                case("step_then_resume").science_ticks,
+            ),
+            (TargetRunState::Running, TargetScienceTicks::Exactly(1))
+        );
+        assert_eq!(
+            (
+                case("resume_then_step").final_state,
+                case("resume_then_step").science_ticks,
+            ),
+            (TargetRunState::Paused, TargetScienceTicks::Exactly(1))
+        );
+        assert_eq!(
+            application_counts(case("unserviced_step_burst_33_capacity_32").application),
+            (32, 1, 0)
+        );
+        assert_eq!(
+            application_counts(case("unserviced_step_burst_1000_capacity_32").application),
+            (32, 968, 0)
+        );
+    }
+
+    #[test]
+    fn current_capacity_32_bus_accepts_32_and_rejects_the_33rd() {
+        let (sender, _receiver) = create_command_bus(32);
+        for index in 0..32 {
+            let result = sender.try_send(ControlCommand::UpdateSimulation(
+                SimulationCommand::default(),
+            ));
+            assert!(result.is_ok(), "command {index} should fit: {result:?}");
+        }
+        assert!(matches!(
+            sender.try_send(ControlCommand::UpdateSimulation(
+                SimulationCommand::default()
+            )),
+            Err(TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: mixed command classes do not apply in enqueue order"
+    )]
+    fn target_mixed_command_classes_apply_atomically_in_enqueue_order() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let (sender, receiver) = create_command_bus(2);
+        sender
+            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: false,
+            }))
+            .expect("pause fits");
+        let mut updated = world.config().clone();
+        updated.food_max = 0.73;
+        sender
+            .try_send(ControlCommand::UpdateConfig(Box::new(updated)))
+            .expect("config fits");
+
+        drain_pending_commands(&receiver, &mut world);
+        assert!((world.config().food_max - 0.73).abs() < f32::EPSILON);
+        let deferred_playback = world.drain_simulation_commands();
+        assert_eq!(
+            deferred_playback.len(),
+            1,
+            "current defect must stay visible"
+        );
+        assert!(
+            deferred_playback.is_empty(),
+            "KNOWN DEFECT bd-2z0.4.1: mixed command classes do not apply in enqueue order"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: shutdown returns while admitted command work is pending"
+    )]
+    fn target_shutdown_terminally_resolves_pending_commands() {
+        let world = Arc::new(Mutex::new(
+            WorldState::new(ScriptBotsConfig::default()).expect("world"),
+        ));
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let mut updated = world.lock().expect("world lock").config().clone();
+        updated.food_max = 0.73;
+        assert!(submit(ControlCommand::UpdateConfig(Box::new(updated))));
+
+        runtime.shutdown().expect("control runtime shutdown");
+        let observed_at_shutdown = world.lock().expect("world lock").config().food_max;
+        assert!((observed_at_shutdown - 0.73).abs() > f32::EPSILON);
+
+        (drain.as_ref())(&mut world.lock().expect("world lock"));
+        assert!((world.lock().expect("world lock").config().food_max - 0.73).abs() < f32::EPSILON);
+        assert!(
+            (observed_at_shutdown - 0.73).abs() < f32::EPSILON,
+            "KNOWN DEFECT bd-2z0.4.1: shutdown returns while admitted command work is pending"
+        );
+    }
+}

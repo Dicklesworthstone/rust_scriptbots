@@ -148,11 +148,18 @@ fn run_event_loop(
 
 impl TerminalRenderer {
     fn run_headless(&self, ctx: RendererContext<'_>) -> Result<HeadlessReport> {
+        self.run_headless_frames(ctx, self.headless_frame_budget())
+    }
+
+    fn run_headless_frames(
+        &self,
+        ctx: RendererContext<'_>,
+        frames: usize,
+    ) -> Result<HeadlessReport> {
         let backend = ratatui::backend::TestBackend::new(80, 36);
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
         let mut report = HeadlessReport::new(app.snapshot().clone());
-        let frames = self.headless_frame_budget();
 
         for _ in 0..frames {
             app.step_once();
@@ -3209,6 +3216,110 @@ impl<'a> Widget for MapWidget<'a> {
 mod tests {
     use super::*;
     use scriptbots_core::{AgentData, ScriptBotsConfig};
+
+    fn command_characterization_world() -> SharedWorld {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        Arc::new(std::sync::Mutex::new(
+            WorldState::new(config).expect("characterization world"),
+        ))
+    }
+
+    #[test]
+    fn live_tui_single_step_advances_exactly_once_and_stays_paused() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        let before = world.lock().expect("world lock").tick().0;
+
+        let exit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("single-step key");
+
+        let mut guard = world.lock().expect("world lock");
+        assert!(!exit);
+        assert_eq!(guard.tick().0, before + 1);
+        assert!(guard.drain_simulation_commands().is_empty());
+        assert!(app.paused);
+        assert_eq!(app.speed_multiplier, 0.0);
+    }
+
+    #[test]
+    fn headless_tui_single_frame_advances_exactly_once() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+
+        let report = renderer
+            .run_headless_frames(ctx, 1)
+            .expect("one headless frame");
+
+        assert_eq!(report.summary.frame_count, 1);
+        assert_eq!(report.summary.ticks_simulated, 1);
+        assert_eq!(report.summary.final_tick, report.initial.tick + 1);
+        assert_eq!(
+            world.lock().expect("world lock").tick().0,
+            report.initial.tick + 1
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: rejected TUI command leaves optimistic playback state"
+    )]
+    fn target_queue_full_rejection_does_not_change_tui_playback_state() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, _unused_drain, _unused_submit) = crate::servers::ControlRuntime::dummy();
+        let (sender, receiver) = crate::command::create_command_bus(1);
+        sender
+            .try_send(ControlCommand::UpdateSimulation(
+                SimulationCommand::default(),
+            ))
+            .expect("fill command queue");
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world,
+            analytics,
+            control_runtime: &runtime,
+            command_drain: crate::command::make_command_drain(receiver),
+            command_submit: crate::command::make_command_submit(sender),
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        assert!(!app.paused);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("pause key");
+
+        assert!(
+            !app.paused,
+            "KNOWN DEFECT bd-2z0.4.1: rejected TUI command leaves optimistic playback state"
+        );
+    }
 
     #[test]
     fn snapshot_reflects_world_state() {

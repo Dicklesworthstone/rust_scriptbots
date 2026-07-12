@@ -835,6 +835,34 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
+    )]
+    fn target_config_response_reports_only_applied_state() {
+        let (handle, _receiver) = handle();
+        let projected = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_max".to_owned(),
+                value: Value::from(0.6),
+            }])
+            .expect("accepted config patch");
+        let observed = handle.snapshot().expect("current config snapshot");
+        let projected_food_max = projected.config["food_max"]
+            .as_f64()
+            .expect("projected food_max");
+        let observed_food_max = observed.config["food_max"]
+            .as_f64()
+            .expect("observed food_max");
+
+        assert!((projected_food_max - 0.6).abs() < 1.0e-6);
+        assert!((observed_food_max - 0.6).abs() > 1.0e-6);
+        assert_eq!(
+            projected_food_max, observed_food_max,
+            "KNOWN DEFECT bd-2z0.4.1: config response projects unapplied future state"
+        );
+    }
+
+    #[test]
     fn unknown_path_errors() {
         let (handle, _receiver) = handle();
         let err = handle

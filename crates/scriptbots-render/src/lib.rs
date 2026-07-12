@@ -12886,3 +12886,99 @@ fn transform_color(color: Rgba, matrix: [[f32; 3]; 3]) -> Rgba {
         a: color.a,
     }
 }
+
+#[cfg(test)]
+mod command_characterization_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn command_characterization_world() -> Arc<Mutex<WorldState>> {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        Arc::new(Mutex::new(
+            WorldState::new(config).expect("characterization world"),
+        ))
+    }
+
+    fn simulation_view(
+        world: Arc<Mutex<WorldState>>,
+        command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+    ) -> SimulationView {
+        SimulationView::new(
+            world,
+            AnalyticsSnapshotProvider::empty(),
+            "command characterization".into(),
+            command_drain,
+            Arc::new(|_command: ControlCommand| true),
+        )
+    }
+
+    fn prime_exactly_one_view_step(view: &mut SimulationView) {
+        view.controls.paused = false;
+        view.controls.speed_multiplier = 1.0;
+        view.sim_accumulator = 0.0;
+        view.last_sim_instant =
+            Some(Instant::now() - Duration::from_secs_f32(SIM_TICK_INTERVAL * 1.25));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: two GPUI views independently advance one world"
+    )]
+    fn target_two_gpui_views_share_one_simulation_clock() {
+        let world = command_characterization_world();
+        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let mut hud = simulation_view(Arc::clone(&world), Arc::clone(&drain));
+        let mut canvas = simulation_view(Arc::clone(&world), drain);
+        prime_exactly_one_view_step(&mut hud);
+        hud.pump_simulation();
+        prime_exactly_one_view_step(&mut canvas);
+        canvas.pump_simulation();
+
+        let tick = world.lock().expect("world lock").tick().0;
+        assert_eq!(
+            tick, 1,
+            "KNOWN DEFECT bd-2z0.4.1: two GPUI views independently advance one world"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: GPUI leaves playback in the inner world queue"
+    )]
+    fn target_gpui_applies_playback_before_stepping() {
+        let world = command_characterization_world();
+        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|world| {
+            scriptbots_core::apply_control_command(
+                world,
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(true),
+                    speed_multiplier: Some(0.0),
+                    step_once: false,
+                }),
+            )
+            .expect("queue pause command");
+        });
+        let mut view = simulation_view(Arc::clone(&world), drain);
+        prime_exactly_one_view_step(&mut view);
+
+        view.pump_simulation();
+
+        let (tick, pending) = {
+            let mut world = world.lock().expect("world lock");
+            (world.tick().0, world.drain_simulation_commands().len())
+        };
+        assert_eq!(
+            (tick, pending),
+            (0, 0),
+            "KNOWN DEFECT bd-2z0.4.1: GPUI leaves playback in the inner world queue"
+        );
+    }
+}

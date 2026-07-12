@@ -4418,6 +4418,58 @@ mod tests {
         );
     }
 
+    fn consume_driver_step_request(state: &mut SimControlData) -> usize {
+        if state.step_requested {
+            state.step_requested = false;
+            state.paused = true;
+            state.auto_pause_reason = None;
+            1
+        } else {
+            0
+        }
+    }
+
+    fn current_bevy_step_count(queued_command_arrives_before_driver: bool) -> usize {
+        let mut state = SimControlData {
+            paused: true,
+            step_requested: true,
+            ..SimControlData::default()
+        };
+        // Both Bevy playback handlers optimistically set local state before submitting the same
+        // request through CommandSubmitter.
+        let queued = SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: true,
+        };
+
+        if queued_command_arrives_before_driver {
+            apply_simulation_command_to_state(&mut state, &queued);
+        }
+        let mut steps = consume_driver_step_request(&mut state);
+        if !queued_command_arrives_before_driver {
+            apply_simulation_command_to_state(&mut state, &queued);
+            steps += consume_driver_step_request(&mut state);
+        }
+        steps
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: Bevy step advances once or twice by interleaving"
+    )]
+    fn target_bevy_step_is_exactly_once_for_every_queue_interleaving() {
+        let observed = [
+            current_bevy_step_count(true),
+            current_bevy_step_count(false),
+        ];
+        assert_eq!(
+            observed,
+            [1, 1],
+            "KNOWN DEFECT bd-2z0.4.1: Bevy step advances once or twice by interleaving"
+        );
+    }
+
     #[test]
     fn hud_overlay_populates_metrics() -> Result<()> {
         let mut app = App::new();
