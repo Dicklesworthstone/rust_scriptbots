@@ -738,5 +738,8 @@ pub use control::{
 };
 pub use scriptbots_core::ControlCommand;
 pub use servers::{
-    ConfigPatchRequest, ControlRuntime, ControlServerConfig, KnobApplyRequest, McpTransportConfig,
+    ConfigPatchRequest, ControlRuntime, ControlRuntimeStatus, ControlServerConfig,
+    ControlServerReservation, DEFAULT_CONTROL_MCP_HTTP_ADDRESS, DEFAULT_CONTROL_REST_ADDRESS,
+    DEFAULT_CONTROL_SWAGGER_PATH, KnobApplyRequest, McpTransportConfig,
+    default_control_rest_base_url,
 };

@@ -2,6 +2,7 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::{HashMap, VecDeque},
     f32::consts::{PI, TAU},
+    ffi::OsStr,
     fs::{self, File},
     io::{self, Stdout},
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -50,6 +51,105 @@ const EVENT_LOG_CAPACITY: usize = 16;
 const LEADERBOARD_LIMIT: usize = 6;
 const BRAINBOARD_LIMIT: usize = 4;
 
+trait TerminalRestore {
+    fn show_cursor(&mut self);
+    fn leave_alternate_screen(&mut self);
+    fn disable_raw_mode(&mut self);
+}
+
+struct CrosstermRestore;
+
+impl TerminalRestore for CrosstermRestore {
+    fn show_cursor(&mut self) {
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    }
+
+    fn leave_alternate_screen(&mut self) {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+
+    fn disable_raw_mode(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+struct TerminalModeGuard<R: TerminalRestore> {
+    restore: R,
+    raw_mode_enabled: bool,
+    alternate_screen_entered: bool,
+    cursor_hidden: bool,
+}
+
+impl<R: TerminalRestore> TerminalModeGuard<R> {
+    fn begin_with<EnableRaw, EnterAlternate>(
+        restore: R,
+        enable_raw: EnableRaw,
+        enter_alternate: EnterAlternate,
+    ) -> Result<Self>
+    where
+        EnableRaw: FnOnce() -> io::Result<()>,
+        EnterAlternate: FnOnce() -> io::Result<()>,
+    {
+        let mut guard = Self {
+            restore,
+            // Raw-mode setup can alter terminal state before a later syscall
+            // reports failure. A redundant disable is safe, so pre-arm it.
+            raw_mode_enabled: true,
+            alternate_screen_entered: false,
+            cursor_hidden: false,
+        };
+
+        enable_raw().context("failed to enable raw mode")?;
+        // Escape-sequence writes can succeed before their flush reports an
+        // error. Pre-arm the compensating LeaveAlternateScreen action.
+        guard.alternate_screen_entered = true;
+        enter_alternate().context("failed to enter alternate screen")?;
+        Ok(guard)
+    }
+
+    fn mark_cursor_hidden(&mut self) {
+        self.cursor_hidden = true;
+    }
+}
+
+impl<R: TerminalRestore> Drop for TerminalModeGuard<R> {
+    fn drop(&mut self) {
+        if self.cursor_hidden {
+            self.restore.show_cursor();
+            self.cursor_hidden = false;
+        }
+        if self.alternate_screen_entered {
+            self.restore.leave_alternate_screen();
+            self.alternate_screen_entered = false;
+        }
+        if self.raw_mode_enabled {
+            self.restore.disable_raw_mode();
+            self.raw_mode_enabled = false;
+        }
+    }
+}
+
+fn terminal_headless_requested() -> Result<bool> {
+    std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS")
+        .as_deref()
+        .map(parse_terminal_bool)
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn parse_terminal_bool(raw: &OsStr) -> Result<bool> {
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow!("SCRIPTBOTS_TERMINAL_HEADLESS must be a valid Unicode boolean"))?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!(
+            "invalid SCRIPTBOTS_TERMINAL_HEADLESS value '{raw}'; expected one of 1/true/yes/on or 0/false/no/off"
+        )),
+    }
+}
+
 pub struct TerminalRenderer {
     tick_interval: Duration,
     draw_interval: Duration,
@@ -70,7 +170,7 @@ impl Renderer for TerminalRenderer {
     }
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
-        if std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS").is_some() {
+        if terminal_headless_requested()? {
             let report = self.run_headless(ctx)?;
             info!(
                 target = "scriptbots::terminal",
@@ -91,28 +191,23 @@ impl Renderer for TerminalRenderer {
         }
 
         let mut stdout = io::stdout();
-        enable_raw_mode().context("failed to enable raw mode")?;
-        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
-
-        // A panic inside the event loop must not leave the user's shell in raw
-        // mode inside the alternate screen; restore before the message prints.
-        struct RawModeGuard;
-        impl Drop for RawModeGuard {
-            fn drop(&mut self) {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
-                let _ = execute!(io::stdout(), crossterm::cursor::Show);
-            }
-        }
-        let guard = RawModeGuard;
+        // Establish the guard immediately after raw mode succeeds. If entering
+        // the alternate screen fails, `begin_with` drops the partially armed
+        // guard and restores raw mode before returning the original error.
+        let mut guard = TerminalModeGuard::begin_with(CrosstermRestore, enable_raw_mode, || {
+            execute!(stdout, EnterAlternateScreen)
+        })?;
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("failed to build terminal backend")?;
+        // Showing an already-visible cursor is harmless; pre-arm restoration
+        // in case the hide sequence applies before a flush error is reported.
+        guard.mark_cursor_hidden();
         terminal.hide_cursor().ok();
 
         let result = run_event_loop(self, &mut terminal, ctx);
 
-        terminal.show_cursor().ok();
+        drop(terminal);
         drop(guard);
 
         result
@@ -127,6 +222,7 @@ fn run_event_loop(
     let mut app = TerminalApp::new(renderer, ctx);
 
     loop {
+        app.ensure_control_runtime_running()?;
         let now = Instant::now();
         app.maybe_step_simulation(now);
 
@@ -170,6 +266,7 @@ impl TerminalRenderer {
         let mut report = HeadlessReport::new(app.snapshot().clone());
 
         for _ in 0..frames {
+            app.ensure_control_runtime_running()?;
             app.step_once();
             report.record(app.snapshot());
             terminal.draw(|frame| app.draw(frame))?;
@@ -206,7 +303,7 @@ enum FocusLockMode {
 struct TerminalApp<'a> {
     world: SharedWorld,
     analytics_provider: SharedAnalytics,
-    _control: &'a ControlRuntime,
+    control: &'a ControlRuntime,
     command_drain: CommandDrain,
     command_submit: CommandSubmit,
     tick_interval: Duration,
@@ -254,7 +351,7 @@ impl<'a> TerminalApp<'a> {
         let mut app = Self {
             world: Arc::clone(&ctx.world),
             analytics_provider: ctx.analytics.clone(),
-            _control: ctx.control_runtime,
+            control: ctx.control_runtime,
             command_drain: Arc::clone(&ctx.command_drain),
             command_submit: Arc::clone(&ctx.command_submit),
             tick_interval: renderer.tick_interval,
@@ -287,6 +384,12 @@ impl<'a> TerminalApp<'a> {
         };
         app.refresh_snapshot();
         app
+    }
+
+    fn ensure_control_runtime_running(&self) -> Result<()> {
+        self.control
+            .health()
+            .map_err(|detail| anyhow!("control runtime failed while the TUI was active: {detail}"))
     }
 
     fn submit_simulation_command(&self, command: SimulationCommand) {
@@ -3239,6 +3342,113 @@ impl<'a> Widget for MapWidget<'a> {
 mod tests {
     use super::*;
     use scriptbots_core::{AgentData, ScriptBotsConfig};
+
+    #[derive(Clone)]
+    struct FakeTerminalRestore {
+        operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl TerminalRestore for FakeTerminalRestore {
+        fn show_cursor(&mut self) {
+            self.operations.lock().expect("operations").push("show");
+        }
+
+        fn leave_alternate_screen(&mut self) {
+            self.operations.lock().expect("operations").push("leave");
+        }
+
+        fn disable_raw_mode(&mut self) {
+            self.operations.lock().expect("operations").push("disable");
+        }
+    }
+
+    #[test]
+    fn alternate_screen_failure_restores_raw_mode_once_and_preserves_error() {
+        let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restore = FakeTerminalRestore {
+            operations: Arc::clone(&operations),
+        };
+
+        let result = TerminalModeGuard::begin_with(
+            restore,
+            || Ok(()),
+            || Err(io::Error::other("injected alternate-screen failure")),
+        );
+        let error = match result {
+            Ok(_) => panic!("alternate-screen failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.root_cause().to_string(),
+            "injected alternate-screen failure"
+        );
+        assert_eq!(
+            *operations.lock().expect("operations"),
+            vec!["leave", "disable"],
+            "an enter-screen write may take effect before reporting its injected failure"
+        );
+    }
+
+    #[test]
+    fn raw_mode_failure_still_runs_idempotent_disable() {
+        let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restore = FakeTerminalRestore {
+            operations: Arc::clone(&operations),
+        };
+
+        let result = TerminalModeGuard::begin_with(
+            restore,
+            || Err(io::Error::other("injected raw-mode failure")),
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(*operations.lock().expect("operations"), vec!["disable"]);
+    }
+
+    #[test]
+    fn terminal_guard_restores_each_armed_state_exactly_once() {
+        let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restore = FakeTerminalRestore {
+            operations: Arc::clone(&operations),
+        };
+        let mut guard =
+            TerminalModeGuard::begin_with(restore, || Ok(()), || Ok(())).expect("terminal setup");
+        guard.mark_cursor_hidden();
+        drop(guard);
+
+        assert_eq!(
+            *operations.lock().expect("operations"),
+            vec!["show", "leave", "disable"]
+        );
+    }
+
+    #[test]
+    fn terminal_headless_boolean_vocabulary_is_explicit() {
+        for raw in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_terminal_bool(OsStr::new(raw)).expect(raw));
+        }
+        for raw in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(!parse_terminal_bool(OsStr::new(raw)).expect(raw));
+        }
+
+        let error = parse_terminal_bool(OsStr::new("sometimes")).expect_err("invalid boolean");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid SCRIPTBOTS_TERMINAL_HEADLESS value")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_headless_rejects_non_unicode_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let error = parse_terminal_bool(OsStr::from_bytes(b"\xff"))
+            .expect_err("non-Unicode boolean must fail");
+        assert!(error.to_string().contains("valid Unicode boolean"));
+    }
 
     fn command_characterization_world() -> SharedWorld {
         let config = ScriptBotsConfig {

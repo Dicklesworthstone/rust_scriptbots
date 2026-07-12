@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
     env,
-    net::SocketAddr,
-    sync::Arc,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, mpsc},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -20,14 +21,17 @@ use futures_util::stream::{Stream, StreamExt};
 use mcp_protocol_sdk::{
     core::error::McpResult,
     prelude::*,
-    server::{HttpMcpServer, McpServer},
-    transport::http::HttpServerTransport,
+    protocol::types::{
+        JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+        error_codes,
+    },
+    server::McpServer,
 };
 use scriptbots_core::PresetKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{convert::Infallible, time::Duration};
-use tokio::sync::{Mutex, watch};
+use std::convert::Infallible;
+use tokio::sync::watch;
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -47,7 +51,23 @@ use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position,
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
 
-const DEFAULT_MCP_HTTP_ADDR: &str = "127.0.0.1:8090";
+/// Default loopback address for the REST control surface.
+pub const DEFAULT_CONTROL_REST_ADDRESS: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8088);
+/// Default loopback address for the MCP HTTP control surface.
+pub const DEFAULT_CONTROL_MCP_HTTP_ADDRESS: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8090);
+/// Default Swagger UI route served by the REST control surface.
+pub const DEFAULT_CONTROL_SWAGGER_PATH: &str = "/docs";
+
+const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Return the control CLI's default REST base URL from the server's socket authority.
+#[must_use]
+pub fn default_control_rest_base_url() -> String {
+    format!("http://{DEFAULT_CONTROL_REST_ADDRESS}")
+}
 
 /// Configuration for the hosted control surfaces.
 #[derive(Debug, Clone)]
@@ -56,40 +76,47 @@ pub struct ControlServerConfig {
     pub swagger_path: String,
     pub rest_enabled: bool,
     pub mcp_transport: McpTransportConfig,
+    /// Environment parsing failures retained until the fallible launch boundary.
+    #[doc(hidden)]
+    pub environment_errors: Vec<String>,
 }
 
 impl Default for ControlServerConfig {
     fn default() -> Self {
         Self {
-            rest_address: "127.0.0.1:8088"
-                .parse()
-                .expect("hard-coded loopback socket"),
-            swagger_path: "/docs".to_string(),
+            rest_address: DEFAULT_CONTROL_REST_ADDRESS,
+            swagger_path: DEFAULT_CONTROL_SWAGGER_PATH.to_string(),
             rest_enabled: true,
             mcp_transport: McpTransportConfig::Http {
-                bind_address: DEFAULT_MCP_HTTP_ADDR
-                    .parse()
-                    .expect("hard-coded MCP HTTP socket"),
+                bind_address: DEFAULT_CONTROL_MCP_HTTP_ADDRESS,
             },
+            environment_errors: Vec::new(),
         }
     }
 }
 
 impl ControlServerConfig {
-    /// Build configuration from environment variables, falling back to defaults.
+    /// Build configuration from environment variables and retain parse failures
+    /// for validation at the launch/reservation boundary.
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        if let Ok(addr) = env::var("SCRIPTBOTS_CONTROL_REST_ADDR") {
+        if let Some(addr) = read_control_environment(
+            "SCRIPTBOTS_CONTROL_REST_ADDR",
+            &mut config.environment_errors,
+        ) {
             match addr.parse::<SocketAddr>() {
                 Ok(addr) => config.rest_address = addr,
-                Err(err) => {
-                    warn!(%addr, %err, "invalid SCRIPTBOTS_CONTROL_REST_ADDR; using default")
-                }
+                Err(error) => config.environment_errors.push(format!(
+                    "SCRIPTBOTS_CONTROL_REST_ADDR={addr:?} is not a socket address: {error}"
+                )),
             }
         }
 
-        if let Ok(path) = env::var("SCRIPTBOTS_CONTROL_SWAGGER_PATH") {
+        if let Some(path) = read_control_environment(
+            "SCRIPTBOTS_CONTROL_SWAGGER_PATH",
+            &mut config.environment_errors,
+        ) {
             let sanitized = sanitize_swagger_path(&path);
             if sanitized != path {
                 warn!(original = %path, sanitized = %sanitized, "sanitized swagger path");
@@ -97,46 +124,58 @@ impl ControlServerConfig {
             config.swagger_path = sanitized;
         }
 
-        if let Ok(flag) = env::var("SCRIPTBOTS_CONTROL_REST_ENABLED") {
+        if let Some(flag) = read_control_environment(
+            "SCRIPTBOTS_CONTROL_REST_ENABLED",
+            &mut config.environment_errors,
+        ) {
             match flag.trim().to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "on" => config.rest_enabled = true,
                 "0" | "false" | "no" | "off" => config.rest_enabled = false,
-                other => warn!(
-                    value = %other,
-                    "unrecognized SCRIPTBOTS_CONTROL_REST_ENABLED; keeping default"
-                ),
+                other => config.environment_errors.push(format!(
+                    "SCRIPTBOTS_CONTROL_REST_ENABLED={other:?} must be one of true/false, yes/no, on/off, or 1/0"
+                )),
             }
         }
 
         let mut http_override = None;
-        if let Ok(addr) = env::var("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR") {
+        if let Some(addr) = read_control_environment(
+            "SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR",
+            &mut config.environment_errors,
+        ) {
             match parse_mcp_socket_addr(&addr) {
                 Some(parsed) => http_override = Some(parsed),
-                None => warn!(%addr, "invalid SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR; ignoring override"),
+                None if is_https_url(&addr) => config.environment_errors.push(format!(
+                    "SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR={addr:?} requests TLS, but the ScriptBots MCP server is plaintext HTTP; use http:// or a bare socket address"
+                )),
+                None => config.environment_errors.push(format!(
+                    "SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR={addr:?} is not a supported HTTP socket address"
+                )),
             }
         }
 
-        if let Ok(raw) = env::var("SCRIPTBOTS_CONTROL_MCP") {
+        if let Some(raw) =
+            read_control_environment("SCRIPTBOTS_CONTROL_MCP", &mut config.environment_errors)
+        {
             let trimmed = raw.trim();
             match trimmed.to_ascii_lowercase().as_str() {
                 "disabled" | "off" | "false" | "0" => {
                     config.mcp_transport = McpTransportConfig::Disabled;
                 }
                 "http" | "" => {
-                    let bind_address = http_override
-                        .or_else(|| parse_mcp_socket_addr(DEFAULT_MCP_HTTP_ADDR))
-                        .expect("valid default MCP HTTP address");
+                    let bind_address = http_override.unwrap_or(DEFAULT_CONTROL_MCP_HTTP_ADDRESS);
                     config.mcp_transport = McpTransportConfig::Http { bind_address };
                 }
                 _other => {
                     if let Some(addr) = parse_mcp_socket_addr(trimmed) {
                         config.mcp_transport = McpTransportConfig::Http { bind_address: addr };
-                    } else if let Some(addr) = http_override {
-                        warn!(value = %raw, fallback = %addr, "could not parse SCRIPTBOTS_CONTROL_MCP; using HTTP override");
-                        config.mcp_transport = McpTransportConfig::Http { bind_address: addr };
+                    } else if is_https_url(trimmed) {
+                        config.environment_errors.push(format!(
+                            "SCRIPTBOTS_CONTROL_MCP={raw:?} requests TLS, but the ScriptBots MCP server is plaintext HTTP; use http:// or a bare socket address"
+                        ));
                     } else {
-                        warn!(%raw, "unknown MCP transport; disabling MCP server");
-                        config.mcp_transport = McpTransportConfig::Disabled;
+                        config.environment_errors.push(format!(
+                            "SCRIPTBOTS_CONTROL_MCP={raw:?} must be disabled, http, or an HTTP socket address"
+                        ));
                     }
                 }
             }
@@ -146,12 +185,41 @@ impl ControlServerConfig {
 
         config
     }
+
+    /// Build and validate configuration from the process environment.
+    pub fn try_from_env() -> Result<Self> {
+        let config = Self::from_env();
+        config.validate_environment()?;
+        Ok(config)
+    }
+
+    fn validate_environment(&self) -> Result<()> {
+        if self.environment_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "invalid control server environment: {}",
+                self.environment_errors.join("; ")
+            ))
+        }
+    }
+}
+
+fn read_control_environment(name: &str, errors: &mut Vec<String>) -> Option<String> {
+    match env::var(name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            errors.push(format!("{name} is not valid Unicode"));
+            None
+        }
+    }
 }
 
 fn sanitize_swagger_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        return "/docs".to_string();
+        return DEFAULT_CONTROL_SWAGGER_PATH.to_string();
     }
     if trimmed.starts_with('/') {
         trimmed.to_string()
@@ -166,30 +234,35 @@ fn parse_mcp_socket_addr(value: &str) -> Option<SocketAddr> {
         return None;
     }
 
+    if is_https_url(trimmed) {
+        return None;
+    }
+
     if let Ok(addr) = trimmed.parse::<SocketAddr>() {
         return Some(addr);
     }
 
-    let normalized = trimmed
-        .strip_prefix("http://")
-        .or_else(|| trimmed.strip_prefix("https://"))
-        .unwrap_or(trimmed);
+    let normalized = trimmed.strip_prefix("http://").unwrap_or(trimmed);
     let host_port = normalized.split('/').next().unwrap_or(normalized);
     host_port.parse::<SocketAddr>().ok()
+}
+
+fn is_https_url(value: &str) -> bool {
+    value.trim().to_ascii_lowercase().starts_with("https://")
 }
 
 fn parse_id_list(raw: &str) -> Result<Vec<u64>, AppError> {
     let mut ids = Vec::new();
     for part in raw.split(',') {
-        let token = part.trim();
-        if token.is_empty() {
+        let id_text = part.trim();
+        if id_text.is_empty() {
             continue;
         }
-        match token.parse::<u64>() {
+        match id_text.parse::<u64>() {
             Ok(value) => ids.push(value),
             Err(_) => {
                 return Err(AppError::bad_request(format!(
-                    "unable to parse agent id '{token}'"
+                    "unable to parse agent id '{id_text}'"
                 )));
             }
         }
@@ -204,10 +277,85 @@ pub enum McpTransportConfig {
     Http { bind_address: SocketAddr },
 }
 
-impl McpTransportConfig {
-    fn is_enabled(&self) -> bool {
-        !matches!(self, Self::Disabled)
+struct ReservedControlListener {
+    address: SocketAddr,
+    listener: std::net::TcpListener,
+}
+
+/// Transactional socket reservation for the REST and MCP control surfaces.
+///
+/// Preparing a reservation binds every enabled listener before world or
+/// storage construction. Launch consumes those exact listeners, eliminating
+/// check-then-bind races and partial control-plane publication.
+pub struct ControlServerReservation {
+    config: ControlServerConfig,
+    rest: Option<ReservedControlListener>,
+    mcp: Option<ReservedControlListener>,
+}
+
+impl ControlServerReservation {
+    /// Validate configuration and reserve every enabled control socket.
+    pub fn prepare(config: ControlServerConfig) -> Result<Self> {
+        config.validate_environment()?;
+
+        let rest = if config.rest_enabled {
+            Some(reserve_control_listener("REST", config.rest_address)?)
+        } else {
+            None
+        };
+        let mcp = match &config.mcp_transport {
+            McpTransportConfig::Disabled => None,
+            McpTransportConfig::Http { bind_address } => {
+                Some(reserve_control_listener("MCP HTTP", *bind_address)?)
+            }
+        };
+
+        Ok(Self { config, rest, mcp })
     }
+
+    /// Launch the control runtime using the exact listeners reserved earlier.
+    pub fn launch(
+        self,
+        world: SharedWorld,
+    ) -> Result<(ControlRuntime, CommandDrain, CommandSubmit)> {
+        ControlRuntime::launch_reserved_with_timeout(world, self, CONTROL_STARTUP_TIMEOUT)
+    }
+
+    /// Actual REST address, including the assigned port when configured with port zero.
+    #[must_use]
+    pub fn rest_address(&self) -> Option<SocketAddr> {
+        self.rest.as_ref().map(|reserved| reserved.address)
+    }
+
+    /// Actual MCP HTTP address, including the assigned port when configured with port zero.
+    #[must_use]
+    pub fn mcp_http_address(&self) -> Option<SocketAddr> {
+        self.mcp.as_ref().map(|reserved| reserved.address)
+    }
+}
+
+fn reserve_control_listener(name: &str, address: SocketAddr) -> Result<ReservedControlListener> {
+    let listener = std::net::TcpListener::bind(address)
+        .with_context(|| format!("failed to reserve {name} address {address}"))?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("failed to make reserved {name} listener nonblocking"))?;
+    let actual_address = listener
+        .local_addr()
+        .with_context(|| format!("failed to inspect reserved {name} listener"))?;
+    Ok(ReservedControlListener {
+        address: actual_address,
+        listener,
+    })
+}
+
+/// Observable lifecycle state for a running control runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlRuntimeStatus {
+    Starting,
+    Running,
+    Stopped,
+    Failed(String),
 }
 
 /// Runtime guard for background control servers.
@@ -218,57 +366,203 @@ impl McpTransportConfig {
 /// join below would hang forever.
 pub struct ControlRuntime {
     shutdown: watch::Sender<bool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<Result<()>>>,
+    status: watch::Receiver<ControlRuntimeStatus>,
+    #[cfg(test)]
+    _dummy_status_guard: Option<watch::Sender<ControlRuntimeStatus>>,
+}
+
+enum ControlStartupSignal {
+    Ready,
+    Failed(String),
 }
 
 impl ControlRuntime {
-    /// Spawn the control runtime on a dedicated Tokio thread.
+    /// Spawn the control runtime and return only after every enabled listener is bound.
     pub fn launch(
         world: SharedWorld,
         config: ControlServerConfig,
+    ) -> Result<(Self, CommandDrain, CommandSubmit)> {
+        ControlServerReservation::prepare(config)?.launch(world)
+    }
+
+    fn launch_reserved_with_timeout(
+        world: SharedWorld,
+        reservation: ControlServerReservation,
+        startup_timeout: Duration,
     ) -> Result<(Self, CommandDrain, CommandSubmit)> {
         let (command_tx, command_rx) = create_command_bus(32);
         let command_drain = make_command_drain(command_rx);
         let command_submit = make_command_submit(command_tx.clone());
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let shutdown_for_thread = shutdown.clone();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Starting);
+        let status_for_thread = status_tx.clone();
         let handle = ControlHandle::new(world.clone(), command_tx.clone());
 
         let thread = thread::Builder::new()
             .name("scriptbots-control".into())
-            .spawn(move || {
-                match tokio::runtime::Builder::new_multi_thread()
+            .spawn(move || -> Result<()> {
+                let result = match tokio::runtime::Builder::new_multi_thread()
                     .thread_name("scriptbots-control-rt")
                     .enable_all()
                     .build()
                 {
-                    Ok(runtime) => runtime.block_on(async move {
-                        if let Err(err) = run_control_servers(handle, config, shutdown_rx).await {
-                            error!(?err, "control servers terminated with error");
-                        }
-                    }),
-                    Err(err) => error!(?err, "failed to build Tokio runtime for control servers"),
-                }
-            })?;
+                    Ok(runtime) => runtime.block_on(run_control_servers(
+                        handle,
+                        reservation,
+                        shutdown_for_thread,
+                        shutdown_rx,
+                        startup_tx,
+                        status_for_thread.clone(),
+                    )),
+                    Err(source) => {
+                        let error =
+                            anyhow!("failed to build Tokio runtime for control servers: {source}");
+                        let _ = startup_tx.send(ControlStartupSignal::Failed(format!("{error:#}")));
+                        Err(error)
+                    }
+                };
+                publish_control_runtime_result(&status_for_thread, &result);
+                result
+            })
+            .context("failed to spawn control runtime thread")?;
 
-        Ok((
-            Self {
-                shutdown,
-                thread: Some(thread),
+        match startup_rx.recv_timeout(startup_timeout) {
+            Ok(ControlStartupSignal::Ready) => Ok((
+                Self {
+                    shutdown,
+                    thread: Some(thread),
+                    status: status_rx,
+                    #[cfg(test)]
+                    _dummy_status_guard: None,
+                },
+                command_drain,
+                command_submit,
+            )),
+            Ok(ControlStartupSignal::Failed(detail)) => match join_control_thread(thread) {
+                Ok(()) => Err(anyhow!("control server startup failed: {detail}")),
+                Err(error) => {
+                    Err(error).context(format!("control server startup failed: {detail}"))
+                }
             },
-            command_drain,
-            command_submit,
-        ))
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = shutdown.send(true);
+                handoff_control_reaper(thread);
+                Err(anyhow!(
+                    "control servers did not report readiness within {} ms",
+                    startup_timeout.as_millis()
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => match join_control_thread(thread) {
+                Ok(()) => Err(anyhow!(
+                    "control runtime exited before reporting startup readiness"
+                )),
+                Err(error) => {
+                    Err(error).context("control runtime failed before reporting startup readiness")
+                }
+            },
+        }
+    }
+
+    /// Subscribe to prompt runtime termination/failure notifications.
+    #[must_use]
+    pub fn subscribe_status(&self) -> watch::Receiver<ControlRuntimeStatus> {
+        self.status.clone()
+    }
+
+    /// Return the latest runtime lifecycle state without blocking.
+    #[must_use]
+    pub fn status(&self) -> ControlRuntimeStatus {
+        self.status.borrow().clone()
+    }
+
+    /// Check runtime health without blocking or trusting a stale cached status.
+    pub fn health(&self) -> std::result::Result<(), String> {
+        control_runtime_health(&self.status)
+    }
+
+    /// Build an owned, dependency-neutral health callback for UI runtimes.
+    pub fn health_probe(
+        &self,
+    ) -> impl Fn() -> std::result::Result<(), String> + Clone + Send + Sync + 'static {
+        let status = self.status.clone();
+        move || control_runtime_health(&status)
     }
 
     /// Trigger a graceful shutdown and block until the background thread exits.
     pub fn shutdown(mut self) -> Result<()> {
         let _ = self.shutdown.send(true);
         if let Some(handle) = self.thread.take() {
-            handle
-                .join()
-                .map_err(|err| anyhow!("control thread panicked: {err:?}"))?;
+            join_control_thread(handle)?;
         }
         Ok(())
+    }
+}
+
+fn join_control_thread(handle: JoinHandle<Result<()>>) -> Result<()> {
+    handle
+        .join()
+        .map_err(|panic| anyhow!("control thread panicked: {panic:?}"))?
+        .context("control runtime terminated with an error")
+}
+
+fn publish_control_runtime_result(
+    status: &watch::Sender<ControlRuntimeStatus>,
+    result: &Result<()>,
+) {
+    let final_status = match result {
+        Ok(()) => ControlRuntimeStatus::Stopped,
+        Err(error) => ControlRuntimeStatus::Failed(format!("{error:#}")),
+    };
+    status.send_replace(final_status);
+}
+
+fn control_runtime_health(
+    status: &watch::Receiver<ControlRuntimeStatus>,
+) -> std::result::Result<(), String> {
+    let mut probe = status.clone();
+    loop {
+        let cached = probe.borrow_and_update().clone();
+        match &cached {
+            ControlRuntimeStatus::Failed(detail) => return Err(detail.clone()),
+            ControlRuntimeStatus::Stopped => return Err("control runtime stopped".to_string()),
+            ControlRuntimeStatus::Starting | ControlRuntimeStatus::Running => {}
+        }
+
+        match probe.has_changed() {
+            Ok(true) => continue,
+            Err(_) => {
+                return Err(
+                    "control runtime terminated without publishing final status".to_string()
+                );
+            }
+            Ok(false) => {
+                return match cached {
+                    ControlRuntimeStatus::Starting => {
+                        Err("control runtime is still starting".to_string())
+                    }
+                    ControlRuntimeStatus::Running => Ok(()),
+                    ControlRuntimeStatus::Stopped | ControlRuntimeStatus::Failed(_) => {
+                        unreachable!("terminal statuses returned before closure inspection")
+                    }
+                };
+            }
+        }
+    }
+}
+
+fn handoff_control_reaper(handle: JoinHandle<Result<()>>) {
+    if let Err(source) = thread::Builder::new()
+        .name("scriptbots-control-reaper".into())
+        .spawn(move || {
+            if let Err(error) = join_control_thread(handle) {
+                error!(%error, "timed-out control runtime terminated during supervised cleanup");
+            }
+        })
+    {
+        error!(%source, "failed to spawn control runtime cleanup supervisor");
     }
 }
 
@@ -279,9 +573,12 @@ impl ControlRuntime {
         let (command_tx, command_rx) = create_command_bus(4);
         let command_drain = make_command_drain(command_rx);
         let command_submit = make_command_submit(command_tx);
+        let (status_guard, status) = watch::channel(ControlRuntimeStatus::Running);
         let runtime = Self {
             shutdown: watch::channel(false).0,
             thread: None,
+            status,
+            _dummy_status_guard: Some(status_guard),
         };
         (runtime, command_drain, command_submit)
     }
@@ -291,65 +588,216 @@ impl Drop for ControlRuntime {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
         if let Some(handle) = self.thread.take()
-            && let Err(err) = handle.join()
+            && let Err(error) = join_control_thread(handle)
         {
-            error!(?err, "control runtime thread panicked during drop");
+            error!(%error, "control runtime failed during drop");
         }
     }
 }
 
 async fn run_control_servers(
     handle: ControlHandle,
-    config: ControlServerConfig,
-    mut shutdown: watch::Receiver<bool>,
+    reservation: ControlServerReservation,
+    shutdown_signal: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+    startup: mpsc::SyncSender<ControlStartupSignal>,
+    status: watch::Sender<ControlRuntimeStatus>,
 ) -> Result<()> {
-    let mut rest_handle = None;
-    let mut mcp_handle = None;
+    let mut servers = match start_control_servers(handle, reservation, shutdown.clone()).await {
+        Ok(servers) => servers,
+        Err(error) => {
+            let _ = startup.send(ControlStartupSignal::Failed(format!("{error:#}")));
+            return Err(error);
+        }
+    };
 
-    if config.rest_enabled {
-        let rest_handle_clone = handle.clone();
-        let rest_shutdown = shutdown.clone();
-        let rest_config = config.clone();
-        rest_handle = Some(tokio::spawn(async move {
-            if let Err(err) = run_rest_server(rest_handle_clone, &rest_config, rest_shutdown).await
-            {
-                error!(?err, "REST control server exited unexpectedly");
+    status.send_replace(ControlRuntimeStatus::Running);
+    if startup.send(ControlStartupSignal::Ready).is_err() {
+        let _ = shutdown_signal.send(true);
+        return servers
+            .shutdown()
+            .await
+            .context("startup receiver disappeared before control servers were published");
+    }
+
+    servers.supervise(&shutdown_signal, shutdown, &status).await
+}
+
+struct PreparedRestServer {
+    address: SocketAddr,
+    listener: tokio::net::TcpListener,
+    router: Router,
+}
+
+struct PreparedMcpServer {
+    address: SocketAddr,
+    listener: tokio::net::TcpListener,
+    router: Router,
+}
+
+type ControlServerTask = tokio::task::JoinHandle<Result<()>>;
+type JoinedControlServer = std::result::Result<Result<()>, tokio::task::JoinError>;
+
+struct RunningControlServers {
+    rest: Option<ControlServerTask>,
+    mcp: Option<ControlServerTask>,
+}
+
+enum ControlServerExit {
+    Rest(JoinedControlServer),
+    Mcp(JoinedControlServer),
+}
+
+enum SupervisionOutcome {
+    Shutdown,
+    ServerExit(ControlServerExit),
+}
+
+impl RunningControlServers {
+    async fn supervise(
+        &mut self,
+        shutdown_signal: &watch::Sender<bool>,
+        mut shutdown: watch::Receiver<bool>,
+        status: &watch::Sender<ControlRuntimeStatus>,
+    ) -> Result<()> {
+        // Prefer an already-observed shutdown over a simultaneous successful
+        // task completion. Otherwise a normal graceful exit can be mislabeled
+        // as an unexpected server death.
+        let outcome = match (self.rest.as_mut(), self.mcp.as_mut()) {
+            (Some(rest), Some(mcp)) => tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => SupervisionOutcome::Shutdown,
+                result = rest => SupervisionOutcome::ServerExit(ControlServerExit::Rest(result)),
+                result = mcp => SupervisionOutcome::ServerExit(ControlServerExit::Mcp(result)),
+            },
+            (Some(rest), None) => tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => SupervisionOutcome::Shutdown,
+                result = rest => SupervisionOutcome::ServerExit(ControlServerExit::Rest(result)),
+            },
+            (None, Some(mcp)) => tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => SupervisionOutcome::Shutdown,
+                result = mcp => SupervisionOutcome::ServerExit(ControlServerExit::Mcp(result)),
+            },
+            (None, None) => {
+                let _ = shutdown.wait_for(|stop| *stop).await;
+                SupervisionOutcome::Shutdown
             }
-        }));
-    } else {
-        info!("REST control server disabled via configuration");
-    }
+        };
 
-    if config.mcp_transport.is_enabled() {
-        let mcp_handle_clone = handle.clone();
-        let transport = config.mcp_transport.clone();
-        let mcp_shutdown = shutdown.clone();
-        mcp_handle = Some(tokio::spawn(async move {
-            if let Err(err) = run_mcp_server(mcp_handle_clone, transport, mcp_shutdown).await {
-                error!(?err, "MCP server exited unexpectedly");
+        match outcome {
+            SupervisionOutcome::Shutdown => self.shutdown().await,
+            SupervisionOutcome::ServerExit(exit) => {
+                let primary = self.take_unexpected_exit(exit);
+                status.send_replace(ControlRuntimeStatus::Failed(format!("{primary:#}")));
+                let _ = shutdown_signal.send(true);
+                match self.shutdown().await {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(primary)
+                        .context(format!("control sibling shutdown also failed: {cleanup:#}")),
+                }
             }
-        }));
-    } else {
-        info!("MCP control server disabled via configuration");
+        }
     }
 
-    // wait_for returns immediately if the flag is already true, and treats a
-    // dropped sender as shutdown, so a pre-startup shutdown cannot be lost.
-    let _ = shutdown.wait_for(|stop| *stop).await;
-
-    if let Some(handle) = rest_handle
-        && let Err(err) = handle.await
-    {
-        error!(?err, "failed to await REST control server task");
+    fn take_unexpected_exit(&mut self, exit: ControlServerExit) -> anyhow::Error {
+        match exit {
+            ControlServerExit::Rest(result) => {
+                self.rest = None;
+                unexpected_server_exit("REST", result)
+            }
+            ControlServerExit::Mcp(result) => {
+                self.mcp = None;
+                unexpected_server_exit("MCP HTTP", result)
+            }
+        }
     }
 
-    if let Some(handle) = mcp_handle
-        && let Err(err) = handle.await
-    {
-        error!(?err, "MCP server task join error");
-    }
+    async fn shutdown(&mut self) -> Result<()> {
+        let rest = self.rest.take();
+        let mcp = self.mcp.take();
+        let (rest_result, mcp_result) = tokio::join!(
+            await_control_server_shutdown("REST", rest),
+            await_control_server_shutdown("MCP HTTP", mcp),
+        );
 
-    Ok(())
+        match (rest_result, mcp_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(rest_error), Err(mcp_error)) => {
+                Err(rest_error).context(format!("MCP HTTP shutdown also failed: {mcp_error:#}"))
+            }
+        }
+    }
+}
+
+fn unexpected_server_exit(name: &str, result: JoinedControlServer) -> anyhow::Error {
+    match result {
+        Ok(Ok(())) => anyhow!("{name} control server stopped unexpectedly"),
+        Ok(Err(error)) => error.context(format!("{name} control server terminated unexpectedly")),
+        Err(error) => anyhow!("{name} control server task failed: {error}"),
+    }
+}
+
+async fn await_control_server_shutdown(name: &str, task: Option<ControlServerTask>) -> Result<()> {
+    let Some(mut task) = task else {
+        return Ok(());
+    };
+
+    match tokio::time::timeout(CONTROL_SHUTDOWN_TIMEOUT, &mut task).await {
+        Ok(joined) => joined
+            .with_context(|| format!("{name} control server task panicked"))?
+            .with_context(|| format!("{name} control server terminated with an error")),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(anyhow!(
+                "{name} control server did not stop within {} ms",
+                CONTROL_SHUTDOWN_TIMEOUT.as_millis()
+            ))
+        }
+    }
+}
+
+async fn start_control_servers(
+    handle: ControlHandle,
+    reservation: ControlServerReservation,
+    shutdown: watch::Receiver<bool>,
+) -> Result<RunningControlServers> {
+    let ControlServerReservation {
+        config,
+        rest: reserved_rest,
+        mcp: reserved_mcp,
+    } = reservation;
+
+    let prepared_rest = match reserved_rest {
+        Some(reserved) => Some(prepare_rest_server(handle.clone(), &config, reserved)?),
+        None => {
+            info!("REST control server disabled via configuration");
+            None
+        }
+    };
+
+    // Every enabled socket was bound transactionally before this runtime and
+    // its world existed. Build both routers before publishing either task.
+    let prepared_mcp = match reserved_mcp {
+        None => {
+            info!("MCP control server disabled via configuration");
+            None
+        }
+        Some(reserved) => Some(prepare_mcp_server(handle, reserved).await?),
+    };
+
+    let rest = prepared_rest.map(|prepared| {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { serve_prepared_rest_server(prepared, shutdown).await })
+    });
+    let mcp = prepared_mcp.map(|prepared| {
+        tokio::spawn(async move { serve_prepared_mcp_server(prepared, shutdown).await })
+    });
+
+    Ok(RunningControlServers { rest, mcp })
 }
 
 #[derive(Clone)]
@@ -986,13 +1434,12 @@ async fn apply_preset(
     Ok(Json(snapshot))
 }
 
-async fn run_rest_server(
+fn prepare_rest_server(
     handle: ControlHandle,
     config: &ControlServerConfig,
-    shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+    reserved: ReservedControlListener,
+) -> Result<PreparedRestServer> {
     let state = ApiState { handle };
-    let swagger_path_static: &'static str = Box::leak(config.swagger_path.clone().into_boxed_str());
     let mut openapi = ApiDoc::openapi();
     openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
 
@@ -1019,20 +1466,29 @@ async fn run_rest_server(
         .route("/api/config/audit", get(get_config_audit))
         .with_state(state);
 
-    let swagger_router: Router<_> = SwaggerUi::new(swagger_path_static)
+    let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
         .url("/api-docs/openapi.json", openapi)
         .into();
 
-    let app = Router::new().merge(api_router).merge(swagger_router);
+    let router = Router::new().merge(api_router).merge(swagger_router);
 
-    let listener = tokio::net::TcpListener::bind(config.rest_address)
-        .await
-        .with_context(|| format!("failed to bind REST address {}", config.rest_address))?;
+    let listener = tokio::net::TcpListener::from_std(reserved.listener)
+        .context("failed to adopt reserved REST listener")?;
 
-    info!(address = %config.rest_address, "REST control server listening");
+    Ok(PreparedRestServer {
+        address: reserved.address,
+        listener,
+        router,
+    })
+}
 
+async fn serve_prepared_rest_server(
+    prepared: PreparedRestServer,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    info!(address = %prepared.address, "REST control server listening");
     let mut shutdown_signal = shutdown.clone();
-    axum::serve(listener, app)
+    axum::serve(prepared.listener, prepared.router)
         .with_graceful_shutdown(async move {
             let _ = shutdown_signal.wait_for(|stop| *stop).await;
         })
@@ -1040,144 +1496,137 @@ async fn run_rest_server(
         .context("REST control server errored")
 }
 
-async fn run_mcp_server(
+async fn prepare_mcp_server(
     handle: ControlHandle,
-    transport: McpTransportConfig,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    match transport {
-        McpTransportConfig::Disabled => Ok(()),
-        McpTransportConfig::Http { bind_address } => {
-            info!(address = %bind_address, "Starting MCP HTTP server");
-            let mut http_server = HttpMcpServer::new(
-                "scriptbots-control".to_string(),
-                env!("CARGO_PKG_VERSION").to_string(),
-            );
+    reserved: ReservedControlListener,
+) -> Result<PreparedMcpServer> {
+    info!(address = %reserved.address, "Preparing MCP HTTP server");
+    let server = Arc::new(McpServer::new(
+        "scriptbots-control".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    ));
 
-            let server_arc = http_server.server().await;
-            register_tool(
-                server_arc.clone(),
-                "list_presets",
-                "List available scenario presets",
-                json!({"type": "object", "additionalProperties": false}),
-                ControlToolKind::ListPresets,
-                handle.clone(),
-            )
-            .await
-            .map_err(|err| anyhow!("failed to register list_presets tool: {err}"))?;
+    register_tool(
+        Arc::clone(&server),
+        "list_presets",
+        "List available scenario presets",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::ListPresets,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register list_presets tool: {err}"))?;
 
-            register_tool(
-                server_arc.clone(),
-                "apply_preset",
-                "Apply a named scenario preset",
-                json!({
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}},
-                    "required": ["name"],
-                    "additionalProperties": false
-                }),
-                ControlToolKind::ApplyPreset,
-                handle.clone(),
-            )
-            .await
-            .map_err(|err| anyhow!("failed to register apply_preset tool: {err}"))?;
+    register_tool(
+        Arc::clone(&server),
+        "apply_preset",
+        "Apply a named scenario preset",
+        json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ApplyPreset,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register apply_preset tool: {err}"))?;
 
-            register_tool(
-                server_arc.clone(),
-                "list_knobs",
-                "List all exposed configuration knobs",
-                json!({"type": "object", "additionalProperties": false}),
-                ControlToolKind::ListKnobs,
-                handle.clone(),
-            )
-            .await
-            .map_err(|err| anyhow!("failed to register list_knobs tool: {err}"))?;
+    register_tool(
+        Arc::clone(&server),
+        "list_knobs",
+        "List all exposed configuration knobs",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::ListKnobs,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register list_knobs tool: {err}"))?;
 
-            register_tool(
-                server_arc.clone(),
-                "get_config",
-                "Fetch the entire simulation configuration",
-                json!({"type": "object", "additionalProperties": false}),
-                ControlToolKind::GetConfig,
-                handle.clone(),
-            )
-            .await
-            .map_err(|err| anyhow!("failed to register get_config tool: {err}"))?;
+    register_tool(
+        Arc::clone(&server),
+        "get_config",
+        "Fetch the entire simulation configuration",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::GetConfig,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register get_config tool: {err}"))?;
 
-            register_tool(
-                server_arc.clone(),
-                "apply_updates",
-                "Apply one or more knob updates by path",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "updates": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "required": ["path", "value"],
-                                "properties": {
-                                    "path": {"type": "string"},
-                                    "value": {}
-                                },
-                                "additionalProperties": false
-                            }
-                        }
-                    },
-                    "required": ["updates"],
-                    "additionalProperties": false
-                }),
-                ControlToolKind::ApplyUpdates,
-                handle.clone(),
-            )
-            .await
-            .map_err(|err| anyhow!("failed to register apply_updates tool: {err}"))?;
+    register_tool(
+        Arc::clone(&server),
+        "apply_updates",
+        "Apply one or more knob updates by path",
+        json!({
+            "type": "object",
+            "properties": {
+                "updates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["path", "value"],
+                        "properties": {
+                            "path": {"type": "string"},
+                            "value": {}
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["updates"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ApplyUpdates,
+        handle.clone(),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register apply_updates tool: {err}"))?;
 
-            register_tool(
-                server_arc,
-                "apply_patch",
-                "Merge a JSON object patch into the configuration",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "patch": {"type": "object"}
-                    },
-                    "required": ["patch"],
-                    "additionalProperties": false
-                }),
-                ControlToolKind::ApplyPatch,
-                handle,
-            )
-            .await
-            .map_err(|err| anyhow!("failed to register apply_patch tool: {err}"))?;
+    register_tool(
+        Arc::clone(&server),
+        "apply_patch",
+        "Merge a JSON object patch into the configuration",
+        json!({
+            "type": "object",
+            "properties": {
+                "patch": {"type": "object"}
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ApplyPatch,
+        handle,
+    )
+    .await
+    .map_err(|err| anyhow!("failed to register apply_patch tool: {err}"))?;
 
-            let transport = HttpServerTransport::new(bind_address.to_string());
-            http_server
-                .start(transport)
-                .await
-                .context("failed to start MCP HTTP server")?;
+    let router = Router::new()
+        .route("/mcp", post(handle_mcp_http_request))
+        .route("/mcp/notify", post(handle_mcp_http_notification))
+        .route("/mcp/events", get(handle_mcp_http_events))
+        .route("/health", get(handle_mcp_http_health))
+        .with_state(server);
+    let listener = tokio::net::TcpListener::from_std(reserved.listener)
+        .context("failed to adopt reserved MCP HTTP listener")?;
 
-            info!(address = %bind_address, "MCP HTTP server listening");
-            let _ = shutdown.wait_for(|stop| *stop).await;
-            http_server
-                .stop()
-                .await
-                .context("failed to stop MCP HTTP server")?;
-            Ok(())
-        }
-    }
+    Ok(PreparedMcpServer {
+        address: reserved.address,
+        listener,
+        router,
+    })
 }
 
 async fn register_tool(
-    server: Arc<Mutex<McpServer>>,
+    server: Arc<McpServer>,
     name: &str,
     description: &str,
     schema: Value,
     kind: ControlToolKind,
     handle: ControlHandle,
 ) -> McpResult<()> {
-    let guard = server.lock().await;
-    guard
+    server
         .add_tool(
             name.to_string(),
             Some(description.to_string()),
@@ -1185,6 +1634,81 @@ async fn register_tool(
             ControlTool { handle, kind },
         )
         .await
+}
+
+async fn handle_mcp_http_request(
+    State(server): State<Arc<McpServer>>,
+    Json(request): Json<JsonRpcRequest>,
+) -> Json<JsonRpcMessage> {
+    let request_id = request.id.clone();
+    match server.handle_request(request).await {
+        Ok(response) => Json(normalize_mcp_http_response(response)),
+        Err(error) => Json(JsonRpcMessage::Error(JsonRpcError::error(
+            request_id,
+            error_codes::INTERNAL_ERROR,
+            error.to_string(),
+            None,
+        ))),
+    }
+}
+
+fn normalize_mcp_http_response(response: JsonRpcResponse) -> JsonRpcMessage {
+    let protocol_error = response.result.as_ref().and_then(|result| {
+        let result = result.as_object()?;
+        if result.len() != 1 {
+            return None;
+        }
+        let error = result.get("error")?.as_object()?;
+        let code = error
+            .get("code")?
+            .as_i64()
+            .and_then(|code| i32::try_from(code).ok())?;
+        let message = error.get("message")?.as_str()?.to_string();
+        let data = error.get("data").cloned();
+        Some((code, message, data))
+    });
+
+    if let Some((code, message, data)) = protocol_error {
+        JsonRpcMessage::Error(JsonRpcError::error(response.id, code, message, data))
+    } else {
+        JsonRpcMessage::Response(response)
+    }
+}
+
+async fn handle_mcp_http_notification(
+    Json(_notification): Json<JsonRpcNotification>,
+) -> StatusCode {
+    StatusCode::OK
+}
+
+async fn handle_mcp_http_events() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures_util::stream::pending::<Result<Event, Infallible>>();
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("keep-alive"),
+    )
+}
+
+async fn handle_mcp_http_health() -> Json<Value> {
+    Json(json!({
+        "status": "healthy",
+        "transport": "http",
+    }))
+}
+
+async fn serve_prepared_mcp_server(
+    prepared: PreparedMcpServer,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    info!(address = %prepared.address, "MCP HTTP server listening");
+    let mut shutdown_signal = shutdown.clone();
+    axum::serve(prepared.listener, prepared.router)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_signal.wait_for(|stop| *stop).await;
+        })
+        .await
+        .context("MCP HTTP control server errored")
 }
 
 #[derive(Clone)]
@@ -1305,12 +1829,565 @@ fn map_control_error(err: ControlError) -> McpError {
 mod tests {
     use super::*;
     use scriptbots_core::{ScriptBotsConfig, WorldState};
+    use serial_test::serial;
+    use std::{
+        ffi::OsString,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let (sender, receiver) = create_command_bus(2);
         let handle = ControlHandle::new(Arc::new(std::sync::Mutex::new(world)), sender);
         (handle, receiver)
+    }
+
+    fn shared_world() -> SharedWorld {
+        Arc::new(std::sync::Mutex::new(
+            WorldState::new(ScriptBotsConfig::default()).expect("world"),
+        ))
+    }
+
+    fn unused_loopback_address() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve test port");
+        let address = listener.local_addr().expect("reserved test address");
+        drop(listener);
+        address
+    }
+
+    fn two_unused_loopback_addresses() -> (SocketAddr, SocketAddr) {
+        let first = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve first test port");
+        let second = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve second test port");
+        let addresses = (
+            first.local_addr().expect("first test address"),
+            second.local_addr().expect("second test address"),
+        );
+        drop((first, second));
+        addresses
+    }
+
+    fn http_get(address: SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(address).expect("connect HTTP test client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set HTTP test timeout");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write HTTP test request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read HTTP test response");
+        response
+    }
+
+    fn http_post_json(address: SocketAddr, path: &str, body: &Value) -> String {
+        let body = serde_json::to_string(body).expect("serialize HTTP test body");
+        let mut stream = TcpStream::connect(address).expect("connect HTTP test client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set HTTP test timeout");
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write HTTP test request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read HTTP test response");
+        response
+    }
+
+    const CONTROL_ENVIRONMENT_VARIABLES: [&str; 5] = [
+        "SCRIPTBOTS_CONTROL_REST_ADDR",
+        "SCRIPTBOTS_CONTROL_SWAGGER_PATH",
+        "SCRIPTBOTS_CONTROL_REST_ENABLED",
+        "SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR",
+        "SCRIPTBOTS_CONTROL_MCP",
+    ];
+
+    struct ControlEnvironmentGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl ControlEnvironmentGuard {
+        fn cleared() -> Self {
+            let saved = CONTROL_ENVIRONMENT_VARIABLES
+                .into_iter()
+                .map(|name| (name, env::var_os(name)))
+                .collect();
+            for name in CONTROL_ENVIRONMENT_VARIABLES {
+                // SAFETY: serial tests isolate these process-global environment changes.
+                unsafe { env::remove_var(name) };
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for ControlEnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                // SAFETY: serial tests isolate these process-global environment changes.
+                unsafe {
+                    if let Some(value) = value {
+                        env::set_var(name, value);
+                    } else {
+                        env::remove_var(name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn control_defaults_share_one_rest_socket_authority() {
+        let config = ControlServerConfig::default();
+        assert_eq!(config.rest_address, DEFAULT_CONTROL_REST_ADDRESS);
+        assert_eq!(config.swagger_path, DEFAULT_CONTROL_SWAGGER_PATH);
+        assert_eq!(
+            default_control_rest_base_url(),
+            format!("http://{}", config.rest_address)
+        );
+        assert!(matches!(
+            config.mcp_transport,
+            McpTransportConfig::Http { bind_address }
+                if bind_address == DEFAULT_CONTROL_MCP_HTTP_ADDRESS
+        ));
+    }
+
+    #[test]
+    fn mcp_socket_parser_rejects_tls_urls_for_the_plaintext_server() {
+        assert_eq!(
+            parse_mcp_socket_addr("http://127.0.0.1:8090"),
+            Some(DEFAULT_CONTROL_MCP_HTTP_ADDRESS)
+        );
+        assert_eq!(parse_mcp_socket_addr("https://127.0.0.1:8090"), None);
+        assert_eq!(parse_mcp_socket_addr("HTTPS://127.0.0.1:8090"), None);
+    }
+
+    #[test]
+    fn rest_port_conflict_is_reported_before_runtime_publication() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy REST port");
+        let address = occupied.local_addr().expect("occupied REST address");
+        let config = ControlServerConfig {
+            rest_address: address,
+            rest_enabled: true,
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        };
+
+        let error = ControlRuntime::launch(shared_world(), config)
+            .err()
+            .expect("occupied REST address must fail startup");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to reserve REST address"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&address.to_string()), "{rendered}");
+    }
+
+    #[test]
+    fn mcp_port_conflict_is_reported_before_runtime_publication() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy MCP port");
+        let address = occupied.local_addr().expect("occupied MCP address");
+        let config = ControlServerConfig {
+            rest_enabled: false,
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: address,
+            },
+            ..ControlServerConfig::default()
+        };
+
+        let error = ControlRuntime::launch(shared_world(), config)
+            .err()
+            .expect("occupied MCP address must fail startup");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to reserve MCP HTTP address"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&address.to_string()), "{rendered}");
+    }
+
+    #[test]
+    fn second_surface_failure_releases_the_prepared_rest_listener() {
+        let shared_address = unused_loopback_address();
+        let config = ControlServerConfig {
+            rest_address: shared_address,
+            rest_enabled: true,
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: shared_address,
+            },
+            ..ControlServerConfig::default()
+        };
+
+        let error = ControlRuntime::launch(shared_world(), config)
+            .err()
+            .expect("MCP must not share the prepared REST listener");
+        assert!(
+            format!("{error:#}").contains("failed to reserve MCP HTTP address"),
+            "unexpected error: {error:#}"
+        );
+
+        let rebound = TcpListener::bind(shared_address)
+            .expect("failed transactional startup must release the REST listener");
+        drop(rebound);
+    }
+
+    #[test]
+    fn acknowledged_rest_startup_and_shutdown_own_the_listener_exactly_once() {
+        let rest_address = unused_loopback_address();
+        let config = ControlServerConfig {
+            rest_address,
+            rest_enabled: true,
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        };
+
+        let (runtime, _drain, _submit) =
+            ControlRuntime::launch(shared_world(), config).expect("REST startup");
+        let stream = TcpStream::connect(rest_address)
+            .expect("readiness acknowledgement must follow a listening REST socket");
+        drop(stream);
+        assert!(
+            TcpListener::bind(rest_address).is_err(),
+            "live runtime lost exclusive ownership of its listener"
+        );
+
+        runtime.shutdown().expect("acknowledged REST shutdown");
+        let rebound =
+            TcpListener::bind(rest_address).expect("shutdown must release the REST listener");
+        drop(rebound);
+    }
+
+    #[test]
+    fn acknowledged_mcp_startup_and_shutdown_own_the_listener_exactly_once() {
+        let mcp_address = unused_loopback_address();
+        let config = ControlServerConfig {
+            rest_enabled: false,
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: mcp_address,
+            },
+            ..ControlServerConfig::default()
+        };
+        let reservation = ControlServerReservation::prepare(config).expect("MCP reservation");
+        assert_eq!(reservation.mcp_http_address(), Some(mcp_address));
+        assert!(
+            TcpListener::bind(mcp_address).is_err(),
+            "reservation must hold the MCP socket before world construction"
+        );
+
+        let (runtime, _drain, _submit) = reservation.launch(shared_world()).expect("MCP startup");
+        assert_eq!(runtime.status(), ControlRuntimeStatus::Running);
+        let response = http_get(mcp_address, "/health");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"status\":\"healthy\""), "{response}");
+
+        let status = runtime.subscribe_status();
+        runtime.shutdown().expect("acknowledged MCP shutdown");
+        assert_eq!(*status.borrow(), ControlRuntimeStatus::Stopped);
+        let rebound =
+            TcpListener::bind(mcp_address).expect("shutdown must release the MCP listener");
+        drop(rebound);
+    }
+
+    #[test]
+    fn acknowledged_rest_and_mcp_shutdown_release_both_reserved_listeners() {
+        let (rest_address, mcp_address) = two_unused_loopback_addresses();
+        let config = ControlServerConfig {
+            rest_address,
+            rest_enabled: true,
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: mcp_address,
+            },
+            ..ControlServerConfig::default()
+        };
+        let reservation =
+            ControlServerReservation::prepare(config).expect("transactional reservation");
+        assert_eq!(reservation.rest_address(), Some(rest_address));
+        assert_eq!(reservation.mcp_http_address(), Some(mcp_address));
+        assert!(TcpListener::bind(rest_address).is_err());
+        assert!(TcpListener::bind(mcp_address).is_err());
+
+        let (runtime, _drain, _submit) = reservation
+            .launch(shared_world())
+            .expect("REST plus MCP startup");
+        assert!(http_get(rest_address, "/api/knobs").starts_with("HTTP/1.1 200"));
+        assert!(http_get(mcp_address, "/health").starts_with("HTTP/1.1 200"));
+        runtime.shutdown().expect("combined control shutdown");
+
+        let rest = TcpListener::bind(rest_address).expect("REST listener released");
+        let mcp = TcpListener::bind(mcp_address).expect("MCP listener released");
+        drop((rest, mcp));
+    }
+
+    #[test]
+    fn mcp_http_errors_use_the_json_rpc_error_member() {
+        let mcp_address = unused_loopback_address();
+        let config = ControlServerConfig {
+            rest_enabled: false,
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: mcp_address,
+            },
+            ..ControlServerConfig::default()
+        };
+        let (runtime, _drain, _submit) =
+            ControlRuntime::launch(shared_world(), config).expect("MCP startup");
+
+        let response = http_post_json(
+            mcp_address,
+            "/mcp",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "scriptbots/definitely-unknown",
+                "params": {},
+            }),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response contains a body delimiter");
+        let message: Value = serde_json::from_str(body).expect("JSON-RPC response body");
+        assert_eq!(message["id"], json!(41));
+        assert!(message.get("error").is_some(), "{message}");
+        assert!(message.get("result").is_none(), "{message}");
+
+        runtime.shutdown().expect("MCP shutdown");
+    }
+
+    #[tokio::test]
+    async fn post_ready_rest_failure_stops_mcp_and_publishes_the_root_error() {
+        let rest_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("REST fixture");
+        let rest_address = rest_listener.local_addr().expect("REST fixture address");
+        let mcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("MCP fixture");
+        let mcp_address = mcp_listener.local_addr().expect("MCP fixture address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel::<()>();
+        let sibling_stopped = Arc::new(AtomicBool::new(false));
+
+        let rest: ControlServerTask = tokio::spawn(async move {
+            let _listener = rest_listener;
+            trigger_rx
+                .await
+                .context("REST failure trigger disappeared")?;
+            Err(anyhow!("injected REST serve failure"))
+        });
+        let stopped = Arc::clone(&sibling_stopped);
+        let mut mcp_shutdown = shutdown_rx.clone();
+        let mcp: ControlServerTask = tokio::spawn(async move {
+            let _listener = mcp_listener;
+            let _ = mcp_shutdown.wait_for(|stop| *stop).await;
+            stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let mut servers = RunningControlServers {
+            rest: Some(rest),
+            mcp: Some(mcp),
+        };
+        let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Running);
+
+        let trigger = async move {
+            tokio::task::yield_now().await;
+            trigger_tx.send(()).expect("deliver REST failure");
+        };
+        let (result, ()) = tokio::join!(
+            servers.supervise(&shutdown_tx, shutdown_rx, &status_tx),
+            trigger,
+        );
+        let error = result.expect_err("post-ready REST failure must terminate supervision");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("injected REST serve failure"),
+            "{rendered}"
+        );
+        assert!(sibling_stopped.load(Ordering::SeqCst));
+        assert!(matches!(
+            status_rx.borrow().clone(),
+            ControlRuntimeStatus::Failed(detail)
+                if detail.contains("injected REST serve failure")
+        ));
+
+        let rest = TcpListener::bind(rest_address).expect("failed REST task released its port");
+        let mcp = TcpListener::bind(mcp_address).expect("stopped MCP sibling released its port");
+        drop((rest, mcp));
+    }
+
+    #[tokio::test]
+    async fn post_ready_mcp_success_is_an_error_and_stops_rest() {
+        let rest_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("REST fixture");
+        let rest_address = rest_listener.local_addr().expect("REST fixture address");
+        let mcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("MCP fixture");
+        let mcp_address = mcp_listener.local_addr().expect("MCP fixture address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel::<()>();
+        let sibling_stopped = Arc::new(AtomicBool::new(false));
+
+        let stopped = Arc::clone(&sibling_stopped);
+        let mut rest_shutdown = shutdown_rx.clone();
+        let rest: ControlServerTask = tokio::spawn(async move {
+            let _listener = rest_listener;
+            let _ = rest_shutdown.wait_for(|stop| *stop).await;
+            stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let mcp: ControlServerTask = tokio::spawn(async move {
+            let _listener = mcp_listener;
+            trigger_rx
+                .await
+                .context("MCP completion trigger disappeared")?;
+            Ok(())
+        });
+        let mut servers = RunningControlServers {
+            rest: Some(rest),
+            mcp: Some(mcp),
+        };
+        let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Running);
+
+        let trigger = async move {
+            tokio::task::yield_now().await;
+            trigger_tx.send(()).expect("deliver MCP completion");
+        };
+        let (result, ()) = tokio::join!(
+            servers.supervise(&shutdown_tx, shutdown_rx, &status_tx),
+            trigger,
+        );
+        let error = result.expect_err("post-ready MCP completion must terminate supervision");
+        assert_eq!(
+            error.to_string(),
+            "MCP HTTP control server stopped unexpectedly"
+        );
+        assert!(sibling_stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            status_rx.borrow().clone(),
+            ControlRuntimeStatus::Failed(
+                "MCP HTTP control server stopped unexpectedly".to_string()
+            )
+        );
+
+        let rest = TcpListener::bind(rest_address).expect("stopped REST sibling released its port");
+        let mcp = TcpListener::bind(mcp_address).expect("completed MCP task released its port");
+        drop((rest, mcp));
+    }
+
+    #[test]
+    fn disabled_control_surfaces_still_have_a_safe_runtime_lifecycle() {
+        let config = ControlServerConfig {
+            rest_enabled: false,
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        };
+        let (runtime, _drain, _submit) =
+            ControlRuntime::launch(shared_world(), config).expect("disabled runtime startup");
+        runtime.shutdown().expect("disabled runtime shutdown");
+    }
+
+    #[test]
+    fn health_rejects_a_closed_channel_with_a_stale_live_status() {
+        for cached in [
+            ControlRuntimeStatus::Starting,
+            ControlRuntimeStatus::Running,
+        ] {
+            let (status_tx, status_rx) = watch::channel(cached);
+            drop(status_tx);
+            assert_eq!(
+                control_runtime_health(&status_rx),
+                Err("control runtime terminated without publishing final status".to_string())
+            );
+        }
+
+        let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Starting);
+        status_tx.send_replace(ControlRuntimeStatus::Running);
+        drop(status_tx);
+        assert_eq!(
+            control_runtime_health(&status_rx),
+            Err("control runtime terminated without publishing final status".to_string())
+        );
+
+        let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Failed(
+            "published root failure".to_string(),
+        ));
+        drop(status_tx);
+        assert_eq!(
+            control_runtime_health(&status_rx),
+            Err("published root failure".to_string())
+        );
+
+        let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Running);
+        status_tx.send_replace(ControlRuntimeStatus::Failed(
+            "late published root failure".to_string(),
+        ));
+        drop(status_tx);
+        assert_eq!(
+            control_runtime_health(&status_rx),
+            Err("late published root failure".to_string())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn invalid_control_environment_is_actionable_before_socket_reservation() {
+        let _guard = ControlEnvironmentGuard::cleared();
+        // SAFETY: this serial test owns the control environment variables.
+        unsafe { env::set_var("SCRIPTBOTS_CONTROL_REST_ADDR", "definitely-not-a-socket") };
+
+        let error = ControlServerConfig::try_from_env()
+            .expect_err("invalid REST environment must fail configuration");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("SCRIPTBOTS_CONTROL_REST_ADDR"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("not a socket address"), "{rendered}");
+
+        let captured = ControlServerConfig::from_env();
+        let error = ControlServerReservation::prepare(captured)
+            .err()
+            .expect("legacy constructor must still fail at the reservation boundary");
+        assert!(
+            format!("{error:#}").contains("SCRIPTBOTS_CONTROL_REST_ADDR"),
+            "{error:#}"
+        );
+
+        // SAFETY: this serial test owns the control environment variables.
+        unsafe {
+            env::remove_var("SCRIPTBOTS_CONTROL_REST_ADDR");
+            env::set_var("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "https://127.0.0.1:8090");
+        }
+        let error = ControlServerConfig::try_from_env()
+            .expect_err("TLS URL must fail for the plaintext MCP server");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("requests TLS"), "{rendered}");
+        assert!(rendered.contains("plaintext HTTP"), "{rendered}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn non_unicode_control_environment_is_actionable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = ControlEnvironmentGuard::cleared();
+        // SAFETY: this serial test owns the control environment variables.
+        unsafe {
+            env::set_var(
+                "SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR",
+                OsString::from_vec(vec![0xff]),
+            )
+        };
+
+        let error = ControlServerConfig::try_from_env()
+            .expect_err("non-Unicode MCP address must fail configuration");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR is not valid Unicode"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

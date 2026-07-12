@@ -3,7 +3,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    CharacterizationTraceV0, ControlRuntime, ControlServerConfig, ScenarioIdentityV0,
+    CharacterizationTraceV0, ControlServerConfig, ControlServerReservation, ScenarioIdentityV0,
     SharedAnalytics, SharedWorld,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
@@ -40,6 +40,8 @@ use tracing::{debug, info, warn};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+const DEFAULT_BOOTSTRAP_TICKS: u64 = 120;
+
 fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
@@ -65,6 +67,23 @@ fn main() -> Result<()> {
         run_characterization_v0(&cli, config, ticks)?;
         return Ok(());
     }
+
+    // Validate any path that will eventually create a world/storage runtime
+    // before configuration writes, auto-tuning sweeps, thread-priority
+    // changes, or database reservation. Explicitly non-interactive commands
+    // do not need a renderer and retain their independent contracts.
+    let storage_owning_startup = storage_owning_startup_requested(&cli);
+    let resolved_renderer = if storage_owning_startup {
+        preflight_renderer_startup(&cli)?
+    } else {
+        None
+    };
+    let control_reservation = if resolved_renderer.is_some() {
+        let control_config = ControlServerConfig::try_from_env()?;
+        Some(ControlServerReservation::prepare(control_config)?)
+    } else {
+        None
+    };
 
     if let Some(outcome) = maybe_emit_config(&cli, &config)?
         && matches!(outcome, ConfigEmitOutcome::Exit)
@@ -98,6 +117,10 @@ fn main() -> Result<()> {
     if let Some(ticks) = cli.profile_sweep {
         run_profile_sweep(&config, ticks, &cli)?;
         return Ok(());
+    }
+
+    if !storage_owning_startup {
+        bail!("internal error: non-interactive command reached runtime startup");
     }
 
     // Auto-tune: run a quick sweep for the chosen storage mode, apply best settings, then continue.
@@ -173,23 +196,8 @@ fn main() -> Result<()> {
             std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
         }
     }
-    // Prefer terminal renderer in low-power auto mode unless FORCE_GUI is explicitly set
-    if cli.low_power
-        && matches!(cli.mode, RendererMode::Auto)
-        && !matches!(
-            env::var("SCRIPTBOTS_FORCE_GUI")
-                .ok()
-                .and_then(|v| parse_bool(&v)),
-            Some(true)
-        )
-    {
-        unsafe {
-            std::env::set_var("SCRIPTBOTS_FORCE_TERMINAL", "1");
-        }
-    }
-
     let (world, analytics, mut storage_pipeline) =
-        bootstrap_world(config, cli.storage, thresholds)?;
+        bootstrap_world(config, cli.storage, thresholds, cli.bootstrap_ticks)?;
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
     // finalized and the worker is acknowledged before this function returns.
@@ -265,12 +273,14 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        // Resolve first so a future fallible renderer probe cannot strand a
-        // control runtime that has already started.
-        let (active_mode, renderer) = resolve_renderer(cli.mode)?;
-        let control_config = ControlServerConfig::from_env();
+        let (active_mode, renderer) = resolved_renderer.ok_or_else(|| {
+            anyhow::anyhow!("interactive renderer was not resolved before startup")
+        })?;
+        let control_reservation = control_reservation.ok_or_else(|| {
+            anyhow::anyhow!("control listeners were not reserved before runtime startup")
+        })?;
         let (control_runtime, command_drain, command_submit) =
-            ControlRuntime::launch(world.clone(), control_config)?;
+            control_reservation.launch(world.clone())?;
         info!(
             requested_mode = cli.mode.as_str(),
             active_mode = active_mode.as_str(),
@@ -788,6 +798,7 @@ fn bootstrap_world(
     config: ScriptBotsConfig,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
+    bootstrap_ticks: u64,
 ) -> Result<(SharedWorld, SharedAnalytics, StoragePipeline)> {
     #[cfg(feature = "neuro")]
     let _ = validated_neuroflow_config(&config)?;
@@ -844,7 +855,7 @@ fn bootstrap_world(
         let brain_keys = install_brains(&mut world)?;
         seed_agents(&mut world, &brain_keys)?;
 
-        for _ in 0..120 {
+        for _ in 0..bootstrap_ticks {
             world.step()?;
         }
 
@@ -855,8 +866,11 @@ fn bootstrap_world(
                 births = summary.births,
                 deaths = summary.deaths,
                 avg_energy = summary.average_energy,
+                bootstrap_ticks,
                 "Primed world and persisted initial summary",
             );
+        } else if bootstrap_ticks == 0 {
+            info!("Initialized seeded world at tick zero without bootstrap advancement");
         } else {
             warn!("World bootstrap completed without persistence summaries");
         }
@@ -943,7 +957,7 @@ fn maybe_emit_config(cli: &AppCli, config: &ScriptBotsConfig) -> Result<Option<C
     about = "ScriptBots simulation shell"
 )]
 struct AppCli {
-    /// Rendering mode for the simulation shell (auto detects GPUI fallback).
+    /// Rendering mode (auto selects only compiled backends and otherwise uses the terminal).
     #[arg(
         long,
         value_enum,
@@ -963,6 +977,14 @@ struct AppCli {
     /// RNG seed override for deterministic runs.
     #[arg(long = "rng-seed", value_name = "SEED", env = "SCRIPTBOTS_RNG_SEED")]
     rng_seed: Option<u64>,
+    /// Explicit number of simulation ticks to run before launching the selected frontend.
+    #[arg(
+        long = "bootstrap-ticks",
+        value_name = "TICKS",
+        env = "SCRIPTBOTS_BOOTSTRAP_TICKS",
+        default_value_t = DEFAULT_BOOTSTRAP_TICKS
+    )]
+    bootstrap_ticks: u64,
     /// Path to a FrankenSQLite run to verify via headless deterministic replay.
     #[arg(long = "replay-db", value_name = "FILE", env = "SCRIPTBOTS_REPLAY_DB")]
     replay_db: Option<PathBuf>,
@@ -1143,6 +1165,39 @@ fn merge_layer(base: &mut JsonValue, layer: JsonValue) {
     }
 }
 
+fn snapshot_exit_requested(cli: &AppCli) -> bool {
+    if cli.dump_png.is_some() {
+        return true;
+    }
+    #[cfg(feature = "bevy_render")]
+    if cli.dump_bevy_png.is_some() {
+        return true;
+    }
+    false
+}
+
+fn storage_owning_startup_requested(cli: &AppCli) -> bool {
+    !cli.config_only
+        && cli.replay_db.is_none()
+        && cli.det_check.is_none()
+        && cli.profile_steps.is_none()
+        && cli.profile_storage_steps.is_none()
+        && cli.profile_sweep.is_none()
+}
+
+fn preflight_renderer_startup(cli: &AppCli) -> Result<Option<(RendererMode, Box<dyn Renderer>)>> {
+    #[cfg(not(feature = "gui"))]
+    if cli.dump_png.is_some() {
+        bail!("--dump-png requires GUI feature; recompile with --features gui");
+    }
+
+    if snapshot_exit_requested(cli) {
+        Ok(None)
+    } else {
+        resolve_renderer(cli.mode, cli.low_power).map(Some)
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum RendererMode {
     Auto,
@@ -1168,95 +1223,304 @@ impl fmt::Display for RendererMode {
     }
 }
 
-fn resolve_renderer(mode: RendererMode) -> Result<(RendererMode, Box<dyn Renderer>)> {
-    match mode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RendererAvailability {
+    gui: bool,
+    bevy: bool,
+}
+
+impl RendererAvailability {
+    const fn compiled() -> Self {
+        Self {
+            gui: cfg!(feature = "gui"),
+            bevy: cfg!(feature = "bevy_render"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RendererEnvironment {
+    force_terminal: bool,
+    force_gui: bool,
+    graphical_session: bool,
+}
+
+impl RendererEnvironment {
+    fn from_process(prefer_terminal: bool) -> Result<Self> {
+        let force_terminal = renderer_env_flag("SCRIPTBOTS_FORCE_TERMINAL")?;
+        let force_gui = renderer_env_flag("SCRIPTBOTS_FORCE_GUI")?;
+        Ok(Self {
+            force_terminal: force_terminal || (prefer_terminal && !force_gui),
+            force_gui,
+            graphical_session: native_graphical_session_available(),
+        })
+    }
+}
+
+fn renderer_env_flag(name: &'static str) -> Result<bool> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .with_context(|| format!("{name} is not valid Unicode"))?;
+    parse_bool(value).with_context(|| {
+        format!("{name} must be one of true/false, yes/no, on/off, or 1/0; got {value:?}")
+    })
+}
+
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+fn native_graphical_session_available() -> bool {
+    display_environment_available(env::var_os("DISPLAY"), env::var_os("WAYLAND_DISPLAY"))
+}
+
+#[cfg(any(test, all(target_family = "unix", not(target_os = "macos"))))]
+fn display_environment_available(
+    display: Option<std::ffi::OsString>,
+    wayland_display: Option<std::ffi::OsString>,
+) -> bool {
+    [display, wayland_display]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn native_graphical_session_available() -> bool {
+    let remote_shell = remote_shell_session_detected([
+        env::var_os("SSH_CONNECTION"),
+        env::var_os("SSH_CLIENT"),
+        env::var_os("SSH_TTY"),
+    ]);
+    macos_auto_graphical_session_available(
+        macos_graphical_session::quartz_session_available(),
+        remote_shell,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn remote_shell_session_detected(values: [Option<std::ffi::OsString>; 3]) -> bool {
+    values.into_iter().flatten().any(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+const fn macos_auto_graphical_session_available(
+    quartz_session_available: bool,
+    remote_shell: bool,
+) -> bool {
+    quartz_session_available && !remote_shell
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos_graphical_session {
+    use std::ffi::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> *const c_void;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(value: *const c_void);
+    }
+
+    /// Ask Quartz whether this process belongs to a live WindowServer session.
+    ///
+    /// Apple specifies a retained dictionary on success and null when the
+    /// caller is outside a Quartz GUI session or WindowServer is disabled.
+    #[allow(unsafe_code)]
+    pub(super) fn quartz_session_available() -> bool {
+        // SAFETY: both declarations exactly match the CoreGraphics/CoreFoundation
+        // C APIs. A non-null Copy result is owned by this call and released once.
+        let session = unsafe { CGSessionCopyCurrentDictionary() };
+        if session.is_null() {
+            false
+        } else {
+            // SAFETY: `session` is the non-null retained object returned above.
+            unsafe { CFRelease(session) };
+            true
+        }
+    }
+}
+
+#[cfg(windows)]
+fn native_graphical_session_available() -> bool {
+    windows_graphical_session::process_window_station_visible()
+}
+
+#[cfg(any(test, windows))]
+const fn window_station_is_visible(flags: u32) -> bool {
+    const WSF_VISIBLE: u32 = 0x0001;
+    flags & WSF_VISIBLE != 0
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_graphical_session {
+    use std::{ffi::c_void, mem::size_of};
+
+    const UOI_FLAGS: i32 = 1;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct UserObjectFlags {
+        inherit: i32,
+        reserved: i32,
+        flags: u32,
+    }
+
+    #[link(name = "User32")]
+    unsafe extern "system" {
+        fn GetProcessWindowStation() -> *mut c_void;
+        fn GetUserObjectInformationW(
+            object: *mut c_void,
+            index: i32,
+            info: *mut c_void,
+            info_len: u32,
+            bytes_needed: *mut u32,
+        ) -> i32;
+    }
+
+    pub(super) fn process_window_station_visible() -> bool {
+        // SAFETY: `GetProcessWindowStation` takes no arguments and returns a
+        // borrowed process-owned handle which Microsoft says must not be closed.
+        let station = unsafe { GetProcessWindowStation() };
+        if station.is_null() {
+            return false;
+        }
+
+        let mut flags = UserObjectFlags::default();
+        let mut bytes_needed = 0;
+        // SAFETY: `flags` is a correctly laid-out writable USEROBJECTFLAGS
+        // buffer for UOI_FLAGS and both sizes match the Win32 declarations.
+        let succeeded = unsafe {
+            GetUserObjectInformationW(
+                station,
+                UOI_FLAGS,
+                (&raw mut flags).cast(),
+                size_of::<UserObjectFlags>() as u32,
+                &raw mut bytes_needed,
+            )
+        } != 0;
+
+        succeeded && super::window_station_is_visible(flags.flags)
+    }
+}
+
+#[cfg(all(not(target_family = "unix"), not(windows)))]
+const fn native_graphical_session_available() -> bool {
+    false
+}
+
+fn select_renderer_mode(
+    requested: RendererMode,
+    available: RendererAvailability,
+    environment: RendererEnvironment,
+) -> Result<RendererMode> {
+    match requested {
+        RendererMode::Terminal => Ok(RendererMode::Terminal),
+        RendererMode::Gui if available.gui => Ok(RendererMode::Gui),
         RendererMode::Gui => {
-            #[cfg(not(feature = "gui"))]
-            {
-                warn!("GUI feature not enabled; falling back to terminal renderer");
-                Ok((
-                    RendererMode::Terminal,
-                    Box::new(TerminalRenderer::default()),
-                ))
+            bail!("--mode gui requires a binary built with --features gui")
+        }
+        RendererMode::Bevy if available.bevy => Ok(RendererMode::Bevy),
+        RendererMode::Bevy => {
+            bail!("--mode bevy requires a binary built with --features bevy_render")
+        }
+        RendererMode::Auto => {
+            if environment.force_terminal && environment.force_gui {
+                bail!("SCRIPTBOTS_FORCE_TERMINAL and SCRIPTBOTS_FORCE_GUI cannot both be enabled");
             }
+            if environment.force_terminal {
+                return Ok(RendererMode::Terminal);
+            }
+            if environment.force_gui {
+                if available.gui {
+                    return Ok(RendererMode::Gui);
+                }
+                bail!(
+                    "SCRIPTBOTS_FORCE_GUI requires a binary built with --features gui; refusing to substitute another renderer"
+                );
+            }
+            if environment.graphical_session {
+                if available.gui {
+                    return Ok(RendererMode::Gui);
+                }
+                if available.bevy {
+                    return Ok(RendererMode::Bevy);
+                }
+            }
+            Ok(RendererMode::Terminal)
+        }
+    }
+}
+
+fn resolve_renderer(
+    mode: RendererMode,
+    prefer_terminal: bool,
+) -> Result<(RendererMode, Box<dyn Renderer>)> {
+    let environment = if mode == RendererMode::Auto {
+        RendererEnvironment::from_process(prefer_terminal)?
+    } else {
+        RendererEnvironment::default()
+    };
+    let active = select_renderer_mode(mode, RendererAvailability::compiled(), environment)?;
+    let renderer: Box<dyn Renderer> = match active {
+        RendererMode::Terminal => Box::new(TerminalRenderer::default()),
+        RendererMode::Gui => {
             #[cfg(feature = "gui")]
             {
-                if should_use_terminal_mode() {
-                    // Headless environment (no DISPLAY/WAYLAND) or forced terminal mode
-                    println!(
-                        "{} GUI unavailable or disabled. Falling back to terminal. Set {} to force GPUI, or run with {}",
-                        "⚠".yellow().bold(),
-                        "SCRIPTBOTS_FORCE_GUI=1".cyan(),
-                        "--mode terminal".cyan()
-                    );
-                    return Ok((
-                        RendererMode::Terminal,
-                        Box::new(TerminalRenderer::default()),
-                    ));
-                }
-                Ok((RendererMode::Gui, Box::new(GuiRenderer)))
+                Box::new(GuiRenderer)
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                bail!("internal error: selected GPUI without the gui feature")
             }
         }
         RendererMode::Bevy => {
             #[cfg(feature = "bevy_render")]
             {
-                return Ok((RendererMode::Bevy, Box::new(BevyRenderer::default())));
+                Box::new(BevyRenderer)
             }
             #[cfg(not(feature = "bevy_render"))]
             {
-                warn!(
-                    "Bevy renderer requested, but binary was built without bevy_render. Falling back to terminal UI."
-                );
-                Ok((
-                    RendererMode::Terminal,
-                    Box::new(TerminalRenderer::default()),
-                ))
+                bail!("internal error: selected Bevy without the bevy_render feature")
             }
         }
-        RendererMode::Terminal => Ok((
-            RendererMode::Terminal,
-            Box::new(TerminalRenderer::default()),
-        )),
-        RendererMode::Auto => {
-            if should_use_terminal_mode() {
-                debug!("Auto-selected terminal renderer due to headless environment");
-                Ok((
-                    RendererMode::Terminal,
-                    Box::new(TerminalRenderer::default()),
-                ))
-            } else {
-                Ok((RendererMode::Gui, Box::new(GuiRenderer)))
-            }
-        }
-    }
+        RendererMode::Auto => bail!("internal error: unresolved automatic renderer mode"),
+    };
+    debug!(
+        requested_mode = mode.as_str(),
+        active_mode = active.as_str(),
+        "Resolved renderer mode"
+    );
+    Ok((active, renderer))
 }
 
+#[cfg(feature = "gui")]
 #[derive(Default)]
 struct GuiRenderer;
 
+#[cfg(feature = "gui")]
 impl Renderer for GuiRenderer {
     fn name(&self) -> &'static str {
         "gpui"
     }
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
-        #[cfg(feature = "gui")]
-        {
-            prepare_linux_gui_backend();
-            run_demo(
-                Arc::clone(&ctx.world),
-                ctx.analytics.clone(),
-                Arc::clone(&ctx.command_drain),
-                Arc::clone(&ctx.command_submit),
-            );
-            return Ok(());
-        }
-        #[cfg(not(feature = "gui"))]
-        {
-            // Avoid unused-parameter warning when GUI is not enabled
-            let _ = ctx;
-            bail!("GUI feature not enabled; recompile with --features gui or use --mode terminal");
-        }
+        prepare_linux_gui_backend();
+        let control_health: scriptbots_render::GuiHealthProbe =
+            Arc::new(ctx.control_runtime.health_probe());
+        run_demo(
+            Arc::clone(&ctx.world),
+            ctx.analytics.clone(),
+            Arc::clone(&ctx.command_drain),
+            Arc::clone(&ctx.command_submit),
+            control_health,
+        )
+        .map_err(anyhow::Error::new)
     }
 }
 
@@ -1272,38 +1536,16 @@ impl Renderer for BevyRenderer {
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
         prepare_linux_gui_backend();
+        let control_health: scriptbots_bevy::ControlHealthFn =
+            Arc::new(ctx.control_runtime.health_probe());
         let bevy_ctx = BevyRendererContext {
             world: Arc::clone(&ctx.world),
             command_submit: Arc::clone(&ctx.command_submit),
             command_drain: Arc::clone(&ctx.command_drain),
+            control_health: Some(control_health),
         };
         scriptbots_bevy::run_renderer(bevy_ctx)
     }
-}
-
-fn should_use_terminal_mode() -> bool {
-    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_TERMINAL")
-        && let Some(flag) = parse_bool(&value)
-    {
-        return flag;
-    }
-
-    if let Ok(value) = env::var("SCRIPTBOTS_FORCE_GUI")
-        && matches!(parse_bool(&value), Some(true))
-    {
-        return false;
-    }
-
-    #[cfg(target_family = "unix")]
-    {
-        let has_display =
-            env::var_os("DISPLAY").is_some() || env::var_os("WAYLAND_DISPLAY").is_some();
-        if !has_display {
-            return true;
-        }
-    }
-
-    false
 }
 
 #[cfg(all(target_os = "linux", any(feature = "gui", feature = "bevy_render")))]
@@ -1378,18 +1620,18 @@ fn maybe_force_x11_for_legacy_wayland() -> Result<()> {
             .map(|global| global.version)
     });
 
-    if let Some(version) = compositor_version {
-        if version < required {
-            // SAFETY: Modifying the process environment before spawning GUI worker threads.
-            unsafe {
-                env::set_var("WINIT_UNIX_BACKEND", "x11");
-            }
-            tracing::warn!(
-                version,
-                required,
-                "Wayland compositor version too old (v{version}); forcing WINIT_UNIX_BACKEND=x11. Set SCRIPTBOTS_FORCE_GUI=1 to override."
-            );
+    if let Some(version) = compositor_version
+        && version < required
+    {
+        // SAFETY: Modifying the process environment before spawning GUI worker threads.
+        unsafe {
+            env::set_var("WINIT_UNIX_BACKEND", "x11");
         }
+        tracing::warn!(
+            version,
+            required,
+            "Wayland compositor version too old (v{version}); forcing WINIT_UNIX_BACKEND=x11. Set SCRIPTBOTS_FORCE_GUI=1 to override."
+        );
     }
 
     Ok(())
@@ -2388,6 +2630,236 @@ mod tests {
         AppCli::parse_from(["scriptbots-app"])
     }
 
+    #[test]
+    #[serial]
+    fn startup_defaults_expose_the_bootstrap_tick_contract() {
+        with_env_lock(|| {
+            let previous_mode = std::env::var("SCRIPTBOTS_MODE").ok();
+            let previous_bootstrap = std::env::var("SCRIPTBOTS_BOOTSTRAP_TICKS").ok();
+            unsafe {
+                std::env::remove_var("SCRIPTBOTS_MODE");
+                std::env::remove_var("SCRIPTBOTS_BOOTSTRAP_TICKS");
+            }
+
+            let cli = default_cli();
+            assert_eq!(cli.mode, RendererMode::Auto);
+            assert_eq!(cli.bootstrap_ticks, DEFAULT_BOOTSTRAP_TICKS);
+
+            let cli = AppCli::parse_from([
+                "scriptbots-app",
+                "--mode",
+                "terminal",
+                "--bootstrap-ticks",
+                "0",
+            ]);
+            assert_eq!(cli.mode, RendererMode::Terminal);
+            assert_eq!(cli.bootstrap_ticks, 0);
+
+            restore_env("SCRIPTBOTS_MODE", previous_mode);
+            restore_env("SCRIPTBOTS_BOOTSTRAP_TICKS", previous_bootstrap);
+        });
+    }
+
+    #[test]
+    fn explicit_renderer_modes_never_fall_back() {
+        let unavailable = RendererAvailability {
+            gui: false,
+            bevy: false,
+        };
+        let hostile_auto_environment = RendererEnvironment {
+            force_terminal: true,
+            force_gui: false,
+            graphical_session: false,
+        };
+
+        assert_eq!(
+            select_renderer_mode(
+                RendererMode::Terminal,
+                unavailable,
+                hostile_auto_environment,
+            )
+            .expect("terminal is always compiled"),
+            RendererMode::Terminal
+        );
+        let gui_error =
+            select_renderer_mode(RendererMode::Gui, unavailable, hostile_auto_environment)
+                .expect_err("an explicit unavailable GPUI request must fail");
+        assert!(gui_error.to_string().contains("--features gui"));
+        let bevy_error =
+            select_renderer_mode(RendererMode::Bevy, unavailable, hostile_auto_environment)
+                .expect_err("an explicit unavailable Bevy request must fail");
+        assert!(bevy_error.to_string().contains("--features bevy_render"));
+    }
+
+    #[test]
+    fn automatic_renderer_uses_only_compiled_backends() {
+        let graphical = RendererEnvironment {
+            graphical_session: true,
+            ..RendererEnvironment::default()
+        };
+        let headless = RendererEnvironment::default();
+
+        assert_eq!(
+            select_renderer_mode(
+                RendererMode::Auto,
+                RendererAvailability {
+                    gui: true,
+                    bevy: true,
+                },
+                graphical,
+            )
+            .expect("GPUI is the preferred compiled native renderer"),
+            RendererMode::Gui
+        );
+        assert_eq!(
+            select_renderer_mode(
+                RendererMode::Auto,
+                RendererAvailability {
+                    gui: false,
+                    bevy: true,
+                },
+                graphical,
+            )
+            .expect("Bevy is the next compiled graphical renderer"),
+            RendererMode::Bevy
+        );
+        assert_eq!(
+            select_renderer_mode(
+                RendererMode::Auto,
+                RendererAvailability {
+                    gui: false,
+                    bevy: false,
+                },
+                graphical,
+            )
+            .expect("a non-GUI build must remain usable"),
+            RendererMode::Terminal
+        );
+        assert_eq!(
+            select_renderer_mode(
+                RendererMode::Auto,
+                RendererAvailability {
+                    gui: true,
+                    bevy: true,
+                },
+                headless,
+            )
+            .expect("headless auto mode must select the terminal"),
+            RendererMode::Terminal
+        );
+    }
+
+    #[test]
+    fn automatic_renderer_force_contract_is_fail_closed() {
+        let available = RendererAvailability {
+            gui: true,
+            bevy: true,
+        };
+        let conflict = RendererEnvironment {
+            force_terminal: true,
+            force_gui: true,
+            graphical_session: true,
+        };
+        assert!(
+            select_renderer_mode(RendererMode::Auto, available, conflict)
+                .expect_err("conflicting overrides must not depend on branch order")
+                .to_string()
+                .contains("cannot both be enabled")
+        );
+
+        let unavailable_gui = RendererEnvironment {
+            force_gui: true,
+            graphical_session: true,
+            ..RendererEnvironment::default()
+        };
+        assert!(
+            select_renderer_mode(
+                RendererMode::Auto,
+                RendererAvailability {
+                    gui: false,
+                    bevy: true,
+                },
+                unavailable_gui,
+            )
+            .expect_err("force-GUI must not silently substitute Bevy")
+            .to_string()
+            .contains("refusing to substitute")
+        );
+    }
+
+    #[test]
+    fn compiled_renderer_availability_matches_cargo_features() {
+        let available = RendererAvailability::compiled();
+        assert_eq!(available.gui, cfg!(feature = "gui"));
+        assert_eq!(available.bevy, cfg!(feature = "bevy_render"));
+    }
+
+    #[test]
+    fn display_environment_matrix_rejects_missing_and_empty_values() {
+        use std::ffi::OsString;
+
+        assert!(!display_environment_available(None, None));
+        assert!(!display_environment_available(
+            Some(OsString::new()),
+            Some(OsString::new()),
+        ));
+        assert!(display_environment_available(
+            Some(OsString::from(":0")),
+            None,
+        ));
+        assert!(display_environment_available(
+            None,
+            Some(OsString::from("wayland-0")),
+        ));
+    }
+
+    #[test]
+    fn windows_auto_mode_requires_a_visible_window_station() {
+        assert!(!window_station_is_visible(0));
+        assert!(window_station_is_visible(0x0001));
+        assert!(window_station_is_visible(0x0001 | 0x4000));
+        assert!(!window_station_is_visible(0x4000));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_auto_mode_rejects_remote_shell_sessions_without_x11_assumptions() {
+        use std::ffi::OsString;
+
+        assert!(macos_auto_graphical_session_available(true, false));
+        assert!(!macos_auto_graphical_session_available(false, false));
+        assert!(!macos_auto_graphical_session_available(true, true));
+        assert!(!remote_shell_session_detected([None, None, None]));
+        assert!(!remote_shell_session_detected([
+            Some(OsString::new()),
+            None,
+            None,
+        ]));
+        assert!(remote_shell_session_detected([
+            Some(OsString::from("host 22 host 50000")),
+            None,
+            None,
+        ]));
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn unavailable_explicit_gpui_resolution_returns_an_error() {
+        let error = resolve_renderer(RendererMode::Gui, false)
+            .err()
+            .expect("default application build must reject unavailable GPUI");
+        assert!(error.to_string().contains("--features gui"));
+    }
+
+    #[cfg(not(feature = "bevy_render"))]
+    #[test]
+    fn unavailable_explicit_bevy_resolution_returns_an_error() {
+        let error = resolve_renderer(RendererMode::Bevy, false)
+            .err()
+            .expect("default application build must reject unavailable Bevy");
+        assert!(error.to_string().contains("--features bevy_render"));
+    }
+
     fn persistence_batch_at(tick: u64) -> scriptbots_core::PersistenceBatch {
         scriptbots_core::PersistenceBatch {
             summary: TickSummary {
@@ -3118,9 +3590,14 @@ activation = "Sigmoid"
             let mut config = ScriptBotsConfig::default();
             config.neuroflow.enabled = true;
             config.neuroflow.hidden_layers = vec![4, 0, 2];
-            let error = bootstrap_world(config, StorageMode::File, ThresholdsOverride::default())
-                .err()
-                .expect("adapter validation must fail before storage setup");
+            let error = bootstrap_world(
+                config,
+                StorageMode::File,
+                ThresholdsOverride::default(),
+                DEFAULT_BOOTSTRAP_TICKS,
+            )
+            .err()
+            .expect("adapter validation must fail before storage setup");
             let path_exists = path.exists();
             restore_env("SCRIPTBOTS_STORAGE_PATH", previous);
 

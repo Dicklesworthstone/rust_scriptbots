@@ -794,7 +794,7 @@ Empty-versus-empty is reported as `NoEvidence`, never “matched.”
 
 ### 7.5 bounded storage worker
 
-**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact identity/schema proof (`bd-2z0.8.9.4.2`), remaining direct-write/root-cause unification (`bd-2z0.8.9.4.4`), queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open, Codex, 2026-07-12]
+**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact descriptor-bound recovery identity and structural-schema proof is completed under `bd-2z0.8.9.4.2`; remaining direct-write/root-cause unification (`bd-2z0.8.9.4.4`), queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open, Codex, 2026-07-12]
 
 The current unbounded storage channel carrying cloned full batches can exhaust memory. The new worker uses:
 
@@ -813,7 +813,7 @@ The current unbounded storage channel carrying cloned full batches can exhaust m
 
 ### 7.6 FrankenSQLite replacement and multi-run schema
 
-DuckDB is not an accepted backend. Remove its manifest edges, native build graph, direct test imports, mode names, file extensions, documentation, and CI assumptions. The replacement is the public `fsqlite` facade from `~/projects/frankensqlite`, pinned to immutable commit `cd9990bb16291d8c7c247b75b47faae8d7701adb` (package `0.1.16`). Its `default-features = false, features = ["native"]` source check passed under this workspace's `nightly-2026-07-09` in 13m44s; the sibling workspace emitted two upstream unused-feature warnings for obsolete `core_intrinsics` gates, which downstream Git dependency resolution must recheck. JSON payloads remain ordinary `TEXT`, so ScriptBots does not explicitly request extension features; the current upstream `native` feature still activates its extension bundle and is measured separately.
+DuckDB is not an accepted backend. Remove its manifest edges, native build graph, direct test imports, mode names, file extensions, documentation, and CI assumptions. The replacement is the public `fsqlite` facade from `~/projects/frankensqlite`, pinned to immutable commit `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` (package `0.1.16`). This revision provides descriptor-bound `Connection::file_identity`, create-free existing-file open, and expected-identity verification on the already-open VFS handle before recovery can inspect or mutate database bytes, without changing the package version. Its `default-features = false, features = ["native"]` source check passed under this workspace's pinned nightly; JSON payloads remain ordinary `TEXT`, so ScriptBots does not explicitly request extension features. The current upstream `native` feature still activates its extension bundle and is measured separately.
 
 FrankenSQLite uses `LicenseRef-MIT-OpenAI-Anthropic-Rider`, not plain MIT. Local integration is authorized by this project decision, but public distribution stays gated on an explicit license/notice decision and honest downstream package metadata. Do not silently describe the combined product as only `MIT OR Apache-2.0`.
 
@@ -1003,7 +1003,7 @@ Before visual redesign:
 - explicit `--mode gui` must not be overridden by headless auto-detection;
 - macOS uses native-window availability, not X11/Wayland variables;
 - Auto selects only a renderer compiled into the binary;
-- a launch failure returns a real error and can invoke a documented fallback;
+- a launch failure returns a real error; renderer substitution occurs only during documented Auto preselection, never after a failed launch;
 - default feature/mode behavior in README and `--help` matches the binary;
 - launch scripts set only variables that the renderer actually reads.
 
@@ -1083,7 +1083,7 @@ If the answer is no, stop investing in GPUI as the world renderer. It may remain
 
 - native macOS explicit GUI launch;
 - Windows D3D12 launch;
-- Linux Vulkan launch with clear headless failure/fallback;
+- Linux Vulkan launch with a clear explicit-mode headless failure and terminal preselection only in Auto;
 - GPU adapter unavailable;
 - window creation failure;
 - device loss and resize;
@@ -1634,16 +1634,21 @@ Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
 
 **Exit:** every advertised test exercises its named path or is renamed to describe its true scope.
 
-#### 0.4 mode/startup contract
+#### 0.4 mode/startup contract [Currently In Progress — `bd-2z0.1.5`, CyanDove, 2026-07-12]
 
-- explicit mode overrides auto-detection;
-- fix macOS detection;
-- select only compiled renderers;
-- return launch failures;
-- centralize port/defaults;
-- remove hidden bootstrap from startup contract or expose it explicitly.
+- [Implemented] explicit `gui`, `bevy`, and `terminal` modes override auto-detection and never fall back after selection;
+- [Implemented] Auto considers only compiled graphical backends and selects one only in a real native graphical session; macOS uses native session availability rather than X11/Wayland variables;
+- [Implemented] `--bootstrap-ticks`/`SCRIPTBOTS_BOOTSTRAP_TICKS` expose the pre-frontend bootstrap with default `120`, while `0` launches the seeded world at tick zero;
+- [Implemented] control configuration is parsed fail-closed: malformed and non-Unicode values are errors, and TLS-claiming MCP values are rejected because the embedded transport is plaintext HTTP;
+- [Implemented] every enabled REST/MCP socket is transactionally prebound before configuration output, auto-tuning, priority changes, world construction, or storage reservation, and the runtime consumes those exact listeners;
+- [Implemented] REST and MCP are separately supervised; unexpected completion or failure stops the sibling, preserves the root error, publishes failed health, and makes TUI, GPUI, and Bevy exit with that error;
+- [Implemented] returned-error lifecycle paths are supervised and joined; panic-conversion tests are explicitly limited to unwinding profiles because the release profile's intentional `panic = "abort"` policy cannot provide panic recovery or destructor cleanup;
+- [Implemented] GPUI treats its two-window launch as one transaction, returns window-open failures, uses `QuitMode::LastWindowClosed`, closes the paired session when either window closes, and contains double-driving by making the HUD the sole interim driver while the world window is read-only;
+- [Open proof] record the complete startup matrix across default, GUI-enabled, Bevy-enabled, and unavailable-feature builds; terminal, headless, control-server, and launch-failure paths; and real supported macOS, Linux, and Windows sessions. The current targeted unit/integration tests are not yet that full cross-feature/platform acceptance matrix.
 
 **Exit:** startup matrix passes for compiled/uncompiled GUI, terminal, headless, server, and launch failure.
+
+Phase 0.4 therefore remains in progress. This slice hardens renderer selection, process startup, window lifetime, and control-server supervision. GPUI's HUD-only driver is interim containment, not the architectural double-driver fix: scientific time still belongs to a renderer, GPUI's inner command queue remains incorrect, and Bevy still owns a simulation worker. Permanent exactly-one-driver and command authority remain assigned to the `HostCore` migration.
 
 #### 0.5 characterization manifest and digest v0 [Implemented: `bd-2z0.1.6`]
 
@@ -2437,7 +2442,7 @@ Every frontend exposes a small health model:
 Errors are actionable:
 
 - renderer unavailable says which compiled products exist;
-- GPU adapter failure offers terminal/server fallback where authorized;
+- GPU adapter failure identifies the explicit terminal/server next-run option where authorized; it never substitutes a renderer after launch;
 - command full distinguishes retryable overload from rejection;
 - storage failure says whether scientific events are buffered, blocked, or lost;
 - replay divergence names the first tick/stage/agent;
@@ -2942,12 +2947,14 @@ and platform helpers. The browser graph re-enables core defaults through
 `scriptbots-brain`. macOS GUI feature-unifies both Metal and Vulkan on WGPU
 27, while Bevy brings its broad default feature set.
 
-This graph also explains a primary executable failure: app defaults omit the
-GUI feature, but Auto selects GUI on a desktop display and then the uncompiled
-GUI runner aborts. Explicit GUI mode follows a different fallback path.
-Selection happens only after storage setup, a 120-tick bootstrap, and control
-thread startup. The fix is owned by `bd-2z0.1.5`; dependency cleanup must not
-mask it.
+At the 2026-07-11 audit snapshot, this graph also explained a primary
+executable failure: app defaults omitted the GUI feature, but Auto selected GUI
+on a desktop display and then the uncompiled GUI runner aborted. Explicit GUI
+mode followed a different fallback path, and selection happened only after
+storage setup, a 120-tick bootstrap, and control-thread startup. This paragraph
+is retained as historical baseline evidence; the live startup contract and its
+replacement tests are owned by `bd-2z0.1.5`, and dependency cleanup must not
+mask them.
 
 The next mutation is deliberately narrow: `bd-2z0.8.2` removes or relocates
 only proven declarations, one manifest slice at a time, with reviewed lock

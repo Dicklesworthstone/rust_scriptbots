@@ -5,9 +5,9 @@ mod camera;
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
     AlignItems, App, Background, Bounds, Context, Div, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollDelta,
-    ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds, WindowOptions, canvas,
-    div, fill, point, prelude::*, px, rgb, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, QuitMode, Rgba,
+    ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, Window, WindowBounds,
+    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use rand::Rng;
@@ -24,7 +24,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "audio")]
@@ -1244,13 +1244,112 @@ fn safe_mode_enabled() -> bool {
     *RENDER_SAFE.get_or_init(|| env_flag("SCRIPTBOTS_RENDER_SAFE"))
 }
 
+/// Failure of the native GPUI application lifetime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuiRunError {
+    /// One of the windows required by the application shell could not be created.
+    WindowLaunch(String),
+    /// A supervised host dependency failed after the windows were published.
+    ControlRuntime(String),
+}
+
+impl std::fmt::Display for GuiRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WindowLaunch(detail) => write!(f, "GPUI launch failed: {detail}"),
+            Self::ControlRuntime(detail) => write!(f, "GPUI control runtime failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for GuiRunError {}
+
+/// Dependency-neutral liveness probe supplied by the application shell.
+pub type GuiHealthProbe = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync + 'static>;
+
+fn record_gui_run_error(slot: &Mutex<Option<GuiRunError>>, error: GuiRunError) {
+    let mut slot = match slot.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+trait GuiQuitRequest {
+    fn request_gui_quit(&mut self);
+}
+
+impl GuiQuitRequest for App {
+    fn request_gui_quit(&mut self) {
+        self.quit();
+    }
+}
+
+fn abort_gui_launch(
+    app: &mut impl GuiQuitRequest,
+    slot: &Mutex<Option<GuiRunError>>,
+    detail: String,
+) {
+    record_gui_run_error(slot, GuiRunError::WindowLaunch(detail));
+    app.request_gui_quit();
+}
+
+fn gui_health_failure(probe: &GuiHealthProbe) -> Option<String> {
+    #[cfg(panic = "unwind")]
+    {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe())) {
+            Ok(Ok(())) => None,
+            Ok(Err(detail)) => Some(detail),
+            Err(panic) => {
+                let detail = if let Some(message) = panic.downcast_ref::<&str>() {
+                    (*message).to_owned()
+                } else if let Some(message) = panic.downcast_ref::<String>() {
+                    message.clone()
+                } else {
+                    "non-string panic payload".to_owned()
+                };
+                Some(format!("health probe panicked: {detail}"))
+            }
+        }
+    }
+    #[cfg(panic = "abort")]
+    {
+        // The shipped release profile aborts on panic by design; only ordinary
+        // health errors can be converted into a graceful GPUI shutdown there.
+        probe().err()
+    }
+}
+
+fn start_gui_health_monitor(
+    app: &App,
+    probe: GuiHealthProbe,
+    error_slot: Arc<Mutex<Option<GuiRunError>>>,
+) {
+    app.spawn(async move |cx| {
+        loop {
+            if let Some(detail) = gui_health_failure(&probe) {
+                record_gui_run_error(&error_slot, GuiRunError::ControlRuntime(detail));
+                cx.update(|app| app.quit());
+                return;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+    })
+    .detach();
+}
+
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
 pub fn run_demo(
     world: Arc<Mutex<WorldState>>,
     analytics: AnalyticsSnapshotProvider,
     command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
-) {
+    health_probe: GuiHealthProbe,
+) -> Result<(), GuiRunError> {
     if let Ok(world) = world.lock()
         && let Some(summary) = world.history().last()
     {
@@ -1271,72 +1370,108 @@ pub fn run_demo(
     let drain_for_view = Arc::clone(&command_drain);
     let submit_for_view = Arc::clone(&command_submit);
     let analytics_for_view = analytics.clone();
+    let run_error = Arc::new(Mutex::new(None));
+    let run_error_for_app = Arc::clone(&run_error);
 
-    application().run(move |app: &mut App| {
-        // Window A: HUD
-        let hud_bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
-        let mut hud_options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(hud_bounds)),
-            ..Default::default()
-        };
-        if let Some(titlebar) = hud_options.titlebar.as_mut() {
-            titlebar.title = Some(title_for_options.clone());
-        }
+    application()
+        .with_quit_mode(QuitMode::LastWindowClosed)
+        .run(move |app: &mut App| {
+            // Window A: HUD
+            let hud_bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), app);
+            let mut hud_options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(hud_bounds)),
+                ..Default::default()
+            };
+            if let Some(titlebar) = hud_options.titlebar.as_mut() {
+                titlebar.title = Some(title_for_options.clone());
+            }
 
-        let world_handle = Arc::clone(&world_for_view);
-        let view_title = title_for_view.clone();
-        let drain_for_hud = Arc::clone(&drain_for_view);
-        let submit_for_hud = Arc::clone(&submit_for_view);
-        let analytics_for_hud = analytics_for_view.clone();
-        if let Err(err) = app.open_window(hud_options, move |_window, cx| {
-            cx.new(|_| {
-                SimulationView::new(
-                    Arc::clone(&world_handle),
-                    analytics_for_hud.clone(),
-                    view_title.clone(),
-                    Arc::clone(&drain_for_hud),
-                    Arc::clone(&submit_for_hud),
-                )
-            })
-        }) {
-            error!(error = ?err, "failed to open HUD window");
-            return;
-        }
-
-        // Window B: Dedicated simulation viewport (minimal chrome)
-        let sim_bounds = Bounds::centered(None, size(px(1600.0), px(900.0)), app);
-        let mut sim_options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(sim_bounds)),
-            ..Default::default()
-        };
-        if let Some(titlebar) = sim_options.titlebar.as_mut() {
-            titlebar.title = Some("ScriptBots World".into());
-        }
-
-        let world_for_canvas = Arc::clone(&world_for_view);
-        let analytics_for_canvas = analytics_for_view.clone();
-        let drain_for_canvas = Arc::clone(&drain_for_view);
-        let submit_for_canvas = Arc::clone(&submit_for_view);
-        if let Err(err) = app.open_window(sim_options, move |_window, cx| {
-            cx.new(|_| {
-                // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
-                let mut view = SimulationView::new(
-                    Arc::clone(&world_for_canvas),
-                    analytics_for_canvas.clone(),
-                    "World".into(),
-                    Arc::clone(&drain_for_canvas),
-                    Arc::clone(&submit_for_canvas),
+            let world_handle = Arc::clone(&world_for_view);
+            let view_title = title_for_view.clone();
+            let drain_for_hud = Arc::clone(&drain_for_view);
+            let submit_for_hud = Arc::clone(&submit_for_view);
+            let analytics_for_hud = analytics_for_view.clone();
+            if let Err(err) = app.open_window(hud_options, move |_window, cx| {
+                cx.new(|_| {
+                    SimulationView::new(
+                        Arc::clone(&world_handle),
+                        analytics_for_hud.clone(),
+                        view_title.clone(),
+                        Arc::clone(&drain_for_hud),
+                        Arc::clone(&submit_for_hud),
+                    )
+                })
+            }) {
+                error!(error = ?err, "failed to open HUD window");
+                abort_gui_launch(
+                    app,
+                    &run_error_for_app,
+                    format!("could not open HUD window: {err:?}"),
                 );
-                view.set_minimal_canvas_mode();
-                view
-            })
-        }) {
-            error!(error = ?err, "failed to open simulation window");
-            return;
-        }
+                // GPUI uses explicit application-lifetime quitting on macOS. Merely
+                // returning from this launch callback can otherwise leave a
+                // zero-window event loop alive forever, hiding the launch error
+                // from the caller.
+                return;
+            }
 
-        app.activate(true);
-    });
+            // Window B: Dedicated simulation viewport (minimal chrome)
+            let sim_bounds = Bounds::centered(None, size(px(1600.0), px(900.0)), app);
+            let mut sim_options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(sim_bounds)),
+                ..Default::default()
+            };
+            if let Some(titlebar) = sim_options.titlebar.as_mut() {
+                titlebar.title = Some("ScriptBots World".into());
+            }
+
+            let world_for_canvas = Arc::clone(&world_for_view);
+            let analytics_for_canvas = analytics_for_view.clone();
+            let drain_for_canvas = Arc::clone(&drain_for_view);
+            let submit_for_canvas = Arc::clone(&submit_for_view);
+            if let Err(err) = app.open_window(sim_options, move |_window, cx| {
+                cx.new(|_| {
+                    // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
+                    let mut view = SimulationView::new(
+                        Arc::clone(&world_for_canvas),
+                        analytics_for_canvas.clone(),
+                        "World".into(),
+                        Arc::clone(&drain_for_canvas),
+                        Arc::clone(&submit_for_canvas),
+                    );
+                    view.set_minimal_canvas_mode();
+                    view
+                })
+            }) {
+                error!(error = ?err, "failed to open simulation window");
+                abort_gui_launch(
+                    app,
+                    &run_error_for_app,
+                    format!("could not open simulation window: {err:?}"),
+                );
+                // The HUD may already exist here. Quit the whole application so a
+                // two-window launch is transactional from the caller's point of
+                // view and the recorded error is returned promptly.
+                return;
+            }
+
+            // Until HostCore owns the simulation clock, the HUD is the sole
+            // driver and the world window is a read-only projection. Keep the two
+            // windows in one lifetime so closing the driver cannot leave a frozen
+            // or independently-clocked viewport behind.
+            app.on_window_closed(|app, _window_id| app.quit()).detach();
+            start_gui_health_monitor(app, health_probe, Arc::clone(&run_error_for_app));
+            app.activate(true);
+        });
+
+    let error = {
+        let mut slot = match run_error.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.take()
+    };
+    error.map_or(Ok(()), Err)
 }
 
 const MAX_SELECTION_EVENTS: usize = 64;
@@ -1372,6 +1507,8 @@ struct SimulationView {
     audio: Option<AudioState>,
     // When true, render a minimal canvas-focused layout (used in the dedicated world window).
     minimal_canvas_mode: bool,
+    // Temporary containment until HostCore owns the sole simulation clock.
+    drives_simulation: bool,
     // Per-agent short history of brain outputs for inspector sparklines
     brain_history: std::collections::HashMap<AgentId, OutputHistory>,
 }
@@ -1424,12 +1561,14 @@ impl SimulationView {
                 })
                 .ok(),
             minimal_canvas_mode: false,
+            drives_simulation: true,
             brain_history: std::collections::HashMap::new(),
         }
     }
 
     fn set_minimal_canvas_mode(&mut self) {
         self.minimal_canvas_mode = true;
+        self.drives_simulation = false;
     }
 
     fn submit_simulation_command(&self, command: SimulationCommand) {
@@ -1904,7 +2043,9 @@ impl SimulationView {
         selection_changed || inspector_changed
     }
     fn snapshot(&mut self) -> HudSnapshot {
-        self.pump_simulation();
+        if self.drives_simulation {
+            self.pump_simulation();
+        }
         let mut snapshot = HudSnapshot::default();
         let inspector_state = self
             .inspector
@@ -12933,6 +13074,99 @@ mod command_characterization_tests {
     use super::*;
     use std::time::Duration;
 
+    #[derive(Default)]
+    struct FakeGuiLifecycle {
+        quit_requested: bool,
+    }
+
+    impl GuiQuitRequest for FakeGuiLifecycle {
+        fn request_gui_quit(&mut self) {
+            self.quit_requested = true;
+        }
+    }
+
+    #[test]
+    fn gui_launch_error_preserves_the_first_failure_and_quits_the_event_loop() {
+        let slot = Mutex::new(None);
+        let mut lifecycle = FakeGuiLifecycle::default();
+        abort_gui_launch(
+            &mut lifecycle,
+            &slot,
+            "could not open HUD window: adapter unavailable".into(),
+        );
+        abort_gui_launch(
+            &mut lifecycle,
+            &slot,
+            "could not open simulation window: ignored".into(),
+        );
+
+        let error = slot
+            .lock()
+            .expect("launch error slot")
+            .clone()
+            .expect("recorded launch error");
+        assert_eq!(
+            error.to_string(),
+            "GPUI launch failed: could not open HUD window: adapter unavailable"
+        );
+        assert!(
+            lifecycle.quit_requested,
+            "a window-open failure must terminate the GPUI application lifetime"
+        );
+    }
+
+    #[test]
+    fn gui_health_probe_preserves_errors() {
+        let healthy: GuiHealthProbe = Arc::new(|| Ok(()));
+        assert_eq!(gui_health_failure(&healthy), None);
+
+        let failed: GuiHealthProbe = Arc::new(|| Err("injected REST serve failure".to_owned()));
+        assert_eq!(
+            gui_health_failure(&failed).as_deref(),
+            Some("injected REST serve failure")
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn gui_health_probe_contains_panics_in_unwinding_profiles() {
+        let panicked: GuiHealthProbe = Arc::new(|| panic!("injected health panic"));
+        assert_eq!(
+            gui_health_failure(&panicked).as_deref(),
+            Some("health probe panicked: injected health panic")
+        );
+    }
+
+    #[test]
+    fn gui_runtime_error_preserves_a_control_failure_over_later_launch_noise() {
+        let slot = Mutex::new(None);
+        record_gui_run_error(
+            &slot,
+            GuiRunError::ControlRuntime("injected MCP failure".to_owned()),
+        );
+        let mut lifecycle = FakeGuiLifecycle::default();
+        abort_gui_launch(
+            &mut lifecycle,
+            &slot,
+            "late window-close artifact".to_owned(),
+        );
+
+        let error = slot
+            .lock()
+            .expect("GUI error slot")
+            .clone()
+            .expect("recorded control failure");
+        assert_eq!(
+            error,
+            GuiRunError::ControlRuntime("injected MCP failure".to_owned())
+        );
+        assert_eq!(
+            error.to_string(),
+            "GPUI control runtime failed: injected MCP failure"
+        );
+        assert!(lifecycle.quit_requested);
+    }
+
     fn command_characterization_world() -> Arc<Mutex<WorldState>> {
         let config = ScriptBotsConfig {
             world_width: 100,
@@ -12967,6 +13201,21 @@ mod command_characterization_tests {
         view.sim_accumulator = 0.0;
         view.last_sim_instant =
             Some(Instant::now() - Duration::from_secs_f32(SIM_TICK_INTERVAL * 1.25));
+    }
+
+    #[test]
+    fn minimal_canvas_is_a_read_only_projection_until_hostcore_lands() {
+        let world = command_characterization_world();
+        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let mut canvas = simulation_view(Arc::clone(&world), drain);
+        canvas.set_minimal_canvas_mode();
+        prime_exactly_one_view_step(&mut canvas);
+
+        let _snapshot = canvas.snapshot();
+
+        assert_eq!(world.lock().expect("world lock").tick().0, 0);
+        assert!(canvas.minimal_canvas_mode);
+        assert!(!canvas.drives_simulation);
     }
 
     #[test]

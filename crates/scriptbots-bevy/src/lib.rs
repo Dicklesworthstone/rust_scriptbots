@@ -1,6 +1,6 @@
 //! Bevy renderer integration for ScriptBots.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::prelude::*;
@@ -37,16 +37,195 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Launch context supplied by the ScriptBots application shell.
 pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
 pub type CommandDrainFn = Arc<dyn Fn(&mut WorldState) + Send + Sync>;
+pub type ControlHealthFn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
 pub struct BevyRendererContext {
     pub world: Arc<Mutex<WorldState>>,
     pub command_submit: CommandSubmitFn,
     pub command_drain: CommandDrainFn,
+    pub control_health: Option<ControlHealthFn>,
+}
+
+type BevyWorker = thread::JoinHandle<Result<()>>;
+
+#[derive(Debug)]
+struct BevyLifecycleFailure {
+    component: &'static str,
+    detail: String,
+}
+
+struct BevyLifecycleFailureInbox {
+    receiver: mpsc::Receiver<BevyLifecycleFailure>,
+    first_failure: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Resource)]
+struct ControlHealthMonitor {
+    check: Option<ControlHealthFn>,
+    failures: mpsc::Sender<BevyLifecycleFailure>,
+    running: Arc<AtomicBool>,
+    failure_reported: bool,
+}
+
+struct BevyWorkerGroup {
+    running: Arc<AtomicBool>,
+    snapshot: Option<BevyWorker>,
+    simulation: Option<BevyWorker>,
+}
+
+impl BevyWorkerGroup {
+    fn stop_and_join(mut self) -> Result<()> {
+        self.running.store(false, Ordering::Release);
+        let simulation = join_bevy_worker("simulation", self.simulation.take());
+        let snapshot = join_bevy_worker("snapshot", self.snapshot.take());
+        combine_bevy_results(simulation, snapshot, "snapshot worker also failed")
+    }
+}
+
+impl Drop for BevyWorkerGroup {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Err(error) = join_bevy_worker("simulation", self.simulation.take()) {
+            warn!(%error, "Bevy simulation worker failed during emergency cleanup");
+        }
+        if let Err(error) = join_bevy_worker("snapshot", self.snapshot.take()) {
+            warn!(%error, "Bevy snapshot worker failed during emergency cleanup");
+        }
+    }
+}
+
+fn join_bevy_worker(role: &str, worker: Option<BevyWorker>) -> Result<()> {
+    let Some(worker) = worker else {
+        return Ok(());
+    };
+    worker
+        .join()
+        .map_err(|panic| {
+            anyhow!(
+                "Bevy {role} worker panicked: {}",
+                panic_detail(panic.as_ref())
+            )
+        })?
+        .with_context(|| format!("Bevy {role} worker terminated with an error"))
+}
+
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn run_reported_worker(
+    component: &'static str,
+    failures: &mpsc::Sender<BevyLifecycleFailure>,
+    running: &AtomicBool,
+    worker: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // The debug/test profiles unwind and can convert a panic into a reported
+    // lifecycle error. The shipped release profile uses `panic = "abort"`, so
+    // it deliberately cannot promise panic recovery or destructor cleanup.
+    #[cfg(panic = "unwind")]
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)) {
+        Ok(result) => result,
+        Err(panic) => Err(anyhow!(
+            "Bevy {component} panicked: {}",
+            panic_detail(panic.as_ref())
+        )),
+    };
+    #[cfg(panic = "abort")]
+    let result = worker();
+    if let Err(error) = &result {
+        // A renderer worker group is one structured lifetime: failure of either
+        // child cancels its sibling immediately, without waiting for the next
+        // Bevy update to observe the failure message.
+        running.store(false, Ordering::Release);
+        let _ = failures.send(BevyLifecycleFailure {
+            component,
+            detail: format!("{error:#}"),
+        });
+    }
+    result
+}
+
+fn poll_control_health(mut monitor: ResMut<ControlHealthMonitor>) {
+    if monitor.failure_reported {
+        return;
+    }
+    let Some(check) = monitor.check.as_ref() else {
+        return;
+    };
+    #[cfg(panic = "unwind")]
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check()));
+    #[cfg(panic = "abort")]
+    let result: std::thread::Result<std::result::Result<(), String>> = Ok(check());
+    let failure = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(detail)) => detail,
+        Err(panic) => format!("health callback panicked: {}", panic_detail(panic.as_ref())),
+    };
+    monitor.failure_reported = true;
+    monitor.running.store(false, Ordering::Release);
+    let _ = monitor.failures.send(BevyLifecycleFailure {
+        component: "control plane",
+        detail: failure,
+    });
+}
+
+fn poll_bevy_lifecycle_failures(
+    inbox: NonSendMut<BevyLifecycleFailureInbox>,
+    mut exit_events: MessageWriter<AppExit>,
+) {
+    while let Ok(failure) = inbox.receiver.try_recv() {
+        let rendered = format!("Bevy {} failed: {}", failure.component, failure.detail);
+        error!(component = failure.component, detail = %failure.detail, "Bevy lifecycle dependency failed; stopping renderer");
+        match inbox.first_failure.lock() {
+            Ok(mut first) => {
+                if first.is_none() {
+                    *first = Some(rendered);
+                }
+            }
+            Err(poisoned) => {
+                let mut first = poisoned.into_inner();
+                if first.is_none() {
+                    *first = Some(rendered);
+                }
+            }
+        }
+        exit_events.write(AppExit::error());
+    }
+}
+
+fn combine_bevy_results(
+    primary: Result<()>,
+    cleanup: Result<()>,
+    cleanup_context: &str,
+) -> Result<()> {
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => {
+            Err(primary).context(format!("{cleanup_context}: {cleanup:#}"))
+        }
+    }
+}
+
+fn app_exit_result(exit: AppExit) -> Result<()> {
+    match exit {
+        AppExit::Success => Ok(()),
+        AppExit::Error(code) => Err(anyhow!(
+            "Bevy application exited with error code {}",
+            code.get()
+        )),
+    }
 }
 
 /// Entry point for the Bevy renderer; blocks until the window closes.
@@ -57,16 +236,19 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         world,
         command_submit,
         command_drain,
+        control_health,
     } = ctx;
 
     let initial_render_settings = {
-        let guard = world
-            .lock()
-            .expect("world mutex poisoned while reading render settings");
+        let guard = world.lock().map_err(|error| {
+            anyhow!("world mutex poisoned while reading render settings: {error}")
+        })?;
         guard.config().render.clone()
     };
 
     let (tx, rx) = mpsc::channel::<WorldSnapshot>();
+    let (failure_tx, failure_rx) = mpsc::channel::<BevyLifecycleFailure>();
+    let first_worker_failure = Arc::new(Mutex::new(None));
     let running = Arc::new(AtomicBool::new(true));
     let worker_flag = Arc::clone(&running);
     let world_for_worker = Arc::clone(&world);
@@ -78,34 +260,61 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let drain_for_thread = Arc::clone(&command_drain);
     let world_for_sim = Arc::clone(&world);
     let running_sim = Arc::clone(&running);
+    let snapshot_failures = failure_tx.clone();
 
-    let worker = thread::spawn(move || {
-        let mut last_tick = 0u64;
-        while worker_flag.load(Ordering::Relaxed) {
-            let snapshot = {
-                let guard = world_for_worker.lock().expect("world mutex poisoned");
-                WorldSnapshot::from_world(&guard)
-            };
+    let snapshot_worker = thread::Builder::new()
+        .name("scriptbots-bevy-snapshot".into())
+        .spawn(move || {
+            run_reported_worker("snapshot worker", &snapshot_failures, &worker_flag, || {
+                let mut last_tick = 0u64;
+                while worker_flag.load(Ordering::Acquire) {
+                    let snapshot = {
+                        let guard = world_for_worker.lock().map_err(|error| {
+                            anyhow!("world mutex poisoned in Bevy snapshot worker: {error}")
+                        })?;
+                        WorldSnapshot::from_world(&guard)
+                    };
 
-            if let Some(snapshot) = snapshot
-                && snapshot.tick != last_tick
-            {
-                last_tick = snapshot.tick;
-                if tx.send(snapshot).is_err() {
-                    break;
+                    if let Some(snapshot) = snapshot
+                        && snapshot.tick != last_tick
+                    {
+                        last_tick = snapshot.tick;
+                        if tx.send(snapshot).is_err() {
+                            break;
+                        }
+                    }
+
+                    thread::sleep(Duration::from_millis(30));
                 }
-            }
+                Ok(())
+            })
+        })
+        .context("failed to spawn Bevy snapshot worker")?;
 
-            thread::sleep(Duration::from_millis(30));
-        }
-    });
-
-    let simulation_thread = spawn_simulation_driver(
+    let simulation_worker = match spawn_simulation_driver(
         world_for_sim,
         drain_for_thread,
         controls_for_thread.clone(),
         Arc::clone(&running_sim),
-    );
+        failure_tx.clone(),
+    ) {
+        Ok(worker) => worker,
+        Err(error) => {
+            running.store(false, Ordering::Release);
+            let snapshot_cleanup = join_bevy_worker("snapshot", Some(snapshot_worker));
+            return match snapshot_cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error).context(format!("snapshot worker cleanup also failed: {cleanup:#}"))
+                }
+            };
+        }
+    };
+    let workers = BevyWorkerGroup {
+        running: Arc::clone(&running),
+        snapshot: Some(snapshot_worker),
+        simulation: Some(simulation_worker),
+    };
 
     let mut app = App::new();
     let diagnostics_enabled = diagnostics_enabled();
@@ -117,6 +326,16 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_resource(submitter_resource)
     .insert_resource(controls_resource)
     .insert_non_send_resource(SnapshotInbox { receiver: rx })
+    .insert_non_send_resource(BevyLifecycleFailureInbox {
+        receiver: failure_rx,
+        first_failure: Arc::clone(&first_worker_failure),
+    })
+    .insert_resource(ControlHealthMonitor {
+        check: control_health,
+        failures: failure_tx,
+        running: Arc::clone(&running),
+        failure_reported: false,
+    })
     .insert_resource(SnapshotState::default())
     .insert_resource(AgentRegistry::default())
     .insert_resource(AccessibilityState::new())
@@ -158,7 +377,15 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         )
             .chain(),
     )
-    .add_systems(Update, close_on_esc);
+    .add_systems(
+        Update,
+        (
+            poll_control_health,
+            poll_bevy_lifecycle_failures,
+            close_on_esc,
+        )
+            .chain(),
+    );
 
     if diagnostics_enabled {
         app.insert_resource(DiagnosticsTicker::new(DIAGNOSTIC_REPORT_INTERVAL))
@@ -166,12 +393,21 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             .add_systems(Update, report_frame_metrics);
     }
 
-    app.run();
-
-    running.store(false, Ordering::Relaxed);
-    let _ = simulation_thread.join();
-    let _ = worker.join();
-    Ok(())
+    let app_exit = app.run();
+    let worker_failure = match first_worker_failure.lock() {
+        Ok(mut failure) => failure.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    let app_result = worker_failure.map_or_else(
+        || app_exit_result(app_exit),
+        |failure| Err(anyhow!(failure)),
+    );
+    let worker_result = workers.stop_and_join();
+    combine_bevy_results(
+        app_result,
+        worker_result,
+        "Bevy worker shutdown also failed",
+    )
 }
 
 fn diagnostics_enabled() -> bool {
@@ -4109,163 +4345,177 @@ fn spawn_simulation_driver(
     command_drain: CommandDrainFn,
     controls: SimulationControl,
     running: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut last = Instant::now();
-        let mut accumulator = 0.0f32;
+    worker_failures: mpsc::Sender<BevyLifecycleFailure>,
+) -> Result<BevyWorker> {
+    thread::Builder::new()
+        .name("scriptbots-bevy-simulation".into())
+        .spawn(move || {
+            run_reported_worker("simulation worker", &worker_failures, &running, || {
+            let mut last = Instant::now();
+            let mut accumulator = 0.0f32;
 
-        while running.load(Ordering::Relaxed) {
-            let now = Instant::now();
-            let mut dt = (now - last).as_secs_f32();
-            last = now;
-            if !dt.is_finite() || dt > 0.25 {
-                dt = 0.25;
-            }
+            while running.load(Ordering::Acquire) {
+                let now = Instant::now();
+                let mut dt = (now - last).as_secs_f32();
+                last = now;
+                if !dt.is_finite() || dt > 0.25 {
+                    dt = 0.25;
+                }
 
-            let mut latched_step_failure = None;
-            if let Ok(mut world_guard) = world.lock() {
-                if let Some(error) = world_guard.latched_step_error() {
-                    latched_step_failure = Some(format!(
-                        "Simulation stopped after a terminal step failure: {error}"
-                    ));
-                } else {
-                    (command_drain.as_ref())(&mut world_guard);
-                    let pending = world_guard.drain_simulation_commands();
-                    if !pending.is_empty() {
-                        for command in pending {
-                            controls
-                                .update(|state| apply_simulation_command_to_state(state, &command));
+                let mut latched_step_failure = None;
+                {
+                    let mut world_guard = world.lock().map_err(|error| {
+                        anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
+                    })?;
+                    if let Some(error) = world_guard.latched_step_error() {
+                        latched_step_failure = Some(format!(
+                            "Simulation stopped after a terminal step failure: {error}"
+                        ));
+                    } else {
+                        (command_drain.as_ref())(&mut world_guard);
+                        let pending = world_guard.drain_simulation_commands();
+                        if !pending.is_empty() {
+                            for command in pending {
+                                controls.update(|state| {
+                                    apply_simulation_command_to_state(state, &command)
+                                });
+                            }
                         }
                     }
                 }
-            }
-            if let Some(reason) = latched_step_failure {
-                controls.update(|state| {
-                    state.paused = true;
-                    state.auto_pause_reason = Some(reason.clone());
-                });
-                accumulator = 0.0;
-                thread::sleep(Duration::from_millis(4));
-                continue;
-            }
-
-            let (paused, speed, step_once) = {
-                let mut paused = false;
-                let mut speed = 1.0;
-                let mut step_once = false;
-                controls.update(|state| {
-                    paused = state.paused;
-                    speed = state.speed_multiplier.clamp(MIN_SPEED, MAX_SPEED);
-                    if state.step_requested {
-                        step_once = true;
-                        state.step_requested = false;
+                if let Some(reason) = latched_step_failure {
+                    controls.update(|state| {
                         state.paused = true;
-                        state.auto_pause_reason = None;
-                    }
-                });
-                (paused, speed, step_once)
-            };
-
-            if paused && !step_once {
-                thread::sleep(Duration::from_millis(4));
-                continue;
-            }
-
-            if !step_once {
-                accumulator += dt * speed.max(0.0);
-                let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
-                accumulator = accumulator.min(max_accumulator);
-            }
-
-            let mut steps = if step_once {
-                accumulator = 0.0;
-                1
-            } else {
-                let mut queued = 0usize;
-                while accumulator >= SIM_TICK_INTERVAL && queued < MAX_SIM_STEPS_PER_FRAME {
-                    accumulator -= SIM_TICK_INTERVAL;
-                    queued += 1;
-                }
-                queued
-            };
-
-            if let Ok(mut world_guard) = world.lock() {
-                if steps == 0 && !step_once && speed <= MIN_SPEED {
-                    drop(world_guard);
+                        state.auto_pause_reason = Some(reason.clone());
+                    });
+                    accumulator = 0.0;
                     thread::sleep(Duration::from_millis(4));
                     continue;
                 }
 
-                if steps == 0 && step_once {
-                    steps = 1;
-                }
-
-                let mut step_failure = None;
-                for _ in 0..steps {
-                    if let Err(error) = world_guard.step() {
-                        step_failure = Some(format!(
-                            "Simulation stopped after a terminal step failure: {error}"
-                        ));
-                        break;
-                    }
-                }
-
-                let control = world_guard.config().control.clone();
-                let agent_count = world_guard.agent_count();
-                let max_age = world_guard.last_max_age();
-                let spike_hits = world_guard.last_spike_hits();
-
-                let step_failed = step_failure.is_some();
-                let mut reason = step_failure;
-                if reason.is_none() {
-                    if control.auto_pause_on_spike_hit && spike_hits > 0 {
-                        reason = Some(format!("Spike hits detected ({spike_hits})"));
-                    } else if let Some(age_limit) = control.auto_pause_age_above {
-                        if max_age >= age_limit {
-                            reason = Some(format!("Max age {max_age} ≥ {age_limit}"));
+                let (paused, speed, step_once) = {
+                    let mut paused = false;
+                    let mut speed = 1.0;
+                    let mut step_once = false;
+                    controls.update(|state| {
+                        paused = state.paused;
+                        speed = state.speed_multiplier.clamp(MIN_SPEED, MAX_SPEED);
+                        if state.step_requested {
+                            step_once = true;
+                            state.step_requested = false;
+                            state.paused = true;
+                            state.auto_pause_reason = None;
                         }
-                    } else if let Some(limit) = control.auto_pause_population_below
-                        && agent_count as u32 <= limit
-                    {
-                        reason = Some(format!("Population {agent_count} ≤ {limit}"));
-                    }
+                    });
+                    (paused, speed, step_once)
+                };
+
+                if paused && !step_once {
+                    thread::sleep(Duration::from_millis(4));
+                    continue;
                 }
 
-                if let Some(reason) = reason {
-                    controls.update(|state| {
-                        state.paused = true;
-                        state.auto_pause_reason = Some(reason.clone());
-                        state.step_requested = false;
-                    });
-                    if !step_failed
-                        && let Err(error) =
-                            world_guard.enqueue_simulation_command(SimulationCommand {
-                                paused: Some(true),
-                                speed_multiplier: Some(0.0),
-                                step_once: false,
-                            })
-                    {
-                        warn!(%error, "failed to queue Bevy auto-pause command");
-                    }
-                    if step_failed {
-                        warn!(%reason, "Bevy simulation paused after terminal step failure");
-                    } else {
-                        info!(%reason, "Bevy simulation auto-paused");
-                    }
-                } else if steps > 0 {
-                    controls.update(|state| {
-                        state.auto_pause_reason = None;
-                    });
+                if !step_once {
+                    accumulator += dt * speed.max(0.0);
+                    let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
+                    accumulator = accumulator.min(max_accumulator);
                 }
 
-                drop(world_guard);
-            }
+                let mut steps = if step_once {
+                    accumulator = 0.0;
+                    1
+                } else {
+                    let mut queued = 0usize;
+                    while accumulator >= SIM_TICK_INTERVAL && queued < MAX_SIM_STEPS_PER_FRAME {
+                        accumulator -= SIM_TICK_INTERVAL;
+                        queued += 1;
+                    }
+                    queued
+                };
 
-            if steps == 0 {
-                thread::sleep(Duration::from_millis(2));
+                {
+                    let mut world_guard = world.lock().map_err(|error| {
+                        anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
+                    })?;
+                    if steps == 0 && !step_once && speed <= MIN_SPEED {
+                        drop(world_guard);
+                        thread::sleep(Duration::from_millis(4));
+                        continue;
+                    }
+
+                    if steps == 0 && step_once {
+                        steps = 1;
+                    }
+
+                    let mut step_failure = None;
+                    for _ in 0..steps {
+                        if let Err(error) = world_guard.step() {
+                            step_failure = Some(format!(
+                                "Simulation stopped after a terminal step failure: {error}"
+                            ));
+                            break;
+                        }
+                    }
+
+                    let control = world_guard.config().control.clone();
+                    let agent_count = world_guard.agent_count();
+                    let max_age = world_guard.last_max_age();
+                    let spike_hits = world_guard.last_spike_hits();
+
+                    let step_failed = step_failure.is_some();
+                    let mut reason = step_failure;
+                    if reason.is_none() {
+                        if control.auto_pause_on_spike_hit && spike_hits > 0 {
+                            reason = Some(format!("Spike hits detected ({spike_hits})"));
+                        } else if let Some(age_limit) = control.auto_pause_age_above {
+                            if max_age >= age_limit {
+                                reason = Some(format!("Max age {max_age} ≥ {age_limit}"));
+                            }
+                        } else if let Some(limit) = control.auto_pause_population_below
+                            && agent_count as u32 <= limit
+                        {
+                            reason = Some(format!("Population {agent_count} ≤ {limit}"));
+                        }
+                    }
+
+                    if let Some(reason) = reason {
+                        controls.update(|state| {
+                            state.paused = true;
+                            state.auto_pause_reason = Some(reason.clone());
+                            state.step_requested = false;
+                        });
+                        if !step_failed
+                            && let Err(error) =
+                                world_guard.enqueue_simulation_command(SimulationCommand {
+                                    paused: Some(true),
+                                    speed_multiplier: Some(0.0),
+                                    step_once: false,
+                                })
+                        {
+                            warn!(%error, "failed to queue Bevy auto-pause command");
+                        }
+                        if step_failed {
+                            warn!(%reason, "Bevy simulation paused after terminal step failure");
+                        } else {
+                            info!(%reason, "Bevy simulation auto-paused");
+                        }
+                    } else if steps > 0 {
+                        controls.update(|state| {
+                            state.auto_pause_reason = None;
+                        });
+                    }
+
+                    drop(world_guard);
+                }
+
+                if steps == 0 {
+                    thread::sleep(Duration::from_millis(2));
+                }
             }
-        }
-    })
+                Ok(())
+            })
+        })
+        .context("failed to spawn Bevy simulation worker")
 }
 
 fn color_to_rgba(color: Color) -> [u8; 4] {
@@ -4284,6 +4534,193 @@ mod tests {
     use bevy::{MinimalPlugins, prelude::Messages};
     use scriptbots_core::ScriptBotsConfig;
     use std::sync::{Arc, Mutex};
+
+    fn worker_group(snapshot: BevyWorker, simulation: BevyWorker) -> BevyWorkerGroup {
+        BevyWorkerGroup {
+            running: Arc::new(AtomicBool::new(true)),
+            snapshot: Some(snapshot),
+            simulation: Some(simulation),
+        }
+    }
+
+    #[test]
+    fn bevy_error_exit_is_not_reported_as_success() {
+        let error = app_exit_result(AppExit::error()).expect_err("error exit must propagate");
+        assert!(error.to_string().contains("error code 1"));
+        app_exit_result(AppExit::Success).expect("success exit");
+    }
+
+    #[test]
+    fn post_start_worker_failure_cancels_siblings_and_requests_bevy_error_exit() {
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let first_failure = Arc::new(Mutex::new(None));
+        let running = Arc::new(AtomicBool::new(true));
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_non_send_resource(BevyLifecycleFailureInbox {
+                receiver: failure_rx,
+                first_failure: Arc::clone(&first_failure),
+            })
+            .add_systems(Update, poll_bevy_lifecycle_failures);
+
+        app.update();
+        assert!(app.should_exit().is_none());
+
+        let worker_running = Arc::clone(&running);
+        let worker = thread::spawn(move || {
+            run_reported_worker("snapshot worker", &failure_tx, &worker_running, || {
+                Err(anyhow!("injected post-startup failure"))
+            })
+        });
+        worker
+            .join()
+            .expect("reported worker must not panic")
+            .expect_err("injected worker failure must propagate");
+        app.update();
+
+        assert!(!running.load(Ordering::Acquire));
+        assert!(matches!(app.should_exit(), Some(AppExit::Error(_))));
+        assert_eq!(
+            first_failure.lock().expect("first failure").as_deref(),
+            Some("Bevy snapshot worker failed: injected post-startup failure")
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn worker_panic_is_converted_into_a_reported_failure() {
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let worker = thread::spawn(move || {
+            run_reported_worker(
+                "simulation worker",
+                &failure_tx,
+                &worker_running,
+                || -> Result<()> { panic!("injected supervised panic") },
+            )
+        });
+
+        let error = worker
+            .join()
+            .expect("panic must be caught at worker boundary")
+            .expect_err("caught panic must remain an error");
+        assert!(error.to_string().contains("injected supervised panic"));
+        assert!(!running.load(Ordering::Acquire));
+        let failure = failure_rx.recv().expect("reported worker failure");
+        assert_eq!(failure.component, "simulation worker");
+        assert!(failure.detail.contains("injected supervised panic"));
+    }
+
+    #[test]
+    fn control_health_transition_reports_once_and_requests_bevy_error_exit() {
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let first_failure = Arc::new(Mutex::new(None));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let health_checks = Arc::clone(&checks);
+        let health: ControlHealthFn = Arc::new(move || {
+            if health_checks.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(())
+            } else {
+                Err("control runtime stopped".to_string())
+            }
+        });
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_non_send_resource(BevyLifecycleFailureInbox {
+                receiver: failure_rx,
+                first_failure: Arc::clone(&first_failure),
+            })
+            .insert_resource(ControlHealthMonitor {
+                check: Some(health),
+                failures: failure_tx,
+                running: Arc::clone(&running),
+                failure_reported: false,
+            })
+            .add_systems(
+                Update,
+                (poll_control_health, poll_bevy_lifecycle_failures).chain(),
+            );
+
+        app.update();
+        assert!(app.should_exit().is_none());
+        app.update();
+
+        assert!(matches!(app.should_exit(), Some(AppExit::Error(_))));
+        assert!(!running.load(Ordering::Acquire));
+        assert_eq!(
+            first_failure.lock().expect("first failure").as_deref(),
+            Some("Bevy control plane failed: control runtime stopped")
+        );
+        app.update();
+        assert_eq!(checks.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn simulation_worker_panic_is_propagated() {
+        let snapshot = thread::spawn(|| -> Result<()> { Ok(()) });
+        let simulation =
+            thread::spawn(|| -> Result<()> { panic!("injected simulation-worker panic") });
+
+        let error = worker_group(snapshot, simulation)
+            .stop_and_join()
+            .expect_err("simulation panic must propagate");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("simulation worker panicked"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("injected simulation-worker panic"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn snapshot_worker_panic_is_propagated() {
+        let snapshot = thread::spawn(|| -> Result<()> { panic!("injected snapshot-worker panic") });
+        let simulation = thread::spawn(|| -> Result<()> { Ok(()) });
+
+        let error = worker_group(snapshot, simulation)
+            .stop_and_join()
+            .expect_err("snapshot panic must propagate");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("snapshot worker panicked"), "{rendered}");
+        assert!(
+            rendered.contains("injected snapshot-worker panic"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn worker_shutdown_clears_the_shared_running_flag_before_join() {
+        let running = Arc::new(AtomicBool::new(true));
+        let snapshot_flag = Arc::clone(&running);
+        let simulation_flag = Arc::clone(&running);
+        let snapshot = thread::spawn(move || -> Result<()> {
+            while snapshot_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            Ok(())
+        });
+        let simulation = thread::spawn(move || -> Result<()> {
+            while simulation_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            Ok(())
+        });
+        let workers = BevyWorkerGroup {
+            running: Arc::clone(&running),
+            snapshot: Some(snapshot),
+            simulation: Some(simulation),
+        };
+
+        workers.stop_and_join().expect("clean worker shutdown");
+        assert!(!running.load(Ordering::Acquire));
+    }
 
     #[test]
     fn bevy_offscreen_renderer_produces_png() -> Result<()> {

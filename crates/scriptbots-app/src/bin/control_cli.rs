@@ -25,7 +25,7 @@ use ratatui::{
 use reqwest::{Client, StatusCode};
 use scriptbots_app::{
     ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest, KnobEntry, KnobKind,
-    KnobUpdate, STORAGE_SIDECAR_SUFFIXES,
+    KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
 };
 use scriptbots_storage::StorageReader;
 use serde::de::DeserializeOwned;
@@ -46,7 +46,7 @@ struct Cli {
     #[arg(
         long,
         env = "SCRIPTBOTS_CONTROL_URL",
-        default_value = "http://127.0.0.1:8088"
+        default_value_t = default_control_rest_base_url()
     )]
     base_url: String,
 
@@ -482,12 +482,12 @@ async fn run_watch(client: Client, base_url: String, interval: Duration) -> Resu
 }
 
 fn watch_blocking(client: Client, base_url: String, interval: Duration) -> Result<()> {
-    enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, Hide).context("failed to enter alternate screen")?;
+    let cleanup = WatchTerminalGuard::begin_with(CrosstermWatchRestore, enable_raw_mode, || {
+        execute!(stdout, EnterAlternateScreen, Hide)
+    })?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
-    let _cleanup = TerminalCleanup;
 
     let handle = tokio::runtime::Handle::current();
     let mut previous: HashMap<String, Value> = HashMap::new();
@@ -534,7 +534,8 @@ fn watch_blocking(client: Client, base_url: String, interval: Duration) -> Resul
         }
     }
 
-    terminal.show_cursor().ok();
+    drop(terminal);
+    drop(cleanup);
     Ok(())
 }
 
@@ -652,13 +653,76 @@ fn draw_watch(frame: &mut Frame<'_>, rows: &[WatchRow], error: Option<&str>, int
     frame.render_widget(table, layout[1]);
 }
 
-struct TerminalCleanup;
+trait WatchTerminalRestore {
+    fn show_cursor(&mut self);
+    fn leave_alternate_screen(&mut self);
+    fn disable_raw_mode(&mut self);
+}
 
-impl Drop for TerminalCleanup {
-    fn drop(&mut self) {
+struct CrosstermWatchRestore;
+
+impl WatchTerminalRestore for CrosstermWatchRestore {
+    fn show_cursor(&mut self) {
+        let _ = execute!(io::stdout(), Show);
+    }
+
+    fn leave_alternate_screen(&mut self) {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+
+    fn disable_raw_mode(&mut self) {
         let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+    }
+}
+
+struct WatchTerminalGuard<R: WatchTerminalRestore> {
+    restore: R,
+    raw_mode_may_be_enabled: bool,
+    alternate_screen_may_be_entered: bool,
+    cursor_may_be_hidden: bool,
+}
+
+impl<R: WatchTerminalRestore> WatchTerminalGuard<R> {
+    fn begin_with<EnableRaw, EnterTerminal>(
+        restore: R,
+        enable_raw: EnableRaw,
+        enter_terminal: EnterTerminal,
+    ) -> Result<Self>
+    where
+        EnableRaw: FnOnce() -> io::Result<()>,
+        EnterTerminal: FnOnce() -> io::Result<()>,
+    {
+        let mut guard = Self {
+            restore,
+            raw_mode_may_be_enabled: true,
+            alternate_screen_may_be_entered: false,
+            cursor_may_be_hidden: false,
+        };
+        enable_raw().context("failed to enable raw mode")?;
+
+        // Escape-sequence writes can take effect before a later flush reports
+        // an error. Conservatively arm both compensating actions first.
+        guard.alternate_screen_may_be_entered = true;
+        guard.cursor_may_be_hidden = true;
+        enter_terminal().context("failed to enter alternate screen")?;
+        Ok(guard)
+    }
+}
+
+impl<R: WatchTerminalRestore> Drop for WatchTerminalGuard<R> {
+    fn drop(&mut self) {
+        if self.cursor_may_be_hidden {
+            self.restore.show_cursor();
+            self.cursor_may_be_hidden = false;
+        }
+        if self.alternate_screen_may_be_entered {
+            self.restore.leave_alternate_screen();
+            self.alternate_screen_may_be_entered = false;
+        }
+        if self.raw_mode_may_be_enabled {
+            self.restore.disable_raw_mode();
+            self.raw_mode_may_be_enabled = false;
+        }
     }
 }
 
@@ -918,11 +982,79 @@ fn json_pointer(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use clap::CommandFactory;
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+    };
 
     use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
     use scriptbots_storage::{RunLedgerSummary, Storage};
     use tempfile::tempdir;
+
+    #[test]
+    fn cli_default_base_url_comes_from_the_server_socket_authority() {
+        let command = Cli::command();
+        let default = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "base_url")
+            .and_then(|argument| argument.get_default_values().first())
+            .and_then(|value| value.to_str());
+        let expected = default_control_rest_base_url();
+        assert_eq!(default, Some(expected.as_str()));
+    }
+
+    #[derive(Clone)]
+    struct FakeWatchRestore(Arc<Mutex<Vec<&'static str>>>);
+
+    impl WatchTerminalRestore for FakeWatchRestore {
+        fn show_cursor(&mut self) {
+            self.0.lock().expect("operations").push("show");
+        }
+
+        fn leave_alternate_screen(&mut self) {
+            self.0.lock().expect("operations").push("leave");
+        }
+
+        fn disable_raw_mode(&mut self) {
+            self.0.lock().expect("operations").push("disable");
+        }
+    }
+
+    #[test]
+    fn watch_setup_failure_conservatively_restores_every_possible_side_effect() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let result = WatchTerminalGuard::begin_with(
+            FakeWatchRestore(Arc::clone(&operations)),
+            || Ok(()),
+            || Err(io::Error::other("injected terminal setup failure")),
+        );
+        let error = match result {
+            Ok(_) => panic!("terminal setup failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.root_cause().to_string(),
+            "injected terminal setup failure"
+        );
+        assert_eq!(
+            *operations.lock().expect("operations"),
+            vec!["show", "leave", "disable"]
+        );
+    }
+
+    #[test]
+    fn watch_raw_mode_failure_still_runs_idempotent_rollback() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let result = WatchTerminalGuard::begin_with(
+            FakeWatchRestore(Arc::clone(&operations)),
+            || Err(io::Error::other("injected raw-mode failure")),
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(*operations.lock().expect("operations"), vec!["disable"]);
+    }
 
     #[test]
     fn non_finite_and_unrepresentable_float_text_is_not_silently_normalized() {

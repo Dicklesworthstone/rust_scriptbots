@@ -104,7 +104,10 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 ```
 
 - Background workers: `StoragePipeline` is a bounded-admission writer whose dedicated thread creates and exclusively owns its FrankenSQLite connection; `ControlRuntime` (Tokio) is separately isolated. A successful enqueue is not a durability receipt: flush or shutdown must acknowledge the earlier transactions. The core drains commands inside the tick loop for deterministic application.
-- Renderers are read-only consumers of world and analytics snapshots; they do not mutate simulation state, query the database, or wait on a storage mutex during paint.
+- Startup is fail-closed and transactional. Renderer selection and control-environment validation happen first, then every enabled REST/MCP socket is prebound and held before configuration output, auto-tuning, process-priority changes, world construction, or storage reservation. Launch consumes those exact listeners, so a bind failure cannot leave config, tuning, or run-database artifacts behind and cannot race a later rebind.
+- REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
+- That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
+- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The presentation boundary is not yet complete, however: GPUI now contains its characterized double-drive by making the HUD the sole interim simulation driver and the world window read-only, but scientific time still belongs to a renderer and GPUI's inner command queue remains incorrect; Bevy still owns a simulation worker. Moving all scientific time and command authority into `HostCore` remains explicit roadmap work, and the interim containment is not the architectural fix.
 - Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
 
 ### Crate roles
@@ -122,6 +125,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - Workspace scaffolding, shared lints, and profiles are in place.
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
 - `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
+- `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
 - `scriptbots-brain-neuro`: NeuroFlow-backed brain available behind the `neuro` feature (runtime toggles below).
 - `scriptbots-storage`: the exact FrankenSQLite source is pinned; its bounded worker now has a file-backed durable outbox, stable per-batch identities, monotonic admitted/applied/durable watermarks, ordered startup recovery, controller wait deadlines, supervised worker ownership, and real child-process exit/reopen tests at the admitted and applied boundaries. Deadlines do not cancel an in-flight database call or bound the supervised reaper. Exact recovery identity/schema proof, remaining direct-write hardening, multi-run schemas, strict-run host policy, and full command/replay journals remain tracked in the active plan.
@@ -184,10 +188,10 @@ RUST_LOG=info cargo run -p scriptbots-app
   ```bash
   SCRIPTBOTS_MODE=terminal cargo run -p scriptbots-app
   ```
-- Auto fallback: `SCRIPTBOTS_MODE=auto` (default) will drop into terminal mode if no GUI backend is available (e.g., SSH sessions).
-- Override detection:
-  - `SCRIPTBOTS_FORCE_TERMINAL=1` → force terminal even when a display server is present.
-  - `SCRIPTBOTS_FORCE_GUI=1` → keep GPUI even if no display variables are set (may still fail if the OS truly lacks a GUI).
+- Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
+- Auto-mode policy overrides:
+  - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.
+  - `SCRIPTBOTS_FORCE_GUI=1` → require compiled GPUI in Auto mode even if no display variables are set; unavailable features and launch failures are errors, never terminal fallbacks.
 - CI/headless smoke runs can bypass raw TTY requirements by setting `SCRIPTBOTS_TERMINAL_HEADLESS=1`, which drives the renderer against an in-memory buffer for a few frames.
 
 - Emoji mode (terminal renderer):
@@ -418,10 +422,11 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 
 ### Command-line options (scriptbots-app)
 - `--mode {auto|gui|bevy|terminal}`: select renderer. Defaults to `auto` and can be set via `SCRIPTBOTS_MODE`.
-  - `auto`: use GPUI when a display is detected; otherwise fall back to terminal.
-  - `gui`: force GPUI; may fail on headless systems.
-  - `bevy`: force the Bevy frontend when built with the `bevy_render` application feature.
+  - `auto`: choose GPUI, then Bevy, only when that backend is compiled and a real native graphical session is available; otherwise use the terminal.
+  - `gui`: require GPUI; an uncompiled feature or native window launch failure is returned to the caller.
+  - `bevy`: require the Bevy frontend and fail clearly unless built with the `bevy_render` application feature.
   - `terminal`: force emoji TUI.
+- `--bootstrap-ticks N`: explicitly run `N` science ticks after seeding and before frontend launch (default `120`; use `0` to launch at tick zero).
  - `--dump-png <FILE>` (GUI builds): write an offscreen PNG and exit (no UI). Pair with `--png-size WxH`.
  - `--png-size WxH` (GUI builds): snapshot size for `--dump-png` (e.g., `1280x720`).
  - `--debug-watermark`: overlay a tiny diagnostics watermark in the render canvas.
@@ -446,7 +451,8 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
 - `RAYON_NUM_THREADS` — set simulation thread pool size when `parallel` is enabled.
 - `SCRIPTBOTS_MODE` — `auto|gui|bevy|terminal` (renderer selection).
-- `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — hard override renderer detection (`1|true|yes`).
+- `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — override Auto-mode renderer detection (`1|true|yes`); explicit `--mode` remains authoritative.
+- `SCRIPTBOTS_BOOTSTRAP_TICKS` — explicit pre-frontend science ticks (default `120`, equivalent to `--bootstrap-ticks`).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
 - `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
 - `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.
@@ -462,11 +468,13 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - `SCRIPTBOTS_CONTROL_REST_ENABLED` — `true|false`.
 - `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
 - `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
+- Control-server environment is validated before startup side effects. Malformed or non-Unicode control values fail closed; `https://` in either MCP transport/address setting is rejected because the embedded MCP listener is plaintext HTTP rather than silently claiming TLS.
 - `SCRIPTBOTS_STORAGE_PATH` — optional new-run FrankenSQLite file path. Without it, ScriptBots creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`. In either case the app reserves the path with create-new semantics and refuses an existing database or stale `-wal`, `-shm`, `-journal`, `-wal-fec`, or lock sidecar. The selected path is printed as `Run database: ...`; save that exact value for later reads and exports.
 - `SCRIPTBOTS_RECOVER_STORAGE` — existing file-backed run to repair and finalize, equivalent to `--recover-storage FILE`. Recovery exits after persistence repair; it does not resume the simulation because world checkpoint restoration is separate roadmap work.
 
 ### Dual-window mode (GUI)
-- On capable desktops, ScriptBots opens two GPUI windows: a canvas window rendering the world and a HUD window with controls, charts, and inspector. If a second window cannot be created (WM limits/remote desktop), the app falls back to a single-window overlay layout automatically.
+- ScriptBots opens two GPUI windows as one transactional launch: a canvas window rendering the world and a HUD window with controls, charts, and inspector. If either window cannot be created (for example because of window-manager or remote-session limits), ScriptBots terminates the partial application lifetime and returns an actionable error; it never silently changes the requested layout. GPUI uses `QuitMode::LastWindowClosed`, and closing either member of the paired session closes the application rather than leaving one orphaned window or a hidden process alive.
+- This is lifecycle hardening plus interim double-drive containment: the HUD is the only current GPUI simulation driver and the world window is read-only. It is not the final ownership fix—the renderer still owns scientific time and GPUI command draining remains incorrect. The `HostCore` migration owns both remaining defects and the permanent exactly-one-driver proof.
 
 ## Simulation overview
 Deterministic, staged tick pipeline (seeded RNG; stable ordering):
@@ -532,7 +540,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - **Analytics**: attacker/victim flags (carnivore/herbivore), births/deaths, hybrid markers, age/boost tracking, and per-tick summaries feed FrankenSQLite plus the immutable HUD analytics snapshot.
 
 ## Rendering & UX
-- GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes). Dual-window layout opens a HUD window and a simulation canvas window; a single-window overlay fallback is used when needed.
+- GPUI window, HUD, and canvas renderer for food tiles and agents (circles/spikes). The dual-window HUD and simulation canvas launch transactionally under `QuitMode::LastWindowClosed`; closing either paired window ends the session, so a launch/close failure cannot leave a degraded or orphaned UI. The world window is read-only while the HUD temporarily remains the sole driver pending `HostCore`.
 - Camera controls: pan/zoom; keyboard bindings for pause, draw toggle, speed ±.
 - Overlays: selection highlights, diagnostics panel; charts and advanced overlays are staged in the plan.
 - Functional search: the settings panel includes a live search bar that filters parameters across all categories via a centralized filter, making it fast to find and tweak knobs.
@@ -563,17 +571,17 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
 
 ### Terminal mode
-The implemented Ratatui frontend provides an emoji-rich dashboard, headless snapshot mode, and automatic fallback when GPUI cannot start.
+The implemented Ratatui frontend provides an emoji-rich dashboard and headless snapshot mode. Automatic selection chooses it only before launch; an explicit GPUI/Bevy request or a native window launch failure is surfaced rather than silently changing products.
 
 #### Terminal-only mode
 - Force the emoji TUI renderer (useful on headless machines):
   ```bash
   SCRIPTBOTS_MODE=terminal cargo run -p scriptbots-app
   ```
-- Auto fallback: `SCRIPTBOTS_MODE=auto` (default) will drop into terminal mode if no GUI backend is available (e.g., SSH sessions).
-- Override detection:
-  - `SCRIPTBOTS_FORCE_TERMINAL=1` → force terminal even when a display server is present.
-  - `SCRIPTBOTS_FORCE_GUI=1` → keep GPUI even if no display variables are set (may still fail if the OS truly lacks a GUI).
+- Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses a compiled native renderer only for a real native graphical session and otherwise starts the terminal (including macOS SSH sessions).
+- Auto-mode policy overrides:
+  - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.
+  - `SCRIPTBOTS_FORCE_GUI=1` → require compiled GPUI in Auto mode even if no display variables are set; failures remain visible.
 - CI/headless smoke runs can bypass raw TTY requirements by setting `SCRIPTBOTS_TERMINAL_HEADLESS=1`, which drives the renderer against an in-memory buffer for a few frames.
 
 - Emoji mode (terminal renderer):
@@ -588,9 +596,9 @@ Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baselin
 
 ## Storage & analytics
 
-- **One embedded engine:** ScriptBots uses the public `fsqlite` facade from FrankenSQLite with `version = "=0.1.16"`, pinned to immutable revision `cd9990bb16291d8c7c247b75b47faae8d7701adb` at `https://github.com/Dicklesworthstone/frankensqlite`. The current dependency enables `native` with default features disabled.
+- **One embedded engine:** ScriptBots uses the public `fsqlite` facade from FrankenSQLite with `version = "=0.1.16"`, pinned to immutable revision `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` at `https://github.com/Dicklesworthstone/frankensqlite`. The current dependency enables `native` with default features disabled and provides create-free existing-file open plus expected-identity verification before recovery can read or mutate database bytes.
 - **Two storage targets:** `--storage file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a generated `runs/scriptbots-<unix-ms>-<pid>.sqlite` and prints the selected run database; it refuses reuse or stale sidecars. `--storage memory` opens volatile `:memory:` through the same implementation.
-- **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) is the only application path that opens an existing run database for mutation. It holds the OS writer lease, checks the supported migration pair and persistence invariants, and refuses missing, unrelated, symlink, and multiply-linked files before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. This is persistence repair, not world resume. Identity-bound open and an exact structural schema fingerprint remain open under `bd-2z0.8.9.4.2`.
+- **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) is the only application path that opens an existing run database for mutation. It holds the OS writer lease, binds recovery to the identity of the already-open VFS handle, verifies the exact structural schema fingerprint plus supported migration pair and persistence invariants, and refuses missing, replaced, unrelated, symlink, and multiply-linked files before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. This is persistence repair, not world resume.
 - **Thread-confined, single-writer connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. File writers hold a nonblocking OS advisory lease on a persistent companion lock file; process-local path/inode tracking is only defense in depth. No connection-owning value is shared through `Arc<Mutex<_>>`.
 - **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. Configurable `StorageDeadlines` bound startup, admission-gate, command-enqueue, receipt, flush, and shutdown acknowledgement waits, but cannot cancel a database call already executing on the owner thread or bound the supervised reaper. Validation, closed-gate, queue-send, and rolled-back outbox failures are definitely `NotAdmitted`; the world retains the exact completed batch, latches the fault, and blocks later science ticks until explicit retry succeeds. A lost or timed-out acknowledgement remains typed as `Indeterminate` at the world boundary, but retrying the unchanged canonical payload is idempotent and reuses its stable batch ID; a conflicting payload is rejected by its BLAKE3 identity. Timed-out shutdown retains the exact pending receipt and worker handle for retry; dropping the controller hands both to an independent supervised reaper rather than abandoning connection ownership. `submit_with_receipt` returns the batch ID after the exact payload enters the worker outbox and reports `Durable` for a file database or `CommittedVolatile` for memory. That receipt proves admission, not scientific-table application. Remaining direct-write/root-cause unification is tracked by `bd-2z0.8.9.4.4`.
 - **Durable recovery and watermarks:** each file-backed batch advances three monotonic, separately queryable prefixes: `admitted` after the outbox transaction, `applied` in the same transaction as all scientific-table rows, and `durable` in a later marker transaction that permits outbox-payload compaction. Startup replays admitted-but-unapplied payloads in order and finalizes applied-but-not-durable batches without duplicating rows. Exact duplicate retries reuse the original batch identity; a different payload for an already admitted tick is rejected. Flush and shutdown receipts include all three watermarks.
@@ -669,6 +677,8 @@ JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. 
 - Prefer structured fields (e.g., `tick = summary.tick.0`) for machine-readable logs. Avoid panics in production; release profile uses `panic = abort`.
 
 ## Runtime control surfaces
+
+For an interactive run, ScriptBots parses the control environment and transactionally reserves every enabled REST/MCP socket before writing config output, tuning, changing process priority, constructing the world, or reserving FrankenSQLite storage. The runtime adopts those exact listeners. REST and MCP are supervised independently; an unexpected exit from either stops the other, publishes failed health, and causes the active TUI, GPUI, or Bevy frontend to return the preserved root error.
 
 ### REST Control API (with Swagger UI)
 - Default address: `http://127.0.0.1:8088` (override `SCRIPTBOTS_CONTROL_REST_ADDR`)
@@ -833,7 +843,7 @@ MCP quickstart:
   - Long-running research experiments that demand bitwise-stable replays.
 
 ## Security & operations
-- REST and MCP servers bind to loopback by default. If you expose them externally, front with TLS and configure CORS appropriately. The WASM path requires COOP/COEP headers only when enabling multithreading; single-thread builds avoid this.
+- REST and MCP servers bind to loopback by default and are plaintext HTTP. If you expose them externally, terminate TLS in a separate trusted proxy and configure CORS appropriately; `https://` control settings fail closed rather than pretending the embedded listener implements TLS. The WASM path requires COOP/COEP headers only when enabling multithreading; single-thread builds avoid this.
 
 ### Configuration knobs (examples)
 All configuration can be inspected and updated at runtime via REST/CLI/MCP. Common knobs:
