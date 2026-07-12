@@ -641,6 +641,7 @@ impl Brain for NeuroflowBrain {
         Some(BrainActivations {
             layers: result_layers,
             connections: Vec::new(),
+            truncated: false,
         })
     }
 }

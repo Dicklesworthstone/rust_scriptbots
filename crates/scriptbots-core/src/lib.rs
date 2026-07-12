@@ -28,6 +28,13 @@ pub struct BrainActivations {
     pub layers: Vec<ActivationLayer>,
     #[serde(default)]
     pub connections: Vec<ActivationEdge>,
+    /// Set when the snapshot was clipped to fit [`ACTIVATION_VALUE_BUDGET`].
+    ///
+    /// An inspector showing a truncated view must say so. Silently dropping
+    /// layers would let a user conclude a brain has no deep structure when in
+    /// fact we simply refused to copy it.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +116,42 @@ pub const NUM_EYES: usize = 4;
 /// time; a small budget covers every real use while keeping the cost
 /// population-independent.
 pub const ACTIVATION_CAPTURE_BUDGET: usize = 8;
+
+/// Maximum number of activation values copied out of a single brain per tick.
+///
+/// Bounding *how many* agents are captured is not enough: one agent's snapshot
+/// must also be bounded in size. Brain topology is configuration (a Neuroflow
+/// net can be declared with arbitrarily wide hidden layers), so without a cap a
+/// single inspected agent could copy megabytes out of the simulation every tick.
+/// Snapshots past this budget are clipped and marked
+/// [`BrainActivations::truncated`] — never silently shortened.
+pub const ACTIVATION_VALUE_BUDGET: usize = 4_096;
+
+/// Clip an activation snapshot to [`ACTIVATION_VALUE_BUDGET`] values.
+///
+/// Whole layers are kept or dropped rather than partially copied: half a layer
+/// is a lie about the shape of the network.
+fn clamp_activations(mut activations: BrainActivations) -> BrainActivations {
+    let mut budget = ACTIVATION_VALUE_BUDGET;
+    let mut kept = Vec::with_capacity(activations.layers.len());
+    let mut truncated = false;
+    for layer in activations.layers {
+        if layer.values.len() <= budget {
+            budget -= layer.values.len();
+            kept.push(layer);
+        } else {
+            truncated = true;
+        }
+    }
+    activations.layers = kept;
+    activations.truncated = truncated;
+    if truncated {
+        // Edges index into layers we may have dropped; a dangling edge would
+        // paint a connection to a node the viewer cannot see.
+        activations.connections.clear();
+    }
+    activations
+}
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
 const HALF_TURN: f32 = std::f32::consts::PI;
@@ -1324,6 +1367,75 @@ struct ActuationDelta {
     velocity: Velocity,
     position: Position,
     health_delta: f32,
+}
+
+/// One neighbour's share of what an agent currently perceives.
+///
+/// Every field is the *delta this neighbour added*, in the same units the
+/// sensor vector uses before clamping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorContribution {
+    /// The neighbour responsible.
+    pub source: AgentId,
+    /// Bearing from the observer's heading, in radians, wrapped to [-pi, pi].
+    pub bearing: f32,
+    /// Toroidal distance to the neighbour.
+    pub distance: f32,
+    /// The neighbour's body colour, as the observer sees it.
+    pub color: [f32; 3],
+    /// Density added to each eye.
+    pub eye_density: [f32; NUM_EYES],
+    /// Red/green/blue added to each eye.
+    pub eye_rgb: [[f32; 3]; NUM_EYES],
+    /// Smell added (pre trait multiplier).
+    pub smell: f32,
+    /// Movement noise added (pre trait multiplier).
+    pub sound: f32,
+    /// Deliberate signal added (pre trait multiplier).
+    pub hearing: f32,
+    /// Blood added (pre trait multiplier).
+    pub blood: f32,
+    /// Ranking key: total sensory energy this neighbour contributed.
+    pub total: f32,
+}
+
+/// What an agent perceives right now, and *why*.
+///
+/// # Which tick does this describe?
+///
+/// It describes the world **as it stands**, i.e. what the agent's next
+/// sensing pass will see. It deliberately does NOT try to reproduce
+/// `AgentRuntime::sensors`, because those were computed in `stage_sense`
+/// from the positions agents held *before* actuation moved them — the world
+/// that produced them no longer exists. Claiming to explain a vector while
+/// silently using different positions would be the worst possible outcome:
+/// an explanation that looks authoritative and is wrong.
+///
+/// The honest contract, which the tests enforce, is: step the world and the
+/// next `runtime.sensors` will match [`SensorAttribution::clamped`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorAttribution {
+    /// Observer.
+    pub agent: AgentId,
+    /// Tick the attribution was taken at.
+    pub tick: Tick,
+    /// Sensor values *before* clamping. Contributions sum to these.
+    pub raw: [f32; INPUT_SIZE],
+    /// Sensor values after clamping — what a brain actually receives.
+    pub clamped: [f32; INPUT_SIZE],
+    /// Channels whose raw value exceeded the clamp.
+    ///
+    /// This mask is not a nicety. Contributions routinely sum above 1.0, so
+    /// a panel listing contributors totalling 2.4 beside a displayed value
+    /// of 1.0 looks broken — and the "fix" someone reaches for is to
+    /// normalise the contributors, which destroys the information. Saying
+    /// "saturated" is the difference between a confusing panel and a
+    /// truthful one.
+    pub saturated: [bool; INPUT_SIZE],
+    /// Contributing neighbours, strongest first. Bounded.
+    pub contributions: Vec<SensorContribution>,
+    /// How many contributors were dropped to honour the bound.
+    pub truncated: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6551,6 +6663,233 @@ impl WorldState {
         }
     }
 
+    /// Explain what `agent` currently perceives, attributing the neighbour-derived
+    /// channels to the neighbours responsible.
+    ///
+    /// Attribution is computed here, in core, and never re-derived in a UI: the
+    /// falloff is subtle (a trait multiplier, a legacy proximity factor on the
+    /// density channel only, and trait multipliers applied *after* the neighbour
+    /// loop), and a frontend that re-implements it will get it slightly wrong and
+    /// then display the wrong explanation with total confidence.
+    ///
+    /// Only the probed agent is ever explained — this is an on-demand,
+    /// population-independent query (see `ACTIVATION_CAPTURE_BUDGET` for the same
+    /// principle applied to brain activations).
+    ///
+    /// Returns `None` if the agent is gone.
+    #[must_use]
+    pub fn explain_sensors(
+        &self,
+        agent: AgentId,
+        max_contributors: usize,
+    ) -> Option<SensorAttribution> {
+        let idx = self.agents.index_of(agent)?;
+        let observer = self.runtime.get(agent)?;
+        let columns = self.agents.columns();
+        let positions = columns.positions();
+        let colors = columns.colors();
+        let healths = columns.health();
+        let velocities = columns.velocities();
+        let headings = columns.headings();
+
+        let position = positions[idx];
+        let heading = headings[idx];
+        let traits = observer.trait_modifiers;
+        let radius = self.config.sense_radius;
+        let radius_sq = radius * radius;
+        let world_width = self.config.world_width as f32;
+        let world_height = self.config.world_height as f32;
+        let max_speed = (self.config.bot_speed * self.config.boost_multiplier).max(1e-3);
+        let (hx, hy) = (heading.cos(), heading.sin());
+        let cos_bhf = BLOOD_HALF_FOV.cos();
+
+        let mut eye_dirs = [0.0f32; NUM_EYES];
+        let mut eye_fovs = [1.0f32; NUM_EYES];
+        for eye in 0..NUM_EYES {
+            eye_dirs[eye] = wrap_signed_angle(heading + observer.eye_direction[eye]);
+            eye_fovs[eye] = observer.eye_fov[eye].max(0.01);
+        }
+
+        let mut density = [0.0f32; NUM_EYES];
+        let mut eye_r = [0.0f32; NUM_EYES];
+        let mut eye_g = [0.0f32; NUM_EYES];
+        let mut eye_b = [0.0f32; NUM_EYES];
+        let (mut smell, mut sound, mut hearing, mut blood) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let mut contributions: Vec<SensorContribution> = Vec::new();
+
+        // A full scan rather than a spatial-index query: the index holds the
+        // membership of whichever stage last rebuilt it, and an explanation
+        // computed against stale buckets would omit real contributors. This runs
+        // for one agent, on demand, so O(n) is the right trade.
+        for (other_idx, other_id) in self.agents.iter_handles().enumerate() {
+            if other_idx == idx {
+                continue;
+            }
+            let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
+            let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
+            let dist_sq = dx.mul_add(dx, dy * dy);
+            if dist_sq <= f32::EPSILON || dist_sq > radius_sq {
+                continue;
+            }
+            let dist = dist_sq.sqrt();
+            let dist_factor = (radius - dist) / radius;
+            if dist_factor <= 0.0 {
+                continue;
+            }
+            let ang = angle_to(dx, dy);
+            let color = colors[other_idx];
+
+            let mut share = SensorContribution {
+                source: other_id,
+                bearing: wrap_signed_angle(ang - heading),
+                distance: dist,
+                color,
+                eye_density: [0.0; NUM_EYES],
+                eye_rgb: [[0.0; 3]; NUM_EYES],
+                smell: 0.0,
+                sound: 0.0,
+                hearing: 0.0,
+                blood: 0.0,
+                total: 0.0,
+            };
+
+            for eye in 0..NUM_EYES {
+                let diff = angle_difference(eye_dirs[eye], ang);
+                let fov = eye_fovs[eye];
+                if diff >= fov {
+                    continue;
+                }
+                let fov_factor = ((fov - diff) / fov).max(0.0);
+                let intensity = traits.eye * fov_factor * dist_factor;
+                // The density channel alone carries the legacy proximity factor.
+                let density_delta = intensity * (dist / radius);
+                share.eye_density[eye] = density_delta;
+                share.eye_rgb[eye] = [
+                    intensity * color[0],
+                    intensity * color[1],
+                    intensity * color[2],
+                ];
+                density[eye] += density_delta;
+                eye_r[eye] += intensity * color[0];
+                eye_g[eye] += intensity * color[1];
+                eye_b[eye] += intensity * color[2];
+            }
+
+            let velocity = velocities[other_idx];
+            let speed_norm = ((velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt()
+                / max_speed)
+                .clamp(0.0, 1.0);
+            let emitter = self
+                .runtime
+                .get(other_id)
+                .map_or(0.0, |rt| rt.sound_multiplier);
+
+            share.smell = dist_factor;
+            share.sound = dist_factor * speed_norm;
+            share.hearing = dist_factor * emitter;
+            smell += share.smell;
+            sound += share.sound;
+            hearing += share.hearing;
+
+            let align = hx * (dx / dist) + hy * (dy / dist);
+            if align >= cos_bhf {
+                let forward_diff = angle_difference(heading, ang);
+                share.blood =
+                    blood_sensor_contribution(forward_diff, dist_factor, healths[other_idx]);
+                blood += share.blood;
+            }
+
+            share.total = share.eye_density.iter().sum::<f32>()
+                + share
+                    .eye_rgb
+                    .iter()
+                    .map(|rgb| rgb[0] + rgb[1] + rgb[2])
+                    .sum::<f32>()
+                + share.smell
+                + share.sound
+                + share.hearing
+                + share.blood;
+            contributions.push(share);
+        }
+
+        // Trait multipliers apply to the ACCUMULATED totals, after the neighbour
+        // loop — exactly as stage_sense does. Folding them in per-neighbour would
+        // be plausible-looking and wrong.
+        smell *= traits.smell;
+        sound *= traits.sound;
+        hearing *= traits.hearing;
+        blood *= traits.blood;
+
+        let cell_size = self.config.food_cell_size as f32;
+        let food_width = self.food.width();
+        let food_height = self.food.height();
+        let food_max = self.config.food_max;
+        let cell_x = ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
+        let cell_y =
+            ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
+        let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
+        let food_value = self.food.cells().get(food_idx).copied().unwrap_or(0.0) / food_max;
+
+        let tick_value = self.tick.0 as f32;
+        let clocks = observer.clocks;
+        let env_temperature = sample_temperature(&self.config, position.x);
+        let discomfort = temperature_discomfort(env_temperature, observer.temperature_preference);
+
+        let mut raw = [0.0f32; INPUT_SIZE];
+        raw[0] = density[0];
+        raw[1] = eye_r[0];
+        raw[2] = eye_g[0];
+        raw[3] = eye_b[0];
+        raw[4] = food_value;
+        raw[5] = density[1];
+        raw[6] = eye_r[1];
+        raw[7] = eye_g[1];
+        raw[8] = eye_b[1];
+        raw[9] = sound;
+        raw[10] = smell;
+        raw[11] = healths[idx] * 0.5;
+        raw[12] = density[2];
+        raw[13] = eye_r[2];
+        raw[14] = eye_g[2];
+        raw[15] = eye_b[2];
+        raw[16] = (tick_value / clocks[0].max(1.0)).sin().abs();
+        raw[17] = (tick_value / clocks[1].max(1.0)).sin().abs();
+        raw[18] = hearing;
+        raw[19] = blood;
+        raw[20] = discomfort;
+        raw[21] = density[3];
+        raw[22] = eye_r[3];
+        raw[23] = eye_g[3];
+        raw[24] = eye_b[3];
+
+        let mut clamped = [0.0f32; INPUT_SIZE];
+        let mut saturated = [false; INPUT_SIZE];
+        for i in 0..INPUT_SIZE {
+            clamped[i] = clamp01(raw[i]);
+            saturated[i] = raw[i] > 1.0;
+        }
+
+        // Deterministic, total order: strongest first, ties broken by a stable
+        // agent identity so the same world always explains itself the same way.
+        contributions.sort_by(|a, b| {
+            b.total
+                .total_cmp(&a.total)
+                .then_with(|| a.source.data().as_ffi().cmp(&b.source.data().as_ffi()))
+        });
+        let truncated = contributions.len().saturating_sub(max_contributors);
+        contributions.truncate(max_contributors);
+
+        Some(SensorAttribution {
+            agent,
+            tick: self.tick,
+            raw,
+            clamped,
+            saturated,
+            contributions,
+            truncated,
+        })
+    }
+
     fn default_outputs(inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
         let mut outputs = [0.0; OUTPUT_SIZE];
         let limit = OUTPUT_SIZE.min(INPUT_SIZE);
@@ -6609,7 +6948,7 @@ impl WorldState {
                 // them for every agent allocates layer buffers across the
                 // whole population every tick.
                 if job.capture {
-                    job.activations = runner.snapshot_activations();
+                    job.activations = runner.snapshot_activations().map(clamp_activations);
                 }
             } else {
                 job.outputs = Self::default_outputs(&job.sensors);
@@ -11810,6 +12149,217 @@ mod tests {
         assert_eq!(run(), run(), "same seed must yield the same story");
     }
 
+    /// The attribution must reproduce core's own sensing, or the inspector is
+    /// confidently lying to the user — the worst possible outcome for a panel
+    /// whose entire job is to explain.
+    ///
+    /// The proof: explain what the agent perceives now, then step the world once
+    /// (stage_sense runs before anything moves, so it senses exactly the world we
+    /// just explained) and require core's sensors to match what we predicted.
+    #[test]
+    fn explain_sensors_reproduces_the_sensors_core_itself_computes() {
+        // Freeze the food economy so sensor[4] cannot drift between the
+        // explanation and the step; every other channel is position-derived.
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.4,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            rng_seed: Some(77),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let observer = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            heading: 0.0,
+            health: 1.0,
+            ..AgentData::default()
+        });
+        // Neighbours spread around the observer so several eyes and the blood
+        // cone are all exercised.
+        for (dx, dy, health) in [(30.0, 0.0, 0.4), (20.0, 20.0, 1.5), (-25.0, 10.0, 1.0)] {
+            world.spawn_agent(AgentData {
+                position: Position::new(100.0 + dx, 100.0 + dy),
+                heading: 1.0,
+                health,
+                color: [0.9, 0.2, 0.5],
+                ..AgentData::default()
+            });
+        }
+
+        let attribution = world
+            .explain_sensors(observer, 16)
+            .expect("observer exists");
+        assert!(
+            !attribution.contributions.is_empty(),
+            "three neighbours inside the sense radius must contribute"
+        );
+
+        world.step().expect("step");
+        let sensed = world.agent_runtime(observer).expect("runtime").sensors;
+
+        for (index, channel) in SENSOR_LAYOUT.iter().enumerate() {
+            let predicted = attribution.clamped[index];
+            let actual = sensed[index];
+            assert!(
+                (predicted - actual).abs() < 1e-5,
+                "channel {} ({index}): explained {predicted}, core computed {actual}",
+                channel.name
+            );
+        }
+    }
+
+    #[test]
+    fn explain_sensors_is_bounded_deterministic_and_honest_about_saturation() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(9),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let observer = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            heading: 0.0,
+            health: 1.0,
+            ..AgentData::default()
+        });
+        // A crowd: enough neighbours to saturate the channels and to exceed any
+        // sane contributor bound.
+        for i in 0..40 {
+            let angle = i as f32 * 0.157;
+            world.spawn_agent(AgentData {
+                position: Position::new(100.0 + 12.0 * angle.cos(), 100.0 + 12.0 * angle.sin()),
+                heading: 0.0,
+                health: 0.2,
+                color: [1.0, 1.0, 1.0],
+                ..AgentData::default()
+            });
+        }
+
+        let attribution = world.explain_sensors(observer, 5).expect("observer");
+        assert_eq!(attribution.contributions.len(), 5, "bounded to top-k");
+        assert!(
+            attribution.truncated >= 30,
+            "dropped count must be reported"
+        );
+        // Strongest first, and the order is total (never float-equality dependent).
+        for pair in attribution.contributions.windows(2) {
+            assert!(pair[0].total >= pair[1].total);
+        }
+        // Same world, same explanation.
+        let again = world.explain_sensors(observer, 5).expect("observer");
+        assert_eq!(attribution, again);
+
+        // Saturation must be SAID, not hidden: contributions legitimately sum
+        // past 1.0, and a panel that silently clamps them invites someone to
+        // "fix" it by normalising, which destroys the information.
+        let smell_index = 10;
+        assert!(
+            attribution.raw[smell_index] > 1.0,
+            "forty close neighbours should oversaturate smell, got {}",
+            attribution.raw[smell_index]
+        );
+        assert!(attribution.saturated[smell_index]);
+        assert!((attribution.clamped[smell_index] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn explain_sensors_returns_none_for_a_dead_agent_and_nothing_for_a_lone_one() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(3),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let lone = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            health: 1.0,
+            ..AgentData::default()
+        });
+
+        let attribution = world.explain_sensors(lone, 8).expect("lone agent exists");
+        assert!(attribution.contributions.is_empty());
+        assert_eq!(attribution.truncated, 0);
+        // Self-state channels still carry values; an empty contributor list must
+        // never be read as "this agent senses nothing".
+        assert!(attribution.clamped[11] > 0.0, "health is self-state");
+        assert!(attribution.saturated.iter().all(|hit| !hit));
+
+        world.remove_agent(lone);
+        assert!(world.explain_sensors(lone, 8).is_none());
+    }
+
+    #[test]
+    fn a_single_activation_snapshot_is_size_bounded_and_says_when_it_was_clipped() {
+        // Bounding how MANY agents are captured is not enough: brain topology is
+        // configuration (a Neuroflow net can declare arbitrarily wide hidden
+        // layers), so one inspected agent could otherwise copy megabytes out of
+        // the simulation every single tick.
+        let huge = BrainActivations {
+            layers: vec![
+                ActivationLayer {
+                    name: "small".to_owned(),
+                    width: 4,
+                    height: 4,
+                    values: vec![0.1; 16],
+                },
+                ActivationLayer {
+                    name: "enormous".to_owned(),
+                    width: 1_000,
+                    height: 1_000,
+                    values: vec![0.2; 1_000_000],
+                },
+            ],
+            connections: vec![ActivationEdge {
+                from: 0,
+                to: 1,
+                weight: 1.0,
+            }],
+            truncated: false,
+        };
+
+        let clipped = clamp_activations(huge);
+        let total: usize = clipped.layers.iter().map(|l| l.values.len()).sum();
+        assert!(
+            total <= ACTIVATION_VALUE_BUDGET,
+            "snapshot kept {total} values, budget is {ACTIVATION_VALUE_BUDGET}"
+        );
+        assert!(
+            clipped.truncated,
+            "a clipped snapshot must SAY it was clipped; silently dropping layers \
+             would let a user conclude the brain has no deep structure"
+        );
+        // Whole layers survive or are dropped — half a layer is a lie about the
+        // shape of the network — and dangling edges are removed.
+        assert_eq!(clipped.layers.len(), 1);
+        assert_eq!(clipped.layers[0].name, "small");
+        assert!(clipped.connections.is_empty());
+
+        // A snapshot that fits is passed through untouched and unflagged.
+        let small = BrainActivations {
+            layers: vec![ActivationLayer {
+                name: "fits".to_owned(),
+                width: 2,
+                height: 2,
+                values: vec![0.5; 4],
+            }],
+            connections: Vec::new(),
+            truncated: false,
+        };
+        let kept = clamp_activations(small);
+        assert!(!kept.truncated);
+        assert_eq!(kept.layers.len(), 1);
+    }
+
     #[test]
     fn activation_capture_is_bounded_even_when_every_agent_is_selected() {
         // Regression guard: a frontend "select all" must not reinstate
@@ -11834,6 +12384,7 @@ mod tests {
                         values: vec![0.5],
                     }],
                     connections: Vec::new(),
+                    truncated: false,
                 })
             }
         }

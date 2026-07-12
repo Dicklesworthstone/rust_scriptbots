@@ -166,6 +166,7 @@ impl MlpBrain {
                 values,
             }],
             connections: Vec::new(),
+            truncated: false,
         }
     }
 }
