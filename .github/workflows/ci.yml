@@ -241,6 +241,11 @@ jobs:
           bash ci/check_asupersync_universe.sh --self-test
           bash ci/check_asupersync_universe.sh asupersync
 
+      - name: FrankenSQLite pin-consistency guard (bd-2z0.8.9.14)
+        run: |
+          bash ci/check_fsqlite_pin.sh --self-test
+          bash ci/check_fsqlite_pin.sh
+
   wasm:
     name: Wasm (ubuntu)
     runs-on: ubuntu-24.04

@@ -224,6 +224,8 @@ The authoritative guide is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`. 
 
 In general, you should also try to follow all suggested best practices listed in `RUST_SYSTEM_PROGRAMMING_BEST_PRACTICES.md`.
 
+For anything touching the franken-family libraries (fsqlite/asupersync/ftui/fnx/frankenpandas/fsci/ft/fnp), read `docs/franken_integration.md` first — program verdicts, constraint matrix, boundary rules, and CI guards (umbrella bead `bd-2js6`); licenses: `docs/licenses.md`.
+
 ### Architecture
 
 ```

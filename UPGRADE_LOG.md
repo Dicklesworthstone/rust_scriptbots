@@ -949,3 +949,23 @@ No version migration in this ledger is authorized merely by being newer.
   manifest/lock entries and retain the legacy adapter. Never substitute a
   mutable source or delete the old frontend without separate explicit file
   deletion permission.
+
+## 2026-07-12 — Reconcile FrankenSQLite pin records to the e04543d revision (bd-2z0.8.9.14)
+
+- **What happened:** commit `e04543d` ("fix(storage): bind recovery to exact
+  database identity", bd-2z0.8.9.4.2) deliberately advanced the fsqlite pin
+  from `cd9990bb16291d8c7c247b75b47faae8d7701adb` to
+  `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` in `Cargo.toml` **and**
+  `Cargo.lock` together, but the advancement was never logged here, leaving
+  this log's two earlier entries (2026-07-11 sections above) as the only
+  sources still citing the superseded revision.
+- **Canonical record now:** `fsqlite = "=0.1.16"` at immutable revision
+  `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — consistent across `Cargo.toml`,
+  `Cargo.lock`, `AGENTS.md`, and `README.md` (verified 2026-07-12). The two
+  earlier entries above remain unedited as accurate history of the state at
+  their dates.
+- **Enforcement:** `ci/check_fsqlite_pin.sh` (CI `security` job) now fails any
+  PR where the `Cargo.toml` rev, `Cargo.lock` resolution, and `AGENTS.md`
+  record disagree, printing every discovered rev with file context.
+- **Future advancement** (e.g. to `a293a252…`) remains gated by
+  bd-2z0.8.9.11's qualification protocol, now from an unambiguous baseline.

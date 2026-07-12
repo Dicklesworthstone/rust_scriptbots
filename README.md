@@ -909,6 +909,8 @@ Helpful docs:
 - `docs/wasm/adrs/ADR-002-browser-persistence.md` — browser persistence approach
 - `docs/wasm/adrs/ADR-004-component-model.md` — component model/WASI Preview assessment
 - `docs/wasm/browser_matrix.csv` — browser capabilities (WebGPU, SAB, SIMD)
+- `docs/franken_integration.md` — franken-library integration program: verdicts, constraints, boundary rules (bd-2js6)
+- `docs/licenses.md` — dependency license audit incl. the franken MIT+rider analysis
 
 ### WASM snapshot format & APIs
 - `snapshot_format`: `json` (default) or `binary` (Postcard `Uint8Array`).

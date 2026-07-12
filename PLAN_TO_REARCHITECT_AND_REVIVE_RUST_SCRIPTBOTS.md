@@ -1294,7 +1294,7 @@ These candidates were checked against live crates.io records on 2026-07-11. Regi
 | Core/data | `anyhow 1.0.103`, `rayon 1.12.0`, `serde 1.0.228`, `serde_json 1.0.150`, `thiserror 2.0.18`, `tracing 0.1.44`, `tracing-subscriber 0.3.23`, `slotmap 1.1.1`, `postcard 1.1.3`, `num_cpus 1.17.0`, `csv 1.4.0` |
 | App/server | `axum 0.8.9`, `async-trait 0.1.89`, `clap 4.6.1`, `serde_path_to_error 0.1.20`, `smallvec 1.15.2`, `futures-util 0.3.32`, `tokio-stream 0.1.18`, `supports-color 3.0.2`, `tokio 1.52.3`, `utoipa 5.5.0`, `owo-colors 4.3.0` |
 | Platform/dev | `libc 0.2.186`, `windows-sys 0.61.2` (platform-gated), `wayland-client 0.31.14`, `mimalloc 0.1.52`, `tempfile 3.27.0`, `serial_test 3.5.0` |
-| Storage/render | target `fsqlite 0.1.16 @ cd9990bb` (minimal native storage gate), `crossbeam-channel 0.5.16`, `image 0.25.10`, `bytemuck 1.25.1`, `winit 0.30.13` |
+| Storage/render | target `fsqlite 0.1.16 @ 1eec0d2` [pin advanced from `cd9990bb` by e04543d/bd-2z0.8.9.4.2; records reconciled by bd-2z0.8.9.14] (minimal native storage gate), `crossbeam-channel 0.5.16`, `image 0.25.10`, `bytemuck 1.25.1`, `winit 0.30.13` |
 | Web | `js-sys 0.3.103`, `wasm-bindgen 0.2.126`, `wasm-bindgen-test 0.3.76`, `serde-wasm-bindgen 0.6.5` (browser/WASM gate) |
 | Already latest | `mcp-protocol-sdk 0.5.1`, `utoipa-swagger-ui 9.0.2`, `neuroflow 0.2.0` |
 
@@ -3073,7 +3073,9 @@ or manual file deletion was used.
   `691ef47c`. Selected statistics, FFT, bootstrap, and clustering stay behind
   an offline-only conformance/build-cost decision.
 - `frankensqlite`: clean tracked `main` fast-forwarded from the product's
-  current pin `cd9990bb` to sibling head `a293a252`; untracked stash-analysis
+  then-current pin `cd9990bb` to sibling head `a293a252` [the product pin has
+  since advanced to `1eec0d2` via e04543d/bd-2z0.8.9.4.2; records reconciled by
+  bd-2z0.8.9.14]; untracked stash-analysis
   material was retained. ScriptBots does not silently move its immutable pin:
   the newer revision must pass the full SQL, durability, error-taxonomy,
   feature-closure, compile-size, and platform qualification gate first.
