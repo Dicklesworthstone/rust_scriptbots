@@ -597,61 +597,114 @@ and scientific decisions.
 The current `Brain`/`BrainRunner` bridge loses the operations required by evolution. Replace trait-object cloning with versioned heritable data **and** separately versioned dynamic evaluator state. Evaluator state is not universally ephemeral: recurrent MLP/DWRAON node state and Assembly working cells can affect future outputs and must survive checkpoints when the family contract says so.
 
 ```rust,ignore
+// Family codecs can create only bounded bytes and version metadata. They cannot
+// choose scientific identity or lineage.
+pub struct BrainGenomeMaterial {
+    schema_version: u32,
+    codec_version: u16,
+    payload: Vec<u8>,
+}
+
 pub struct BrainGenomeEnvelope {
-    pub family_id: BrainFamilyId,
-    pub schema_version: u32,
-    pub payload: Vec<u8>,
-    pub provenance: BrainProvenance,
+    envelope_version: u16,
+    family_id: BrainFamilyId,
+    schema_version: u32,
+    codec_version: u16,
+    payload: Vec<u8>,
+    provenance: BrainProvenance,
 }
 
-pub struct BrainStateEnvelope {
-    pub family_id: BrainFamilyId,
-    pub schema_version: u32,
-    pub payload: Vec<u8>,
+pub struct BrainEvaluatorStateEnvelope {
+    envelope_version: u16,
+    family_id: BrainFamilyId,
+    schema_version: u32,
+    codec_version: u16,
+    payload: Vec<u8>,
 }
 
-pub trait BrainFamily: Send + Sync {
-    fn id(&self) -> BrainFamilyId;
-    fn random_genome(&self, rng: &mut dyn RandomStream) -> Result<BrainGenomeEnvelope>;
-    fn validate(&self, genome: &BrainGenomeEnvelope) -> Result<()>;
-    fn mutate(
+pub trait BrainFamilyCodec: Send + Sync {
+    fn family_id(&self) -> &BrainFamilyId;
+    fn random_genome_material(
+        &self,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeMaterial>;
+    fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<()>;
+    fn validate_evaluator_state(&self, state: &BrainEvaluatorStateEnvelope) -> Result<()>;
+    fn mutate_genome_material(
         &self,
         genome: &BrainGenomeEnvelope,
         rates: MutationRates,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope>;
-    fn crossover(
+    ) -> Result<BrainGenomeMaterial>;
+    fn crossover_genomes_material(
         &self,
         left: &BrainGenomeEnvelope,
         right: &BrainGenomeEnvelope,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope>;
+    ) -> Result<BrainGenomeMaterial>;
     fn initial_state(
         &self,
         genome: &BrainGenomeEnvelope,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainStateEnvelope>;
-    fn evaluator(
-        &self,
-        genome: &BrainGenomeEnvelope,
-        state: &BrainStateEnvelope,
-    ) -> Result<Box<dyn BrainEvaluator>>;
+    ) -> Result<BrainEvaluatorStateEnvelope>;
+    fn offspring_state_policy(&self) -> OffspringStatePolicy;
     fn offspring_state(
         &self,
         child: &BrainGenomeEnvelope,
-        parents: &[&BrainStateEnvelope],
+        parents: &[&BrainEvaluatorStateEnvelope],
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainStateEnvelope>;
+    ) -> Result<BrainEvaluatorStateEnvelope>;
+    fn evaluator(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<Box<dyn BrainEvaluator>>;
 }
 
+// This blanket implementation is the only route from material to an envelope.
+// The caller owns the exact parent UIDs and creation tick.
+pub trait BrainFamilyAdapter: BrainFamilyCodec {
+    fn random_genome(
+        &self,
+        provenance: BrainProvenance,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope> {
+        construct_brain_genome(self, self.random_genome_material(rng)?, provenance)
+    }
+    fn mutate_genome(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        rates: MutationRates,
+        provenance: BrainProvenance,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope> {
+        self.validate_genome(genome)?;
+        let material = self.mutate_genome_material(genome, rates, rng)?;
+        construct_brain_genome(self, material, provenance)
+    }
+    fn crossover_genomes(
+        &self,
+        left: &BrainGenomeEnvelope,
+        right: &BrainGenomeEnvelope,
+        provenance: BrainProvenance,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope> {
+        self.validate_genome(left)?;
+        self.validate_genome(right)?;
+        let material = self.crossover_genomes_material(left, right, rng)?;
+        construct_brain_genome(self, material, provenance)
+    }
+}
+impl<T: BrainFamilyCodec + ?Sized> BrainFamilyAdapter for T {}
+
 pub trait BrainEvaluator: Send {
-    fn evaluate(&mut self, sensors: &BrainInputs) -> BrainOutputs;
-    fn inspect(&self, request: BrainInspection) -> Option<BrainActivations>;
-    fn checkpoint_state(&self) -> Result<BrainStateEnvelope>;
+    fn evaluate(&mut self, sensors: &BrainInputs) -> Result<BrainOutputs>;
+    fn inspect(&self, request: BrainInspection) -> Result<Option<BrainActivations>>;
+    fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope>;
 }
 ```
 
-Each agent stores the exact genome envelope, versioned evaluator state, and a live evaluator constructed from both. Reproduction operates on genomes. Each family explicitly declares whether child dynamic state is reset, inherited, or blended; there is no accidental trait-object clone policy. Checkpoints persist both envelopes, and `WorldDigest` includes all evaluator state that can affect future behavior.
+Each agent stores the exact genome envelope, versioned evaluator state, and a live evaluator constructed from both. Reproduction operates on genomes. Core, not a family codec, attaches the caller-owned `BrainProvenance`; the blanket adapter prevents a family from fabricating parent UIDs or creation ticks. Each family explicitly declares whether child dynamic state is reset, inherited, or blended; there is no accidental trait-object clone policy. Every recurrent/working-state payload is cryptographically bound to its genome's family/schema/codec/payload tuple (excluding provenance), and evaluator construction rejects a checkpoint from a different genome. Raw serde persistence of concrete brain structs is prohibited because it bypasses the bounded codecs. Checkpoints persist both envelopes, and `WorldDigest` includes all evaluator state that can affect future behavior.
 
 This removes the need to clone an opaque runner and makes persistence, replay, lineage, stateful-brain behavior, and external inspection truthful.
 
@@ -1872,7 +1925,7 @@ batch evaluators; each family owns its reset/inherit/blend policy; and the fixtu
 identical future-affecting evaluator continuation. Core 165/165, integration 13/13, strict core
 Clippy, workspace all-target check, formatting, and UBS passed on the integrated protocol surface.
 
-#### 1.7 brain-family adapters and inheritance [Currently In Progress — `bd-2z0.3.3`, `bd-2z0.3.4`, `bd-2z0.3.5`]
+#### 1.7 brain-family adapters and inheritance [Currently In Progress — family adapters implemented in `bd-2z0.3.3`, `bd-2z0.3.4`, and `bd-2z0.3.5`; world binding remains `bd-2z0.3.6`]
 
 - MLP adapter and recurrent-state policy;
 - DWRAON adapter/parity and recurrent-state policy;
@@ -1882,6 +1935,17 @@ Clippy, workspace all-target check, formatting, and UBS passed on the integrated
 - remove placeholder from default registration;
 - register only honest scenario families;
 - on-demand introspection.
+
+Adapter implementation evidence: MLP, DWRAON, and Assembly now use bounded, versioned genome and
+evaluator-state codecs; preserve or deliberately document the legacy constructor, mutation, and
+crossover semantics; reset offspring working state; and reconstruct exact future-affecting state.
+Every state codec embeds a domain-separated BLAKE3 binding to the owning genome material while
+excluding lineage-only provenance, and cross-genome checkpoint splicing is rejected. Raw serde
+persistence was removed from the concrete brain structs so callers cannot bypass these invariants.
+The integrated all-feature brain suite passes 37/37 tests under strict Clippy. The remaining work in
+this phase is to bind those envelopes into live world agents, reproduction, scenario registration,
+checkpoint/digest consumers, and the multi-generation fixture; the adapter completion does not
+claim that world integration early.
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
