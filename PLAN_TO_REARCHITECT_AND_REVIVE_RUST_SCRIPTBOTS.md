@@ -1847,7 +1847,7 @@ Completion evidence:
 
 **Exit:** downstream brain APIs depend on a real protocol, while the later `fnp-random`/domain-separation decision remains independent.
 
-#### 1.6 brain genome/evaluator-state protocol
+#### 1.6 brain genome/evaluator-state protocol [Completed — `bd-2z0.3.2`]
 
 - versioned genome envelope;
 - versioned evaluator-state envelope;
@@ -1860,6 +1860,12 @@ Completion evidence:
 This is a protocol bead. Separate child beads implement each family and integration so the change does not silently exceed the ten-file review gate.
 
 **Exit:** the protocol and fixture family round-trip genome plus future-affecting evaluator state; full world checkpointing is not claimed yet.
+
+Completion evidence: bounded genome and evaluator-state envelopes freeze exact wire bytes and
+reject version/family/schema/codec/size mismatches; the deterministic registry covers scalar and
+batch evaluators; each family owns its reset/inherit/blend policy; and the fixture reconstructs an
+identical future-affecting evaluator continuation. Core 165/165, integration 13/13, strict core
+Clippy, workspace all-target check, formatting, and UBS passed on the integrated protocol surface.
 
 #### 1.7 brain-family adapters and inheritance
 

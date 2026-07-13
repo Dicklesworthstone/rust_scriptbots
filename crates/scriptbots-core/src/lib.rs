@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use slotmap::{Key, KeyData, SecondaryMap, SlotMap, new_key_type};
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 use std::sync::OnceLock;
@@ -3058,210 +3058,712 @@ impl WorldPersistence for NullPersistence {
     }
 }
 
-/// Current on-disk schema version for serialized brain genomes.
-pub const GENOME_FORMAT_VERSION: u16 = 1;
+/// Wire version for heritable brain-genome envelopes.
+pub const BRAIN_GENOME_ENVELOPE_VERSION: u16 = 1;
+/// Wire version for future-affecting evaluator-state envelopes.
+pub const BRAIN_EVALUATOR_STATE_ENVELOPE_VERSION: u16 = 1;
+/// Maximum UTF-8 bytes accepted for a brain-family identifier.
+pub const MAX_BRAIN_FAMILY_ID_BYTES: usize = 64;
+/// Maximum opaque payload accepted for a heritable brain genome.
+pub const MAX_BRAIN_GENOME_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum opaque payload accepted for a live evaluator checkpoint.
+pub const MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES: usize = 256 * 1024;
 
-/// Supported brain family discriminants.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
-pub enum BrainFamily {
-    #[default]
-    Mlp,
-    Dwraon,
-    Assembly,
-    External(String),
-}
-
-/// Supported activation functions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub enum ActivationKind {
-    #[default]
-    Identity,
-    Relu,
-    Sigmoid,
-    Tanh,
-    Softplus,
-    LeakyRelu {
-        slope: f32,
-    },
-    Custom(String),
-}
-
-/// Layer specification used by fully-connected style brains.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LayerSpec {
-    pub inputs: usize,
-    pub outputs: usize,
-    pub activation: ActivationKind,
-    pub bias: bool,
-    pub dropout: f32,
-}
-
-impl LayerSpec {
-    /// Convenience helper to build a dense layer.
-    #[must_use]
-    pub fn dense(inputs: usize, outputs: usize, activation: ActivationKind) -> Self {
-        Self {
-            inputs,
-            outputs,
-            activation,
-            bias: true,
-            dropout: 0.0,
-        }
-    }
-}
-
-impl Default for LayerSpec {
-    fn default() -> Self {
-        Self::dense(1, 1, ActivationKind::Identity)
-    }
-}
-
-/// Hyperparameter bundle stored alongside genomes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GenomeHyperParams {
-    pub learning_rate: f32,
-    pub momentum: f32,
-    pub weight_decay: f32,
-    pub temperature: f32,
-}
-
-impl Default for GenomeHyperParams {
-    fn default() -> Self {
-        Self {
-            learning_rate: 0.01,
-            momentum: 0.9,
-            weight_decay: 0.0,
-            temperature: 1.0,
-        }
-    }
-}
-
-/// Legacy genome-provenance placeholder awaiting the versioned genome protocol.
+/// Validated, stable identifier for a brain-family protocol.
 ///
-/// Its transient `AgentId` parents are intentionally not half-migrated here: `bd-2z0.3.2`
-/// replaces this entire placeholder with the stable-UID genome/evaluator-state envelope.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GenomeProvenance {
-    pub parents: [Option<AgentId>; 2],
-    pub created_at: Tick,
-    pub comment: Option<String>,
-}
+/// Identifiers use lowercase ASCII alphanumeric segments separated by `-` or `_`. They are
+/// deliberately data rather than a closed enum so optional and external families can participate
+/// without changing the core wire format.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct BrainFamilyId(String);
 
-impl Default for GenomeProvenance {
-    fn default() -> Self {
-        Self {
-            parents: [None, None],
-            created_at: Tick::zero(),
-            comment: None,
-        }
-    }
-}
-
-/// Errors raised when validating genome structures.
-#[derive(Debug, Error, PartialEq)]
-pub enum GenomeError {
-    #[error("layer stack must contain at least one layer")]
-    EmptyLayers,
-    #[error("layer {index} has zero-sized dimensions")]
-    ZeroSizedLayer { index: usize },
-    #[error("layer {index} dropout {dropout} must be between 0.0 and 1.0")]
-    InvalidDropout { index: usize, dropout: f32 },
-    #[error("layer {index} input {actual} does not match previous output {expected}")]
-    MismatchedTopology {
-        index: usize,
-        expected: usize,
-        actual: usize,
-    },
-    #[error("final layer outputs {actual} do not match genome output_size {expected}")]
-    OutputMismatch { expected: usize, actual: usize },
-    #[error("input_size must be non-zero")]
-    ZeroInput,
-    #[error("output_size must be non-zero")]
-    ZeroOutput,
-}
-
-/// Versioned, serializable genome description.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BrainGenome {
-    pub version: u16,
-    pub family: BrainFamily,
-    pub input_size: usize,
-    pub output_size: usize,
-    pub layers: Vec<LayerSpec>,
-    pub mutation: MutationRates,
-    pub hyper_params: GenomeHyperParams,
-    pub provenance: GenomeProvenance,
-}
-
-impl BrainGenome {
-    /// Construct and validate a new genome.
-    pub fn new(
-        family: BrainFamily,
-        input_size: usize,
-        output_size: usize,
-        layers: Vec<LayerSpec>,
-        mutation: MutationRates,
-        hyper_params: GenomeHyperParams,
-        provenance: GenomeProvenance,
-    ) -> Result<Self, GenomeError> {
-        let genome = Self {
-            version: GENOME_FORMAT_VERSION,
-            family,
-            input_size,
-            output_size,
-            layers,
-            mutation,
-            hyper_params,
-            provenance,
-        };
-        genome.validate()?;
-        Ok(genome)
-    }
-
-    /// Ensure layer topology matches declared IO sizes.
-    pub fn validate(&self) -> Result<(), GenomeError> {
-        if self.input_size == 0 {
-            return Err(GenomeError::ZeroInput);
-        }
-        if self.output_size == 0 {
-            return Err(GenomeError::ZeroOutput);
-        }
-        if self.layers.is_empty() {
-            return Err(GenomeError::EmptyLayers);
-        }
-        let mut expected_inputs = self.input_size;
-        for (index, layer) in self.layers.iter().enumerate() {
-            if layer.inputs == 0 || layer.outputs == 0 {
-                return Err(GenomeError::ZeroSizedLayer { index });
-            }
-            if layer.inputs != expected_inputs {
-                return Err(GenomeError::MismatchedTopology {
-                    index,
-                    expected: expected_inputs,
-                    actual: layer.inputs,
-                });
-            }
-            if !(0.0..=1.0).contains(&layer.dropout) {
-                return Err(GenomeError::InvalidDropout {
-                    index,
-                    dropout: layer.dropout,
-                });
-            }
-            expected_inputs = layer.outputs;
-        }
-        if expected_inputs != self.output_size {
-            return Err(GenomeError::OutputMismatch {
-                expected: self.output_size,
-                actual: expected_inputs,
+impl BrainFamilyId {
+    /// Validate and construct a family identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self, BrainProtocolError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(BrainProtocolError::InvalidFamilyId {
+                value,
+                reason: "identifier must not be empty",
             });
         }
+        if value.len() > MAX_BRAIN_FAMILY_ID_BYTES {
+            return Err(BrainProtocolError::InvalidFamilyId {
+                value,
+                reason: "identifier exceeds the 64-byte protocol limit",
+            });
+        }
+        let mut previous_was_separator = true;
+        for byte in value.bytes() {
+            let is_alphanumeric = byte.is_ascii_lowercase() || byte.is_ascii_digit();
+            let is_separator = matches!(byte, b'-' | b'_');
+            if !is_alphanumeric && !is_separator {
+                return Err(BrainProtocolError::InvalidFamilyId {
+                    value,
+                    reason: "identifier must contain only lowercase ASCII, digits, '-', or '_'",
+                });
+            }
+            if is_separator && previous_was_separator {
+                return Err(BrainProtocolError::InvalidFamilyId {
+                    value,
+                    reason: "identifier separators must delimit nonempty alphanumeric segments",
+                });
+            }
+            previous_was_separator = is_separator;
+        }
+        if previous_was_separator {
+            return Err(BrainProtocolError::InvalidFamilyId {
+                value,
+                reason: "identifier must end with a lowercase ASCII letter or digit",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the validated wire identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BrainFamilyId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BrainFamilyId")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl fmt::Display for BrainFamilyId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BrainFamilyId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Stable scientific lineage metadata carried by a heritable genome.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainProvenance {
+    /// Stable logical identities of the parents, never transient slot-map handles.
+    pub parents: [Option<AgentUid>; 2],
+    /// Completed tick at which this genome was created.
+    pub created_at: Tick,
+}
+
+/// Versioned, bounded, opaque heritable brain data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainGenomeEnvelope {
+    envelope_version: u16,
+    family_id: BrainFamilyId,
+    schema_version: u32,
+    codec_version: u16,
+    #[serde(deserialize_with = "deserialize_bounded_brain_genome_payload")]
+    payload: Vec<u8>,
+    provenance: BrainProvenance,
+}
+
+impl BrainGenomeEnvelope {
+    /// Construct a current-version genome envelope without interpreting family-owned bytes.
+    pub fn new(
+        family_id: BrainFamilyId,
+        schema_version: u32,
+        codec_version: u16,
+        payload: Vec<u8>,
+        provenance: BrainProvenance,
+    ) -> Result<Self, BrainProtocolError> {
+        ensure_payload_bound(
+            BrainEnvelopeKind::Genome,
+            payload.len(),
+            MAX_BRAIN_GENOME_PAYLOAD_BYTES,
+        )?;
+        Ok(Self {
+            envelope_version: BRAIN_GENOME_ENVELOPE_VERSION,
+            family_id,
+            schema_version,
+            codec_version,
+            payload,
+            provenance,
+        })
+    }
+
+    /// Validate the generic envelope and the family-owned version tuple.
+    pub fn require_protocol(
+        &self,
+        family_id: &BrainFamilyId,
+        schema_version: u32,
+        codec_version: u16,
+    ) -> Result<(), BrainProtocolError> {
+        require_envelope_version(
+            BrainEnvelopeKind::Genome,
+            self.envelope_version,
+            BRAIN_GENOME_ENVELOPE_VERSION,
+        )?;
+        require_family(&self.family_id, family_id)?;
+        require_schema(
+            BrainEnvelopeKind::Genome,
+            self.schema_version,
+            schema_version,
+        )?;
+        require_codec(BrainEnvelopeKind::Genome, self.codec_version, codec_version)?;
+        ensure_payload_bound(
+            BrainEnvelopeKind::Genome,
+            self.payload.len(),
+            MAX_BRAIN_GENOME_PAYLOAD_BYTES,
+        )
+    }
+
+    /// Family that owns and interprets the opaque payload.
+    #[must_use]
+    pub const fn family_id(&self) -> &BrainFamilyId {
+        &self.family_id
+    }
+
+    /// Family-owned genome schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Family-owned payload codec version.
+    #[must_use]
+    pub const fn codec_version(&self) -> u16 {
+        self.codec_version
+    }
+
+    /// Borrow the bounded family-owned bytes.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Stable lineage metadata.
+    #[must_use]
+    pub const fn provenance(&self) -> &BrainProvenance {
+        &self.provenance
+    }
+}
+
+/// Versioned, bounded, opaque future-affecting evaluator state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainEvaluatorStateEnvelope {
+    envelope_version: u16,
+    family_id: BrainFamilyId,
+    schema_version: u32,
+    codec_version: u16,
+    #[serde(deserialize_with = "deserialize_bounded_brain_evaluator_state_payload")]
+    payload: Vec<u8>,
+}
+
+impl BrainEvaluatorStateEnvelope {
+    /// Construct a current-version evaluator-state envelope.
+    pub fn new(
+        family_id: BrainFamilyId,
+        schema_version: u32,
+        codec_version: u16,
+        payload: Vec<u8>,
+    ) -> Result<Self, BrainProtocolError> {
+        ensure_payload_bound(
+            BrainEnvelopeKind::EvaluatorState,
+            payload.len(),
+            MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES,
+        )?;
+        Ok(Self {
+            envelope_version: BRAIN_EVALUATOR_STATE_ENVELOPE_VERSION,
+            family_id,
+            schema_version,
+            codec_version,
+            payload,
+        })
+    }
+
+    /// Validate the generic envelope and the family-owned version tuple.
+    pub fn require_protocol(
+        &self,
+        family_id: &BrainFamilyId,
+        schema_version: u32,
+        codec_version: u16,
+    ) -> Result<(), BrainProtocolError> {
+        require_envelope_version(
+            BrainEnvelopeKind::EvaluatorState,
+            self.envelope_version,
+            BRAIN_EVALUATOR_STATE_ENVELOPE_VERSION,
+        )?;
+        require_family(&self.family_id, family_id)?;
+        require_schema(
+            BrainEnvelopeKind::EvaluatorState,
+            self.schema_version,
+            schema_version,
+        )?;
+        require_codec(
+            BrainEnvelopeKind::EvaluatorState,
+            self.codec_version,
+            codec_version,
+        )?;
+        ensure_payload_bound(
+            BrainEnvelopeKind::EvaluatorState,
+            self.payload.len(),
+            MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES,
+        )
+    }
+
+    /// Family that owns and interprets the opaque payload.
+    #[must_use]
+    pub const fn family_id(&self) -> &BrainFamilyId {
+        &self.family_id
+    }
+
+    /// Family-owned evaluator-state schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Family-owned payload codec version.
+    #[must_use]
+    pub const fn codec_version(&self) -> u16 {
+        self.codec_version
+    }
+
+    /// Borrow the bounded family-owned bytes.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+fn deserialize_bounded_brain_genome_payload<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_bytes::<D, MAX_BRAIN_GENOME_PAYLOAD_BYTES>(
+        deserializer,
+        "brain-genome payload",
+    )
+}
+
+fn deserialize_bounded_brain_evaluator_state_payload<'de, D>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_bytes::<D, MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES>(
+        deserializer,
+        "brain evaluator-state payload",
+    )
+}
+
+fn deserialize_bounded_bytes<'de, D, const LIMIT: usize>(
+    deserializer: D,
+    label: &'static str,
+) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedBytesVisitor<const LIMIT: usize> {
+        label: &'static str,
+    }
+
+    impl<'de, const LIMIT: usize> serde::de::Visitor<'de> for BoundedBytesVisitor<LIMIT> {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "{} of at most {LIMIT} bytes", self.label)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let hinted = sequence.size_hint().unwrap_or_default();
+            if hinted > LIMIT {
+                return Err(serde::de::Error::invalid_length(hinted, &self));
+            }
+            let mut bytes = Vec::with_capacity(hinted);
+            while let Some(byte) = sequence.next_element()? {
+                if bytes.len() == LIMIT {
+                    return Err(serde::de::Error::invalid_length(bytes.len() + 1, &self));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedBytesVisitor::<LIMIT> { label })
+}
+
+/// Which protocol envelope produced a validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrainEnvelopeKind {
+    Genome,
+    EvaluatorState,
+}
+
+impl fmt::Display for BrainEnvelopeKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Genome => formatter.write_str("genome"),
+            Self::EvaluatorState => formatter.write_str("evaluator state"),
+        }
+    }
+}
+
+/// Explicit protocol and adapter failures. Version mismatches never fall back or coerce bytes.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum BrainProtocolError {
+    #[error("invalid brain-family identifier `{value}`: {reason}")]
+    InvalidFamilyId { value: String, reason: &'static str },
+    #[error("unsupported {kind} envelope version {found}; expected exactly {expected}")]
+    EnvelopeVersionMismatch {
+        kind: BrainEnvelopeKind,
+        found: u16,
+        expected: u16,
+    },
+    #[error("brain-family mismatch: found `{found}`, expected `{expected}`")]
+    FamilyMismatch {
+        found: BrainFamilyId,
+        expected: BrainFamilyId,
+    },
+    #[error("{kind} schema version {found} does not match expected version {expected}")]
+    SchemaVersionMismatch {
+        kind: BrainEnvelopeKind,
+        found: u32,
+        expected: u32,
+    },
+    #[error("{kind} codec version {found} does not match expected version {expected}")]
+    CodecVersionMismatch {
+        kind: BrainEnvelopeKind,
+        found: u16,
+        expected: u16,
+    },
+    #[error("{kind} payload is {found} bytes; maximum is {maximum}")]
+    PayloadTooLarge {
+        kind: BrainEnvelopeKind,
+        found: usize,
+        maximum: usize,
+    },
+    #[error("invalid {kind} payload for brain family `{family_id}`: {detail}")]
+    InvalidPayload {
+        kind: BrainEnvelopeKind,
+        family_id: BrainFamilyId,
+        detail: String,
+    },
+    #[error("brain family `{family_id}` is already registered")]
+    DuplicateFamily { family_id: BrainFamilyId },
+    #[error("brain family `{family_id}` is not registered")]
+    UnknownFamily { family_id: BrainFamilyId },
+    #[error("offspring state policy requested parent {index}, but only {available} states exist")]
+    ParentStateUnavailable { index: usize, available: usize },
+    #[error(
+        "batch cardinality mismatch: {evaluators} evaluators, {inputs} inputs, {outputs} outputs"
+    )]
+    BatchCardinalityMismatch {
+        evaluators: usize,
+        inputs: usize,
+        outputs: usize,
+    },
+}
+
+fn ensure_payload_bound(
+    kind: BrainEnvelopeKind,
+    found: usize,
+    maximum: usize,
+) -> Result<(), BrainProtocolError> {
+    if found > maximum {
+        Err(BrainProtocolError::PayloadTooLarge {
+            kind,
+            found,
+            maximum,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn require_envelope_version(
+    kind: BrainEnvelopeKind,
+    found: u16,
+    expected: u16,
+) -> Result<(), BrainProtocolError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(BrainProtocolError::EnvelopeVersionMismatch {
+            kind,
+            found,
+            expected,
+        })
+    }
+}
+
+fn require_family(
+    found: &BrainFamilyId,
+    expected: &BrainFamilyId,
+) -> Result<(), BrainProtocolError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(BrainProtocolError::FamilyMismatch {
+            found: found.clone(),
+            expected: expected.clone(),
+        })
+    }
+}
+
+fn require_schema(
+    kind: BrainEnvelopeKind,
+    found: u32,
+    expected: u32,
+) -> Result<(), BrainProtocolError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(BrainProtocolError::SchemaVersionMismatch {
+            kind,
+            found,
+            expected,
+        })
+    }
+}
+
+fn require_codec(
+    kind: BrainEnvelopeKind,
+    found: u16,
+    expected: u16,
+) -> Result<(), BrainProtocolError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(BrainProtocolError::CodecVersionMismatch {
+            kind,
+            found,
+            expected,
+        })
+    }
+}
+
+/// Explicit dynamic-state inheritance policy selected for each brain family.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OffspringStatePolicy {
+    /// Construct a fresh state from the child genome.
+    Reset,
+    /// Copy one selected parent state after full protocol validation.
+    Inherit { parent_index: u8 },
+    /// Ask the family to deterministically combine the supplied parent states.
+    Blend,
+}
+
+/// Bounded request for optional brain inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrainInspection {
+    Activations,
+}
+
+/// Object-safe scalar evaluator reconstructed from exact genome and state envelopes.
+pub trait BrainEvaluator: Send {
+    /// Owning protocol family.
+    fn family_id(&self) -> &BrainFamilyId;
+
+    /// Evaluate one fixed ScriptBots sensor vector.
+    fn evaluate(
+        &mut self,
+        sensors: &[f32; INPUT_SIZE],
+    ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError>;
+
+    /// Capture optional, on-demand inspection data.
+    fn inspect(
+        &self,
+        request: BrainInspection,
+    ) -> Result<Option<BrainActivations>, BrainProtocolError>;
+
+    /// Capture every future-affecting dynamic value in a bounded state envelope.
+    fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError>;
+}
+
+/// Optional family-owned batch/arena evaluation path.
+///
+/// This is deliberately separate from the scalar evaluator so families can keep structure-of-
+/// arrays or device-native state instead of allocating one `Box<dyn BrainEvaluator>` per agent.
+pub trait BrainBatchEvaluator: Send {
+    /// Owning protocol family.
+    fn family_id(&self) -> &BrainFamilyId;
+
+    /// Evaluate a batch without changing input/output cardinality.
+    fn evaluate_batch(
+        &mut self,
+        sensors: &[[f32; INPUT_SIZE]],
+        outputs: &mut [[f32; OUTPUT_SIZE]],
+    ) -> Result<(), BrainProtocolError>;
+
+    /// Capture one future-affecting state envelope per evaluator lane.
+    fn checkpoint_states(&self) -> Result<Vec<BrainEvaluatorStateEnvelope>, BrainProtocolError>;
+}
+
+/// Object-safe protocol adapter implemented by each concrete brain family.
+pub trait BrainFamilyAdapter: Send + Sync {
+    /// Stable family identity used by every envelope and registry lookup.
+    fn family_id(&self) -> &BrainFamilyId;
+
+    /// Generate a new heritable genome from the supplied deterministic stream.
+    fn random_genome(
+        &self,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError>;
+
+    /// Validate generic versions and family-owned genome bytes.
+    fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError>;
+
+    /// Validate generic versions and family-owned future-affecting state bytes.
+    fn validate_evaluator_state(
+        &self,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<(), BrainProtocolError>;
+
+    /// Mutate heritable data, never a live evaluator object.
+    fn mutate_genome(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        rates: MutationRates,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError>;
+
+    /// Recombine two validated genomes into heritable child data.
+    fn crossover_genomes(
+        &self,
+        left: &BrainGenomeEnvelope,
+        right: &BrainGenomeEnvelope,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError>;
+
+    /// Construct the family's deterministic initial evaluator state.
+    fn initial_state(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError>;
+
+    /// Declare the sole dynamic-state inheritance policy used by this family.
+    fn offspring_state_policy(&self) -> OffspringStatePolicy;
+
+    /// Apply the family's declared reset/inherit/blend policy.
+    fn offspring_state(
+        &self,
+        child: &BrainGenomeEnvelope,
+        parents: &[&BrainEvaluatorStateEnvelope],
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError>;
+
+    /// Reconstruct a scalar evaluator from exact heritable and dynamic state.
+    fn evaluator(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError>;
+
+    /// Optionally reconstruct a family-owned batch/arena evaluator.
+    fn batch_evaluator(
+        &self,
+        _genomes: &[BrainGenomeEnvelope],
+        _states: &[BrainEvaluatorStateEnvelope],
+    ) -> Result<Option<Box<dyn BrainBatchEvaluator>>, BrainProtocolError> {
+        Ok(None)
+    }
+
+    /// Validate and capture one scalar evaluator's future-affecting state.
+    fn checkpoint_evaluator(
+        &self,
+        evaluator: &dyn BrainEvaluator,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        require_family(evaluator.family_id(), self.family_id())?;
+        let state = evaluator.checkpoint_state()?;
+        self.validate_evaluator_state(&state)?;
+        Ok(state)
+    }
+}
+
+/// Deterministic family registry ordered by validated wire identifier.
+#[derive(Default)]
+pub struct BrainFamilyRegistry {
+    families: BTreeMap<BrainFamilyId, Box<dyn BrainFamilyAdapter>>,
+}
+
+impl fmt::Debug for BrainFamilyRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrainFamilyRegistry")
+            .field("family_ids", &self.family_ids())
+            .finish()
+    }
+}
+
+impl BrainFamilyRegistry {
+    /// Construct an empty protocol registry.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            families: BTreeMap::new(),
+        }
+    }
+
+    /// Register one family, refusing duplicate identifiers.
+    pub fn register(
+        &mut self,
+        adapter: Box<dyn BrainFamilyAdapter>,
+    ) -> Result<(), BrainProtocolError> {
+        let family_id = adapter.family_id().clone();
+        if self.families.contains_key(&family_id) {
+            return Err(BrainProtocolError::DuplicateFamily { family_id });
+        }
+        self.families.insert(family_id, adapter);
         Ok(())
     }
 
-    /// Returns true if the genome references at least one parent.
+    /// Look up a registered adapter.
     #[must_use]
-    pub fn is_descendant(&self) -> bool {
-        self.provenance.parents.iter().any(Option::is_some)
+    pub fn get(&self, family_id: &BrainFamilyId) -> Option<&dyn BrainFamilyAdapter> {
+        self.families.get(family_id).map(Box::as_ref)
+    }
+
+    /// Require a registered adapter with an explicit unknown-family error.
+    pub fn require(
+        &self,
+        family_id: &BrainFamilyId,
+    ) -> Result<&dyn BrainFamilyAdapter, BrainProtocolError> {
+        self.get(family_id)
+            .ok_or_else(|| BrainProtocolError::UnknownFamily {
+                family_id: family_id.clone(),
+            })
+    }
+
+    /// Return family identifiers in deterministic lexical order.
+    #[must_use]
+    pub fn family_ids(&self) -> Vec<BrainFamilyId> {
+        self.families.keys().cloned().collect()
+    }
+
+    /// Number of registered protocol families.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.families.len()
+    }
+
+    /// Whether no protocol family is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.families.is_empty()
     }
 }
 
@@ -16710,75 +17212,763 @@ mod tests {
         assert!(!attacker_runtime.combat.hit_herbivore);
     }
 
-    #[test]
-    fn brain_genome_validation_passes() {
-        let layers = vec![
-            LayerSpec::dense(INPUT_SIZE, 32, ActivationKind::Relu),
-            LayerSpec::dense(32, OUTPUT_SIZE, ActivationKind::Sigmoid),
-        ];
-        let genome = BrainGenome::new(
-            BrainFamily::Mlp,
-            INPUT_SIZE,
-            OUTPUT_SIZE,
-            layers,
-            MutationRates::default(),
-            GenomeHyperParams::default(),
-            GenomeProvenance::default(),
-        )
-        .expect("genome valid");
-        assert_eq!(genome.version, GENOME_FORMAT_VERSION);
-        assert!(genome.validate().is_ok());
-        assert!(!genome.is_descendant());
+    const FIXTURE_GENOME_SCHEMA: u32 = 7;
+    const FIXTURE_GENOME_CODEC: u16 = 3;
+    const FIXTURE_STATE_SCHEMA: u32 = 11;
+    const FIXTURE_STATE_CODEC: u16 = 5;
+
+    #[derive(Debug)]
+    struct FixtureBrainFamily {
+        id: BrainFamilyId,
+        offspring_policy: OffspringStatePolicy,
+    }
+
+    impl FixtureBrainFamily {
+        fn new(id: &str) -> Self {
+            Self {
+                id: BrainFamilyId::new(id).expect("valid fixture family id"),
+                offspring_policy: OffspringStatePolicy::Reset,
+            }
+        }
+
+        fn with_policy(id: &str, offspring_policy: OffspringStatePolicy) -> Self {
+            Self {
+                id: BrainFamilyId::new(id).expect("valid fixture family id"),
+                offspring_policy,
+            }
+        }
+
+        fn genome(&self, gain: i8, bias: i8, provenance: BrainProvenance) -> BrainGenomeEnvelope {
+            BrainGenomeEnvelope::new(
+                self.id.clone(),
+                FIXTURE_GENOME_SCHEMA,
+                FIXTURE_GENOME_CODEC,
+                vec![gain as u8, bias as u8],
+                provenance,
+            )
+            .expect("fixture genome")
+        }
+
+        fn state(&self, accumulator: i16) -> BrainEvaluatorStateEnvelope {
+            BrainEvaluatorStateEnvelope::new(
+                self.id.clone(),
+                FIXTURE_STATE_SCHEMA,
+                FIXTURE_STATE_CODEC,
+                accumulator.to_le_bytes().to_vec(),
+            )
+            .expect("fixture state")
+        }
+
+        fn decode_genome(
+            &self,
+            genome: &BrainGenomeEnvelope,
+        ) -> Result<(i8, i8), BrainProtocolError> {
+            genome.require_protocol(&self.id, FIXTURE_GENOME_SCHEMA, FIXTURE_GENOME_CODEC)?;
+            let [gain, bias] = genome.payload() else {
+                return Err(BrainProtocolError::InvalidPayload {
+                    kind: BrainEnvelopeKind::Genome,
+                    family_id: self.id.clone(),
+                    detail: format!(
+                        "fixture genome requires exactly 2 bytes, found {}",
+                        genome.payload().len()
+                    ),
+                });
+            };
+            Ok((*gain as i8, *bias as i8))
+        }
+
+        fn decode_state(
+            &self,
+            state: &BrainEvaluatorStateEnvelope,
+        ) -> Result<i16, BrainProtocolError> {
+            state.require_protocol(&self.id, FIXTURE_STATE_SCHEMA, FIXTURE_STATE_CODEC)?;
+            let bytes: [u8; 2] =
+                state
+                    .payload()
+                    .try_into()
+                    .map_err(|_| BrainProtocolError::InvalidPayload {
+                        kind: BrainEnvelopeKind::EvaluatorState,
+                        family_id: self.id.clone(),
+                        detail: format!(
+                            "fixture evaluator state requires exactly 2 bytes, found {}",
+                            state.payload().len()
+                        ),
+                    })?;
+            Ok(i16::from_le_bytes(bytes))
+        }
+    }
+
+    struct FixtureBrainEvaluator {
+        id: BrainFamilyId,
+        gain: i8,
+        bias: i8,
+        accumulator: i16,
+    }
+
+    impl BrainEvaluator for FixtureBrainEvaluator {
+        fn family_id(&self) -> &BrainFamilyId {
+            &self.id
+        }
+
+        fn evaluate(
+            &mut self,
+            sensors: &[f32; INPUT_SIZE],
+        ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+            let mut outputs = [0.0; OUTPUT_SIZE];
+            outputs[0] = sensors[0] * f32::from(self.gain)
+                + f32::from(self.bias)
+                + f32::from(self.accumulator);
+            self.accumulator = self.accumulator.saturating_add(1);
+            Ok(outputs)
+        }
+
+        fn inspect(
+            &self,
+            _request: BrainInspection,
+        ) -> Result<Option<BrainActivations>, BrainProtocolError> {
+            Ok(None)
+        }
+
+        fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+            BrainEvaluatorStateEnvelope::new(
+                self.id.clone(),
+                FIXTURE_STATE_SCHEMA,
+                FIXTURE_STATE_CODEC,
+                self.accumulator.to_le_bytes().to_vec(),
+            )
+        }
+    }
+
+    struct FixtureBrainBatchEvaluator {
+        id: BrainFamilyId,
+        evaluators: Vec<FixtureBrainEvaluator>,
+    }
+
+    impl BrainBatchEvaluator for FixtureBrainBatchEvaluator {
+        fn family_id(&self) -> &BrainFamilyId {
+            &self.id
+        }
+
+        fn evaluate_batch(
+            &mut self,
+            sensors: &[[f32; INPUT_SIZE]],
+            outputs: &mut [[f32; OUTPUT_SIZE]],
+        ) -> Result<(), BrainProtocolError> {
+            if self.evaluators.len() != sensors.len() || sensors.len() != outputs.len() {
+                return Err(BrainProtocolError::BatchCardinalityMismatch {
+                    evaluators: self.evaluators.len(),
+                    inputs: sensors.len(),
+                    outputs: outputs.len(),
+                });
+            }
+            for ((evaluator, inputs), output) in self
+                .evaluators
+                .iter_mut()
+                .zip(sensors)
+                .zip(outputs.iter_mut())
+            {
+                *output = evaluator.evaluate(inputs)?;
+            }
+            Ok(())
+        }
+
+        fn checkpoint_states(
+            &self,
+        ) -> Result<Vec<BrainEvaluatorStateEnvelope>, BrainProtocolError> {
+            self.evaluators
+                .iter()
+                .map(BrainEvaluator::checkpoint_state)
+                .collect()
+        }
+    }
+
+    impl BrainFamilyAdapter for FixtureBrainFamily {
+        fn family_id(&self) -> &BrainFamilyId {
+            &self.id
+        }
+
+        fn random_genome(
+            &self,
+            rng: &mut dyn RandomStream,
+        ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+            let sample = rng.next_u32().to_le_bytes();
+            Ok(self.genome(sample[0] as i8, sample[1] as i8, BrainProvenance::default()))
+        }
+
+        fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
+            self.decode_genome(genome).map(|_| ())
+        }
+
+        fn validate_evaluator_state(
+            &self,
+            state: &BrainEvaluatorStateEnvelope,
+        ) -> Result<(), BrainProtocolError> {
+            self.decode_state(state).map(|_| ())
+        }
+
+        fn mutate_genome(
+            &self,
+            genome: &BrainGenomeEnvelope,
+            rates: MutationRates,
+            rng: &mut dyn RandomStream,
+        ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+            let (gain, bias) = self.decode_genome(genome)?;
+            let delta = if rates.primary > 0.0 {
+                (rng.next_u32() % 7 + 1) as i8
+            } else {
+                0
+            };
+            Ok(self.genome(gain.wrapping_add(delta), bias, genome.provenance().clone()))
+        }
+
+        fn crossover_genomes(
+            &self,
+            left: &BrainGenomeEnvelope,
+            right: &BrainGenomeEnvelope,
+            _rng: &mut dyn RandomStream,
+        ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+            let (left_gain, _) = self.decode_genome(left)?;
+            let (_, right_bias) = self.decode_genome(right)?;
+            let provenance = BrainProvenance {
+                parents: [left.provenance().parents[0], right.provenance().parents[0]],
+                created_at: Tick(
+                    left.provenance()
+                        .created_at
+                        .0
+                        .max(right.provenance().created_at.0),
+                ),
+            };
+            Ok(self.genome(left_gain, right_bias, provenance))
+        }
+
+        fn initial_state(
+            &self,
+            genome: &BrainGenomeEnvelope,
+            _rng: &mut dyn RandomStream,
+        ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+            let (_, bias) = self.decode_genome(genome)?;
+            Ok(self.state(i16::from(bias)))
+        }
+
+        fn offspring_state_policy(&self) -> OffspringStatePolicy {
+            self.offspring_policy
+        }
+
+        fn offspring_state(
+            &self,
+            child: &BrainGenomeEnvelope,
+            parents: &[&BrainEvaluatorStateEnvelope],
+            rng: &mut dyn RandomStream,
+        ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+            self.validate_genome(child)?;
+            match self.offspring_state_policy() {
+                OffspringStatePolicy::Reset => self.initial_state(child, rng),
+                OffspringStatePolicy::Inherit { parent_index } => {
+                    let parent_index = usize::from(parent_index);
+                    let parent = parents.get(parent_index).ok_or(
+                        BrainProtocolError::ParentStateUnavailable {
+                            index: parent_index,
+                            available: parents.len(),
+                        },
+                    )?;
+                    Ok(self.state(self.decode_state(parent)?))
+                }
+                OffspringStatePolicy::Blend => {
+                    if parents.is_empty() {
+                        return Err(BrainProtocolError::ParentStateUnavailable {
+                            index: 0,
+                            available: 0,
+                        });
+                    }
+                    let total = parents.iter().try_fold(0_i64, |sum, parent| {
+                        self.decode_state(parent)
+                            .map(|value| sum + i64::from(value))
+                    })?;
+                    let blended = i16::try_from(total / parents.len() as i64).map_err(|_| {
+                        BrainProtocolError::InvalidPayload {
+                            kind: BrainEnvelopeKind::EvaluatorState,
+                            family_id: self.id.clone(),
+                            detail: "blended fixture state exceeds i16 range".to_owned(),
+                        }
+                    })?;
+                    Ok(self.state(blended))
+                }
+            }
+        }
+
+        fn evaluator(
+            &self,
+            genome: &BrainGenomeEnvelope,
+            state: &BrainEvaluatorStateEnvelope,
+        ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+            let (gain, bias) = self.decode_genome(genome)?;
+            let accumulator = self.decode_state(state)?;
+            Ok(Box::new(FixtureBrainEvaluator {
+                id: self.id.clone(),
+                gain,
+                bias,
+                accumulator,
+            }))
+        }
+
+        fn batch_evaluator(
+            &self,
+            genomes: &[BrainGenomeEnvelope],
+            states: &[BrainEvaluatorStateEnvelope],
+        ) -> Result<Option<Box<dyn BrainBatchEvaluator>>, BrainProtocolError> {
+            if genomes.len() != states.len() {
+                return Err(BrainProtocolError::BatchCardinalityMismatch {
+                    evaluators: genomes.len(),
+                    inputs: states.len(),
+                    outputs: states.len(),
+                });
+            }
+            let mut evaluators = Vec::with_capacity(genomes.len());
+            for (genome, state) in genomes.iter().zip(states) {
+                let (gain, bias) = self.decode_genome(genome)?;
+                evaluators.push(FixtureBrainEvaluator {
+                    id: self.id.clone(),
+                    gain,
+                    bias,
+                    accumulator: self.decode_state(state)?,
+                });
+            }
+            Ok(Some(Box::new(FixtureBrainBatchEvaluator {
+                id: self.id.clone(),
+                evaluators,
+            })))
+        }
+    }
+
+    fn fixture_provenance() -> BrainProvenance {
+        BrainProvenance {
+            parents: [Some(AgentUid(41)), Some(AgentUid(99))],
+            created_at: Tick(12),
+        }
     }
 
     #[test]
-    fn brain_genome_validation_detects_errors() {
-        let layers = vec![
-            LayerSpec::dense(INPUT_SIZE, 16, ActivationKind::Relu),
-            LayerSpec::dense(16, OUTPUT_SIZE, ActivationKind::Sigmoid),
-        ];
-        let mut genome = BrainGenome::new(
-            BrainFamily::Mlp,
-            INPUT_SIZE,
-            OUTPUT_SIZE,
-            layers.clone(),
-            MutationRates::default(),
-            GenomeHyperParams::default(),
-            GenomeProvenance::default(),
-        )
-        .expect("base genome valid");
+    fn brain_protocol_exact_wire_round_trips_and_reconstructs_deterministically() {
+        let family = FixtureBrainFamily::new("fixture-counter");
+        let genome = family.genome(2, -3, fixture_provenance());
+        let state = family.state(9);
 
-        genome.layers[0].dropout = 1.2;
+        let genome_wire = postcard::to_allocvec(&genome).expect("encode fixture genome");
         assert_eq!(
-            genome.validate(),
-            Err(GenomeError::InvalidDropout {
-                index: 0,
-                dropout: 1.2
-            })
+            genome_wire,
+            [
+                1, 15, b'f', b'i', b'x', b't', b'u', b'r', b'e', b'-', b'c', b'o', b'u', b'n',
+                b't', b'e', b'r', 7, 3, 2, 2, 253, 1, 41, 1, 99, 12,
+            ]
+        );
+        let state_wire = postcard::to_allocvec(&state).expect("encode fixture state");
+        assert_eq!(
+            state_wire,
+            [
+                1, 15, b'f', b'i', b'x', b't', b'u', b'r', b'e', b'-', b'c', b'o', b'u', b'n',
+                b't', b'e', b'r', 11, 5, 2, 9, 0,
+            ]
+        );
+        let inherit_policy = OffspringStatePolicy::Inherit { parent_index: 200 };
+        let inherit_wire = postcard::to_allocvec(&inherit_policy).expect("encode inherit policy");
+        assert_eq!(inherit_wire, [1, 200]);
+        assert_eq!(
+            postcard::from_bytes::<OffspringStatePolicy>(&inherit_wire)
+                .expect("decode inherit policy"),
+            inherit_policy
+        );
+        assert_eq!(
+            postcard::from_bytes::<BrainGenomeEnvelope>(&genome_wire)
+                .expect("decode fixture genome"),
+            genome
+        );
+        assert_eq!(
+            postcard::from_bytes::<BrainEvaluatorStateEnvelope>(&state_wire)
+                .expect("decode fixture state"),
+            state
         );
 
-        genome.layers[0].dropout = 0.0;
-        genome.layers[1].inputs = OUTPUT_SIZE + 1;
+        let mut left = family.evaluator(&genome, &state).expect("left evaluator");
+        let mut right = family.evaluator(&genome, &state).expect("right evaluator");
+        let mut sensors = [0.0; INPUT_SIZE];
+        sensors[0] = 4.0;
+        let left_output = left.evaluate(&sensors).expect("left output");
+        let right_output = right.evaluate(&sensors).expect("right output");
+        assert_eq!(left_output, right_output);
+        assert_eq!(left_output[0], 14.0);
         assert_eq!(
-            genome.validate(),
-            Err(GenomeError::MismatchedTopology {
+            family
+                .checkpoint_evaluator(left.as_ref())
+                .expect("left checkpoint"),
+            family
+                .checkpoint_evaluator(right.as_ref())
+                .expect("right checkpoint")
+        );
+        let checkpoint = left.checkpoint_state().expect("checkpoint state");
+        let mut reconstructed = family
+            .evaluator(&genome, &checkpoint)
+            .expect("reconstructed evaluator");
+        assert_eq!(
+            reconstructed.evaluate(&sensors).expect("resumed output")[0],
+            15.0
+        );
+    }
+
+    #[test]
+    fn brain_protocol_rejects_invalid_ids_versions_families_codecs_and_sizes() {
+        assert!(matches!(
+            BrainFamilyId::new("Fixture.Bad"),
+            Err(BrainProtocolError::InvalidFamilyId { .. })
+        ));
+        for invalid in [
+            ".fixture",
+            "fixture.",
+            "fixture.bad",
+            "fixture--bad",
+            "fixture__bad",
+            "fixture-_bad",
+            "fixture_-bad",
+            "-fixture",
+            "fixture-",
+            "_fixture",
+            "fixture_",
+        ] {
+            assert!(
+                matches!(
+                    BrainFamilyId::new(invalid),
+                    Err(BrainProtocolError::InvalidFamilyId { .. })
+                ),
+                "{invalid} must not be a canonical family id"
+            );
+        }
+        assert!(serde_json::from_str::<BrainFamilyId>("\"Fixture.Bad\"").is_err());
+        for valid in ["fixture", "fixture-counter", "fixture_counter", "f1-x2"] {
+            assert_eq!(
+                BrainFamilyId::new(valid)
+                    .expect("canonical family id")
+                    .as_str(),
+                valid
+            );
+        }
+        assert!(matches!(
+            BrainFamilyId::new("a".repeat(MAX_BRAIN_FAMILY_ID_BYTES + 1)),
+            Err(BrainProtocolError::InvalidFamilyId { .. })
+        ));
+
+        let family = FixtureBrainFamily::new("fixture-counter");
+        let genome = family.genome(2, -3, fixture_provenance());
+        let mut wrong_envelope = genome.clone();
+        wrong_envelope.envelope_version += 1;
+        assert!(matches!(
+            family.validate_genome(&wrong_envelope),
+            Err(BrainProtocolError::EnvelopeVersionMismatch { .. })
+        ));
+
+        let mut wrong_family = genome.clone();
+        wrong_family.family_id = BrainFamilyId::new("fixture-other").expect("other id");
+        assert!(matches!(
+            family.validate_genome(&wrong_family),
+            Err(BrainProtocolError::FamilyMismatch { .. })
+        ));
+
+        let mut wrong_schema = genome.clone();
+        wrong_schema.schema_version += 1;
+        assert!(matches!(
+            family.validate_genome(&wrong_schema),
+            Err(BrainProtocolError::SchemaVersionMismatch { .. })
+        ));
+
+        let mut wrong_codec = genome.clone();
+        wrong_codec.codec_version += 1;
+        assert!(matches!(
+            family.validate_genome(&wrong_codec),
+            Err(BrainProtocolError::CodecVersionMismatch { .. })
+        ));
+
+        assert!(
+            BrainGenomeEnvelope::new(
+                family.id.clone(),
+                FIXTURE_GENOME_SCHEMA,
+                FIXTURE_GENOME_CODEC,
+                vec![0; MAX_BRAIN_GENOME_PAYLOAD_BYTES],
+                BrainProvenance::default(),
+            )
+            .is_ok(),
+            "the exact genome payload limit must remain admissible"
+        );
+        assert!(matches!(
+            BrainGenomeEnvelope::new(
+                family.id.clone(),
+                FIXTURE_GENOME_SCHEMA,
+                FIXTURE_GENOME_CODEC,
+                vec![0; MAX_BRAIN_GENOME_PAYLOAD_BYTES + 1],
+                BrainProvenance::default(),
+            ),
+            Err(BrainProtocolError::PayloadTooLarge {
+                kind: BrainEnvelopeKind::Genome,
+                ..
+            })
+        ));
+        let mut oversized = genome;
+        oversized.payload = vec![0; MAX_BRAIN_GENOME_PAYLOAD_BYTES + 1];
+        let oversized_wire = postcard::to_allocvec(&oversized).expect("encode invalid envelope");
+        assert!(
+            postcard::from_bytes::<BrainGenomeEnvelope>(&oversized_wire).is_err(),
+            "the payload bound must apply during deserialization, before adapter validation"
+        );
+
+        assert!(
+            BrainEvaluatorStateEnvelope::new(
+                family.id.clone(),
+                FIXTURE_STATE_SCHEMA,
+                FIXTURE_STATE_CODEC,
+                vec![0; MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES],
+            )
+            .is_ok(),
+            "the exact evaluator-state payload limit must remain admissible"
+        );
+        assert!(matches!(
+            BrainEvaluatorStateEnvelope::new(
+                family.id.clone(),
+                FIXTURE_STATE_SCHEMA,
+                FIXTURE_STATE_CODEC,
+                vec![0; MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES + 1],
+            ),
+            Err(BrainProtocolError::PayloadTooLarge {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
+        let mut oversized_state = family.state(1);
+        oversized_state.payload = vec![0; MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES + 1];
+        let oversized_state_wire =
+            postcard::to_allocvec(&oversized_state).expect("encode invalid state envelope");
+        assert!(
+            postcard::from_bytes::<BrainEvaluatorStateEnvelope>(&oversized_state_wire).is_err(),
+            "the evaluator-state bound must apply during deserialization"
+        );
+
+        let mut wrong_state_codec = family.state(1);
+        wrong_state_codec.codec_version += 1;
+        assert!(matches!(
+            family.validate_evaluator_state(&wrong_state_codec),
+            Err(BrainProtocolError::CodecVersionMismatch {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
+        assert!(matches!(
+            family.evaluator(
+                &family.genome(1, 1, BrainProvenance::default()),
+                &wrong_state_codec
+            ),
+            Err(BrainProtocolError::CodecVersionMismatch {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
+
+        struct WrongCheckpointEvaluator {
+            id: BrainFamilyId,
+            state: BrainEvaluatorStateEnvelope,
+        }
+
+        impl BrainEvaluator for WrongCheckpointEvaluator {
+            fn family_id(&self) -> &BrainFamilyId {
+                &self.id
+            }
+
+            fn evaluate(
+                &mut self,
+                _sensors: &[f32; INPUT_SIZE],
+            ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+                Ok([0.0; OUTPUT_SIZE])
+            }
+
+            fn inspect(
+                &self,
+                _request: BrainInspection,
+            ) -> Result<Option<BrainActivations>, BrainProtocolError> {
+                Ok(None)
+            }
+
+            fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+                Ok(self.state.clone())
+            }
+        }
+
+        let bad_checkpoint = WrongCheckpointEvaluator {
+            id: family.id.clone(),
+            state: wrong_state_codec,
+        };
+        assert!(matches!(
+            family.checkpoint_evaluator(&bad_checkpoint),
+            Err(BrainProtocolError::CodecVersionMismatch {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn brain_protocol_mutates_crosses_and_applies_every_offspring_state_policy() {
+        let reset_family =
+            FixtureBrainFamily::with_policy("fixture-counter", OffspringStatePolicy::Reset);
+        let left = reset_family.genome(
+            2,
+            -3,
+            BrainProvenance {
+                parents: [Some(AgentUid(10)), None],
+                created_at: Tick(4),
+            },
+        );
+        let right = reset_family.genome(
+            -5,
+            7,
+            BrainProvenance {
+                parents: [Some(AgentUid(20)), None],
+                created_at: Tick(6),
+            },
+        );
+        let mut rng = SmallRngStream::seed_from_u64(33);
+        let mutated = reset_family
+            .mutate_genome(
+                &left,
+                MutationRates {
+                    primary: 1.0,
+                    secondary: 0.0,
+                },
+                &mut rng,
+            )
+            .expect("mutated genome");
+        assert_ne!(mutated.payload(), left.payload());
+
+        let child = reset_family
+            .crossover_genomes(&left, &right, &mut rng)
+            .expect("crossed genome");
+        assert_eq!(child.payload(), &[2, 7]);
+        assert_eq!(
+            child.provenance(),
+            &BrainProvenance {
+                parents: [Some(AgentUid(10)), Some(AgentUid(20))],
+                created_at: Tick(6),
+            }
+        );
+
+        let first = reset_family.state(8);
+        let second = reset_family.state(14);
+        let reset = reset_family
+            .offspring_state(&child, &[&first, &second], &mut rng)
+            .expect("reset child state");
+        assert_eq!(reset_family.decode_state(&reset).expect("decode reset"), 7);
+        let inherit_family = FixtureBrainFamily::with_policy(
+            "fixture-counter",
+            OffspringStatePolicy::Inherit { parent_index: 1 },
+        );
+        let inherited = inherit_family
+            .offspring_state(&child, &[&first, &second], &mut rng)
+            .expect("inherited child state");
+        assert_eq!(
+            inherit_family
+                .decode_state(&inherited)
+                .expect("decode inherit"),
+            14
+        );
+        let blend_family =
+            FixtureBrainFamily::with_policy("fixture-counter", OffspringStatePolicy::Blend);
+        let blended = blend_family
+            .offspring_state(&child, &[&first, &second], &mut rng)
+            .expect("blended child state");
+        assert_eq!(
+            blend_family.decode_state(&blended).expect("decode blend"),
+            11
+        );
+        assert!(matches!(
+            inherit_family.offspring_state(&child, &[&first], &mut rng),
+            Err(BrainProtocolError::ParentStateUnavailable {
                 index: 1,
-                expected: 16,
-                actual: OUTPUT_SIZE + 1
+                available: 1
             })
-        );
+        ));
+    }
 
-        genome.layers[1].inputs = 16;
-        genome.layers[1].outputs = OUTPUT_SIZE + 2;
+    #[test]
+    fn brain_protocol_registry_is_deterministic_and_batch_path_is_real() {
+        let mut registry = BrainFamilyRegistry::new();
+        registry
+            .register(Box::new(FixtureBrainFamily::new("fixture-zeta")))
+            .expect("zeta registration");
+        registry
+            .register(Box::new(FixtureBrainFamily::new("fixture-alpha")))
+            .expect("alpha registration");
         assert_eq!(
-            genome.validate(),
-            Err(GenomeError::OutputMismatch {
-                expected: OUTPUT_SIZE,
-                actual: OUTPUT_SIZE + 2
-            })
+            registry
+                .family_ids()
+                .iter()
+                .map(BrainFamilyId::as_str)
+                .collect::<Vec<_>>(),
+            ["fixture-alpha", "fixture-zeta"]
         );
-        genome.layers = layers;
-        assert!(genome.validate().is_ok());
+        assert_eq!(registry.len(), 2);
+        assert!(matches!(
+            registry.register(Box::new(FixtureBrainFamily::new("fixture-alpha"))),
+            Err(BrainProtocolError::DuplicateFamily { .. })
+        ));
+        let missing = BrainFamilyId::new("fixture-missing").expect("missing id");
+        assert!(matches!(
+            registry.require(&missing),
+            Err(BrainProtocolError::UnknownFamily { .. })
+        ));
+
+        let alpha_id = BrainFamilyId::new("fixture-alpha").expect("alpha id");
+        let alpha = registry.require(&alpha_id).expect("alpha adapter");
+        let first_genome =
+            FixtureBrainFamily::new("fixture-alpha").genome(2, 1, BrainProvenance::default());
+        let second_genome =
+            FixtureBrainFamily::new("fixture-alpha").genome(3, -2, BrainProvenance::default());
+        let first_state = FixtureBrainFamily::new("fixture-alpha").state(4);
+        let second_state = FixtureBrainFamily::new("fixture-alpha").state(5);
+        let mut batch = alpha
+            .batch_evaluator(&[first_genome, second_genome], &[first_state, second_state])
+            .expect("batch construction")
+            .expect("fixture batch extension");
+        assert!(matches!(
+            alpha.batch_evaluator(
+                &[FixtureBrainFamily::new("fixture-alpha").genome(
+                    1,
+                    0,
+                    BrainProvenance::default(),
+                )],
+                &[],
+            ),
+            Err(BrainProtocolError::BatchCardinalityMismatch {
+                evaluators: 1,
+                inputs: 0,
+                outputs: 0,
+            })
+        ));
+        assert_eq!(batch.family_id(), &alpha_id);
+        let mut sensors = [[0.0; INPUT_SIZE]; 2];
+        sensors[0][0] = 2.0;
+        sensors[1][0] = 4.0;
+        let mut outputs = [[0.0; OUTPUT_SIZE]; 2];
+        assert!(matches!(
+            batch.evaluate_batch(&sensors[..1], &mut outputs),
+            Err(BrainProtocolError::BatchCardinalityMismatch {
+                evaluators: 2,
+                inputs: 1,
+                outputs: 2,
+            })
+        ));
+        batch
+            .evaluate_batch(&sensors, &mut outputs)
+            .expect("batch evaluate");
+        assert_eq!(outputs[0][0], 9.0);
+        assert_eq!(outputs[1][0], 15.0);
+        let states = batch.checkpoint_states().expect("batch checkpoints");
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].payload(), &5_i16.to_le_bytes());
+        assert_eq!(states[1].payload(), &6_i16.to_le_bytes());
     }
 
     #[derive(Clone, Default)]
