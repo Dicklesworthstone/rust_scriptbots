@@ -51,12 +51,16 @@ DENYLIST=(
   fnp-
 )
 
+# NB: stderr is DROPPED (not merged) — cargo emits "Blocking waiting for
+# file lock…" chatter to stderr under contention, and one such line once
+# leaked into the golden snapshot. Failures are still caught via exit code
+# (pipefail) plus the plausibility checks in --update-snapshot.
 wasm_graph() {
   ( cd "$REPO_ROOT" && cargo tree --locked \
       --target wasm32-unknown-unknown \
       -p scriptbots-web \
       --edges normal,build \
-      --prefix none --format '{p}' 2>&1 ) \
+      --prefix none --format '{p}' 2>/dev/null ) \
     | sed -E 's/ \(.*//' | sed -E 's/ v[0-9].*$//' | sort -u
 }
 
@@ -64,7 +68,7 @@ core_default_graph() {
   ( cd "$REPO_ROOT" && cargo tree --locked \
       -p scriptbots-core \
       --edges normal \
-      --prefix none --format '{p}' 2>&1 ) \
+      --prefix none --format '{p}' 2>/dev/null ) \
     | sed -E 's/ \(.*//' | sed -E 's/ v[0-9].*$//' | sort -u
 }
 
@@ -165,7 +169,7 @@ case "${1:-}" in
       rm -f "$TMP_SNAP"
       exit 1
     fi
-    if ! grep -q '^scriptbots-web$' "$TMP_SNAP" || grep -qiE '^(error|warning|blocking)' "$TMP_SNAP"; then
+    if ! grep -q '^scriptbots-web$' "$TMP_SNAP" || grep -qiE '^[[:space:]]*(error|warning|blocking)' "$TMP_SNAP"; then
       echo "::error::resolution output failed plausibility checks (must contain scriptbots-web, no error/lock-wait lines); snapshot NOT updated. Output was:"
       cat "$TMP_SNAP"
       rm -f "$TMP_SNAP"
