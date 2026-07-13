@@ -10,9 +10,10 @@ use fsqlite::{
     migrate::MigrationRunner,
 };
 use scriptbots_core::{
-    AgentState, AgentUid, BirthRecord, BrainBinding, DeathCause, DeathRecord,
+    AgentState, AgentUid, BirthRecord, BrainBinding, DeathCause, DeathRecord, Generation,
     PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
-    ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, WorldPersistence,
+    ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick, WorldPersistence,
+    ancestry::{AncestryError, AncestryGraph},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
@@ -1298,6 +1299,102 @@ pub struct ReplayEventCount {
     pub count: u64,
 }
 
+/// One ancestry edge, read back out of the run database.
+///
+/// The birth row IS the edge: child, both parents, and everything the graph needs
+/// to reconstruct the node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedAncestryBirth {
+    /// When the child was born.
+    pub tick: Tick,
+    /// The child's logical identity — never a slot handle.
+    pub agent_uid: AgentUid,
+    /// First parent, if any.
+    pub parent_a: Option<AgentUid>,
+    /// Second parent, if any.
+    pub parent_b: Option<AgentUid>,
+    /// Generations since a root.
+    pub generation: Generation,
+    /// Which brain it ran.
+    pub brain_key: Option<u64>,
+    /// Whether it was a hybrid.
+    pub is_hybrid: bool,
+}
+
+/// One death, read back out of the run database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedAncestryDeath {
+    /// When it died.
+    pub tick: Tick,
+    /// Who died.
+    pub agent_uid: AgentUid,
+}
+
+/// Rebuild an ancestry graph from a run database alone.
+///
+/// THIS FUNCTION IS THE JUSTIFICATION FOR THE STORAGE LAYER. If a graph rebuilt
+/// from nothing but the persisted rows is not identical to the one the live run
+/// held, then the run database is not sufficient for offline science, and every
+/// claim that a run can be analysed after the fact is a claim we cannot back.
+/// The test that compares the two by `canonical_digest` is what turns that from
+/// an aspiration into a checked property.
+///
+/// Deaths are applied AFTER all births, deliberately. An agent can die on the
+/// same tick another is born, and the two tables are ordered independently; if a
+/// death were applied before the birth it terminates, the rebuild would report an
+/// unknown-uid error for a log that is perfectly well formed.
+///
+/// # Errors
+///
+/// [`AncestryError`] if the persisted log is not a well-formed ancestry — which
+/// would itself be a finding: it would mean the writer emitted rows the graph's
+/// invariants reject.
+pub fn rebuild_ancestry(
+    founders: &[PersistedAncestryBirth],
+    births: &[PersistedAncestryBirth],
+    deaths: &[PersistedAncestryDeath],
+) -> Result<AncestryGraph, AncestryError> {
+    let mut graph = AncestryGraph::new();
+    // Founders FIRST. They have no birth row of their own, and every
+    // first-generation child names one as a parent, so a rebuild that skipped
+    // them would fail on the very first descendant.
+    for birth in founders.iter().chain(births) {
+        graph.apply_birth(&BirthRecord {
+            tick: birth.tick,
+            agent_uid: birth.agent_uid,
+            spawn_ordinal: 0,
+            birth_ordinal: 0,
+            parent_a: birth.parent_a,
+            parent_b: birth.parent_b,
+            brain_kind: None,
+            brain_key: birth.brain_key,
+            herbivore_tendency: 0.0,
+            generation: birth.generation,
+            position: scriptbots_core::Position::new(0.0, 0.0),
+            is_hybrid: birth.is_hybrid,
+        })?;
+    }
+    for death in deaths {
+        // A death for an agent this run never recorded a birth for is a hole in
+        // the log, not something to paper over.
+        graph.apply_death(&DeathRecord {
+            tick: death.tick,
+            agent_uid: death.agent_uid,
+            age: 0,
+            generation: Generation(0),
+            herbivore_tendency: 0.0,
+            brain_kind: None,
+            brain_key: None,
+            energy: 0.0,
+            food_balance_total: 0.0,
+            cause: DeathCause::Starvation,
+            was_hybrid: false,
+            combat_flags: scriptbots_core::CombatEventFlags::default(),
+        })?;
+    }
+    Ok(graph)
+}
+
 /// Replay event reconstructed from persisted storage.
 #[derive(Debug, Clone)]
 pub struct PersistedReplayEvent {
@@ -1746,6 +1843,131 @@ impl StorageReader {
             });
         }
         Ok(events)
+    }
+
+    /// Load every ancestry edge recorded in this run, ready for an offline rebuild.
+    ///
+    /// THE BIRTH ROW IS THE EDGE. Every field the graph needs — the child's uid,
+    /// both parents' uids, the birth tick, the generation, the brain key, and the
+    /// hybrid flag — is already on `births`, so there is no second table to keep
+    /// in sync and no join that could silently drop a parent.
+    ///
+    /// Ordered by `(tick, agent_uid)`, and that order is LOAD-BEARING rather than
+    /// tidy: a rebuilt graph is checked against the live one by digest, and the
+    /// digest only means something if the replay order is fixed. It also
+    /// guarantees a parent is always inserted before its child, because a child's
+    /// birth tick is strictly greater than its parent's.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] if the connection is unavailable or a row does not decode.
+    pub fn load_ancestry_births(&self) -> Result<Vec<PersistedAncestryBirth>, StorageError> {
+        let rows = self.connection()?.query(
+            "SELECT tick, agent_uid, parent_a, parent_b, generation, brain_key, is_hybrid
+             FROM births
+             ORDER BY tick ASC, agent_uid ASC",
+        )?;
+        let mut births = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick: i64 = decode(&row, 0, "births.tick")?;
+            let agent_uid: i64 = decode(&row, 1, "births.agent_uid")?;
+            let parent_a: Option<i64> = decode(&row, 2, "births.parent_a")?;
+            let parent_b: Option<i64> = decode(&row, 3, "births.parent_b")?;
+            let generation: i64 = decode(&row, 4, "births.generation")?;
+            let brain_key: Option<i64> = decode(&row, 5, "births.brain_key")?;
+            let is_hybrid: i64 = decode(&row, 6, "births.is_hybrid")?;
+
+            births.push(PersistedAncestryBirth {
+                tick: Tick(checked_u64("births.tick", tick)?),
+                agent_uid: AgentUid(checked_u64("births.agent_uid", agent_uid)?),
+                parent_a: parent_a
+                    .map(|raw| checked_u64("births.parent_a", raw).map(AgentUid))
+                    .transpose()?,
+                parent_b: parent_b
+                    .map(|raw| checked_u64("births.parent_b", raw).map(AgentUid))
+                    .transpose()?,
+                generation: Generation(
+                    u32::try_from(checked_u64("births.generation", generation)?)
+                        .unwrap_or(u32::MAX),
+                ),
+                brain_key: brain_key
+                    .map(|raw| checked_u64("births.brain_key", raw))
+                    .transpose()?,
+                is_hybrid: is_hybrid != 0,
+            });
+        }
+        Ok(births)
+    }
+
+    /// Load the FOUNDING population: agents that exist but were never born.
+    ///
+    /// The founders are seeded at bootstrap, so they never pass through the
+    /// spawn-commit stage and therefore have NO ROW IN `births`. Reading only the
+    /// birth table, an offline rebuild sees every first-generation child name a
+    /// parent it has never heard of, and the whole phylogeny fails to construct.
+    ///
+    /// The founders are not missing from the database, though — they are in
+    /// `agents`. A founder is exactly an agent that exists and has no birth row,
+    /// which is what this query says, and it is the reason the run database really
+    /// is sufficient for offline ancestry rather than merely almost sufficient.
+    ///
+    /// Their earliest observed tick is used as a birth tick, which is correct in
+    /// the only sense that matters here: a founder must be strictly older than its
+    /// children, and it is.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] if the connection is unavailable or a row does not decode.
+    pub fn load_ancestry_founders(&self) -> Result<Vec<PersistedAncestryBirth>, StorageError> {
+        let rows = self.connection()?.query(
+            "SELECT MIN(a.tick) AS first_tick, a.agent_uid, MIN(a.generation) AS generation
+             FROM agents a
+             WHERE a.agent_uid NOT IN (SELECT b.agent_uid FROM births b)
+             GROUP BY a.agent_uid
+             ORDER BY a.agent_uid ASC",
+        )?;
+        let mut founders = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick: i64 = decode(&row, 0, "agents.tick")?;
+            let agent_uid: i64 = decode(&row, 1, "agents.agent_uid")?;
+            let generation: i64 = decode(&row, 2, "agents.generation")?;
+            founders.push(PersistedAncestryBirth {
+                tick: Tick(checked_u64("agents.tick", tick)?),
+                agent_uid: AgentUid(checked_u64("agents.agent_uid", agent_uid)?),
+                parent_a: None,
+                parent_b: None,
+                generation: Generation(
+                    u32::try_from(checked_u64("agents.generation", generation)?)
+                        .unwrap_or(u32::MAX),
+                ),
+                brain_key: None,
+                is_hybrid: false,
+            });
+        }
+        Ok(founders)
+    }
+
+    /// Load every death recorded in this run, ordered to match the birth replay.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] if the connection is unavailable or a row does not decode.
+    pub fn load_ancestry_deaths(&self) -> Result<Vec<PersistedAncestryDeath>, StorageError> {
+        let rows = self.connection()?.query(
+            "SELECT tick, agent_uid
+             FROM deaths
+             ORDER BY tick ASC, agent_uid ASC",
+        )?;
+        let mut deaths = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tick: i64 = decode(&row, 0, "deaths.tick")?;
+            let agent_uid: i64 = decode(&row, 1, "deaths.agent_uid")?;
+            deaths.push(PersistedAncestryDeath {
+                tick: Tick(checked_u64("deaths.tick", tick)?),
+                agent_uid: AgentUid(checked_u64("deaths.agent_uid", agent_uid)?),
+            });
+        }
+        Ok(deaths)
     }
 
     /// Return replay-event counts grouped by stable event type.
