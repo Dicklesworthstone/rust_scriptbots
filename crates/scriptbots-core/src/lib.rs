@@ -6373,15 +6373,14 @@ pub mod narrative {
 
 mod map_sandbox {
     use super::{
-        ScientificStateError, TerrainKind, TerrainLayer, TerrainTile, default_tile_fertility_bias,
-        default_tile_palette_index, validate_finite, validate_finite_slice,
-        validated_cell_count_for,
+        ScientificStateError, TerrainKind, TerrainLayer, TerrainTile, characterization_fnv1a64,
+        default_tile_fertility_bias, default_tile_palette_index, terrain_kind_tag_v0,
+        validate_finite, validate_finite_slice, validated_cell_count_for,
     };
     use direction::{CardinalDirection, CardinalDirectionTable};
     use rand08::{SeedableRng, rngs::StdRng};
     use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
-    use std::hash::{DefaultHasher, Hasher};
     use std::num::NonZeroU32;
     use std::time::{SystemTime, UNIX_EPOCH};
     use wfc::{
@@ -7310,13 +7309,106 @@ mod map_sandbox {
         ((value >> 11) as f64 / (1u64 << 53) as f64) as f32
     }
 
+    /// Schema tag for the canonical tileset-identity encoding. Bump this if — and only
+    /// if — the byte walk below changes shape, so that a moved hash is announced rather
+    /// than discovered.
+    const TILESET_HASH_V1_SCHEMA: &str = "scriptbots.tileset-hash.v1";
+
+    /// Canonical, dependency-free identity of a tileset.
+    ///
+    /// This value is fed into `characterization_digest_v0` (the terrain lane), which is
+    /// the oracle that decides whether two runs are *the same run*. It therefore may not
+    /// depend on anything whose byte-level output is permitted to drift.
+    ///
+    /// It previously hashed `serde_json::to_vec(spec)` with `std::hash::DefaultHasher`,
+    /// and both halves of that were unsound for this purpose:
+    ///
+    /// * `DefaultHasher`'s algorithm is explicitly **not specified across Rust releases**
+    ///   — std's own documentation says its hashes "should not be relied upon over
+    ///   releases". It *is* stable within a given toolchain, which is precisely why this
+    ///   went unnoticed: a **compiler upgrade** would silently move the characterization
+    ///   digest of every run that used a generated map. No error, no schema bump — just a
+    ///   science oracle that quietly stops agreeing with its own recorded history. That is
+    ///   the exact failure this dependency-reproducibility epic exists to make impossible,
+    ///   sitting inside the oracle.
+    /// * The `Err(_)` arm fell back to hashing the **tile count**, so any two tilesets that
+    ///   failed to serialize and happened to have the same number of tiles hashed equal.
+    ///
+    /// The walk below is length-prefixed and self-describing, so distinct specs cannot
+    /// encode to the same byte stream, `None` cannot collide with `Some(0.0)`, and the
+    /// function is **total** — there is no failure path left to degrade into a collision.
+    /// It also removes `serde_json` from the hash path entirely, so a *serialization*
+    /// crate bump cannot move the digest either.
     fn compute_tileset_hash(spec: &TilesetSpec) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        match serde_json::to_vec(spec) {
-            Ok(bytes) => hasher.write(&bytes),
-            Err(_) => hasher.write_u64(spec.tiles.len() as u64),
+        fn push_str(bytes: &mut Vec<u8>, value: &str) {
+            // Length-prefixed: without this, ("ab", "c") and ("a", "bc") would encode to
+            // the same bytes and two different tilesets would share an identity.
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
         }
-        hasher.finish()
+        fn push_opt_str(bytes: &mut Vec<u8>, value: Option<&str>) {
+            match value {
+                Some(inner) => {
+                    bytes.push(1);
+                    push_str(bytes, inner);
+                }
+                None => bytes.push(0),
+            }
+        }
+        fn push_opt_f32(bytes: &mut Vec<u8>, value: Option<f32>) {
+            match value {
+                Some(inner) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&inner.to_bits().to_le_bytes());
+                }
+                None => bytes.push(0),
+            }
+        }
+        fn push_opt_u16(bytes: &mut Vec<u8>, value: Option<u16>) {
+            match value {
+                Some(inner) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&inner.to_le_bytes());
+                }
+                None => bytes.push(0),
+            }
+        }
+
+        let mut bytes = Vec::new();
+        push_str(&mut bytes, TILESET_HASH_V1_SCHEMA);
+        push_str(&mut bytes, &spec.id);
+        push_opt_str(&mut bytes, spec.label.as_deref());
+        push_opt_str(&mut bytes, spec.description.as_deref());
+
+        bytes.extend_from_slice(&(spec.tiles.len() as u64).to_le_bytes());
+        for tile in &spec.tiles {
+            push_str(&mut bytes, &tile.id);
+            push_opt_str(&mut bytes, tile.label.as_deref());
+            bytes.extend_from_slice(&tile.weight.to_le_bytes());
+            bytes.push(terrain_kind_tag_v0(tile.terrain_kind));
+            push_opt_f32(&mut bytes, tile.fertility_bias);
+            push_opt_f32(&mut bytes, tile.temperature_bias);
+            push_opt_f32(&mut bytes, tile.elevation);
+            push_opt_f32(&mut bytes, tile.moisture);
+            push_opt_f32(&mut bytes, tile.accent);
+            push_opt_u16(&mut bytes, tile.palette_index);
+            push_opt_f32(&mut bytes, tile.permeability);
+            push_opt_f32(&mut bytes, tile.runoff_bias);
+            push_opt_f32(&mut bytes, tile.basin_rank);
+            push_opt_f32(&mut bytes, tile.channel_priority);
+            push_opt_f32(&mut bytes, tile.swim_cost);
+        }
+
+        bytes.extend_from_slice(&(spec.adjacency.len() as u64).to_le_bytes());
+        for edge in &spec.adjacency {
+            push_str(&mut bytes, &edge.tile_a);
+            push_str(&mut bytes, &edge.side_a);
+            push_str(&mut bytes, &edge.tile_b);
+            push_str(&mut bytes, &edge.side_b);
+            bytes.push(u8::from(edge.allowed));
+        }
+
+        characterization_fnv1a64(&bytes)
     }
     fn compute_hydrology_field(
         width: u32,
@@ -7529,6 +7621,148 @@ mod map_sandbox {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A tileset whose every optional field is populated, so the golden below is
+        /// sensitive to the WHOLE walk rather than to a handful of required fields.
+        fn fixture_spec() -> TilesetSpec {
+            TilesetSpec {
+                id: "fixture".to_owned(),
+                label: Some("Fixture".to_owned()),
+                description: Some("golden".to_owned()),
+                tiles: vec![
+                    TileSpec {
+                        id: "water".to_owned(),
+                        label: Some("Water".to_owned()),
+                        weight: 3,
+                        terrain_kind: TerrainKind::DeepWater,
+                        fertility_bias: Some(0.25),
+                        temperature_bias: Some(-0.5),
+                        elevation: Some(0.0),
+                        moisture: Some(1.0),
+                        accent: Some(0.125),
+                        palette_index: Some(7),
+                        permeability: Some(0.9),
+                        runoff_bias: Some(0.1),
+                        basin_rank: Some(2.0),
+                        channel_priority: Some(0.75),
+                        swim_cost: Some(0.2),
+                    },
+                    TileSpec {
+                        id: "grass".to_owned(),
+                        label: None,
+                        weight: 1,
+                        terrain_kind: TerrainKind::Grass,
+                        fertility_bias: None,
+                        temperature_bias: None,
+                        elevation: None,
+                        moisture: None,
+                        accent: None,
+                        palette_index: None,
+                        permeability: None,
+                        runoff_bias: None,
+                        basin_rank: None,
+                        channel_priority: None,
+                        swim_cost: None,
+                    },
+                ],
+                adjacency: vec![AdjacencySpec {
+                    tile_a: "water".to_owned(),
+                    side_a: "north".to_owned(),
+                    tile_b: "grass".to_owned(),
+                    side_b: "south".to_owned(),
+                    allowed: true,
+                }],
+            }
+        }
+
+        #[test]
+        fn the_tileset_hash_is_pinned_to_a_specified_algorithm() {
+            // THE TOOLCHAIN GUARD. This hash reaches `characterization_digest_v0`, the
+            // oracle that decides whether two runs are the same run.
+            //
+            // It used to be computed with `std::hash::DefaultHasher`, whose algorithm std
+            // explicitly does NOT promise across Rust releases. It is stable within a
+            // toolchain — which is exactly why nobody noticed — so the failure mode was a
+            // *compiler upgrade* silently changing the digest of every run that used a
+            // generated map, with no error and no schema bump.
+            //
+            // Pinning the value here means any future change to the hash — a dependency
+            // bump, a refactor, a field added to TilesetSpec without extending the walk —
+            // fails LOUDLY, right here, naming itself. That is the whole point.
+            assert_eq!(
+                compute_tileset_hash(&fixture_spec()),
+                0x7651_91dc_ef37_0f72,
+                "the canonical tileset identity moved. If you INTENDED this (a new field \
+                 in the walk, a schema bump), update the golden and bump \
+                 TILESET_HASH_V1_SCHEMA. If you did not, a dependency or the toolchain \
+                 just silently changed the characterization digest of every generated-map \
+                 run."
+            );
+        }
+
+        #[test]
+        fn distinct_tilesets_with_the_same_tile_count_do_not_collide() {
+            // The precise old bug: the `Err(_)` arm hashed only `spec.tiles.len()`, so any
+            // two specs that failed to serialize and had the same number of tiles were
+            // given the SAME identity — two different worlds, one digest.
+            let mut other = fixture_spec();
+            other.tiles[1].id = "sand".to_owned();
+            other.tiles[1].terrain_kind = TerrainKind::Sand;
+
+            assert_eq!(fixture_spec().tiles.len(), other.tiles.len());
+            assert_ne!(
+                compute_tileset_hash(&fixture_spec()),
+                compute_tileset_hash(&other),
+                "two materially different tilesets with equal tile counts share an \
+                 identity — the digest cannot tell those worlds apart"
+            );
+        }
+
+        #[test]
+        fn an_absent_field_does_not_collide_with_a_zero_valued_one() {
+            // `None` and `Some(0.0)` are different tilesets: one takes the generator's
+            // default, the other pins zero. Encoding both as "nothing" would silently
+            // merge them.
+            let mut absent = fixture_spec();
+            absent.tiles[0].fertility_bias = None;
+            let mut zeroed = fixture_spec();
+            zeroed.tiles[0].fertility_bias = Some(0.0);
+
+            assert_ne!(
+                compute_tileset_hash(&absent),
+                compute_tileset_hash(&zeroed),
+                "an unset field hashes the same as one explicitly set to zero"
+            );
+        }
+
+        #[test]
+        fn the_encoding_is_prefix_free_across_adjacent_strings() {
+            // Without length prefixes, ("ab","c") and ("a","bc") concatenate to the same
+            // bytes. This is the classic framing collision, and it is easy to reintroduce
+            // by "simplifying" the walk to push raw bytes.
+            let mut left = fixture_spec();
+            left.adjacency[0].side_a = "ab".to_owned();
+            left.adjacency[0].tile_b = "c".to_owned();
+            let mut right = fixture_spec();
+            right.adjacency[0].side_a = "a".to_owned();
+            right.adjacency[0].tile_b = "bc".to_owned();
+
+            assert_ne!(
+                compute_tileset_hash(&left),
+                compute_tileset_hash(&right),
+                "the byte walk is not prefix-free: moving a character across a field \
+                 boundary leaves the identity unchanged"
+            );
+        }
+
+        #[test]
+        fn the_hash_is_deterministic_within_a_process() {
+            // Cheap, but it is the property everything else rests on: if this ever varied
+            // (a HashMap iteration order sneaking into the walk, say), every assertion
+            // above would be meaningless.
+            let spec = fixture_spec();
+            assert_eq!(compute_tileset_hash(&spec), compute_tileset_hash(&spec));
+        }
 
         fn incoming_from_targets(targets: &[Option<usize>]) -> Vec<Vec<usize>> {
             let mut incoming = vec![Vec::new(); targets.len()];
