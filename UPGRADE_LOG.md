@@ -1243,3 +1243,81 @@ No version migration in this ledger is authorized merely by being newer.
   Roll back only the one root `rayon` declaration and this Rayon log section;
   `Cargo.lock` and core source require no rollback. Do not use reset,
   checkout, stash, clean, or file deletion.
+
+## 2026-07-12 — Raise the SlotMap compatibility floor
+
+- **Bead and serialization:** `bd-2z0.8.5`, serialized sub-update two of
+  three, applied only after the Rayon sub-update and its evidence commit. This
+  change touches the workspace declaration and this record; it does not alter
+  the concurrent stable-identity implementation or any golden artifact.
+- **Declaration and resolution:** root `slotmap 1.0.7` becomes `1.1.1` while
+  preserving the `serde` feature and default `std` policy. The authoritative
+  lock already selected `slotmap 1.1.1`, so this raises the minimum compatible
+  declaration without changing the package tuple, checksum, Serde edge, or
+  executable implementation. The stable-identity commit had already removed
+  storage's unused direct SlotMap edge; this update preserves that lock/source
+  deletion and the remaining app, Bevy, core, and web ownership.
+- **Primary release research:** crates.io reported non-yanked [SlotMap
+  1.1.1](https://crates.io/crates/slotmap/1.1.1) as latest stable on
+  2026-07-12. The published archive identifies source commit
+  [`2d56154b9b62`](https://github.com/orlp/slotmap/commit/2d56154b9b628f7d7a506f24ebc4f55a13ec8fed).
+  The [upstream release
+  record](https://github.com/orlp/slotmap/blob/v1.1.1/RELEASES.md) says 1.1.0
+  fixed a `clone_from` memory leak and a Stacked-Borrows Miri error, made
+  `KeyData::from_ffi` constant, and deprecated `HopSlotMap`; 1.1.1 added
+  `DenseSlotMap::as_slices` and notes that the earlier slice accessors may be
+  removed only in 2.0. ScriptBots uses `SlotMap`, `SecondaryMap`,
+  `new_key_type!`, and `KeyData`, not `HopSlotMap` or those dense-slice APIs,
+  so no source migration or compatibility shim is needed.
+- **MSRV, license, and security:** SlotMap declares Rust 1.58 and the Zlib
+  license, both compatible with the workspace Rust 1.89 floor and license
+  policy. RustSec had no SlotMap package advisory page at review time. The
+  selected target includes the upstream leak and Miri fixes, and the
+  byte-identical lock means this manifest-floor change cannot introduce a new
+  package advisory.
+- **Exact manifest and lock boundary:** root-manifest SHA-256 changes from the
+  post-Rayon value
+  `4fc7957fca4372c359448cf047a9e00fb786eaf6dd5b78b7a8f016646eb0f4e0`
+  to
+  `30055b6ee9193e77b55024852589235e1f67afa67e0f57141751c4f4192c1d62`.
+  `Cargo.lock` remains byte-identical at
+  `fae88a0e2b3f113fbab1426929b5064e6d8a76460aa55e261beadb7956a2b8f3`;
+  no dependency record or edge moves.
+- **Identity and owner proof:** the default core library passed 151/151 tests,
+  including UID snapshot/churn non-reuse, spawn/birth ordinal independence
+  from slot handles, sensor attribution across slot reuse, death-record
+  retention, child identity, allocator uniqueness, dense removal coherence,
+  and raw handle round trips. Bevy passed 17/17 and web's Postcard snapshot
+  golden passed 1/1. The full locked workspace all-target check passed with
+  only the pre-existing `proc-macro-error2 2.0.1` future-incompatibility
+  notice.
+- **Pre-existing manifest-golden defect exposed, not hidden:** the first app
+  suite under the required `RAYON_NUM_THREADS=4` lane passed 78 tests but
+  failed `canonical_json_sorts_nested_keys_and_round_trips_manifest`: actual
+  `fnv1a64:ea4674216ce44aa6`, expected
+  `fnv1a64:bb8b9b7bc9277d32`. The unchanged binary proves that
+  `complete_test_build()` embeds `CoreBuildIdentityV0::current()` and therefore
+  runtime `rayon::current_num_threads()` into a supposedly fixed wire golden.
+  Fresh-process reproductions mapped one thread to
+  `fnv1a64:de779845c8f830ad`, two to
+  `fnv1a64:41518292c387ea28`, four to
+  `fnv1a64:ea4674216ce44aa6`, and eight to the expected
+  `fnv1a64:bb8b9b7bc9277d32`. Three additional four-thread runs reproduced
+  `ea4674216ce44aa6` exactly; an eight-thread full rerun passed 79/79. This is
+  genuine schedule/global-pool nondeterminism, not an acceptable flake and
+  not a SlotMap resolution change. The golden was not updated. Wide work is
+  paused until the dedicated P0 fix supplies an explicit synthetic build
+  identity and the four-thread owner suite passes.
+- **Performance proof:** on the same worker and Criterion protocol as the
+  Rayon entry, the post-Rayon estimate was
+  `[11.133 ms 14.926 ms 20.179 ms]`; after the floor-only SlotMap change it was
+  `[9.4543 ms 12.013 ms 15.496 ms]`. Criterion measured
+  `[-39.371%, -14.420%, +22.191%]` with `p=0.43` and reported no performance
+  change. The executable SlotMap version is identical, so there is no package
+  mechanism for a performance shift.
+- **Result and rollback:** the dependency update itself is accepted as a
+  lock-stable floor correction; the independently discovered P0 golden defect
+  remains an explicit gate before the Wide sub-update. Roll back only the one
+  root SlotMap declaration and this SlotMap log section. Preserve the stable
+  identity source and lock deletions; do not use reset, checkout, stash, clean,
+  golden replacement, or file deletion.
