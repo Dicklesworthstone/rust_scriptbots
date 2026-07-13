@@ -3,13 +3,16 @@
 use rand::Rng;
 use scriptbots_core::{
     ActivationLayer, BrainActivations, BrainEnvelopeKind, BrainEvaluator,
-    BrainEvaluatorStateEnvelope, BrainFamilyAdapter, BrainFamilyId, BrainGenomeEnvelope,
-    BrainInspection, BrainProtocolError, BrainProvenance, MutationRates, OffspringStatePolicy,
-    RandomStream, Tick,
+    BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope,
+    BrainGenomeMaterial, BrainInspection, BrainProtocolError, MutationRates, OffspringStatePolicy,
+    RandomStream,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
+
+#[cfg(test)]
+use scriptbots_core::BrainProvenance;
 
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 
@@ -461,6 +464,7 @@ fn decode_state(state: &BrainEvaluatorStateEnvelope) -> Result<Vec<NodeState>, B
     decode_state_payload(state.payload())
 }
 
+#[cfg(test)]
 fn genome_envelope(
     nodes: &[NodeParams],
     provenance: BrainProvenance,
@@ -471,6 +475,14 @@ fn genome_envelope(
         GENOME_CODEC_VERSION,
         encode_genome_payload(nodes)?,
         provenance,
+    )
+}
+
+fn genome_material(nodes: &[NodeParams]) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+    BrainGenomeMaterial::new(
+        GENOME_SCHEMA_VERSION,
+        GENOME_CODEC_VERSION,
+        encode_genome_payload(nodes)?,
     )
 }
 
@@ -633,17 +645,17 @@ impl BrainEvaluator for DwraonEvaluator {
     }
 }
 
-impl BrainFamilyAdapter for DwraonFamilyAdapter {
+impl BrainFamilyCodec for DwraonFamilyAdapter {
     fn family_id(&self) -> &BrainFamilyId {
         &self.family_id
     }
 
-    fn random_genome(
+    fn random_genome_material(
         &self,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         let brain = DwraonBrain::random(rng);
-        genome_envelope(&brain.nodes, BrainProvenance::default())
+        genome_material(&brain.nodes)
     }
 
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
@@ -657,37 +669,28 @@ impl BrainFamilyAdapter for DwraonFamilyAdapter {
         decode_state(state).map(|_| ())
     }
 
-    fn mutate_genome(
+    fn mutate_genome_material(
         &self,
         genome: &BrainGenomeEnvelope,
         rates: MutationRates,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         validate_mutation_rates(rates)?;
         let mut nodes = decode_genome(genome)?;
         mutate_nodes(&mut nodes, rng, rates.primary, rates.secondary);
-        genome_envelope(&nodes, genome.provenance().clone())
+        genome_material(&nodes)
     }
 
-    fn crossover_genomes(
+    fn crossover_genomes_material(
         &self,
         left: &BrainGenomeEnvelope,
         right: &BrainGenomeEnvelope,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         let left_nodes = decode_genome(left)?;
         let right_nodes = decode_genome(right)?;
         let child = crossover_nodes(&left_nodes, &right_nodes, rng);
-        let provenance = BrainProvenance {
-            parents: [left.provenance().parents[0], right.provenance().parents[0]],
-            created_at: Tick(
-                left.provenance()
-                    .created_at
-                    .0
-                    .max(right.provenance().created_at.0),
-            ),
-        };
-        genome_envelope(&child, provenance)
+        genome_material(&child)
     }
 
     fn initial_state(
@@ -843,7 +846,7 @@ impl Brain for DwraonBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{AgentUid, SmallRngStream};
+    use scriptbots_core::{AgentUid, BrainFamilyAdapter, SmallRngStream, Tick};
 
     fn protocol_genome(nodes: &[NodeParams], provenance: BrainProvenance) -> BrainGenomeEnvelope {
         genome_envelope(nodes, provenance).expect("valid test genome")
@@ -971,11 +974,11 @@ mod tests {
         let family = DwraonFamilyAdapter::default();
         let mut first_rng = SmallRngStream::seed_from_u64(0x0A11_CE55);
         let first = family
-            .random_genome(&mut first_rng)
+            .random_genome(BrainProvenance::default(), &mut first_rng)
             .expect("first deterministic genome");
         let mut second_rng = SmallRngStream::seed_from_u64(0x0A11_CE55);
         let second = family
-            .random_genome(&mut second_rng)
+            .random_genome(BrainProvenance::default(), &mut second_rng)
             .expect("second deterministic genome");
         assert_eq!(first, second);
         assert_eq!(first.payload().len(), GENOME_PAYLOAD_BYTES);
@@ -1031,7 +1034,9 @@ mod tests {
     fn protocol_rejects_malformed_genomes_states_and_mutation_rates() {
         let family = DwraonFamilyAdapter::default();
         let mut rng = SmallRngStream::seed_from_u64(17);
-        let genome = family.random_genome(&mut rng).expect("valid genome");
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut rng)
+            .expect("valid genome");
 
         let mut invalid_source_payload = genome.payload().to_vec();
         let first_source = GENOME_HEADER_BYTES + 1 + 4 + 4 + 4;
@@ -1053,7 +1058,12 @@ mod tests {
             })
         ));
         assert!(matches!(
-            family.mutate_genome(&invalid_source, MutationRates::default(), &mut rng),
+            family.mutate_genome(
+                &invalid_source,
+                MutationRates::default(),
+                BrainProvenance::default(),
+                &mut rng
+            ),
             Err(BrainProtocolError::InvalidPayload {
                 kind: BrainEnvelopeKind::Genome,
                 ..
@@ -1066,6 +1076,7 @@ mod tests {
                     primary: f32::NAN,
                     secondary: 0.1,
                 },
+                BrainProvenance::default(),
                 &mut rng,
             ),
             Err(BrainProtocolError::InvalidPayload {
@@ -1130,25 +1141,31 @@ mod tests {
     fn protocol_mutation_is_deterministic_changes_genome_and_stays_valid() {
         let family = DwraonFamilyAdapter::default();
         let mut genome_rng = SmallRngStream::seed_from_u64(44);
-        let genome = family.random_genome(&mut genome_rng).expect("base genome");
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut genome_rng)
+            .expect("base genome");
         let rates = MutationRates {
             primary: 0.2,
             secondary: 0.05,
         };
+        let child_provenance = BrainProvenance {
+            parents: [Some(AgentUid(77)), None],
+            created_at: Tick(12),
+        };
         let mut first_rng = SmallRngStream::seed_from_u64(99);
         let first = family
-            .mutate_genome(&genome, rates, &mut first_rng)
+            .mutate_genome(&genome, rates, child_provenance.clone(), &mut first_rng)
             .expect("first mutation");
         let mut second_rng = SmallRngStream::seed_from_u64(99);
         let second = family
-            .mutate_genome(&genome, rates, &mut second_rng)
+            .mutate_genome(&genome, rates, child_provenance.clone(), &mut second_rng)
             .expect("second mutation");
         assert_eq!(first, second);
         assert_ne!(first.payload(), genome.payload());
         family
             .validate_genome(&first)
             .expect("mutation must return a valid offspring genome");
-        assert_eq!(first.provenance(), genome.provenance());
+        assert_eq!(first.provenance(), &child_provenance);
     }
 
     #[test]
@@ -1170,8 +1187,12 @@ mod tests {
             },
         );
         let mut crossover_rng = SmallRngStream::seed_from_u64(0xC205_50E2);
+        let child_provenance = BrainProvenance {
+            parents: [Some(AgentUid(111)), Some(AgentUid(222))],
+            created_at: Tick(15),
+        };
         let child = family
-            .crossover_genomes(&left, &right, &mut crossover_rng)
+            .crossover_genomes(&left, &right, child_provenance.clone(), &mut crossover_rng)
             .expect("field-wise child");
         let child_nodes = decode_genome(&child).expect("decode child");
 
@@ -1239,13 +1260,7 @@ mod tests {
             node.bias == left_nodes[0].bias && node.kind == right_nodes[0].kind
                 || node.bias == right_nodes[0].bias && node.kind == left_nodes[0].kind
         }));
-        assert_eq!(
-            child.provenance(),
-            &BrainProvenance {
-                parents: [Some(AgentUid(11)), Some(AgentUid(22))],
-                created_at: Tick(9),
-            }
-        );
+        assert_eq!(child.provenance(), &child_provenance);
         family
             .validate_genome(&child)
             .expect("field-wise child must remain valid");
@@ -1255,7 +1270,9 @@ mod tests {
     fn evaluator_checkpoint_restore_has_identical_next_output_and_state() {
         let family = DwraonFamilyAdapter::default();
         let mut rng = SmallRngStream::seed_from_u64(8080);
-        let genome = family.random_genome(&mut rng).expect("genome");
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut rng)
+            .expect("genome");
         let initial = family.initial_state(&genome, &mut rng).expect("state");
         assert_eq!(initial.payload().len(), STATE_PAYLOAD_BYTES);
         assert_eq!(&initial.payload()[..6], &[b'D', b'W', b'S', b'T', 200, 0]);
@@ -1302,7 +1319,9 @@ mod tests {
         let family = DwraonFamilyAdapter::default();
         assert_eq!(family.offspring_state_policy(), OffspringStatePolicy::Reset);
         let mut rng = SmallRngStream::seed_from_u64(303);
-        let genome = family.random_genome(&mut rng).expect("genome");
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut rng)
+            .expect("genome");
         let initial = family.initial_state(&genome, &mut rng).expect("initial");
         let mut parent = family
             .evaluator(&genome, &initial)

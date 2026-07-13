@@ -3,10 +3,13 @@
 use rand::Rng;
 use scriptbots_core::{
     BrainActivations, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
-    BrainFamilyAdapter, BrainFamilyId, BrainGenomeEnvelope, BrainInspection, BrainProtocolError,
-    BrainProvenance, MutationRates, OffspringStatePolicy, RandomStream,
+    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection,
+    BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream,
 };
 use std::any::Any;
+
+#[cfg(test)]
+use scriptbots_core::BrainProvenance;
 
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 
@@ -209,6 +212,7 @@ impl AssemblyFamilyAdapter {
         decode_state_payload(state.payload(), &self.family_id)
     }
 
+    #[cfg(test)]
     fn genome(
         &self,
         cells: &[f32; BRAIN_SIZE],
@@ -220,6 +224,17 @@ impl AssemblyFamilyAdapter {
             ASSEMBLY_GENOME_CODEC_VERSION,
             encode_cells(cells, BrainEnvelopeKind::Genome, &self.family_id)?,
             provenance,
+        )
+    }
+
+    fn genome_material(
+        &self,
+        cells: &[f32; BRAIN_SIZE],
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        BrainGenomeMaterial::new(
+            ASSEMBLY_GENOME_SCHEMA_VERSION,
+            ASSEMBLY_GENOME_CODEC_VERSION,
+            encode_cells(cells, BrainEnvelopeKind::Genome, &self.family_id)?,
         )
     }
 
@@ -319,17 +334,17 @@ impl BrainEvaluator for AssemblyProtocolEvaluator {
     }
 }
 
-impl BrainFamilyAdapter for AssemblyFamilyAdapter {
+impl BrainFamilyCodec for AssemblyFamilyAdapter {
     fn family_id(&self) -> &BrainFamilyId {
         &self.family_id
     }
 
-    fn random_genome(
+    fn random_genome_material(
         &self,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         let brain = AssemblyBrain::random(rng);
-        self.genome(&brain.cells, BrainProvenance::default())
+        self.genome_material(&brain.cells)
     }
 
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
@@ -343,12 +358,12 @@ impl BrainFamilyAdapter for AssemblyFamilyAdapter {
         self.decode_state(state).map(|_| ())
     }
 
-    fn mutate_genome(
+    fn mutate_genome_material(
         &self,
         genome: &BrainGenomeEnvelope,
         rates: MutationRates,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         validate_mutation_probability(rates.primary, &self.family_id)?;
         let mut cells = self.decode_genome(genome)?;
         for cell in &mut cells {
@@ -358,15 +373,15 @@ impl BrainFamilyAdapter for AssemblyFamilyAdapter {
         }
         // Legacy Assembly mutation deliberately ignores MR2. `secondary` is retained in the
         // shared rate structure but cannot silently acquire a different meaning for this family.
-        self.genome(&cells, genome.provenance().clone())
+        self.genome_material(&cells)
     }
 
-    fn crossover_genomes(
+    fn crossover_genomes_material(
         &self,
         left: &BrainGenomeEnvelope,
         right: &BrainGenomeEnvelope,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         let left_cells = self.decode_genome(left)?;
         let right_cells = self.decode_genome(right)?;
         let mut child = right_cells;
@@ -375,18 +390,7 @@ impl BrainFamilyAdapter for AssemblyFamilyAdapter {
                 *cell = left_cell;
             }
         }
-        self.genome(
-            &child,
-            BrainProvenance {
-                parents: [left.provenance().parents[0], right.provenance().parents[0]],
-                created_at: scriptbots_core::Tick(
-                    left.provenance()
-                        .created_at
-                        .0
-                        .max(right.provenance().created_at.0),
-                ),
-            },
-        )
+        self.genome_material(&child)
     }
 
     fn initial_state(
@@ -656,7 +660,7 @@ impl Brain for AssemblyBrain {
 mod tests {
     use super::*;
     use rand::RngCore;
-    use scriptbots_core::{AgentUid, SmallRngStream, Tick};
+    use scriptbots_core::{AgentUid, BrainFamilyAdapter, SmallRngStream, Tick};
 
     #[derive(Clone, Debug, Default)]
     struct AlternatingThresholdStream {
@@ -795,7 +799,7 @@ mod tests {
 
         let mut protocol_rng = AlternatingThresholdStream::default();
         let protocol_child = family
-            .crossover_genomes(&left, &right, &mut protocol_rng)
+            .crossover_genomes(&left, &right, BrainProvenance::default(), &mut protocol_rng)
             .expect("protocol crossover");
         assert_eq!(
             family
@@ -908,6 +912,10 @@ mod tests {
             .expect("right genome");
 
         let mut rng = SmallRngStream::seed_from_u64(91);
+        let unchanged_provenance = BrainProvenance {
+            parents: [Some(AgentUid(101)), None],
+            created_at: Tick(40),
+        };
         let unchanged = family
             .mutate_genome(
                 &left,
@@ -915,12 +923,17 @@ mod tests {
                     primary: 0.0,
                     secondary: 999.0,
                 },
+                unchanged_provenance.clone(),
                 &mut rng,
             )
             .expect("zero-rate mutation");
         assert_eq!(unchanged.payload(), left.payload());
-        assert_eq!(unchanged.provenance(), left.provenance());
+        assert_eq!(unchanged.provenance(), &unchanged_provenance);
 
+        let mutated_provenance = BrainProvenance {
+            parents: [Some(AgentUid(102)), None],
+            created_at: Tick(41),
+        };
         let mutated = family
             .mutate_genome(
                 &left,
@@ -928,16 +941,23 @@ mod tests {
                     primary: 1.0,
                     secondary: 0.0,
                 },
+                mutated_provenance.clone(),
                 &mut rng,
             )
             .expect("full mutation");
+        assert_eq!(mutated.provenance(), &mutated_provenance);
         let mutated_cells = family.decode_genome(&mutated).expect("mutated cells");
         assert_ne!(mutated_cells, left_cells);
         assert!(mutated_cells.iter().all(|cell| (-3.0..3.0).contains(cell)));
 
+        let child_provenance = BrainProvenance {
+            parents: [Some(AgentUid(103)), Some(AgentUid(104))],
+            created_at: Tick(42),
+        };
         let child = family
-            .crossover_genomes(&left, &right, &mut rng)
+            .crossover_genomes(&left, &right, child_provenance.clone(), &mut rng)
             .expect("field-wise crossover");
+        assert_eq!(child.provenance(), &child_provenance);
         let child_cells = family.decode_genome(&child).expect("child cells");
         assert!(child_cells.iter().all(|cell| *cell == -1.0 || *cell == 1.0));
         assert!(child_cells.contains(&-1.0));
@@ -1006,6 +1026,7 @@ mod tests {
                         primary: invalid_rate,
                         secondary: 0.0,
                     },
+                    BrainProvenance::default(),
                     &mut rng,
                 ),
                 Err(BrainProtocolError::InvalidPayload { .. })

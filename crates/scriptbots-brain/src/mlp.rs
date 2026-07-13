@@ -2,12 +2,15 @@
 
 use rand::Rng;
 use scriptbots_core::{
-    BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyAdapter,
-    BrainFamilyId, BrainGenomeEnvelope, BrainInspection, BrainProtocolError, BrainProvenance,
+    BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec,
+    BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection, BrainProtocolError,
     MutationRates, OffspringStatePolicy, RandomStream,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+
+#[cfg(test)]
+use scriptbots_core::BrainProvenance;
 
 use scriptbots_core::{ActivationLayer, BrainActivations, BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
 
@@ -607,6 +610,7 @@ impl MlpBrainFamily {
         Ok(decoded)
     }
 
+    #[cfg(test)]
     fn genome(
         &self,
         nodes: &[NodeParams],
@@ -618,6 +622,17 @@ impl MlpBrainFamily {
             GENOME_CODEC_VERSION,
             self.encode_genome_payload(nodes)?,
             provenance,
+        )
+    }
+
+    fn genome_material(
+        &self,
+        nodes: &[NodeParams],
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        BrainGenomeMaterial::new(
+            GENOME_SCHEMA_VERSION,
+            GENOME_CODEC_VERSION,
+            self.encode_genome_payload(nodes)?,
         )
     }
 
@@ -706,17 +721,17 @@ impl BrainEvaluator for MlpEvaluator {
     }
 }
 
-impl BrainFamilyAdapter for MlpBrainFamily {
+impl BrainFamilyCodec for MlpBrainFamily {
     fn family_id(&self) -> &BrainFamilyId {
         &self.family_id
     }
 
-    fn random_genome(
+    fn random_genome_material(
         &self,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         let brain = MlpBrain::random(rng);
-        self.genome(&brain.nodes, BrainProvenance::default())
+        self.genome_material(&brain.nodes)
     }
 
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
@@ -730,27 +745,27 @@ impl BrainFamilyAdapter for MlpBrainFamily {
         self.decode_state(state).map(|_| ())
     }
 
-    fn mutate_genome(
+    fn mutate_genome_material(
         &self,
         genome: &BrainGenomeEnvelope,
         rates: MutationRates,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         self.validate_mutation_rates(rates)?;
         let mut brain = MlpBrain {
             nodes: self.decode_genome(genome)?,
             state: vec![NodeState::default(); BRAIN_SIZE],
         };
         brain.mutate_parameters(rng, rates.primary, rates.secondary);
-        self.genome(&brain.nodes, genome.provenance().clone())
+        self.genome_material(&brain.nodes)
     }
 
-    fn crossover_genomes(
+    fn crossover_genomes_material(
         &self,
         left: &BrainGenomeEnvelope,
         right: &BrainGenomeEnvelope,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         let left_nodes = self.decode_genome(left)?;
         let right_nodes = self.decode_genome(right)?;
         let mut child_nodes = left_nodes;
@@ -759,16 +774,7 @@ impl BrainFamilyAdapter for MlpBrainFamily {
                 *child = right;
             }
         }
-        let provenance = BrainProvenance {
-            parents: [left.provenance().parents[0], right.provenance().parents[0]],
-            created_at: scriptbots_core::Tick(
-                left.provenance()
-                    .created_at
-                    .0
-                    .max(right.provenance().created_at.0),
-            ),
-        };
-        self.genome(&child_nodes, provenance)
+        self.genome_material(&child_nodes)
     }
 
     fn initial_state(
@@ -920,7 +926,7 @@ impl Brain for MlpBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{AgentUid, SmallRngStream, Tick};
+    use scriptbots_core::{AgentUid, BrainFamilyAdapter, SmallRngStream, Tick};
 
     fn fixture_nodes() -> Vec<NodeParams> {
         (0..BRAIN_SIZE)
@@ -1256,6 +1262,10 @@ mod tests {
             .expect("right genome");
 
         let mut mutation_rng = SmallRngStream::seed_from_u64(0xA11C_E5E5);
+        let mutation_provenance = BrainProvenance {
+            parents: [Some(AgentUid(101)), None],
+            created_at: Tick(7),
+        };
         let mutated = family
             .mutate_genome(
                 &left,
@@ -1263,10 +1273,11 @@ mod tests {
                     primary: 1.0,
                     secondary: 0.25,
                 },
+                mutation_provenance.clone(),
                 &mut mutation_rng,
             )
             .expect("mutated genome");
-        assert_eq!(mutated.provenance(), &left_provenance);
+        assert_eq!(mutated.provenance(), &mutation_provenance);
         let mutated_nodes = family.decode_genome(&mutated).expect("mutated nodes");
         assert_eq!(mutated_nodes.len(), BRAIN_SIZE);
         assert_ne!(mutated_nodes, left_nodes);
@@ -1303,8 +1314,12 @@ mod tests {
         }
 
         let mut crossover_rng = SmallRngStream::seed_from_u64(0xC205_50FE);
+        let child_provenance = BrainProvenance {
+            parents: [Some(AgentUid(101)), Some(AgentUid(202))],
+            created_at: Tick(8),
+        };
         let child = family
-            .crossover_genomes(&left, &right, &mut crossover_rng)
+            .crossover_genomes(&left, &right, child_provenance.clone(), &mut crossover_rng)
             .expect("child genome");
         let child_nodes = family.decode_genome(&child).expect("child nodes");
         let mut selected_left = false;
@@ -1315,13 +1330,7 @@ mod tests {
             selected_right |= child == right;
         }
         assert!(selected_left && selected_right);
-        assert_eq!(
-            child.provenance(),
-            &BrainProvenance {
-                parents: [Some(AgentUid(10)), Some(AgentUid(20))],
-                created_at: Tick(6),
-            }
-        );
+        assert_eq!(child.provenance(), &child_provenance);
 
         let first_parent_state = family.state(&fixture_state()).expect("first parent state");
         let mut second_dynamic = fixture_state();
@@ -1345,7 +1354,9 @@ mod tests {
     fn checkpoint_reconstruction_preserves_the_exact_next_output() {
         let family = MlpBrainFamily::new();
         let mut rng = SmallRngStream::seed_from_u64(0x5EED_F00D);
-        let genome = family.random_genome(&mut rng).expect("random genome");
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut rng)
+            .expect("random genome");
         let state = family
             .initial_state(&genome, &mut rng)
             .expect("initial state");
@@ -1463,6 +1474,7 @@ mod tests {
                     primary: 1.0,
                     secondary: 0.0,
                 },
+                BrainProvenance::default(),
                 &mut rng,
             )
             .expect("legacy-clamped mutation");
