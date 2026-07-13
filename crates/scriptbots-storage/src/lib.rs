@@ -17,6 +17,7 @@ use scriptbots_core::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -330,6 +331,38 @@ const AGENT_COLUMNS: &[&str] = &[
 /// Storage error wrapper.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    /// The batch was refused BEFORE it was prepared, because it is too large.
+    ///
+    /// This is a `NotAdmitted` outcome in the strictest sense: nothing was
+    /// allocated, nothing was enqueued, and the caller still holds the exact
+    /// payload it tried to submit, so the retry semantics are untouched.
+    #[error(
+        "batch at tick {tick} is too large to admit: {bytes} bytes across {events} records exceeds the cap of {max_bytes} bytes / {max_events} records"
+    )]
+    PayloadTooLarge {
+        /// Which tick was refused.
+        tick: u64,
+        /// Estimated size of the payload.
+        bytes: usize,
+        /// Record count across every vector in the batch.
+        events: usize,
+        /// The byte ceiling.
+        max_bytes: usize,
+        /// The record ceiling.
+        max_events: usize,
+    },
+    /// Admitting this batch would push the in-flight buffer past its byte ceiling.
+    #[error(
+        "batch at tick {tick} would push in-flight persistence to {would_be} bytes, over the cap of {max_inflight}"
+    )]
+    InFlightBytesExhausted {
+        /// Which tick was refused.
+        tick: u64,
+        /// What the in-flight total would have become.
+        would_be: usize,
+        /// The ceiling.
+        max_inflight: usize,
+    },
     #[error("FrankenSQLite error: {0}")]
     Database(#[from] FrankenError),
     #[error(
@@ -1401,6 +1434,98 @@ pub struct PersistedReplayEvent {
     pub tick: u64,
     pub seq: u64,
     pub event: ReplayEvent,
+}
+
+/// Holds a reservation on the in-flight byte counter and releases it on drop.
+///
+/// RAII rather than a manual decrement, because "released exactly once on commit,
+/// refusal, timeout handoff, crash, and shutdown" is a requirement that a chain of
+/// hand-written `fetch_sub` calls WILL eventually violate — one early return that
+/// forgets it, and the counter creeps up until the sink refuses everything and
+/// persistence dies quietly in a long run rather than loudly in a test.
+struct InFlightPermit {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for InFlightPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+/// Ceilings on what persistence will admit.
+///
+/// The queue used to be bounded by COUNT alone, which bounds nothing that matters:
+/// a single batch carrying a hundred thousand agent rows is one command, sails
+/// through a count-based gate, and is fully materialized by
+/// `PreparedPersistenceBatch::from_batch` BEFORE any deadline or admission check
+/// can refuse it. The memory is gone by the time anyone gets a say.
+///
+/// So the size is measured FIRST, from the batch's own shape, and an oversized
+/// batch is refused before a single row is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadBudget {
+    /// Largest single batch, in estimated bytes.
+    pub max_batch_bytes: usize,
+    /// Largest single batch, in records across every vector.
+    pub max_batch_events: usize,
+    /// Largest total in-flight (buffered, not yet flushed) payload, in bytes.
+    pub max_inflight_bytes: usize,
+}
+
+impl Default for PayloadBudget {
+    fn default() -> Self {
+        Self {
+            // 64 MiB is generous for one tick and still bounded: a batch this
+            // large is pathological, and pathological is exactly what must be
+            // refused rather than allocated.
+            max_batch_bytes: 64 << 20,
+            max_batch_events: 1_000_000,
+            // 256 MiB of buffered payload is the ceiling before back-pressure.
+            max_inflight_bytes: 256 << 20,
+        }
+    }
+}
+
+/// Estimated bytes and record count for a batch, WITHOUT allocating it.
+///
+/// Deterministic and cheap: it reads the vector lengths and multiplies by each
+/// row's in-memory size. It deliberately does NOT serialize — serializing to find
+/// out whether something is too big to serialize is the bug, not the check.
+///
+/// The estimate is an approximation of the heap the prepared batch will occupy,
+/// and it does not need to be exact. It needs to be MONOTONIC in the batch's size
+/// and computable in constant time, which it is.
+#[must_use]
+pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
+    let events = payload.metrics.len()
+        + payload.events.len()
+        + payload.agents.len()
+        + payload.births.len()
+        + payload.deaths.len()
+        + payload.replay_events.len();
+
+    // Per-record sizes, plus a per-record allowance for the strings and JSON each
+    // row carries on the heap. Fixed constants keep this deterministic across
+    // platforms and feature sets, which a `size_of` chain would not be.
+    const METRIC_BYTES: usize = 96;
+    const EVENT_BYTES: usize = 256;
+    const AGENT_BYTES: usize = 512;
+    const BIRTH_BYTES: usize = 192;
+    const DEATH_BYTES: usize = 192;
+    const REPLAY_BYTES: usize = 512;
+    const SUMMARY_BYTES: usize = 256;
+
+    let bytes = SUMMARY_BYTES
+        + payload.metrics.len().saturating_mul(METRIC_BYTES)
+        + payload.events.len().saturating_mul(EVENT_BYTES)
+        + payload.agents.len().saturating_mul(AGENT_BYTES)
+        + payload.births.len().saturating_mul(BIRTH_BYTES)
+        + payload.deaths.len().saturating_mul(DEATH_BYTES)
+        + payload.replay_events.len().saturating_mul(REPLAY_BYTES);
+
+    (bytes, events)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -4169,6 +4294,16 @@ pub struct StorageSink {
     admission: Arc<Mutex<AdmissionState>>,
     path: Arc<str>,
     deadlines: StorageDeadlines,
+    /// What this sink will admit. See [`PayloadBudget`].
+    budget: PayloadBudget,
+    /// Bytes admitted but not yet flushed.
+    ///
+    /// Incremented on admission and decremented when the worker reports the batch
+    /// committed or failed — EXACTLY ONCE on every exit path. A permit that leaks
+    /// on the error path is worse than no permit at all: the counter creeps up,
+    /// the sink eventually refuses everything, and persistence dies quietly in a
+    /// long run rather than loudly in a test.
+    inflight_bytes: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -4227,6 +4362,50 @@ impl StorageSink {
         payload: &PersistenceBatch,
     ) -> Result<AdmissionReceipt, StorageError> {
         let tick = payload.summary.tick.0;
+
+        // MEASURE BEFORE ALLOCATING. `from_batch` below materializes the entire
+        // batch; if the batch is pathological, the memory is already gone by the
+        // time any deadline or admission gate gets a say. So the size is computed
+        // from the batch's own shape first — constant time, no serialization —
+        // and an oversized batch is refused here, having allocated nothing.
+        //
+        // This is a NotAdmitted outcome in the strictest sense: the caller still
+        // holds the exact payload it tried to submit, so the exact-retry semantics
+        // the storage contract depends on are untouched.
+        let (bytes, events) = estimate_batch_size(payload);
+        if bytes > self.budget.max_batch_bytes || events > self.budget.max_batch_events {
+            return Err(StorageError::PayloadTooLarge {
+                tick,
+                bytes,
+                events,
+                max_bytes: self.budget.max_batch_bytes,
+                max_events: self.budget.max_batch_events,
+            });
+        }
+
+        // Total in-flight back-pressure. A stream of individually-legal batches
+        // can still exhaust memory if the writer falls behind, so the buffered
+        // total is bounded too. Reserved BEFORE preparation, and released on every
+        // exit below.
+        let previous = self.inflight_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let would_be = previous.saturating_add(bytes);
+        if would_be > self.budget.max_inflight_bytes {
+            // Release immediately: this batch never became in-flight.
+            self.inflight_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(StorageError::InFlightBytesExhausted {
+                tick,
+                would_be,
+                max_inflight: self.budget.max_inflight_bytes,
+            });
+        }
+        // From here on, `bytes` is reserved and MUST be released exactly once on
+        // every path out of this function. `InFlightPermit` does that on drop, so
+        // an early return, an error, or a panic cannot leak it.
+        let _permit = InFlightPermit {
+            counter: Arc::clone(&self.inflight_bytes),
+            bytes,
+        };
+
         let prepared = PreparedPersistenceBatch::from_batch(payload).inspect_err(|error| {
             let worker_error = StorageWorkerError::Internal {
                 operation: StorageOperation::Admit,
@@ -4675,6 +4854,8 @@ impl StoragePipeline {
                     admission,
                     path: storage_path.clone(),
                     deadlines,
+                    budget: PayloadBudget::default(),
+                    inflight_bytes: Arc::new(AtomicUsize::new(0)),
                 },
                 handle: Some(handle),
                 pending_shutdown: None,
@@ -4742,6 +4923,20 @@ impl StoragePipeline {
     }
 
     /// Admit a persistence batch to the bounded worker queue.
+    /// Set the ceilings this pipeline will admit.
+    ///
+    /// Exposed so operators (and tests) can bound persistence to the machine they
+    /// are actually on; the default is deliberately generous but finite.
+    pub fn set_payload_budget(&mut self, budget: PayloadBudget) {
+        self.sink.budget = budget;
+    }
+
+    /// Bytes admitted but not yet flushed.
+    #[must_use]
+    pub fn inflight_bytes(&self) -> usize {
+        self.sink.inflight_bytes.load(Ordering::SeqCst)
+    }
+
     pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
         self.sink.submit(payload)
     }
@@ -7681,6 +7876,8 @@ mod tests {
             admission: Arc::new(Mutex::new(AdmissionState { open: true })),
             path: Arc::from(":memory:"),
             deadlines: StorageDeadlines::default(),
+            budget: PayloadBudget::default(),
+            inflight_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let worker = thread::spawn(move || -> Result<(), std::io::Error> {
             match rx
@@ -7716,6 +7913,8 @@ mod tests {
             admission: Arc::new(Mutex::new(AdmissionState { open: true })),
             path: Arc::from(":memory:"),
             deadlines: short_deadlines(),
+            budget: PayloadBudget::default(),
+            inflight_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let started = Instant::now();
         let error = sink
@@ -7740,6 +7939,8 @@ mod tests {
             admission: Arc::new(Mutex::new(AdmissionState { open: true })),
             path: Arc::from(":memory:"),
             deadlines: short_deadlines(),
+            budget: PayloadBudget::default(),
+            inflight_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let admission = Arc::clone(&sink.admission);
         let guard = admission.lock().expect("test admission gate");
