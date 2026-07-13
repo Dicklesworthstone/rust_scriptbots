@@ -3162,6 +3162,52 @@ pub struct BrainProvenance {
     pub created_at: Tick,
 }
 
+/// Bounded family-owned genome bytes before core attaches scientific identity and lineage.
+///
+/// Adapter hooks can construct this material, but it intentionally contains neither a family ID
+/// nor provenance. Only the non-overridable [`BrainFamilyAdapter`] methods can turn it into
+/// a [`BrainGenomeEnvelope`] through the adapter protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrainGenomeMaterial {
+    schema_version: u32,
+    codec_version: u16,
+    payload: Vec<u8>,
+}
+
+impl BrainGenomeMaterial {
+    /// Construct bounded family-owned genome material.
+    pub fn new(
+        schema_version: u32,
+        codec_version: u16,
+        payload: Vec<u8>,
+    ) -> Result<Self, BrainProtocolError> {
+        ensure_payload_bound(
+            BrainEnvelopeKind::Genome,
+            payload.len(),
+            MAX_BRAIN_GENOME_PAYLOAD_BYTES,
+        )?;
+        Ok(Self {
+            schema_version,
+            codec_version,
+            payload,
+        })
+    }
+
+    fn into_envelope(
+        self,
+        family_id: BrainFamilyId,
+        provenance: BrainProvenance,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        BrainGenomeEnvelope::new(
+            family_id,
+            self.schema_version,
+            self.codec_version,
+            self.payload,
+            provenance,
+        )
+    }
+}
+
 /// Versioned, bounded, opaque heritable brain data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainGenomeEnvelope {
@@ -3612,16 +3658,20 @@ pub trait BrainBatchEvaluator: Send {
     fn checkpoint_states(&self) -> Result<Vec<BrainEvaluatorStateEnvelope>, BrainProtocolError>;
 }
 
-/// Object-safe protocol adapter implemented by each concrete brain family.
-pub trait BrainFamilyAdapter: Send + Sync {
+/// Object-safe family-owned protocol hooks implemented by each concrete brain family.
+///
+/// Genome-creation hooks return provenance-free [`BrainGenomeMaterial`]. Callers use
+/// [`BrainFamilyAdapter`] for the non-overridable operations that attach exact scientific
+/// family identity and caller-supplied provenance.
+pub trait BrainFamilyCodec: Send + Sync {
     /// Stable family identity used by every envelope and registry lookup.
     fn family_id(&self) -> &BrainFamilyId;
 
-    /// Generate a new heritable genome from the supplied deterministic stream.
-    fn random_genome(
+    /// Generate provenance-free heritable material from the supplied deterministic stream.
+    fn random_genome_material(
         &self,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError>;
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError>;
 
     /// Validate generic versions and family-owned genome bytes.
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError>;
@@ -3632,21 +3682,21 @@ pub trait BrainFamilyAdapter: Send + Sync {
         state: &BrainEvaluatorStateEnvelope,
     ) -> Result<(), BrainProtocolError>;
 
-    /// Mutate heritable data, never a live evaluator object.
-    fn mutate_genome(
+    /// Mutate heritable data into provenance-free child material, never a live evaluator object.
+    fn mutate_genome_material(
         &self,
         genome: &BrainGenomeEnvelope,
         rates: MutationRates,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError>;
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError>;
 
-    /// Recombine two validated genomes into heritable child data.
-    fn crossover_genomes(
+    /// Recombine two validated genomes into provenance-free child material.
+    fn crossover_genomes_material(
         &self,
         left: &BrainGenomeEnvelope,
         right: &BrainGenomeEnvelope,
         rng: &mut dyn RandomStream,
-    ) -> Result<BrainGenomeEnvelope, BrainProtocolError>;
+    ) -> Result<BrainGenomeMaterial, BrainProtocolError>;
 
     /// Construct the family's deterministic initial evaluator state.
     fn initial_state(
@@ -3693,6 +3743,65 @@ pub trait BrainFamilyAdapter: Send + Sync {
         Ok(state)
     }
 }
+
+fn construct_brain_genome<A>(
+    adapter: &A,
+    material: BrainGenomeMaterial,
+    provenance: BrainProvenance,
+) -> Result<BrainGenomeEnvelope, BrainProtocolError>
+where
+    A: BrainFamilyCodec + ?Sized,
+{
+    let genome = material.into_envelope(adapter.family_id().clone(), provenance)?;
+    adapter.validate_genome(&genome)?;
+    Ok(genome)
+}
+
+/// Core-controlled genome creation operations shared by every brain-family codec.
+///
+/// The blanket implementation is intentionally the only implementation. Concrete adapters can
+/// choose family-owned bytes through [`BrainFamilyCodec`], but cannot override family identity
+/// or fabricate lineage metadata while producing an envelope.
+pub trait BrainFamilyAdapter: BrainFamilyCodec {
+    /// Generate a new genome with the caller's exact creation provenance.
+    fn random_genome(
+        &self,
+        provenance: BrainProvenance,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        let material = self.random_genome_material(rng)?;
+        construct_brain_genome(self, material, provenance)
+    }
+
+    /// Mutate a validated genome and attach the caller's exact child provenance.
+    fn mutate_genome(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        rates: MutationRates,
+        provenance: BrainProvenance,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        self.validate_genome(genome)?;
+        let material = self.mutate_genome_material(genome, rates, rng)?;
+        construct_brain_genome(self, material, provenance)
+    }
+
+    /// Cross two validated genomes and attach the caller's exact child provenance.
+    fn crossover_genomes(
+        &self,
+        left: &BrainGenomeEnvelope,
+        right: &BrainGenomeEnvelope,
+        provenance: BrainProvenance,
+        rng: &mut dyn RandomStream,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        self.validate_genome(left)?;
+        self.validate_genome(right)?;
+        let material = self.crossover_genomes_material(left, right, rng)?;
+        construct_brain_genome(self, material, provenance)
+    }
+}
+
+impl<T> BrainFamilyAdapter for T where T: BrainFamilyCodec + ?Sized {}
 
 /// Deterministic family registry ordered by validated wire identifier.
 #[derive(Default)]
@@ -17249,6 +17358,15 @@ mod tests {
             .expect("fixture genome")
         }
 
+        fn genome_material(&self, gain: i8, bias: i8) -> BrainGenomeMaterial {
+            BrainGenomeMaterial::new(
+                FIXTURE_GENOME_SCHEMA,
+                FIXTURE_GENOME_CODEC,
+                vec![gain as u8, bias as u8],
+            )
+            .expect("fixture genome material")
+        }
+
         fn state(&self, accumulator: i16) -> BrainEvaluatorStateEnvelope {
             BrainEvaluatorStateEnvelope::new(
                 self.id.clone(),
@@ -17382,17 +17500,17 @@ mod tests {
         }
     }
 
-    impl BrainFamilyAdapter for FixtureBrainFamily {
+    impl BrainFamilyCodec for FixtureBrainFamily {
         fn family_id(&self) -> &BrainFamilyId {
             &self.id
         }
 
-        fn random_genome(
+        fn random_genome_material(
             &self,
             rng: &mut dyn RandomStream,
-        ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
             let sample = rng.next_u32().to_le_bytes();
-            Ok(self.genome(sample[0] as i8, sample[1] as i8, BrainProvenance::default()))
+            Ok(self.genome_material(sample[0] as i8, sample[1] as i8))
         }
 
         fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
@@ -17406,39 +17524,30 @@ mod tests {
             self.decode_state(state).map(|_| ())
         }
 
-        fn mutate_genome(
+        fn mutate_genome_material(
             &self,
             genome: &BrainGenomeEnvelope,
             rates: MutationRates,
             rng: &mut dyn RandomStream,
-        ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
             let (gain, bias) = self.decode_genome(genome)?;
             let delta = if rates.primary > 0.0 {
                 (rng.next_u32() % 7 + 1) as i8
             } else {
                 0
             };
-            Ok(self.genome(gain.wrapping_add(delta), bias, genome.provenance().clone()))
+            Ok(self.genome_material(gain.wrapping_add(delta), bias))
         }
 
-        fn crossover_genomes(
+        fn crossover_genomes_material(
             &self,
             left: &BrainGenomeEnvelope,
             right: &BrainGenomeEnvelope,
             _rng: &mut dyn RandomStream,
-        ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
             let (left_gain, _) = self.decode_genome(left)?;
             let (_, right_bias) = self.decode_genome(right)?;
-            let provenance = BrainProvenance {
-                parents: [left.provenance().parents[0], right.provenance().parents[0]],
-                created_at: Tick(
-                    left.provenance()
-                        .created_at
-                        .0
-                        .max(right.provenance().created_at.0),
-                ),
-            };
-            Ok(self.genome(left_gain, right_bias, provenance))
+            Ok(self.genome_material(left_gain, right_bias))
         }
 
         fn initial_state(
@@ -17811,9 +17920,10 @@ mod tests {
     }
 
     #[test]
-    fn brain_protocol_mutates_crosses_and_applies_every_offspring_state_policy() {
+    fn brain_protocol_creation_preserves_caller_provenance_and_applies_offspring_state_policy() {
         let reset_family =
             FixtureBrainFamily::with_policy("fixture-counter", OffspringStatePolicy::Reset);
+        let adapter: &dyn BrainFamilyAdapter = &reset_family;
         let left = reset_family.genome(
             2,
             -3,
@@ -17831,28 +17941,56 @@ mod tests {
             },
         );
         let mut rng = SmallRngStream::seed_from_u64(33);
-        let mutated = reset_family
+        let random_provenance = BrainProvenance {
+            parents: [Some(AgentUid(1_001)), None],
+            created_at: Tick(70),
+        };
+        let random = adapter
+            .random_genome(random_provenance.clone(), &mut rng)
+            .expect("random genome");
+        assert_eq!(random.provenance(), &random_provenance);
+        assert_ne!(random.provenance(), &BrainProvenance::default());
+
+        let mutated_provenance = BrainProvenance {
+            parents: [Some(AgentUid(2_001)), None],
+            created_at: Tick(71),
+        };
+        let mutated = adapter
             .mutate_genome(
                 &left,
                 MutationRates {
                     primary: 1.0,
                     secondary: 0.0,
                 },
+                mutated_provenance.clone(),
                 &mut rng,
             )
             .expect("mutated genome");
         assert_ne!(mutated.payload(), left.payload());
+        assert_eq!(mutated.provenance(), &mutated_provenance);
+        assert_ne!(mutated.provenance(), left.provenance());
 
-        let child = reset_family
-            .crossover_genomes(&left, &right, &mut rng)
+        let crossover_provenance = BrainProvenance {
+            parents: [Some(AgentUid(3_001)), Some(AgentUid(3_002))],
+            created_at: Tick(72),
+        };
+        let child = adapter
+            .crossover_genomes(&left, &right, crossover_provenance.clone(), &mut rng)
             .expect("crossed genome");
         assert_eq!(child.payload(), &[2, 7]);
-        assert_eq!(
+        assert_eq!(child.provenance(), &crossover_provenance);
+        assert_ne!(
             child.provenance(),
             &BrainProvenance {
-                parents: [Some(AgentUid(10)), Some(AgentUid(20))],
-                created_at: Tick(6),
-            }
+                parents: [left.provenance().parents[0], right.provenance().parents[0]],
+                created_at: Tick(
+                    left.provenance()
+                        .created_at
+                        .0
+                        .max(right.provenance().created_at.0),
+                ),
+            },
+            "an adapter must not fabricate child lineage from parent-genome provenance"
         );
 
         let first = reset_family.state(8);
