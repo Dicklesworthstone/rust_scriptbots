@@ -246,6 +246,7 @@ jobs:
         run: |
           bash ci/check_franken_licenses.sh --self-test
           bash ci/check_franken_licenses.sh
+          bash ci/check_franken_licenses.sh --third-party
 
       - name: Asupersync single-version-universe guard (bd-2z0.8.17)
         run: |
