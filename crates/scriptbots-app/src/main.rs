@@ -5,6 +5,7 @@ use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     CharacterizationTraceV0, ControlServerConfig, ControlServerReservation, ScenarioIdentityV0,
     SharedAnalytics, SharedWorld,
+    precedence::{ThreadSource, resolve_thread_policy},
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -125,18 +126,16 @@ fn main() -> Result<()> {
 
     // Auto-tune: run a quick sweep for the chosen storage mode, apply best settings, then continue.
     let mut thresholds = thresholds;
-    let mut threads_set_by_auto_tune = false;
+    let mut auto_tune_threads: Option<usize> = None;
     if let Some(ticks) = cli.auto_tune
         && let Some(best) =
             pick_best_for_storage(&config, ticks, cli.storage, cli.threads, cli.low_power)?
     {
-        // Apply threads if not explicitly set
-        if cli.threads.is_none() {
-            unsafe {
-                std::env::set_var("SCRIPTBOTS_MAX_THREADS", best.threads.to_string());
-            }
-            threads_set_by_auto_tune = true;
-        }
+        // The probe RECOMMENDS; it does not decide. Whether the recommendation is
+        // taken is settled by resolve_thread_policy below, which is what keeps a
+        // probe child's tuning from leaking into a run whose operator had already
+        // made the decision themselves.
+        auto_tune_threads = Some(best.threads);
         // Apply thresholds if not provided via CLI
         if cli.storage_thresholds.is_none() {
             thresholds = ThresholdsOverride {
@@ -162,15 +161,41 @@ fn main() -> Result<()> {
         );
     }
 
-    // Configure low-power / thread budget before world creation so the Rayon pool is capped.
-    if let Some(threads) = cli.threads {
+    // Configure the thread budget before world creation so the Rayon pool is
+    // capped. Precedence is resolved in ONE place, by a pure function, rather than
+    // by whichever branch of a chain happened to run last — see
+    // `scriptbots_app::precedence`. The bug that arrangement used to hide: a user
+    // who exported SCRIPTBOTS_MAX_THREADS=16 and passed --low-power had their
+    // explicit value silently replaced with 2.
+    let env_threads = std::env::var("SCRIPTBOTS_MAX_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|threads| *threads > 0);
+    let policy = resolve_thread_policy(cli.threads, env_threads, auto_tune_threads, cli.low_power);
+    tracing::info!(
+        threads = ?policy.threads,
+        source = %policy.source,
+        overridden = ?policy.overridden.map(|source| source.to_string()),
+        "resolved thread policy"
+    );
+    if let Some(overridden) = policy.overridden {
+        // Visible, not silent. This is the correct outcome of the precedence
+        // rules, but the user must learn it from the program rather than from a
+        // surprising performance number.
+        tracing::info!(
+            winner = %policy.source,
+            declined = %overridden,
+            "a less specific configuration layer was declined"
+        );
+    }
+    // Only write the variable when a layer other than the environment decided;
+    // rewriting it with the value it already holds is noise, and rewriting it
+    // with a DIFFERENT value is the clobber this whole module exists to prevent.
+    if policy.source != ThreadSource::Environment
+        && let Some(threads) = policy.threads
+    {
         unsafe {
             std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
-        }
-    } else if cli.low_power && !threads_set_by_auto_tune {
-        // Conservative default: 2 worker threads unless --threads or auto-tune decided already
-        unsafe {
-            std::env::set_var("SCRIPTBOTS_MAX_THREADS", "2");
         }
     }
 
