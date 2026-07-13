@@ -222,9 +222,7 @@ fn occupied_mcp_port_refuses_before_config_tuning_or_storage() {
     assert_no_startup_artifacts(&storage_path, &config_path, &tuning_dir);
 }
 
-#[cfg(not(feature = "gui"))]
-#[test]
-fn explicit_uncompiled_gui_refuses_before_storage_reservation() {
+fn assert_uncompiled_renderer_refuses_before_storage_reservation(mode: &str, expected_error: &str) {
     let temp_dir = tempdir().expect("temp storage directory");
     let storage_path = temp_dir.path().join("must-not-be-created.sqlite");
     let tuning_dir = temp_dir.path().join("auto-tune-temp");
@@ -237,7 +235,7 @@ fn explicit_uncompiled_gui_refuses_before_storage_reservation() {
         .env("TMPDIR", &tuning_dir)
         .args([
             "--mode",
-            "gui",
+            mode,
             "--bootstrap-ticks",
             "0",
             "--auto-tune",
@@ -250,11 +248,11 @@ fn explicit_uncompiled_gui_refuses_before_storage_reservation() {
 
     assert!(
         !output.status.success(),
-        "uncompiled GPUI request must fail"
+        "uncompiled {mode} request must fail"
     );
     let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
     assert!(
-        stderr.contains("--mode gui requires a binary built with --features gui"),
+        stderr.contains(expected_error),
         "expected precise unavailable-feature error; stderr:\n{stderr}"
     );
     assert!(
@@ -288,6 +286,24 @@ fn explicit_uncompiled_gui_refuses_before_storage_reservation() {
             .next()
             .is_none(),
         "renderer preflight must reject the request before the auto-tuning sweep"
+    );
+}
+
+#[cfg(not(feature = "gui"))]
+#[test]
+fn explicit_uncompiled_gui_refuses_before_storage_reservation() {
+    assert_uncompiled_renderer_refuses_before_storage_reservation(
+        "gui",
+        "--mode gui requires a binary built with --features gui",
+    );
+}
+
+#[cfg(not(feature = "bevy_render"))]
+#[test]
+fn explicit_uncompiled_bevy_refuses_before_storage_reservation() {
+    assert_uncompiled_renderer_refuses_before_storage_reservation(
+        "bevy",
+        "--mode bevy requires a binary built with --features bevy_render",
     );
 }
 
