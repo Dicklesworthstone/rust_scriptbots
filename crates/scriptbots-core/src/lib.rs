@@ -1,5 +1,6 @@
 //! Core types shared across the ScriptBots workspace.
 
+pub mod ancestry;
 pub mod channels;
 pub mod detect;
 pub mod sense_fixed;
