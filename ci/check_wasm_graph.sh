@@ -154,7 +154,24 @@ case "${1:-}" in
   --self-test) self_test ;;
   --update-snapshot)
     mkdir -p "$(dirname "$SNAPSHOT")"
-    wasm_graph > "$SNAPSHOT"
+    # Harden against a failing/queued cargo: build to a temp file, validate,
+    # and only then replace the snapshot. A failed resolution must never
+    # leave error text in the golden file (this happened once: an offloaded
+    # cargo run wrote its --locked refusal into the snapshot).
+    TMP_SNAP="$(mktemp)"
+    if ! wasm_graph > "$TMP_SNAP"; then
+      echo "::error::cargo resolution failed; snapshot NOT updated. Output was:"
+      cat "$TMP_SNAP"
+      rm -f "$TMP_SNAP"
+      exit 1
+    fi
+    if ! grep -q '^scriptbots-web$' "$TMP_SNAP" || grep -qiE '^(error|warning|blocking)' "$TMP_SNAP"; then
+      echo "::error::resolution output failed plausibility checks (must contain scriptbots-web, no error/lock-wait lines); snapshot NOT updated. Output was:"
+      cat "$TMP_SNAP"
+      rm -f "$TMP_SNAP"
+      exit 1
+    fi
+    mv "$TMP_SNAP" "$SNAPSHOT"
     echo "snapshot written: $SNAPSHOT ($(grep -c . "$SNAPSHOT") crates)"
     ;;
   *) main ;;
