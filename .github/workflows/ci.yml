@@ -114,6 +114,7 @@ jobs:
             mold \
             libfontconfig1 \
             libfreetype6-dev \
+            libwayland-dev \
             libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
@@ -169,6 +170,7 @@ jobs:
             mold \
             libfontconfig1 \
             libfreetype6-dev \
+            libwayland-dev \
             libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
@@ -441,6 +443,7 @@ jobs:
             mold \
             libfontconfig1 \
             libfreetype6-dev \
+            libwayland-dev \
             libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
@@ -504,6 +507,7 @@ jobs:
             mold \
             libfontconfig1 \
             libfreetype6-dev \
+            libwayland-dev \
             libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
