@@ -283,6 +283,25 @@ impl TerminalRenderer {
         Ok(report)
     }
 
+    /// Render exactly one frame and return the terminal buffer it drew into.
+    ///
+    /// `run_headless_frames` has always rendered into a real ratatui
+    /// `TestBackend` — and then thrown the buffer away. Nothing ever looked at
+    /// it, so the draw could have been a complete no-op and every "headless
+    /// frame" test would still have gone green on the strength of the simulation
+    /// having ticked. This hands the buffer back so a test can read what was
+    /// actually painted.
+    #[cfg(test)]
+    fn render_frame_to_buffer(&self, ctx: RendererContext<'_>) -> Result<ratatui::buffer::Buffer> {
+        let backend = ratatui::backend::TestBackend::new(80, 36);
+        let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
+        let mut app = TerminalApp::new(self, ctx);
+        app.ensure_control_runtime_running()?;
+        app.step_once();
+        terminal.draw(|frame| app.draw(frame))?;
+        Ok(terminal.backend().buffer().clone())
+    }
+
     fn headless_frame_budget(&self) -> usize {
         std::env::var("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES")
             .ok()
@@ -3517,6 +3536,93 @@ mod tests {
         assert_eq!(
             world.lock().expect("world lock").tick().0,
             report.initial.tick + 1
+        );
+    }
+
+    /// Flatten a rendered buffer into the text a human would actually see.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn the_headless_frame_actually_paints_the_hud_into_the_terminal_buffer() {
+        // The existing headless test asserts that the SIMULATION advanced, which
+        // it does honestly — but it says nothing whatsoever about rendering. The
+        // draw call could have been deleted, or could paint an empty screen, and
+        // that test would still pass. This one reads the buffer.
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+
+        let buffer = renderer
+            .render_frame_to_buffer(ctx)
+            .expect("one rendered frame");
+        let text = buffer_text(&buffer);
+
+        assert!(
+            text.contains("ScriptBots Terminal HUD"),
+            "the HUD panel was never painted; the buffer holds:\n{text}"
+        );
+        assert!(
+            text.contains("Tick"),
+            "the status line was never painted; the buffer holds:\n{text}"
+        );
+        // And the world it reports must be THIS world, not a default-constructed
+        // one: the frame is supposed to be a view of the simulation, and a HUD
+        // that renders a plausible-looking screen for the wrong world is worse
+        // than one that renders nothing.
+        let tick = world.lock().expect("world lock").tick().0;
+        assert!(
+            text.contains(&format!("Tick {tick:>6}")),
+            "the HUD does not show the world's actual tick ({tick}); it holds:\n{text}"
+        );
+
+        let painted = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count();
+        assert!(
+            painted > 200,
+            "only {painted} cells were painted — a near-blank frame is not a HUD"
+        );
+    }
+
+    #[test]
+    fn the_blank_buffer_detector_would_catch_a_frame_that_painted_nothing() {
+        // The same discipline as any alarm: an evidence check nobody has watched
+        // fail is an evidence check nobody knows works. A buffer nothing drew into
+        // is all spaces, and must be distinguishable from one that was painted.
+        let blank = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 36));
+        let painted = blank
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count();
+        assert_eq!(
+            painted, 0,
+            "an untouched buffer must read as zero painted cells, or the assertion \
+             above proves nothing"
+        );
+        assert!(
+            !buffer_text(&blank).contains("ScriptBots Terminal HUD"),
+            "an untouched buffer must not appear to contain the HUD"
         );
     }
 

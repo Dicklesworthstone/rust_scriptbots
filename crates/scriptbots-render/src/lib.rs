@@ -310,6 +310,12 @@ pub mod world_compositor {
         // diagnose blank screens without user setup.
         force_first_capture: bool,
         last_digest: Option<ReadbackDigest>,
+        /// Whether the adapter that actually rasterized is a CPU surrogate.
+        ///
+        /// The compositor has always known this; it simply never told anyone. A
+        /// capture test that cannot distinguish a live GPU framebuffer from an
+        /// llvmpipe raster is not testing the thing its name claims.
+        adapter_is_software: bool,
     }
 
     impl Compositor {
@@ -361,6 +367,7 @@ pub mod world_compositor {
                 save_prefix,
                 force_first_capture,
                 last_digest: None,
+                adapter_is_software: false,
             }
         }
 
@@ -385,6 +392,15 @@ pub mod world_compositor {
         #[cfg(test)]
         pub(super) fn adapter_failure(&self) -> Option<&str> {
             self.adapter_failure.as_deref()
+        }
+
+        /// Did a CPU surrogate rasterize the last frame?
+        ///
+        /// A test that asserts "the GPU drew this" while an llvmpipe adapter did
+        /// the drawing is asserting a falsehood, however green it looks.
+        #[cfg(test)]
+        pub(super) fn adapter_is_software(&self) -> bool {
+            self.adapter_is_software
         }
 
         pub fn set_camera_params(&mut self, scale: f32, offset: (f32, f32)) {
@@ -442,6 +458,7 @@ pub mod world_compositor {
                     self.record_adapter_failure(reason.clone());
                     return Err(reason);
                 } else if is_software {
+                    self.adapter_is_software = true;
                     warn!(
                         adapter = %info.name,
                         vendor = format!("{:#x}", info.vendor),
@@ -839,6 +856,72 @@ mod wgpu_capture_test {
         (dir, prefix, path)
     }
 
+    /// The captured frame, decoded into real pixels.
+    ///
+    /// The old tests asserted `metadata.len() > 0` — the size of the FILE, not
+    /// the content of the IMAGE. A PNG of a completely black frame is several
+    /// hundred bytes and sails through that check, so the renderer could have
+    /// drawn nothing at all and the test would still have gone green.
+    fn decode_capture(path: &std::path::Path) -> image::RgbaImage {
+        let decoded = image::open(path).unwrap_or_else(|err| {
+            panic!("captured frame at {} must decode: {err}", path.display())
+        });
+        decoded.to_rgba8()
+    }
+
+    /// How many DISTINCT colours the frame contains.
+    ///
+    /// This is the blank-frame detector. A frame that was never drawn into is
+    /// uniform (one colour: the clear colour, or transparent black), so a count
+    /// above one is the minimum evidence that rasterization actually happened.
+    fn distinct_colors(image: &image::RgbaImage) -> usize {
+        let mut seen = std::collections::BTreeSet::new();
+        for pixel in image.pixels() {
+            seen.insert(pixel.0);
+        }
+        seen.len()
+    }
+
+    /// Do two frames disagree anywhere within `radius` of a point?
+    ///
+    /// This is the honest question to ask of a renderer whose colours are blended:
+    /// not "is this pixel exactly the colour I passed in" (that tests the shader's
+    /// arithmetic) but "did drawing this thing change the picture here".
+    fn frames_differ_near(
+        a: &image::RgbaImage,
+        b: &image::RgbaImage,
+        center: (u32, u32),
+        radius: u32,
+    ) -> bool {
+        let (width, height) = a.dimensions();
+        let x0 = center.0.saturating_sub(radius);
+        let y0 = center.1.saturating_sub(radius);
+        let x1 = (center.0 + radius).min(width.saturating_sub(1));
+        let y1 = (center.1 + radius).min(height.saturating_sub(1));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if a.get_pixel(x, y) != b.get_pixel(x, y) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Name the surface that actually rasterized, so the test never overclaims.
+    ///
+    /// These captures run green on a headless CI box with no GPU in it — which
+    /// means llvmpipe, a CPU rasterizer, is doing the drawing. That is a
+    /// perfectly good thing to test; it is NOT a live GPU framebuffer, and a test
+    /// named as though it were is selling false confidence in the GPU path.
+    fn raster_source(comp: &Compositor) -> &'static str {
+        if comp.adapter_is_software() {
+            "CPU surrogate (software adapter)"
+        } else {
+            "live GPU framebuffer"
+        }
+    }
+
     fn test_agent(
         position: [f32; 2],
         size: f32,
@@ -880,8 +963,17 @@ mod wgpu_capture_test {
         }
     }
 
+    /// A captured terrain frame must contain a RASTERIZED IMAGE, not merely a file.
+    ///
+    /// This test was called `wgpu_capture_smoke` and asserted two things: that a
+    /// PNG existed, and that its file length was greater than zero. Both are true
+    /// of a PNG containing a completely black frame — so the renderer could have
+    /// drawn nothing whatsoever and this test would still have passed. It also
+    /// claimed "wgpu" in its name while running green on a headless CI box with
+    /// no GPU, i.e. on an llvmpipe CPU rasterizer. The name has been corrected and
+    /// the assertions now look at the pixels.
     #[test]
-    fn wgpu_capture_smoke() {
+    fn a_captured_terrain_frame_is_actually_rasterized_and_not_merely_written() {
         let (save_dir, save_prefix, expected_png) = capture_target("render");
         let mut comp = Compositor::new_for_capture_test(save_dir, save_prefix);
         let viewport = (640u32, 360u32);
@@ -903,22 +995,87 @@ mod wgpu_capture_test {
 
         assert!(
             expected_png.is_file(),
-            "expected current render capture at {}; adapter failure: {:?}",
+            "expected a render capture at {}; adapter failure: {:?}",
             expected_png.display(),
             comp.adapter_failure()
         );
+
+        // The evidence, at last: decode the frame and look at it.
+        let frame = decode_capture(&expected_png);
+        assert_eq!(
+            frame.dimensions(),
+            viewport,
+            "the captured frame must be the size we asked to render"
+        );
+
+        let colors = distinct_colors(&frame);
         assert!(
-            std::fs::metadata(&expected_png)
-                .expect("capture metadata")
-                .len()
-                > 0,
-            "render capture must not be empty"
+            colors > 1,
+            "the captured frame is a single flat colour, which means NOTHING WAS \
+             DRAWN — the old test passed on exactly this, because it only checked \
+             that the file had a non-zero length. Rasterized by: {}",
+            raster_source(&comp)
+        );
+
+        // The snapshot is wall-to-wall grass (tile kind 3), so the frame must be
+        // predominantly green: a frame that decoded, had several colours, and was
+        // still the wrong scene would otherwise slip through.
+        let greener_than_red = frame
+            .pixels()
+            .filter(|pixel| pixel.0[3] > 0 && pixel.0[1] > pixel.0[0])
+            .count();
+        assert!(
+            greener_than_red > (frame.pixels().len() / 4),
+            "a frame of solid grass must be predominantly green, but only {} of {} \
+             pixels were. Rasterized by: {}",
+            greener_than_red,
+            frame.pixels().len(),
+            raster_source(&comp)
         );
     }
 
+    /// The blank-frame detector must actually fire.
+    ///
+    /// Same discipline as any other alarm: an evidence check nobody has ever seen
+    /// fail is an evidence check nobody knows works. This constructs the exact
+    /// image the old test would have accepted — a uniform, fully black frame —
+    /// and proves the new check rejects it.
     #[test]
-    fn wgpu_capture_agents() {
+    fn the_blank_frame_check_rejects_the_frame_the_old_test_would_have_accepted() {
+        let blank = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 255]));
+        assert_eq!(
+            distinct_colors(&blank),
+            1,
+            "a frame nothing was drawn into is uniform; if this ever reports more \
+             than one colour, the detector is broken and every capture test above \
+             it is worthless"
+        );
+
+        let drawn = {
+            let mut image = blank.clone();
+            image.put_pixel(10, 10, image::Rgba([12, 200, 40, 255]));
+            image
+        };
+        assert!(
+            distinct_colors(&drawn) > 1,
+            "a frame with something drawn in it must be distinguishable from a \
+             blank one, or the check would reject everything and prove nothing"
+        );
+    }
+
+    /// The agents must actually appear in the frame, where they were placed.
+    ///
+    /// This test was called `wgpu_capture_agents` and never looked at a single
+    /// pixel: it built two agents with deliberately distinct colours, rendered
+    /// them, and then asserted only that a file existed and was non-empty. The
+    /// agent-drawing path could have been deleted entirely and it would still have
+    /// passed. It now proves both agents were rasterized, at the positions they
+    /// were given.
+    #[test]
+    fn both_agents_are_rasterized_into_the_frame_at_the_positions_they_were_given() {
         let (save_dir, save_prefix, expected_png) = capture_target("agents");
+        // The compositor numbers its captures, so the second render lands here.
+        let second_png = save_dir.join(format!("{save_prefix}_000002.png"));
         let mut comp = Compositor::new_for_capture_test(save_dir, save_prefix);
         let viewport = (640u32, 360u32);
 
@@ -975,16 +1132,85 @@ mod wgpu_capture_test {
 
         assert!(
             expected_png.is_file(),
-            "expected current agents capture at {}; adapter failure: {:?}",
+            "expected an agents capture at {}; adapter failure: {:?}",
             expected_png.display(),
             comp.adapter_failure()
         );
+
+        let frame = decode_capture(&expected_png);
         assert!(
-            std::fs::metadata(&expected_png)
-                .expect("capture metadata")
-                .len()
-                > 0,
-            "agents capture must not be empty"
+            distinct_colors(&frame) > 1,
+            "nothing was drawn at all. Rasterized by: {}",
+            raster_source(&comp)
+        );
+
+        // Where the two agents should have landed, in pixels.
+        let to_pixel = |world: [f32; 2]| -> (u32, u32) {
+            (
+                (world[0] * base_scale + pad_x).round().max(0.0) as u32,
+                (world[1] * base_scale + pad_y).round().max(0.0) as u32,
+            )
+        };
+        let red_at = to_pixel([world_size.0 * 0.5, world_size.1 * 0.5]);
+        let green_at = to_pixel([world_size.0 * 0.55, world_size.1 * 0.48]);
+
+        // The agent colours are deliberately distinct from the terrain, and from
+        // each other, so their presence is a real signal rather than a coincidence
+        // of the background. A generous tolerance and search radius: the shader
+        // blends and antialiases, so demanding the exact input colour at the exact
+        // centre pixel would be a test of the blend function, not of whether the
+        // agent was drawn.
+        // A DIFFERENTIAL proof, rather than a guess about the shader's arithmetic.
+        //
+        // Demanding an exact input colour at the agent's centre pixel would be
+        // testing the blend function, not the thing we care about: the agents
+        // carry glow and selection, so the red agent lands on screen as a washed
+        // pink rather than its literal input colour. Instead, render the SAME
+        // scene with the agents removed and compare. If the agent-drawing path
+        // were deleted, the two frames would be identical — and that is exactly
+        // what the old test could not tell.
+        let empty = GfxSnapshot {
+            world_size,
+            terrain: TerrainView {
+                dims,
+                cell_size: 50,
+                tiles: &tiles,
+                elevation: None,
+            },
+            agents: &[] as &[AgentInstance],
+        };
+        comp.render_snapshot(&empty, viewport);
+        let without_agents = decode_capture(&second_png);
+        assert_eq!(
+            without_agents.dimensions(),
+            frame.dimensions(),
+            "the two frames must be comparable"
+        );
+
+        assert!(
+            frames_differ_near(&frame, &without_agents, red_at, 12),
+            "removing the agents changed NOTHING near the red agent at {red_at:?}, \
+             which means the agent was never rasterized there — the agent-drawing \
+             path could have been deleted and the old test would not have noticed. \
+             Rasterized by: {}",
+            raster_source(&comp)
+        );
+        assert!(
+            frames_differ_near(&frame, &without_agents, green_at, 12),
+            "removing the agents changed nothing near the green agent at \
+             {green_at:?}. Rasterized by: {}",
+            raster_source(&comp)
+        );
+
+        // And the difference must be LOCAL. If the whole frame changed, the two
+        // renders differ for some reason that has nothing to do with the agents
+        // (a moved camera, a different clear colour), and the assertions above
+        // would be passing for the wrong reason.
+        let corner = (8u32, 8u32);
+        assert!(
+            !frames_differ_near(&frame, &without_agents, corner, 6),
+            "the frames differ in a corner far from any agent, so the difference \
+             cannot be attributed to the agents and these assertions prove nothing"
         );
     }
 }
