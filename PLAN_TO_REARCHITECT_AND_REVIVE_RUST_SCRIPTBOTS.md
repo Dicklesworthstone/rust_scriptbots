@@ -1867,7 +1867,7 @@ batch evaluators; each family owns its reset/inherit/blend policy; and the fixtu
 identical future-affecting evaluator continuation. Core 165/165, integration 13/13, strict core
 Clippy, workspace all-target check, formatting, and UBS passed on the integrated protocol surface.
 
-#### 1.7 brain-family adapters and inheritance
+#### 1.7 brain-family adapters and inheritance [Currently In Progress — `bd-2z0.3.3`, `bd-2z0.3.4`, `bd-2z0.3.5`]
 
 - MLP adapter and recurrent-state policy;
 - DWRAON adapter/parity and recurrent-state policy;
