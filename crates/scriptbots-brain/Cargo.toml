@@ -14,4 +14,4 @@ experimental = ["assembly"]
 blake3 = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
-scriptbots-core = { path = "../scriptbots-core" }
+scriptbots-core = { path = "../scriptbots-core", default-features = false }
