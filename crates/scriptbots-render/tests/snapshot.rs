@@ -81,12 +81,25 @@ fn scriptbots_render_cpu_surrogate_raster_matches_semantic_golden() -> Result<()
     );
 
     if png != expected {
+        let failure_dir = project_root().join("target").join("snapshot-failures");
+        fs::create_dir_all(&failure_dir)
+            .map_err(|error| format!("create {}: {error}", failure_dir.display()))?;
+        let actual_path = failure_dir.join("rust_default.actual.png");
+        fs::write(&actual_path, &png)
+            .map_err(|error| format!("write {}: {error}", actual_path.display()))?;
         let rgba = image::load_from_memory(&png)
-            .expect("decode generated PNG for mismatch diagnostics")
+            .map_err(|error| {
+                format!(
+                    "decode generated PNG after writing {}: {error}",
+                    actual_path.display()
+                )
+            })?
             .to_rgba8();
         let expected_rgba = image::load_from_memory(&expected)
-            .expect("decode golden PNG for mismatch diagnostics")
+            .map_err(|error| format!("decode {}: {error}", golden_path.display()))?
             .to_rgba8();
+        let actual_dimensions = rgba.dimensions();
+        let expected_dimensions = expected_rgba.dimensions();
         let transparent_pixels = rgba.pixels().filter(|pixel| pixel.0[3] == 0).count();
         let opaque_black_pixels = rgba
             .pixels()
@@ -97,32 +110,37 @@ fn scriptbots_render_cpu_surrogate_raster_matches_semantic_golden() -> Result<()
             *color_counts.entry(pixel.0).or_default() += 1;
         }
         let mut common_colors = color_counts.into_iter().collect::<Vec<_>>();
-        common_colors.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+        common_colors.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
         common_colors.truncate(8);
-        let mut differing_pixels = 0usize;
+        let shared_width = actual_dimensions.0.min(expected_dimensions.0);
+        let shared_height = actual_dimensions.1.min(expected_dimensions.1);
+        let actual_area = u64::from(actual_dimensions.0) * u64::from(actual_dimensions.1);
+        let expected_area = u64::from(expected_dimensions.0) * u64::from(expected_dimensions.1);
+        let shared_area = u64::from(shared_width) * u64::from(shared_height);
+        let mut differing_pixels = actual_area + expected_area - 2 * shared_area;
         let mut difference_bounds = None::<(u32, u32, u32, u32)>;
         let mut maximum_channel_delta = 0u8;
-        for (x, y, actual) in rgba.enumerate_pixels() {
-            let expected = expected_rgba.get_pixel(x, y);
-            if actual != expected {
-                differing_pixels += 1;
-                difference_bounds = Some(match difference_bounds {
-                    Some((min_x, min_y, max_x, max_y)) => {
-                        (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+        for y in 0..shared_height {
+            for x in 0..shared_width {
+                let actual = rgba.get_pixel(x, y);
+                let expected = expected_rgba.get_pixel(x, y);
+                if actual != expected {
+                    differing_pixels += 1;
+                    difference_bounds = Some(match difference_bounds {
+                        Some((min_x, min_y, max_x, max_y)) => {
+                            (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                        }
+                        None => (x, y, x, y),
+                    });
+                    for (actual, expected) in actual.0.iter().zip(expected.0) {
+                        maximum_channel_delta =
+                            maximum_channel_delta.max(actual.abs_diff(expected));
                     }
-                    None => (x, y, x, y),
-                });
-                for (actual, expected) in actual.0.iter().zip(expected.0) {
-                    maximum_channel_delta = maximum_channel_delta.max(actual.abs_diff(expected));
                 }
             }
         }
-        let failure_dir = project_root().join("target").join("snapshot-failures");
-        fs::create_dir_all(&failure_dir).expect("create failure dir");
-        let actual_path = failure_dir.join("rust_default.actual.png");
-        fs::write(&actual_path, &png).expect("write actual snapshot");
         return Err(format!(
-            "scriptbots-render CPU-surrogate raster diverged from its semantic golden; this is not evidence about the shipped GPUI or wgpu framebuffer.\nexpected: {}\nactual: {}\ntransparent pixels: {transparent_pixels}\nopaque black pixels: {opaque_black_pixels}\ndiffering pixels: {differing_pixels}\ndifference bounds: {difference_bounds:?}\nmaximum channel delta: {maximum_channel_delta}\nmost common RGBA colors: {common_colors:?}",
+            "scriptbots-render CPU-surrogate raster diverged from its semantic golden; this is not evidence about the shipped GPUI or wgpu framebuffer.\nexpected: {}\nactual: {}\nexpected dimensions: {expected_dimensions:?}\nactual dimensions: {actual_dimensions:?}\ntransparent pixels: {transparent_pixels}\nopaque black pixels: {opaque_black_pixels}\ndiffering pixels: {differing_pixels}\ndifference bounds within shared dimensions: {difference_bounds:?}\nmaximum channel delta within shared dimensions: {maximum_channel_delta}\nmost common RGBA colors: {common_colors:?}",
             golden_path.display(),
             actual_path.display()
         ));
