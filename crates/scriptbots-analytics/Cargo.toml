@@ -1,0 +1,24 @@
+[package]
+name = "scriptbots-analytics"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Offline science layer for ScriptBots: read-only reports over finished run databases (bd-2z0.11.5). Never a dependency of the app binaries; never built for wasm."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+scriptbots-core = { path = "../scriptbots-core", default-features = false }
+scriptbots-storage = { path = "../scriptbots-storage" }
+clap = { version = "4.6.1", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[[bin]]
+name = "sb-analyze"
+path = "src/bin/sb_analyze.rs"
