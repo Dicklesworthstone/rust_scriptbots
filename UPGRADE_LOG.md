@@ -1321,3 +1321,102 @@ No version migration in this ledger is authorized merely by being newer.
   root SlotMap declaration and this SlotMap log section. Preserve the stable
   identity source and lock deletions; do not use reset, checkout, stash, clean,
   golden replacement, or file deletion.
+
+## 2026-07-12 — Update the Wide SIMD family
+
+- **Bead and serialization:** `bd-2z0.8.5`, serialized sub-update three of
+  three, applied only after the Rayon and SlotMap evidence commits and after
+  P0 manifest-fixture stabilization landed as `fff3aa7`. This update owns only
+  the core Wide declaration, the exact Wide/SafeArch lock records, this log
+  section, and the plan status marker.
+- **Declaration and resolution:** core's optional, no-default-feature `wide`
+  declaration moves from `0.8.1` (resolved `0.8.3`) to `1.5.0`. Its coupled
+  `safe_arch` package moves from `0.9.3` to `1.0.0`; `bytemuck 1.25.1` and all
+  other package records remain unchanged. The `simd_wide` feature boundary is
+  unchanged and the scalar implementation remains available independently.
+- **Primary release research:** crates.io reported non-yanked [Wide
+  1.5.0](https://crates.io/crates/wide/1.5.0) as latest stable on 2026-07-12.
+  Its published archive identifies source commit
+  [`dcfa3c5ba39a`](https://github.com/Lokathor/wide/commit/dcfa3c5ba39ab340323c4e64570cc1c5db7321b7).
+  The [upstream changelog](https://github.com/Lokathor/wide/blob/v1.5.0/CHANGELOG.md)
+  records the 1.x stabilization, build and negation fixes, `f32x16`
+  corrections, non-finite handling fixes, the `sign_bit` rename, and later
+  API additions. ScriptBots uses only `f32x4::new`, `splat`, arithmetic,
+  `abs`, `sqrt`, `min`, `max`, and `to_array`; those APIs are present in the
+  1.5.0 source and required no call-site migration. Wide's default `std`
+  feature remains deliberately disabled.
+- **Coupled-package research:** crates.io reported non-yanked [SafeArch
+  1.0.0](https://crates.io/crates/safe_arch/1.0.0) as latest stable. Its
+  published archive identifies source commit
+  [`69c1aa03040c`](https://github.com/Lokathor/safe_arch/commit/69c1aa03040c11660553554c5177bf50be1e44db),
+  and its changelog describes the release as the initial stable 1.x API.
+  SafeArch remains a private Wide implementation dependency; ScriptBots does
+  not call it directly.
+- **MSRV, license, and security:** Wide and SafeArch both declare Rust 1.89,
+  exactly the workspace floor, and `Zlib OR Apache-2.0 OR MIT`; neither changes
+  the project's dependency-license policy. RustSec had no package advisory
+  page for either package at the review instant. A 1,160-advisory whole-lock
+  audit found no advisory for Wide or SafeArch. It did report two pre-existing
+  `quick-xml 0.39.4` findings, RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both
+  fixed by 0.41.0), plus eight pre-existing unmaintained-package warnings;
+  this two-package lock delta neither introduces nor changes any of those
+  dependency paths.
+- **Rejected generated lock churn:** pinned-nightly
+  `cargo update -p wide@0.8.3 --precise 1.5.0` selected the correct Wide and
+  SafeArch versions but also rewrote eleven unrelated package/dependency
+  records. That generated lock was rejected in full under the family circuit
+  breaker. A manually reviewed minimal lock mutation changes exactly the two
+  package tuples and checksums above; `cargo check --locked -p
+  scriptbots-core` accepted that lock on the pinned remote toolchain.
+- **Exact manifest and lock boundary:** core-manifest SHA-256 changes from
+  `1509cc4d37b7179a7b49fbe99ca422ed5bc0ce68f6b6b38bde069bab259e7259`
+  to
+  `cf7144514f443fa760310597b454b9d34616c46dc786d7a3cf68f4f771f432b0`.
+  Lock SHA-256 changes from
+  `fae88a0e2b3f113fbab1426929b5064e6d8a76460aa55e261beadb7956a2b8f3`
+  to
+  `c36bd6dd2c77819d89a046d2ea2a62de46ca983d72b7be382797a98f64f92e2a`.
+  The exact lock delta is `wide 0.8.3` checksum
+  `13ca908d26e4786149c48efcf6c0ea09ab0e06d1fe3c17dc1b4b0f1ca4a7e788`
+  to `wide 1.5.0` checksum
+  `dfdfe6a32973f2d1b268b8895845a8a96cac2f0191e72c27cc929036060dbf89`,
+  plus `safe_arch 0.9.3` checksum
+  `629516c85c29fe757770fa03f2074cf1eac43d44c02a3de9fc2ef7b0e207dfdd`
+  to `safe_arch 1.0.0` checksum
+  `1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed`.
+  No source URL, feature, dependency edge, or third package moves.
+- **Determinism and spatial proof:** the exact pre-upgrade and post-upgrade
+  trees each passed the same 13 current-protocol scientific integration tests
+  under serial scalar, serial Wide SIMD, four-thread parallel scalar, and
+  four-thread parallel Wide SIMD configurations (52/52 on each tree). The
+  live `UniformGridIndex` passed all eight dense/sparse toroidal,
+  wrap-boundary, and duplicate-delivery oracles before and after. The final
+  post-upgrade default core library passed 165/165 tests on the final rebased
+  tree, including the newly landed brain-state protocol gates. The synthetic
+  build identity from `fff3aa7` kept its unchanged
+  `fnv1a64:09d4c1cee0922e9e` golden across fresh one-, two-, four-, and
+  eight-thread processes; the post-Wide four-thread application library
+  passed 79/79.
+- **Backend scope:** `UniformGridIndex` is the only implemented spatial
+  backend. Optional `rstar` and `kiddo` declarations have no implementation or
+  call site, so this sub-update neither upgrades them nor falsely claims
+  R-tree/k-d-tree conformance. That declaration/product gap remains explicit
+  future work.
+- **Workspace proof:** `cargo check --locked --workspace --all-targets`
+  passed on pinned `nightly-2026-07-09`. The only diagnostic was the already
+  recorded future-incompatibility notice for transitive
+  `proc-macro-error2 2.0.1`; Wide introduced no warning or deprecation.
+- **Performance proof:** with `RAYON_NUM_THREADS=4`, eight steps, 1,000
+  agents, ten Criterion samples, one-second warmup, and three-second
+  measurement on the same worker and target directory, the exact pre-update
+  estimate was `[12.242 ms 13.523 ms 15.869 ms]`; the post-update estimate was
+  `[13.535 ms 18.628 ms 26.729 ms]`. Criterion measured change
+  `[-21.697%, +7.9082%, +45.928%]` with `p=0.69` and explicitly reported no
+  performance change. Four of ten measurements were outliers and the
+  confidence intervals are correspondingly wide; this is noise, not evidence
+  of a regression.
+- **Result and rollback:** accepted as an isolated SIMD-family update with no
+  scientific, identity, spatial, feature-boundary, or source-API change. Roll
+  back only core's one `wide` declaration, the two exact lock package records,
+  this Wide log section, and the exact plan marker. Do not use reset,
+  checkout, stash, clean, golden replacement, or file deletion.

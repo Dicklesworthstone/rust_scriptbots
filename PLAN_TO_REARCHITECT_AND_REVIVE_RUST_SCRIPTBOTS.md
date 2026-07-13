@@ -1296,6 +1296,11 @@ stable target floors with byte-stable wire-compatibility proof,
 `owo-colors`/`supports-color` stable target floors, `bd-2z0.8.6`, Codex,
 2026-07-12]
 
+**Core numerical/indexing family:** [Completed — `rayon`, `slotmap`, and
+`wide` stable target floors plus live uniform-grid conformance; unused
+`rstar`/`kiddo` declarations remain explicitly unimplemented and unclaimed,
+`bd-2z0.8.5`, Codex, 2026-07-12]
+
 These candidates were checked against live crates.io records on 2026-07-11. Registry metadata establishes a candidate version, not its migration risk. Release notes, changelog, repository, features, and security research are still required before the bead becomes actionable. They are manifest lower-bound candidates plus a committed lock, not universal exact `=version` requirements.
 
 | Group | Researched stable targets |
