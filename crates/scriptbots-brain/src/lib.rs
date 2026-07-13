@@ -1,8 +1,8 @@
 //! Traits and adapters for ScriptBots brain implementations.
 
-use rand::RngCore;
 use scriptbots_core::{
-    AgentId, BrainActivations, BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, Tick,
+    AgentUid, BrainActivations, BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE,
+    RandomStream, Tick,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -119,13 +119,13 @@ pub trait Brain: Send + Sync + Any {
     /// Mutate the brain's internal state given mutation rates.
     fn mutate(
         &mut self,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         rate: f32,
         scale: f32,
     ) -> Result<(), BrainMutationError>;
 
     /// Optional crossover hook; return `None` when unsupported.
-    fn crossover(&self, _other: &dyn Brain, _rng: &mut dyn RngCore) -> Option<Box<dyn Brain>> {
+    fn crossover(&self, _other: &dyn Brain, _rng: &mut dyn RandomStream) -> Option<Box<dyn Brain>> {
         None
     }
 
@@ -149,9 +149,9 @@ pub trait Brain: Send + Sync + Any {
 }
 
 /// Summary emitted after each brain evaluation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainTelemetry {
-    pub agent: AgentId,
+    pub agent: AgentUid,
     pub tick: Tick,
     pub energy_spent: f32,
 }
@@ -178,7 +178,7 @@ mod tests {
 
         fn mutate(
             &mut self,
-            _rng: &mut dyn RngCore,
+            _rng: &mut dyn RandomStream,
             _rate: f32,
             _scale: f32,
         ) -> Result<(), BrainMutationError> {
@@ -261,7 +261,7 @@ impl BrainRunner for BrainRunnerAdapter {
 
     fn mutate(
         &mut self,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         rate: f32,
         scale: f32,
     ) -> Result<(), BrainSpawnError> {
@@ -274,7 +274,7 @@ impl BrainRunner for BrainRunnerAdapter {
     fn crossover(
         &self,
         partner: &dyn BrainRunner,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
     ) -> Option<Box<dyn BrainRunner>> {
         let partner = partner.as_any()?.downcast_ref::<Self>()?;
         let child = self.brain.crossover(&*partner.brain, rng)?;

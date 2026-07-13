@@ -36,7 +36,7 @@ const SCHEMA_SQL: &str = r#"
     CREATE TABLE replay_events (
         tick INTEGER,
         seq INTEGER,
-        agent_id INTEGER,
+        agent_uid INTEGER,
         scope TEXT,
         event_type TEXT,
         payload TEXT,
@@ -44,7 +44,7 @@ const SCHEMA_SQL: &str = r#"
     );
     CREATE TABLE agents (
         tick INTEGER,
-        agent_id INTEGER,
+        agent_uid INTEGER,
         generation INTEGER,
         age INTEGER,
         position_x REAL,
@@ -82,11 +82,13 @@ const SCHEMA_SQL: &str = r#"
         hit_herbivore INTEGER,
         hit_by_carnivore INTEGER,
         hit_by_herbivore INTEGER,
-        PRIMARY KEY (tick, agent_id)
+        PRIMARY KEY (tick, agent_uid)
     );
     CREATE TABLE births (
         tick INTEGER,
-        agent_id INTEGER,
+        agent_uid INTEGER,
+        spawn_ordinal INTEGER,
+        birth_ordinal INTEGER,
         parent_a INTEGER,
         parent_b INTEGER,
         brain_kind TEXT,
@@ -96,11 +98,11 @@ const SCHEMA_SQL: &str = r#"
         position_x REAL,
         position_y REAL,
         is_hybrid INTEGER,
-        PRIMARY KEY (tick, agent_id)
+        PRIMARY KEY (tick, agent_uid)
     );
     CREATE TABLE deaths (
         tick INTEGER,
-        agent_id INTEGER,
+        agent_uid INTEGER,
         age INTEGER,
         generation INTEGER,
         herbivore_tendency REAL,
@@ -116,13 +118,13 @@ const SCHEMA_SQL: &str = r#"
         hit_herbivore INTEGER,
         hit_by_carnivore INTEGER,
         hit_by_herbivore INTEGER,
-        PRIMARY KEY (tick, agent_id)
+        PRIMARY KEY (tick, agent_uid)
     );
 "#;
 
 const AGENT_INSERT_SQL: &str = r#"
     INSERT OR REPLACE INTO agents (
-        tick, agent_id, generation, age,
+        tick, agent_uid, generation, age,
         position_x, position_y, velocity_x, velocity_y, heading,
         health, energy, color_r, color_g, color_b, spike_length, boost,
         herbivore_tendency, sound_multiplier, reproduction_counter,
@@ -139,10 +141,10 @@ const AGENT_INSERT_SQL: &str = r#"
     )
 "#;
 
-fn agent_values(tick: i64, agent_id: i64) -> [SqliteValue; 39] {
+fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; 39] {
     [
         tick.into(),
-        agent_id.into(),
+        agent_uid.into(),
         3_i64.into(),
         17_i64.into(),
         12.25_f64.into(),
@@ -189,7 +191,7 @@ fn create_schema(connection: &Connection) {
         .expect("FrankenSQLite should create all seven ScriptBots tables");
 }
 
-fn insert_table_group(connection: &Connection, tick: i64, agent_id: i64) {
+fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
     connection
         .execute_with_params(
             "INSERT OR REPLACE INTO ticks VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -232,15 +234,17 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_id: i64) {
         )
         .expect("replay insert should preserve nullable ids and JSON encoded as TEXT");
     connection
-        .execute_with_params(AGENT_INSERT_SQL, &agent_values(tick, agent_id))
+        .execute_with_params(AGENT_INSERT_SQL, &agent_values(tick, agent_uid))
         .expect("agent insert should bind all 39 numbered parameters");
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO births VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO births VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             &[
                 tick.into(),
-                agent_id.into(),
-                (agent_id - 1).into(),
+                agent_uid.into(),
+                (agent_uid - 1).into(),
+                (agent_uid - 1).into(),
+                (agent_uid - 1).into(),
                 SqliteValue::Null,
                 "mlp".into(),
                 SqliteValue::Null,
@@ -257,7 +261,7 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_id: i64) {
             "INSERT OR REPLACE INTO deaths VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             &[
                 tick.into(),
-                agent_id.into(),
+                agent_uid.into(),
                 17_i64.into(),
                 3_i64.into(),
                 0.65_f64.into(),
@@ -458,14 +462,14 @@ fn verify_metric_aggregates(connection: &Connection) {
 fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
     let replay = connection
         .query_row_with_params(
-            "SELECT agent_id, payload FROM replay_events WHERE tick = ?1 AND seq = ?2",
+            "SELECT agent_uid, payload FROM replay_events WHERE tick = ?1 AND seq = ?2",
             &[FIRST_TICK.into(), 0_i64.into()],
         )
         .expect("replay row should be queryable with numbered parameters");
     assert_eq!(
         replay
             .get_typed::<Option<i64>>(0)
-            .expect("nullable replay agent id should decode"),
+            .expect("nullable replay agent uid should decode"),
         None
     );
     assert_eq!(
@@ -478,7 +482,7 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
     let agent = connection
         .query_row_with_params(
             "SELECT brain_binding, brain_key, spiked, sound_output, hit_by_herbivore \
-             FROM agents WHERE tick = ?1 AND agent_id = ?2",
+             FROM agents WHERE tick = ?1 AND agent_uid = ?2",
             &[FIRST_TICK.into(), 7_i64.into()],
         )
         .expect("39-column agent row should be queryable by its composite key");

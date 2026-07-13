@@ -8,13 +8,12 @@ use fsqlite::{
     migrate::MigrationRunner,
 };
 use scriptbots_core::{
-    AgentId, AgentState, BirthRecord, BrainBinding, DeathCause, DeathRecord,
+    AgentState, AgentUid, BirthRecord, BrainBinding, DeathCause, DeathRecord,
     PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
     ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, WorldPersistence,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
-use slotmap::{Key, KeyData};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -40,7 +39,7 @@ const DEFAULT_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
-const OUTBOX_PAYLOAD_VERSION: u32 = 1;
+const OUTBOX_PAYLOAD_VERSION: u32 = 2;
 const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
 
 /// Files FrankenSQLite may create beside its primary database.
@@ -54,7 +53,7 @@ pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
     "-lock-pending",
 ];
 
-const SCRIPTBOTS_SCHEMA_V1: &str = "
+const SCRIPTBOTS_SCHEMA_V3: &str = "
     CREATE TABLE ticks (
         tick INTEGER PRIMARY KEY CHECK (tick >= 0),
         epoch INTEGER NOT NULL CHECK (epoch >= 0),
@@ -81,7 +80,7 @@ const SCRIPTBOTS_SCHEMA_V1: &str = "
     CREATE TABLE replay_events (
         tick INTEGER NOT NULL CHECK (tick >= 0),
         seq INTEGER NOT NULL CHECK (seq >= 0),
-        agent_id INTEGER CHECK (agent_id IS NULL OR agent_id >= 0),
+        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
         scope TEXT NOT NULL,
         event_type TEXT NOT NULL,
         payload TEXT NOT NULL,
@@ -89,7 +88,7 @@ const SCRIPTBOTS_SCHEMA_V1: &str = "
     );
     CREATE TABLE agents (
         tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_id INTEGER NOT NULL CHECK (agent_id >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
         generation INTEGER NOT NULL CHECK (generation >= 0),
         age INTEGER NOT NULL CHECK (age >= 0),
         position_x REAL NOT NULL,
@@ -127,11 +126,13 @@ const SCRIPTBOTS_SCHEMA_V1: &str = "
         hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
         hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
         hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
-        PRIMARY KEY (tick, agent_id)
+        PRIMARY KEY (tick, agent_uid)
     );
     CREATE TABLE births (
         tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_id INTEGER NOT NULL CHECK (agent_id >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
+        birth_ordinal INTEGER NOT NULL CHECK (birth_ordinal >= 0),
         parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
         parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
         brain_kind TEXT,
@@ -141,11 +142,11 @@ const SCRIPTBOTS_SCHEMA_V1: &str = "
         position_x REAL NOT NULL,
         position_y REAL NOT NULL,
         is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
-        PRIMARY KEY (tick, agent_id)
+        PRIMARY KEY (tick, agent_uid)
     );
     CREATE TABLE deaths (
         tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_id INTEGER NOT NULL CHECK (agent_id >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
         age INTEGER NOT NULL CHECK (age >= 0),
         generation INTEGER NOT NULL CHECK (generation >= 0),
         herbivore_tendency REAL NOT NULL,
@@ -161,11 +162,11 @@ const SCRIPTBOTS_SCHEMA_V1: &str = "
         hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
         hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
         hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
-        PRIMARY KEY (tick, agent_id)
+        PRIMARY KEY (tick, agent_uid)
     );
 ";
 
-const SCRIPTBOTS_SCHEMA_V2: &str = "
+const SCRIPTBOTS_SCHEMA_V4: &str = "
     CREATE TABLE storage_progress (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         admitted_batch_id INTEGER NOT NULL CHECK (admitted_batch_id >= 0),
@@ -214,8 +215,12 @@ impl SchemaObject {
 
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
     MigrationRunner::new()
-        .add(1, "create_scriptbots_schema", SCRIPTBOTS_SCHEMA_V1)
-        .add(2, "create_durable_persistence_outbox", SCRIPTBOTS_SCHEMA_V2)
+        .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
+        .add(
+            4,
+            "create_stable_uid_persistence_outbox",
+            SCRIPTBOTS_SCHEMA_V4,
+        )
         .run(connection)?;
     Ok(())
 }
@@ -279,7 +284,7 @@ fn canonical_schema_objects() -> Result<Vec<SchemaObject>, StorageError> {
 
 const AGENT_COLUMNS: &[&str] = &[
     "tick",
-    "agent_id",
+    "agent_uid",
     "generation",
     "age",
     "position_x",
@@ -1196,7 +1201,7 @@ impl PreparedPersistenceBatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentRow {
     tick: i64,
-    agent_id: i64,
+    agent_uid: i64,
     generation: i64,
     age: i64,
     position_x: f64,
@@ -1239,7 +1244,9 @@ struct AgentRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BirthRow {
     tick: i64,
-    agent_id: i64,
+    agent_uid: i64,
+    spawn_ordinal: i64,
+    birth_ordinal: i64,
     parent_a: Option<i64>,
     parent_b: Option<i64>,
     brain_kind: Option<String>,
@@ -1254,7 +1261,7 @@ struct BirthRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeathRow {
     tick: i64,
-    agent_id: i64,
+    agent_uid: i64,
     age: i64,
     generation: i64,
     herbivore_tendency: f64,
@@ -1276,7 +1283,7 @@ struct DeathRow {
 struct ReplayEventRow {
     tick: i64,
     seq: i64,
-    agent_id: Option<i64>,
+    agent_uid: Option<i64>,
     scope: String,
     event_type: String,
     payload: String,
@@ -1715,7 +1722,7 @@ impl StorageReader {
     /// Load replay events in deterministic tick/sequence order.
     pub fn load_replay_events(&self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
         let rows = self.connection()?.query(
-            "SELECT tick, seq, agent_id, scope, event_type, payload
+            "SELECT tick, seq, agent_uid, scope, event_type, payload
              FROM replay_events
              ORDER BY tick ASC, seq ASC",
         )?;
@@ -1724,7 +1731,7 @@ impl StorageReader {
             let replay_row = ReplayEventRow {
                 tick: decode(&row, 0, "replay_events.tick")?,
                 seq: decode(&row, 1, "replay_events.seq")?,
-                agent_id: decode(&row, 2, "replay_events.agent_id")?,
+                agent_uid: decode(&row, 2, "replay_events.agent_uid")?,
                 scope: decode(&row, 3, "replay_events.scope")?,
                 event_type: decode(&row, 4, "replay_events.event_type")?,
                 payload: decode(&row, 5, "replay_events.payload")?,
@@ -1767,12 +1774,12 @@ impl StorageReader {
         }
         let bound = checked_i64("top_predators.limit", limit)?;
         let rows = self.connection()?.query_with_params(
-            "SELECT agent_id,
+            "SELECT agent_uid,
                     AVG(energy) AS avg_energy,
                     MAX(spike_length) AS max_spike_length,
                     MAX(tick) AS last_tick
              FROM agents
-             GROUP BY agent_id
+             GROUP BY agent_uid
              ORDER BY avg_energy DESC
              LIMIT ?1",
             &[bound.into()],
@@ -1780,7 +1787,7 @@ impl StorageReader {
         let mut stats = Vec::with_capacity(limit.min(16));
         for row in rows {
             stats.push(PredatorStats {
-                agent_id: checked_u64("agents.agent_id", decode(&row, 0, "agents.agent_id")?)?,
+                agent_uid: checked_u64("agents.agent_uid", decode(&row, 0, "agents.agent_uid")?)?,
                 avg_energy: decode(&row, 1, "agents.avg_energy")?,
                 max_spike_length: decode(&row, 2, "agents.max_spike_length")?,
                 last_tick: decode(&row, 3, "agents.last_tick")?,
@@ -2585,8 +2592,8 @@ impl Storage {
             });
         }
         let expected_migrations = [
-            (1_i64, "create_scriptbots_schema"),
-            (2_i64, "create_durable_persistence_outbox"),
+            (3_i64, "create_stable_agent_uid_schema"),
+            (4_i64, "create_stable_uid_persistence_outbox"),
         ];
         for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
             let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
@@ -3175,7 +3182,7 @@ impl Storage {
                 Self::agent_insert_sql(),
                 &[
                     row.tick.into(),
-                    row.agent_id.into(),
+                    row.agent_uid.into(),
                     row.generation.into(),
                     row.age.into(),
                     row.position_x.into(),
@@ -3236,16 +3243,18 @@ impl Storage {
             return Ok(());
         }
         let sql = "insert or replace into births (
-                tick, agent_id, parent_a, parent_b,
+                tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
                 brain_kind, brain_key, herbivore_tendency,
                 generation, position_x, position_y, is_hybrid
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
         for row in rows {
             tx.execute_with_params(
                 sql,
                 &[
                     row.tick.into(),
-                    row.agent_id.into(),
+                    row.agent_uid.into(),
+                    row.spawn_ordinal.into(),
+                    row.birth_ordinal.into(),
                     sqlite_optional_i64(row.parent_a),
                     sqlite_optional_i64(row.parent_b),
                     sqlite_optional_text(row.brain_kind.as_deref()),
@@ -3266,7 +3275,7 @@ impl Storage {
             return Ok(());
         }
         let sql = "insert or replace into deaths (
-                tick, agent_id, age, generation,
+                tick, agent_uid, age, generation,
                 herbivore_tendency, brain_kind, brain_key,
                 energy, food_balance_total, cause, was_hybrid,
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
@@ -3277,7 +3286,7 @@ impl Storage {
                 sql,
                 &[
                     row.tick.into(),
-                    row.agent_id.into(),
+                    row.agent_uid.into(),
                     row.age.into(),
                     row.generation.into(),
                     row.herbivore_tendency.into(),
@@ -3307,7 +3316,7 @@ impl Storage {
             return Ok(());
         }
         let sql = "insert or replace into replay_events (
-                tick, seq, agent_id, scope, event_type, payload
+                tick, seq, agent_uid, scope, event_type, payload
             ) values (?1, ?2, ?3, ?4, ?5, ?6)";
         for row in rows {
             tx.execute_with_params(
@@ -3315,7 +3324,7 @@ impl Storage {
                 &[
                     row.tick.into(),
                     row.seq.into(),
-                    sqlite_optional_i64(row.agent_id),
+                    sqlite_optional_i64(row.agent_uid),
                     row.scope.as_str().into(),
                     row.event_type.as_str().into(),
                     row.payload.as_str().into(),
@@ -3589,7 +3598,7 @@ impl Storage {
     pub fn load_replay_events(&mut self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
         self.flush()?;
         let rows = self.connection()?.query(
-            "SELECT tick, seq, agent_id, scope, event_type, payload
+            "SELECT tick, seq, agent_uid, scope, event_type, payload
              from replay_events
              ORDER BY tick ASC, seq ASC",
         )?;
@@ -3598,7 +3607,7 @@ impl Storage {
             let replay_row = ReplayEventRow {
                 tick: decode(&row, 0, "replay_events.tick")?,
                 seq: decode(&row, 1, "replay_events.seq")?,
-                agent_id: decode(&row, 2, "replay_events.agent_id")?,
+                agent_uid: decode(&row, 2, "replay_events.agent_uid")?,
                 scope: decode(&row, 3, "replay_events.scope")?,
                 event_type: decode(&row, 4, "replay_events.event_type")?,
                 payload: decode(&row, 5, "replay_events.payload")?,
@@ -3641,21 +3650,21 @@ impl Storage {
         self.flush()?;
         let bound = checked_i64("top_predators.limit", limit)?;
         let rows = self.connection()?.query_with_params(
-            "SELECT agent_id,
+            "SELECT agent_uid,
                     AVG(energy) AS avg_energy,
                     MAX(spike_length) AS max_spike_length,
                     MAX(tick) AS last_tick
              FROM agents
-             GROUP BY agent_id
+             GROUP BY agent_uid
              ORDER BY avg_energy DESC
              LIMIT ?1",
             &[bound.into()],
         )?;
         let mut stats = Vec::with_capacity(limit.min(16));
         for row in rows {
-            let agent_id = decode::<i64>(&row, 0, "agents.agent_id")?;
+            let agent_uid = decode::<i64>(&row, 0, "agents.agent_uid")?;
             stats.push(PredatorStats {
-                agent_id: checked_u64("agents.agent_id", agent_id)?,
+                agent_uid: checked_u64("agents.agent_uid", agent_uid)?,
                 avg_energy: decode(&row, 1, "agents.avg_energy")?,
                 max_spike_length: decode(&row, 2, "agents.max_spike_length")?,
                 last_tick: decode(&row, 3, "agents.last_tick")?,
@@ -3757,7 +3766,7 @@ impl Drop for Storage {
 /// Aggregated predator statistics used for analytics.
 #[derive(Debug, Clone)]
 pub struct PredatorStats {
-    pub agent_id: u64,
+    pub agent_uid: u64,
     pub avg_energy: f64,
     pub max_spike_length: f64,
     pub last_tick: i64,
@@ -5168,12 +5177,12 @@ fn brain_binding_to_string(binding: &BrainBinding) -> String {
 }
 
 fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> Result<AgentRow, StorageError> {
-    let id = encode_u64("agents.agent_id", agent.id.data().as_ffi())?;
+    let uid = encode_u64("agents.agent_uid", agent.identity.uid.get())?;
     let data = &agent.data;
     let runtime = &agent.runtime;
     Ok(AgentRow {
         tick,
-        agent_id: id,
+        agent_uid: uid,
         generation: i64::from(data.generation.0),
         age: i64::from(data.age),
         position_x: f64::from(data.position.x),
@@ -5218,11 +5227,11 @@ fn agent_row_from_snapshot(tick: i64, agent: &AgentState) -> Result<AgentRow, St
     })
 }
 
-fn optional_agent_id(
+fn optional_agent_uid(
     context: &'static str,
-    id: Option<AgentId>,
+    uid: Option<AgentUid>,
 ) -> Result<Option<i64>, StorageError> {
-    id.map(|agent_id| encode_u64(context, agent_id.data().as_ffi()))
+    uid.map(|agent_uid| encode_u64(context, agent_uid.get()))
         .transpose()
 }
 
@@ -5261,7 +5270,7 @@ fn replay_row_from_event(
                 return Err(invalid_non_finite("replay_events.brain_outputs"));
             }
             (
-                if event.agent_id.is_some() {
+                if event.agent_uid.is_some() {
                     "agent:brain"
                 } else {
                     "world:brain"
@@ -5286,15 +5295,10 @@ fn replay_row_from_event(
                 return Err(invalid_non_finite("replay_events.action"));
             }
             let spike_target = spike_target
-                .map(|agent_id| {
-                    encode_u64(
-                        "replay_events.action.spike_target",
-                        agent_id.data().as_ffi(),
-                    )
-                })
+                .map(|agent_uid| encode_u64("replay_events.action.spike_target", agent_uid.get()))
                 .transpose()?;
             (
-                if event.agent_id.is_some() {
+                if event.agent_uid.is_some() {
                     "agent:action"
                 } else {
                     "world:action"
@@ -5323,18 +5327,18 @@ fn replay_row_from_event(
             {
                 return Err(invalid_non_finite("replay_events.rng_sample"));
             }
-            let scope_agent_id = match scope {
+            let scope_agent_uid = match scope {
                 ReplayRngScope::World => None,
-                ReplayRngScope::Agent { agent_id, .. } => Some(encode_u64(
-                    "replay_events.rng_sample.scope_agent_id",
-                    agent_id.data().as_ffi(),
+                ReplayRngScope::Agent { agent_uid, .. } => Some(encode_u64(
+                    "replay_events.rng_sample.scope_agent_uid",
+                    agent_uid.get(),
                 )?),
             };
             (
                 scope_label(*scope),
                 "rng_sample".to_string(),
                 json!({
-                    "scope_agent_id": scope_agent_id,
+                    "scope_agent_uid": scope_agent_uid,
                     "range_min": range_min,
                     "range_max": range_max,
                     "value": value,
@@ -5346,37 +5350,38 @@ fn replay_row_from_event(
     Ok(ReplayEventRow {
         tick,
         seq: checked_i64("replay_events.seq", seq)?,
-        agent_id: optional_agent_id("replay_events.agent_id", event.agent_id)?,
+        agent_uid: optional_agent_uid("replay_events.agent_uid", event.agent_uid)?,
         scope,
         event_type,
         payload: payload_value.to_string(),
     })
 }
 
-fn decode_agent_id(raw: Option<i64>, tick: i64, seq: i64) -> Result<Option<AgentId>, StorageError> {
+fn decode_agent_uid(
+    raw: Option<i64>,
+    tick: i64,
+    seq: i64,
+) -> Result<Option<AgentUid>, StorageError> {
     match raw {
         Some(value) if value < 0 => Err(StorageError::ReplayParse {
             tick,
             seq,
-            reason: format!("negative agent id {value}"),
+            reason: format!("negative agent uid {value}"),
         }),
-        Some(value) => {
-            let key = KeyData::from_ffi(value as u64);
-            Ok(Some(AgentId::from(key)))
-        }
+        Some(value) => Ok(Some(AgentUid(value as u64))),
         None => Ok(None),
     }
 }
 
-fn agent_id_from_u64(value: u64, tick: i64, seq: i64) -> Result<AgentId, StorageError> {
+fn agent_uid_from_u64(value: u64, tick: i64, seq: i64) -> Result<AgentUid, StorageError> {
     if value > i64::MAX as u64 {
         return Err(StorageError::ReplayParse {
             tick,
             seq,
-            reason: format!("agent id {value} exceeds supported range"),
+            reason: format!("agent uid {value} exceeds supported range"),
         });
     }
-    Ok(AgentId::from(KeyData::from_ffi(value)))
+    Ok(AgentUid(value))
 }
 
 fn parse_payload<T>(row: &ReplayEventRow) -> Result<T, StorageError>
@@ -5404,7 +5409,7 @@ fn parse_agent_phase(label: &str) -> Option<ReplayAgentPhase> {
 
 fn parse_rng_scope(
     scope: &str,
-    agent_id: Option<AgentId>,
+    agent_uid: Option<AgentUid>,
     row: &ReplayEventRow,
 ) -> Result<ReplayRngScope, StorageError> {
     if scope == "world" {
@@ -5412,17 +5417,17 @@ fn parse_rng_scope(
     }
 
     if let Some(phase_label) = scope.strip_prefix("agent:") {
-        let agent_id = agent_id.ok_or_else(|| StorageError::ReplayParse {
+        let agent_uid = agent_uid.ok_or_else(|| StorageError::ReplayParse {
             tick: row.tick,
             seq: row.seq,
-            reason: "agent-scoped RNG sample missing agent_id".to_string(),
+            reason: "agent-scoped RNG sample missing agent_uid".to_string(),
         })?;
         let phase = parse_agent_phase(phase_label).ok_or_else(|| StorageError::ReplayParse {
             tick: row.tick,
             seq: row.seq,
             reason: format!("unknown agent phase '{phase_label}'"),
         })?;
-        return Ok(ReplayRngScope::Agent { agent_id, phase });
+        return Ok(ReplayRngScope::Agent { agent_uid, phase });
     }
 
     Err(StorageError::ReplayParse {
@@ -5449,21 +5454,21 @@ struct ActionPayload {
 
 #[derive(Debug, Deserialize)]
 struct RngSamplePayload {
-    scope_agent_id: Option<u64>,
+    scope_agent_uid: Option<u64>,
     range_min: f32,
     range_max: f32,
     value: f32,
 }
 
 fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageError> {
-    let agent_id = decode_agent_id(row.agent_id, row.tick, row.seq)?;
+    let agent_uid = decode_agent_uid(row.agent_uid, row.tick, row.seq)?;
     let kind = match row.event_type.as_str() {
         "brain_outputs" => {
-            if row.scope.starts_with("agent:") && agent_id.is_none() {
+            if row.scope.starts_with("agent:") && agent_uid.is_none() {
                 return Err(StorageError::ReplayParse {
                     tick: row.tick,
                     seq: row.seq,
-                    reason: "brain outputs missing agent_id".to_string(),
+                    reason: "brain outputs missing agent_uid".to_string(),
                 });
             }
             let payload: BrainOutputsPayload = parse_payload(row)?;
@@ -5472,16 +5477,16 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
             }
         }
         "action" => {
-            if row.scope.starts_with("agent:") && agent_id.is_none() {
+            if row.scope.starts_with("agent:") && agent_uid.is_none() {
                 return Err(StorageError::ReplayParse {
                     tick: row.tick,
                     seq: row.seq,
-                    reason: "action event missing agent_id".to_string(),
+                    reason: "action event missing agent_uid".to_string(),
                 });
             }
             let payload: ActionPayload = parse_payload(row)?;
             let spike_target = match payload.spike_target {
-                Some(raw) => Some(agent_id_from_u64(raw, row.tick, row.seq)?),
+                Some(raw) => Some(agent_uid_from_u64(raw, row.tick, row.seq)?),
                 None => None,
             };
             ReplayEventKind::Action {
@@ -5495,11 +5500,11 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
         }
         "rng_sample" => {
             let payload: RngSamplePayload = parse_payload(row)?;
-            let scope_agent_id = payload
-                .scope_agent_id
-                .map(|raw| agent_id_from_u64(raw, row.tick, row.seq))
+            let scope_agent_uid = payload
+                .scope_agent_uid
+                .map(|raw| agent_uid_from_u64(raw, row.tick, row.seq))
                 .transpose()?;
-            let scope = parse_rng_scope(&row.scope, scope_agent_id, row)?;
+            let scope = parse_rng_scope(&row.scope, scope_agent_uid, row)?;
             ReplayEventKind::RngSample {
                 scope,
                 range_min: payload.range_min,
@@ -5516,15 +5521,17 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
         }
     };
 
-    Ok(ReplayEvent { agent_id, kind })
+    Ok(ReplayEvent { agent_uid, kind })
 }
 
 fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError> {
     Ok(BirthRow {
         tick: encode_u64("births.tick", record.tick.0)?,
-        agent_id: encode_u64("births.agent_id", record.agent_id.data().as_ffi())?,
-        parent_a: optional_agent_id("births.parent_a", record.parent_a)?,
-        parent_b: optional_agent_id("births.parent_b", record.parent_b)?,
+        agent_uid: encode_u64("births.agent_uid", record.agent_uid.get())?,
+        spawn_ordinal: encode_u64("births.spawn_ordinal", record.spawn_ordinal)?,
+        birth_ordinal: encode_u64("births.birth_ordinal", record.birth_ordinal)?,
+        parent_a: optional_agent_uid("births.parent_a", record.parent_a)?,
+        parent_b: optional_agent_uid("births.parent_b", record.parent_b)?,
         brain_kind: record.brain_kind.clone(),
         brain_key: record
             .brain_key
@@ -5551,7 +5558,7 @@ fn death_cause_to_string(cause: DeathCause) -> &'static str {
 fn death_row_from_record(record: &DeathRecord) -> Result<DeathRow, StorageError> {
     Ok(DeathRow {
         tick: encode_u64("deaths.tick", record.tick.0)?,
-        agent_id: encode_u64("deaths.agent_id", record.agent_id.data().as_ffi())?,
+        agent_uid: encode_u64("deaths.agent_uid", record.agent_uid.get())?,
         age: i64::from(record.age),
         generation: i64::from(record.generation.0),
         herbivore_tendency: f64::from(record.herbivore_tendency),
@@ -5618,6 +5625,11 @@ mod tests {
 
         AgentState {
             id: scriptbots_core::AgentId::default(),
+            identity: scriptbots_core::AgentIdentity {
+                uid: AgentUid(1),
+                spawn_ordinal: 0,
+                birth_ordinal: None,
+            },
             data,
             runtime,
         }
@@ -6218,17 +6230,17 @@ mod tests {
         create_valid_database(&future)?;
         add_schema_object(
             &future,
-            "INSERT INTO _schema_migrations (version, name) VALUES (3, 'future_schema')",
+            "INSERT INTO _schema_migrations (version, name) VALUES (5, 'future_schema')",
         )?;
         assert_recovery_refused_without_database_mutation(&future, "exactly two")?;
 
-        let weak_v1 = temp_db_path("storage-recovery-weak-v1");
-        let weak_connection = Connection::open(weak_v1.to_string_lossy().as_ref())?;
+        let incomplete = temp_db_path("storage-recovery-incomplete-migration-set");
+        let incomplete_connection = Connection::open(incomplete.to_string_lossy().as_ref())?;
         MigrationRunner::new()
-            .add(1, "create_scriptbots_schema", SCRIPTBOTS_SCHEMA_V1)
-            .run(&weak_connection)?;
-        weak_connection.close()?;
-        assert_recovery_refused_without_database_mutation(&weak_v1, "exactly two")?;
+            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
+            .run(&incomplete_connection)?;
+        incomplete_connection.close()?;
+        assert_recovery_refused_without_database_mutation(&incomplete, "exactly two")?;
         Ok(())
     }
 
@@ -6244,9 +6256,9 @@ mod tests {
                 applied_at TEXT NOT NULL
              );
              INSERT INTO _schema_migrations (version, name, applied_at)
-             VALUES (1, 'create_scriptbots_schema', 'forged');
+             VALUES (3, 'create_stable_agent_uid_schema', 'forged');
              INSERT INTO _schema_migrations (version, name, applied_at)
-             VALUES (2, 'create_durable_persistence_outbox', 'forged');
+             VALUES (4, 'create_stable_uid_persistence_outbox', 'forged');
              CREATE TABLE storage_progress (
                 singleton INTEGER PRIMARY KEY,
                 admitted_batch_id INTEGER NOT NULL,
@@ -6841,20 +6853,20 @@ mod tests {
     }
 
     #[test]
-    fn replay_rng_scope_preserves_inner_and_outer_agent_ids()
+    fn replay_rng_scope_preserves_inner_and_outer_agent_uids()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-replay-rng-agent-ids");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
             Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
-        let outer_agent = AgentId::from(KeyData::from_ffi(0x0000_0001_0000_0001));
-        let scope_agent = AgentId::from(KeyData::from_ffi(0x0000_0002_0000_0001));
+        let outer_agent = AgentUid(0x0000_0001_0000_0001);
+        let scope_agent = AgentUid(0x0000_0002_0000_0001);
         let mut batch = sample_batch(5, 1.0);
         batch.replay_events.push(ReplayEvent {
-            agent_id: Some(outer_agent),
+            agent_uid: Some(outer_agent),
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::Agent {
-                    agent_id: scope_agent,
+                    agent_uid: scope_agent,
                     phase: ReplayAgentPhase::Mutation,
                 },
                 range_min: -1.0,
@@ -6874,16 +6886,16 @@ mod tests {
     }
 
     #[test]
-    fn replay_action_preserves_spike_target_agent_id() -> Result<(), Box<dyn std::error::Error>> {
+    fn replay_action_preserves_spike_target_agent_uid() -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-replay-action-spike-target");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
             Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
-        let actor = AgentId::from(KeyData::from_ffi(0x0000_0001_0000_0001));
-        let target = AgentId::from(KeyData::from_ffi(0x0000_0002_0000_0001));
+        let actor = AgentUid(0x0000_0001_0000_0001);
+        let target = AgentUid(0x0000_0002_0000_0001);
         let mut batch = sample_batch(6, 1.0);
         batch.replay_events.push(ReplayEvent {
-            agent_id: Some(actor),
+            agent_uid: Some(actor),
             kind: ReplayEventKind::Action {
                 left_wheel: -0.25,
                 right_wheel: 0.75,
@@ -6898,7 +6910,7 @@ mod tests {
         assert_eq!(encoded_row.event_type, "action");
         assert_eq!(
             encoded_row.payload,
-            r#"{"left_wheel":-0.25,"right_wheel":0.75,"boost":true,"spike_target":12884901889,"sound_level":0.5,"give_intent":0.125}"#,
+            r#"{"left_wheel":-0.25,"right_wheel":0.75,"boost":true,"spike_target":8589934593,"sound_level":0.5,"give_intent":0.125}"#,
             "replay payload changes require a versioned schema boundary"
         );
         assert_eq!(replay_event_from_row(&encoded_row)?, batch.replay_events[0]);
@@ -6922,7 +6934,7 @@ mod tests {
             Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
         let mut invalid = sample_batch(1, 1.0);
         invalid.replay_events.push(ReplayEvent {
-            agent_id: None,
+            agent_uid: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![f32::NAN],
             },
@@ -6973,7 +6985,7 @@ mod tests {
         let mut invalid = sample_batch(2, 2.0);
         invalid.deaths.push(DeathRecord {
             tick: Tick(2),
-            agent_id: AgentId::default(),
+            agent_uid: AgentUid(2),
             age: 1,
             generation: scriptbots_core::Generation(1),
             herbivore_tendency: 0.5,
@@ -7027,7 +7039,7 @@ mod tests {
         pipeline.submit(&sample_batch(1, 1.0))?;
         let mut invalid = sample_batch(2, 2.0);
         invalid.replay_events.push(ReplayEvent {
-            agent_id: None,
+            agent_uid: None,
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::World,
                 range_min: 0.0,
@@ -7131,10 +7143,12 @@ mod tests {
         assert!(invalid_null.is_err(), "NOT NULL columns must reject NULL");
 
         let mut batch = sample_batch(11, 1.0);
-        let agent_id = batch.agents[0].id;
+        let agent_uid = batch.agents[0].identity.uid;
         batch.births.push(BirthRecord {
             tick: Tick(11),
-            agent_id,
+            agent_uid,
+            spawn_ordinal: 0,
+            birth_ordinal: 0,
             parent_a: None,
             parent_b: None,
             brain_kind: Some("schema-test".to_owned()),
@@ -7146,7 +7160,7 @@ mod tests {
         });
         batch.deaths.push(DeathRecord {
             tick: Tick(11),
-            agent_id,
+            agent_uid,
             age: 0,
             generation: scriptbots_core::Generation(0),
             herbivore_tendency: 0.5,
@@ -7159,7 +7173,7 @@ mod tests {
             combat_flags: scriptbots_core::CombatEventFlags::default(),
         });
         batch.replay_events.push(ReplayEvent {
-            agent_id: None,
+            agent_uid: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![0.25],
             },
@@ -7200,13 +7214,13 @@ mod tests {
                 "UPDATE replay_events SET seq = -1 WHERE tick = 11",
             ),
             (
-                "replay_events.agent_id",
-                "UPDATE replay_events SET agent_id = -1 WHERE tick = 11",
+                "replay_events.agent_uid",
+                "UPDATE replay_events SET agent_uid = -1 WHERE tick = 11",
             ),
             ("agents.tick", "UPDATE agents SET tick = -1 WHERE tick = 11"),
             (
-                "agents.agent_id",
-                "UPDATE agents SET agent_id = -1 WHERE tick = 11",
+                "agents.agent_uid",
+                "UPDATE agents SET agent_uid = -1 WHERE tick = 11",
             ),
             (
                 "agents.generation",
@@ -7219,8 +7233,16 @@ mod tests {
             ),
             ("births.tick", "UPDATE births SET tick = -1 WHERE tick = 11"),
             (
-                "births.agent_id",
-                "UPDATE births SET agent_id = -1 WHERE tick = 11",
+                "births.agent_uid",
+                "UPDATE births SET agent_uid = -1 WHERE tick = 11",
+            ),
+            (
+                "births.spawn_ordinal",
+                "UPDATE births SET spawn_ordinal = -1 WHERE tick = 11",
+            ),
+            (
+                "births.birth_ordinal",
+                "UPDATE births SET birth_ordinal = -1 WHERE tick = 11",
             ),
             (
                 "births.parent_a",
@@ -7240,8 +7262,8 @@ mod tests {
             ),
             ("deaths.tick", "UPDATE deaths SET tick = -1 WHERE tick = 11"),
             (
-                "deaths.agent_id",
-                "UPDATE deaths SET agent_id = -1 WHERE tick = 11",
+                "deaths.agent_uid",
+                "UPDATE deaths SET agent_uid = -1 WHERE tick = 11",
             ),
             ("deaths.age", "UPDATE deaths SET age = -1 WHERE tick = 11"),
             (
@@ -7972,15 +7994,15 @@ mod tests {
     }
 
     #[test]
-    fn prepare_batch_rejects_out_of_range_agent_id() {
+    fn prepare_batch_rejects_out_of_range_agent_uid() {
         let mut batch = sample_batch(9, 1.0);
-        batch.agents[0].id = AgentId::from(KeyData::from_ffi(u64::MAX));
+        batch.agents[0].identity.uid = AgentUid(u64::MAX);
         let error = Storage::prepare_batch(&batch)
-            .expect_err("agent id above i64::MAX must fail batch preparation");
+            .expect_err("agent uid above i64::MAX must fail batch preparation");
         assert!(matches!(
             error,
             StorageError::InvalidData {
-                context: "agents.agent_id",
+                context: "agents.agent_uid",
                 ..
             }
         ));
@@ -8017,17 +8039,17 @@ mod tests {
     }
 
     #[test]
-    fn prepare_batch_rejects_out_of_range_nested_replay_agent_ids() {
-        let invalid_id = AgentId::from(KeyData::from_ffi(u64::MAX));
+    fn prepare_batch_rejects_out_of_range_nested_replay_agent_uids() {
+        let invalid_uid = AgentUid(u64::MAX);
 
         let mut action = sample_batch(9, 1.0);
         action.replay_events.push(ReplayEvent {
-            agent_id: None,
+            agent_uid: None,
             kind: ReplayEventKind::Action {
                 left_wheel: 0.0,
                 right_wheel: 0.0,
                 boost: false,
-                spike_target: Some(invalid_id),
+                spike_target: Some(invalid_uid),
                 sound_level: 0.0,
                 give_intent: 0.0,
             },
@@ -8044,10 +8066,10 @@ mod tests {
 
         let mut rng = sample_batch(9, 1.0);
         rng.replay_events.push(ReplayEvent {
-            agent_id: None,
+            agent_uid: None,
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::Agent {
-                    agent_id: invalid_id,
+                    agent_uid: invalid_uid,
                     phase: ReplayAgentPhase::Mutation,
                 },
                 range_min: 0.0,
@@ -8060,7 +8082,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::InvalidData {
-                context: "replay_events.rng_sample.scope_agent_id",
+                context: "replay_events.rng_sample.scope_agent_uid",
                 ..
             }
         ));
@@ -8083,7 +8105,7 @@ mod tests {
             }
         }
 
-        let invalid_id = AgentId::from(KeyData::from_ffi(u64::MAX));
+        let invalid_uid = AgentUid(u64::MAX);
 
         let mut epoch = sample_batch(9, 1.0);
         epoch.epoch = u64::MAX;
@@ -8095,7 +8117,9 @@ mod tests {
 
         let base_birth = BirthRecord {
             tick: Tick(9),
-            agent_id: AgentId::default(),
+            agent_uid: AgentUid(1),
+            spawn_ordinal: 0,
+            birth_ordinal: 0,
             parent_a: None,
             parent_b: None,
             brain_kind: Some("test.keyed".to_owned()),
@@ -8109,13 +8133,19 @@ mod tests {
         birth.tick = Tick(u64::MAX);
         assert_invalid_data_context(birth_row_from_record(&birth), "births.tick");
         let mut birth = base_birth.clone();
-        birth.agent_id = invalid_id;
-        assert_invalid_data_context(birth_row_from_record(&birth), "births.agent_id");
+        birth.agent_uid = invalid_uid;
+        assert_invalid_data_context(birth_row_from_record(&birth), "births.agent_uid");
         let mut birth = base_birth.clone();
-        birth.parent_a = Some(invalid_id);
+        birth.spawn_ordinal = u64::MAX;
+        assert_invalid_data_context(birth_row_from_record(&birth), "births.spawn_ordinal");
+        let mut birth = base_birth.clone();
+        birth.birth_ordinal = u64::MAX;
+        assert_invalid_data_context(birth_row_from_record(&birth), "births.birth_ordinal");
+        let mut birth = base_birth.clone();
+        birth.parent_a = Some(invalid_uid);
         assert_invalid_data_context(birth_row_from_record(&birth), "births.parent_a");
         let mut birth = base_birth.clone();
-        birth.parent_b = Some(invalid_id);
+        birth.parent_b = Some(invalid_uid);
         assert_invalid_data_context(birth_row_from_record(&birth), "births.parent_b");
         let mut birth = base_birth;
         birth.brain_key = Some(u64::MAX);
@@ -8123,7 +8153,7 @@ mod tests {
 
         let base_death = DeathRecord {
             tick: Tick(9),
-            agent_id: AgentId::default(),
+            agent_uid: AgentUid(1),
             age: 1,
             generation: scriptbots_core::Generation(1),
             herbivore_tendency: 0.5,
@@ -8139,21 +8169,21 @@ mod tests {
         death.tick = Tick(u64::MAX);
         assert_invalid_data_context(death_row_from_record(&death), "deaths.tick");
         let mut death = base_death.clone();
-        death.agent_id = invalid_id;
-        assert_invalid_data_context(death_row_from_record(&death), "deaths.agent_id");
+        death.agent_uid = invalid_uid;
+        assert_invalid_data_context(death_row_from_record(&death), "deaths.agent_uid");
         let mut death = base_death;
         death.brain_key = Some(u64::MAX);
         assert_invalid_data_context(death_row_from_record(&death), "deaths.brain_key");
 
         let replay = ReplayEvent {
-            agent_id: Some(invalid_id),
+            agent_uid: Some(invalid_uid),
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![0.25],
             },
         };
         assert_invalid_data_context(
             replay_row_from_event(&replay, 9, 0),
-            "replay_events.agent_id",
+            "replay_events.agent_uid",
         );
     }
 
@@ -8161,7 +8191,7 @@ mod tests {
     #[test]
     fn replay_sequence_above_sql_integer_range_is_rejected() {
         let replay = ReplayEvent {
-            agent_id: None,
+            agent_uid: None,
             kind: ReplayEventKind::BrainOutputs {
                 outputs: vec![0.25],
             },
@@ -8178,15 +8208,15 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut pipeline = StoragePipeline::memory_with_thresholds(64, 4096, 1024, 1024)?;
         let mut bad = sample_batch(7, 1.0);
-        bad.agents[0].id = AgentId::from(KeyData::from_ffi(u64::MAX));
+        bad.agents[0].identity.uid = AgentUid(u64::MAX);
 
         let error = pipeline
             .submit(&bad)
-            .expect_err("out-of-range agent id must be rejected at admission");
+            .expect_err("out-of-range agent uid must be rejected at admission");
         assert!(matches!(
             error,
             StorageError::InvalidData {
-                context: "agents.agent_id",
+                context: "agents.agent_uid",
                 ..
             }
         ));

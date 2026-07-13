@@ -1,7 +1,7 @@
 //! Feature-gated DWRAON brain (Damped Weighted Recurrent AND/OR Network).
 
 use rand::Rng;
-use rand::RngCore;
+use scriptbots_core::RandomStream;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
@@ -19,7 +19,7 @@ enum NodeKind {
 }
 
 impl NodeKind {
-    fn random(rng: &mut dyn RngCore) -> Self {
+    fn random(rng: &mut dyn RandomStream) -> Self {
         if rng.random::<f32>() < 0.5 {
             Self::And
         } else {
@@ -46,7 +46,7 @@ struct NodeParams {
 }
 
 impl NodeParams {
-    fn random(rng: &mut dyn RngCore) -> Self {
+    fn random(rng: &mut dyn RandomStream) -> Self {
         let mut weights = [0.0; CONNECTIONS];
         for weight in &mut weights {
             *weight = rng.random_range(0.1..2.0);
@@ -104,7 +104,7 @@ impl DwraonBrain {
 
     /// Construct a randomly initialized brain.
     #[must_use]
-    pub fn random(rng: &mut dyn RngCore) -> Self {
+    pub fn random(rng: &mut dyn RandomStream) -> Self {
         let mut nodes = Vec::with_capacity(BRAIN_SIZE);
         for idx in 0..BRAIN_SIZE {
             let mut params = NodeParams::random(rng);
@@ -128,7 +128,7 @@ impl DwraonBrain {
 
     /// Return a boxed runner for this brain implementation.
     #[must_use]
-    pub fn runner(rng: &mut dyn RngCore) -> Box<dyn BrainRunner> {
+    pub fn runner(rng: &mut dyn RandomStream) -> Box<dyn BrainRunner> {
         into_runner(Self::random(rng))
     }
 
@@ -138,7 +138,7 @@ impl DwraonBrain {
         }
     }
 
-    fn gaussian(rng: &mut dyn RngCore) -> f32 {
+    fn gaussian(rng: &mut dyn RandomStream) -> f32 {
         const TWO_PI: f32 = std::f32::consts::TAU;
         let u1 = (rng.random::<f32>()).clamp(f32::MIN_POSITIVE, 1.0);
         let u2 = rng.random::<f32>();
@@ -217,7 +217,7 @@ impl Brain for DwraonBrain {
 
     fn mutate(
         &mut self,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         rate: f32,
         scale: f32,
     ) -> Result<(), crate::BrainMutationError> {
@@ -246,7 +246,7 @@ impl Brain for DwraonBrain {
         Ok(())
     }
 
-    fn crossover(&self, other: &dyn Brain, rng: &mut dyn RngCore) -> Option<Box<dyn Brain>> {
+    fn crossover(&self, other: &dyn Brain, rng: &mut dyn RandomStream) -> Option<Box<dyn Brain>> {
         if other.kind() != Self::KIND {
             return None;
         }
@@ -299,12 +299,11 @@ impl Brain for DwraonBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-    use rand::rngs::SmallRng;
+    use scriptbots_core::SmallRngStream;
 
     #[test]
     fn random_brain_builds_expected_layout() {
-        let mut rng = SmallRng::seed_from_u64(0x5A5A5A5A);
+        let mut rng = SmallRngStream::seed_from_u64(0x5A5A5A5A);
         let brain = DwraonBrain::random(&mut rng);
         assert_eq!(brain.nodes.len(), BRAIN_SIZE);
         assert_eq!(brain.state.len(), BRAIN_SIZE);
@@ -312,7 +311,7 @@ mod tests {
 
     #[test]
     fn tick_emits_bounded_outputs() {
-        let mut rng = SmallRng::seed_from_u64(1234);
+        let mut rng = SmallRngStream::seed_from_u64(1234);
         let mut brain = DwraonBrain::random(&mut rng);
         let inputs = [0.25; INPUT_SIZE];
         let outputs = brain.tick(&inputs);
@@ -321,7 +320,7 @@ mod tests {
 
     #[test]
     fn mutate_adjusts_parameters() {
-        let mut rng = SmallRng::seed_from_u64(5678);
+        let mut rng = SmallRngStream::seed_from_u64(5678);
         let mut brain = DwraonBrain::random(&mut rng);
         let before = brain.nodes[5].bias;
         brain
@@ -332,17 +331,17 @@ mod tests {
 
     #[test]
     fn crossover_combines_parents() {
-        let mut rng = SmallRng::seed_from_u64(42);
+        let mut rng = SmallRngStream::seed_from_u64(42);
         let brain_a = DwraonBrain::random(&mut rng);
         let brain_b = DwraonBrain::random(&mut rng);
-        let mut rng = SmallRng::seed_from_u64(84);
+        let mut rng = SmallRngStream::seed_from_u64(84);
         let child = brain_a.crossover(&brain_b, &mut rng).expect("same kind");
         assert_eq!(child.kind(), DwraonBrain::KIND);
     }
 
     #[test]
     fn runner_bridge_invokes_brain() {
-        let mut rng = SmallRng::seed_from_u64(9001);
+        let mut rng = SmallRngStream::seed_from_u64(9001);
         let mut runner = DwraonBrain::runner(&mut rng);
         let inputs = [0.1; INPUT_SIZE];
         let outputs = runner.tick(&inputs);

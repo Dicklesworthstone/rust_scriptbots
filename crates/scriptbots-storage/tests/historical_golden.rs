@@ -1,7 +1,7 @@
 use fsqlite::{Connection, FrankenError, compat::RowExt};
 use scriptbots_core::{
-    AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
-    PersistenceEventKind, Position, Tick, TickSummary,
+    AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, MetricSample, PersistenceBatch,
+    PersistenceEvent, PersistenceEventKind, Position, Tick, TickSummary,
 };
 use scriptbots_storage::Storage;
 use std::{
@@ -24,7 +24,7 @@ fn temp_db_path(prefix: &str) -> PathBuf {
     path
 }
 
-fn make_agent_state(energy: f32, position: (f32, f32)) -> AgentState {
+fn make_agent_state(uid: u64, energy: f32, position: (f32, f32)) -> AgentState {
     let data = AgentData {
         position: Position::new(position.0, position.1),
         health: energy,
@@ -36,6 +36,11 @@ fn make_agent_state(energy: f32, position: (f32, f32)) -> AgentState {
     };
     AgentState {
         id: scriptbots_core::AgentId::default(),
+        identity: AgentIdentity {
+            uid: AgentUid(uid),
+            spawn_ordinal: uid - 1,
+            birth_ordinal: None,
+        },
         data,
         runtime,
     }
@@ -97,9 +102,9 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
             0,
             3.6,
             vec![
-                make_agent_state(1.0, (10.0, 10.0)),
-                make_agent_state(1.2, (15.0, 12.0)),
-                make_agent_state(1.4, (20.0, 18.0)),
+                make_agent_state(1, 1.0, (10.0, 10.0)),
+                make_agent_state(2, 1.2, (15.0, 12.0)),
+                make_agent_state(3, 1.4, (20.0, 18.0)),
             ],
             vec![PersistenceEvent::new(PersistenceEventKind::Births, 1)],
         ),
@@ -110,10 +115,10 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
             1,
             4.8,
             vec![
-                make_agent_state(1.3, (11.0, 11.0)),
-                make_agent_state(1.1, (14.0, 16.0)),
-                make_agent_state(1.0, (21.0, 19.0)),
-                make_agent_state(1.4, (24.0, 22.0)),
+                make_agent_state(1, 1.3, (11.0, 11.0)),
+                make_agent_state(2, 1.1, (14.0, 16.0)),
+                make_agent_state(3, 1.0, (21.0, 19.0)),
+                make_agent_state(4, 1.4, (24.0, 22.0)),
             ],
             vec![
                 PersistenceEvent::new(PersistenceEventKind::Births, 2),
@@ -127,11 +132,11 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
             0,
             6.5,
             vec![
-                make_agent_state(1.3, (13.0, 11.0)),
-                make_agent_state(1.5, (17.0, 16.0)),
-                make_agent_state(1.2, (23.0, 21.0)),
-                make_agent_state(1.0, (25.0, 24.0)),
-                make_agent_state(1.5, (28.0, 26.0)),
+                make_agent_state(1, 1.3, (13.0, 11.0)),
+                make_agent_state(2, 1.5, (17.0, 16.0)),
+                make_agent_state(3, 1.2, (23.0, 21.0)),
+                make_agent_state(4, 1.0, (25.0, 24.0)),
+                make_agent_state(5, 1.5, (28.0, 26.0)),
             ],
             vec![PersistenceEvent::new(PersistenceEventKind::Births, 1)],
         ),

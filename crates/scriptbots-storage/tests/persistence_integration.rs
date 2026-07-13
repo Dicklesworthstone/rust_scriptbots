@@ -45,7 +45,7 @@ fn storage_persists_metrics_roundtrip() {
             births: Vec::new(),
             deaths: Vec::new(),
             replay_events: vec![ReplayEvent {
-                agent_id: None,
+                agent_uid: None,
                 kind: ReplayEventKind::BrainOutputs {
                     outputs: vec![0.25, 0.75],
                 },

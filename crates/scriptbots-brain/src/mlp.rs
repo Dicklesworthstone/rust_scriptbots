@@ -1,7 +1,7 @@
 //! Multi-layer perceptron brain mirroring the legacy ScriptBots baseline.
 
 use rand::Rng;
-use rand::RngCore;
+use scriptbots_core::RandomStream;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
@@ -20,7 +20,7 @@ enum SynapseKind {
 }
 
 impl SynapseKind {
-    fn random(rng: &mut dyn RngCore) -> Self {
+    fn random(rng: &mut dyn RandomStream) -> Self {
         if rng.random::<f32>() < 0.05 {
             Self::ChangeSensitive
         } else {
@@ -48,7 +48,7 @@ struct NodeParams {
 }
 
 impl NodeParams {
-    fn random(rng: &mut dyn RngCore) -> Self {
+    fn random(rng: &mut dyn RandomStream) -> Self {
         let mut weights = [0.0; CONNECTIONS];
         for weight in &mut weights {
             let value = rng.random_range(-3.0..3.0);
@@ -114,7 +114,7 @@ impl MlpBrain {
 
     /// Construct a randomly initialized brain.
     #[must_use]
-    pub fn random(rng: &mut dyn RngCore) -> Self {
+    pub fn random(rng: &mut dyn RandomStream) -> Self {
         let mut nodes = Vec::with_capacity(BRAIN_SIZE);
         for _ in 0..BRAIN_SIZE {
             nodes.push(NodeParams::random(rng));
@@ -129,7 +129,7 @@ impl MlpBrain {
 
     /// Return a boxed brain runner wrapping a randomly initialized MLP.
     #[must_use]
-    pub fn runner(rng: &mut dyn RngCore) -> Box<dyn BrainRunner> {
+    pub fn runner(rng: &mut dyn RandomStream) -> Box<dyn BrainRunner> {
         into_runner(Self::random(rng))
     }
 
@@ -143,7 +143,7 @@ impl MlpBrain {
         1.0 / (1.0 + (-value).exp())
     }
 
-    fn gaussian(rng: &mut dyn RngCore) -> f32 {
+    fn gaussian(rng: &mut dyn RandomStream) -> f32 {
         const TWO_PI: f32 = std::f32::consts::TAU;
         let u1 = (rng.random::<f32>()).clamp(f32::MIN_POSITIVE, 1.0);
         let u2 = rng.random::<f32>();
@@ -239,7 +239,7 @@ impl Brain for MlpBrain {
 
     fn mutate(
         &mut self,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         rate: f32,
         scale: f32,
     ) -> Result<(), crate::BrainMutationError> {
@@ -271,7 +271,7 @@ impl Brain for MlpBrain {
         Ok(())
     }
 
-    fn crossover(&self, other: &dyn Brain, rng: &mut dyn RngCore) -> Option<Box<dyn Brain>> {
+    fn crossover(&self, other: &dyn Brain, rng: &mut dyn RandomStream) -> Option<Box<dyn Brain>> {
         if other.kind() != Self::KIND {
             return None;
         }
@@ -309,12 +309,11 @@ impl Brain for MlpBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-    use rand::rngs::SmallRng;
+    use scriptbots_core::SmallRngStream;
 
     #[test]
     fn random_brain_has_expected_structure() {
-        let mut rng = SmallRng::seed_from_u64(0xDEADBEEF);
+        let mut rng = SmallRngStream::seed_from_u64(0xDEADBEEF);
         let brain = MlpBrain::random(&mut rng);
         assert_eq!(brain.nodes.len(), BRAIN_SIZE);
         assert_eq!(brain.state.len(), BRAIN_SIZE);
@@ -322,7 +321,7 @@ mod tests {
 
     #[test]
     fn tick_produces_stable_outputs() {
-        let mut rng = SmallRng::seed_from_u64(123);
+        let mut rng = SmallRngStream::seed_from_u64(123);
         let mut brain = MlpBrain::random(&mut rng);
         let mut inputs = [0.0; INPUT_SIZE];
         inputs[0] = 1.0;
@@ -332,7 +331,7 @@ mod tests {
 
     #[test]
     fn mutate_changes_parameters() {
-        let mut rng = SmallRng::seed_from_u64(456);
+        let mut rng = SmallRngStream::seed_from_u64(456);
         let mut brain = MlpBrain::random(&mut rng);
         let original = brain.nodes[10].bias;
         brain
@@ -343,10 +342,10 @@ mod tests {
 
     #[test]
     fn crossover_combines_parents() {
-        let mut rng = SmallRng::seed_from_u64(789);
+        let mut rng = SmallRngStream::seed_from_u64(789);
         let brain_a = MlpBrain::random(&mut rng);
         let brain_b = MlpBrain::random(&mut rng);
-        let mut rng = SmallRng::seed_from_u64(101112);
+        let mut rng = SmallRngStream::seed_from_u64(101112);
         let child = brain_a
             .crossover(&brain_b, &mut rng)
             .expect("crossover should succeed");
@@ -355,7 +354,7 @@ mod tests {
 
     #[test]
     fn runner_bridge_executes() {
-        let mut rng = SmallRng::seed_from_u64(42);
+        let mut rng = SmallRngStream::seed_from_u64(42);
         let mut runner = MlpBrain::runner(&mut rng);
         let inputs = [0.0; INPUT_SIZE];
         let outputs = runner.tick(&inputs);

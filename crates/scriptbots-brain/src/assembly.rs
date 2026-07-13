@@ -1,7 +1,7 @@
 //! Experimental assembly-style brain gated behind the `experimental` feature.
 
 use rand::Rng;
-use rand::RngCore;
+use scriptbots_core::RandomStream;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
@@ -23,7 +23,7 @@ impl AssemblyBrain {
 
     /// Construct a randomly initialized assembly brain.
     #[must_use]
-    pub fn random(rng: &mut dyn RngCore) -> Self {
+    pub fn random(rng: &mut dyn RandomStream) -> Self {
         let mut cells = Vec::with_capacity(BRAIN_SIZE);
         for _ in 0..BRAIN_SIZE {
             let mut value = rng.random_range(-3.0..3.0);
@@ -41,7 +41,7 @@ impl AssemblyBrain {
 
     /// Return a boxed runner for this brain implementation.
     #[must_use]
-    pub fn runner(rng: &mut dyn RngCore) -> Box<dyn BrainRunner> {
+    pub fn runner(rng: &mut dyn RandomStream) -> Box<dyn BrainRunner> {
         into_runner(Self::random(rng))
     }
 
@@ -132,7 +132,7 @@ impl Brain for AssemblyBrain {
 
     fn mutate(
         &mut self,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         rate: f32,
         _scale: f32,
     ) -> Result<(), crate::BrainMutationError> {
@@ -144,7 +144,7 @@ impl Brain for AssemblyBrain {
         Ok(())
     }
 
-    fn crossover(&self, other: &dyn Brain, rng: &mut dyn RngCore) -> Option<Box<dyn Brain>> {
+    fn crossover(&self, other: &dyn Brain, rng: &mut dyn RandomStream) -> Option<Box<dyn Brain>> {
         if other.kind() != Self::KIND {
             return None;
         }
@@ -177,19 +177,18 @@ impl Brain for AssemblyBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-    use rand::rngs::SmallRng;
+    use scriptbots_core::SmallRngStream;
 
     #[test]
     fn random_brain_has_expected_length() {
-        let mut rng = SmallRng::seed_from_u64(0xABCD);
+        let mut rng = SmallRngStream::seed_from_u64(0xABCD);
         let brain = AssemblyBrain::random(&mut rng);
         assert_eq!(brain.cells.len(), BRAIN_SIZE);
     }
 
     #[test]
     fn tick_outputs_in_range() {
-        let mut rng = SmallRng::seed_from_u64(4242);
+        let mut rng = SmallRngStream::seed_from_u64(4242);
         let mut brain = AssemblyBrain::random(&mut rng);
         let inputs = [0.5; INPUT_SIZE];
         let outputs = brain.tick(&inputs);
@@ -198,7 +197,7 @@ mod tests {
 
     #[test]
     fn mutate_changes_cells() {
-        let mut rng = SmallRng::seed_from_u64(1717);
+        let mut rng = SmallRngStream::seed_from_u64(1717);
         let mut brain = AssemblyBrain::random(&mut rng);
         let before = brain.cells[10];
         brain
@@ -209,10 +208,10 @@ mod tests {
 
     #[test]
     fn crossover_selects_values() {
-        let mut rng = SmallRng::seed_from_u64(9999);
+        let mut rng = SmallRngStream::seed_from_u64(9999);
         let brain_a = AssemblyBrain::random(&mut rng);
         let brain_b = AssemblyBrain::random(&mut rng);
-        let mut rng = SmallRng::seed_from_u64(1111);
+        let mut rng = SmallRngStream::seed_from_u64(1111);
         let child = brain_a
             .crossover(&brain_b, &mut rng)
             .expect("matching kinds");
@@ -221,7 +220,7 @@ mod tests {
 
     #[test]
     fn runner_executes_program() {
-        let mut rng = SmallRng::seed_from_u64(2025);
+        let mut rng = SmallRngStream::seed_from_u64(2025);
         let mut runner = AssemblyBrain::runner(&mut rng);
         let inputs = [0.0; INPUT_SIZE];
         let outputs = runner.tick(&inputs);

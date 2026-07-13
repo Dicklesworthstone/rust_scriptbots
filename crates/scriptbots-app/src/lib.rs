@@ -4,8 +4,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use scriptbots_core::{
-    CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0, ScriptBotsConfig,
-    TickEvents, WorldState,
+    CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0, RandomStreamState,
+    ScriptBotsConfig, TickEvents, WorldState,
 };
 use scriptbots_storage::AnalyticsSnapshotProvider;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
@@ -15,8 +15,8 @@ use thiserror::Error;
 pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
-/// Schema identifier for the temporary pre-redesign run manifest.
-pub const RUN_MANIFEST_V0_SCHEMA: &str = "scriptbots.run-manifest";
+/// Schema identifier for the stable-identity/random-stream run manifest.
+pub const RUN_MANIFEST_V1_SCHEMA: &str = "scriptbots.run-manifest.v1";
 /// Schema identifier for a sequence of V0 world characterization points.
 pub const CHARACTERIZATION_TRACE_V0_SCHEMA: &str = "scriptbots.characterization-trace";
 /// Safety bound for the temporary characterization runner.
@@ -25,7 +25,7 @@ const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 const RUST_TOOLCHAIN_BYTES: &[u8] = include_bytes!("../../../rust-toolchain.toml");
 const RUST_TOOLCHAIN_TEXT: &str = include_str!("../../../rust-toolchain.toml");
 
-/// Build identity captured alongside every version-zero run manifest.
+/// Build identity V0 embedded in the V1 run manifest and legacy characterization trace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildProvenanceV0 {
     pub package_name: String,
@@ -192,12 +192,12 @@ impl Default for CharacterizationLimitationsV0 {
     fn default() -> Self {
         Self {
             purpose: "characterization_only".to_owned(),
-            agent_identity: "AgentId::data().as_ffi(), not stable AgentUid".to_owned(),
+            agent_identity: "AgentState snapshots and persistence use stable AgentUid; RunManifestV1 records allocation counters; legacy CharacterizationDigestV0 still orders agents by transient AgentId and excludes AgentUid".to_owned(),
             source_identity:
                 "commit plus status/tracked-diff digests; untracked file contents are not hashed"
                     .to_owned(),
             evaluator_state_covered: false,
-            rng_state_restorable: false,
+            rng_state_restorable: true,
             checkpoint_replay_guarantee: false,
             comparison_lane: "same pinned toolchain, target, features, and thread lane".to_owned(),
             superseded_by: "WorldDigestV1".to_owned(),
@@ -205,17 +205,22 @@ impl Default for CharacterizationLimitationsV0 {
     }
 }
 
-/// Version-zero record tying scenario construction and normalized configuration to a build.
+/// Version-one record tying scenario construction, stable identity allocation, random-stream
+/// continuation, and normalized configuration to a build.
 ///
 /// `reproducible` means the manifest has an explicit seed and complete clean-source provenance. It
 /// does not override the characterization digest's exclusions or claim that replay can reconstruct
 /// the world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RunManifestV0 {
+pub struct RunManifestV1 {
     pub schema: String,
     pub schema_version: u16,
     pub purpose: String,
     pub root_seed: u64,
+    pub random_stream: RandomStreamState,
+    pub next_agent_uid: u64,
+    pub next_spawn_ordinal: u64,
+    pub next_birth_ordinal: u64,
     pub scenario: ScenarioIdentityV0,
     pub normalized_config: serde_json::Value,
     pub config_digest: String,
@@ -227,12 +232,12 @@ pub struct RunManifestV0 {
     pub limitations: CharacterizationLimitationsV0,
 }
 
-/// Errors returned while constructing a version-zero run manifest.
+/// Errors returned while constructing a version-one run manifest.
 #[derive(Debug, Error)]
 pub enum RunManifestError {
     #[error("scenario identity must not be empty")]
     EmptyScenarioIdentity,
-    #[error("characterization V0 requires an explicit rng_seed")]
+    #[error("run manifest V1 requires an explicit rng_seed")]
     MissingExplicitSeed,
     #[error("failed to normalize ScriptBots configuration: {0}")]
     ConfigSerialization(#[source] serde_json::Error),
@@ -240,7 +245,7 @@ pub enum RunManifestError {
     ConfigDigestSerialization(String),
 }
 
-impl RunManifestV0 {
+impl RunManifestV1 {
     /// Capture a run manifest using provenance embedded in the current build.
     pub fn from_world(
         scenario_id: impl Into<String>,
@@ -284,12 +289,19 @@ impl RunManifestV0 {
             .collect();
         let reproducible = build.provenance_complete;
         let warnings = build.warnings.clone();
+        let random_stream = world.random_stream_state();
+        let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) =
+            world.identity_sequence_state();
 
         Ok(Self {
-            schema: RUN_MANIFEST_V0_SCHEMA.to_owned(),
-            schema_version: 0,
+            schema: RUN_MANIFEST_V1_SCHEMA.to_owned(),
+            schema_version: 1,
             purpose: "characterization_only".to_owned(),
             root_seed,
+            random_stream,
+            next_agent_uid,
+            next_spawn_ordinal,
+            next_birth_ordinal,
             scenario,
             normalized_config,
             config_digest,
@@ -328,7 +340,7 @@ pub struct CharacterizationTraceV0 {
     pub schema: String,
     pub schema_version: u16,
     pub digest_algorithm: String,
-    pub manifest: RunManifestV0,
+    pub manifest: RunManifestV1,
     pub manifest_digest: String,
     pub points: Vec<TracePointV0>,
 }
@@ -371,13 +383,13 @@ impl CharacterizationTraceV0 {
             });
         }
 
-        let manifest = RunManifestV0::from_world_with_provenance(
+        let manifest = RunManifestV1::from_world_with_provenance(
             scenario,
             world,
             BuildProvenanceV0::current(),
         )?;
         let manifest_bytes = manifest.canonical_json_bytes()?;
-        let manifest_digest = manifest_digest("run-manifest-v0", &manifest_bytes);
+        let manifest_digest = manifest_digest("run-manifest-v1", &manifest_bytes);
         let mut points = Vec::with_capacity(usize::try_from(ticks).unwrap_or(0) + 1);
         let initial = world.characterization_digest_v0()?;
         points.push(TracePointV0 {
@@ -556,6 +568,22 @@ mod characterization_tests {
     }
 
     #[test]
+    fn brain_telemetry_round_trip_uses_stable_agent_uid() {
+        let telemetry = scriptbots_brain::BrainTelemetry {
+            agent: scriptbots_core::AgentUid(0xfeed_beef),
+            tick: scriptbots_core::Tick(17),
+            energy_spent: 0.25,
+        };
+        let encoded = serde_json::to_vec(&telemetry).expect("encode brain telemetry");
+        let decoded: scriptbots_brain::BrainTelemetry =
+            serde_json::from_slice(&encoded).expect("decode brain telemetry");
+        assert_eq!(decoded, telemetry);
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("inspect brain telemetry");
+        assert_eq!(value["agent"], 0xfeed_beef_u64);
+    }
+
+    #[test]
     fn canonical_json_sorts_nested_keys_and_round_trips_manifest() {
         let input = serde_json::json!({
             "z": {"beta": 2, "alpha": 1},
@@ -568,14 +596,14 @@ mod characterization_tests {
         );
 
         let world = test_world(Some(17));
-        let manifest = RunManifestV0::from_world_with_provenance(
+        let manifest = RunManifestV1::from_world_with_provenance(
             ScenarioIdentityV0::caller_seeded("canonical-test"),
             &world,
             complete_test_build(),
         )
         .expect("manifest");
         let encoded = manifest.canonical_json_bytes().expect("manifest JSON");
-        let decoded: RunManifestV0 = serde_json::from_slice(&encoded).expect("round trip");
+        let decoded: RunManifestV1 = serde_json::from_slice(&encoded).expect("round trip");
         assert_eq!(manifest, decoded);
         let encoded_value: serde_json::Value =
             serde_json::from_slice(&encoded).expect("manifest schema");
@@ -591,8 +619,12 @@ mod characterization_tests {
                 "config_digest",
                 "config_digest_encoding",
                 "limitations",
+                "next_agent_uid",
+                "next_birth_ordinal",
+                "next_spawn_ordinal",
                 "normalized_config",
                 "purpose",
+                "random_stream",
                 "reproducible",
                 "root_seed",
                 "scenario",
@@ -601,11 +633,11 @@ mod characterization_tests {
                 "warnings",
             ]
         );
-        assert_eq!(encoded_value["schema"], RUN_MANIFEST_V0_SCHEMA);
-        assert_eq!(encoded_value["schema_version"], 0);
+        assert_eq!(encoded_value["schema"], RUN_MANIFEST_V1_SCHEMA);
+        assert_eq!(encoded_value["schema_version"], 1);
         assert_eq!(
-            manifest_digest("run-manifest-v0-wire-golden", &encoded),
-            "fnv1a64:19088384726fe309",
+            manifest_digest("run-manifest-v1-wire-golden", &encoded),
+            "fnv1a64:bb8b9b7bc9277d32",
             "manifest wire changes require a versioned schema boundary"
         );
     }
@@ -619,9 +651,9 @@ mod characterization_tests {
         let world_b = test_world(Some(33));
         let scenario = ScenarioIdentityV0::caller_seeded("stable-test");
         let manifest_a =
-            RunManifestV0::from_world_with_provenance(scenario.clone(), &world_a, build.clone())
+            RunManifestV1::from_world_with_provenance(scenario.clone(), &world_a, build.clone())
                 .expect("manifest A");
-        let manifest_b = RunManifestV0::from_world_with_provenance(scenario, &world_b, build)
+        let manifest_b = RunManifestV1::from_world_with_provenance(scenario, &world_b, build)
             .expect("manifest B");
         assert_eq!(
             manifest_a.canonical_json_bytes().expect("manifest A JSON"),
@@ -649,12 +681,12 @@ mod characterization_tests {
         let build = complete_test_build();
         let scenario = ScenarioIdentityV0::caller_seeded("closed-policy-test");
         let open_manifest =
-            RunManifestV0::from_world_with_provenance(scenario.clone(), &world, build.clone())
+            RunManifestV1::from_world_with_provenance(scenario.clone(), &world, build.clone())
                 .expect("open manifest");
         assert_eq!(open_manifest.normalized_config["closed"], false);
 
         world.set_closed(true);
-        let closed_manifest = RunManifestV0::from_world_with_provenance(scenario, &world, build)
+        let closed_manifest = RunManifestV1::from_world_with_provenance(scenario, &world, build)
             .expect("closed manifest");
 
         assert!(world.is_closed());
@@ -674,7 +706,7 @@ mod characterization_tests {
     fn manifest_rejects_entropy_seed_and_marks_provenance_gaps() {
         let entropy_world = test_world(None);
         assert!(matches!(
-            RunManifestV0::from_world_with_provenance(
+            RunManifestV1::from_world_with_provenance(
                 ScenarioIdentityV0::caller_seeded("entropy"),
                 &entropy_world,
                 complete_test_build(),
@@ -691,7 +723,7 @@ mod characterization_tests {
         incomplete.provenance_complete = false;
         incomplete.warnings = vec!["provenance deliberately incomplete".to_owned()];
         let world = test_world(Some(5));
-        let manifest = RunManifestV0::from_world_with_provenance(
+        let manifest = RunManifestV1::from_world_with_provenance(
             ScenarioIdentityV0::caller_seeded("incomplete"),
             &world,
             incomplete,

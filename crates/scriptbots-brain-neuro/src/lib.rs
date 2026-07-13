@@ -8,13 +8,13 @@
 
 use neuroflow::FeedForward;
 use neuroflow::activators::Type;
-use rand::{Rng, RngCore};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use scriptbots_brain::{Brain, BrainCloneError, BrainKind, BrainMutationError, into_runner};
 use scriptbots_core::{
     ActivationLayer, BrainActivations, BrainRunner, BrainSpawnError, NeuroflowActivationKind,
-    NeuroflowSettings, WorldState,
+    NeuroflowSettings, RandomStream, WorldState,
 };
 use std::sync::Arc;
 
@@ -328,7 +328,7 @@ impl NeuroflowBrain {
     /// Construct a new brain with random weights using the supplied configuration.
     pub fn new(
         config: NeuroflowBrainConfig,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
     ) -> Result<Self, NeuroflowBrainError> {
         let network = Self::build_network(&config, rng)?;
         Ok(Self {
@@ -341,7 +341,7 @@ impl NeuroflowBrain {
     /// Convenience helper to box the brain into a [`BrainRunner`].
     pub fn runner(
         config: NeuroflowBrainConfig,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
     ) -> Result<Box<dyn BrainRunner>, NeuroflowBrainError> {
         Self::new(config, rng).map(into_runner)
     }
@@ -363,14 +363,17 @@ impl NeuroflowBrain {
     }
 
     /// Rebuild weights through the same validated, fallible constructor used at startup.
-    pub fn try_regenerate(&mut self, rng: &mut dyn RngCore) -> Result<(), NeuroflowBrainError> {
+    pub fn try_regenerate(
+        &mut self,
+        rng: &mut dyn RandomStream,
+    ) -> Result<(), NeuroflowBrainError> {
         self.network = Self::build_network(&self.config, rng)?;
         Ok(())
     }
 
     fn build_network(
         config: &NeuroflowBrainConfig,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
     ) -> Result<FeedForward, NeuroflowBrainError> {
         config.validate()?;
         let architecture_len = config.hidden_layers.len().checked_add(2).ok_or(
@@ -498,7 +501,7 @@ impl NeuroflowBrain {
         Ok(network)
     }
 
-    fn gaussian(rng: &mut dyn RngCore) -> f64 {
+    fn gaussian(rng: &mut dyn RandomStream) -> f64 {
         let u1 = rng.random::<f64>().clamp(f64::MIN_POSITIVE, 1.0);
         let u2 = rng.random::<f64>();
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
@@ -524,7 +527,7 @@ impl Brain for NeuroflowBrain {
 
     fn mutate(
         &mut self,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         rate: f32,
         scale: f32,
     ) -> Result<(), BrainMutationError> {
@@ -649,12 +652,11 @@ impl Brain for NeuroflowBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-    use rand::rngs::SmallRng;
+    use scriptbots_core::SmallRngStream;
 
     #[test]
     fn runner_executes_and_returns_outputs() {
-        let mut rng = SmallRng::seed_from_u64(0xBEEF);
+        let mut rng = SmallRngStream::seed_from_u64(0xBEEF);
         let mut runner = NeuroflowBrain::runner(NeuroflowBrainConfig::default(), &mut rng)
             .expect("default NeuroFlow runner");
         let outputs = runner.tick(&[0.0; INPUT_SIZE]);
@@ -664,7 +666,7 @@ mod tests {
 
     #[test]
     fn fallible_regeneration_changes_network() {
-        let mut rng = SmallRng::seed_from_u64(0xCAFE);
+        let mut rng = SmallRngStream::seed_from_u64(0xCAFE);
         let config = NeuroflowBrainConfig::default();
         let mut brain = NeuroflowBrain::new(config, &mut rng).expect("default NeuroFlow brain");
         let baseline = brain.tick(&[0.0; INPUT_SIZE]);
@@ -677,7 +679,7 @@ mod tests {
 
     #[test]
     fn exact_clone_preserves_outputs_and_mutates_independently() {
-        let mut rng = SmallRng::seed_from_u64(0xC10E);
+        let mut rng = SmallRngStream::seed_from_u64(0xC10E);
         let mut original = NeuroflowBrain::new(NeuroflowBrainConfig::default(), &mut rng)
             .expect("validated NeuroFlow brain");
         let inputs = [0.25; INPUT_SIZE];
@@ -710,7 +712,7 @@ mod tests {
                 "momentum" => config.momentum = value,
                 _ => unreachable!("test field table is exhaustive"),
             }
-            let mut rng = SmallRng::seed_from_u64(7);
+            let mut rng = SmallRngStream::seed_from_u64(7);
             let error = NeuroflowBrain::new(config, &mut rng)
                 .expect_err("non-finite public rate must fail construction");
             assert_eq!(error.field(), Some(field));
@@ -730,7 +732,7 @@ mod tests {
                 momentum,
                 ..NeuroflowBrainConfig::default()
             };
-            let mut rng = SmallRng::seed_from_u64(11);
+            let mut rng = SmallRngStream::seed_from_u64(11);
             let mut brain =
                 NeuroflowBrain::new(config, &mut rng).expect("finite signed rates remain valid");
             assert!(
@@ -782,7 +784,7 @@ mod tests {
             hidden_layers: Vec::new(),
             ..NeuroflowBrainConfig::default()
         };
-        let mut rng = SmallRng::seed_from_u64(13);
+        let mut rng = SmallRngStream::seed_from_u64(13);
         NeuroflowBrain::new(no_hidden, &mut rng)
             .expect("direct input-to-output architecture remains valid");
     }

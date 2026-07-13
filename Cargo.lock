@@ -10043,7 +10043,6 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
- "rand 0.9.5",
  "scriptbots-brain",
  "scriptbots-core",
  "tch",
@@ -10124,7 +10123,6 @@ dependencies = [
  "scriptbots-core",
  "serde",
  "serde_json",
- "slotmap",
  "thiserror 2.0.18",
  "tracing",
 ]

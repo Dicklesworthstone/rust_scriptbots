@@ -1777,7 +1777,7 @@ Writer errors, queue bounds, flush, and cancellation belong to the runtime/stora
 
 #### 1.4 scenario/startup construction
 
-- minimal scenario schema on `RunManifestV0`;
+- minimal scenario schema on `RunManifestV1`;
 - full-world seeding;
 - remove hidden 120 ticks;
 - preserve current ecology parameters until honest brains/RNG/digests exist;
@@ -1785,13 +1785,26 @@ Writer errors, queue bounds, flush, and cancellation belong to the runtime/stora
 
 **Exit:** startup is explicit and reproducible; no claim about a tuned ecosystem is made yet.
 
-#### 1.5 stable IDs and minimal random-stream protocol
+#### 1.5 stable IDs and minimal random-stream protocol [Completed — `bd-2z0.3.1`]
 
 - add stable `AgentUid` without changing slot-map lookup behavior;
 - define the minimal `RandomStream` interface required by core/brain families;
 - adapt the current RNG behind that interface first;
 - version algorithm identity/state in the manifest;
 - add basic state round-trip and stream-identity tests.
+
+Completion evidence:
+
+- `AgentUid` plus deterministic spawn/birth ordinals now cross snapshots, lineage, replay,
+  telemetry, lifecycle records, FrankenSQLite rows, analytics, and the V1 run manifest without
+  replacing `AgentId` as the live arena handle;
+- the object-safe `RandomStream` boundary wraps the exact `rand 0.9.5` `SmallRng` behavior with a
+  bounded/versioned opaque state envelope, fixed codec golden, differential sampling proof, and
+  serialized continuation tests; named domains and scheduler-independent streams remain deferred;
+- persistence moved to outbox payload V2 and an exact fresh-run migration 3/4 pair, so an old
+  AgentId database is refused rather than silently interpreted as the stable-UID layout; and
+- `GenomeProvenance.parents` remains an explicit legacy placeholder owned by `bd-2z0.3.2`; this
+  slice does not half-migrate the later genome/evaluator-state protocol.
 
 **Exit:** downstream brain APIs depend on a real protocol, while the later `fnp-random`/domain-separation decision remains independent.
 

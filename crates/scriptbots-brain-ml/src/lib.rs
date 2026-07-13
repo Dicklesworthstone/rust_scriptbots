@@ -1,7 +1,7 @@
 //! Optional modern ML brain backends (Candle, tract-onnx, tch).
 
 use scriptbots_brain::{Brain, BrainKind, into_runner};
-use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
+use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
 use std::any::Any;
 
 /// Supported ML backends selected at build time.
@@ -62,7 +62,7 @@ impl Brain for MlBrain {
 
     fn mutate(
         &mut self,
-        _rng: &mut dyn rand::RngCore,
+        _rng: &mut dyn RandomStream,
         _rate: f32,
         _scale: f32,
     ) -> Result<(), scriptbots_brain::BrainMutationError> {

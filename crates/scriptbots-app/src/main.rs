@@ -2369,7 +2369,7 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
     match &event.kind {
         ReplayEventKind::BrainOutputs { outputs } => format!(
             "BrainOutputs(agent={:?}, len={})",
-            event.agent_id,
+            event.agent_uid,
             outputs.len()
         ),
         ReplayEventKind::Action {
@@ -2381,7 +2381,7 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             give_intent,
         } => format!(
             "Action(agent={:?}, lw={:.3}, rw={:.3}, boost={}, spike={:?}, sound={:.3}, give={:.3})",
-            event.agent_id, left_wheel, right_wheel, boost, spike_target, sound_level, give_intent
+            event.agent_uid, left_wheel, right_wheel, boost, spike_target, sound_level, give_intent
         ),
         ReplayEventKind::RngSample {
             scope,

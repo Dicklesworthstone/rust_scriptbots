@@ -105,6 +105,354 @@ impl AgentId {
     }
 }
 
+/// Stable logical identity for an agent within one simulation run.
+///
+/// Unlike [`AgentId`], this value is never recycled when a SlotMap entry is removed. Scientific
+/// snapshots, lineage, replay, and persistence use this identity; the generational handle remains
+/// the efficient in-memory lookup key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AgentUid(pub u64);
+
+impl AgentUid {
+    /// Return the integer representation used by persistence and protocol DTOs.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Stable creation-order metadata attached to one live agent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentIdentity {
+    pub uid: AgentUid,
+    /// Monotonic ordinal assigned to every successful insertion, including injected agents.
+    pub spawn_ordinal: u64,
+    /// Monotonic ordinal assigned only to offspring produced from parent agents.
+    pub birth_ordinal: Option<u64>,
+}
+
+/// Version of the restorable adapter state carried by [`RandomStreamState`].
+pub const RANDOM_STREAM_STATE_VERSION: u16 = 1;
+/// Maximum opaque state payload accepted from any random-stream implementation.
+pub const MAX_RANDOM_STREAM_STATE_BYTES: usize = 256;
+const SMALL_RNG_STATE_CODEC_VERSION: u16 = 1;
+const SMALL_RNG_STATE_BYTES: usize = 8 + 4 * 8;
+
+#[cfg(target_pointer_width = "64")]
+const RANDOM_STREAM_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro256plusplus-64-seed-from-u64";
+#[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+const RANDOM_STREAM_ALGORITHM: &str = "rand-0.9.5-smallrng-xoshiro128plusplus-32-seed-from-u64";
+
+/// Serializable continuation state for the current world random stream.
+///
+/// `SmallRng` deliberately does not promise a portable, serializable state. This first protocol
+/// therefore carries a bounded opaque payload identified by an algorithm and codec version. The
+/// current adapter's private codec records its seed and four state words as explicit little-endian
+/// `u64`s. Restore is constant-time and validates versions and lengths before decoding, so
+/// untrusted state cannot request unbounded work. This preserves the existing generator and
+/// fixed-seed behavior without constraining future adapters to xoshiro's state shape, selecting a
+/// replacement generator, or claiming domain separation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RandomStreamState {
+    pub version: u16,
+    pub algorithm: String,
+    pub codec_version: u16,
+    #[serde(deserialize_with = "deserialize_bounded_random_stream_state")]
+    pub state: Vec<u8>,
+}
+
+fn deserialize_bounded_random_stream_state<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedStateVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for BoundedStateVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_RANDOM_STREAM_STATE_BYTES} random-stream state bytes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let hinted = sequence.size_hint().unwrap_or_default();
+            if hinted > MAX_RANDOM_STREAM_STATE_BYTES {
+                return Err(serde::de::Error::invalid_length(hinted, &self));
+            }
+            let mut state = Vec::with_capacity(hinted);
+            while let Some(byte) = sequence.next_element()? {
+                if state.len() == MAX_RANDOM_STREAM_STATE_BYTES {
+                    return Err(serde::de::Error::invalid_length(state.len() + 1, &self));
+                }
+                state.push(byte);
+            }
+            Ok(state)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedStateVisitor)
+}
+
+/// Failure to restore a random stream state produced by another protocol or algorithm lane.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum RandomStreamRestoreError {
+    #[error("unsupported random-stream state version {found}; expected {expected}")]
+    UnsupportedVersion { found: u16, expected: u16 },
+    #[error("unsupported random-stream algorithm `{found}`; expected `{expected}`")]
+    UnsupportedAlgorithm {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("unsupported random-stream codec version {found}; expected {expected}")]
+    UnsupportedCodecVersion { found: u16, expected: u16 },
+    #[error("random-stream state payload is {found} bytes; maximum is {maximum}")]
+    StateTooLarge { found: usize, maximum: usize },
+    #[error("invalid random-stream state length {found}; expected exactly {expected} bytes")]
+    InvalidStateLength { found: usize, expected: usize },
+    #[error("invalid all-zero random-stream state")]
+    AllZeroState,
+    #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+    #[error("random-stream state word {index} exceeds the 32-bit algorithm width: {value}")]
+    StateWordOutOfRange { index: usize, value: u64 },
+}
+
+/// Object-safe random-stream protocol consumed by core and brain families.
+///
+/// The current world owns a [`SmallRngStream`], while consumers depend only on this checkpointable
+/// interface. Named domains and scheduler-independent child streams are deliberately not part of
+/// this first protocol.
+pub trait RandomStream: RngCore {
+    /// Stable identity of the concrete algorithm/state encoding.
+    fn algorithm_id(&self) -> &'static str;
+
+    /// Capture a versioned, serializable continuation state.
+    fn checkpoint(&self) -> RandomStreamState;
+}
+
+/// Restorable adapter around the world's existing [`SmallRng`] algorithm.
+///
+/// The adapter implements [`RngCore`], so existing core and brain-family consumers retain the
+/// exact sampling calls they make today. It is one global stream for now; named domains and
+/// scheduler-independent substreams remain a later protocol decision.
+#[derive(Clone, Debug)]
+pub struct SmallRngStream {
+    seed: u64,
+    state_words: [u64; 4],
+}
+
+impl SmallRngStream {
+    /// Construct the current adapter with the same `SmallRng::seed_from_u64` behavior used before
+    /// this protocol existed.
+    #[must_use]
+    pub fn seed_from_u64(seed: u64) -> Self {
+        let mut splitmix_state = seed;
+        #[cfg(target_pointer_width = "64")]
+        let state_words = std::array::from_fn(|_| splitmix64(&mut splitmix_state));
+        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+        let state_words = {
+            let first = splitmix64(&mut splitmix_state);
+            let second = splitmix64(&mut splitmix_state);
+            [
+                first & u64::from(u32::MAX),
+                first >> 32,
+                second & u64::from(u32::MAX),
+                second >> 32,
+            ]
+        };
+        debug_assert!(state_words.iter().any(|word| *word != 0));
+        Self { seed, state_words }
+    }
+
+    /// Stable identity of the current adapted algorithm lane.
+    #[must_use]
+    pub const fn algorithm() -> &'static str {
+        RANDOM_STREAM_ALGORITHM
+    }
+
+    /// Capture a serializable continuation state.
+    #[must_use]
+    fn state(&self) -> RandomStreamState {
+        let mut state = Vec::with_capacity(SMALL_RNG_STATE_BYTES);
+        state.extend_from_slice(&self.seed.to_le_bytes());
+        for word in self.state_words {
+            state.extend_from_slice(&word.to_le_bytes());
+        }
+        RandomStreamState {
+            version: RANDOM_STREAM_STATE_VERSION,
+            algorithm: RANDOM_STREAM_ALGORITHM.to_owned(),
+            codec_version: SMALL_RNG_STATE_CODEC_VERSION,
+            state,
+        }
+    }
+
+    /// Restore the exact continuation represented by `state` in constant time.
+    ///
+    /// Version, algorithm, word width, and the xoshiro all-zero forbidden state are validated
+    /// before construction. An error performs no sampling and has no externally visible state.
+    pub fn from_state(state: &RandomStreamState) -> Result<Self, RandomStreamRestoreError> {
+        if state.version != RANDOM_STREAM_STATE_VERSION {
+            return Err(RandomStreamRestoreError::UnsupportedVersion {
+                found: state.version,
+                expected: RANDOM_STREAM_STATE_VERSION,
+            });
+        }
+        if state.algorithm != RANDOM_STREAM_ALGORITHM {
+            return Err(RandomStreamRestoreError::UnsupportedAlgorithm {
+                found: state.algorithm.clone(),
+                expected: RANDOM_STREAM_ALGORITHM,
+            });
+        }
+        if state.codec_version != SMALL_RNG_STATE_CODEC_VERSION {
+            return Err(RandomStreamRestoreError::UnsupportedCodecVersion {
+                found: state.codec_version,
+                expected: SMALL_RNG_STATE_CODEC_VERSION,
+            });
+        }
+        if state.state.len() > MAX_RANDOM_STREAM_STATE_BYTES {
+            return Err(RandomStreamRestoreError::StateTooLarge {
+                found: state.state.len(),
+                maximum: MAX_RANDOM_STREAM_STATE_BYTES,
+            });
+        }
+        if state.state.len() != SMALL_RNG_STATE_BYTES {
+            return Err(RandomStreamRestoreError::InvalidStateLength {
+                found: state.state.len(),
+                expected: SMALL_RNG_STATE_BYTES,
+            });
+        }
+
+        let seed = decode_le_u64(&state.state[0..8]);
+        let state_words = std::array::from_fn(|index| {
+            let start = 8 + index * 8;
+            decode_le_u64(&state.state[start..start + 8])
+        });
+        if state_words.iter().all(|word| *word == 0) {
+            return Err(RandomStreamRestoreError::AllZeroState);
+        }
+        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+        for (index, value) in state_words.iter().copied().enumerate() {
+            if value > u64::from(u32::MAX) {
+                return Err(RandomStreamRestoreError::StateWordOutOfRange { index, value });
+            }
+        }
+        Ok(Self { seed, state_words })
+    }
+}
+
+#[inline]
+fn decode_le_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    const PHI: u64 = 0x9e37_79b9_7f4a_7c15;
+    *state = state.wrapping_add(PHI);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+impl RngCore for SmallRngStream {
+    #[inline]
+    fn next_u32(&mut self) -> u32 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            (self.next_u64() >> 32) as u32
+        }
+        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+        {
+            let mut words = self.state_words.map(|word| word as u32);
+            let result = words[0]
+                .wrapping_add(words[3])
+                .rotate_left(7)
+                .wrapping_add(words[0]);
+            let shifted = words[1] << 9;
+            words[2] ^= words[0];
+            words[3] ^= words[1];
+            words[1] ^= words[2];
+            words[0] ^= words[3];
+            words[2] ^= shifted;
+            words[3] = words[3].rotate_left(11);
+            self.state_words = words.map(u64::from);
+            result
+        }
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            let result = self.state_words[0]
+                .wrapping_add(self.state_words[3])
+                .rotate_left(23)
+                .wrapping_add(self.state_words[0]);
+            let shifted = self.state_words[1] << 17;
+            self.state_words[2] ^= self.state_words[0];
+            self.state_words[3] ^= self.state_words[1];
+            self.state_words[1] ^= self.state_words[2];
+            self.state_words[0] ^= self.state_words[3];
+            self.state_words[2] ^= shifted;
+            self.state_words[3] = self.state_words[3].rotate_left(45);
+            result
+        }
+        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+        {
+            let low = u64::from(self.next_u32());
+            let high = u64::from(self.next_u32());
+            (high << 32) | low
+        }
+    }
+
+    #[inline]
+    fn fill_bytes(&mut self, destination: &mut [u8]) {
+        #[cfg(target_pointer_width = "64")]
+        {
+            let (chunks, remainder) = destination.as_chunks_mut::<8>();
+            for chunk in chunks {
+                *chunk = self.next_u64().to_le_bytes();
+            }
+            if remainder.len() > 4 {
+                let bytes = self.next_u64().to_le_bytes();
+                remainder.copy_from_slice(&bytes[..remainder.len()]);
+            } else if !remainder.is_empty() {
+                let bytes = self.next_u32().to_le_bytes();
+                remainder.copy_from_slice(&bytes[..remainder.len()]);
+            }
+        }
+        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+        {
+            let (chunks, remainder) = destination.as_chunks_mut::<4>();
+            for chunk in chunks {
+                *chunk = self.next_u32().to_le_bytes();
+            }
+            if !remainder.is_empty() {
+                let bytes = self.next_u32().to_le_bytes();
+                remainder.copy_from_slice(&bytes[..remainder.len()]);
+            }
+        }
+    }
+}
+
+impl RandomStream for SmallRngStream {
+    fn algorithm_id(&self) -> &'static str {
+        Self::algorithm()
+    }
+
+    fn checkpoint(&self) -> RandomStreamState {
+        self.state()
+    }
+}
+
 /// Convenience alias for associating side data with agents.
 pub type AgentMap<T> = SecondaryMap<AgentId, T>;
 
@@ -626,7 +974,10 @@ pub struct AgentDebugQuery {
 /// Debug projection of an agent suitable for external tooling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDebugInfo {
+    /// Transient generational lookup handle encoded for live control requests.
     pub agent_id: u64,
+    /// Stable logical identity used by scientific records and lineage.
+    pub agent_uid: AgentUid,
     pub selection: SelectionState,
     pub position: Position,
     pub energy: f32,
@@ -712,7 +1063,7 @@ impl BrainBinding {
     /// Instantiate a brain from the registry and bind it to the agent.
     pub fn from_registry(
         registry: &BrainRegistry,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         key: u64,
     ) -> Result<Option<Self>, BrainSpawnError> {
         let Some(runner) = registry.spawn(rng, key)? else {
@@ -813,7 +1164,7 @@ pub trait BrainRunner: Send + Sync {
     /// Perturb parameters in place using the agent's mutation rates.
     fn mutate(
         &mut self,
-        _rng: &mut dyn RngCore,
+        _rng: &mut dyn RandomStream,
         _rate: f32,
         _scale: f32,
     ) -> Result<(), BrainSpawnError> {
@@ -824,7 +1175,7 @@ pub trait BrainRunner: Send + Sync {
     fn crossover(
         &self,
         _partner: &dyn BrainRunner,
-        _rng: &mut dyn RngCore,
+        _rng: &mut dyn RandomStream,
     ) -> Option<Box<dyn BrainRunner>> {
         None
     }
@@ -885,7 +1236,7 @@ struct MissingBrainFactory {
 struct MissingHeritableBrain;
 
 type BrainSpawner = Box<
-    dyn Fn(&mut dyn RngCore) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+    dyn Fn(&mut dyn RandomStream) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
         + Send
         + Sync
         + 'static,
@@ -921,7 +1272,7 @@ impl BrainRegistry {
     /// Registers a fallible brain factory, returning its registry key.
     pub fn register<F>(&mut self, kind: impl Into<Cow<'static, str>>, factory: F) -> u64
     where
-        F: Fn(&mut dyn RngCore) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+        F: Fn(&mut dyn RandomStream) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
             + Send
             + Sync
             + 'static,
@@ -946,7 +1297,7 @@ impl BrainRegistry {
     /// Instantiate a new brain runner using the factory referenced by `key`.
     pub fn spawn(
         &self,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn RandomStream,
         key: u64,
     ) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
         self.entries
@@ -979,7 +1330,7 @@ impl BrainRegistry {
     }
 
     /// Pick a random registered brain key, if any.
-    pub fn random_key(&self, rng: &mut dyn RngCore) -> Option<u64> {
+    pub fn random_key(&self, rng: &mut dyn RandomStream) -> Option<u64> {
         if self.entries.is_empty() {
             return None;
         }
@@ -1015,7 +1366,7 @@ pub struct AgentRuntime {
     pub sound_output: f32,
     pub temperature_preference: f32,
     pub brain: BrainBinding,
-    pub lineage: [Option<AgentId>; 2],
+    pub lineage: [Option<AgentUid>; 2],
     pub mutation_log: Vec<String>,
     pub food_balance_total: f32,
     #[serde(skip)]
@@ -1111,14 +1462,14 @@ impl AgentRuntime {
     }
 
     /// Sample randomized sensory parameters matching the legacy ScriptBots defaults.
-    pub fn new_random(rng: &mut dyn RngCore) -> Self {
+    pub fn new_random(rng: &mut dyn RandomStream) -> Self {
         let mut runtime = Self::default();
         runtime.randomize_spawn(rng);
         runtime
     }
 
     /// Randomize spawn-time traits and sensory configuration.
-    pub fn randomize_spawn(&mut self, rng: &mut dyn RngCore) {
+    pub fn randomize_spawn(&mut self, rng: &mut dyn RandomStream) {
         self.herbivore_tendency = rng.random_range(0.0..1.0);
         self.mutation_rates.primary = rng.random_range(0.001..0.005);
         self.mutation_rates.secondary = rng.random_range(0.03..0.07);
@@ -1165,6 +1516,7 @@ impl AgentRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
     pub id: AgentId,
+    pub identity: AgentIdentity,
     pub data: AgentData,
     pub runtime: AgentRuntime,
 }
@@ -1175,10 +1527,12 @@ pub const CHARACTERIZATION_DIGEST_V0_SCHEMA: &str = "scriptbots.world.characteri
 /// Stable, non-cryptographic fingerprint of the deterministic world fields available today.
 ///
 /// Version zero is intentionally a characterization aid rather than a replay guarantee. It
-/// captures boundary-visible world data and a non-mutating RNG probe, but the current architecture
-/// does not expose restorable RNG state, live brain-runner state, persistence sinks, or registered
-/// factory closures. [`WorldState::characterization_digest_v0`] documents the complete inclusion
-/// and exclusion contract. A future full-state digest must use a new schema version.
+/// captures boundary-visible world data and a non-mutating RNG probe. A restorable random-stream
+/// protocol now exists, but V0 deliberately retains its historical probe-only field and raw-handle
+/// ordering so its characterization fixtures do not masquerade as the later canonical digest.
+/// Live brain-runner state, persistence sinks, and registered factory closures also remain outside
+/// V0. [`WorldState::characterization_digest_v0`] documents the complete inclusion/exclusion
+/// contract. A future full-state digest must use a new schema version.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CharacterizationDigestV0 {
     pub schema: String,
@@ -1325,8 +1679,8 @@ impl CharacterizationEncoderV0 {
         }
     }
 
-    fn option_agent_id(&mut self, value: Option<AgentId>) {
-        self.option_u64(value.map(|id| id.data().as_ffi()));
+    fn option_agent_uid(&mut self, value: Option<AgentUid>) {
+        self.option_u64(value.map(AgentUid::get));
     }
 
     fn option_string(&mut self, value: Option<&str>) {
@@ -1391,7 +1745,7 @@ fn encode_agent_runtime_v0(encoder: &mut CharacterizationEncoderV0, runtime: &Ag
     encoder.f32(runtime.sound_output);
     encoder.f32(runtime.temperature_preference);
     for parent in runtime.lineage {
-        encoder.option_agent_id(parent);
+        encoder.option_agent_uid(parent);
     }
     encoder.option_u64(runtime.brain.registry_key());
     encoder.option_string(runtime.brain.kind());
@@ -1440,8 +1794,10 @@ struct ActuationDelta {
 /// sensor vector uses before clamping.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorContribution {
-    /// The neighbour responsible.
+    /// Transient live handle for the neighbour responsible.
     pub source: AgentId,
+    /// Stable logical identity used for scientific attribution and deterministic ties.
+    pub source_uid: AgentUid,
     /// Bearing from the observer's heading, in radians, wrapped to [-pi, pi].
     pub bearing: f32,
     /// Toroidal distance to the neighbour.
@@ -1904,7 +2260,10 @@ struct SpawnOrder {
 struct PopulationSpawnReceipt {
     inserted: Vec<AgentId>,
     arena_checkpoint: (SlotMap<AgentId, usize>, usize),
-    rng_before: SmallRng,
+    rng_before: SmallRngStream,
+    next_agent_uid_before: u64,
+    next_spawn_ordinal_before: u64,
+    next_birth_ordinal_before: u64,
 }
 
 /// Absolute error floor used by resource-ledger reconciliation.
@@ -2432,9 +2791,11 @@ pub enum DeathCause {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BirthRecord {
     pub tick: Tick,
-    pub agent_id: AgentId,
-    pub parent_a: Option<AgentId>,
-    pub parent_b: Option<AgentId>,
+    pub agent_uid: AgentUid,
+    pub spawn_ordinal: u64,
+    pub birth_ordinal: u64,
+    pub parent_a: Option<AgentUid>,
+    pub parent_b: Option<AgentUid>,
     pub brain_kind: Option<String>,
     pub brain_key: Option<u64>,
     pub herbivore_tendency: f32,
@@ -2447,7 +2808,7 @@ pub struct BirthRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeathRecord {
     pub tick: Tick,
-    pub agent_id: AgentId,
+    pub agent_uid: AgentUid,
     pub age: u32,
     pub generation: Generation,
     pub herbivore_tendency: f32,
@@ -2476,7 +2837,7 @@ pub enum ReplayAgentPhase {
 pub enum ReplayRngScope {
     World,
     Agent {
-        agent_id: AgentId,
+        agent_uid: AgentUid,
         phase: ReplayAgentPhase,
     },
 }
@@ -2491,7 +2852,7 @@ pub enum ReplayEventKind {
         left_wheel: f32,
         right_wheel: f32,
         boost: bool,
-        spike_target: Option<AgentId>,
+        spike_target: Option<AgentUid>,
         sound_level: f32,
         give_intent: f32,
     },
@@ -2506,7 +2867,7 @@ pub enum ReplayEventKind {
 /// Lightweight wrapper pairing an agent context with a replay event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayEvent {
-    pub agent_id: Option<AgentId>,
+    pub agent_uid: Option<AgentUid>,
     pub kind: ReplayEventKind,
 }
 
@@ -2700,7 +3061,10 @@ impl Default for GenomeHyperParams {
     }
 }
 
-/// Provenance metadata for lineage tracking.
+/// Legacy genome-provenance placeholder awaiting the versioned genome protocol.
+///
+/// Its transient `AgentId` parents are intentionally not half-migrated here: `bd-2z0.3.2`
+/// replaces this entire placeholder with the stable-UID genome/evaluator-state envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GenomeProvenance {
     pub parents: [Option<AgentId>; 2],
@@ -4542,14 +4906,8 @@ impl ScriptBotsConfig {
     }
 
     /// Returns the configured RNG seed, generating one from entropy if absent.
-    fn seeded_rng(&self) -> SmallRng {
-        match self.rng_seed {
-            Some(seed) => SmallRng::seed_from_u64(seed),
-            None => {
-                let seed: u64 = rand::random();
-                SmallRng::seed_from_u64(seed)
-            }
-        }
+    fn seeded_rng(&self) -> SmallRngStream {
+        SmallRngStream::seed_from_u64(self.rng_seed.unwrap_or_else(rand::random))
     }
 }
 
@@ -7268,8 +7626,12 @@ pub struct WorldState {
     config: ScriptBotsConfig,
     tick: Tick,
     epoch: u64,
-    rng: SmallRng,
+    rng: SmallRngStream,
     agents: AgentArena,
+    identities: AgentMap<AgentIdentity>,
+    next_agent_uid: u64,
+    next_spawn_ordinal: u64,
+    next_birth_ordinal: u64,
     food: FoodGrid,
     food_profiles: Vec<FoodCellProfile>,
     terrain: TerrainLayer,
@@ -7402,6 +7764,10 @@ impl WorldState {
             epoch: 0,
             rng,
             agents: AgentArena::new(),
+            identities: AgentMap::new(),
+            next_agent_uid: 1,
+            next_spawn_ordinal: 0,
+            next_birth_ordinal: 0,
             runtime: AgentMap::new(),
             index,
             brain_registry: BrainRegistry::new(),
@@ -8460,9 +8826,11 @@ impl WorldState {
             }
             let ang = angle_to(dx, dy);
             let color = colors[other_idx];
+            let source_uid = self.agent_uid(other_id)?;
 
             let mut share = SensorContribution {
                 source: other_id,
+                source_uid,
                 bearing: wrap_signed_angle(ang - heading),
                 distance: dist,
                 color,
@@ -8596,7 +8964,7 @@ impl WorldState {
         contributions.sort_by(|a, b| {
             b.total
                 .total_cmp(&a.total)
-                .then_with(|| a.source.data().as_ffi().cmp(&b.source.data().as_ffi()))
+                .then_with(|| a.source_uid.cmp(&b.source_uid))
         });
         let truncated = contributions.len().saturating_sub(max_contributors);
         contributions.truncate(max_contributors);
@@ -9872,6 +10240,12 @@ impl WorldState {
 
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
+        let parent_uid = self
+            .agent_uid(parent_id)
+            .expect("live crossover parent must have stable identity");
+        let partner_uid = self
+            .agent_uid(partner_id)
+            .expect("live crossover partner must have stable identity");
         let child_data = self.build_child_data(
             &parent_data,
             Some(&partner_data),
@@ -9885,8 +10259,8 @@ impl WorldState {
             &parent_runtime,
             partner_runtime.as_ref(),
             self.config.reproduction_gene_log_capacity,
-            parent_id,
-            Some(partner_id),
+            parent_uid,
+            Some(partner_uid),
         );
 
         // Preserve the historical RNG position of `spawn_agent`, whose random runtime was
@@ -9936,8 +10310,7 @@ impl WorldState {
             return Err(BrainSpawnError::new(parent_kind, MissingHeritableBrain));
         }
 
-        let child_id = self.agents.insert(child_data);
-        self.runtime.insert(child_id, child_runtime);
+        let child_id = self.insert_agent(child_data, child_runtime, true);
         Ok(Some(child_id))
     }
 
@@ -9945,10 +10318,15 @@ impl WorldState {
         for id in receipt.inserted {
             let removed = self.runtime.remove(id);
             debug_assert!(removed.is_some());
+            let identity = self.identities.remove(id);
+            debug_assert!(identity.is_some());
         }
         self.agents
             .restore_append_checkpoint(receipt.arena_checkpoint);
         self.rng = receipt.rng_before;
+        self.next_agent_uid = receipt.next_agent_uid_before;
+        self.next_spawn_ordinal = receipt.next_spawn_ordinal_before;
+        self.next_birth_ordinal = receipt.next_birth_ordinal_before;
     }
 
     fn stage_population(
@@ -9971,6 +10349,9 @@ impl WorldState {
             inserted: Vec::new(),
             arena_checkpoint: self.agents.append_checkpoint(),
             rng_before: self.rng.clone(),
+            next_agent_uid_before: self.next_agent_uid,
+            next_spawn_ordinal_before: self.next_spawn_ordinal,
+            next_birth_ordinal_before: self.next_birth_ordinal,
         };
         let result: Result<(), BrainSpawnError> = (|| {
             while self.agents.len() < minimum {
@@ -10045,10 +10426,48 @@ impl WorldState {
         if let Some(binding) = binding {
             runtime.brain = binding;
         }
-        let id = self.agents.insert(data);
-        self.runtime.insert(id, runtime);
+        let id = self.insert_agent(data, runtime, false);
         Ok(id)
     }
+
+    fn allocate_identity(&mut self, is_birth: bool) -> AgentIdentity {
+        assert!(
+            self.next_agent_uid < u64::MAX,
+            "AgentUid space exhausted for this run"
+        );
+        assert!(
+            self.next_spawn_ordinal < u64::MAX,
+            "agent spawn ordinal space exhausted for this run"
+        );
+        let birth_ordinal = if is_birth {
+            assert!(
+                self.next_birth_ordinal < u64::MAX,
+                "agent birth ordinal space exhausted for this run"
+            );
+            let ordinal = self.next_birth_ordinal;
+            self.next_birth_ordinal += 1;
+            Some(ordinal)
+        } else {
+            None
+        };
+        let identity = AgentIdentity {
+            uid: AgentUid(self.next_agent_uid),
+            spawn_ordinal: self.next_spawn_ordinal,
+            birth_ordinal,
+        };
+        self.next_agent_uid += 1;
+        self.next_spawn_ordinal += 1;
+        identity
+    }
+
+    fn insert_agent(&mut self, data: AgentData, runtime: AgentRuntime, is_birth: bool) -> AgentId {
+        let identity = self.allocate_identity(is_birth);
+        let id = self.agents.insert(data);
+        self.identities.insert(id, identity);
+        self.runtime.insert(id, runtime);
+        id
+    }
+
     fn pulse_indicator(&mut self, id: AgentId, intensity: f32, color: [f32; 3]) {
         if let Some(runtime) = self.runtime.get_mut(id) {
             runtime.indicator.intensity = (runtime.indicator.intensity + intensity).min(100.0);
@@ -10674,9 +11093,17 @@ impl WorldState {
         let death_records: Vec<DeathRecord> = {
             let columns = self.agents.columns();
             dead.iter()
-                .filter_map(|(idx, agent_id)| {
+                .map(|(idx, agent_id)| {
                     let data = columns.snapshot(*idx);
-                    let runtime = self.runtime.get(*agent_id)?.clone();
+                    let identity = self
+                        .identities
+                        .get(*agent_id)
+                        .expect("live dying agent must have stable identity");
+                    let runtime = self
+                        .runtime
+                        .get(*agent_id)
+                        .expect("live dying agent must have runtime state")
+                        .clone();
                     let herbivore = clamp01(runtime.herbivore_tendency);
                     let brain_kind = runtime.brain.kind().map(str::to_string);
                     let brain_key = runtime.brain.registry_key();
@@ -10692,9 +11119,9 @@ impl WorldState {
                         DeathCause::Unknown
                     };
 
-                    Some(DeathRecord {
+                    DeathRecord {
                         tick,
-                        agent_id: *agent_id,
+                        agent_uid: identity.uid,
                         age: data.age,
                         generation: data.generation,
                         herbivore_tendency: herbivore,
@@ -10705,7 +11132,7 @@ impl WorldState {
                         cause,
                         was_hybrid: runtime.hybrid,
                         combat_flags: runtime.combat,
-                    })
+                    }
                 })
                 .collect()
         };
@@ -10835,17 +11262,25 @@ impl WorldState {
                 width,
                 height,
             );
+            let parent_uid = self
+                .agent_uid(*agent_id)
+                .expect("live birth parent must have stable identity");
+            let partner_id = partner_index.map(|j| handles[j]);
+            let partner_uid = partner_id.map(|id| {
+                self.agent_uid(id)
+                    .expect("live birth partner must have stable identity")
+            });
             let child_runtime = self.build_child_runtime(
                 &parent_runtime_snapshot,
                 partner_runtime.as_ref(),
                 gene_log_capacity,
-                *agent_id,
-                partner_index.map(|j| handles[j]),
+                parent_uid,
+                partner_uid,
             );
             self.pending_spawns.push(SpawnOrder {
                 parent_index: idx,
                 parent_id: *agent_id,
-                partner_id: partner_index.map(|j| handles[j]),
+                partner_id,
                 parent_energy_before_debit,
                 parent_reproduction_counter_before_reset,
                 data: child_data,
@@ -10980,37 +11415,49 @@ impl WorldState {
         for order in orders {
             let SpawnOrder {
                 parent_index: _,
-                parent_id,
-                partner_id,
+                parent_id: _,
+                partner_id: _,
                 parent_energy_before_debit: _,
                 parent_reproduction_counter_before_reset: _,
                 data,
                 runtime,
             } = order;
-            let child_id = self.agents.insert(data);
-            self.runtime.insert(child_id, runtime);
-
-            if let (Some(child_runtime), Some(idx)) =
-                (self.runtime.get(child_id), self.agents.index_of(child_id))
-            {
-                let snapshot = self.agents.columns().snapshot(idx);
-                let brain_kind = child_runtime.brain.kind().map(str::to_string);
-                let brain_key = child_runtime.brain.registry_key();
-                let record = BirthRecord {
-                    tick,
-                    agent_id: child_id,
-                    parent_a: Some(parent_id),
-                    parent_b: partner_id,
-                    brain_kind,
-                    brain_key,
-                    herbivore_tendency: clamp01(child_runtime.herbivore_tendency),
-                    generation: snapshot.generation,
-                    position: snapshot.position,
-                    is_hybrid: child_runtime.hybrid,
-                };
-                self.pending_lifecycle_birth_metrics.push(record.clone());
-                self.pending_birth_records.push(record);
-            }
+            let child_id = self.insert_agent(data, runtime, true);
+            let child_runtime = self
+                .runtime
+                .get(child_id)
+                .expect("newborn agent must have runtime state");
+            let identity = self
+                .identities
+                .get(child_id)
+                .copied()
+                .expect("newborn agent must have stable identity");
+            let birth_ordinal = identity
+                .birth_ordinal
+                .expect("newborn agent must have a birth ordinal");
+            let idx = self
+                .agents
+                .index_of(child_id)
+                .expect("newborn agent must have dense scalar state");
+            let snapshot = self.agents.columns().snapshot(idx);
+            let brain_kind = child_runtime.brain.kind().map(str::to_string);
+            let brain_key = child_runtime.brain.registry_key();
+            let record = BirthRecord {
+                tick,
+                agent_uid: identity.uid,
+                spawn_ordinal: identity.spawn_ordinal,
+                birth_ordinal,
+                parent_a: child_runtime.lineage[0],
+                parent_b: child_runtime.lineage[1],
+                brain_kind,
+                brain_key,
+                herbivore_tendency: clamp01(child_runtime.herbivore_tendency),
+                generation: snapshot.generation,
+                position: snapshot.position,
+                is_hybrid: child_runtime.hybrid,
+            };
+            self.pending_lifecycle_birth_metrics.push(record.clone());
+            self.pending_birth_records.push(record);
         }
         Ok(())
     }
@@ -11069,8 +11516,8 @@ impl WorldState {
         parent: &AgentRuntime,
         partner: Option<&AgentRuntime>,
         gene_log_capacity: usize,
-        parent_id: AgentId,
-        partner_id: Option<AgentId>,
+        parent_uid: AgentUid,
+        partner_uid: Option<AgentUid>,
     ) -> AgentRuntime {
         let mut runtime = parent.clone();
         runtime.energy = self.config.reproduction_child_energy.clamp(0.0, 2.0);
@@ -11091,7 +11538,7 @@ impl WorldState {
         if runtime.brain.registry_key().is_none() {
             runtime.brain = BrainBinding::default();
         }
-        runtime.lineage = [Some(parent_id), partner_id];
+        runtime.lineage = [Some(parent_uid), partner_uid];
 
         if let Some(partner_runtime) = partner {
             runtime.hybrid = true;
@@ -11879,6 +12326,10 @@ impl WorldState {
                 }
                 agents.push(AgentState {
                     id: *id,
+                    identity: *self
+                        .identities
+                        .get(*id)
+                        .expect("live agent must have stable identity"),
                     data,
                     runtime,
                 });
@@ -12202,7 +12653,8 @@ impl WorldState {
     /// UI-owned selection/indicator state, activation snapshots, mutation log strings, history,
     /// configuration/audit state, analytics and persistence buffers, derived indexes, scratch
     /// vectors, the map generation timestamp, factory closures, and opaque evaluator state are
-    /// excluded. The RNG probe does not expose restorable RNG state. Therefore this is a stable V0
+    /// excluded. The restorable random-stream state and stable identity-allocation counters are
+    /// intentionally not encoded into this historical V0 format. Therefore this is a stable V0
     /// regression oracle for one pinned build lane, not a checkpoint or replay guarantee.
     pub fn characterization_digest_v0(
         &self,
@@ -12640,7 +13092,7 @@ impl WorldState {
 
     /// Borrow the world RNG mutably for deterministic sampling.
     #[must_use]
-    pub fn rng(&mut self) -> &mut SmallRng {
+    pub fn rng(&mut self) -> &mut dyn RandomStream {
         &mut self.rng
     }
 
@@ -12661,6 +13113,34 @@ impl WorldState {
     #[must_use]
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    /// Return the stable logical identity metadata for a live SlotMap handle.
+    #[must_use]
+    pub fn agent_identity(&self, id: AgentId) -> Option<AgentIdentity> {
+        self.identities.get(id).copied()
+    }
+
+    /// Return the stable logical UID for a live SlotMap handle.
+    #[must_use]
+    pub fn agent_uid(&self, id: AgentId) -> Option<AgentUid> {
+        self.agent_identity(id).map(|identity| identity.uid)
+    }
+
+    /// Capture the restorable state of the current, single world random stream.
+    #[must_use]
+    pub fn random_stream_state(&self) -> RandomStreamState {
+        self.rng.checkpoint()
+    }
+
+    /// Next stable identity and creation ordinals, for manifest/checkpoint protocols.
+    #[must_use]
+    pub const fn identity_sequence_state(&self) -> (u64, u64, u64) {
+        (
+            self.next_agent_uid,
+            self.next_spawn_ordinal,
+            self.next_birth_ordinal,
+        )
     }
 
     /// Spike hits recorded during the most recent tick.
@@ -12693,8 +13173,7 @@ impl WorldState {
             self.rng = rng_before;
             return Err(error);
         }
-        let id = self.agents.insert_trusted(agent);
-        self.runtime.insert(id, runtime);
+        let id = self.insert_agent(agent, runtime, false);
         Ok(id)
     }
 
@@ -12702,16 +13181,15 @@ impl WorldState {
     #[cfg(test)]
     fn spawn_agent(&mut self, agent: AgentData) -> AgentId {
         debug_assert!(agent.validate().is_ok());
-        let id = self.agents.insert_trusted(agent);
         let runtime = AgentRuntime::new_random(&mut self.rng);
         debug_assert!(runtime.validate().is_ok());
-        self.runtime.insert(id, runtime);
-        id
+        self.insert_agent(agent, runtime, false)
     }
 
     /// Remove an agent by handle, returning its last known data.
     pub fn remove_agent(&mut self, id: AgentId) -> Option<AgentData> {
         self.runtime.remove(id);
+        self.identities.remove(id);
         self.agents.remove(id)
     }
 
@@ -12920,8 +13398,14 @@ impl WorldState {
     #[must_use]
     pub fn snapshot_agent(&self, id: AgentId) -> Option<AgentState> {
         let data = self.agents.snapshot(id)?;
+        let identity = self.identities.get(id).copied()?;
         let runtime = self.runtime.get(id)?.clone();
-        Some(AgentState { id, data, runtime })
+        Some(AgentState {
+            id,
+            identity,
+            data,
+            runtime,
+        })
     }
 
     /// Produce a filtered, sorted listing of agents for debug consumers.
@@ -12982,6 +13466,7 @@ impl WorldState {
 
             entries.push(AgentDebugInfo {
                 agent_id: Self::encode_agent_id(handle),
+                agent_uid: snapshot.identity.uid,
                 selection: runtime.selection,
                 position: snapshot.data.position,
                 energy: runtime.energy,
@@ -13105,6 +13590,179 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    fn assert_small_rng_stream_continuation(stream: &SmallRngStream) {
+        let checkpoint = stream.checkpoint();
+        let encoded = postcard::to_allocvec(&checkpoint).expect("encode random-stream state");
+        let decoded: RandomStreamState =
+            postcard::from_bytes(&encoded).expect("decode random-stream state");
+        assert_eq!(decoded, checkpoint);
+
+        let mut restored = SmallRngStream::from_state(&decoded).expect("restore random stream");
+        let mut expected = stream.clone();
+        assert_eq!(restored.next_u32(), expected.next_u32());
+        assert_eq!(restored.next_u64(), expected.next_u64());
+        let mut restored_bytes = [0_u8; 13];
+        let mut expected_bytes = [0_u8; 13];
+        restored.fill_bytes(&mut restored_bytes);
+        expected.fill_bytes(&mut expected_bytes);
+        assert_eq!(restored_bytes, expected_bytes);
+        assert_eq!(restored.next_u64(), expected.next_u64());
+    }
+
+    #[test]
+    fn small_rng_stream_matches_rand_095_and_restores_every_continuation() {
+        for seed in [0, 1, 0x5eed_cafe_dead_beef, u64::MAX] {
+            let mut expected = SmallRng::seed_from_u64(seed);
+            let mut actual = SmallRngStream::seed_from_u64(seed);
+            assert_eq!(actual.next_u32(), expected.next_u32());
+            assert_small_rng_stream_continuation(&actual);
+            assert_eq!(actual.next_u64(), expected.next_u64());
+            assert_small_rng_stream_continuation(&actual);
+            assert_eq!(actual.next_u32(), expected.next_u32());
+            assert_small_rng_stream_continuation(&actual);
+            assert_eq!(actual.next_u64(), expected.next_u64());
+            assert_small_rng_stream_continuation(&actual);
+
+            for length in 0..=20 {
+                let mut expected = SmallRng::seed_from_u64(seed);
+                let mut actual = SmallRngStream::seed_from_u64(seed);
+                let mut expected_bytes = vec![0_u8; length];
+                let mut actual_bytes = vec![0_u8; length];
+                expected.fill_bytes(&mut expected_bytes);
+                actual.fill_bytes(&mut actual_bytes);
+                assert_eq!(actual_bytes, expected_bytes, "seed={seed}, length={length}");
+                assert_eq!(actual.next_u32(), expected.next_u32());
+                assert_eq!(actual.next_u64(), expected.next_u64());
+                assert_small_rng_stream_continuation(&actual);
+            }
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn small_rng_stream_codec_v1_freezes_seed_and_state_words_as_little_endian() {
+        let state = SmallRngStream::seed_from_u64(0).checkpoint();
+        assert_eq!(state.version, RANDOM_STREAM_STATE_VERSION);
+        assert_eq!(state.algorithm, SmallRngStream::algorithm());
+        assert_eq!(state.codec_version, SMALL_RNG_STATE_CODEC_VERSION);
+        assert_eq!(
+            state.state,
+            [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaf, 0xcd, 0x1d, 0x7b, 0x39, 0xa8,
+                0x20, 0xe2, 0xf4, 0x65, 0xb9, 0xa1, 0x6a, 0x9e, 0x78, 0x6e, 0x4f, 0x45, 0x09, 0x80,
+                0x18, 0x5d, 0xc4, 0x06, 0xec, 0x81, 0x4c, 0x72, 0xa8, 0xb8, 0x8b, 0xf8,
+            ]
+        );
+    }
+
+    #[test]
+    fn random_stream_restore_rejects_protocol_mismatch_and_zero_state_atomically() {
+        let original = SmallRngStream::seed_from_u64(9).checkpoint();
+
+        let mut wrong_version = original.clone();
+        wrong_version.version += 1;
+        assert!(matches!(
+            SmallRngStream::from_state(&wrong_version),
+            Err(RandomStreamRestoreError::UnsupportedVersion { .. })
+        ));
+        assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
+
+        let mut wrong_algorithm = original.clone();
+        wrong_algorithm.algorithm = "not-the-current-algorithm".to_owned();
+        assert!(matches!(
+            SmallRngStream::from_state(&wrong_algorithm),
+            Err(RandomStreamRestoreError::UnsupportedAlgorithm { .. })
+        ));
+        assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
+
+        let mut wrong_codec = original.clone();
+        wrong_codec.codec_version += 1;
+        assert!(matches!(
+            SmallRngStream::from_state(&wrong_codec),
+            Err(RandomStreamRestoreError::UnsupportedCodecVersion { .. })
+        ));
+        assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
+
+        let mut oversized = original.clone();
+        oversized.state = vec![0; MAX_RANDOM_STREAM_STATE_BYTES + 1];
+        assert!(matches!(
+            SmallRngStream::from_state(&oversized),
+            Err(RandomStreamRestoreError::StateTooLarge { .. })
+        ));
+        let oversized_json = serde_json::to_vec(&oversized).expect("encode oversized state");
+        assert!(
+            serde_json::from_slice::<RandomStreamState>(&oversized_json).is_err(),
+            "the protocol ceiling must also apply while decoding an opaque envelope"
+        );
+        assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
+
+        let mut wrong_length = original.clone();
+        wrong_length.state.pop();
+        assert!(matches!(
+            SmallRngStream::from_state(&wrong_length),
+            Err(RandomStreamRestoreError::InvalidStateLength { .. })
+        ));
+        assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
+
+        let mut all_zero = original.clone();
+        all_zero.state[8..].fill(0);
+        assert_eq!(
+            SmallRngStream::from_state(&all_zero).expect_err("zero state must fail"),
+            RandomStreamRestoreError::AllZeroState
+        );
+        assert_eq!(original, SmallRngStream::seed_from_u64(9).checkpoint());
+    }
+
+    #[test]
+    fn random_stream_protocol_is_object_safe_and_not_small_rng_specific() {
+        #[derive(Clone)]
+        struct MockStream(u64);
+
+        impl RngCore for MockStream {
+            fn next_u32(&mut self) -> u32 {
+                self.next_u64() as u32
+            }
+
+            fn next_u64(&mut self) -> u64 {
+                let value = self.0;
+                self.0 += 1;
+                value
+            }
+
+            fn fill_bytes(&mut self, destination: &mut [u8]) {
+                for byte in destination {
+                    *byte = self.next_u32() as u8;
+                }
+            }
+        }
+
+        impl RandomStream for MockStream {
+            fn algorithm_id(&self) -> &'static str {
+                "test.mock-counter"
+            }
+
+            fn checkpoint(&self) -> RandomStreamState {
+                RandomStreamState {
+                    version: RANDOM_STREAM_STATE_VERSION,
+                    algorithm: self.algorithm_id().to_owned(),
+                    codec_version: 1,
+                    state: self.0.to_le_bytes().to_vec(),
+                }
+            }
+        }
+
+        fn consume_protocol(stream: &mut dyn RandomStream) -> (&'static str, u64, u64) {
+            let algorithm = stream.algorithm_id();
+            let before = decode_le_u64(&stream.checkpoint().state);
+            let sample = stream.next_u64();
+            (algorithm, before, sample)
+        }
+
+        let mut stream = MockStream(41);
+        assert_eq!(consume_protocol(&mut stream), ("test.mock-counter", 41, 41));
+        assert_eq!(decode_le_u64(&stream.checkpoint().state), 42);
+    }
+
     fn invalid_config_message(error: WorldStateError) -> &'static str {
         match error {
             WorldStateError::InvalidConfig(message) => message,
@@ -13126,6 +13784,78 @@ mod tests {
             age: seed,
             generation: Generation(seed),
         }
+    }
+
+    #[test]
+    fn agent_uid_survives_snapshot_round_trip_and_never_reuses_after_arena_churn() {
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x1d),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let first_id = world.spawn_agent(sample_agent(1));
+        let first = world.snapshot_agent(first_id).expect("first snapshot");
+        let encoded = postcard::to_allocvec(&first).expect("encode agent snapshot");
+        let decoded: AgentState = postcard::from_bytes(&encoded).expect("decode agent snapshot");
+        assert_eq!(decoded.identity, first.identity);
+        assert_eq!(first.identity.uid, AgentUid(1));
+        assert_eq!(first.identity.spawn_ordinal, 0);
+        assert_eq!(first.identity.birth_ordinal, None);
+
+        world.remove_agent(first_id).expect("remove first agent");
+        let second_id = world.spawn_agent(sample_agent(2));
+        let second = world.snapshot_agent(second_id).expect("second snapshot");
+        assert_ne!(
+            first_id, second_id,
+            "SlotMap generation must change on reuse"
+        );
+        assert_ne!(first.identity.uid, second.identity.uid);
+        assert_eq!(second.identity.uid, AgentUid(2));
+        assert_eq!(second.identity.spawn_ordinal, 1);
+        assert_eq!(world.agent_uid(first_id), None);
+        assert_eq!(world.agent_uid(second_id), Some(AgentUid(2)));
+    }
+
+    #[test]
+    fn spawn_and_birth_ordinals_are_deterministic_and_independent_of_slotmap_handles() {
+        let identity_sequence = || {
+            let config = ScriptBotsConfig {
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                rng_seed: Some(0x51),
+                ..ScriptBotsConfig::default()
+            };
+            let mut world = WorldState::new(config).expect("world");
+            let removed = world.spawn_agent(sample_agent(0));
+            let survivor = world.spawn_agent(sample_agent(1));
+            world.remove_agent(removed).expect("remove first spawn");
+            let replacement = world.spawn_agent(sample_agent(2));
+            let first_birth = world.insert_agent(sample_agent(3), AgentRuntime::default(), true);
+            let second_birth = world.insert_agent(sample_agent(4), AgentRuntime::default(), true);
+            [survivor, replacement, first_birth, second_birth]
+                .map(|id| (id.raw(), world.agent_identity(id).expect("stable identity")))
+        };
+
+        let first = identity_sequence();
+        let second = identity_sequence();
+        assert_eq!(
+            first, second,
+            "fixed construction order must reproduce exactly"
+        );
+        assert_eq!(first[0].1.uid, AgentUid(2));
+        assert_eq!(first[1].1.uid, AgentUid(3));
+        assert_eq!(first[2].1.uid, AgentUid(4));
+        assert_eq!(first[3].1.uid, AgentUid(5));
+        assert_eq!(first[0].1.spawn_ordinal, 1);
+        assert_eq!(first[1].1.spawn_ordinal, 2);
+        assert_eq!(first[2].1.birth_ordinal, Some(0));
+        assert_eq!(first[3].1.birth_ordinal, Some(1));
+        assert_ne!(
+            first[0].0, first[1].0,
+            "SlotMap handles remain generational"
+        );
     }
 
     fn assert_non_finite_path(error: ScientificStateError, expected_path: &str) {
@@ -15056,6 +15786,63 @@ mod tests {
     }
 
     #[test]
+    fn sensor_attribution_ties_follow_agent_uid_across_slot_reuse() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            sense_radius: 80.0,
+            rng_seed: Some(19),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let observer = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            ..AgentData::default()
+        });
+        let removed = world.spawn_agent(AgentData::default());
+        world
+            .remove_agent(removed)
+            .expect("remove sacrificial slot");
+
+        let tied_agent = || AgentData {
+            position: Position::new(120.0, 100.0),
+            health: 0.5,
+            color: [0.4, 0.6, 0.8],
+            ..AgentData::default()
+        };
+        let reused_slot = world.spawn_agent(tied_agent());
+        let appended_slot = world.spawn_agent(tied_agent());
+        assert!(
+            reused_slot.raw() > appended_slot.raw(),
+            "the recycled SlotMap generation must oppose logical creation order in this fixture"
+        );
+
+        let attribution = world.explain_sensors(observer, 8).expect("attribution");
+        assert_eq!(attribution.contributions.len(), 2);
+        assert_eq!(
+            attribution.contributions[0].total, attribution.contributions[1].total,
+            "fixture must exercise the stable tie-break"
+        );
+        assert_eq!(
+            attribution
+                .contributions
+                .iter()
+                .map(|entry| entry.source)
+                .collect::<Vec<_>>(),
+            [reused_slot, appended_slot]
+        );
+        assert_eq!(
+            attribution
+                .contributions
+                .iter()
+                .map(|entry| entry.source_uid)
+                .collect::<Vec<_>>(),
+            [AgentUid(3), AgentUid(4)]
+        );
+    }
+
+    #[test]
     fn explain_sensors_returns_none_for_a_dead_agent_and_nothing_for_a_lone_one() {
         let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 200,
@@ -15457,7 +16244,7 @@ mod tests {
 
             fn mutate(
                 &mut self,
-                _rng: &mut dyn RngCore,
+                _rng: &mut dyn RandomStream,
                 _rate: f32,
                 _scale: f32,
             ) -> Result<(), BrainSpawnError> {
@@ -16033,7 +16820,9 @@ mod tests {
     fn lifecycle_birth(tick: u64) -> BirthRecord {
         BirthRecord {
             tick: Tick(tick),
-            agent_id: AgentId::default(),
+            agent_uid: AgentUid(tick + 1),
+            spawn_ordinal: tick,
+            birth_ordinal: tick,
             parent_a: None,
             parent_b: None,
             brain_kind: Some("test".to_owned()),
@@ -16048,7 +16837,7 @@ mod tests {
     fn lifecycle_death(tick: u64) -> DeathRecord {
         DeathRecord {
             tick: Tick(tick),
-            agent_id: AgentId::default(),
+            agent_uid: AgentUid(tick + 1),
             age: tick as u32,
             generation: Generation(tick as u32),
             herbivore_tendency: 0.5,
@@ -16064,7 +16853,7 @@ mod tests {
 
     fn replay_marker(value: f32) -> ReplayEvent {
         ReplayEvent {
-            agent_id: None,
+            agent_uid: None,
             kind: ReplayEventKind::RngSample {
                 scope: ReplayRngScope::World,
                 range_min: 0.0,
@@ -16703,7 +17492,12 @@ mod tests {
             .find(|id| *id != parent_id)
             .expect("child");
         let child_state = world.snapshot_agent(child_id).expect("child state");
+        let parent_uid = world.agent_uid(parent_id).expect("parent uid");
         assert_eq!(child_state.data.generation, Generation(1));
+        assert_eq!(child_state.identity.uid, AgentUid(2));
+        assert_eq!(child_state.identity.spawn_ordinal, 1);
+        assert_eq!(child_state.identity.birth_ordinal, Some(0));
+        assert_eq!(child_state.runtime.lineage, [Some(parent_uid), None]);
         assert!((child_state.runtime.energy - 0.6).abs() < 1e-6);
         assert!(
             world
@@ -16974,8 +17768,8 @@ mod tests {
             .expect("child spawned");
         let child_runtime = world.agent_runtime(child_id).expect("child runtime");
         assert!(child_runtime.hybrid, "child should be marked hybrid");
-        assert_eq!(child_runtime.lineage[0], Some(parent));
-        assert_eq!(child_runtime.lineage[1], Some(partner));
+        assert_eq!(child_runtime.lineage[0], world.agent_uid(parent));
+        assert_eq!(child_runtime.lineage[1], world.agent_uid(partner));
         assert!(
             !child_runtime.mutation_log.is_empty(),
             "expected gene log entries for hybrid child"
@@ -18331,6 +19125,21 @@ mod tests {
         assert_eq!(world.agent_count(), 2);
         assert!(world.pending_deaths.is_empty());
         assert_eq!(world.last_deaths, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "live dying agent must have stable identity")]
+    fn death_cleanup_never_silently_drops_a_scientific_record() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(1234),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let agent = world.spawn_agent(sample_agent(0));
+        world.identities.remove(agent);
+        world.pending_deaths.push(agent);
+
+        world.stage_death_cleanup(Tick::zero());
     }
 
     fn characterization_world(seed: u64) -> (WorldState, Vec<AgentId>) {
