@@ -28,7 +28,7 @@ const GENOME_HEADER_BYTES: usize = 12;
 const GENOME_NODE_BYTES: usize = CONNECTIONS * 4 + CONNECTIONS * 2 + CONNECTIONS + 3 * 4;
 const GENOME_PAYLOAD_BYTES: usize = GENOME_HEADER_BYTES + BRAIN_SIZE * GENOME_NODE_BYTES;
 const STATE_HEADER_BYTES: usize = 6;
-const STATE_NODE_BYTES: usize = 3 * 4;
+const STATE_NODE_BYTES: usize = 2 * 4;
 const STATE_PAYLOAD_BYTES: usize = STATE_HEADER_BYTES + BRAIN_SIZE * STATE_NODE_BYTES;
 const INITIAL_DAMPING_MIN: f32 = 0.9;
 const INITIAL_DAMPING_MAX: f32 = 1.1;
@@ -73,35 +73,38 @@ struct NodeParams {
 impl NodeParams {
     fn random(rng: &mut dyn RandomStream) -> Self {
         let mut weights = [0.0; CONNECTIONS];
-        for weight in &mut weights {
+        let mut targets = [0usize; CONNECTIONS];
+        let mut kinds = [SynapseKind::Regular; CONNECTIONS];
+        // The preserved constructor samples a complete connection before
+        // advancing to the next one. Conditional sensor retargeting consumes
+        // an extra draw, so field-wise passes would change every subsequent
+        // deterministic gene even though the marginal distributions match.
+        for connection in 0..CONNECTIONS {
             let value = rng.random_range(-3.0..3.0);
-            *weight = if rng.random::<f32>() < 0.5 {
+            weights[connection] = if rng.random::<f32>() < 0.5 {
                 0.0
             } else {
                 value
             };
-        }
-
-        let mut targets = [0usize; CONNECTIONS];
-        for target in &mut targets {
-            *target = rng.random_range(0..BRAIN_SIZE);
+            targets[connection] = rng.random_range(0..BRAIN_SIZE);
             if rng.random::<f32>() < 0.2 {
-                *target = rng.random_range(0..INPUT_SIZE);
+                targets[connection] = rng.random_range(0..INPUT_SIZE);
             }
+            kinds[connection] = SynapseKind::random(rng);
         }
 
-        let mut kinds = [SynapseKind::Regular; CONNECTIONS];
-        for kind in &mut kinds {
-            *kind = SynapseKind::random(rng);
-        }
+        // C++ samples kp, gw, bias in precisely this order.
+        let damping = rng.random_range(INITIAL_DAMPING_MIN..INITIAL_DAMPING_MAX);
+        let gain = rng.random_range(0.0..5.0);
+        let bias = rng.random_range(-2.0..2.0);
 
         Self {
             weights,
             targets,
             kinds,
-            gain: rng.random_range(0.0..5.0),
-            damping: rng.random_range(INITIAL_DAMPING_MIN..INITIAL_DAMPING_MAX),
-            bias: rng.random_range(-2.0..2.0),
+            gain,
+            damping,
+            bias,
         }
     }
 }
@@ -167,6 +170,10 @@ impl MlpBrain {
     }
 
     fn gaussian(rng: &mut dyn RandomStream) -> f32 {
+        // The legacy helper cached a spare Marsaglia-polar deviate in mutable
+        // process-global state. Reproducing that would make parallel agent
+        // mutation depend on scheduling, so the protocol deliberately uses a
+        // stream-local Box-Muller pair and freezes its continuation in tests.
         const TWO_PI: f32 = std::f32::consts::TAU;
         let u1 = (rng.random::<f32>()).clamp(f32::MIN_POSITIVE, 1.0);
         let u2 = rng.random::<f32>();
@@ -178,7 +185,9 @@ impl MlpBrain {
     }
 
     fn mutate_parameters(&mut self, rng: &mut dyn RandomStream, rate: f32, scale: f32) {
-        let sigma = scale.max(1e-5);
+        // Preserve randn(0, MR2) exactly: a zero mutation scale consumes the
+        // same random draws but contributes a zero delta.
+        let sigma = scale;
         for params in &mut self.nodes {
             if rng.random::<f32>() < rate {
                 params.bias += Self::gaussian(rng) * sigma;
@@ -532,8 +541,11 @@ impl MlpBrainFamily {
         let mut payload = Vec::with_capacity(STATE_PAYLOAD_BYTES);
         payload.extend_from_slice(&STATE_MAGIC);
         payload.extend_from_slice(&BRAIN_SIZE_WIRE.to_le_bytes());
+        // `target` is scratch: every non-input target is overwritten before
+        // it is read, while input-node targets are never read. Canonical
+        // checkpoints therefore encode only future-affecting recurrent data.
         for node in state {
-            for value in [node.output, node.previous_output, node.target] {
+            for value in [node.output, node.previous_output] {
                 payload.extend_from_slice(&value.to_bits().to_le_bytes());
             }
         }
@@ -585,15 +597,10 @@ impl MlpBrainFamily {
                 BrainEnvelopeKind::EvaluatorState,
                 "node previous output",
             )?));
-            let target = f32::from_bits(u32::from_le_bytes(self.read::<4>(
-                &mut reader,
-                BrainEnvelopeKind::EvaluatorState,
-                "node target",
-            )?));
             decoded.push(NodeState {
                 output,
                 previous_output,
-                target,
+                target: 0.0,
             });
         }
         self.validate_state_values(&decoded)?;
@@ -669,14 +676,19 @@ impl BrainEvaluator for MlpEvaluator {
                 "MLP sensor input contains a non-finite value",
             ));
         }
-        let outputs = self.brain.tick(sensors);
-        self.family.validate_state_values(&self.brain.state)?;
+        // Publish recurrent state atomically. A finite envelope can still
+        // overflow during evaluation (for example inf * 0 -> NaN), and an
+        // error must never poison the next science tick.
+        let mut candidate = self.brain.clone();
+        let outputs = candidate.tick(sensors);
+        self.family.validate_state_values(&candidate.state)?;
         if outputs.iter().any(|value| !value.is_finite()) {
             return Err(self.family.invalid(
                 BrainEnvelopeKind::EvaluatorState,
                 "MLP evaluation produced a non-finite output",
             ));
         }
+        self.brain = candidate;
         Ok(outputs)
     }
 
@@ -976,6 +988,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_random_constructor_freezes_interleaved_draw_order() {
+        let mut rng = SmallRngStream::seed_from_u64(0xC0FF_EE11);
+        let brain = MlpBrain::random(&mut rng);
+        assert_eq!(
+            (
+                brain.nodes[0].clone(),
+                brain.nodes[73].targets,
+                brain.nodes[199].weights,
+                rng.random::<u64>(),
+            ),
+            (
+                NodeParams {
+                    weights: [0.0, -1.160_481_7, 2.873_790_7, -0.205_322_03],
+                    targets: [14, 161, 1, 126],
+                    kinds: [SynapseKind::Regular; CONNECTIONS],
+                    gain: 4.711_219,
+                    damping: 0.933_311_7,
+                    bias: 0.671_535_5,
+                },
+                [11, 94, 198, 3],
+                [1.623_674_4, 2.362_800_6, 0.0, 1.791_975],
+                14_877_408_283_798_974_444,
+            )
+        );
+    }
+
+    #[test]
     fn tick_produces_stable_outputs() {
         let mut rng = SmallRngStream::seed_from_u64(123);
         let mut brain = MlpBrain::random(&mut rng);
@@ -1056,15 +1095,58 @@ mod tests {
             &state.payload()[..STATE_HEADER_BYTES],
             &[b'M', b'L', b'P', b'S', 200, 0]
         );
-        assert_eq!(fnv1a64(state.payload()), 0x3187_c3e9_4404_77c5);
+        assert_eq!(fnv1a64(state.payload()), 0xc71e_27b4_031b_c9de);
         let decoded_state = family.decode_state(&state).expect("decode state");
-        assert_eq!(decoded_state, dynamic_state);
+        assert!(
+            decoded_state
+                .iter()
+                .zip(&dynamic_state)
+                .all(|(decoded, original)| decoded.output == original.output
+                    && decoded.previous_output == original.previous_output
+                    && decoded.target == 0.0)
+        );
         assert_eq!(
             family
                 .state(&decoded_state)
                 .expect("re-encode state")
                 .payload(),
             state.payload()
+        );
+    }
+
+    #[test]
+    fn protocol_state_omits_behaviorally_dead_targets() {
+        let family = MlpBrainFamily::new();
+        let first = fixture_state();
+        let mut second = first.clone();
+        for (index, node) in second.iter_mut().enumerate() {
+            node.target = if index % 2 == 0 { -123.5 } else { 987.25 };
+        }
+        let first_envelope = family.state(&first).expect("first canonical state");
+        let second_envelope = family.state(&second).expect("second canonical state");
+        assert_eq!(first_envelope, second_envelope);
+
+        let genome = family
+            .genome(&fixture_nodes(), BrainProvenance::default())
+            .expect("fixture genome");
+        let mut first_evaluator = family
+            .evaluator(&genome, &first_envelope)
+            .expect("first evaluator");
+        let mut second_evaluator = family
+            .evaluator(&genome, &second_envelope)
+            .expect("second evaluator");
+        let sensors = [0.125; INPUT_SIZE];
+        assert_eq!(
+            first_evaluator.evaluate(&sensors).expect("first output"),
+            second_evaluator.evaluate(&sensors).expect("second output")
+        );
+        assert_eq!(
+            first_evaluator
+                .checkpoint_state()
+                .expect("first continuation state"),
+            second_evaluator
+                .checkpoint_state()
+                .expect("second continuation state")
         );
     }
 
@@ -1307,6 +1389,43 @@ mod tests {
     }
 
     #[test]
+    fn rejected_arithmetic_overflow_preserves_checkpoint_exactly() {
+        let family = MlpBrainFamily::new();
+        let inert = NodeParams {
+            weights: [0.0; CONNECTIONS],
+            targets: [0; CONNECTIONS],
+            kinds: [SynapseKind::Regular; CONNECTIONS],
+            gain: 0.0,
+            damping: 1.0,
+            bias: 0.0,
+        };
+        let mut nodes = vec![inert; BRAIN_SIZE];
+        nodes[INPUT_SIZE].weights[0] = f32::MAX;
+        nodes[INPUT_SIZE].targets[0] = INPUT_SIZE;
+        let genome = family
+            .genome(&nodes, BrainProvenance::default())
+            .expect("finite hostile genome");
+        let mut dynamic = vec![NodeState::default(); BRAIN_SIZE];
+        dynamic[INPUT_SIZE].output = f32::MAX;
+        let state = family.state(&dynamic).expect("finite hostile state");
+        let mut evaluator = family.evaluator(&genome, &state).expect("evaluator");
+        let before = evaluator.checkpoint_state().expect("checkpoint before");
+
+        assert!(matches!(
+            evaluator.evaluate(&[0.0; INPUT_SIZE]),
+            Err(BrainProtocolError::InvalidPayload {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
+        assert_eq!(
+            evaluator.checkpoint_state().expect("checkpoint after"),
+            before,
+            "a rejected finite-but-overflowing tick must not poison recurrent state"
+        );
+    }
+
+    #[test]
     fn legacy_damping_oracle_preserves_initial_overshoot_then_mutation_cap() {
         assert_eq!(INITIAL_DAMPING_MIN, 0.9);
         assert_eq!(INITIAL_DAMPING_MAX, 1.1);
@@ -1336,6 +1455,7 @@ mod tests {
         assert_eq!(output.to_bits(), legacy_expected.to_bits());
         assert!(output > legacy_target, "1.1 damping must overshoot target");
 
+        let before = family.decode_genome(&genome).expect("original nodes");
         let mutated = family
             .mutate_genome(
                 &genome,
@@ -1346,12 +1466,17 @@ mod tests {
                 &mut rng,
             )
             .expect("legacy-clamped mutation");
+        let after = family.decode_genome(&mutated).expect("mutated nodes");
         assert!(
-            family
-                .decode_genome(&mutated)
-                .expect("mutated nodes")
+            after
                 .iter()
                 .all(|node| (MUTATED_DAMPING_MIN..=MUTATED_DAMPING_MAX).contains(&node.damping))
         );
+        for (before, after) in before.iter().zip(&after) {
+            assert_eq!(after.bias.to_bits(), before.bias.to_bits());
+            assert_eq!(after.gain.to_bits(), before.gain.to_bits());
+            assert_eq!(after.weights, before.weights);
+        }
+        assert_eq!(rng.random::<u64>(), 0x0753_bb8e_add8_2f25);
     }
 }

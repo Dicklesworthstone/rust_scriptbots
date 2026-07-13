@@ -869,6 +869,42 @@ mod tests {
         (vec![left; BRAIN_SIZE], vec![right; BRAIN_SIZE])
     }
 
+    fn codec_fixture_nodes() -> Vec<NodeParams> {
+        (0..BRAIN_SIZE)
+            .map(|index| {
+                let scalar = f32::from(u16::try_from(index).expect("fixture index fits u16"));
+                NodeParams {
+                    kind: if index % 2 == 0 {
+                        NodeKind::And
+                    } else {
+                        NodeKind::Or
+                    },
+                    damping: 0.1 + scalar * 0.001,
+                    bias: scalar * -0.03125 + 2.0,
+                    weights: [
+                        scalar + 0.01,
+                        scalar * 0.125 + 0.02,
+                        scalar * 0.25 + 0.03,
+                        scalar * 0.5 + 0.04,
+                    ],
+                    sources: [
+                        index,
+                        (index + 1) % BRAIN_SIZE,
+                        (index + 29) % BRAIN_SIZE,
+                        (BRAIN_SIZE - 1) - index,
+                    ],
+                    inverted: [index % 2 == 0, index % 3 == 0, true, false],
+                }
+            })
+            .collect()
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
     #[test]
     fn random_brain_builds_expected_layout() {
         let mut rng = SmallRngStream::seed_from_u64(0x5A5A5A5A);
@@ -963,6 +999,32 @@ mod tests {
             first.payload(),
             "fixed-width source fields and float bits must round-trip byte-for-byte"
         );
+
+        let fixture_nodes = codec_fixture_nodes();
+        let fixture = protocol_genome(&fixture_nodes, BrainProvenance::default());
+        assert_eq!(fnv1a64(fixture.payload()), 0x25aa_4cd2_7796_3912);
+        assert_eq!(
+            decode_genome(&fixture).expect("decode all-field fixture"),
+            fixture_nodes
+        );
+
+        let dynamic_state = (0..BRAIN_SIZE)
+            .map(|index| NodeState {
+                output: f32::from(u16::try_from(index).expect("state index fits u16"))
+                    / f32::from(u16::try_from(BRAIN_SIZE).expect("brain size fits u16")),
+                target: 1.0,
+            })
+            .collect::<Vec<_>>();
+        let state = state_envelope(&dynamic_state).expect("nonzero fixture state");
+        assert_eq!(fnv1a64(state.payload()), 0x4ba4_cfee_91ca_6113);
+        assert!(
+            decode_state(&state)
+                .expect("decode nonzero fixture state")
+                .iter()
+                .zip(&dynamic_state)
+                .all(|(decoded, original)| decoded.output == original.output
+                    && decoded.target == 0.0)
+        );
     }
 
     #[test]
@@ -1044,22 +1106,24 @@ mod tests {
         let before = family
             .checkpoint_evaluator(evaluator.as_ref())
             .expect("checkpoint before rejected input");
-        let mut nonfinite_sensors = [0.0; INPUT_SIZE];
-        nonfinite_sensors[3] = f32::INFINITY;
-        assert!(matches!(
-            evaluator.evaluate(&nonfinite_sensors),
-            Err(BrainProtocolError::InvalidPayload {
-                kind: BrainEnvelopeKind::EvaluatorState,
-                ..
-            })
-        ));
-        assert_eq!(
-            family
-                .checkpoint_evaluator(evaluator.as_ref())
-                .expect("checkpoint after rejected input"),
-            before,
-            "a rejected sensor frame must not partially advance recurrent state"
-        );
+        for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut nonfinite_sensors = [0.0; INPUT_SIZE];
+            nonfinite_sensors[3] = nonfinite;
+            assert!(matches!(
+                evaluator.evaluate(&nonfinite_sensors),
+                Err(BrainProtocolError::InvalidPayload {
+                    kind: BrainEnvelopeKind::EvaluatorState,
+                    ..
+                })
+            ));
+            assert_eq!(
+                family
+                    .checkpoint_evaluator(evaluator.as_ref())
+                    .expect("checkpoint after rejected input"),
+                before,
+                "a rejected sensor frame must not partially advance recurrent state"
+            );
+        }
     }
 
     #[test]
