@@ -11,6 +11,7 @@ assembly = []
 experimental = ["assembly"]
 
 [dependencies]
+blake3 = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }

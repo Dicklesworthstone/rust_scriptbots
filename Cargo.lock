@@ -10032,6 +10032,7 @@ dependencies = [
 name = "scriptbots-brain"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "rand 0.9.5",
  "scriptbots-core",
  "serde",
