@@ -1291,6 +1291,11 @@ CI tests declared products, not the combinatorial powerset of nonsensical featur
 stable target floors with byte-stable wire-compatibility proof,
 `bd-2z0.8.3`, Codex, 2026-07-12]
 
+**CLI/observability family:** [Completed — `clap`,
+`tracing`/`tracing-subscriber`, `thiserror`/`anyhow`, and
+`owo-colors`/`supports-color` stable target floors, `bd-2z0.8.6`, Codex,
+2026-07-12]
+
 These candidates were checked against live crates.io records on 2026-07-11. Registry metadata establishes a candidate version, not its migration risk. Release notes, changelog, repository, features, and security research are still required before the bead becomes actionable. They are manifest lower-bound candidates plus a committed lock, not universal exact `=version` requirements.
 
 | Group | Researched stable targets |

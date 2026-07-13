@@ -1027,3 +1027,132 @@ No version migration in this ledger is authorized merely by being newer.
 - **Rollback:** manually restore only the three root workspace declaration
   floors and these fixture/log/plan additions. `Cargo.lock` needs no rollback;
   do not overwrite its independently landed reqwest or core-Postcard edges.
+
+## 2026-07-12 — Raise the CLI, observability, error, and color-family floors
+
+- **Bead:** `bd-2z0.8.6`
+- **Change class:** four serialized dependency-family target-floor updates;
+  the committed lock already selected every target, so this changes future
+  resolution floors without changing the executing package graph
+- **Before manifests:** root `anyhow 1.0.93`, `thiserror 2.0.2`, `tracing
+  0.1.40`, and `tracing-subscriber 0.3.18`; application `clap 4.5`,
+  `owo-colors 4.0`, and `supports-color 3.0`; world-gfx independently
+  declared `tracing 0.1`
+- **Target manifests:** root `anyhow 1.0.103`, `thiserror 2.0.18`, `tracing
+  0.1.44`, and `tracing-subscriber 0.3.23`; application `clap 4.6.1`,
+  `owo-colors 4.3.0`, and `supports-color 3.0.2`; world-gfx now inherits the
+  reviewed workspace `tracing` policy. All prior features remain exact:
+  Clap keeps `derive,env`, and tracing-subscriber keeps `env-filter,fmt` plus
+  its unchanged defaults.
+- **Latest-stable check:** on 2026-07-12, each docs.rs `latest` package page
+  selected the exact target above. The corresponding registry packages are
+  [anyhow 1.0.103](https://crates.io/crates/anyhow/1.0.103), [thiserror
+  2.0.18](https://crates.io/crates/thiserror/2.0.18), [tracing
+  0.1.44](https://crates.io/crates/tracing/0.1.44), [tracing-subscriber
+  0.3.23](https://crates.io/crates/tracing-subscriber/0.3.23), [clap
+  4.6.1](https://crates.io/crates/clap/4.6.1), [owo-colors
+  4.3.0](https://crates.io/crates/owo-colors/4.3.0), and [supports-color
+  3.0.2](https://crates.io/crates/supports-color/3.0.2). Registry archives
+  identify source commits `5bdb0e24db39` (anyhow), `dc0f6a23a3fb`
+  (thiserror), `2d55f6faf9be` (tracing), `54ede4d5d85a`
+  (tracing-subscriber), `ac5fda6a799e` (clap), `baf10f9a7400`
+  (owo-colors), and `26ad8d206ad0` (supports-color).
+- **Error-family research:** [anyhow's reviewed
+  comparison](https://github.com/dtolnay/anyhow/compare/1.0.93...1.0.103)
+  adds APIs and fixes rather than removing ScriptBots' used `Context`,
+  `bail!`, or `anyhow!` surface. The formerly dependency-bearing `backtrace`
+  feature is retained as a no-op compatibility feature, and ScriptBots does
+  not enable it. [thiserror's reviewed
+  comparison](https://github.com/dtolnay/thiserror/compare/2.0.2...2.0.18)
+  contains derive correctness, diagnostics, no-std, and compiler-compatibility
+  fixes; ScriptBots' derives require no migration.
+- **Observability-family research:** the [tracing 0.1.44
+  changelog](https://github.com/tokio-rs/tracing/blob/tracing-0.1.44/tracing/CHANGELOG.md)
+  records macro/core fixes and a `record_all` panic fix. Release 0.1.43
+  reverted the accidentally breaking 0.1.42 macro change, so the selected
+  stable target does not carry it. The [tracing-subscriber 0.3.23
+  changelog](https://github.com/tokio-rs/tracing/blob/tracing-subscriber-0.3.23/tracing-subscriber/CHANGELOG.md)
+  retains ANSI sanitization by default while allowing an explicit opt-out;
+  ScriptBots does not opt out. No logging call site, target, structured field,
+  filter, or formatter configuration changes in this dependency mutation.
+- **CLI research:** [Clap's 4.6.1
+  changelog](https://github.com/clap-rs/clap/blob/v4.6.1/CHANGELOG.md)
+  records the Rust 1.85 compatibility floor and one derive rebuild fix.
+  ScriptBots uses only stable 4.x derive/parser APIs. The workspace's Rust
+  1.89 policy exceeds the target floor.
+- **Color research:** [owo-colors' 4.3.0
+  changelog](https://github.com/owo-colors/owo-colors/blob/v4.3.0/CHANGELOG.md)
+  includes rendering fixes, sealed-trait clarification, and an MSRV increase
+  to Rust 1.81; it does not change the used `OwoColorize` formatting methods.
+  [supports-color's 3.0.2
+  changelog](https://github.com/zkat/supports-color/blob/v3.0.2/CHANGELOG.md)
+  records SSH detection improvements and replacement of internal unsafe cache
+  code by `OnceLock`. Its Rust 1.70 floor and cached `on_cached` API remain
+  compatible with the TUI capability path.
+- **MSRV and license:** anyhow and thiserror declare Rust 1.68 and `MIT OR
+  Apache-2.0`; tracing and tracing-subscriber declare Rust 1.65 and MIT; Clap
+  declares Rust 1.85 and `MIT OR Apache-2.0`; owo-colors declares Rust 1.81
+  and MIT; supports-color declares Rust 1.70 and Apache-2.0. All are below the
+  workspace Rust 1.89 floor and introduce no license-policy change.
+- **Security:** [RUSTSEC-2026-0190](https://rustsec.org/advisories/RUSTSEC-2026-0190.html)
+  marks `anyhow <1.0.103` unsound in `Error::downcast_mut`;
+  [RUSTSEC-2023-0078](https://rustsec.org/advisories/RUSTSEC-2023-0078.html)
+  marks `tracing <0.1.40` unsound in `Instrumented::into_inner`; and
+  [RUSTSEC-2025-0055](https://rustsec.org/advisories/RUSTSEC-2025-0055.html)
+  marks `tracing-subscriber <0.3.20` vulnerable to ANSI log injection. The
+  selected targets are the fixed versions or newer. RustSec has no package
+  advisory page for thiserror, Clap, owo-colors, or supports-color at the
+  review instant. The final whole-lock audit remains authoritative for the
+  transitive graph.
+- **Exact manifest boundary:** before SHA-256 values were root
+  `3fcfffa501cbab9986349da19d5d78c65d55addd02559e089c9d6805d28bda0b`,
+  application
+  `ca02ad162179c1471e392822726b45f7e884643e433ff44d711a33442adb5fae`,
+  and world-gfx
+  `89b3120be4344ee1ab15ae38e4fa12df60cf73277df7e95d7e334a5042a86338`.
+  Before final rebase, the reviewed target-floor versions produced root
+  `87d3468f6991d1231a9c74ddb05ff87b91c062471e0d07fd8faeab185831f015`,
+  application
+  `b530ea96b6731def7b975744d1501353254c1345965630c050935ca79132ddf7`,
+  and world-gfx
+  `ac18600d9417515c91283f27d5eed5a7aa1e4a3f7f65335d8830ed512ab4c549`.
+  Later peer-source rebases may change whole-file hashes; the dependency hunk
+  remains limited to the declarations named above.
+- **Exact lock boundary:** `Cargo.lock` is byte-identical before and after at
+  SHA-256
+  `bb52a2a93ed71a0b3e25aa3bc13041ffb4569328081178988ce88f86de042e55`.
+  No package tuple, source, checksum, dependency edge, or feature resolution
+  moved. Any nonempty lock delta is unrelated drift and must stop this update.
+- **CLI/help/error proof:** before and after the Clap floor change,
+  `scriptbots-app --help` is byte-identical at SHA-256
+  `f3c6707b6bd51493ff5fcc3e479941ab2ba738cb72a62f0890a2b28f0b739d98`
+  and `control_cli --help` is byte-identical at
+  `700578c48e9511b5dc7cc33b8864d11fbeae2f6c96470eeb69f46c1fd2fce7bd`.
+  An invalid application flag still exits 2 with exact stderr hash
+  `78189b43fb28cacf55e28e742b67cca85b77fa1a8d6c794ff8611b8120c9a5a4`.
+  No shell-completion generator is currently exposed; the attempted
+  `control_cli --generate-completion bash` remains a truthful exit 2 with
+  exact stderr hash
+  `401a55b779833bebd6ce06cf3f3f9bd28627e9d549cf650da05d3409407db9b2`.
+  A real connection failure to `127.0.0.1:1` still exits 1 with exact stderr
+  hash
+  `9c6a12270e8eb6efecc145bab67366b225dfddeee7b80009a7b449b88e3397b1`.
+- **Focused proof:** after each serialized family, the locked application
+  library passed 73/73 tests. The observability family additionally passed
+  world-gfx 3/3. Under `TERM=dumb`, `NO_COLOR=1`, `CI=1`, and forced ASCII
+  emoji-off mode, the final color family passed the application library 73/73
+  and the real headless terminal smoke 6/6, covering unavailable-renderer and
+  pre-side-effect error paths as well as the TUI capability fallback. Direct
+  decorative `OwoColorize` startup labels remain their pre-existing behavior;
+  this floor-only mutation does not mix in a console-style rewrite.
+- **Workspace proof:** a locked workspace all-target check passed after each
+  of the observability, CLI, and color families. The only diagnostic was the
+  already-recorded future-incompatibility warning for transitive
+  `proc-macro-error2 2.0.1`; no requested-family warning or deprecation was
+  introduced.
+- **Result:** accepted as a lock-stable target-floor update with no API,
+  feature, output, schema, or scientific-behavior mutation.
+- **Rollback:** manually restore only the eight reviewed manifest declaration
+  lines, the world-gfx workspace-inheritance line, this log entry, and the
+  exact plan status marker. `Cargo.lock` needs no rollback. Do not use reset,
+  checkout, stash, clean, or delete any file.

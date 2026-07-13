@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = { workspace = true }
 axum = { version = "0.8.0", features = ["macros", "json"] }
 async-trait = "0.1"
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 mcp-protocol-sdk = { version = "0.5.1", default-features = false, features = ["http"] }
 ratatui = { version = "0.30.0-alpha.5" }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
@@ -25,7 +25,7 @@ smallvec = "1.13"
 futures-util = "0.3.31"
 tokio-stream = "0.1.16"
 slotmap = { workspace = true }
-supports-color = "3.0"
+supports-color = "3.0.2"
 thiserror = { workspace = true }
 rand = { workspace = true }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal"] }
@@ -35,7 +35,7 @@ crossfire = "2.1.6"
 utoipa = { version = "5.4.0", features = ["macros", "axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 crossterm = "0.27"
-owo-colors = "4.0"
+owo-colors = "4.3.0"
 csv = { workspace = true }
 ron = "0.8"
 toml = "0.8"
