@@ -21,9 +21,10 @@ hashbrown
 itoa
 js-sys
 libc
+libm
 memchr
-num_cpus
 num-traits
+num_cpus
 once_cell
 ordered-float
 pin-project-lite
@@ -40,10 +41,10 @@ scriptbots-core
 scriptbots-index
 scriptbots-web
 serde
+serde-wasm-bindgen
 serde_core
 serde_derive
 serde_json
-serde-wasm-bindgen
 shlex
 slab
 slotmap

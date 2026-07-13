@@ -6,7 +6,6 @@ license.workspace = true
 description = "Offline science layer for ScriptBots: read-only reports over finished run databases (bd-2z0.11.5). Never a dependency of the app binaries; never built for wasm."
 
 [dependencies]
-anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -18,6 +17,9 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "sb-analyze"

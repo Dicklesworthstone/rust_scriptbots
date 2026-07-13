@@ -12,6 +12,7 @@ members = [
     "crates/scriptbots-app",
     "crates/scriptbots-bevy",
     "crates/scriptbots-web",
+    "crates/scriptbots-analytics",
 ]
 
 [workspace.package]

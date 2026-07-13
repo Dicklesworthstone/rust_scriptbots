@@ -1,8 +1,8 @@
-//! Offline science layer for ScriptBots (bd-2z0.11.5, program bd-2js6).
+//! Offline science layer for `ScriptBots` (bd-2z0.11.5, program bd-2js6).
 //!
 //! This crate is the ONE blessed offline reader of finished run databases:
 //! a report framework plus the `sb-analyze` CLI. Boundary rules it exists to
-//! uphold (docs/franken_integration.md §4):
+//! uphold (`docs/franken_integration.md` §4):
 //!
 //! - **Read-only**: all access goes through [`scriptbots_storage::StorageReader`],
 //!   which exposes no mutating API. This crate never opens a writable
@@ -13,6 +13,8 @@
 //! - **Franken analytics adapters land here** (fsci-stats: bd-2z0.11.6,
 //!   fnx graphs: bd-2z0.11.7, frankenpandas exports: bd-2z0.11.8) behind
 //!   this crate's report registry — never in the tick path, never in core.
+//! - **Export successor**: report coverage lands here before the app's direct-DB
+//!   `control_cli Export` path is retired under bd-2z0.8.9.5.
 //!
 //! Every report execution is wrapped in a tracing span carrying the report
 //! name, parameter set, row counts, and wall time, so detailed logging is a
@@ -22,13 +24,13 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use scriptbots_storage::{StorageError, StorageReader};
+use scriptbots_storage::{PersistenceBatchId, StorageError, StorageReader};
 use serde::Serialize;
 
 /// Schema version stamped into every machine-readable report payload.
 ///
-/// Bump ONLY with a documented migration note in `docs/analytics.md`; the
-/// value is asserted by scaffold tests so an accidental bump is loud.
+/// Bump ONLY with a migration note in the owning Bead/release evidence. Full
+/// envelope goldens assert the value so an accidental schema change is loud.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
 /// Errors surfaced by the analytics layer.
@@ -51,6 +53,9 @@ pub enum AnalyticsError {
     /// Serialization of the machine payload failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// Writing a requested report artifact failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Read-only context handed to every report.
@@ -65,10 +70,14 @@ impl ReaderCtx {
     /// Opens a finished run database read-only.
     ///
     /// Fails (rather than creating anything) when the path does not exist —
-    /// asserted by the scaffold tests as the read-only contract.
+    /// asserted by the scaffold tests as the read-only contract. The finished-run
+    /// lease rejects a live writer and remains held for every report query.
     pub fn open(db_path: &str) -> Result<Self, AnalyticsError> {
-        let reader = StorageReader::open(db_path)?;
-        Ok(Self { reader, db_path: db_path.to_owned() })
+        let reader = StorageReader::open_finished(db_path)?;
+        Ok(Self {
+            reader,
+            db_path: db_path.to_owned(),
+        })
     }
 }
 
@@ -83,11 +92,23 @@ impl ReportParams {
         for pair in pairs {
             let Some((k, v)) = pair.split_once('=') else {
                 return Err(AnalyticsError::BadParam {
-                    name: pair.clone(),
+                    name: pair,
                     reason: "expected key=value".into(),
                 });
             };
-            map.insert(k.trim().to_owned(), v.trim().to_owned());
+            let key = k.trim();
+            if key.is_empty() {
+                return Err(AnalyticsError::BadParam {
+                    name: pair,
+                    reason: "parameter name must not be empty".into(),
+                });
+            }
+            if map.insert(key.to_owned(), v.trim().to_owned()).is_some() {
+                return Err(AnalyticsError::BadParam {
+                    name: key.to_owned(),
+                    reason: "parameter was supplied more than once".into(),
+                });
+            }
         }
         Ok(Self(map))
     }
@@ -127,6 +148,8 @@ pub struct ReportOutput {
     pub db_path: String,
     /// Latest tick present in the database when the report ran, if any.
     pub latest_tick: Option<u64>,
+    /// Number of primary rows rendered by this report.
+    pub row_count: usize,
     /// Machine-readable payload (stable per `schema_version`).
     pub machine: serde_json::Value,
     /// Human-readable markdown rendering of the same content.
@@ -156,13 +179,18 @@ impl Registry {
     /// their beads land (bd-2z0.11.6/.7/.8).
     #[must_use]
     pub fn builtin() -> Self {
-        Self { reports: vec![Box::new(RunSummary), Box::new(NarrativeTimeline)] }
+        Self {
+            reports: vec![Box::new(RunSummary), Box::new(NarrativeTimeline)],
+        }
     }
 
     /// Lists `(name, description)` pairs in registration order.
     #[must_use]
     pub fn list(&self) -> Vec<(&'static str, &'static str)> {
-        self.reports.iter().map(|r| (r.name(), r.description())).collect()
+        self.reports
+            .iter()
+            .map(|r| (r.name(), r.description()))
+            .collect()
     }
 
     /// Runs a report by name with framework-level tracing.
@@ -183,15 +211,17 @@ impl Registry {
             tracing::debug!(param = %k, value = %v, "report parameter");
         }
         let started = Instant::now();
+        tracing::info!("report started");
         let result = report.run(cx, params);
         match &result {
             Ok(out) => tracing::info!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = elapsed_millis(&started),
                 latest_tick = ?out.latest_tick,
+                rows = out.row_count,
                 "report completed"
             ),
             Err(err) => tracing::error!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = elapsed_millis(&started),
                 error = %err,
                 "report failed"
             ),
@@ -200,9 +230,23 @@ impl Registry {
     }
 }
 
+fn elapsed_millis(started: &Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn log_report_stage(stage: &'static str, started: &Instant, rows: usize) {
+    tracing::debug!(
+        stage,
+        elapsed_ms = elapsed_millis(started),
+        rows,
+        "report stage completed"
+    );
+}
+
 fn base_output(
     name: &str,
     cx: &ReaderCtx,
+    row_count: usize,
     machine: serde_json::Value,
     human_md: String,
 ) -> Result<ReportOutput, AnalyticsError> {
@@ -211,6 +255,7 @@ fn base_output(
         report: name.to_owned(),
         db_path: cx.db_path.clone(),
         latest_tick: cx.reader.max_tick()?,
+        row_count,
         machine,
         human_md,
     })
@@ -231,7 +276,14 @@ struct RunSummaryMachine {
     population_mean: Option<f64>,
     total_energy_first: Option<f64>,
     total_energy_last: Option<f64>,
-    watermarks_debug: String,
+    watermarks: WatermarksMachine,
+}
+
+#[derive(Debug, Serialize)]
+struct WatermarksMachine {
+    admitted: Option<u64>,
+    applied: Option<u64>,
+    durable: Option<u64>,
 }
 
 impl Report for RunSummary {
@@ -244,31 +296,52 @@ impl Report for RunSummary {
     }
 
     fn run(&self, cx: &ReaderCtx, _params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let read_started = Instant::now();
         let ledger = cx.reader.run_ledger_summary()?;
-        // recent_ticks returns newest-first; reverse into chronological order.
-        let mut ticks = cx.reader.recent_ticks(None)?;
-        ticks.reverse();
-        tracing::debug!(rows = ticks.len(), "tick trajectory loaded");
+        // StorageReader guarantees chronological order.
+        let ticks = cx.reader.recent_ticks(None)?;
+        let watermarks = cx.reader.persistence_watermarks()?;
+        log_report_stage("read", &read_started, ticks.len());
 
-        let populations: Vec<usize> = ticks.iter().map(|t| t.agent_count).collect();
-        let mean = if populations.is_empty() {
-            None
-        } else {
+        let render_started = Instant::now();
+        let mut population_first = None;
+        let mut population_last = None;
+        let mut population_min = None;
+        let mut population_max = None;
+        let mut population_mean = 0.0_f64;
+        let mut population_count = 0_u64;
+        for tick in &ticks {
+            population_first.get_or_insert(tick.agent_count);
+            population_last = Some(tick.agent_count);
+            population_min = Some(
+                population_min.map_or(tick.agent_count, |value: usize| value.min(tick.agent_count)),
+            );
+            population_max = Some(
+                population_max.map_or(tick.agent_count, |value: usize| value.max(tick.agent_count)),
+            );
+            population_count += 1;
             #[allow(clippy::cast_precision_loss)]
-            Some(populations.iter().sum::<usize>() as f64 / populations.len() as f64)
-        };
+            let observation = tick.agent_count as f64;
+            #[allow(clippy::cast_precision_loss)]
+            let count = population_count as f64;
+            population_mean += (observation - population_mean) / count;
+        }
         let machine = RunSummaryMachine {
             tick_count: ledger.tick_count,
             birth_records: ledger.birth_records,
             death_records: ledger.death_records,
-            population_first: populations.first().copied(),
-            population_last: populations.last().copied(),
-            population_min: populations.iter().min().copied(),
-            population_max: populations.iter().max().copied(),
-            population_mean: mean,
+            population_first,
+            population_last,
+            population_min,
+            population_max,
+            population_mean: (population_count > 0).then_some(population_mean),
             total_energy_first: ticks.first().map(|t| t.total_energy),
             total_energy_last: ticks.last().map(|t| t.total_energy),
-            watermarks_debug: format!("{:?}", cx.reader.persistence_watermarks()?),
+            watermarks: WatermarksMachine {
+                admitted: watermarks.admitted.map(PersistenceBatchId::get),
+                applied: watermarks.applied.map(PersistenceBatchId::get),
+                durable: watermarks.durable.map(PersistenceBatchId::get),
+            },
         };
 
         let mut md = String::new();
@@ -276,14 +349,20 @@ impl Report for RunSummary {
         let _ = writeln!(md, "| field | value |");
         let _ = writeln!(md, "|---|---|");
         let _ = writeln!(md, "| ticks persisted | {} |", machine.tick_count);
-        let _ = writeln!(md, "| births / deaths | {} / {} |", machine.birth_records, machine.death_records);
+        let _ = writeln!(
+            md,
+            "| births / deaths | {} / {} |",
+            machine.birth_records, machine.death_records
+        );
         let _ = writeln!(
             md,
             "| population first→last (min/mean/max) | {:?}→{:?} ({:?}/{}/{:?}) |",
             machine.population_first,
             machine.population_last,
             machine.population_min,
-            machine.population_mean.map_or_else(|| "-".into(), |m| format!("{m:.1}")),
+            machine
+                .population_mean
+                .map_or_else(|| "-".into(), |m| format!("{m:.1}")),
             machine.population_max,
         );
         let _ = writeln!(
@@ -292,7 +371,15 @@ impl Report for RunSummary {
             machine.total_energy_first, machine.total_energy_last
         );
 
-        base_output(self.name(), cx, serde_json::to_value(&machine)?, md)
+        let output = base_output(
+            self.name(),
+            cx,
+            ticks.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
     }
 }
 
@@ -330,6 +417,7 @@ impl Report for NarrativeTimeline {
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
         let limit = params.get_usize("limit")?;
+        let read_started = Instant::now();
         let counts = cx.reader.replay_event_counts()?;
         let mut events = cx.reader.load_replay_events()?;
         events.sort_by_key(|e| (e.tick, e.seq));
@@ -337,10 +425,14 @@ impl Report for NarrativeTimeline {
         if let Some(limit) = limit {
             events.truncate(limit);
         }
-        tracing::debug!(rows = total, rendered = events.len(), "timeline loaded");
+        log_report_stage("read", &read_started, total);
 
+        let render_started = Instant::now();
         let machine = TimelineMachine {
-            event_counts: counts.iter().map(|c| (c.event_type.clone(), c.count)).collect(),
+            event_counts: counts
+                .iter()
+                .map(|c| (c.event_type.clone(), c.count))
+                .collect(),
             events: events
                 .iter()
                 .map(|e| {
@@ -369,6 +461,14 @@ impl Report for NarrativeTimeline {
             }
         }
 
-        base_output(self.name(), cx, serde_json::to_value(&machine)?, md)
+        let output = base_output(
+            self.name(),
+            cx,
+            machine.events.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
     }
 }

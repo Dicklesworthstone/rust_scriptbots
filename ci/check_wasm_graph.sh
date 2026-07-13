@@ -32,6 +32,10 @@
 #   ci/check_wasm_graph.sh --self-test      # denylist logic fixture proof
 set -euo pipefail
 
+# Golden ordering must not depend on the runner's locale (BSD/macOS and GNU
+# `sort` otherwise disagree about '-' versus '_' in crate names).
+export LC_ALL=C
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNAPSHOT="${REPO_ROOT}/ci/fixtures/wasm_graph_snapshot.txt"
 

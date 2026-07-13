@@ -1866,17 +1866,67 @@ fn decode<T: FromSqliteValue>(
         })
 }
 
+struct FinishedRunReaderLease {
+    _path: StoragePathLease,
+    _writer: StorageWriterLease,
+    _identity: ExistingStorageLease,
+}
+
 /// Read-only view over an existing ScriptBots database.
 pub struct StorageReader {
     conn: Option<Connection>,
+    _finished_run_lease: Option<FinishedRunReaderLease>,
 }
 
 impl StorageReader {
-    /// Open an existing FrankenSQLite database without creating or migrating it.
+    /// Open an existing ScriptBots database read-only without creating or migrating it.
     pub fn open(path: &str) -> Result<Self, StorageError> {
         validate_durable_storage_path(path)?;
         let conn = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Ok(Self { conn: Some(conn) })
+        Ok(Self {
+            conn: Some(conn),
+            _finished_run_lease: None,
+        })
+    }
+
+    /// Open a finished ScriptBots run under an exclusive, identity-bound read lease.
+    ///
+    /// Unlike [`Self::open`], this rejects a live writer before validating the exact
+    /// migration set, structural schema, and persistence invariants. The writer and
+    /// identity leases remain held for the reader's lifetime, so validation and all
+    /// later report queries observe an immutable finished-run database.
+    pub fn open_finished(path: &str) -> Result<Self, StorageError> {
+        validate_durable_storage_path(path)?;
+        let path_lease = StoragePathLease::acquire(path)?.ok_or(StorageError::InvalidData {
+            context: "storage.finished_reader_path",
+            reason: "a finished-run reader requires file-backed storage".to_owned(),
+        })?;
+        let writer_lease = StorageWriterLease::acquire_existing(path)?;
+        let existing_lease = ExistingStorageLease::open(path)?;
+        let conn = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let validation = existing_lease
+            .bind_connection(&conn, path)
+            .and_then(|()| Storage::validate_existing_scriptbots_database(&conn))
+            .and_then(|()| Storage::validate_persistence_invariants_for_connection(&conn, true))
+            .and_then(|()| existing_lease.verify_path(path));
+        if let Err(error) = validation {
+            if let Err(close_error) = conn.close_without_checkpoint() {
+                warn!(
+                    path,
+                    %close_error,
+                    "failed to close refused read-only storage connection"
+                );
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            conn: Some(conn),
+            _finished_run_lease: Some(FinishedRunReaderLease {
+                _path: path_lease,
+                _writer: writer_lease,
+                _identity: existing_lease,
+            }),
+        })
     }
 
     fn connection(&self) -> Result<&Connection, StorageError> {
@@ -2526,10 +2576,25 @@ impl StorageWriterLease {
             return Ok(None);
         }
 
+        Self::acquire_lock(path, true).map(Some)
+    }
+
+    fn acquire_existing(path: &str) -> Result<Self, StorageError> {
+        if path == ":memory:" {
+            return Err(StorageError::InvalidData {
+                context: "storage.finished_reader_path",
+                reason: "a finished-run reader requires file-backed storage".to_owned(),
+            });
+        }
+
+        Self::acquire_lock(path, false)
+    }
+
+    fn acquire_lock(path: &str, create: bool) -> Result<Self, StorageError> {
         let lock_path = storage_writer_lock_path(path);
         let lock_path_display = lock_path.display().to_string();
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true);
+        options.read(true).write(true).create(create);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -2576,7 +2641,7 @@ impl StorageWriterLease {
         }
         Self::verify_path(&lock_path, &lock_path_display, &identity)?;
 
-        Ok(Some(Self { file, lock_path }))
+        Ok(Self { file, lock_path })
     }
 
     fn verify_path(
@@ -3008,11 +3073,27 @@ impl Storage {
     }
 
     fn validate_persistence_invariants(&self) -> Result<(), StorageError> {
-        let watermarks = self.persistence_watermarks()?;
+        Self::validate_persistence_invariants_for_connection(self.connection()?, self.file_backed())
+    }
+
+    fn validate_persistence_invariants_for_connection(
+        connection: &Connection,
+        file_backed: bool,
+    ) -> Result<(), StorageError> {
+        let progress = connection.query_row(
+            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress
+             WHERE singleton = 1",
+        )?;
+        let watermarks = PersistenceWatermarks::from_raw(
+            decode(&progress, 0, "storage_progress.admitted_batch_id")?,
+            decode(&progress, 1, "storage_progress.applied_batch_id")?,
+            decode(&progress, 2, "storage_progress.durable_batch_id")?,
+        )?;
         let admitted = watermarks.admitted_raw();
         let applied = watermarks.applied_raw();
         let durable = watermarks.durable_raw();
-        let ledger = self.connection()?.query_row(
+        let ledger = connection.query_row(
             "SELECT COUNT(*), MIN(batch_id), MAX(batch_id), COUNT(DISTINCT tick)
              FROM storage_batch_ledger",
         )?;
@@ -3039,7 +3120,7 @@ impl Storage {
             ("applied", durable, applied),
             ("admitted", applied, admitted),
         ] {
-            let mismatches = self.connection()?.query_with_params(
+            let mismatches = connection.query_with_params(
                 "SELECT batch_id, state
                  FROM storage_batch_ledger
                  WHERE batch_id > ?1 AND batch_id <= ?2 AND state != ?3
@@ -3063,8 +3144,8 @@ impl Storage {
             }
         }
 
-        if self.file_backed() {
-            let outbox = self.connection()?.query_row(
+        if file_backed {
+            let outbox = connection.query_row(
                 "SELECT COUNT(*), MIN(batch_id), MAX(batch_id)
                  FROM storage_outbox",
             )?;
@@ -6681,6 +6762,84 @@ mod tests {
         let before = fs::read(&unrelated)?;
         assert!(StoragePipeline::recover_existing(&unrelated_string).is_err());
         assert_eq!(fs::read(&unrelated)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_reader_is_identity_bound_schema_verified_and_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-reader-verified-read-only");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = create_file_storage(&path_string)?;
+        storage.persist(&sample_batch(1, 10.0))?;
+        storage.flush()?;
+        storage.close()?;
+        let before = fs::read(&path)?;
+
+        let reader = StorageReader::open_finished(&path_string)?;
+        let write_error = reader
+            .connection()?
+            .execute("CREATE TABLE reader_must_not_write (value INTEGER NOT NULL)")
+            .expect_err("the verified analytics connection accepted a schema write");
+        assert!(
+            matches!(write_error, FrankenError::ReadOnly),
+            "unexpected read-only write error: {write_error}"
+        );
+        reader.close()?;
+        assert_eq!(
+            fs::read(&path)?,
+            before,
+            "read-only open or refused write changed database bytes"
+        );
+
+        let unrelated = temp_db_path("storage-reader-unrelated-refusal");
+        let unrelated_string = unrelated.to_string_lossy().to_string();
+        let connection = Connection::open_strict_multi_process(&unrelated_string)?;
+        connection.execute("CREATE TABLE unrelated (value INTEGER NOT NULL)")?;
+        connection.close()?;
+        let unrelated_before = fs::read(&unrelated)?;
+        let unrelated_lock = storage_writer_lock_path(&unrelated_string);
+        assert!(!unrelated_lock.try_exists()?);
+        assert!(
+            StorageReader::open_finished(&unrelated_string).is_err(),
+            "verified reader accepted an unrelated FrankenSQLite database"
+        );
+        assert_eq!(
+            fs::read(&unrelated)?,
+            unrelated_before,
+            "refused reader open mutated an unrelated database"
+        );
+        assert!(
+            !unrelated_lock.try_exists()?,
+            "refused reader open created a writer-lease sidecar"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finished_reader_rejects_live_writer_without_breaking_live_readers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-finished-reader-live-writer");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::create_new_file(&path_string)?;
+
+        let live_reader = StorageReader::open(&path_string)?;
+        let finished_error = match StorageReader::open_finished(&path_string) {
+            Ok(reader) => {
+                reader.close()?;
+                return Err("finished-run reader admitted a live writer".into());
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(finished_error, StorageError::InvalidData { .. }),
+            "unexpected live-writer refusal: {finished_error}"
+        );
+
+        live_reader.close()?;
+        pipeline.shutdown()?;
+        let finished_reader = StorageReader::open_finished(&path_string)?;
+        finished_reader.close()?;
         Ok(())
     }
 
