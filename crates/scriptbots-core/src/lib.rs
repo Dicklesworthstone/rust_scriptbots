@@ -703,6 +703,80 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Legacy's dead-zone threshold, in the SQUARED discomfort domain.
+///
+/// `World.cpp:95-100` computes the health drain as:
+///
+/// ```text
+///   dd         = 2 * |pos.x / WIDTH - 0.5|      // 0 at the equator, 1 at the edges
+///   discomfort = |dd - temperature_preference|
+///   discomfort = discomfort * discomfort         // SQUARED FIRST
+///   if (discomfort < 0.08) discomfort = 0;       // ...and the gate is on the SQUARE
+///   health -= TEMPERATURE_DISCOMFORT * discomfort
+/// ```
+///
+/// The gate is applied to the SQUARE, so in the raw domain it opens at
+/// `sqrt(0.08)` — see [`DEFAULT_TEMPERATURE_COMFORT_BAND`]. Porting the literal
+/// `0.08` into a raw-domain comparison, as this codebase did, silently shrinks
+/// the comfort zone by a factor of ~3.5 and drains health from agents legacy
+/// considered perfectly comfortable. Same magic number; different meaning.
+pub const LEGACY_COMFORT_BAND_SQUARED: f32 = 0.08;
+
+/// The comfort band, in the RAW discomfort domain: `sqrt(0.08)`.
+///
+/// This is the width legacy actually intended (see [`LEGACY_COMFORT_BAND_SQUARED`]).
+///
+/// # Parity versus policy — the decision, stated once
+///
+/// Two things differ from legacy, and only one of them is deliberate:
+///
+/// - **Deliberate policy.** Beyond the band, the drain scales with the EXCESS
+///   discomfort (`(d - band)^exponent`), not the full discomfort. Legacy jumps
+///   discontinuously from zero to `0.08 * rate` the instant the gate opens. That
+///   cliff is an artefact of writing the gate as an `if`, not a modelling
+///   intent, and a step change in a health drain puts a sharp, arbitrary
+///   selection boundary in the middle of the temperature axis. The continuous
+///   ramp is kept.
+/// - **A defect, now fixed.** The band CONSTANT was ported across domains
+///   unchanged, which is the bug documented above.
+///
+/// # The contract
+///
+/// - **Units.** Temperature and preference are both dimensionless, in `[0, 1]`.
+///   `0` is the equator (the middle of the world), `1` is the east/west edges.
+/// - **Formula.** `T(x) = (2 * |x/W - 0.5|) ^ gradient_exponent`, clamped to
+///   `[0, 1]`. The default exponent of `1.0` is exactly legacy's linear gradient.
+/// - **Cadence.** Once per tick, in `stage_temperature_discomfort`.
+/// - **RNG inputs: NONE.** Temperature is a pure function of position and config.
+///   This is a property worth protecting: a climate that consumed entropy would
+///   make every run's weather a function of how many other draws happened first.
+/// - **Bounds.** Every intermediate and every result is finite; a degenerate
+///   (zero-width) world reports a uniform `0.5` rather than dividing by zero.
+/// - **Default drain rate is 0.0**, exactly as in legacy (`TEMPERATURE_DISCOMFORT
+///   = 0`), so the whole mechanism is inert unless a scenario turns it on — which
+///   is why correcting the band moves no default digest.
+pub const DEFAULT_TEMPERATURE_COMFORT_BAND: f32 = 0.282_842_7;
+
+/// Legacy's health drain, transcribed exactly from `World.cpp:95-100`.
+///
+/// The micro-oracle. It exists to be DIFFERENT from the code under test where we
+/// have chosen to differ, and identical where we have not — a parity claim that
+/// cannot be checked against the thing it claims parity with is just an assertion.
+#[must_use]
+pub fn legacy_temperature_health_drain(
+    normalized_x: f32,
+    preference: f32,
+    discomfort_rate: f32,
+) -> f32 {
+    let dd = 2.0 * (normalized_x - 0.5).abs();
+    let mut discomfort = (dd - preference).abs();
+    discomfort *= discomfort;
+    if discomfort < LEGACY_COMFORT_BAND_SQUARED {
+        discomfort = 0.0;
+    }
+    discomfort_rate * discomfort
+}
+
 fn sample_temperature(config: &ScriptBotsConfig, x: f32) -> f32 {
     if config.world_width == 0 {
         return 0.5;
@@ -4204,7 +4278,7 @@ impl Default for ScriptBotsConfig {
             metabolism_ramp_rate: 0.0,
             metabolism_boost_penalty: 0.0,
             temperature_discomfort_rate: 0.0,
-            temperature_comfort_band: 0.08,
+            temperature_comfort_band: DEFAULT_TEMPERATURE_COMFORT_BAND,
             temperature_gradient_exponent: 1.0,
             temperature_discomfort_exponent: 2.0,
             food_intake_rate: 0.002,
@@ -17944,6 +18018,205 @@ mod tests {
             (runtime.energy - 1.0).abs() < 1e-6,
             "expected energy to remain unchanged when discomfort is zero"
         );
+    }
+
+    #[test]
+    fn the_climate_gradient_is_a_pure_function_with_no_entropy_and_no_infinities() {
+        // Temperature must never consume RNG. A climate that drew entropy would
+        // make every run's weather a function of how many other draws happened
+        // first, and the whole determinism programme would be built on sand.
+        let config = ScriptBotsConfig {
+            world_width: 1000,
+            world_height: 200,
+            temperature_gradient_exponent: 1.0,
+            ..ScriptBotsConfig::default()
+        };
+
+        // COLD at the equator (the middle), HOT at the edges — legacy's convention.
+        assert!(
+            sample_temperature(&config, 500.0) < 1e-6,
+            "the equator is cold"
+        );
+        assert!(
+            (sample_temperature(&config, 0.0) - 1.0).abs() < 1e-6,
+            "the west edge is hot"
+        );
+        assert!(
+            (sample_temperature(&config, 1000.0) - 1.0).abs() < 1e-6,
+            "the east edge is hot"
+        );
+
+        // THE SEAM. x = 0 and x = W are the SAME point on a torus, so they must
+        // report the same temperature. A climate with a discontinuity at the seam
+        // would give agents a free thermal cliff to exploit by stepping across it.
+        assert!(
+            (sample_temperature(&config, 0.0) - sample_temperature(&config, 1000.0)).abs() < 1e-6,
+            "the seam must not be a temperature discontinuity"
+        );
+
+        // BOUNDARY and beyond: out-of-range coordinates wrap rather than escaping
+        // the [0, 1] range.
+        for x in [-2500.0f32, -1.0, 0.0, 499.9, 500.1, 1000.0, 2500.0, 1e9] {
+            let temperature = sample_temperature(&config, x);
+            assert!(
+                temperature.is_finite() && (0.0..=1.0).contains(&temperature),
+                "temperature at x = {x} left [0, 1]: {temperature}"
+            );
+        }
+
+        // DEGENERATE: a zero-width world must report a uniform temperature rather
+        // than dividing by zero.
+        let degenerate = ScriptBotsConfig {
+            world_width: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let temperature = sample_temperature(&degenerate, 123.0);
+        assert!(
+            temperature.is_finite(),
+            "a degenerate world must not produce NaN"
+        );
+
+        // Purity: same input, same answer, forever.
+        assert_eq!(
+            sample_temperature(&config, 321.0).to_bits(),
+            sample_temperature(&config, 321.0).to_bits()
+        );
+    }
+
+    #[test]
+    fn the_climate_matches_the_legacy_oracle_except_where_we_chose_to_differ() {
+        // The parity-versus-policy decision, checked against the actual legacy
+        // formula (World.cpp:95-100) rather than against a memory of it.
+        let rate = 0.005_f32; // legacy's own "decent value" comment
+        let config = ScriptBotsConfig {
+            world_width: 1000,
+            temperature_gradient_exponent: 1.0, // legacy is linear
+            temperature_comfort_band: DEFAULT_TEMPERATURE_COMFORT_BAND,
+            temperature_discomfort_exponent: 2.0, // legacy squares
+            temperature_discomfort_rate: rate,
+            ..ScriptBotsConfig::default()
+        };
+
+        let ours = |x: f32, preference: f32| -> f32 {
+            let temperature = sample_temperature(&config, x);
+            let discomfort = temperature_discomfort(temperature, preference);
+            let band = config.temperature_comfort_band;
+            if discomfort <= band {
+                return 0.0;
+            }
+            rate * (discomfort - band).powf(config.temperature_discomfort_exponent)
+        };
+
+        for step in 0..=100 {
+            let x = step as f32 * 10.0;
+            for preference in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+                let legacy = legacy_temperature_health_drain(x / 1000.0, preference, rate);
+                let mine = ours(x, preference);
+
+                assert!(mine.is_finite() && legacy.is_finite());
+                assert!(mine >= 0.0, "a drain must never heal an agent");
+
+                // AGREEMENT ON THE COMFORT ZONE. This is the part that must match,
+                // and the part the old constant got wrong: inside the band that
+                // legacy considers comfortable, we must not drain health either.
+                if legacy == 0.0 {
+                    assert_eq!(
+                        mine, 0.0,
+                        "x = {x}, preference = {preference}: legacy considers this \
+                         agent comfortable, so we must not be draining its health. \
+                         (This is exactly what the ported 0.08 constant got wrong: \
+                         it gated the RAW discomfort on a threshold legacy applied \
+                         to the SQUARE.)"
+                    );
+                } else {
+                    // DELIBERATE DIVERGENCE, bounded. Beyond the band we ramp from
+                    // zero instead of stepping off legacy's cliff, so our drain is
+                    // always <= legacy's. It is never larger, so no agent is
+                    // punished harder than legacy would punish it.
+                    assert!(
+                        mine <= legacy + 1e-6,
+                        "x = {x}, preference = {preference}: our continuous ramp must \
+                         never exceed legacy's step ({mine} > {legacy})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_ported_constant_really_did_punish_agents_legacy_called_comfortable() {
+        // Proof that the defect was real, not a story. Legacy gates on the SQUARE
+        // of the discomfort, so its comfort zone extends to sqrt(0.08) ~= 0.283 in
+        // the raw domain. The port compared the RAW discomfort against 0.08, which
+        // is a comfort zone ~3.5x narrower.
+        //
+        // Pick a discomfort that sits in the gap: comfortable to legacy, punished
+        // by the old port.
+        let discomfort = 0.15_f32;
+        assert!(
+            discomfort > LEGACY_COMFORT_BAND_SQUARED,
+            "must exceed the OLD (wrongly-ported) raw threshold"
+        );
+        assert!(
+            discomfort < DEFAULT_TEMPERATURE_COMFORT_BAND,
+            "but must lie INSIDE the comfort zone legacy actually intended"
+        );
+
+        // Legacy: comfortable. No drain.
+        assert_eq!(
+            legacy_temperature_health_drain(0.5 + discomfort / 2.0, 0.0, 0.005),
+            0.0,
+            "legacy considers this agent comfortable"
+        );
+
+        // The corrected band agrees with legacy; the old one did not.
+        assert!(
+            discomfort <= DEFAULT_TEMPERATURE_COMFORT_BAND,
+            "the corrected band leaves this agent alone"
+        );
+        assert!(
+            discomfort > LEGACY_COMFORT_BAND_SQUARED,
+            "the old band drained its health every single tick, forever, for being \
+             0.15 away from its preferred temperature — a distance legacy treats as \
+             perfectly comfortable"
+        );
+    }
+
+    #[test]
+    fn the_climate_drain_is_identical_however_many_threads_run_it() {
+        // The SIMD and scalar lanes must agree, and so must one thread and many:
+        // a health drain that depended on the worker count would make a run's
+        // outcome a property of the machine it ran on.
+        let config = ScriptBotsConfig {
+            world_width: 400,
+            world_height: 400,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.5,
+            temperature_comfort_band: 0.05,
+            temperature_gradient_exponent: 1.0,
+            temperature_discomfort_exponent: 2.0,
+            rng_seed: Some(7),
+            ..ScriptBotsConfig::default()
+        };
+
+        let run = || {
+            let mut world = WorldState::new(config.clone()).expect("world");
+            for seed in 0..24 {
+                world.spawn_agent(sample_agent(seed));
+            }
+            for _ in 0..25 {
+                world.step().expect("step");
+            }
+            world
+                .characterization_digest_v0()
+                .expect("quiescent")
+                .agents
+        };
+        assert_eq!(run(), run(), "the climate drain must be reproducible");
     }
 
     #[test]

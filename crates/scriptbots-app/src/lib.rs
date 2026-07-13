@@ -636,8 +636,17 @@ mod characterization_tests {
         assert_eq!(encoded_value["schema"], RUN_MANIFEST_V1_SCHEMA);
         assert_eq!(encoded_value["schema_version"], 1);
         assert_eq!(
+            // Their v1 wire boundary (a genuine schema change, correctly versioned)
+            // stands. This digest additionally reflects the correction of
+            // `temperature_comfort_band`'s DEFAULT (bd-2z0.2.9): legacy gates its
+            // temperature drain on the SQUARE of the discomfort, so its comfort
+            // zone is sqrt(0.08); the port compared the RAW discomfort against 0.08
+            // and drained health from agents legacy considered comfortable. The
+            // manifest embeds the normalized config, so correcting a default
+            // necessarily moves this digest — a VALUE change riding on top of their
+            // WIRE change, not a second wire change.
             manifest_digest("run-manifest-v1-wire-golden", &encoded),
-            "fnv1a64:bb8b9b7bc9277d32",
+            "fnv1a64:09d4c1cee0922e9e",
             "manifest wire changes require a versioned schema boundary"
         );
     }
