@@ -1175,3 +1175,71 @@ No version migration in this ledger is authorized merely by being newer.
   Earlier entries above that warned against describing the product as only
   `MIT OR Apache-2.0` are preserved as history; that description is now
   simply incorrect everywhere.
+
+## 2026-07-12 — Raise the Rayon compatibility floor
+
+- **Bead and baseline:** `bd-2z0.8.5`, serialized sub-update one of three,
+  rebased before measurement onto authoritative commit `5d012b0`. That base
+  contains the stable `AgentUid` and `RandomStream` protocols; none of their
+  source or lockfile deletions is changed by this sub-update.
+- **Declaration and resolution:** root `rayon 1.10.0` becomes `1.12.0` while
+  remaining optional behind core feature `parallel`. The committed lock
+  already selected `rayon 1.12.0` with public dependency `rayon-core 1.13.0`,
+  so the executing packages, checksums, dependency edges, and features are
+  identical before and after. No Rayon source call needed migration.
+- **Primary release research:** crates.io reported non-yanked [Rayon
+  1.12.0](https://crates.io/crates/rayon/1.12.0) as latest stable on
+  2026-07-12. Its published archive identifies source commit
+  [`c9ced185ae35`](https://github.com/rayon-rs/rayon/commit/c9ced185ae3508246a9eb70c8407a1199bb1b77f).
+  The [upstream release
+  record](https://github.com/rayon-rs/rayon/blob/v1.12.0/RELEASES.md) says
+  1.11 raised MSRV to Rust 1.80, retained deprecated `repeatn` as a compatible
+  alias for `repeat_n`, and fixed `in_place_scope`; 1.12 fixed parallel
+  `Range<char>` at the surrogate boundary, which had unsafely produced
+  invalid `char` values. ScriptBots uses `ThreadPoolBuilder`, `par_iter`,
+  `par_iter_mut`, and `par_chunks_mut`, not either renamed iteration helper or
+  parallel character ranges.
+- **Features, MSRV, and license:** the crate declares Rust 1.80 and `MIT OR
+  Apache-2.0`, both compatible with the workspace Rust 1.89 floor and license
+  policy. The optional `web_spin_lock` feature remains disabled; this update
+  adds no feature and does not change the existing native-only thread-pool
+  configuration boundary.
+- **Security:** the selected release contains the upstream invalid-`char`
+  safety fix. RustSec had no package advisory page for Rayon at the review
+  instant. Because the lock is byte-identical, this floor cannot introduce a
+  new package advisory; the final whole-lock audit remains the transitive
+  authority.
+- **Exact manifest and lock boundary:** root-manifest SHA-256 changes from
+  `87d3468f6991d1231a9c74ddb05ff87b91c062471e0d07fd8faeab185831f015`
+  to
+  `4fc7957fca4372c359448cf047a9e00fb786eaf6dd5b78b7a8f016646eb0f4e0`.
+  `Cargo.lock` is byte-identical before and after at
+  `fae88a0e2b3f113fbab1426929b5064e6d8a76460aa55e261beadb7956a2b8f3`;
+  an empty `git diff -- Cargo.lock` is part of this sub-update's acceptance.
+- **Determinism and identity proof:** before mutation, the current-protocol
+  scalar/SIMD by serial/parallel matrix passed the same 13 scientific
+  integration tests in all four configurations (52/52 total), including the
+  seeded regression and chunk-boundary eyesight oracles. The live uniform
+  grid passed all eight dense/sparse toroidal and duplicate-delivery oracles.
+  The five stable-identity gates passed: UID snapshot/churn non-reuse,
+  deterministic spawn/birth ordinals independent of slot handles, sensor tie
+  attribution across slot reuse, death-record retention, and child identity.
+  After the Rayon floor, the default core library passed 151/151 tests and
+  the parallel-scalar and parallel-SIMD integration lanes each passed 13/13.
+- **Workspace proof:** `cargo check --locked --workspace --all-targets`
+  passed on the pinned `nightly-2026-07-09` remote worker. The only diagnostic
+  was the pre-existing future-incompatibility notice for transitive
+  `proc-macro-error2 2.0.1`; Rayon introduced no warning or deprecation.
+- **Performance proof:** with `RAYON_NUM_THREADS=4`, eight steps, 1,000
+  agents, ten Criterion samples, one-second warmup, and three-second
+  measurement on the same worker, the current-protocol pre-update estimate
+  was `[11.023 ms 12.640 ms 14.857 ms]`. The floor-only result was
+  `[11.133 ms 14.926 ms 20.179 ms]`; Criterion measured change
+  `[-22.272%, +6.4682%, +41.325%]` with `p=0.71` and explicitly reported no
+  performance change. The wide confidence intervals and unchanged executable
+  resolution make this noise, not evidence of a regression.
+- **Result and rollback:** accepted as a manifest-floor correction with no
+  scientific, identity, feature, package-graph, or source-behavior change.
+  Roll back only the one root `rayon` declaration and this Rayon log section;
+  `Cargo.lock` and core source require no rollback. Do not use reset,
+  checkout, stash, clean, or file deletion.
