@@ -15723,6 +15723,213 @@ mod tests {
         assert_eq!(history.last().map(|s| s.tick), Some(Tick(6)));
     }
 
+    /// A brain with actual heritable WEIGHTS.
+    ///
+    /// `StubBrain` is stateless, so it can prove nothing about heredity: a
+    /// reproduction path that dropped the parent's brain entirely and handed the
+    /// child a fresh one would look identical. This one carries genome material,
+    /// so "did the child inherit it" is a question with an answer.
+    #[derive(Clone)]
+    struct HeritableBrain {
+        weights: Vec<f32>,
+    }
+
+    impl HeritableBrain {
+        fn new(seed: f32) -> Self {
+            Self {
+                weights: (0..8).map(|i| seed + i as f32 * 0.125).collect(),
+            }
+        }
+
+        /// The genome, as a bit-exact fingerprint. Comparing floats by VALUE would
+        /// let a re-randomized brain that happened to land nearby slip through.
+        fn genome_digest(&self) -> Vec<u32> {
+            self.weights.iter().map(|w| w.to_bits()).collect()
+        }
+    }
+
+    impl BrainRunner for HeritableBrain {
+        fn kind(&self) -> &'static str {
+            "heritable"
+        }
+
+        fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+            [0.0; OUTPUT_SIZE]
+        }
+
+        fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+
+        fn mutate(
+            &mut self,
+            rng: &mut dyn RandomStream,
+            rate: f32,
+            scale: f32,
+        ) -> Result<(), BrainSpawnError> {
+            for weight in &mut self.weights {
+                // The RNG is drawn EVERY time, whatever the rate. A mutate() that
+                // short-circuits on rate == 0 would consume a different number of
+                // draws than one that does not, and the whole run would diverge
+                // from the same seed depending on a mutation rate.
+                let roll: f32 = rng.random::<f32>();
+                if roll < rate {
+                    *weight += scale;
+                }
+            }
+            Ok(())
+        }
+
+        fn crossover(
+            &self,
+            partner: &dyn BrainRunner,
+            _rng: &mut dyn RandomStream,
+        ) -> Option<Box<dyn BrainRunner>> {
+            let partner = partner.as_any()?.downcast_ref::<Self>()?;
+            // Deterministic recombination: even loci from self, odd from the partner.
+            // A random split would be fine too, but a FIXED one makes the test able
+            // to say exactly which parent each locus came from.
+            let weights = self
+                .weights
+                .iter()
+                .zip(&partner.weights)
+                .enumerate()
+                .map(|(i, (mine, theirs))| if i % 2 == 0 { *mine } else { *theirs })
+                .collect();
+            Some(Box::new(Self { weights }))
+        }
+
+        fn as_any(&self) -> Option<&(dyn Any + Send + Sync)> {
+            Some(self)
+        }
+    }
+
+    /// Breed one child from a heritable parent and hand back both genomes.
+    fn breed_one_child(mutation_rate: f32, mutation_scale: f32) -> (Vec<u32>, Vec<u32>) {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            // A threshold of 0.0 DISABLES reproduction outright (stage_reproduction
+            // returns early), so it must be positive and the parent must clear it.
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 0,
+            // The cadence gates reproduction too: without these the parent clears
+            // every energy check and still never breeds.
+            reproduction_attempt_interval: 0,
+            reproduction_attempt_chance: 1.0,
+            reproduction_child_energy: 1.0,
+            // Meta-mutation OFF: the child must inherit the parent's mutation rates
+            // EXACTLY, or "zero mutation" would not actually be zero and the proof
+            // below would be measuring the wrong thing.
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            reproduction_mutation_scale: mutation_scale,
+            rng_seed: Some(31),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let key = world
+            .brain_registry_mut()
+            .register("heritable", |_rng| Ok(Box::new(HeritableBrain::new(0.5))));
+
+        let parent = world.spawn_agent(sample_agent(0));
+        assert!(world.bind_agent_brain(parent, key).expect("bind parent"));
+
+        let parent_genome = world
+            .agent_runtime(parent)
+            .and_then(|runtime| runtime.brain.runner())
+            .and_then(|runner| runner.as_any())
+            .and_then(|any| any.downcast_ref::<HeritableBrain>())
+            .map(HeritableBrain::genome_digest)
+            .expect("the parent must actually carry a heritable brain");
+
+        // The mutation rates live on the AGENT, not the config, and the child derives
+        // them from the parent — so this is where "no mutation" is actually set.
+        if let Some(runtime) = world.agent_runtime_mut(parent) {
+            runtime.mutation_rates.primary = mutation_rate;
+            runtime.mutation_rates.secondary = mutation_scale;
+            runtime.reproduction_counter = f32::MAX;
+            // Clear the reproduction energy threshold, which must be POSITIVE or
+            // stage_reproduction returns immediately and nothing breeds at all.
+            runtime.energy = 5.0;
+        }
+        let before = world.agents().len();
+        for _ in 0..8 {
+            world.step().expect("step");
+            if world.agents().len() > before {
+                break;
+            }
+        }
+        assert!(
+            world.agents().len() > before,
+            "the fixture never reproduced, so this test proves nothing about heredity"
+        );
+
+        let child = world
+            .agents()
+            .iter_handles()
+            .find(|id| *id != parent)
+            .expect("a child exists");
+        let child_genome = world
+            .agent_runtime(child)
+            .and_then(|runtime| runtime.brain.runner())
+            .and_then(|runner| runner.as_any())
+            .and_then(|any| any.downcast_ref::<HeritableBrain>())
+            .map(HeritableBrain::genome_digest)
+            .expect(
+                "THE CHILD HAS NO HERITABLE BRAIN. Reproduction dropped the parent's \
+                 genome and handed the child something else — this simulator is a \
+                 random-restart simulator wearing an evolution simulator's clothes.",
+            );
+
+        (parent_genome, child_genome)
+    }
+
+    #[test]
+    fn with_no_mutation_a_child_genome_is_bit_identical_to_its_parent() {
+        // THE PROOF THIS BEAD OWES. Heredity was fixed once; the codebase's evidence
+        // that it STAYED fixed was "it compiles", which is not evidence.
+        //
+        // Zero mutation is the cleanest possible test: if the child's genome is
+        // bit-identical to the parent's, inheritance provably works. If a single
+        // locus differs, something in the spawn path is re-randomizing the brain —
+        // and that regression would be INVISIBLE, because the population would still
+        // look perfectly alive while evolution had silently stopped.
+        let (parent, child) = breed_one_child(0.0, 0.0);
+        assert_eq!(
+            child, parent,
+            "with mutation disabled the child's genome MUST be the parent's, bit for \
+             bit. A single differing locus means the brain was re-randomized somewhere \
+             in the spawn path, and this project is no longer simulating evolution."
+        );
+    }
+
+    #[test]
+    fn with_mutation_the_child_actually_differs_from_its_parent() {
+        // The other half of the matched pair. Without this, "the child equals the
+        // parent" could be satisfied by a mutate() that does nothing at all — and a
+        // population that never mutates is just as dead as one that never inherits.
+        let (parent, child) = breed_one_child(1.0, 0.25);
+        assert_ne!(
+            child, parent,
+            "with mutation at full rate the child's genome MUST differ from the \
+             parent's. If it does not, mutation is not being applied and the \
+             population cannot evolve — the previous test would then be passing for \
+             the wrong reason."
+        );
+        assert_eq!(
+            child.len(),
+            parent.len(),
+            "mutation must perturb the genome, not resize it"
+        );
+    }
+
     struct StubBrain;
 
     impl BrainRunner for StubBrain {
