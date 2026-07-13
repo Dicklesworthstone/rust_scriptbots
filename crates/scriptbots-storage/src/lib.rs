@@ -4673,29 +4673,196 @@ fn reap_storage_request(request: StorageReapRequest) {
     }
 }
 
+/// Most reaper threads that may exist at once, across every storage path.
+///
+/// The old handoff spawned ONE INDEPENDENT OS THREAD PER TIMEOUT, with no bound.
+/// A slow or wedged disk does not time out once; it times out over and over, and
+/// each timeout spawned another thread that then blocked on the same sick disk.
+/// The failure mode is a thread-count explosion caused BY the thing that was
+/// already failing — the process runs out of threads while trying to clean up
+/// after a disk that stopped answering.
+const MAX_CONCURRENT_REAPERS: usize = 4;
+
+/// The supervisor registry: who is being reaped, and who is waiting.
+///
+/// Keyed by storage PATH, which is what makes coalescing correct. Two timeouts on
+/// the same path do not need two reapers — the second is queued behind the first
+/// and drained by it. Two timeouts on DIFFERENT paths must not block each other,
+/// which is why the key is the path and not a single global lock on "reaping".
+#[derive(Default)]
+struct ReaperRegistry {
+    /// Paths with a live reaper thread.
+    active: BTreeSet<String>,
+    /// Requests waiting behind an active reaper, per path.
+    ///
+    /// A queued request is NEVER dropped: the reaper that owns the path drains
+    /// this before it retires. Dropping one would leak a `JoinHandle` and lose a
+    /// receipt, which is the one thing the storage contract cannot tolerate.
+    queued: BTreeMap<String, Vec<StorageReapRequest>>,
+    /// Reaper threads started.
+    started: u64,
+    /// Handoffs folded into an existing reaper rather than spawning a new thread.
+    coalesced: u64,
+    /// Handoffs run on the CALLER's thread because the registry was saturated or
+    /// the spawn failed.
+    synchronous: u64,
+}
+
+/// A snapshot of the reaper registry, for operators and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReaperStats {
+    /// Paths currently being reaped.
+    pub active: usize,
+    /// Requests waiting behind an active reaper.
+    pub queued: usize,
+    /// Reaper threads started since process start.
+    pub started: u64,
+    /// Handoffs coalesced onto an existing reaper.
+    pub coalesced: u64,
+    /// Handoffs that fell back to running synchronously.
+    pub synchronous: u64,
+}
+
+fn reaper_registry() -> &'static Mutex<ReaperRegistry> {
+    static REGISTRY: OnceLock<Mutex<ReaperRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(ReaperRegistry::default()))
+}
+
+fn lock_reaper_registry() -> std::sync::MutexGuard<'static, ReaperRegistry> {
+    // A poisoned registry is recoverable: the contents are counters and queues, not
+    // invariants a panic could have half-broken. Refusing to reap because a previous
+    // reaper panicked would leak every subsequent worker.
+    match reaper_registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Current state of the supervised-reap registry.
+#[must_use]
+pub fn storage_reaper_stats() -> ReaperStats {
+    let registry = lock_reaper_registry();
+    ReaperStats {
+        active: registry.active.len(),
+        queued: registry.queued.values().map(Vec::len).sum(),
+        started: registry.started,
+        coalesced: registry.coalesced,
+        synchronous: registry.synchronous,
+    }
+}
+
+fn request_path(request: &StorageReapRequest) -> String {
+    match request {
+        StorageReapRequest::Pipeline { path, .. } | StorageReapRequest::JoinOnly { path, .. } => {
+            path.to_string()
+        }
+    }
+}
+
 fn handoff_storage_reap(request: StorageReapRequest) {
-    let request = Arc::new(Mutex::new(Some(request)));
-    let background = Arc::clone(&request);
+    let path = request_path(&request);
+
+    // Decide under the lock, then act outside it: reaping JOINS a worker thread,
+    // and joining while holding the registry lock would let one sick path stall
+    // every other path's handoff — the exact cross-path blocking this bead forbids.
+    let action = {
+        let mut registry = lock_reaper_registry();
+        if registry.active.contains(&path) {
+            // COALESCE. A path already has a reaper; a second thread would just
+            // queue behind the same worker. Hand the request to the running reaper,
+            // which drains this before it retires.
+            registry.coalesced += 1;
+            registry
+                .queued
+                .entry(path.clone())
+                .or_default()
+                .push(request);
+            return;
+        }
+        if registry.active.len() >= MAX_CONCURRENT_REAPERS {
+            // SATURATED. Run on the caller's thread rather than spawning past the
+            // bound. This is the same fallback the old code used when `spawn`
+            // failed, and it is what makes the bound a real bound: the work still
+            // happens, the handle is still joined, and no receipt is dropped — the
+            // caller simply pays for it.
+            registry.synchronous += 1;
+            ReaperAction::Synchronous(request)
+        } else {
+            registry.active.insert(path.clone());
+            registry.started += 1;
+            ReaperAction::Spawn(request)
+        }
+    };
+
+    let request = match action {
+        ReaperAction::Synchronous(request) => {
+            reap_storage_request(request);
+            return;
+        }
+        ReaperAction::Spawn(request) => request,
+    };
+
+    let thread_path = path.clone();
+    // The request travels in a shared slot rather than being moved into the
+    // closure. `thread::Builder::spawn` DROPS the closure when it fails, and
+    // dropping this request would drop the worker's JoinHandle with it — leaking
+    // the very thread we are trying to reap. The slot lets the caller take it back.
+    let slot = Arc::new(Mutex::new(Some(request)));
+    let thread_slot = Arc::clone(&slot);
     let spawned = thread::Builder::new()
         .name("scriptbots-storage-reaper".into())
         .spawn(move || {
-            let request = match background.lock() {
-                Ok(mut request) => request.take(),
+            let mut current = match thread_slot.lock() {
+                Ok(mut slot) => slot.take(),
                 Err(poisoned) => poisoned.into_inner().take(),
             };
-            if let Some(request) = request {
+            while let Some(request) = current.take() {
                 reap_storage_request(request);
+                // Drain anything that arrived for this path while we were joining.
+                // Retiring with a queued request still in the registry would leak
+                // its JoinHandle forever.
+                let mut registry = lock_reaper_registry();
+                current = registry
+                    .queued
+                    .get_mut(&thread_path)
+                    .and_then(std::vec::Vec::pop);
+                if current.is_none() {
+                    registry.queued.remove(&thread_path);
+                    registry.active.remove(&thread_path);
+                }
             }
         });
-    if spawned.is_err() {
-        let request = match request.lock() {
-            Ok(mut request) => request.take(),
+
+    if let Err(error) = spawned {
+        // The spawn failed, so nobody owns this path. Release it and do the work
+        // here — losing the request because the OS would not give us a thread would
+        // leak the very worker we were trying to clean up after.
+        let mut registry = lock_reaper_registry();
+        registry.active.remove(&path);
+        registry.synchronous += 1;
+        let queued = registry.queued.remove(&path).unwrap_or_default();
+        drop(registry);
+        tracing::warn!(
+            path = %path,
+            error = %error,
+            "could not spawn a storage reaper; reaping synchronously on the caller"
+        );
+        let request = match slot.lock() {
+            Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(request) = request {
             reap_storage_request(request);
         }
+        for request in queued {
+            reap_storage_request(request);
+        }
     }
+}
+
+enum ReaperAction {
+    Spawn(StorageReapRequest),
+    Synchronous(StorageReapRequest),
 }
 
 /// Host-owned controller for flush receipts, shutdown acknowledgement, and worker join.
