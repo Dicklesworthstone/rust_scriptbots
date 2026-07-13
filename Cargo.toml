@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 rust-version = "1.89"
 authors = ["ScriptBots Team"]
 description = "Evolutionary agent simulation rebuilt in modern Rust with GPUI rendering."
@@ -91,6 +91,10 @@ strip = false
 
 [workspace.metadata.dist]
 ci = ["github"]
+# bd-2z0.13.6: release archives must carry the third-party notice file —
+# the embedded FrankenSQLite/asupersync components' license requires its
+# rider to accompany any distribution (see docs/licenses.md §3c).
+include = ["THIRD-PARTY-LICENSES.md"]
 
 [[workspace.metadata.dist.product]]
 package = "scriptbots-app"

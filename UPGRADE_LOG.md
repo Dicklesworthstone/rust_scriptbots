@@ -1156,3 +1156,22 @@ No version migration in this ledger is authorized merely by being newer.
   lines, the world-gfx workspace-inheritance line, this log entry, and the
   exact plan status marker. `Cargo.lock` needs no rollback. Do not use reset,
   checkout, stash, clean, or delete any file.
+
+## 2026-07-13 — Relicense the whole project to LicenseRef-MIT-OpenAI-Anthropic-Rider (owner directive)
+
+- **Authorization (verbatim, in-session):** "wait just make the whole project
+  licensed under the `LicenseRef-MIT-OpenAI-Anthropic-Rider` license, that's
+  better and simpler" — project owner, 2026-07-13.
+- **What changed:** `[workspace.package] license` in `Cargo.toml` (was
+  `MIT OR Apache-2.0`), `crates/scriptbots-world-gfx/Cargo.toml` (hardcoded
+  dual license → `license.workspace = true`), README Licensing section,
+  `THIRD-PARTY-LICENSES.md` §1, `docs/licenses.md` header + §3 status, PLAN
+  §license gate note. The root `LICENSE` file needed NO change — it already
+  carried the rider text verbatim (byte-identical to the franken-family
+  canonical, sha `32a82e0a…3509`); the manifest/doc claims were the drift.
+- **Effect:** first-party and embedded franken components now share one
+  license. The earlier combined-work analysis (docs/licenses.md §3) is moot;
+  the "pending owner sign-off" flag from the bd-2z0.8.15 audit is resolved.
+  Earlier entries above that warned against describing the product as only
+  `MIT OR Apache-2.0` are preserved as history; that description is now
+  simply incorrect everywhere.

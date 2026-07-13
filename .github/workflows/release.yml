@@ -106,6 +106,40 @@ jobs:
           CARGO_BUILD_TARGET: ${{ matrix.build_target }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
 
+      - name: Verify third-party license notice in artifacts (bd-2z0.13.6)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANON_SHA="32a82e0a5754e72e51fae44b65a936c831c07376f21c90f5fb9e76897fcc3509"
+          found_any=0
+          for ARCHIVE in ./dist/*.tar.* ./dist/*.zip; do
+            [[ -e "$ARCHIVE" ]] || continue
+            found_any=1
+            TMP_DIR=$(mktemp -d)
+            case "$ARCHIVE" in
+              *.tar.xz) tar -xJf "$ARCHIVE" -C "$TMP_DIR" ;;
+              *.tar.gz) tar -xzf "$ARCHIVE" -C "$TMP_DIR" ;;
+              *.zip)    unzip -q "$ARCHIVE" -d "$TMP_DIR" ;;
+              *) echo "::warning::unknown archive format: $ARCHIVE"; rm -rf "$TMP_DIR"; continue ;;
+            esac
+            NOTICE=$(find "$TMP_DIR" -maxdepth 3 -name "THIRD-PARTY-LICENSES.md" | head -n 1 || true)
+            if [[ -z "$NOTICE" ]]; then
+              echo "::error::$ARCHIVE does not contain THIRD-PARTY-LICENSES.md — the rider's include-with-distribution obligation is unmet (bd-2z0.13.6)"
+              rm -rf "$TMP_DIR"; exit 1
+            fi
+            BLOCK_SHA=$(sed -n '/^BEGIN LICENSE TEXT$/,/^END LICENSE TEXT$/p' "$NOTICE" | sed '1d;$d' | shasum -a 256 | cut -d' ' -f1)
+            if [[ "$BLOCK_SHA" != "$CANON_SHA" ]]; then
+              echo "::error::$ARCHIVE notice's embedded license block sha ($BLOCK_SHA) != canonical ($CANON_SHA) — rider text drifted"
+              rm -rf "$TMP_DIR"; exit 1
+            fi
+            echo "verified: $ARCHIVE carries THIRD-PARTY-LICENSES.md with canonical rider block"
+            rm -rf "$TMP_DIR"
+          done
+          if [[ "$found_any" == "0" ]]; then
+            echo "::error::no archives found in ./dist to verify"
+            exit 1
+          fi
+
       - name: Codesign macOS artifacts
         if: ${{ matrix.apple }}
         shell: bash

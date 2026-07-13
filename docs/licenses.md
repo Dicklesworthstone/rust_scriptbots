@@ -1,13 +1,22 @@
 # Dependency License Audit — Franken Family (bd-2z0.8.15)
 
-Status: **recorded 2026-07-12 by GoldenOtter; pending owner sign-off** (flagged in the
-bd-2z0.8.15 close comment). This document is the canonical license reference the
-franken dependency-admission beads (bd-2z0.11.6, bd-2z0.11.7, bd-2z0.11.8,
-bd-2z0.3.12.1) cite before touching `Cargo.toml`. Program context: bd-2js6.
+Status: **recorded 2026-07-12 by GoldenOtter; OWNER SIGN-OFF RESOLVED 2026-07-13**
+by the relicensing directive below. This document is the canonical license
+reference the franken dependency-admission beads (bd-2z0.11.6, bd-2z0.11.7,
+bd-2z0.11.8, bd-2z0.3.12.1) cite before touching `Cargo.toml`. Program
+context: bd-2js6.
 
-First-party rule, unchanged: all code in this repository is
-`MIT OR Apache-2.0` (`Cargo.toml` `[workspace.package] license`).
-Nothing in this document alters the first-party license.
+> **RELICENSING DECISION (owner directive, 2026-07-13).** The whole project is
+> licensed `LicenseRef-MIT-OpenAI-Anthropic-Rider` — the same license as the
+> franken family. Owner's words: "make the whole project licensed under the
+> LicenseRef-MIT-OpenAI-Anthropic-Rider license, that's better and simpler."
+> The repository `LICENSE` file already carried the rider text verbatim
+> (byte-identical to the family sha in §1); the `MIT OR Apache-2.0` claims in
+> the workspace manifest and docs were the inconsistency, now fixed. The
+> §3 combined-work analysis below is retained for the historical record but is
+> LARGELY MOOT: first-party and embedded components now share one license, so
+> there is no dual-license split to reason about — recipients get everything
+> under the rider, and Restricted Parties have no rights to any of it.
 
 ## 1. The license every franken component carries
 
@@ -86,12 +95,15 @@ combined work containing rider-licensed object code. Two obligations follow:
 components to Restricted Parties is a counsel-grade question this project does
 not resolve. Position taken: the owner's own hosting/releases are unambiguous
 (he is the grantor); third parties receive the disclosure in (c) and carry
-their own compliance burden. **Accepted risk, pending owner sign-off.**
+their own compliance burden. **Accepted risk — superseded by the 2026-07-13
+relicensing decision (header), which removes the dual-license ambiguity.**
 
-**(e) Effective license statement for this project:** first-party code
-`MIT OR Apache-2.0`; distributed artifacts additionally contain components under
-`LicenseRef-MIT-OpenAI-Anthropic-Rider`, under which **no rights are granted to
-OpenAI, Anthropic, their affiliates, or parties acting for them.**
+**(e) Effective license statement for this project (updated 2026-07-13):**
+everything — first-party code and distributed artifacts alike — is licensed
+`LicenseRef-MIT-OpenAI-Anthropic-Rider`, under which **no rights are granted
+to OpenAI, Anthropic, their affiliates, or parties acting for them.**
+(Pre-relicense text said: first-party `MIT OR Apache-2.0` + embedded rider
+components; kept here only as a record of what changed.)
 
 ## 4. Enforcement
 
