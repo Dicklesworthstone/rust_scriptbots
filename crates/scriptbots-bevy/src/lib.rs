@@ -4723,7 +4723,7 @@ mod tests {
     }
 
     #[test]
-    fn bevy_offscreen_renderer_produces_png() -> Result<()> {
+    fn bevy_scene_cpu_surrogate_raster_produces_png() -> Result<()> {
         let config = ScriptBotsConfig::default();
         let mut world = WorldState::new(config).expect("world initialization");
         for _ in 0..32 {

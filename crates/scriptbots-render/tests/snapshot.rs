@@ -49,7 +49,7 @@ fn seed_agents(world: &mut WorldState, brain_key: u64) {
 }
 
 #[test]
-fn rust_renderer_matches_golden_snapshot() {
+fn scriptbots_render_cpu_surrogate_raster_matches_semantic_golden() {
     let config = ScriptBotsConfig {
         rng_seed: Some(424_242),
         ..ScriptBotsConfig::default()
@@ -77,7 +77,7 @@ fn rust_renderer_matches_golden_snapshot() {
         return;
     }
     let expected = fs::read(&golden_path).expect(
-        "golden snapshot missing; generate locally with: RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-render --test snapshot rust_renderer_matches_golden_snapshot -- --exact --nocapture",
+        "CPU-surrogate semantic golden missing; this test does not exercise a GPUI window, GPUI paint, or wgpu framebuffer. Generate the candidate locally with: RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-render --test snapshot scriptbots_render_cpu_surrogate_raster_matches_semantic_golden -- --exact --nocapture; then review the image and Git diff before committing it",
     );
 
     if png != expected {
@@ -86,7 +86,7 @@ fn rust_renderer_matches_golden_snapshot() {
         let actual_path = failure_dir.join("rust_default.actual.png");
         fs::write(&actual_path, &png).expect("write actual snapshot");
         panic!(
-            "Rust snapshot diverged from golden.\nexpected: {}\nactual: {}",
+            "scriptbots-render CPU-surrogate raster diverged from its semantic golden; this is not evidence about the shipped GPUI or wgpu framebuffer.\nexpected: {}\nactual: {}",
             golden_path.display(),
             actual_path.display()
         );

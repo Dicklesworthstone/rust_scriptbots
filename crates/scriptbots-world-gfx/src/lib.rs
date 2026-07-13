@@ -299,10 +299,10 @@ impl WorldRenderer {
 mod capture_smoke_test {
     use super::*;
 
-    // Not a real unit test; handy local harness to write one frame PNG for diagnosis.
-    // Run: `cargo test -p scriptbots-world-gfx capture_smoke -- --nocapture`
+    // This executes the real offscreen wgpu pipeline and blocking GPU readback.
+    // It is not a GPUI window, Bevy render graph, or on-screen presentation test.
     #[test]
-    fn capture_smoke() {
+    fn wgpu_offscreen_gpu_framebuffer_readback_is_populated() {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -326,25 +326,23 @@ mod capture_smoke_test {
             agents: &[],
         };
         let frame = renderer.render(&snapshot);
-        renderer.copy_to_readback(&frame).unwrap();
-        if let Some(view) = renderer.mapped_rgba() {
-            let row_bytes = (view.width as usize) * 4;
-            let mut tight = vec![0u8; row_bytes * (view.height as usize)];
-            let src = view.bytes();
-            for y in 0..(view.height as usize) {
-                let s = y * (view.bytes_per_row as usize);
-                let d = y * row_bytes;
-                tight[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
-            }
-            let _ = image::save_buffer_with_format(
-                "wgpu_capture_smoke.png",
-                &tight,
-                view.width,
-                view.height,
-                image::ColorType::Rgba8,
-                image::ImageFormat::Png,
-            );
-        }
+        renderer
+            .copy_to_readback(&frame)
+            .expect("real wgpu offscreen framebuffer copy");
+        let view = renderer
+            .mapped_rgba()
+            .expect("real wgpu framebuffer readback must map instead of passing ceremonially");
+        assert_eq!((view.width, view.height), size);
+        assert!(view.bytes_per_row >= view.width * 4);
+        let bytes = view.bytes();
+        assert_eq!(
+            bytes.len(),
+            view.bytes_per_row as usize * view.height as usize
+        );
+        assert!(
+            bytes.iter().any(|byte| *byte != 0),
+            "real wgpu framebuffer readback must contain rendered color data"
+        );
     }
 }
 

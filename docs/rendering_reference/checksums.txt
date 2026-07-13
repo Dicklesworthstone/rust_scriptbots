@@ -1,4 +1,5 @@
-# Active approved semantic-render references (SHA-256).
+# Active approved CPU-surrogate semantic-render references (SHA-256).
+# These images do not come from GPUI, a Bevy App/render graph, or a live GPU framebuffer.
 # Paths are relative to this directory. Every entry must exist in Git.
 # Unavailable legacy-capture hashes remain historical evidence in
 # legacy_capture_checklist.md; they are deliberately excluded from this manifest.

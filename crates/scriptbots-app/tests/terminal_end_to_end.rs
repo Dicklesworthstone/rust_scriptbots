@@ -52,6 +52,23 @@ struct FrameStatsDto {
     births: usize,
     deaths: usize,
     avg_energy: f32,
+    buffer: Option<HeadlessBufferEvidenceDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadlessBufferEvidenceDto {
+    backend: String,
+    capability_profile: String,
+    viewport_width: u16,
+    viewport_height: u16,
+    current_tick: u64,
+    non_blank_cells: usize,
+    styled_cells: usize,
+    skipped_cells: usize,
+    forced_width_cells: usize,
+    empty_symbol_cells: usize,
+    full_cell_fnv1a64: String,
+    semantic_regions: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -76,9 +93,62 @@ struct HeadlessReportDto {
     summary: ReportSummaryDto,
 }
 
+fn assert_test_backend_buffer_evidence(report: &HeadlessReportDto) {
+    assert!(
+        report.initial.buffer.is_none(),
+        "the initial measurement precedes the first rendered frame"
+    );
+    for frame in &report.frames {
+        let buffer = frame
+            .buffer
+            .as_ref()
+            .expect("every TestBackend frame must retain rendered-buffer evidence");
+        assert_eq!(buffer.backend, "ratatui_test_backend");
+        assert_eq!(
+            buffer.capability_profile, "ascii_natural_fixed_80x36",
+            "headless evidence must identify its deterministic non-live capability profile"
+        );
+        assert_eq!((buffer.viewport_width, buffer.viewport_height), (80, 36));
+        assert_eq!(
+            buffer.current_tick, frame.tick,
+            "rendered tick text must describe the same snapshot as the frame report"
+        );
+        assert!(
+            buffer.non_blank_cells > 100,
+            "the TestBackend frame must contain substantive rendered content"
+        );
+        assert!(
+            buffer.styled_cells > 0,
+            "the full-cell proof must cover styles"
+        );
+        assert_eq!(
+            buffer.skipped_cells, 0,
+            "the ASCII TestBackend profile must not skip cells"
+        );
+        assert_eq!(
+            buffer.forced_width_cells, 0,
+            "the ASCII TestBackend profile must not require forced-width cells"
+        );
+        assert_eq!(
+            buffer.empty_symbol_cells, 0,
+            "the ASCII TestBackend profile must fill each cell symbol"
+        );
+        assert_eq!(
+            buffer.full_cell_fnv1a64.len(),
+            16,
+            "buffer evidence must include the full deterministic FNV-1a digest"
+        );
+        assert_eq!(
+            buffer.semantic_regions,
+            ["terminal_hud", "current_tick", "world_map", "vital_stats"],
+            "buffer evidence must come from the expected terminal HUD regions"
+        );
+    }
+}
+
 #[test]
 #[serial]
-fn terminal_headless_generates_report() -> Result<()> {
+fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
     let _env_guard = ENV_GUARD
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -194,6 +264,7 @@ fn terminal_headless_generates_report() -> Result<()> {
 
     let report_contents = std::fs::read_to_string(&report_path)?;
     let report: HeadlessReportDto = serde_json::from_str(&report_contents)?;
+    assert_test_backend_buffer_evidence(&report);
     let summary = &report.summary;
 
     assert_eq!(
@@ -300,7 +371,7 @@ fn terminal_headless_generates_report() -> Result<()> {
 
 #[test]
 #[serial]
-fn terminal_headless_applies_control_updates() -> Result<()> {
+fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Result<()> {
     let _env_guard = ENV_GUARD
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -462,6 +533,7 @@ fn terminal_headless_applies_control_updates() -> Result<()> {
 
     let report_contents = std::fs::read_to_string(&report_path)?;
     let report: HeadlessReportDto = serde_json::from_str(&report_contents)?;
+    assert_test_backend_buffer_evidence(&report);
     let summary = &report.summary;
 
     assert_eq!(summary.frame_count, frames);

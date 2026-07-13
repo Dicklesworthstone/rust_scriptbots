@@ -1662,7 +1662,7 @@ The existing `.gitignore` contains unrelated user changes. This bead must reserv
 
 **Exit:** two clean resolutions at the same commit produce the same lock and sources.
 
-#### 0.3 honest test assets
+#### 0.3 honest test assets [Completed — `bd-2z0.1.4`, 2026-07-12]
 
 Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
 
@@ -1670,8 +1670,23 @@ Golden-asset policy slice: [Completed — `bd-2z0.1.3`]
 - add tracked metadata-bearing golden directories [Completed — `bd-2z0.1.3`];
 - make missing goldens a clear failure with generation instructions [Completed — `bd-2z0.1.3`];
 - prohibit CI auto-bless [Completed — `bd-2z0.1.3`];
-- inspect TUI buffers;
-- require nonempty replay evidence.
+- inspect TUI buffers [Completed — the fixed 80x36 ASCII Ratatui `TestBackend`
+  frame carries backend/capability provenance, current tick, semantic regions,
+  exact cell counts, and a full-cell digest over coordinates, symbols, colors,
+  modifiers, and diff/width directives; a blank-buffer negative control proves
+  the detector fires];
+- require nonempty replay evidence [Completed — every nonzero verification now
+  requires both recorded/simulated event streams and recorded/simulated digest
+  streams, so event equality alone cannot certify a replay].
+
+Renderer evidence now names its real boundary. The compositor tests decode
+pixels, report software-adapter versus live-GPU provenance, and prove agent
+locality by differential frames; the lower-level `scriptbots-world-gfx` test
+requires a mapped, dimensionally correct, populated wgpu readback. The tracked
+Rust and Bevy images and their CI failures are explicitly CPU-surrogate semantic
+references, not GPUI/Bevy live-frame evidence. The pre-existing Bevy surrogate
+remains honestly red at maximum channel difference 212; this bead neither
+loosens that threshold nor blesses the current output.
 
 **Exit:** every advertised test exercises its named path or is renamed to describe its true scope.
 

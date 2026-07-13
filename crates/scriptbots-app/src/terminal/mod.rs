@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -19,7 +19,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -263,13 +263,16 @@ impl TerminalRenderer {
         let backend = ratatui::backend::TestBackend::new(80, 36);
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
+        app.palette = Palette::test_backend_evidence();
         let mut report = HeadlessReport::new(app.snapshot().clone());
 
         for _ in 0..frames {
             app.ensure_control_runtime_running()?;
             app.step_once();
-            report.record(app.snapshot());
             terminal.draw(|frame| app.draw(frame))?;
+            let buffer =
+                HeadlessBufferEvidence::inspect(terminal.backend().buffer(), app.snapshot().tick)?;
+            report.record(app.snapshot(), buffer);
         }
 
         report.finalize();
@@ -281,25 +284,6 @@ impl TerminalRenderer {
         }
 
         Ok(report)
-    }
-
-    /// Render exactly one frame and return the terminal buffer it drew into.
-    ///
-    /// `run_headless_frames` has always rendered into a real ratatui
-    /// `TestBackend` — and then thrown the buffer away. Nothing ever looked at
-    /// it, so the draw could have been a complete no-op and every "headless
-    /// frame" test would still have gone green on the strength of the simulation
-    /// having ticked. This hands the buffer back so a test can read what was
-    /// actually painted.
-    #[cfg(test)]
-    fn render_frame_to_buffer(&self, ctx: RendererContext<'_>) -> Result<ratatui::buffer::Buffer> {
-        let backend = ratatui::backend::TestBackend::new(80, 36);
-        let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
-        let mut app = TerminalApp::new(self, ctx);
-        app.ensure_control_runtime_running()?;
-        app.step_once();
-        terminal.draw(|frame| app.draw(frame))?;
-        Ok(terminal.backend().buffer().clone())
     }
 
     fn headless_frame_budget(&self) -> usize {
@@ -2507,14 +2491,15 @@ struct HeadlessReport {
 impl HeadlessReport {
     fn new(initial_snapshot: Snapshot) -> Self {
         Self {
-            initial: FrameStats::from_snapshot(&initial_snapshot),
+            initial: FrameStats::from_snapshot(&initial_snapshot, None),
             frames: Vec::new(),
             summary: ReportSummary::default(),
         }
     }
 
-    fn record(&mut self, snapshot: &Snapshot) {
-        self.frames.push(FrameStats::from_snapshot(snapshot));
+    fn record(&mut self, snapshot: &Snapshot, buffer: HeadlessBufferEvidence) {
+        self.frames
+            .push(FrameStats::from_snapshot(snapshot, Some(buffer)));
     }
 
     fn finalize(&mut self) {
@@ -2539,10 +2524,11 @@ struct FrameStats {
     births: usize,
     deaths: usize,
     avg_energy: f32,
+    buffer: Option<HeadlessBufferEvidence>,
 }
 
 impl FrameStats {
-    fn from_snapshot(snapshot: &Snapshot) -> Self {
+    fn from_snapshot(snapshot: &Snapshot, buffer: Option<HeadlessBufferEvidence>) -> Self {
         Self {
             tick: snapshot.tick,
             epoch: snapshot.epoch,
@@ -2550,7 +2536,128 @@ impl FrameStats {
             births: snapshot.births,
             deaths: snapshot.deaths,
             avg_energy: snapshot.avg_energy,
+            buffer,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct HeadlessBufferEvidence {
+    backend: &'static str,
+    capability_profile: &'static str,
+    viewport_width: u16,
+    viewport_height: u16,
+    current_tick: u64,
+    non_blank_cells: usize,
+    styled_cells: usize,
+    skipped_cells: usize,
+    forced_width_cells: usize,
+    empty_symbol_cells: usize,
+    full_cell_fnv1a64: String,
+    semantic_regions: Vec<&'static str>,
+}
+
+impl HeadlessBufferEvidence {
+    fn inspect(buffer: &Buffer, current_tick: u64) -> Result<Self> {
+        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let area = buffer.area;
+        let mut text = String::new();
+        let mut non_blank_cells = 0usize;
+        let mut styled_cells = 0usize;
+        let mut skipped_cells = 0usize;
+        let mut forced_width_cells = 0usize;
+        let mut empty_symbol_cells = 0usize;
+        let mut hash = OFFSET_BASIS;
+
+        let mut hash_bytes = |bytes: &[u8]| {
+            for byte in (bytes.len() as u64).to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+        };
+
+        hash_bytes(&area.width.to_le_bytes());
+        hash_bytes(&area.height.to_le_bytes());
+
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                let cell = &buffer[(x, y)];
+                let symbol = cell.symbol();
+                if !symbol.trim().is_empty() {
+                    non_blank_cells += 1;
+                }
+                if symbol.is_empty() {
+                    empty_symbol_cells += 1;
+                }
+                if matches!(cell.diff_option, CellDiffOption::Skip) {
+                    skipped_cells += 1;
+                }
+                if matches!(cell.diff_option, CellDiffOption::ForcedWidth(_)) {
+                    forced_width_cells += 1;
+                }
+                if cell.fg != Color::Reset
+                    || cell.bg != Color::Reset
+                    || cell.underline_color != Color::Reset
+                    || !cell.modifier.is_empty()
+                {
+                    styled_cells += 1;
+                }
+                text.push_str(symbol);
+                hash_bytes(&x.to_le_bytes());
+                hash_bytes(&y.to_le_bytes());
+                hash_bytes(symbol.as_bytes());
+                hash_bytes(format!("{:?}", cell.fg).as_bytes());
+                hash_bytes(format!("{:?}", cell.bg).as_bytes());
+                hash_bytes(format!("{:?}", cell.underline_color).as_bytes());
+                hash_bytes(format!("{:?}", cell.modifier).as_bytes());
+                hash_bytes(format!("{:?}", cell.diff_option).as_bytes());
+            }
+            text.push('\n');
+        }
+
+        let tick_label = format!("Tick {current_tick:>6}");
+        let required_regions = [
+            ("terminal_hud", "ScriptBots Terminal HUD"),
+            ("current_tick", tick_label.as_str()),
+            ("world_map", "World Map"),
+            ("vital_stats", "Vital Stats"),
+        ];
+        for (region, needle) in required_regions {
+            ensure!(
+                text.contains(needle),
+                "headless TestBackend frame at tick {current_tick} omitted required {region} content {needle:?} from its {}x{} buffer",
+                area.width,
+                area.height
+            );
+        }
+        ensure!(
+            non_blank_cells > 0,
+            "headless TestBackend frame at tick {current_tick} produced an empty buffer"
+        );
+
+        Ok(Self {
+            backend: "ratatui_test_backend",
+            capability_profile: "ascii_natural_fixed_80x36",
+            viewport_width: area.width,
+            viewport_height: area.height,
+            current_tick,
+            non_blank_cells,
+            styled_cells,
+            skipped_cells,
+            forced_width_cells,
+            empty_symbol_cells,
+            full_cell_fnv1a64: format!("{hash:016x}"),
+            semantic_regions: required_regions
+                .into_iter()
+                .map(|(region, _)| region)
+                .collect(),
+        })
     }
 }
 
@@ -2700,6 +2807,15 @@ fn rgb(hex: u32) -> Color {
 }
 
 impl Palette {
+    fn test_backend_evidence() -> Self {
+        Self {
+            level: None,
+            emoji: false,
+            emoji_narrow: false,
+            mode: TerminalPaletteMode::Natural,
+        }
+    }
+
     fn theme(&self) -> TerminalTheme {
         match self.mode {
             TerminalPaletteMode::Natural => TerminalTheme {
@@ -3477,6 +3593,7 @@ mod tests {
             population_minimum: 0,
             population_spawn_interval: 0,
             persistence_interval: 0,
+            rng_seed: Some(0xB0FF_EA11),
             ..ScriptBotsConfig::default()
         };
         Arc::new(std::sync::Mutex::new(
@@ -3485,7 +3602,7 @@ mod tests {
     }
 
     #[test]
-    fn live_tui_single_step_advances_exactly_once_and_stays_paused() {
+    fn terminal_app_key_handler_single_step_advances_exactly_once_and_stays_paused() {
         let world = command_characterization_world();
         let analytics = AnalyticsSnapshotProvider::empty();
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
@@ -3513,7 +3630,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_tui_single_frame_advances_exactly_once() {
+    fn headless_test_backend_frame_proves_buffer_semantics_and_current_tick() {
         let world = command_characterization_world();
         let analytics = AnalyticsSnapshotProvider::empty();
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
@@ -3533,74 +3650,53 @@ mod tests {
         assert_eq!(report.summary.frame_count, 1);
         assert_eq!(report.summary.ticks_simulated, 1);
         assert_eq!(report.summary.final_tick, report.initial.tick + 1);
+        let evidence = report.frames[0]
+            .buffer
+            .as_ref()
+            .expect("a rendered TestBackend frame must carry buffer evidence");
+        assert_eq!(evidence.viewport_width, 80);
+        assert_eq!(evidence.viewport_height, 36);
+        assert_eq!(evidence.current_tick, report.frames[0].tick);
+        assert_eq!(
+            (
+                evidence.non_blank_cells,
+                evidence.styled_cells,
+                evidence.skipped_cells,
+                evidence.forced_width_cells,
+                evidence.empty_symbol_cells,
+            ),
+            (2429, 1743, 0, 0, 0),
+            "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}"
+        );
+        assert_eq!(
+            evidence.full_cell_fnv1a64, "8ba8b5fc2f0f2f7a",
+            "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
+        );
+        assert_eq!(
+            evidence.semantic_regions,
+            ["terminal_hud", "current_tick", "world_map", "vital_stats"]
+        );
         assert_eq!(
             world.lock().expect("world lock").tick().0,
             report.initial.tick + 1
         );
-    }
 
-    /// Flatten a rendered buffer into the text a human would actually see.
-    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
-        let area = buffer.area();
-        let mut out = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                out.push_str(buffer[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    #[test]
-    fn the_headless_frame_actually_paints_the_hud_into_the_terminal_buffer() {
-        // The existing headless test asserts that the SIMULATION advanced, which
-        // it does honestly — but it says nothing whatsoever about rendering. The
-        // draw call could have been deleted, or could paint an empty screen, and
-        // that test would still pass. This one reads the buffer.
-        let world = command_characterization_world();
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
-        let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
+        let repeat_world = command_characterization_world();
+        let (repeat_runtime, repeat_drain, repeat_submit) = crate::servers::ControlRuntime::dummy();
+        let repeat_ctx = crate::renderer::RendererContext {
+            world: repeat_world,
+            analytics: AnalyticsSnapshotProvider::empty(),
+            control_runtime: &repeat_runtime,
+            command_drain: repeat_drain,
+            command_submit: repeat_submit,
         };
-
-        let buffer = renderer
-            .render_frame_to_buffer(ctx)
-            .expect("one rendered frame");
-        let text = buffer_text(&buffer);
-
-        assert!(
-            text.contains("ScriptBots Terminal HUD"),
-            "the HUD panel was never painted; the buffer holds:\n{text}"
-        );
-        assert!(
-            text.contains("Tick"),
-            "the status line was never painted; the buffer holds:\n{text}"
-        );
-        // And the world it reports must be THIS world, not a default-constructed
-        // one: the frame is supposed to be a view of the simulation, and a HUD
-        // that renders a plausible-looking screen for the wrong world is worse
-        // than one that renders nothing.
-        let tick = world.lock().expect("world lock").tick().0;
-        assert!(
-            text.contains(&format!("Tick {tick:>6}")),
-            "the HUD does not show the world's actual tick ({tick}); it holds:\n{text}"
-        );
-
-        let painted = buffer
-            .content()
-            .iter()
-            .filter(|cell| cell.symbol() != " ")
-            .count();
-        assert!(
-            painted > 200,
-            "only {painted} cells were painted — a near-blank frame is not a HUD"
+        let repeat = renderer
+            .run_headless_frames(repeat_ctx, 1)
+            .expect("repeat deterministic headless frame");
+        assert_eq!(
+            repeat.frames[0].buffer.as_ref(),
+            Some(evidence),
+            "the fixed-seed TestBackend buffer evidence must be deterministic"
         );
     }
 
@@ -3620,9 +3716,11 @@ mod tests {
             "an untouched buffer must read as zero painted cells, or the assertion \
              above proves nothing"
         );
+        let error = HeadlessBufferEvidence::inspect(&blank, 1)
+            .expect_err("the production TestBackend evidence inspector must reject a blank frame");
         assert!(
-            !buffer_text(&blank).contains("ScriptBots Terminal HUD"),
-            "an untouched buffer must not appear to contain the HUD"
+            error.to_string().contains("omitted required terminal_hud"),
+            "blank-frame rejection must identify the first missing semantic region: {error:#}"
         );
     }
 

@@ -1702,7 +1702,16 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
             "Simulated tick count differs from requested limit"
         );
     }
-    require_non_vacuous_replay(tick_limit, persisted_events.len(), replay_run.events.len())?;
+    // The current run database has no canonical replay-digest stream yet. Pass
+    // that absence explicitly so event equality cannot be promoted into a
+    // replay-verification success without the later digest instrumentation.
+    require_non_vacuous_replay(
+        tick_limit,
+        persisted_events.len(),
+        replay_run.events.len(),
+        0,
+        0,
+    )?;
     let diff = diff_event_stream(&persisted_events, &replay_run.events);
 
     let recorded_map = recorded_counts
@@ -1781,10 +1790,17 @@ fn require_non_vacuous_replay(
     tick_limit: u64,
     recorded_events: usize,
     simulated_events: usize,
+    recorded_digests: usize,
+    simulated_digests: usize,
 ) -> Result<()> {
-    if tick_limit > 0 && (recorded_events == 0 || simulated_events == 0) {
+    if tick_limit > 0
+        && (recorded_events == 0
+            || simulated_events == 0
+            || recorded_digests == 0
+            || simulated_digests == 0)
+    {
         bail!(
-            "replay verification refused a vacuous nonzero run: {recorded_events} recorded events and {simulated_events} simulated events across {tick_limit} ticks; production replay instrumentation is not yet complete"
+            "replay verification refused a vacuous nonzero run: events recorded={recorded_events} simulated={simulated_events}; digests recorded={recorded_digests} simulated={simulated_digests}; ticks={tick_limit}. Production replay event and canonical digest instrumentation must both provide nonempty evidence"
         );
     }
     Ok(())
@@ -3483,11 +3499,32 @@ activation = "Sigmoid"
     }
 
     #[test]
-    fn replay_verification_rejects_empty_nonzero_event_streams() {
-        let error = require_non_vacuous_replay(16, 0, 0)
+    fn replay_verification_requires_nonempty_event_and_digest_evidence() {
+        let error = require_non_vacuous_replay(16, 0, 0, 0, 0)
             .expect_err("empty nonzero replay must not be reported as verified");
         assert!(error.to_string().contains("refused a vacuous nonzero run"));
-        require_non_vacuous_replay(0, 0, 0).expect("a zero-tick replay is not vacuous");
+        assert!(error.to_string().contains("events recorded=0 simulated=0"));
+        assert!(error.to_string().contains("digests recorded=0 simulated=0"));
+
+        let missing_digests = require_non_vacuous_replay(16, 1, 1, 0, 0)
+            .expect_err("event equality without digest evidence must fail closed");
+        assert!(
+            missing_digests
+                .to_string()
+                .contains("digests recorded=0 simulated=0")
+        );
+
+        let missing_events = require_non_vacuous_replay(16, 0, 0, 1, 1)
+            .expect_err("digest equality without event evidence must fail closed");
+        assert!(
+            missing_events
+                .to_string()
+                .contains("events recorded=0 simulated=0")
+        );
+
+        require_non_vacuous_replay(16, 1, 1, 1, 1)
+            .expect("nonempty event and digest counts satisfy the evidence gate");
+        require_non_vacuous_replay(0, 0, 0, 0, 0).expect("a zero-tick replay is not vacuous");
     }
 
     #[test]

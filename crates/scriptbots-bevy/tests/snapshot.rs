@@ -28,7 +28,7 @@ fn seed_visible_agents(world: &mut WorldState) {
 }
 
 #[test]
-fn bevy_renderer_matches_golden() {
+fn bevy_scene_cpu_surrogate_raster_matches_semantic_golden() {
     let path = golden_path();
     let config = ScriptBotsConfig {
         rng_seed: Some(0xBEEF_F00D),
@@ -76,7 +76,7 @@ fn bevy_renderer_matches_golden() {
     }
 
     let golden = fs::read(&path).expect(
-        "golden snapshot missing; generate locally with: BEVY_REGEN_GOLDEN=1 cargo test -p scriptbots-bevy --test snapshot bevy_renderer_matches_golden -- --exact --nocapture",
+        "Bevy-scene CPU-surrogate semantic golden missing; this test does not construct a Bevy App, camera, PBR pipeline, render graph, or GPU framebuffer. Generate the candidate locally with: BEVY_REGEN_GOLDEN=1 cargo test -p scriptbots-bevy --test snapshot bevy_scene_cpu_surrogate_raster_matches_semantic_golden -- --exact --nocapture; then review the image and Git diff before committing it",
     );
     let golden_img = image::load_from_memory(&golden)
         .expect("decode golden")

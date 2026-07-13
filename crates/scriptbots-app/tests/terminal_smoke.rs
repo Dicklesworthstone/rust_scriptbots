@@ -100,7 +100,7 @@ fn assert_no_startup_artifacts(storage_path: &Path, config_path: &Path, tuning_d
 }
 
 #[test]
-fn terminal_headless_smoke() {
+fn actual_binary_terminal_test_backend_path_exits_successfully() {
     let temp_dir = tempdir().expect("temp storage directory");
     let storage_path = temp_dir.path().join("scriptbots_headless.sqlite");
 
@@ -111,7 +111,7 @@ fn terminal_headless_smoke() {
 }
 
 #[test]
-fn terminal_headless_emits_bootstrap_metrics() {
+fn actual_binary_terminal_test_backend_path_reports_rendered_tick_budget() {
     let temp_dir = tempdir().expect("temp storage directory");
     let storage_path = temp_dir.path().join("scriptbots_headless_report.sqlite");
 
