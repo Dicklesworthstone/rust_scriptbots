@@ -3,9 +3,9 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    CharacterizationTraceV0, ControlServerConfig, ControlServerReservation, ScenarioIdentityV0,
-    SharedAnalytics, SharedWorld,
-    precedence::{ThreadSource, resolve_thread_policy},
+    CharacterizationTraceV0, ControlServerConfig, ControlServerReservation, RunManifestV1,
+    ScenarioIdentityV0, SharedAnalytics, SharedWorld,
+    precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
@@ -222,7 +222,7 @@ fn main() -> Result<()> {
         }
     }
     let (world, analytics, mut storage_pipeline) =
-        bootstrap_world(config, cli.storage, thresholds, cli.bootstrap_ticks)?;
+        bootstrap_world(config, cli.storage, thresholds, cli.bootstrap_ticks, policy)?;
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
     // finalized and the worker is acknowledged before this function returns.
@@ -819,11 +819,75 @@ fn recover_storage(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write the run's provenance record next to its database.
+///
+/// A provenance write must NEVER be able to kill the run: a manifest that took the
+/// simulation down with it would have inverted its own purpose. Every failure here
+/// is a warning and the run continues — but the warning names exactly what was
+/// lost, because a silent provenance failure is how you end up with a run
+/// directory nobody can explain.
+fn emit_run_manifest(world: &WorldState, storage_path: Option<&str>, thread_policy: ThreadPolicy) {
+    let Some(storage_path) = storage_path else {
+        // An in-memory run leaves no directory to describe.
+        return;
+    };
+    let manifest_path = std::path::Path::new(storage_path).with_extension("manifest.json");
+
+    let manifest = match RunManifestV1::from_world("default", world) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %manifest_path.display(),
+                "could not build the run manifest; this run will carry NO provenance \
+                 record and nobody will be able to say what produced it"
+            );
+            return;
+        }
+    };
+
+    match manifest.canonical_json_bytes() {
+        Ok(encoded) => {
+            if let Err(error) = std::fs::write(&manifest_path, &encoded) {
+                warn!(
+                    error = %error,
+                    path = %manifest_path.display(),
+                    "could not write the run manifest; the run continues WITHOUT provenance"
+                );
+                return;
+            }
+            info!(
+                path = %manifest_path.display(),
+                config_digest = %manifest.config_digest,
+                root_seed = manifest.root_seed,
+                reproducible = manifest.reproducible,
+                warnings = manifest.warnings.len(),
+                threads = ?thread_policy.threads,
+                thread_source = %thread_policy.source,
+                "wrote run manifest"
+            );
+            if !manifest.reproducible {
+                // Say it out loud. A manifest that claims reproducibility it does
+                // not have is worse than no manifest at all.
+                warn!(
+                    warnings = ?manifest.warnings,
+                    "this run is NOT reproducible; the manifest records why"
+                );
+            }
+        }
+        Err(error) => warn!(
+            error = %error,
+            "could not encode the run manifest; the run continues WITHOUT provenance"
+        ),
+    }
+}
+
 fn bootstrap_world(
     config: ScriptBotsConfig,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
     bootstrap_ticks: u64,
+    thread_policy: ThreadPolicy,
 ) -> Result<(SharedWorld, SharedAnalytics, StoragePipeline)> {
     #[cfg(feature = "neuro")]
     let _ = validated_neuroflow_config(&config)?;
@@ -857,6 +921,9 @@ fn bootstrap_world(
             None,
         ),
     };
+    // Keep the path: the manifest is written next to the database, and the binding
+    // below moves it.
+    let manifest_storage_path = storage_path.clone();
     if let Some(storage_path) = storage_path {
         info!(path = %storage_path, "Selected unique FrankenSQLite run database");
         println!(
@@ -879,6 +946,17 @@ fn bootstrap_world(
     let bootstrap_result = (|| -> Result<()> {
         let brain_keys = install_brains(&mut world)?;
         seed_agents(&mut world, &brain_keys)?;
+
+        // PROVENANCE. Emitted here — after the brains are installed and the agents
+        // seeded, so the roster is real — and BEFORE any bootstrap tick, so the
+        // manifest describes the run as it was launched.
+        //
+        // Until now `main` never wrote a manifest at all: the type was well-built
+        // and thoroughly tested and simply never reached disk, so every claim about
+        // provenanced, reproducible runs was true of the LIBRARY and false of the
+        // PRODUCT. A user could not tell which build, which seed, or which config
+        // produced a run directory.
+        emit_run_manifest(&world, manifest_storage_path.as_deref(), thread_policy);
 
         for _ in 0..bootstrap_ticks {
             world.step()?;
@@ -3739,6 +3817,7 @@ activation = "Sigmoid"
                 StorageMode::File,
                 ThresholdsOverride::default(),
                 DEFAULT_BOOTSTRAP_TICKS,
+                resolve_thread_policy(None, None, None, false),
             )
             .err()
             .expect("adapter validation must fail before storage setup");
