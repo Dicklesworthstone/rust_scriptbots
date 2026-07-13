@@ -30,9 +30,11 @@ const STATE_MAGIC: [u8; 4] = *b"MLPS";
 const GENOME_HEADER_BYTES: usize = 12;
 const GENOME_NODE_BYTES: usize = CONNECTIONS * 4 + CONNECTIONS * 2 + CONNECTIONS + 3 * 4;
 const GENOME_PAYLOAD_BYTES: usize = GENOME_HEADER_BYTES + BRAIN_SIZE * GENOME_NODE_BYTES;
-const STATE_HEADER_BYTES: usize = 6;
+const GENOME_DIGEST_BYTES: usize = blake3::OUT_LEN;
+const STATE_HEADER_BYTES: usize = STATE_MAGIC.len() + GENOME_DIGEST_BYTES + 2;
 const STATE_NODE_BYTES: usize = 2 * 4;
 const STATE_PAYLOAD_BYTES: usize = STATE_HEADER_BYTES + BRAIN_SIZE * STATE_NODE_BYTES;
+const GENOME_DIGEST_CONTEXT: &str = "rust-scriptbots.mlp.genome-state-binding.v1";
 const INITIAL_DAMPING_MIN: f32 = 0.9;
 const INITIAL_DAMPING_MAX: f32 = 1.1;
 const MUTATED_DAMPING_MIN: f32 = 0.01;
@@ -131,7 +133,11 @@ impl Default for NodeState {
 }
 
 /// Baseline ScriptBots MLP brain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Persistence deliberately goes through [`MlpBrainFamily`]'s bounded, versioned protocol
+/// envelopes. Raw serde would bypass topology validation and the binding between a checkpointed
+/// evaluator state and the exact genome that produced it.
+#[derive(Debug, Clone)]
 pub struct MlpBrain {
     nodes: Vec<NodeParams>,
     state: Vec<NodeState>,
@@ -267,6 +273,12 @@ impl<'a> PayloadReader<'a> {
 #[derive(Debug, Clone)]
 pub struct MlpBrainFamily {
     family_id: BrainFamilyId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DecodedMlpState {
+    genome_digest: [u8; GENOME_DIGEST_BYTES],
+    nodes: Vec<NodeState>,
 }
 
 impl MlpBrainFamily {
@@ -539,10 +551,15 @@ impl MlpBrainFamily {
         Ok(nodes)
     }
 
-    fn encode_state_payload(&self, state: &[NodeState]) -> Result<Vec<u8>, BrainProtocolError> {
+    fn encode_state_payload(
+        &self,
+        genome_digest: [u8; GENOME_DIGEST_BYTES],
+        state: &[NodeState],
+    ) -> Result<Vec<u8>, BrainProtocolError> {
         self.validate_state_values(state)?;
         let mut payload = Vec::with_capacity(STATE_PAYLOAD_BYTES);
         payload.extend_from_slice(&STATE_MAGIC);
+        payload.extend_from_slice(&genome_digest);
         payload.extend_from_slice(&BRAIN_SIZE_WIRE.to_le_bytes());
         // `target` is scratch: every non-input target is overwritten before
         // it is read, while input-node targets are never read. Canonical
@@ -559,7 +576,7 @@ impl MlpBrainFamily {
     fn decode_state(
         &self,
         state: &BrainEvaluatorStateEnvelope,
-    ) -> Result<Vec<NodeState>, BrainProtocolError> {
+    ) -> Result<DecodedMlpState, BrainProtocolError> {
         state.require_protocol(&self.family_id, STATE_SCHEMA_VERSION, STATE_CODEC_VERSION)?;
         let payload = state.payload();
         if payload.len() != STATE_PAYLOAD_BYTES {
@@ -576,6 +593,11 @@ impl MlpBrainFamily {
             &mut reader,
             BrainEnvelopeKind::EvaluatorState,
             "state magic",
+        )?;
+        let genome_digest = self.read::<GENOME_DIGEST_BYTES>(
+            &mut reader,
+            BrainEnvelopeKind::EvaluatorState,
+            "genome digest",
         )?;
         let node_count = u16::from_le_bytes(self.read::<2>(
             &mut reader,
@@ -607,7 +629,10 @@ impl MlpBrainFamily {
             });
         }
         self.validate_state_values(&decoded)?;
-        Ok(decoded)
+        Ok(DecodedMlpState {
+            genome_digest,
+            nodes: decoded,
+        })
     }
 
     #[cfg(test)]
@@ -638,13 +663,15 @@ impl MlpBrainFamily {
 
     fn state(
         &self,
+        genome: &BrainGenomeEnvelope,
         state: &[NodeState],
     ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        genome.require_protocol(&self.family_id, GENOME_SCHEMA_VERSION, GENOME_CODEC_VERSION)?;
         BrainEvaluatorStateEnvelope::new(
             self.family_id.clone(),
             STATE_SCHEMA_VERSION,
             STATE_CODEC_VERSION,
-            self.encode_state_payload(state)?,
+            self.encode_state_payload(genome_digest(genome), state)?,
         )
     }
 
@@ -665,6 +692,22 @@ impl MlpBrainFamily {
     }
 }
 
+fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
+    let mut hasher = blake3::Hasher::new_derive_key(GENOME_DIGEST_CONTEXT);
+    let family_id = genome.family_id().as_str().as_bytes();
+    hasher.update(&(family_id.len() as u64).to_le_bytes());
+    hasher.update(family_id);
+    hasher.update(&genome.schema_version().to_le_bytes());
+    hasher.update(&genome.codec_version().to_le_bytes());
+    hasher.update(&(genome.payload().len() as u64).to_le_bytes());
+    hasher.update(genome.payload());
+    *hasher.finalize().as_bytes()
+}
+
+fn state_digest_hex(digest: &[u8; GENOME_DIGEST_BYTES]) -> String {
+    blake3::Hash::from_bytes(*digest).to_hex().to_string()
+}
+
 impl Default for MlpBrainFamily {
     fn default() -> Self {
         Self::new()
@@ -673,6 +716,7 @@ impl Default for MlpBrainFamily {
 
 struct MlpEvaluator {
     family: MlpBrainFamily,
+    genome_digest: [u8; GENOME_DIGEST_BYTES],
     brain: MlpBrain,
 }
 
@@ -717,7 +761,13 @@ impl BrainEvaluator for MlpEvaluator {
     }
 
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
-        self.family.state(&self.brain.state)
+        BrainEvaluatorStateEnvelope::new(
+            self.family.family_id.clone(),
+            STATE_SCHEMA_VERSION,
+            STATE_CODEC_VERSION,
+            self.family
+                .encode_state_payload(self.genome_digest, &self.brain.state)?,
+        )
     }
 }
 
@@ -783,7 +833,7 @@ impl BrainFamilyCodec for MlpBrainFamily {
         _rng: &mut dyn RandomStream,
     ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
         self.validate_genome(genome)?;
-        self.state(&vec![NodeState::default(); BRAIN_SIZE])
+        self.state(genome, &vec![NodeState::default(); BRAIN_SIZE])
     }
 
     fn offspring_state_policy(&self) -> OffspringStatePolicy {
@@ -806,9 +856,24 @@ impl BrainFamilyCodec for MlpBrainFamily {
     ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
         let nodes = self.decode_genome(genome)?;
         let state = self.decode_state(state)?;
+        let expected_digest = genome_digest(genome);
+        if state.genome_digest != expected_digest {
+            return Err(self.invalid(
+                BrainEnvelopeKind::EvaluatorState,
+                format!(
+                    "MLP state belongs to genome {}, but evaluator received {}",
+                    state_digest_hex(&state.genome_digest),
+                    state_digest_hex(&expected_digest)
+                ),
+            ));
+        }
         Ok(Box::new(MlpEvaluator {
             family: self.clone(),
-            brain: MlpBrain { nodes, state },
+            genome_digest: expected_digest,
+            brain: MlpBrain {
+                nodes,
+                state: state.nodes,
+            },
         }))
     }
 }
@@ -1092,19 +1157,32 @@ mod tests {
         );
 
         let dynamic_state = fixture_state();
-        let state = family.state(&dynamic_state).expect("fixture state");
+        let state = family
+            .state(&genome, &dynamic_state)
+            .expect("fixture state");
         assert_eq!(state.family_id(), family.family_id());
         assert_eq!(state.schema_version(), STATE_SCHEMA_VERSION);
         assert_eq!(state.codec_version(), STATE_CODEC_VERSION);
         assert_eq!(state.payload().len(), STATE_PAYLOAD_BYTES);
+        assert_eq!(&state.payload()[..STATE_MAGIC.len()], STATE_MAGIC);
         assert_eq!(
-            &state.payload()[..STATE_HEADER_BYTES],
-            &[b'M', b'L', b'P', b'S', 200, 0]
+            &state.payload()[STATE_MAGIC.len()..STATE_MAGIC.len() + GENOME_DIGEST_BYTES],
+            genome_digest(&genome)
         );
-        assert_eq!(fnv1a64(state.payload()), 0xc71e_27b4_031b_c9de);
+        assert_eq!(
+            &state.payload()[STATE_HEADER_BYTES - 2..STATE_HEADER_BYTES],
+            &BRAIN_SIZE_WIRE.to_le_bytes()
+        );
+        assert_eq!(
+            fnv1a64(state.payload()),
+            0x0c03_4910_5011_b4e2,
+            "update only after reviewing an intentional MLP state codec change"
+        );
         let decoded_state = family.decode_state(&state).expect("decode state");
+        assert_eq!(decoded_state.genome_digest, genome_digest(&genome));
         assert!(
             decoded_state
+                .nodes
                 .iter()
                 .zip(&dynamic_state)
                 .all(|(decoded, original)| decoded.output == original.output
@@ -1113,7 +1191,7 @@ mod tests {
         );
         assert_eq!(
             family
-                .state(&decoded_state)
+                .state(&genome, &decoded_state.nodes)
                 .expect("re-encode state")
                 .payload(),
             state.payload()
@@ -1128,13 +1206,17 @@ mod tests {
         for (index, node) in second.iter_mut().enumerate() {
             node.target = if index % 2 == 0 { -123.5 } else { 987.25 };
         }
-        let first_envelope = family.state(&first).expect("first canonical state");
-        let second_envelope = family.state(&second).expect("second canonical state");
-        assert_eq!(first_envelope, second_envelope);
-
         let genome = family
             .genome(&fixture_nodes(), BrainProvenance::default())
             .expect("fixture genome");
+        let first_envelope = family
+            .state(&genome, &first)
+            .expect("first canonical state");
+        let second_envelope = family
+            .state(&genome, &second)
+            .expect("second canonical state");
+        assert_eq!(first_envelope, second_envelope);
+
         let mut first_evaluator = family
             .evaluator(&genome, &first_envelope)
             .expect("first evaluator");
@@ -1154,6 +1236,68 @@ mod tests {
                 .checkpoint_state()
                 .expect("second continuation state")
         );
+    }
+
+    #[test]
+    fn evaluator_state_is_bound_to_exact_genome_material_not_provenance() {
+        let family = MlpBrainFamily::new();
+        let nodes = fixture_nodes();
+        let genome = family
+            .genome(&nodes, fixture_provenance(1, 2, 3))
+            .expect("fixture genome");
+        let same_material_new_lineage = family
+            .genome(&nodes, fixture_provenance(91, 92, 93))
+            .expect("same material with different provenance");
+        let mut different_nodes = nodes;
+        different_nodes[37].bias += 0.25;
+        let different_genome = family
+            .genome(&different_nodes, fixture_provenance(1, 2, 3))
+            .expect("different genome material");
+
+        assert_eq!(
+            genome_digest(&genome),
+            genome_digest(&same_material_new_lineage),
+            "provenance is metadata and must not change evaluator-state compatibility"
+        );
+        assert_ne!(genome_digest(&genome), genome_digest(&different_genome));
+
+        let mut rng = SmallRngStream::seed_from_u64(0xB1AD_5A7E);
+        let initial = family
+            .initial_state(&genome, &mut rng)
+            .expect("bound initial state");
+        assert_eq!(
+            family
+                .decode_state(&initial)
+                .expect("decode initial state")
+                .genome_digest,
+            genome_digest(&genome)
+        );
+
+        let mut evaluator = family.evaluator(&genome, &initial).expect("evaluator");
+        evaluator
+            .evaluate(&[0.125; INPUT_SIZE])
+            .expect("finite evaluation");
+        let checkpoint = evaluator.checkpoint_state().expect("bound checkpoint");
+        assert_eq!(
+            family
+                .decode_state(&checkpoint)
+                .expect("decode checkpoint")
+                .genome_digest,
+            genome_digest(&genome)
+        );
+        assert!(
+            family
+                .evaluator(&same_material_new_lineage, &checkpoint)
+                .is_ok(),
+            "identical protocol material remains compatible across provenance changes"
+        );
+        assert!(matches!(
+            family.evaluator(&different_genome, &checkpoint),
+            Err(BrainProtocolError::InvalidPayload {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1213,7 +1357,9 @@ mod tests {
             })
         ));
 
-        let state = family.state(&fixture_state()).expect("valid state");
+        let state = family
+            .state(&genome, &fixture_state())
+            .expect("valid state");
         let mut non_finite_state = state.payload().to_vec();
         non_finite_state[STATE_HEADER_BYTES..][..4]
             .copy_from_slice(&f32::INFINITY.to_bits().to_le_bytes());
@@ -1332,10 +1478,14 @@ mod tests {
         assert!(selected_left && selected_right);
         assert_eq!(child.provenance(), &child_provenance);
 
-        let first_parent_state = family.state(&fixture_state()).expect("first parent state");
+        let first_parent_state = family
+            .state(&left, &fixture_state())
+            .expect("first parent state");
         let mut second_dynamic = fixture_state();
         second_dynamic[0].output = 99.0;
-        let second_parent_state = family.state(&second_dynamic).expect("second parent state");
+        let second_parent_state = family
+            .state(&right, &second_dynamic)
+            .expect("second parent state");
         assert_eq!(family.offspring_state_policy(), OffspringStatePolicy::Reset);
         let reset = family
             .offspring_state(
@@ -1344,10 +1494,9 @@ mod tests {
                 &mut crossover_rng,
             )
             .expect("reset offspring state");
-        assert_eq!(
-            family.decode_state(&reset).expect("decoded reset state"),
-            vec![NodeState::default(); BRAIN_SIZE]
-        );
+        let decoded_reset = family.decode_state(&reset).expect("decoded reset state");
+        assert_eq!(decoded_reset.genome_digest, genome_digest(&child));
+        assert_eq!(decoded_reset.nodes, vec![NodeState::default(); BRAIN_SIZE]);
     }
 
     #[test]
@@ -1418,7 +1567,9 @@ mod tests {
             .expect("finite hostile genome");
         let mut dynamic = vec![NodeState::default(); BRAIN_SIZE];
         dynamic[INPUT_SIZE].output = f32::MAX;
-        let state = family.state(&dynamic).expect("finite hostile state");
+        let state = family
+            .state(&genome, &dynamic)
+            .expect("finite hostile state");
         let mut evaluator = family.evaluator(&genome, &state).expect("evaluator");
         let before = evaluator.checkpoint_state().expect("checkpoint before");
 

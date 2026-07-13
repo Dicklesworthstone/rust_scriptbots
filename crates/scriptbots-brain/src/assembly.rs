@@ -365,6 +365,7 @@ impl BrainFamilyCodec for AssemblyFamilyAdapter {
         rng: &mut dyn RandomStream,
     ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
         validate_mutation_probability(rates.primary, &self.family_id)?;
+        validate_mutation_scale(rates.secondary, &self.family_id)?;
         let mut cells = self.decode_genome(genome)?;
         for cell in &mut cells {
             if rng.random::<f32>() < rates.primary {
@@ -586,6 +587,23 @@ fn validate_mutation_probability(
             family_id,
             format!(
                 "Assembly mutation probability must be finite and in [0, 1], found {probability}"
+            ),
+        ))
+    }
+}
+
+fn validate_mutation_scale(
+    scale: f32,
+    family_id: &BrainFamilyId,
+) -> Result<(), BrainProtocolError> {
+    if scale.is_finite() && scale >= 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_payload(
+            BrainEnvelopeKind::Genome,
+            family_id,
+            format!(
+                "Assembly secondary mutation scale must be finite and nonnegative, found {scale}"
             ),
         ))
     }
@@ -1025,6 +1043,21 @@ mod tests {
                     MutationRates {
                         primary: invalid_rate,
                         secondary: 0.0,
+                    },
+                    BrainProvenance::default(),
+                    &mut rng,
+                ),
+                Err(BrainProtocolError::InvalidPayload { .. })
+            ));
+        }
+        for invalid_scale in [f32::NAN, -0.01, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut rng = SmallRngStream::seed_from_u64(1);
+            assert!(matches!(
+                family.mutate_genome(
+                    &genome,
+                    MutationRates {
+                        primary: 0.0,
+                        secondary: invalid_scale,
                     },
                     BrainProvenance::default(),
                     &mut rng,

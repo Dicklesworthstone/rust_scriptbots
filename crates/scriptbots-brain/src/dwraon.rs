@@ -30,9 +30,13 @@ const STATE_MAGIC: [u8; 4] = *b"DWST";
 const GENOME_HEADER_BYTES: usize = 8;
 const GENOME_NODE_BYTES: usize = 1 + 4 + 4 + CONNECTIONS * (4 + 2 + 1);
 const GENOME_PAYLOAD_BYTES: usize = GENOME_HEADER_BYTES + BRAIN_SIZE * GENOME_NODE_BYTES;
-const STATE_HEADER_BYTES: usize = 6;
+const GENOME_DIGEST_BYTES: usize = blake3::OUT_LEN;
+const STATE_BRAIN_SIZE_BYTES: usize = std::mem::size_of::<u16>();
+const STATE_DIGEST_END: usize = STATE_MAGIC.len() + GENOME_DIGEST_BYTES;
+const STATE_HEADER_BYTES: usize = STATE_DIGEST_END + STATE_BRAIN_SIZE_BYTES;
 const STATE_NODE_BYTES: usize = 4;
 const STATE_PAYLOAD_BYTES: usize = STATE_HEADER_BYTES + BRAIN_SIZE * STATE_NODE_BYTES;
+const GENOME_DIGEST_CONTEXT: &str = "rust-scriptbots.dwraon.genome-state-binding.v1";
 
 static DWRAON_FAMILY_ID: LazyLock<BrainFamilyId> = LazyLock::new(|| {
     BrainFamilyId::new(DWRAON_FAMILY_NAME).expect("the built-in DWRAON family id is canonical")
@@ -116,10 +120,20 @@ impl Default for NodeState {
 }
 
 /// DWRAON implementation closely mirroring the legacy C++ behavior.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Persistence deliberately goes through [`DwraonFamilyAdapter`]'s bounded, versioned protocol
+/// envelopes. Raw serde for this type would bypass genome/state shape, finite-value, and exact
+/// genome-binding validation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DwraonBrain {
     nodes: Vec<NodeParams>,
     state: Vec<NodeState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DecodedDwraonState {
+    genome_digest: [u8; GENOME_DIGEST_BYTES],
+    nodes: Vec<NodeState>,
 }
 
 impl DwraonBrain {
@@ -401,11 +415,15 @@ fn decode_f32(payload: &[u8], offset: usize) -> f32 {
     ]))
 }
 
-fn encode_state_payload(state: &[NodeState]) -> Result<Vec<u8>, BrainProtocolError> {
+fn encode_state_payload(
+    genome_digest: [u8; GENOME_DIGEST_BYTES],
+    state: &[NodeState],
+) -> Result<Vec<u8>, BrainProtocolError> {
     validate_state(state)?;
     let brain_size = u16::try_from(BRAIN_SIZE).expect("DWRAON brain size fits the v1 wire field");
     let mut payload = Vec::with_capacity(STATE_PAYLOAD_BYTES);
     payload.extend_from_slice(&STATE_MAGIC);
+    payload.extend_from_slice(&genome_digest);
     payload.extend_from_slice(&brain_size.to_le_bytes());
     // `target` is intentionally absent. Every target is recomputed from the
     // checkpointed outputs before the evaluator reads it, so it is scratch,
@@ -417,7 +435,7 @@ fn encode_state_payload(state: &[NodeState]) -> Result<Vec<u8>, BrainProtocolErr
     Ok(payload)
 }
 
-fn decode_state_payload(payload: &[u8]) -> Result<Vec<NodeState>, BrainProtocolError> {
+fn decode_state_payload(payload: &[u8]) -> Result<DecodedDwraonState, BrainProtocolError> {
     if payload.len() != STATE_PAYLOAD_BYTES {
         return Err(invalid_payload(
             BrainEnvelopeKind::EvaluatorState,
@@ -433,21 +451,29 @@ fn decode_state_payload(payload: &[u8]) -> Result<Vec<NodeState>, BrainProtocolE
             "DWRAON v1 evaluator-state magic does not match DWST",
         ));
     }
-    let encoded_brain_size = usize::from(u16::from_le_bytes([payload[4], payload[5]]));
+    let mut genome_digest = [0; GENOME_DIGEST_BYTES];
+    genome_digest.copy_from_slice(&payload[STATE_MAGIC.len()..STATE_DIGEST_END]);
+    let encoded_brain_size = usize::from(u16::from_le_bytes([
+        payload[STATE_DIGEST_END],
+        payload[STATE_DIGEST_END + 1],
+    ]));
     if encoded_brain_size != BRAIN_SIZE {
         return Err(invalid_payload(
             BrainEnvelopeKind::EvaluatorState,
             format!("DWRAON v1 state declares {encoded_brain_size} nodes"),
         ));
     }
-    let state = (0..BRAIN_SIZE)
+    let nodes = (0..BRAIN_SIZE)
         .map(|index| NodeState {
             output: decode_f32(payload, STATE_HEADER_BYTES + index * STATE_NODE_BYTES),
             target: 0.0,
         })
         .collect::<Vec<_>>();
-    validate_state(&state)?;
-    Ok(state)
+    validate_state(&nodes)?;
+    Ok(DecodedDwraonState {
+        genome_digest,
+        nodes,
+    })
 }
 
 fn decode_genome(genome: &BrainGenomeEnvelope) -> Result<Vec<NodeParams>, BrainProtocolError> {
@@ -459,7 +485,9 @@ fn decode_genome(genome: &BrainGenomeEnvelope) -> Result<Vec<NodeParams>, BrainP
     decode_genome_payload(genome.payload())
 }
 
-fn decode_state(state: &BrainEvaluatorStateEnvelope) -> Result<Vec<NodeState>, BrainProtocolError> {
+fn decode_state(
+    state: &BrainEvaluatorStateEnvelope,
+) -> Result<DecodedDwraonState, BrainProtocolError> {
     state.require_protocol(&DWRAON_FAMILY_ID, STATE_SCHEMA_VERSION, STATE_CODEC_VERSION)?;
     decode_state_payload(state.payload())
 }
@@ -486,13 +514,32 @@ fn genome_material(nodes: &[NodeParams]) -> Result<BrainGenomeMaterial, BrainPro
     )
 }
 
-fn state_envelope(state: &[NodeState]) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+fn state_envelope(
+    genome_digest: [u8; GENOME_DIGEST_BYTES],
+    state: &[NodeState],
+) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
     BrainEvaluatorStateEnvelope::new(
         DWRAON_FAMILY_ID.clone(),
         STATE_SCHEMA_VERSION,
         STATE_CODEC_VERSION,
-        encode_state_payload(state)?,
+        encode_state_payload(genome_digest, state)?,
     )
+}
+
+fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
+    let mut hasher = blake3::Hasher::new_derive_key(GENOME_DIGEST_CONTEXT);
+    let family_id = genome.family_id().as_str().as_bytes();
+    hasher.update(&(family_id.len() as u64).to_le_bytes());
+    hasher.update(family_id);
+    hasher.update(&genome.schema_version().to_le_bytes());
+    hasher.update(&genome.codec_version().to_le_bytes());
+    hasher.update(&(genome.payload().len() as u64).to_le_bytes());
+    hasher.update(genome.payload());
+    *hasher.finalize().as_bytes()
+}
+
+fn state_digest_hex(digest: &[u8; GENOME_DIGEST_BYTES]) -> String {
+    blake3::Hash::from_bytes(*digest).to_hex().to_string()
 }
 
 fn validate_mutation_rates(rates: MutationRates) -> Result<(), BrainProtocolError> {
@@ -598,6 +645,7 @@ impl Default for DwraonFamilyAdapter {
 #[derive(Debug)]
 struct DwraonEvaluator {
     family_id: BrainFamilyId,
+    genome_digest: [u8; GENOME_DIGEST_BYTES],
     brain: DwraonBrain,
 }
 
@@ -641,7 +689,7 @@ impl BrainEvaluator for DwraonEvaluator {
     }
 
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
-        state_envelope(&self.brain.state)
+        state_envelope(self.genome_digest, &self.brain.state)
     }
 }
 
@@ -699,7 +747,10 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
         _rng: &mut dyn RandomStream,
     ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
         self.validate_genome(genome)?;
-        state_envelope(&vec![NodeState::default(); BRAIN_SIZE])
+        state_envelope(
+            genome_digest(genome),
+            &vec![NodeState::default(); BRAIN_SIZE],
+        )
     }
 
     fn offspring_state_policy(&self) -> OffspringStatePolicy {
@@ -723,11 +774,25 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
         genome: &BrainGenomeEnvelope,
         state: &BrainEvaluatorStateEnvelope,
     ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+        let nodes = decode_genome(genome)?;
+        let state = decode_state(state)?;
+        let expected_digest = genome_digest(genome);
+        if state.genome_digest != expected_digest {
+            return Err(invalid_payload(
+                BrainEnvelopeKind::EvaluatorState,
+                format!(
+                    "DWRAON state belongs to genome {}, but evaluator received {}",
+                    state_digest_hex(&state.genome_digest),
+                    state_digest_hex(&expected_digest)
+                ),
+            ));
+        }
         Ok(Box::new(DwraonEvaluator {
             family_id: self.family_id.clone(),
+            genome_digest: expected_digest,
             brain: DwraonBrain {
-                nodes: decode_genome(genome)?,
-                state: decode_state(state)?,
+                nodes,
+                state: state.nodes,
             },
         }))
     }
@@ -1018,11 +1083,28 @@ mod tests {
                 target: 1.0,
             })
             .collect::<Vec<_>>();
-        let state = state_envelope(&dynamic_state).expect("nonzero fixture state");
-        assert_eq!(fnv1a64(state.payload()), 0x4ba4_cfee_91ca_6113);
+        let fixture_digest = genome_digest(&fixture);
+        let state = state_envelope(fixture_digest, &dynamic_state).expect("nonzero fixture state");
+        assert_eq!(&state.payload()[..STATE_MAGIC.len()], STATE_MAGIC);
+        assert_eq!(
+            &state.payload()[STATE_MAGIC.len()..STATE_DIGEST_END],
+            fixture_digest
+        );
+        assert_eq!(
+            &state.payload()[STATE_DIGEST_END..STATE_HEADER_BYTES],
+            &u16::try_from(BRAIN_SIZE)
+                .expect("DWRAON brain size fits the v1 wire field")
+                .to_le_bytes()
+        );
+        assert_eq!(
+            fnv1a64(state.payload()),
+            0x1569_fe8b_2724_180d,
+            "update only after reviewing an intentional DWRAON state codec change"
+        );
         assert!(
             decode_state(&state)
                 .expect("decode nonzero fixture state")
+                .nodes
                 .iter()
                 .zip(&dynamic_state)
                 .all(|(decoded, original)| decoded.output == original.output
@@ -1088,6 +1170,40 @@ mod tests {
         let state = family
             .initial_state(&genome, &mut rng)
             .expect("valid initial state");
+
+        let genome_nodes = decode_genome(&genome).expect("decode valid genome");
+        let provenance_only_genome = protocol_genome(
+            &genome_nodes,
+            BrainProvenance {
+                parents: [Some(AgentUid(91)), None],
+                created_at: Tick(37),
+            },
+        );
+        assert_eq!(
+            genome_digest(&provenance_only_genome),
+            genome_digest(&genome),
+            "state binding deliberately excludes lineage provenance"
+        );
+        family
+            .evaluator(&provenance_only_genome, &state)
+            .expect("the same genome material with different provenance remains compatible");
+
+        let mut different_nodes = genome_nodes;
+        different_nodes[0].bias = if different_nodes[0].bias == 0.0 {
+            0.25
+        } else {
+            -different_nodes[0].bias
+        };
+        let different_genome = protocol_genome(&different_nodes, BrainProvenance::default());
+        assert_ne!(genome_digest(&different_genome), genome_digest(&genome));
+        assert!(matches!(
+            family.evaluator(&different_genome, &state),
+            Err(BrainProtocolError::InvalidPayload {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
+
         let mut nonfinite_state_payload = state.payload().to_vec();
         nonfinite_state_payload[STATE_HEADER_BYTES..STATE_HEADER_BYTES + 4]
             .copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
@@ -1275,7 +1391,17 @@ mod tests {
             .expect("genome");
         let initial = family.initial_state(&genome, &mut rng).expect("state");
         assert_eq!(initial.payload().len(), STATE_PAYLOAD_BYTES);
-        assert_eq!(&initial.payload()[..6], &[b'D', b'W', b'S', b'T', 200, 0]);
+        assert_eq!(&initial.payload()[..STATE_MAGIC.len()], STATE_MAGIC);
+        assert_eq!(
+            &initial.payload()[STATE_MAGIC.len()..STATE_DIGEST_END],
+            genome_digest(&genome)
+        );
+        assert_eq!(
+            &initial.payload()[STATE_DIGEST_END..STATE_HEADER_BYTES],
+            &u16::try_from(BRAIN_SIZE)
+                .expect("DWRAON brain size fits the v1 wire field")
+                .to_le_bytes()
+        );
         let mut original = family
             .evaluator(&genome, &initial)
             .expect("original evaluator");
@@ -1339,6 +1465,7 @@ mod tests {
         assert!(
             decode_state(&child_state)
                 .expect("decode reset child")
+                .nodes
                 .iter()
                 .all(|node| node.output == 0.0)
         );
