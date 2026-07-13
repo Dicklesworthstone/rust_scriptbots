@@ -286,6 +286,14 @@ jobs:
           toolchain: nightly-2026-07-09
           targets: wasm32-unknown-unknown
 
+      # Fail fast before the expensive wasm-pack build: the wasm dependency
+      # graph must contain no denied native crates and must match the
+      # committed golden snapshot (bd-2z0.8.16; caught bd-2z0.12.5 pre-CI).
+      - name: Wasm dependency-graph denylist + snapshot guard (bd-2z0.8.16)
+        run: |
+          bash ci/check_wasm_graph.sh --self-test
+          bash ci/check_wasm_graph.sh
+
       - name: Install wasm-pack
         run: cargo install wasm-pack --version 0.15.0 --locked
 

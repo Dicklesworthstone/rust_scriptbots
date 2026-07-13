@@ -1,11 +1,17 @@
 ahash
 anyhow
+arrayref
+arrayvec
 autocfg
+blake3
 bumpalo
+cc
 cfg-if
 cobs
+constant_time_eq
 coord_2d
 direction
+find-msvc-tools
 futures-core
 futures-task
 futures-util
@@ -38,6 +44,7 @@ serde_core
 serde_derive
 serde_json
 serde-wasm-bindgen
+shlex
 slab
 slotmap
 syn
