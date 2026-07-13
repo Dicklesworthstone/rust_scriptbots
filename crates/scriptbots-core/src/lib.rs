@@ -612,7 +612,10 @@ fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
 }
 
 fn angle_to(dx: f32, dy: f32) -> f32 {
-    dy.atan2(dx)
+    // `f32::atan2` delegates to the host C math library. Its last-bit result differs between
+    // supported glibc releases, which changes eye inputs and eventually the scientific replay.
+    // libm's pure-Rust implementation gives every native and Wasm target the same bearing.
+    libm::atan2f(dy, dx)
 }
 
 fn angle_difference(a: f32, b: f32) -> f32 {
@@ -14275,6 +14278,17 @@ impl WorldState {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn sensory_bearing_is_bit_exact_for_cross_libc_regression_geometry() {
+        // These coordinates reproduce the eye-ray geometry that first exposed a one-ULP
+        // Ubuntu 24.04 versus 25.10 divergence in the characterization trace.
+        let dx = toroidal_delta(10.0, f32::from_bits(0x41f0_583d), 40.0);
+        let dy = toroidal_delta(10.0, f32::from_bits(0x41ef_ff9f), 40.0);
+        assert_eq!(dx.to_bits(), 0x419f_a7c3);
+        assert_eq!(dy.to_bits(), 0xc19f_ff9f);
+        assert_eq!(angle_to(dx, dy).to_bits(), 0xbf49_5637);
+    }
 
     fn assert_small_rng_stream_continuation(stream: &SmallRngStream) {
         let checkpoint = stream.checkpoint();

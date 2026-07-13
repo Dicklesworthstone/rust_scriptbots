@@ -796,9 +796,12 @@ mod characterization_tests {
         assert_eq!(
             sequence(&trace_c),
             [
+                // Re-pinned after sensory bearings moved from the host C math library to
+                // deterministic pure-Rust `libm::atan2f`. The trajectory is now bit-identical
+                // across the glibc versions used by supported Ubuntu runners.
                 "1daf2c9601805056",
                 "34862afcc3524912",
-                "efbb642bc81acede",
+                "20a40eb07ba95835",
                 "43e8f2f64a481ff5",
                 "360f4818949324a7",
             ]

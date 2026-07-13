@@ -10069,6 +10069,7 @@ dependencies = [
  "criterion",
  "direction",
  "getrandom 0.3.4",
+ "libm",
  "num_cpus",
  "postcard",
  "rand 0.8.7",

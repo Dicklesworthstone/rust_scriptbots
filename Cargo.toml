@@ -28,6 +28,7 @@ anyhow = "1.0.103"
 arc-swap = "1.9.2"
 blake3 = "1.8.5"
 libc = "0.2.186"
+libm = "0.2.16"
 rayon = "1.12.0"
 rand = { version = "0.9.0", features = ["small_rng"] }
 serde = { version = "1.0.228", features = ["derive"] }
