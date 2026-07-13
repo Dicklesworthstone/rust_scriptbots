@@ -49,7 +49,7 @@ fn seed_agents(world: &mut WorldState, brain_key: u64) {
 }
 
 #[test]
-fn scriptbots_render_cpu_surrogate_raster_matches_semantic_golden() {
+fn scriptbots_render_cpu_surrogate_raster_matches_semantic_golden() -> Result<(), String> {
     let config = ScriptBotsConfig {
         rng_seed: Some(424_242),
         ..ScriptBotsConfig::default()
@@ -74,21 +74,58 @@ fn scriptbots_render_cpu_surrogate_raster_matches_semantic_golden() {
     if regenerate {
         fs::create_dir_all(golden_dir()).expect("create golden snapshot directory");
         fs::write(&golden_path, &png).expect("write updated golden");
-        return;
+        return Ok(());
     }
     let expected = fs::read(&golden_path).expect(
         "CPU-surrogate semantic golden missing; this test does not exercise a GPUI window, GPUI paint, or wgpu framebuffer. Generate the candidate locally with: RUST_REGEN_GOLDEN=1 cargo test -p scriptbots-render --test snapshot scriptbots_render_cpu_surrogate_raster_matches_semantic_golden -- --exact --nocapture; then review the image and Git diff before committing it",
     );
 
     if png != expected {
+        let rgba = image::load_from_memory(&png)
+            .expect("decode generated PNG for mismatch diagnostics")
+            .to_rgba8();
+        let expected_rgba = image::load_from_memory(&expected)
+            .expect("decode golden PNG for mismatch diagnostics")
+            .to_rgba8();
+        let transparent_pixels = rgba.pixels().filter(|pixel| pixel.0[3] == 0).count();
+        let opaque_black_pixels = rgba
+            .pixels()
+            .filter(|pixel| pixel.0 == [0, 0, 0, 255])
+            .count();
+        let mut color_counts = std::collections::BTreeMap::<[u8; 4], usize>::new();
+        for pixel in rgba.pixels() {
+            *color_counts.entry(pixel.0).or_default() += 1;
+        }
+        let mut common_colors = color_counts.into_iter().collect::<Vec<_>>();
+        common_colors.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+        common_colors.truncate(8);
+        let mut differing_pixels = 0usize;
+        let mut difference_bounds = None::<(u32, u32, u32, u32)>;
+        let mut maximum_channel_delta = 0u8;
+        for (x, y, actual) in rgba.enumerate_pixels() {
+            let expected = expected_rgba.get_pixel(x, y);
+            if actual != expected {
+                differing_pixels += 1;
+                difference_bounds = Some(match difference_bounds {
+                    Some((min_x, min_y, max_x, max_y)) => {
+                        (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                    }
+                    None => (x, y, x, y),
+                });
+                for (actual, expected) in actual.0.iter().zip(expected.0) {
+                    maximum_channel_delta = maximum_channel_delta.max(actual.abs_diff(expected));
+                }
+            }
+        }
         let failure_dir = project_root().join("target").join("snapshot-failures");
         fs::create_dir_all(&failure_dir).expect("create failure dir");
         let actual_path = failure_dir.join("rust_default.actual.png");
         fs::write(&actual_path, &png).expect("write actual snapshot");
-        panic!(
-            "scriptbots-render CPU-surrogate raster diverged from its semantic golden; this is not evidence about the shipped GPUI or wgpu framebuffer.\nexpected: {}\nactual: {}",
+        return Err(format!(
+            "scriptbots-render CPU-surrogate raster diverged from its semantic golden; this is not evidence about the shipped GPUI or wgpu framebuffer.\nexpected: {}\nactual: {}\ntransparent pixels: {transparent_pixels}\nopaque black pixels: {opaque_black_pixels}\ndiffering pixels: {differing_pixels}\ndifference bounds: {difference_bounds:?}\nmaximum channel delta: {maximum_channel_delta}\nmost common RGBA colors: {common_colors:?}",
             golden_path.display(),
             actual_path.display()
-        );
+        ));
     }
+    Ok(())
 }
