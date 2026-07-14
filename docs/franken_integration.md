@@ -1,6 +1,6 @@
 # Franken Ecosystem Integration — Program Guide (bd-2js6)
 
-Last reconciled: **2026-07-13** (update this line whenever a program bead
+Last reconciled: **2026-07-14** (update this line whenever a program bead
 closes — that is part of each bead's close checklist by convention). This
 document is what a new contributor reads INSTEAD of re-running the six-repo
 survey that produced the program. Style: terse, factual. Authority order when
@@ -113,10 +113,10 @@ and review log). Status at last reconcile:
   guard), bd-2z0.8.17 (asupersync universe guard), bd-2z0.8.9.14 (fsqlite pin
   reconciliation → `ci/check_fsqlite_pin.sh`), bd-2z0.8.16 (wasm graph
   denylist + golden), bd-2z0.11.5 (analytics scaffold), bd-2z0.13.6 (rider
-  release packaging), bd-2z0.3.12.1 (frankentorch dependency admission).
-- **OPEN, ready**: bd-2z0.3.12.2
-  (BatchBrain — sequenced after the bd-16g.15.x sense-lane digest move),
-  bd-2z0.8.18 (perf gates).
+  release packaging), bd-2z0.3.12.1 (frankentorch dependency admission),
+  bd-2z0.8.18 (performance gates; DSR-only acceptance).
+- **OPEN, ready**: bd-2z0.3.12.2 (BatchBrain — sequenced after the
+  bd-16g.15.x sense-lane digest move).
 - **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.12/.13
   (async-api / MVCC decision), bd-2z0.4.12/.13/.14 + bd-2z0.8.9.15 +
   bd-2z0.12.4 (asupersync spine chain), bd-2z0.11.6/.7/.8/.9 (analytics
