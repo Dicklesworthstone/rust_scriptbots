@@ -1,0 +1,389 @@
+name: Report performance budgets
+
+on:
+  workflow_run:
+    workflows:
+      - Performance budgets
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-report-${{ github.event.workflow_run.pull_requests[0].number || 'nightly' }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Publish trusted performance report
+    if: >-
+      ${{
+        github.event.workflow_run.event == 'schedule'
+        || (
+          github.event.workflow_run.event == 'pull_request'
+          && github.event.workflow_run.head_repository.full_name == github.repository
+          && github.event.workflow_run.pull_requests[0].number != null
+        )
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Download, bound, and validate untrusted evidence
+        id: evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+        run: |
+          set -euo pipefail
+          printf 'publish=false\n' >> "${GITHUB_OUTPUT}"
+          marker='<!-- scriptbots-perf-gate -->'
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
+
+          write_rejection() {
+            local reason="$1"
+            {
+              echo "${marker}"
+              echo "## ScriptBots performance gate"
+              echo
+              echo "**Workflow conclusion:** \`${SOURCE_CONCLUSION}\`"
+              echo
+              echo "The trusted reporter rejected the untrusted benchmark evidence: ${reason}"
+              echo
+              echo "[Inspect the read-only benchmark run](${run_url})."
+            } > comment.md
+            printf 'publish=true\n' >> "${GITHUB_OUTPUT}"
+          }
+
+          if [[ ! "${SOURCE_RUN_ID}" =~ ^[1-9][0-9]*$ \
+            || ! "${SOURCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid source workflow identity." >&2
+            exit 2
+          fi
+          case "${SOURCE_EVENT}" in
+            pull_request)
+              operation=short
+              ;;
+            schedule)
+              operation=full
+              ;;
+            *)
+              echo "Unsupported source event: ${SOURCE_EVENT}" >&2
+              exit 2
+              ;;
+          esac
+          case "${SOURCE_CONCLUSION}" in
+            success|failure|cancelled|timed_out|action_required|neutral|skipped|stale|startup_failure)
+              ;;
+            *)
+              echo "Unsupported source conclusion: ${SOURCE_CONCLUSION}" >&2
+              exit 2
+              ;;
+          esac
+          source_workflow_file="${SOURCE_WORKFLOW_PATH%%@*}"
+          if [[ "${source_workflow_file}" != ".github/workflows/perf.yml" ]]; then
+            write_rejection "the source run did not use the expected performance workflow path."
+            exit 0
+          fi
+          if [[ ! "${SOURCE_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            write_rejection "the source run has no valid commit identity."
+            exit 0
+          fi
+          if [[ "${SOURCE_EVENT}" == "pull_request" ]]; then
+            source_pr_number="$(jq -r '.workflow_run.pull_requests[0].number // empty' "${GITHUB_EVENT_PATH}")"
+            source_pr_head_sha="$(jq -r '.workflow_run.pull_requests[0].head.sha // empty' "${GITHUB_EVENT_PATH}")"
+            base_sha="$(jq -r '.workflow_run.pull_requests[0].base.sha // empty' "${GITHUB_EVENT_PATH}")"
+            if [[ ! "${source_pr_number}" =~ ^[1-9][0-9]*$ \
+              || ! "${source_pr_head_sha}" =~ ^[0-9a-f]{40}$ \
+              || ! "${base_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+              write_rejection "the pull-request source run has no valid PR, head, or base identity."
+              exit 0
+            fi
+            if ! gh api "repos/${REPOSITORY}/pulls/${source_pr_number}" > current-pr.json; then
+              echo "Unable to verify whether pull request ${source_pr_number} is current." >&2
+              exit 2
+            fi
+            current_pr_state="$(jq -r '.state // empty' current-pr.json)"
+            current_pr_head_sha="$(jq -r '.head.sha // empty' current-pr.json)"
+            current_pr_base_sha="$(jq -r '.base.sha // empty' current-pr.json)"
+            current_changed_files="$(jq -r '.changed_files // empty' current-pr.json)"
+            if [[ "${current_pr_state}" != "open" \
+              || "${current_pr_head_sha}" != "${source_pr_head_sha}" \
+              || "${current_pr_base_sha}" != "${base_sha}" ]]; then
+              echo "Skipping stale or closed pull-request evidence for #${source_pr_number}."
+              exit 0
+            fi
+            if [[ "${SOURCE_HEAD_SHA}" != "${source_pr_head_sha}" \
+              || ! "${current_changed_files}" =~ ^[0-9]+$ ]]; then
+              write_rejection "the source run disagrees with its pull-request identity."
+              exit 0
+            fi
+            gh api --paginate --slurp \
+              "repos/${REPOSITORY}/pulls/${source_pr_number}/files?per_page=100" \
+              > pr-files.json
+            listed_changed_files="$(jq '[.[][]] | length' pr-files.json)"
+            if [[ "${listed_changed_files}" != "${current_changed_files}" ]]; then
+              write_rejection "the complete pull-request file list could not be attested."
+              exit 0
+            fi
+            if jq -e --arg workflow ".github/workflows/perf.yml" '
+              any(.[][];
+                .filename == $workflow
+                or (.previous_filename // "") == $workflow
+              )
+            ' pr-files.json > /dev/null; then
+              write_rejection "the pull request changed the performance workflow; its evidence is untrusted until that workflow lands on the base branch."
+              exit 0
+            fi
+          fi
+
+          artifact_name="performance-${operation}-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
+          gh api --paginate --slurp \
+            "repos/${REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" \
+            > artifacts.json
+          artifact_count="$(
+            jq -r --arg name "${artifact_name}" '
+              [.[] | .artifacts[] | select(.name == $name and .expired == false)] | length
+            ' artifacts.json
+          )"
+          if [[ "${artifact_count}" != "1" ]]; then
+            write_rejection "expected exactly one \`${artifact_name}\` artifact, found ${artifact_count}."
+            exit 0
+          fi
+          artifact_id="$(
+            jq -r --arg name "${artifact_name}" '
+              [.[] | .artifacts[] | select(.name == $name and .expired == false)][0].id
+            ' artifacts.json
+          )"
+          artifact_size="$(
+            jq -r --arg name "${artifact_name}" '
+              [.[] | .artifacts[] | select(.name == $name and .expired == false)][0].size_in_bytes
+            ' artifacts.json
+          )"
+          if [[ ! "${artifact_id}" =~ ^[1-9][0-9]*$ \
+            || ! "${artifact_size}" =~ ^[0-9]+$ \
+            || "${artifact_size}" -gt 52428800 ]]; then
+            write_rejection "the exact artifact has an invalid identity or exceeds 50 MiB."
+            exit 0
+          fi
+
+          gh api "repos/${REPOSITORY}/actions/artifacts/${artifact_id}/zip" > performance.zip
+          if ! python3 - performance.zip perf_verdict.json <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          archive_path, output_path = sys.argv[1:]
+          limit = 262_144
+          with zipfile.ZipFile(archive_path) as archive:
+              entries = archive.infolist()
+              if len(entries) > 10_000:
+                  raise SystemExit("artifact central directory has too many entries")
+              verdicts = [entry for entry in entries if pathlib.PurePosixPath(entry.filename).name == "perf_verdict.json"]
+              if len(verdicts) != 1:
+                  raise SystemExit(f"expected exactly one perf_verdict.json, found {len(verdicts)}")
+              verdict = verdicts[0]
+              path = pathlib.PurePosixPath(verdict.filename)
+              if path.is_absolute() or ".." in path.parts:
+                  raise SystemExit("unsafe verdict entry path")
+              if verdict.file_size > limit:
+                  raise SystemExit("verdict central-directory size exceeds 256 KiB")
+              with archive.open(verdict) as source:
+                  payload = source.read(limit + 1)
+                  if len(payload) > limit or source.read(1):
+                      raise SystemExit("expanded verdict exceeds 256 KiB")
+              pathlib.Path(output_path).write_bytes(payload)
+          PY
+          then
+            write_rejection "the artifact archive failed bounded extraction."
+            exit 0
+          fi
+
+          if ! jq -e --arg operation "${operation}" --arg conclusion "${SOURCE_CONCLUSION}" '
+            def short_ids: [
+              "agents-1000__brain-mlp-baseline__ticks-200__snapshot-dynamic-v1",
+              "agents-1000__brain-ml-neuroflow__ticks-200__snapshot-dynamic-v1"
+            ];
+            def full_ids: short_ids + [
+              "agents-5000__brain-mlp-baseline__ticks-200__snapshot-dynamic-v1",
+              "agents-5000__brain-ml-neuroflow__ticks-200__snapshot-dynamic-v1"
+            ];
+            def expected_ids: if $operation == "short" then short_ids else full_ids end;
+            (.schema == "scriptbots.perf-verdict.v1")
+            and (.status | IN("pass", "fail", "advisory", "refused", "bootstrap_required"))
+            and (.exit_code | type == "number" and floor == .)
+            and (
+              ((.status | IN("pass", "advisory", "bootstrap_required")) and .exit_code == 0)
+              or (.status == "fail" and .exit_code == 1)
+              or (.status == "refused" and .exit_code == 2)
+            )
+            and (
+              if $conclusion == "success"
+              then (.status | IN("pass", "advisory"))
+              else (.status | IN("fail", "refused", "bootstrap_required"))
+              end
+            )
+            and (.candidate_machine_class_id
+              | type == "string" and test("^fnv1a64:[0-9a-f]{16}$"))
+            and (.reasons
+              | type == "array"
+              and length >= 1
+              and length <= 50
+              and all(.[];
+                type == "string"
+                and length <= 2000
+                and test("^[^\\u0000-\\u001f\\u007f]*$")
+              ))
+            and (.scenarios | type == "array" and length <= 4 and all(.[];
+              (.id | type == "string" and test("^[a-z0-9._-]{1,200}$"))
+              and (.baseline_tps | type == "number")
+              and (.candidate_tps | type == "number")
+              and (.tps_regression_pct | type == "number")
+              and (.noisy | type == "boolean")
+            ))
+            and (
+              if (.status | IN("pass", "advisory", "fail"))
+              then (
+                (.baseline_machine_class_id
+                  | type == "string" and test("^fnv1a64:[0-9a-f]{16}$"))
+                and (([.scenarios[].id] | sort) == (expected_ids | sort))
+              )
+              else (.scenarios | length == 0)
+              end
+            )
+          ' perf_verdict.json > /dev/null; then
+            write_rejection "the typed verdict failed schema, matrix, or workflow-conclusion binding."
+            exit 0
+          fi
+
+          jq -r \
+            --arg conclusion "${SOURCE_CONCLUSION}" \
+            --arg marker "${marker}" \
+            --arg run_url "${run_url}" '
+            def safe:
+              gsub("&"; "&amp;")
+              | gsub("<"; "&lt;")
+              | gsub(">"; "&gt;")
+              | gsub("@"; "＠");
+            $marker,
+            "## ScriptBots performance gate",
+            "",
+            ("**Status:** `" + .status + "`  "),
+            ("**Workflow conclusion:** `" + $conclusion + "`  "),
+            ("**Machine class:** `" + (.candidate_machine_class_id | safe) + "`"),
+            "",
+            (.reasons[:10][] | "- <code>" + safe + "</code>"),
+            "",
+            (if (.scenarios | length) == 0 then empty else
+              "| Scenario | Baseline TPS | Candidate TPS | Delta | Noise |",
+              "|---|---:|---:|---:|---|",
+              (.scenarios[] |
+                "| `" + (.id | safe) + "` | "
+                + (.baseline_tps | tostring) + " | "
+                + (.candidate_tps | tostring) + " | "
+                + ((-.tps_regression_pct) | tostring) + "% | "
+                + (if .noisy then "advisory" else "stable" end) + " |"
+              )
+            end),
+            "",
+            ("[Raw samples, fingerprint, and job summary](" + $run_url + ").")
+          ' perf_verdict.json > comment.md
+          printf 'publish=true\n' >> "${GITHUB_OUTPUT}"
+
+      - name: Publish comparison comment
+        if: steps.evidence.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+        run: |
+          set -euo pipefail
+          marker='<!-- scriptbots-perf-gate -->'
+          jq -Rs '{body: .}' comment.md > payload.json
+          case "${SOURCE_EVENT}" in
+            pull_request)
+              if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Invalid pull-request number." >&2
+                exit 2
+              fi
+              source_pr_head_sha="$(jq -r '.workflow_run.pull_requests[0].head.sha // empty' "${GITHUB_EVENT_PATH}")"
+              source_pr_base_sha="$(jq -r '.workflow_run.pull_requests[0].base.sha // empty' "${GITHUB_EVENT_PATH}")"
+              gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" > current-pr-at-publish.json
+              current_pr_state="$(jq -r '.state // empty' current-pr-at-publish.json)"
+              current_pr_head_sha="$(jq -r '.head.sha // empty' current-pr-at-publish.json)"
+              current_pr_base_sha="$(jq -r '.base.sha // empty' current-pr-at-publish.json)"
+              if [[ "${current_pr_state}" != "open" \
+                || ! "${source_pr_head_sha}" =~ ^[0-9a-f]{40}$ \
+                || ! "${source_pr_base_sha}" =~ ^[0-9a-f]{40}$ \
+                || "${current_pr_head_sha}" != "${source_pr_head_sha}" \
+                || "${current_pr_base_sha}" != "${source_pr_base_sha}" ]]; then
+                echo "Skipping stale performance report for pull request #${PR_NUMBER}."
+                exit 0
+              fi
+              gh api --paginate --slurp \
+                "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > comments.json
+              comment_id="$(
+                jq -r --arg marker "${marker}" '
+                  [.[][]
+                    | select(.user.login == "github-actions[bot]")
+                    | select(.body | contains($marker))]
+                  | last | .id // empty
+                ' comments.json
+              )"
+              if [[ -n "${comment_id}" ]]; then
+                gh api --method PATCH \
+                  "repos/${REPOSITORY}/issues/comments/${comment_id}" \
+                  --input payload.json > /dev/null
+              else
+                gh api --method POST \
+                  "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                  --input payload.json > /dev/null
+              fi
+              ;;
+            schedule)
+              nightly_title='Nightly ScriptBots performance budgets'
+              nightly_marker='<!-- scriptbots-nightly-perf-issue -->'
+              gh api --paginate --slurp \
+                "repos/${REPOSITORY}/issues?state=open&per_page=100" > issues.json
+              issue_number="$(
+                jq -r --arg title "${nightly_title}" --arg marker "${nightly_marker}" '
+                  [.[][]
+                    | select(has("pull_request") | not)
+                    | select(.user.login == "github-actions[bot]")
+                    | select(.title == $title)
+                    | select((.body // "") | contains($marker))]
+                  | first | .number // empty
+                ' issues.json
+              )"
+              if [[ -z "${issue_number}" ]]; then
+                jq -n \
+                  --arg title "${nightly_title}" \
+                  --arg body "${nightly_marker}"$'\n\nAutomated full-matrix performance comparisons are posted here by the trusted scheduled workflow.' \
+                  '{title: $title, body: $body}' > issue.json
+                issue_number="$(
+                  gh api --method POST "repos/${REPOSITORY}/issues" --input issue.json --jq '.number'
+                )"
+              fi
+              gh api --method POST \
+                "repos/${REPOSITORY}/issues/${issue_number}/comments" \
+                --input payload.json > /dev/null
+              ;;
+            *)
+              echo "Unsupported report event: ${SOURCE_EVENT}" >&2
+              exit 2
+              ;;
+          esac

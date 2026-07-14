@@ -10192,6 +10192,8 @@ dependencies = [
  "rand 0.8.7",
  "rand 0.9.5",
  "rayon",
+ "scriptbots-brain",
+ "scriptbots-brain-neuro",
  "scriptbots-index",
  "serde",
  "serde_json",
@@ -10259,7 +10261,6 @@ dependencies = [
  "scriptbots-core",
  "serde",
  "serde-wasm-bindgen",
- "slotmap",
  "wasm-bindgen",
  "wasm-bindgen-test",
 ]

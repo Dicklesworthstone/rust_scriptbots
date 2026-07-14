@@ -10,12 +10,16 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
-    AgentData, AgentId, BrainBinding, BrainRunner, Generation, INPUT_SIZE, OUTPUT_SIZE, Position,
-    ScriptBotsConfig, Velocity, WorldState,
+    AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
+    Generation, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, Velocity, WorldState,
+};
+#[cfg(test)]
+use scriptbots_core::{
+    DynamicAgentSnapshot as AgentSnapshot, DynamicSnapshotSummary as SnapshotSummary,
+    DynamicSnapshotWorld as SnapshotWorld,
 };
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
-use slotmap::Key;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -235,130 +239,6 @@ impl InitOptions {
             self.default_brain,
         )
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SimulationSnapshot {
-    tick: u64,
-    epoch: u64,
-    world: SnapshotWorld,
-    summary: SnapshotSummary,
-    agents: Vec<AgentSnapshot>,
-}
-
-impl SimulationSnapshot {
-    fn from_world(world: &WorldState) -> Self {
-        let handles: Vec<AgentId> = world.agents().iter_handles().collect();
-        let columns = world.agents().columns();
-        let mut agents = Vec::with_capacity(handles.len());
-        let mut total_energy = 0.0_f32;
-        let mut total_health = 0.0_f32;
-
-        for (dense_index, id) in handles.iter().enumerate() {
-            let data = columns.snapshot(dense_index);
-            let energy = world
-                .agent_runtime(*id)
-                .map(|runtime| runtime.energy)
-                .unwrap_or_default();
-            total_energy += energy;
-            total_health += data.health;
-
-            agents.push(AgentSnapshot {
-                id: id.data().as_ffi(),
-                position: [data.position.x, data.position.y],
-                velocity: [data.velocity.vx, data.velocity.vy],
-                heading: data.heading,
-                health: data.health,
-                energy,
-                color: data.color,
-                spike_length: data.spike_length,
-                boost: data.boost,
-            });
-        }
-
-        let summary = world
-            .history()
-            .last()
-            .cloned()
-            .map(|entry| SnapshotSummary {
-                agent_count: entry.agent_count,
-                births: entry.births,
-                deaths: entry.deaths,
-                total_energy: entry.total_energy,
-                average_energy: entry.average_energy,
-                average_health: entry.average_health,
-            })
-            .unwrap_or_else(|| {
-                let agent_count = agents.len();
-                let average_energy = if agent_count > 0 {
-                    total_energy / agent_count as f32
-                } else {
-                    0.0
-                };
-                let average_health = if agent_count > 0 {
-                    total_health / agent_count as f32
-                } else {
-                    0.0
-                };
-                SnapshotSummary {
-                    agent_count,
-                    births: 0,
-                    deaths: 0,
-                    total_energy,
-                    average_energy,
-                    average_health,
-                }
-            });
-
-        let config = world.config();
-        let world_info = SnapshotWorld {
-            width: config.world_width,
-            height: config.world_height,
-            closed: world.is_closed(),
-        };
-
-        Self {
-            tick: world.tick().0,
-            epoch: world.epoch(),
-            world: world_info,
-            summary,
-            agents,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SnapshotSummary {
-    agent_count: usize,
-    births: usize,
-    deaths: usize,
-    total_energy: f32,
-    average_energy: f32,
-    average_health: f32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentSnapshot {
-    id: u64,
-    position: [f32; 2],
-    velocity: [f32; 2],
-    heading: f32,
-    health: f32,
-    energy: f32,
-    color: [f32; 3],
-    spike_length: f32,
-    boost: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SnapshotWorld {
-    width: u32,
-    height: u32,
-    closed: bool,
 }
 
 #[wasm_bindgen]

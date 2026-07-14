@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 #[cfg(feature = "simd_wide")]
 use wide::f32x4;
@@ -1599,6 +1600,144 @@ pub struct AgentState {
     pub runtime: AgentRuntime,
 }
 
+/// Schema identifier for the renderer-neutral dynamic snapshot currently consumed by the web
+/// frontend and exercised by the performance gate.
+pub const DYNAMIC_WORLD_SNAPSHOT_SCHEMA: &str = "scriptbots.dynamic-world-snapshot.v1";
+
+/// Compact dynamic state for one agent in [`DynamicWorldSnapshot`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicAgentSnapshot {
+    /// Stable generational handle encoded for external consumers.
+    pub id: u64,
+    /// World-space position `[x, y]`.
+    pub position: [f32; 2],
+    /// World-space velocity `[vx, vy]`.
+    pub velocity: [f32; 2],
+    /// Agent heading in radians.
+    pub heading: f32,
+    /// Current health.
+    pub health: f32,
+    /// Current runtime energy.
+    pub energy: f32,
+    /// Display color in linear RGB.
+    pub color: [f32; 3],
+    /// Current spike extension.
+    pub spike_length: f32,
+    /// Whether movement boost is active.
+    pub boost: bool,
+}
+
+/// Dynamic world bounds and policy included with a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicSnapshotWorld {
+    /// World width in simulation units.
+    pub width: u32,
+    /// World height in simulation units.
+    pub height: u32,
+    /// Whether automatic population injection is disabled.
+    pub closed: bool,
+}
+
+/// Latest aggregate values included with a dynamic snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicSnapshotSummary {
+    /// Agent population at the captured boundary.
+    pub agent_count: usize,
+    /// Births during the latest completed tick.
+    pub births: usize,
+    /// Deaths during the latest completed tick.
+    pub deaths: usize,
+    /// Sum of current agent energy.
+    pub total_energy: f32,
+    /// Mean current agent energy.
+    pub average_energy: f32,
+    /// Mean current agent health.
+    pub average_health: f32,
+}
+
+/// Renderer-neutral dynamic world projection with static terrain deliberately excluded.
+///
+/// This is a real production snapshot surface, not a benchmark-only copy loop. Static terrain and
+/// other revisioned layers remain outside the payload so callers can share them independently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicWorldSnapshot {
+    /// Completed simulation tick.
+    pub tick: u64,
+    /// Evolution epoch.
+    pub epoch: u64,
+    /// Dynamic world bounds and closed-world policy.
+    pub world: DynamicSnapshotWorld,
+    /// Latest aggregate values.
+    pub summary: DynamicSnapshotSummary,
+    /// Compact dynamic agent projection.
+    pub agents: Vec<DynamicAgentSnapshot>,
+}
+
+impl DynamicWorldSnapshot {
+    /// Capture current dynamic world state without terrain or other static layers.
+    #[must_use]
+    pub fn from_world(world: &WorldState) -> Self {
+        let arena = world.agents();
+        let columns = arena.columns();
+        let mut agents = Vec::with_capacity(arena.len());
+        let mut total_energy = 0.0_f32;
+        let mut total_health = 0.0_f32;
+
+        for (dense_index, id) in arena.iter_handles().enumerate() {
+            let data = columns.snapshot(dense_index);
+            let energy = world
+                .agent_runtime(id)
+                .map_or(0.0, |runtime| runtime.energy);
+            total_energy += energy;
+            total_health += data.health;
+            agents.push(DynamicAgentSnapshot {
+                id: id.raw(),
+                position: [data.position.x, data.position.y],
+                velocity: [data.velocity.vx, data.velocity.vy],
+                heading: data.heading,
+                health: data.health,
+                energy,
+                color: data.color,
+                spike_length: data.spike_length,
+                boost: data.boost,
+            });
+        }
+
+        let agent_count = agents.len();
+        let divisor = agent_count.max(1) as f32;
+        let (births, deaths) = world
+            .history()
+            .last()
+            .filter(|entry| entry.tick == world.tick())
+            .map_or((0, 0), |entry| (entry.births, entry.deaths));
+        let summary = DynamicSnapshotSummary {
+            agent_count,
+            births,
+            deaths,
+            total_energy,
+            average_energy: total_energy / divisor,
+            average_health: total_health / divisor,
+        };
+        let config = world.config();
+
+        Self {
+            tick: world.tick().0,
+            epoch: world.epoch(),
+            world: DynamicSnapshotWorld {
+                width: config.world_width,
+                height: config.world_height,
+                closed: world.is_closed(),
+            },
+            summary,
+            agents,
+        }
+    }
+}
+
 /// Schema identifier for the temporary pre-redesign world characterization digest.
 pub const CHARACTERIZATION_DIGEST_V0_SCHEMA: &str = "scriptbots.world.characterization.v0";
 
@@ -2663,6 +2802,235 @@ impl ResourceLedgerState {
             reconciliation,
         });
     }
+}
+
+/// Schema identifier for opt-in per-stage simulation-step timing.
+pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
+
+/// Stable stage identifiers emitted by [`WorldStepProfile`].
+///
+/// The order is part of [`WORLD_STEP_PROFILE_SCHEMA`]. New or regrouped stages require a new
+/// schema identifier so a performance baseline cannot silently compare different work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldStepStage {
+    /// Apply queued scenario interventions and account for rejected capacity.
+    Interventions,
+    /// Apply scheduled aging effects.
+    Aging,
+    /// Update food growth, diffusion, decay, and respawn state.
+    FoodDynamics,
+    /// Rebuild sensory inputs and the neighborhood index used by sensing.
+    Sense,
+    /// Evaluate all bound agent brains.
+    Brains,
+    /// Apply brain outputs to movement and agent control state.
+    Actuation,
+    /// Apply temperature discomfort.
+    TemperatureDiscomfort,
+    /// Consume, share, and account for food.
+    Food,
+    /// Resolve spike combat.
+    Combat,
+    /// Remove dead agents and distribute carcass resources.
+    DeathCleanup,
+    /// Select parents and queue offspring.
+    Reproduction,
+    /// Inject configured population and commit or roll back queued spawns.
+    Population,
+    /// Accumulate tick counters, history, and narrative state.
+    Bookkeeping,
+    /// Materialize and admit the persistence batch when due.
+    Persistence,
+    /// Reset transient events, finish diagnostic ledgers, and advance the tick.
+    Finalize,
+}
+
+impl WorldStepStage {
+    const COUNT: usize = 15;
+
+    const ALL: [Self; Self::COUNT] = [
+        Self::Interventions,
+        Self::Aging,
+        Self::FoodDynamics,
+        Self::Sense,
+        Self::Brains,
+        Self::Actuation,
+        Self::TemperatureDiscomfort,
+        Self::Food,
+        Self::Combat,
+        Self::DeathCleanup,
+        Self::Reproduction,
+        Self::Population,
+        Self::Bookkeeping,
+        Self::Persistence,
+        Self::Finalize,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Stable snake-case label for structured artifacts and human reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interventions => "interventions",
+            Self::Aging => "aging",
+            Self::FoodDynamics => "food_dynamics",
+            Self::Sense => "sense",
+            Self::Brains => "brains",
+            Self::Actuation => "actuation",
+            Self::TemperatureDiscomfort => "temperature_discomfort",
+            Self::Food => "food",
+            Self::Combat => "combat",
+            Self::DeathCleanup => "death_cleanup",
+            Self::Reproduction => "reproduction",
+            Self::Population => "population",
+            Self::Bookkeeping => "bookkeeping",
+            Self::Persistence => "persistence",
+            Self::Finalize => "finalize",
+        }
+    }
+
+    /// Stages in the stable schema order.
+    #[must_use]
+    pub const fn all() -> &'static [Self; Self::COUNT] {
+        &Self::ALL
+    }
+}
+
+/// Timing for the most recently completed profiled simulation step.
+///
+/// Timing is disabled by default. When enabled, durations use the process monotonic clock and are
+/// diagnostic only: they never enter persistence, replay, digests, or scientific decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldStepProfile {
+    /// Schema governing stage names and grouping.
+    pub schema: String,
+    /// Completed tick described by this profile.
+    pub tick: Tick,
+    /// Whole-step elapsed time, including accounting and error finalization.
+    pub total_ns: u64,
+    stage_ns: [u64; WorldStepStage::COUNT],
+    stage_executed: [bool; WorldStepStage::COUNT],
+}
+
+impl WorldStepProfile {
+    fn new(tick: Tick) -> Self {
+        Self {
+            schema: WORLD_STEP_PROFILE_SCHEMA.to_owned(),
+            tick,
+            total_ns: 0,
+            stage_ns: [0; WorldStepStage::COUNT],
+            stage_executed: [false; WorldStepStage::COUNT],
+        }
+    }
+
+    fn reset(&mut self, tick: Tick) {
+        self.tick = tick;
+        self.total_ns = 0;
+        self.stage_ns.fill(0);
+        self.stage_executed.fill(false);
+    }
+
+    fn record(&mut self, stage: WorldStepStage, elapsed: Duration) {
+        self.stage_ns[stage.index()] = duration_ns(elapsed);
+        self.stage_executed[stage.index()] = true;
+    }
+
+    /// Elapsed nanoseconds for one stable stage, or `None` when cadence skipped that stage.
+    #[must_use]
+    pub const fn elapsed_ns(&self, stage: WorldStepStage) -> Option<u64> {
+        if self.stage_executed[stage.index()] {
+            Some(self.stage_ns[stage.index()])
+        } else {
+            None
+        }
+    }
+
+    /// Iterate stable stage identifiers paired with optional elapsed nanoseconds.
+    pub fn stages(&self) -> impl Iterator<Item = (WorldStepStage, Option<u64>)> + '_ {
+        WorldStepStage::ALL
+            .into_iter()
+            .map(|stage| (stage, self.elapsed_ns(stage)))
+    }
+}
+
+/// Opt-in monotonic-clock observer for [`WorldState::step_profiled`].
+///
+/// Ordinary [`WorldState::step`] uses a monomorphized no-op observer, so enabling this type for a
+/// dedicated measurement pass cannot add clock reads to production or pure-throughput steps.
+#[derive(Debug, Default)]
+pub struct WorldStepProfiler {
+    latest: Option<WorldStepProfile>,
+}
+
+impl WorldStepProfiler {
+    /// Most recently completed profiled step, if any.
+    #[must_use]
+    pub const fn latest(&self) -> Option<&WorldStepProfile> {
+        self.latest.as_ref()
+    }
+}
+
+trait WorldStepObserver {
+    type StepHandle;
+    type StageHandle;
+
+    fn begin_step(&mut self, tick: Tick) -> Self::StepHandle;
+    fn begin_stage(&mut self, stage: WorldStepStage) -> Self::StageHandle;
+    fn end_stage(&mut self, stage: WorldStepStage, handle: Self::StageHandle);
+    fn end_step(&mut self, handle: Self::StepHandle);
+}
+
+struct NoopWorldStepObserver;
+
+impl WorldStepObserver for NoopWorldStepObserver {
+    type StepHandle = ();
+    type StageHandle = ();
+
+    fn begin_step(&mut self, _tick: Tick) {}
+
+    fn begin_stage(&mut self, _stage: WorldStepStage) {}
+
+    fn end_stage(&mut self, _stage: WorldStepStage, _handle: ()) {}
+
+    fn end_step(&mut self, _handle: ()) {}
+}
+
+impl WorldStepObserver for WorldStepProfiler {
+    type StepHandle = Instant;
+    type StageHandle = Instant;
+
+    fn begin_step(&mut self, tick: Tick) -> Instant {
+        if let Some(latest) = self.latest.as_mut() {
+            latest.reset(tick);
+        } else {
+            self.latest = Some(WorldStepProfile::new(tick));
+        }
+        Instant::now()
+    }
+
+    fn begin_stage(&mut self, _stage: WorldStepStage) -> Instant {
+        Instant::now()
+    }
+
+    fn end_stage(&mut self, stage: WorldStepStage, started_at: Instant) {
+        if let Some(latest) = self.latest.as_mut() {
+            latest.record(stage, started_at.elapsed());
+        }
+    }
+
+    fn end_step(&mut self, started_at: Instant) {
+        if let Some(latest) = self.latest.as_mut() {
+            latest.total_ns = duration_ns(started_at.elapsed());
+        }
+    }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Events emitted after processing a world tick.
@@ -13381,134 +13749,198 @@ impl WorldState {
     /// blocks later science ticks without mutation; callers must not retry `step` as though the
     /// failed return meant the current tick was unapplied.
     pub fn step(&mut self) -> Result<TickEvents, WorldStepError> {
+        self.step_observed(&mut NoopWorldStepObserver)
+    }
+
+    /// Execute one simulation tick while recording opt-in per-stage wall-clock timings.
+    ///
+    /// This follows the identical authoritative pipeline as [`Self::step`]. Use a separate
+    /// measurement pass when comparing pure TPS so the profiler's monotonic clock reads do not
+    /// contaminate the throughput sample.
+    pub fn step_profiled(
+        &mut self,
+        profiler: &mut WorldStepProfiler,
+    ) -> Result<TickEvents, WorldStepError> {
+        self.step_observed(profiler)
+    }
+
+    fn step_observed<O: WorldStepObserver>(
+        &mut self,
+        observer: &mut O,
+    ) -> Result<TickEvents, WorldStepError> {
         if let Some(error) = self.latched_step_error() {
             return Err(error);
         }
 
         let next_tick = self.tick.next();
+        let step_started_at = observer.begin_step(next_tick);
         let previous_epoch = self.epoch;
+
+        macro_rules! observed_stage {
+            ($stage:expr, $body:block) => {{
+                let stage_started_at = observer.begin_stage($stage);
+                let value = $body;
+                observer.end_stage($stage, stage_started_at);
+                value
+            }};
+        }
 
         if self.resource_ledger.enabled {
             let opening = self.resource_amounts();
             self.resource_ledger.begin_tick(next_tick, opening);
         }
 
-        let before = self.capture_resource_amounts();
-        let intervention_rejection = self.stage_interventions();
-        self.record_resource_change(ResourceFlowKind::ScenarioIntervention, before);
-        self.resource_ledger.record(
-            ResourceFlowKind::CapacityRejection,
-            ResourceAmounts::default(),
-            intervention_rejection,
-        );
-        if self.cadence.should_age(next_tick) {
+        observed_stage!(WorldStepStage::Interventions, {
             let before = self.capture_resource_amounts();
-            self.stage_aging();
-            self.record_resource_change(ResourceFlowKind::Aging, before);
-        }
-        let before = self.capture_resource_amounts();
-        let food_respawned = self.stage_food_dynamics(next_tick);
-        self.record_resource_change(ResourceFlowKind::FoodDynamics, before);
-        self.stage_sense();
-        self.stage_brains();
-        self.stage_actuation();
-        let before = self.capture_resource_amounts();
-        self.stage_temperature_discomfort();
-        self.record_resource_change(ResourceFlowKind::TemperatureStress, before);
-        let before = self.capture_resource_amounts();
-        let food_activity = self.stage_food();
-        if let Some(before) = before {
-            let mut ground_delta = self.resource_amounts().delta_from(before);
-            ground_delta.energy -= food_activity.sharing_delta_energy;
+            let intervention_rejection = self.stage_interventions();
+            self.record_resource_change(ResourceFlowKind::ScenarioIntervention, before);
             self.resource_ledger.record(
-                ResourceFlowKind::GroundFoodConversion,
-                ground_delta,
+                ResourceFlowKind::CapacityRejection,
+                ResourceAmounts::default(),
+                intervention_rejection,
+            );
+        });
+        if self.cadence.should_age(next_tick) {
+            observed_stage!(WorldStepStage::Aging, {
+                let before = self.capture_resource_amounts();
+                self.stage_aging();
+                self.record_resource_change(ResourceFlowKind::Aging, before);
+            });
+        }
+        let food_respawned = observed_stage!(WorldStepStage::FoodDynamics, {
+            let before = self.capture_resource_amounts();
+            let food_respawned = self.stage_food_dynamics(next_tick);
+            self.record_resource_change(ResourceFlowKind::FoodDynamics, before);
+            food_respawned
+        });
+        observed_stage!(WorldStepStage::Sense, {
+            self.stage_sense();
+        });
+        observed_stage!(WorldStepStage::Brains, {
+            self.stage_brains();
+        });
+        observed_stage!(WorldStepStage::Actuation, {
+            self.stage_actuation();
+        });
+        observed_stage!(WorldStepStage::TemperatureDiscomfort, {
+            let before = self.capture_resource_amounts();
+            self.stage_temperature_discomfort();
+            self.record_resource_change(ResourceFlowKind::TemperatureStress, before);
+        });
+        observed_stage!(WorldStepStage::Food, {
+            let before = self.capture_resource_amounts();
+            let food_activity = self.stage_food();
+            if let Some(before) = before {
+                let mut ground_delta = self.resource_amounts().delta_from(before);
+                ground_delta.energy -= food_activity.sharing_delta_energy;
+                self.resource_ledger.record(
+                    ResourceFlowKind::GroundFoodConversion,
+                    ground_delta,
+                    ResourceAmounts::default(),
+                );
+            }
+            self.resource_ledger.record(
+                ResourceFlowKind::EnergySharing,
+                ResourceAmounts {
+                    energy: food_activity.sharing_delta_energy,
+                    ..ResourceAmounts::default()
+                },
+                ResourceAmounts {
+                    energy: food_activity.shared_energy,
+                    ..ResourceAmounts::default()
+                },
+            );
+            self.resource_ledger.record(
+                ResourceFlowKind::CapacityRejection,
+                ResourceAmounts::default(),
+                ResourceAmounts {
+                    energy: food_activity.rejected_energy,
+                    ..ResourceAmounts::default()
+                },
+            );
+        });
+        observed_stage!(WorldStepStage::Combat, {
+            let before = self.capture_resource_amounts();
+            self.stage_combat();
+            self.record_resource_change(ResourceFlowKind::Combat, before);
+        });
+        observed_stage!(WorldStepStage::DeathCleanup, {
+            let death_activity = self.stage_death_cleanup(next_tick);
+            self.resource_ledger.record(
+                ResourceFlowKind::CarcassReward,
+                death_activity.carcass_delta,
                 ResourceAmounts::default(),
             );
-        }
-        self.resource_ledger.record(
-            ResourceFlowKind::EnergySharing,
-            ResourceAmounts {
-                energy: food_activity.sharing_delta_energy,
-                ..ResourceAmounts::default()
-            },
-            ResourceAmounts {
-                energy: food_activity.shared_energy,
-                ..ResourceAmounts::default()
-            },
-        );
-        self.resource_ledger.record(
-            ResourceFlowKind::CapacityRejection,
-            ResourceAmounts::default(),
-            ResourceAmounts {
-                energy: food_activity.rejected_energy,
-                ..ResourceAmounts::default()
-            },
-        );
-        let before = self.capture_resource_amounts();
-        self.stage_combat();
-        self.record_resource_change(ResourceFlowKind::Combat, before);
-        let death_activity = self.stage_death_cleanup(next_tick);
-        self.resource_ledger.record(
-            ResourceFlowKind::CarcassReward,
-            death_activity.carcass_delta,
-            ResourceAmounts::default(),
-        );
-        self.resource_ledger.record(
-            ResourceFlowKind::DeathRemoval,
-            death_activity.removal_delta,
-            ResourceAmounts::default(),
-        );
-        self.resource_ledger.record(
-            ResourceFlowKind::CapacityRejection,
-            ResourceAmounts::default(),
-            death_activity.rejected,
-        );
-        let reproduction_before = self.capture_resource_amounts();
-        self.stage_reproduction();
-        self.record_resource_change(
-            ResourceFlowKind::ReproductionAllocation,
-            reproduction_before,
-        );
-        let population_before = self.capture_resource_amounts();
-        let population_result = self.stage_population(next_tick);
-        self.record_resource_change(ResourceFlowKind::PopulationInjection, population_before);
-        let brain_result = match population_result {
-            Ok(population_receipt) => {
-                let spawn_before = self.capture_resource_amounts();
-                let spawn_result = self.stage_spawn_commit(next_tick);
-                self.record_resource_change(ResourceFlowKind::ReproductionAllocation, spawn_before);
-                match spawn_result {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        if let Some(receipt) = population_receipt {
-                            let rollback_before = self.capture_resource_amounts();
-                            self.rollback_population_spawns(receipt);
-                            self.record_resource_change(
-                                ResourceFlowKind::PopulationInjection,
-                                rollback_before,
-                            );
+            self.resource_ledger.record(
+                ResourceFlowKind::DeathRemoval,
+                death_activity.removal_delta,
+                ResourceAmounts::default(),
+            );
+            self.resource_ledger.record(
+                ResourceFlowKind::CapacityRejection,
+                ResourceAmounts::default(),
+                death_activity.rejected,
+            );
+        });
+        observed_stage!(WorldStepStage::Reproduction, {
+            let reproduction_before = self.capture_resource_amounts();
+            self.stage_reproduction();
+            self.record_resource_change(
+                ResourceFlowKind::ReproductionAllocation,
+                reproduction_before,
+            );
+        });
+        let brain_result = observed_stage!(WorldStepStage::Population, {
+            let population_before = self.capture_resource_amounts();
+            let population_result = self.stage_population(next_tick);
+            self.record_resource_change(ResourceFlowKind::PopulationInjection, population_before);
+            match population_result {
+                Ok(population_receipt) => {
+                    let spawn_before = self.capture_resource_amounts();
+                    let spawn_result = self.stage_spawn_commit(next_tick);
+                    self.record_resource_change(
+                        ResourceFlowKind::ReproductionAllocation,
+                        spawn_before,
+                    );
+                    match spawn_result {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            if let Some(receipt) = population_receipt {
+                                let rollback_before = self.capture_resource_amounts();
+                                self.rollback_population_spawns(receipt);
+                                self.record_resource_change(
+                                    ResourceFlowKind::PopulationInjection,
+                                    rollback_before,
+                                );
+                            }
+                            Err(error)
                         }
-                        Err(error)
                     }
                 }
+                Err(error) => {
+                    let abort_before = self.capture_resource_amounts();
+                    self.abort_pending_spawns();
+                    self.record_resource_change(
+                        ResourceFlowKind::ReproductionAllocation,
+                        abort_before,
+                    );
+                    Err(error)
+                }
             }
-            Err(error) => {
-                let abort_before = self.capture_resource_amounts();
-                self.abort_pending_spawns();
-                self.record_resource_change(ResourceFlowKind::ReproductionAllocation, abort_before);
-                Err(error)
-            }
-        };
-        self.stage_accumulate_food_balance();
-        self.stage_accumulate_tick_events();
-        self.stage_record_history(next_tick);
-        self.stage_narrative(next_tick);
+        });
+        observed_stage!(WorldStepStage::Bookkeeping, {
+            self.stage_accumulate_food_balance();
+            self.stage_accumulate_tick_events();
+            self.stage_record_history(next_tick);
+            self.stage_narrative(next_tick);
+        });
         let preserve_persistence_tail = self.config.persistence_interval != 0
             && !next_tick
                 .0
                 .is_multiple_of(self.config.persistence_interval as u64);
-        let persistence_result = self.stage_persistence(next_tick, false);
+        let persistence_result = observed_stage!(WorldStepStage::Persistence, {
+            self.stage_persistence(next_tick, false)
+        });
 
         let mut events = TickEvents {
             tick: next_tick,
@@ -13517,15 +13949,17 @@ impl WorldState {
             food_respawned,
         };
 
-        self.stage_reset_events(preserve_persistence_tail);
-        if self.resource_ledger.enabled {
-            let closing = self.resource_amounts();
-            self.resource_ledger.finish_tick(closing);
-        }
-        self.advance_tick();
-        events.tick = self.tick;
-        events.epoch_rolled = self.epoch != previous_epoch;
-        match (brain_result, persistence_result) {
+        observed_stage!(WorldStepStage::Finalize, {
+            self.stage_reset_events(preserve_persistence_tail);
+            if self.resource_ledger.enabled {
+                let closing = self.resource_amounts();
+                self.resource_ledger.finish_tick(closing);
+            }
+            self.advance_tick();
+            events.tick = self.tick;
+            events.epoch_rolled = self.epoch != previous_epoch;
+        });
+        let result = match (brain_result, persistence_result) {
             (Ok(()), Ok(())) => Ok(events),
             (Ok(()), Err(persistence)) => Err(persistence.into()),
             (Err(brain), Ok(())) => {
@@ -13536,7 +13970,9 @@ impl WorldState {
                 self.brain_fault = Some(brain.clone());
                 Err(WorldStepError::BrainAndPersistence { brain, persistence })
             }
-        }
+        };
+        observer.end_step(step_started_at);
+        result
     }
 
     /// Returns an immutable reference to configuration.
@@ -21785,5 +22221,198 @@ mod tests {
             expected_cumulative
         );
         assert_eq!(uninstrumented.resource_ledger().completed_ticks, 0);
+    }
+
+    #[test]
+    fn profiled_step_observes_the_authoritative_pipeline_without_changing_science() {
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            persistence_interval: 0,
+            rng_seed: Some(2_812),
+            ..ScriptBotsConfig::default()
+        };
+        let mut control = WorldState::new(config.clone()).expect("control world");
+        let mut profiled = WorldState::new(config).expect("profiled world");
+        let mut profiler = WorldStepProfiler::default();
+        let control_brain = control
+            .brain_registry_mut()
+            .register("profile-parity", |_rng| Ok(Box::new(StubBrain)));
+        let profiled_brain = profiled
+            .brain_registry_mut()
+            .register("profile-parity", |_rng| Ok(Box::new(StubBrain)));
+        for ordinal in 0..2 {
+            let control_agent = control.spawn_agent(sample_agent(ordinal));
+            let profiled_agent = profiled.spawn_agent(sample_agent(ordinal));
+            assert_eq!(control_agent, profiled_agent);
+            assert!(
+                control
+                    .bind_agent_brain(control_agent, control_brain)
+                    .expect("control brain")
+            );
+            assert!(
+                profiled
+                    .bind_agent_brain(profiled_agent, profiled_brain)
+                    .expect("profiled brain")
+            );
+        }
+        control.set_resource_ledger_enabled(true);
+        profiled.set_resource_ledger_enabled(true);
+
+        for expected_tick in 1..=3 {
+            let control_events = control.step().expect("control tick");
+            let profiled_events = profiled
+                .step_profiled(&mut profiler)
+                .expect("profiled tick");
+            assert_eq!(control_events, profiled_events);
+
+            let report = profiler.latest().expect("completed profile");
+            assert_eq!(report.schema, WORLD_STEP_PROFILE_SCHEMA);
+            assert_eq!(report.tick, Tick(expected_tick));
+            assert_eq!(report.stages().count(), WorldStepStage::COUNT);
+            assert_eq!(report.elapsed_ns(WorldStepStage::Aging), None);
+            assert!(
+                WorldStepStage::all()
+                    .iter()
+                    .filter(|stage| **stage != WorldStepStage::Aging)
+                    .all(|stage| report.elapsed_ns(*stage).is_some())
+            );
+            let stage_total = report
+                .stages()
+                .filter_map(|(_, elapsed_ns)| elapsed_ns)
+                .sum::<u64>();
+            assert!(report.total_ns >= stage_total);
+            assert_eq!(
+                control
+                    .characterization_digest_v0()
+                    .expect("control digest"),
+                profiled
+                    .characterization_digest_v0()
+                    .expect("profiled digest")
+            );
+            assert_eq!(control.resource_ledger(), profiled.resource_ledger());
+        }
+    }
+
+    #[test]
+    fn profiled_step_preserves_persistence_failure_and_latched_boundary() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            rng_seed: Some(2_813),
+            ..ScriptBotsConfig::default()
+        };
+        let control_logs = Arc::new(Mutex::new(Vec::new()));
+        let profiled_logs = Arc::new(Mutex::new(Vec::new()));
+        let mut control = WorldState::with_persistence(
+            config.clone(),
+            Box::new(RejectOncePersistence {
+                logs: Arc::clone(&control_logs),
+                reject_next: true,
+            }),
+        )
+        .expect("control world");
+        let mut profiled = WorldState::with_persistence(
+            config,
+            Box::new(RejectOncePersistence {
+                logs: Arc::clone(&profiled_logs),
+                reject_next: true,
+            }),
+        )
+        .expect("profiled world");
+        let mut profiler = WorldStepProfiler::default();
+
+        let control_error = control.step().expect_err("control persistence rejection");
+        let profiled_error = profiled
+            .step_profiled(&mut profiler)
+            .expect_err("profiled persistence rejection");
+        match (&control_error, &profiled_error) {
+            (
+                WorldStepError::Persistence(control_persistence),
+                WorldStepError::Persistence(profiled_persistence),
+            ) => assert_eq!(control_persistence, profiled_persistence),
+            _ => panic!(
+                "expected matching typed persistence errors, got {control_error:?} and {profiled_error:?}"
+            ),
+        }
+        assert_eq!(control.tick(), Tick(1));
+        assert_eq!(profiled.tick(), Tick(1));
+        assert_eq!(
+            profiler.latest().expect("failed tick profile").tick,
+            Tick(1)
+        );
+        assert_eq!(
+            format!("{:?}", *control_logs.lock().unwrap()),
+            format!("{:?}", *profiled_logs.lock().unwrap())
+        );
+        assert_eq!(
+            control
+                .characterization_digest_v0()
+                .expect("control failure digest"),
+            profiled
+                .characterization_digest_v0()
+                .expect("profiled failure digest")
+        );
+
+        let digest = profiled
+            .characterization_digest_v0()
+            .expect("latched digest");
+        let repeated = profiled
+            .step_profiled(&mut profiler)
+            .expect_err("latched failure blocks a second tick");
+        assert_eq!(repeated.to_string(), profiled_error.to_string());
+        assert_eq!(profiled.tick(), Tick(1));
+        assert_eq!(
+            profiled
+                .characterization_digest_v0()
+                .expect("repeated latched digest"),
+            digest
+        );
+    }
+
+    #[test]
+    fn dynamic_snapshot_uses_live_aggregates_after_post_tick_mutation() {
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            closed: true,
+            rng_seed: Some(2_814),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("snapshot world");
+        world.spawn_agent(sample_agent(0));
+        world.step().expect("completed tick");
+        world.spawn_agent(sample_agent(1));
+
+        let snapshot = DynamicWorldSnapshot::from_world(&world);
+        let total_energy = snapshot
+            .agents
+            .iter()
+            .map(|agent| agent.energy)
+            .sum::<f32>();
+        let total_health = snapshot
+            .agents
+            .iter()
+            .map(|agent| agent.health)
+            .sum::<f32>();
+        assert_eq!(snapshot.tick, world.tick().0);
+        assert_eq!(snapshot.summary.agent_count, world.agent_count());
+        assert_eq!(snapshot.summary.agent_count, snapshot.agents.len());
+        assert_eq!(snapshot.summary.total_energy, total_energy);
+        assert_eq!(
+            snapshot.summary.average_energy,
+            total_energy / snapshot.agents.len() as f32
+        );
+        assert_eq!(
+            snapshot.summary.average_health,
+            total_health / snapshot.agents.len() as f32
+        );
     }
 }

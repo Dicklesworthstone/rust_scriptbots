@@ -8,5 +8,5 @@ neuroflow = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-scriptbots-brain = { path = "../scriptbots-brain" }
+scriptbots-brain = { path = "../scriptbots-brain", default-features = false }
 scriptbots-core = { path = "../scriptbots-core" }

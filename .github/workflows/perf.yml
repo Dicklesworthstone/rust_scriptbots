@@ -1,0 +1,356 @@
+name: Performance budgets
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/perf.yml"
+      - ".github/workflows/perf-report.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "ci/fixtures/perf_baseline.json"
+      - "crates/scriptbots-brain/**"
+      - "crates/scriptbots-brain-neuro/**"
+      - "crates/scriptbots-core/**"
+      - "crates/scriptbots-index/**"
+      - "crates/scriptbots-storage/**"
+      - "scripts/perf_gate.sh"
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/perf.yml"
+      - ".github/workflows/perf-report.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "ci/fixtures/perf_baseline.json"
+      - "crates/scriptbots-brain/**"
+      - "crates/scriptbots-brain-neuro/**"
+      - "crates/scriptbots-core/**"
+      - "crates/scriptbots-index/**"
+      - "crates/scriptbots-storage/**"
+      - "scripts/perf_gate.sh"
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Performance operation to run
+        required: true
+        default: short
+        type: choice
+        options:
+          - short
+          - full
+          - baseline-candidate
+          - synthetic-proof
+      justification:
+        description: Required review rationale for baseline-candidate
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RAYON_NUM_THREADS: "4"
+  RUST_BACKTRACE: 1
+  SCRIPTBOTS_MAX_THREADS: "4"
+
+jobs:
+  gate:
+    name: Performance gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      operation: ${{ steps.operation.outputs.operation }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+
+      - name: Prepare trusted baseline and enforce baseline governance
+        id: baseline
+        shell: bash
+        env:
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          baseline_path="${GITHUB_WORKSPACE}/ci/fixtures/perf_baseline.json"
+          baseline_repository_path="ci/fixtures/perf_baseline.json"
+
+          validate_commit_sha() {
+            local label="$1"
+            local sha="$2"
+            if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "${label} is not a lowercase 40-character commit SHA." >&2
+              exit 2
+            fi
+            if ! git cat-file -e "${sha}^{commit}"; then
+              echo "${label} does not resolve to a commit in the fetched history: ${sha}" >&2
+              exit 2
+            fi
+          }
+
+          require_justification_trailers() {
+            local range="$1"
+            local commit
+            local justification
+            mapfile -t baseline_commits < <(
+              git rev-list --reverse "${range}" -- "${baseline_repository_path}"
+            )
+            for commit in "${baseline_commits[@]}"; do
+              justification="$(
+                git show -s \
+                  --format='%(trailers:key=Perf-Baseline-Justification,valueonly)' \
+                  "${commit}"
+              )"
+              if [[ -z "${justification//[[:space:]]/}" ]]; then
+                echo "Commit ${commit} changes ${baseline_repository_path} without a nonempty Perf-Baseline-Justification: trailer." >&2
+                exit 1
+              fi
+            done
+          }
+
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              validate_commit_sha "pull-request base SHA" "${EVENT_BASE_SHA}"
+              validate_commit_sha "pull-request head SHA" "${EVENT_HEAD_SHA}"
+              merge_base="$(git merge-base "${EVENT_BASE_SHA}" "${EVENT_HEAD_SHA}")"
+              validate_commit_sha "pull-request merge-base SHA" "${merge_base}"
+              require_justification_trailers "${merge_base}..${EVENT_HEAD_SHA}"
+
+              baseline_path="${RUNNER_TEMP}/trusted-base-perf-baseline.json"
+              if git cat-file -e "${EVENT_BASE_SHA}:${baseline_repository_path}"; then
+                git show "${EVENT_BASE_SHA}:${baseline_repository_path}" > "${baseline_path}"
+              fi
+              ;;
+            push)
+              validate_commit_sha "push head SHA" "${EVENT_HEAD_SHA}"
+              if [[ "${EVENT_BASE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+                if git rev-parse --verify --quiet "${EVENT_HEAD_SHA}^" > /dev/null; then
+                  require_justification_trailers "${EVENT_HEAD_SHA}^..${EVENT_HEAD_SHA}"
+                else
+                  require_justification_trailers "${EVENT_HEAD_SHA}"
+                fi
+              else
+                validate_commit_sha "push base SHA" "${EVENT_BASE_SHA}"
+                require_justification_trailers "${EVENT_BASE_SHA}..${EVENT_HEAD_SHA}"
+              fi
+              ;;
+            schedule|workflow_dispatch)
+              ;;
+            *)
+              echo "Unsupported event: ${GITHUB_EVENT_NAME}" >&2
+              exit 2
+              ;;
+          esac
+
+          printf 'path=%s\n' "${baseline_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install mold
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: perf-budget-ubuntu-24.04
+
+      - name: Select operation
+        id: operation
+        shell: bash
+        env:
+          DISPATCH_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_EVENT_NAME}" in
+            schedule)
+              operation=full
+              ;;
+            workflow_dispatch)
+              operation="${DISPATCH_MODE}"
+              ;;
+            push|pull_request)
+              operation=short
+              ;;
+            *)
+              echo "Unsupported event: ${GITHUB_EVENT_NAME}" >&2
+              exit 2
+              ;;
+          esac
+          printf 'operation=%s\n' "${operation}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify comparator policy
+        run: >-
+          scripts/perf_gate.sh
+          --self-test
+          --output-dir "${RUNNER_TEMP}/scriptbots-perf/self-test"
+
+      - name: Run performance operation
+        shell: bash
+        env:
+          BASELINE_JUSTIFICATION: ${{ inputs.justification }}
+          PERF_OPERATION: ${{ steps.operation.outputs.operation }}
+          TRUSTED_BASELINE: ${{ steps.baseline.outputs.path }}
+        run: |
+          set -euo pipefail
+          artifact_root="${RUNNER_TEMP}/scriptbots-perf"
+          case "${PERF_OPERATION}" in
+            short|full)
+              set +e
+              scripts/perf_gate.sh \
+                --mode "${PERF_OPERATION}" \
+                --baseline "${TRUSTED_BASELINE}" \
+                --output-dir "${artifact_root}/${PERF_OPERATION}"
+              gate_status=$?
+              set -e
+
+              verdict_path="${artifact_root}/${PERF_OPERATION}/perf_verdict.json"
+              result_path="${artifact_root}/${PERF_OPERATION}/perf_result.json"
+              if [[ ! -f "${verdict_path}" || ! -f "${result_path}" ]]; then
+                echo "The normal performance lane did not produce both typed result and verdict artifacts." >&2
+                exit 1
+              fi
+              if ! jq -e '
+                .fingerprint.git_dirty == false
+                and .fingerprint.class.provider != "local"
+              ' "${result_path}" > /dev/null; then
+                echo "Refusing performance evidence without a clean hosted-runner fingerprint." >&2
+                exit 1
+              fi
+              verdict_status="$(jq -er '.status | select(type == "string")' "${verdict_path}")"
+              verdict_exit_code="$(jq -er '.exit_code | select(type == "number")' "${verdict_path}")"
+              case "${verdict_status}" in
+                pass|advisory)
+                  ;;
+                bootstrap_required|baseline_candidate|fail|refused|class_refused)
+                  echo "Performance comparison produced disallowed typed status: ${verdict_status}." >&2
+                  exit 1
+                  ;;
+                *)
+                  echo "Performance comparison produced unknown typed status: ${verdict_status}." >&2
+                  exit 1
+                  ;;
+              esac
+              if [[ "${gate_status}" -ne 0 || "${verdict_exit_code}" -ne 0 ]]; then
+                echo "Allowed typed status ${verdict_status} had process=${gate_status}, verdict_exit_code=${verdict_exit_code}; expected both zero." >&2
+                exit 1
+              fi
+              ;;
+            baseline-candidate)
+              if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+                echo "Baseline candidates may only be recorded from main; got ${GITHUB_REF}." >&2
+                exit 2
+              fi
+              if [[ -z "${BASELINE_JUSTIFICATION//[[:space:]]/}" ]]; then
+                echo "The baseline-candidate operation requires the justification input." >&2
+                exit 2
+              fi
+              scripts/perf_gate.sh \
+                --mode full \
+                --record-baseline \
+                --justification "${BASELINE_JUSTIFICATION}" \
+                --output-dir "${artifact_root}/baseline-candidate"
+              ;;
+            synthetic-proof)
+              scripts/perf_gate.sh \
+                --mode full \
+                --record-baseline \
+                --justification "Ephemeral same-runner synthetic regression proof; never commit" \
+                --output-dir "${artifact_root}/synthetic-proof/baseline"
+
+              set +e
+              scripts/perf_gate.sh \
+                --mode short \
+                --baseline "${artifact_root}/synthetic-proof/baseline/perf_baseline.json" \
+                --synthetic-sleep-us 20000 \
+                --output-dir "${artifact_root}/synthetic-proof/candidate"
+              candidate_status=$?
+              set -e
+
+              if [[ "${candidate_status}" -ne 1 ]]; then
+                echo "Synthetic regression returned ${candidate_status}; expected the stable failure code 1." >&2
+                exit 1
+              fi
+              jq -e '
+                .status == "fail"
+                and any(.scenarios[];
+                  .would_fail_tps_regression or .would_fail_absolute_tps)
+              ' "${artifact_root}/synthetic-proof/candidate/perf_verdict.json"
+              ;;
+            *)
+              echo "Unsupported performance operation: ${PERF_OPERATION}" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Assert clean benchmark fingerprints
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_root="${RUNNER_TEMP}/scriptbots-perf"
+          mapfile -d '' results < <(
+            find "${artifact_root}" -name perf_result.json -type f -print0 2>/dev/null | sort -z
+          )
+          if (( ${#results[@]} == 0 )); then
+            echo "No perf_result.json artifact was produced." >&2
+            exit 1
+          fi
+          for result in "${results[@]}"; do
+            if ! jq -e '
+              .fingerprint.git_dirty == false
+              and .fingerprint.class.provider != "local"
+            ' "${result}" > /dev/null; then
+              echo "Benchmark result is missing a clean hosted-runner fingerprint: ${result}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Publish performance summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_root="${RUNNER_TEMP}/scriptbots-perf"
+          mapfile -d '' summaries < <(find "${artifact_root}" -name perf_summary.md -type f -print0 2>/dev/null | sort -z)
+          if (( ${#summaries[@]} == 0 )); then
+            {
+              echo "## Performance budgets"
+              echo
+              echo "No performance summary was produced; inspect the job log."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          for summary in "${summaries[@]}"; do
+            cat "${summary}" >> "${GITHUB_STEP_SUMMARY}"
+            echo >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: performance-${{ steps.operation.outputs.operation }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scriptbots-perf
+          if-no-files-found: warn
+          retention-days: 30

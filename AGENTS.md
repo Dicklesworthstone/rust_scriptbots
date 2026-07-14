@@ -202,6 +202,61 @@ cargo test --workspace --all-features
 | `scriptbots-app` | CLI parsing, server startup, TUI mode, MCP endpoints, control commands |
 | `scriptbots-web` | WASM bindings, browser interop, postcard serialization |
 
+### Performance Budget Gate
+
+`scripts/perf_gate.sh` is the executable regression sentinel for the recovery plan's CPU budgets. It runs fresh deterministic worlds for the production-default MLP and NeuroFlow families, uses three warmups plus five measured repetitions, records every raw nanosecond sample, and gates on the median of the five whole-run TPS values so infrequent cadence work cannot disappear behind a median of short windows. It emits:
+
+- `perf_result.json` — scenario inputs, raw TPS windows, raw snapshot samples, per-stage timings, digests, and derived statistics;
+- `fingerprint.json` — the exact machine class, toolchain, build target, thread budget, filesystem, lockfile blob, and source commit;
+- `perf_verdict.json` — the machine-readable pass/fail/advisory/refusal decision;
+- `perf_summary.md` — the human comparison report used by CI job summaries;
+- `perf_baseline.json` — only for an explicitly requested, admissible baseline candidate.
+
+The short lane covers 1k agents; the full lane covers 1k and 5k. Both cover every default brain family. That is the explicit `bd-2z0.8.18` regression-gate matrix; the plan's separate 10k publication target remains with the `bd-h33` optimization/baseline program and is not silently claimed by this harness. The stable gates are a regression greater than 10% from the exact-class baseline, less than 60 TPS at 1k, or dynamic-snapshot p95 greater than or equal to 4 ms at 1k. Per-metric run-to-run CV over 5% makes only that noisy metric advisory; it must not conceal a stable failure in another metric or scenario. A dirty checkout makes the whole local comparison advisory.
+
+```bash
+# Attempt an exact-class short comparison. A Mac or ordinary RCH worker is
+# expected to refuse the Ubuntu hosted-runner golden rather than compare it.
+scripts/perf_gate.sh --mode short
+
+# Full informational comparison
+scripts/perf_gate.sh --mode full --output-dir target/perf-gate/manual
+
+# Comparator/validator boundary tests, including noise and tamper refusal
+scripts/perf_gate.sh --self-test
+
+# Clean-checkout same-machine baseline followed by a comparable local run
+scripts/perf_gate.sh --mode full --record-baseline \
+  --justification "local same-machine diagnostic baseline" \
+  --output-dir target/perf-gate/local-baseline
+scripts/perf_gate.sh --mode short \
+  --baseline target/perf-gate/local-baseline/perf_baseline.json \
+  --output-dir target/perf-gate/local-candidate
+```
+
+The wrapper derives the executable host target from `rustc -vV` so the repository's Linux default target or a globally exported `CARGO_BUILD_TARGET` does not make a macOS benchmark un-runnable; `SCRIPTBOTS_PERF_BUILD_TARGET` is the explicit override. This repository's normal shared-agent policy still applies: use RCH to execute expensive Cargo work on a Linux worker. RCH must see the outer Cargo command and only retrieves benchmark artifacts from its recognized result tree, so do not wrap the command in the shell script or write evidence under `/tmp`:
+
+```bash
+RCH_CANONICAL_PROJECT_ROOT=/Users/jemanuel/projects rch exec -- \
+  cargo bench --locked -p scriptbots-core --bench world_bench -- \
+  --perf-gate --mode short \
+  --baseline ci/fixtures/perf_baseline.json \
+  --output-dir target/criterion/scriptbots-perf
+```
+
+Comparisons are exact-class only. A CPU, runner image, OS/architecture, filesystem, full `rustc -Vv` identity, effective Cargo target/linker/rustflags configuration, Rayon/thread budget, feature set, or scenario/science-digest mismatch returns refusal (exit 2); the harness never invents a cross-class delta. Exit 1 is a stable budget failure. Exit 0 covers pass, explicit bootstrap-required, baseline-candidate, and advisory results, so automation must also inspect `perf_verdict.json` when it expects a particular proof state.
+
+CI treats that typed verdict more strictly than the local executable contract. Normal short/full lanes accept only `pass` or `advisory`, require both the process and typed exit code to be zero, and independently require `perf_result.json.fingerprint.git_dirty` to be `false`. They fail closed on missing artifacts, bootstrap-required, baseline-candidate, stable failure, class refusal, or an unknown status. For pull requests, the comparison baseline is materialized with `git show` from the event's validated base commit into runner-temporary storage; a candidate-tree baseline can therefore never approve its own change.
+
+Re-baselining is a reviewed golden-file operation:
+
+1. Dispatch `.github/workflows/perf.yml` on `main` with `mode=baseline-candidate` and a non-empty justification. The workflow rejects baseline candidates from any other ref.
+2. Review all raw repetitions, CVs, absolute budgets, fingerprint fields, digest stability, and the exact source/lockfile identity in the uploaded artifact.
+3. Commit the artifact byte-for-byte as `ci/fixtures/perf_baseline.json`; include a nonempty `Perf-Baseline-Justification: <reason>` trailer in every commit that changes the golden. CI fetches full history, validates the event SHAs before using them, and rejects baseline-changing pull requests or pushes whose changing commits omit that trailer.
+4. Never bless a dirty, noisy, synthetic-delay, cross-class, or absolute-budget-failing result. Never hand-edit aggregate values; validation recomputes them from raw samples.
+
+The manual `synthetic-proof` workflow records an ephemeral clean same-runner baseline, injects a 20 ms delay per tick, and requires both exit 1 and a typed TPS failure. Its baseline is proof-only and must never be committed. Pull-request code and workflow YAML run with read-only permissions. The separate default-branch `.github/workflows/perf-report.yml` workflow is triggered by `workflow_run`; it checks out no code, executes no artifact content, attests that a same-repository PR used the unmodified base-branch performance workflow, selects the exact source-run artifact across every API page, performs bounded extraction, binds the typed schema and scenario matrix to the source conclusion, and then creates or updates the PR comparison comment. Fork PRs receive only the job summary and retained artifact because the privileged reporter excludes them. The scheduled full lane uses that same isolated reporter to append its comparison to the stable `Nightly ScriptBots performance budgets` issue, creating the issue on its first run. `bd-h33` owns making the numbers better; `bd-2z0.8.18` owns detecting when they silently get worse.
+
 ---
 
 ## Third-Party Library Usage
