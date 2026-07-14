@@ -2570,7 +2570,7 @@ Invalid commands and nonexistent features fail a CI manifest linter before expen
 
 ## 14. Performance and Resource Budgets
 
-**[Currently In Progress — bd-2z0.8.18 performance-budget regression harness]**
+**[Complete — bd-2z0.8.18 performance-budget regression harness; DSR-only acceptance]**
 
 The bead-scoped regression sentinel covers the deterministic 1k/5k matrix. The distinct 10k publication target below remains owned by the `bd-h33` optimization/baseline program; completing this gate must not be read as publishing that still-pending 10k evidence.
 
