@@ -566,6 +566,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 - Playback: `space` pause/resume, `+`/`-` speed up/down, `s` single-step
 - Views: `d` toggle drawing, `f` toggle food overlay, `Ctrl+Shift+O` toggle agent outlines
 - Spawning: `a` add crossover agents, `q`/`h` spawn carnivore/herbivore
+- Persistence safety: a spawn shortcut is refused after the current tick is admitted under the selected storage guarantee; advance to the next open tick boundary before spawning. An unresolved admission is reported separately and must be resolved by retrying the exact retained batch before either the world or an external arrival can advance. Both typed reasons are logged without consuming simulation RNG.
 - World: `c` toggle closed environment, `o` follow oldest, `s` follow selected
 - Accessibility: `p` cycle color palettes (with keyboard rebinding support)
 
@@ -601,10 +602,11 @@ Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baselin
 
 - **One embedded engine:** ScriptBots uses the public `fsqlite` facade from FrankenSQLite with `version = "=0.1.16"`, pinned to immutable revision `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` at `https://github.com/Dicklesworthstone/frankensqlite`. The current dependency enables `native` with default features disabled and provides create-free existing-file open plus expected-identity verification before recovery can read or mutate database bytes.
 - **Two storage targets:** `--storage file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a generated `runs/scriptbots-<unix-ms>-<pid>.sqlite` and prints the selected run database; it refuses reuse or stale sidecars. `--storage memory` opens volatile `:memory:` through the same implementation.
-- **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) is the only application path that opens an existing run database for mutation. It holds the OS writer lease, binds recovery to the identity of the already-open VFS handle, verifies the exact structural schema fingerprint plus supported migration pair and persistence invariants, and refuses missing, replaced, unrelated, symlink, and multiply-linked files before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. This is persistence repair, not world resume.
+- **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) is the only application path that opens an existing run database for mutation. It holds the OS writer lease, binds recovery to the identity of the already-open VFS handle, verifies the exact structural schema fingerprint plus the supported migration sequence and persistence invariants, and refuses missing, replaced, unrelated, symlink, and multiply-linked files before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. This is persistence repair, not world resume.
 - **Thread-confined, single-writer connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. File writers hold a nonblocking OS advisory lease on a persistent companion lock file; process-local path/inode tracking is only defense in depth. No connection-owning value is shared through `Arc<Mutex<_>>`.
 - **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. Configurable `StorageDeadlines` bound startup, admission-gate, command-enqueue, receipt, flush, and shutdown acknowledgement waits, but cannot cancel a database call already executing on the owner thread or bound the supervised reaper. Validation, closed-gate, queue-send, and rolled-back outbox failures are definitely `NotAdmitted`; the world retains the exact completed batch, latches the fault, and blocks later science ticks until explicit retry succeeds. A lost or timed-out acknowledgement remains typed as `Indeterminate` at the world boundary, but retrying the unchanged canonical payload is idempotent and reuses its stable batch ID; a conflicting payload is rejected by its BLAKE3 identity. Timed-out shutdown retains the exact pending receipt and worker handle for retry; dropping the controller hands both to an independent supervised reaper rather than abandoning connection ownership. `submit_with_receipt` returns the batch ID after the exact payload enters the worker outbox and reports `Durable` for a file database or `CommittedVolatile` for memory. That receipt proves admission, not scientific-table application. Remaining direct-write/root-cause unification is tracked by `bd-2z0.8.9.4.4`.
 - **Durable recovery and watermarks:** each file-backed batch advances three monotonic, separately queryable prefixes: `admitted` after the outbox transaction, `applied` in the same transaction as all scientific-table rows, and `durable` in a later marker transaction that permits outbox-payload compaction. Startup replays admitted-but-unapplied payloads in order and finalizes applied-but-not-durable batches without duplicating rows. Exact duplicate retries reuse the original batch identity; a different payload for an already admitted tick is rejected. Flush and shutdown receipts include all three watermarks.
+- **Complete typed ancestry origins:** every agent insertion emits exactly one immutable `born`, `seeded`, or `injected` origin row under a globally unique stable agent UID. Only `born` rows have a birth ordinal or contribute to demographic birth totals; ancestry and offline rebuilds consume all three origins plus exact death causes. Completing any scientific tick while persistence is disabled creates a history gap, even when that tick has no lifecycle or replay rows, because its summary, metrics, and snapshot were not admitted. That world refuses to re-enable persistence; start a new world and storage identity instead of creating a run database with a hidden interval.
 - **Lock-free frontend reads:** the worker atomically publishes immutable `Arc<AnalyticsSnapshot>` latest-value state. GUI, TUI, and API consumers load it without a mutex and may skip stale snapshots; they never run SQL while rendering.
 
 ### Tables and query examples
@@ -925,7 +927,7 @@ Helpful docs:
   - `Cross-Origin-Opener-Policy: same-origin`
   - `Cross-Origin-Embedder-Policy: require-corp`
 - Local dev: serve with a static server that sets these headers (or use a service worker). For now, single-thread builds avoid the requirement.
-- CI: the wasm job runs parity tests in headless Chromium; see `.github/workflows/ci.yml`.
+- DSR: the pinned `rust_scriptbots` profile builds the WASM package and runs its browser parity checks; hosted workflow runs are not accepted as evidence.
 
 ## Licensing
 
@@ -946,15 +948,10 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 - **Determinism regressions**: Ensure you haven't introduced unordered parallel reductions; stage results and apply in a stable commit phase.
 
 ## Releases
-- Releases are built via [`cargo dist`](https://github.com/axodotdev/cargo-dist) in the `release-builds` GitHub Actions workflow. Publish a new version by tagging the repository (`git tag v0.x.y && git push origin v0.x.y`) or running the workflow manually with a `tag` input.
-- The workflow produces archives for Linux (`x86_64-unknown-linux-gnu`), Windows (`x86_64-pc-windows-msvc`), and a universal macOS build (Apple Silicon + Intel). Artifacts are uploaded as workflow run assets for review before attaching them to a GitHub Release.
-- **macOS codesigning**: provide the following repository secrets for automatic signing (the job skips codesign if they are absent):
-  - `MACOS_CERT_BASE64`: base64-encoded `.p12` Developer ID certificate.
-  - `MACOS_CERT_PASSWORD`: password used to protect the `.p12`.
-  - `MACOS_SIGNING_IDENTITY`: e.g. `"Developer ID Application: Example Corp (TEAMID1234)"`.
-  - `MACOS_KEYCHAIN_PASSWORD` (optional): override keychain password used on the runner.
-- Certificates are imported into a temporary keychain, the binaries (and `.app` bundles when present) are signed with the supplied identity, and the archives are repackaged. Add notarization credentials later if we adopt automated notarization.
-- Release operators should verify the uploaded artifacts locally (`codesign --verify --deep` on macOS, `shasum -a 256` on every platform) before drafting public releases.
+- Releases are built, verified, and published only through Doodlestein Self-Releaser (`dsr`) using the pinned `rust_scriptbots` repository profile. Use `dsr build --tool rust_scriptbots ...` for artifacts and `dsr release --tool rust_scriptbots ...` for publication; hosted workflow execution is never release evidence.
+- The DSR release profile is responsible for producing and retaining the platform archives and their verification evidence. Inspect the DSR result bundle before publication, and publish that exact blessed bundle rather than rebuilding it through another system.
+- **macOS codesigning:** configure the signing identity and certificate through DSR's protected release environment. Never put signing credentials in the repository or substitute a hosted workflow's secret store for the pinned DSR release path.
+- DSR imports signing material into an isolated temporary keychain, signs binaries and `.app` bundles, repacks the archives, and retains the resulting checksums in the release evidence. Release operators should verify that exact bundle (`codesign --verify --deep` on macOS and `shasum -a 256` on every platform) before publication.
 
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
@@ -962,7 +959,7 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
 4. Storage: harden the integrated durable-outbox and bounded-controller-wait protocol with exact identity/schema recovery and complete direct-write/root-cause unification, then add strict-run pause/fail-closed host policy, the multi-run schema, and complete command/replay journals.
 5. Rendering: HUD/overlays/inspector polish; performance diagnostics.
-6. Packaging/CI: release builds, binaries; wasm sibling crate scaffolding (non-invasive).
+6. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.
 
 ### Mixed brain families (default)
 - The app now registers multiple brain families by default (MLP, DWRAON, Assembly experimental, NeuroFlow) and seeds mixed populations automatically. Random spawns are bound to a sampled brain family.

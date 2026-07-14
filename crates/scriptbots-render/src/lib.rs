@@ -4324,6 +4324,10 @@ impl SimulationView {
         }
     }
     fn spawn_agent_with_bias_internal(&self, world: &mut WorldState, herbivore_bias: f32) -> bool {
+        if let Err(error) = world.validate_external_arrival_boundary() {
+            warn!(error = %error, "Agent injection rejected before RNG sampling");
+            return false;
+        }
         if let Some(error) = world.latched_step_error() {
             warn!(error = %error, "Agent spawn blocked by terminal simulation failure");
             return false;
@@ -4335,7 +4339,13 @@ impl SimulationView {
         }
 
         let (pos_x, pos_y, color) = {
-            let rng = world.rng();
+            let rng = match world.rng() {
+                Ok(rng) => rng,
+                Err(error) => {
+                    warn!(error = %error, "Agent injection rejected before RNG sampling");
+                    return false;
+                }
+            };
             let x = rng.random_range(0.0..width);
             let y = rng.random_range(0.0..height);
             let color = [
@@ -4352,12 +4362,15 @@ impl SimulationView {
             color,
             ..AgentData::default()
         };
-        let Ok(agent_id) = world.try_spawn_agent_with(agent, |runtime| {
+        let agent_id = match world.try_inject_agent_with(agent, |runtime| {
             runtime.herbivore_tendency = herbivore_bias.clamp(0.0, 1.0);
             runtime.energy = runtime.energy.max(1.0);
-        }) else {
-            warn!("Rejected non-finite agent spawn");
-            return false;
+        }) {
+            Ok(agent_id) => agent_id,
+            Err(error) => {
+                warn!(error = %error, "Agent injection rejected");
+                return false;
+            }
         };
         info!(agent = ?agent_id, bias = herbivore_bias, "Spawned agent");
         true
@@ -4366,6 +4379,10 @@ impl SimulationView {
     fn spawn_crossover_agent(&mut self, cx: &mut Context<Self>) {
         let mut spawned = false;
         if let Ok(mut world) = self.world.lock() {
+            if let Err(error) = world.validate_external_arrival_boundary() {
+                warn!(error = %error, "Crossover injection rejected at persistence boundary");
+                return;
+            }
             if let Some(error) = world.latched_step_error() {
                 warn!(error = %error, "Crossover spawn blocked by terminal simulation failure");
                 return;
@@ -4403,21 +4420,34 @@ impl SimulationView {
                     ..AgentData::default()
                 };
 
-                let Ok(child_id) = world.try_spawn_agent_with(child, |runtime| {
-                    runtime.herbivore_tendency = (parent_a.runtime.herbivore_tendency
-                        + parent_b.runtime.herbivore_tendency)
-                        * 0.5;
-                    runtime.mutation_rates.primary = (parent_a.runtime.mutation_rates.primary
-                        + parent_b.runtime.mutation_rates.primary)
-                        * 0.5;
-                    runtime.mutation_rates.secondary = (parent_a.runtime.mutation_rates.secondary
-                        + parent_b.runtime.mutation_rates.secondary)
-                        * 0.5;
-                    runtime.indicator.intensity = 0.6;
-                    runtime.indicator.color = [0.2, 0.8, 0.9];
-                }) else {
-                    warn!("Rejected non-finite crossover agent spawn");
-                    return;
+                let child_id = match world.try_inject_crossover_agent_with(
+                    selected[0],
+                    selected[1],
+                    child,
+                    |_child, runtime| {
+                        runtime.herbivore_tendency = (parent_a.runtime.herbivore_tendency
+                            + parent_b.runtime.herbivore_tendency)
+                            * 0.5;
+                        runtime.mutation_rates.primary = (parent_a.runtime.mutation_rates.primary
+                            + parent_b.runtime.mutation_rates.primary)
+                            * 0.5;
+                        runtime.mutation_rates.secondary =
+                            (parent_a.runtime.mutation_rates.secondary
+                                + parent_b.runtime.mutation_rates.secondary)
+                                * 0.5;
+                        runtime.indicator.intensity = 0.6;
+                        runtime.indicator.color = [0.2, 0.8, 0.9];
+                    },
+                ) {
+                    Ok(Some(child_id)) => child_id,
+                    Ok(None) => {
+                        warn!("Crossover agent injection rejected stale or identical parents");
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Crossover agent injection rejected");
+                        return;
+                    }
                 };
                 info!(child = ?child_id, "Spawned crossover agent");
                 spawned = true;
@@ -4443,8 +4473,11 @@ impl SimulationView {
         } else {
             return;
         };
-        if let Ok(mut world) = self.world.lock() {
-            world.set_closed(next);
+        if let Ok(mut world) = self.world.lock()
+            && let Err(error) = world.set_closed(next)
+        {
+            warn!(error = %error, "Environment mutation rejected");
+            return;
         }
         cx.notify();
     }
@@ -5470,7 +5503,9 @@ impl SimulationView {
         let open_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             if let Ok(mut world) = this.world.lock() {
                 if world.latched_step_error().is_none() {
-                    world.set_closed(false);
+                    if let Err(error) = world.set_closed(false) {
+                        warn!(error = %error, "Open-world action rejected");
+                    }
                 } else {
                     warn!("Open-world action blocked by terminal simulation failure");
                 }
@@ -5480,7 +5515,9 @@ impl SimulationView {
         let close_world = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             if let Ok(mut world) = this.world.lock() {
                 if world.latched_step_error().is_none() {
-                    world.set_closed(true);
+                    if let Err(error) = world.set_closed(true) {
+                        warn!(error = %error, "Close-world action rejected");
+                    }
                 } else {
                     warn!("Close-world action blocked by terminal simulation failure");
                 }
@@ -13388,6 +13425,57 @@ mod command_characterization_tests {
         Arc::new(Mutex::new(
             WorldState::new(config).expect("characterization world"),
         ))
+    }
+
+    #[test]
+    fn manual_agent_injection_refuses_a_sealed_persistence_boundary() {
+        let world = Arc::new(Mutex::new(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 50,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 1,
+                rng_seed: Some(0x005E_A1ED),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("sealed-boundary world"),
+        ));
+        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let view = simulation_view(Arc::clone(&world), drain);
+
+        {
+            let mut world = world.lock().expect("world lock");
+            world.step().expect("seal the first persistence boundary");
+            assert_eq!(world.tick().0, 1);
+        }
+
+        let (agent_count_before, rng_before, identity_before) = {
+            let world = world.lock().expect("world lock");
+            (
+                world.agent_count(),
+                world.random_stream_state(),
+                world.identity_sequence_state(),
+            )
+        };
+        let injected = {
+            let mut world = world.lock().expect("world lock");
+            view.spawn_agent_with_bias_internal(&mut world, 0.5)
+        };
+        assert!(!injected, "manual ingress must surface the typed rejection");
+        assert_eq!(
+            world.lock().expect("world lock").agent_count(),
+            agent_count_before,
+            "a rejected manual ingress must not add an agent"
+        );
+        let world = world.lock().expect("world lock");
+        assert_eq!(
+            world.random_stream_state(),
+            rng_before,
+            "sealed GUI ingress must be rejected before position/color RNG sampling"
+        );
+        assert_eq!(world.identity_sequence_state(), identity_before);
     }
 
     fn simulation_view(

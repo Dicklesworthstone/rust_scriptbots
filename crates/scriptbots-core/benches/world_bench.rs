@@ -246,6 +246,7 @@ impl GateBrainFamily {
         match self {
             Self::Mlp => Ok(world
                 .brain_registry_mut()
+                .map_err(|error| format!("failed to access brain registry: {error}"))?
                 .register(self.label(), |rng| Ok(MlpBrain::runner(rng)))),
             Self::Neuroflow => {
                 let config = NeuroflowBrainConfig::from_settings(&world.config().neuroflow);

@@ -988,7 +988,11 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
+    use scriptbots_core::{
+        AgentUid, BirthOrigin, BirthRecord, CombatEventFlags, DeathCause, DeathRecord, Generation,
+        MetricSample, PersistenceBatch, PersistenceEvent, PersistenceEventKind, Position, Tick,
+        TickSummary,
+    };
     use scriptbots_storage::{RunLedgerSummary, Storage};
     use tempfile::tempdir;
 
@@ -1083,13 +1087,84 @@ mod tests {
         let tick_usize = usize::from(tick);
         let tick_f32 = f32::from(tick);
         let tick_f64 = f64::from(tick);
+        let birth_count = tick_usize / 10;
+        let death_count = tick_usize / 20;
+
+        let mut birth_records = Vec::with_capacity(birth_count.saturating_add(death_count));
+        let mut death_records = Vec::with_capacity(death_count);
+        for index in 0..death_count {
+            let offset = u64::try_from(index).unwrap_or(u64::MAX);
+            let root_tick = tick_u64.saturating_sub(1);
+            let spawn_ordinal = root_tick.saturating_mul(10).saturating_add(offset);
+            let uid = spawn_ordinal.saturating_add(1);
+            birth_records.push(BirthRecord {
+                tick: Tick(root_tick),
+                agent_uid: AgentUid(uid),
+                spawn_ordinal,
+                birth_ordinal: None,
+                origin: BirthOrigin::Injected,
+                parent_a: None,
+                parent_b: None,
+                brain_kind: Some("control-cli-fixture".to_owned()),
+                brain_key: None,
+                herbivore_tendency: 0.5,
+                generation: Generation::default(),
+                position: Position::new(0.0, 0.0),
+                is_hybrid: false,
+            });
+            death_records.push(DeathRecord {
+                tick: Tick(tick_u64),
+                agent_uid: AgentUid(uid),
+                age: 1,
+                generation: Generation::default(),
+                herbivore_tendency: 0.5,
+                brain_kind: Some("control-cli-fixture".to_owned()),
+                brain_key: None,
+                energy: 0.0,
+                food_balance_total: 0.0,
+                cause: DeathCause::Unknown,
+                was_hybrid: false,
+                combat_flags: CombatEventFlags::default(),
+            });
+        }
+        for index in 0..birth_count {
+            let offset = u64::try_from(index).unwrap_or(u64::MAX);
+            let birth_ordinal = tick_u64.saturating_mul(10).saturating_add(offset);
+            let spawn_ordinal = birth_ordinal;
+            let uid = spawn_ordinal.saturating_add(1);
+            birth_records.push(BirthRecord {
+                tick: Tick(tick_u64),
+                agent_uid: AgentUid(uid),
+                spawn_ordinal,
+                birth_ordinal: Some(birth_ordinal),
+                origin: BirthOrigin::Born,
+                parent_a: None,
+                parent_b: None,
+                brain_kind: Some("control-cli-fixture".to_owned()),
+                brain_key: None,
+                herbivore_tendency: 0.5,
+                generation: Generation::default(),
+                position: Position::new(0.0, 0.0),
+                is_hybrid: false,
+            });
+        }
+        let mut events = vec![PersistenceEvent::new(
+            PersistenceEventKind::Births,
+            birth_count,
+        )];
+        if death_count > 0 {
+            events.push(PersistenceEvent::new(
+                PersistenceEventKind::Deaths,
+                death_count,
+            ));
+        }
 
         PersistenceBatch {
             summary: TickSummary {
                 tick: Tick(tick_u64),
                 agent_count: tick_usize + 2,
-                births: tick_usize / 10,
-                deaths: tick_usize / 20,
+                births: birth_count,
+                deaths: death_count,
                 total_energy: tick_f32 + 0.5,
                 average_energy: tick_f32 / 2.0 + 0.25,
                 average_health,
@@ -1102,10 +1177,10 @@ mod tests {
                 MetricSample::new("zeta", tick_f64 + 0.875),
                 MetricSample::new("alpha", tick_f64 + 0.125),
             ],
-            events: Vec::new(),
+            events,
             agents: Vec::new(),
-            births: Vec::new(),
-            deaths: Vec::new(),
+            births: birth_records,
+            deaths: death_records,
             replay_events: Vec::new(),
         }
     }
@@ -1357,9 +1432,16 @@ mod tests {
         let database = directory.path().join("run.sqlite");
         let output = directory.path().join("metrics.csv");
         write_storage_fixture(&database)?;
-        fs::hard_link(&database, &output)?;
-
-        assert_alias_export_is_rejected_without_mutation(&database, output)
+        match fs::hard_link(&database, &output) {
+            Ok(()) => assert_alias_export_is_rejected_without_mutation(&database, output),
+            // If this filesystem cannot create a second name for the database,
+            // the alias attack cannot be mounted here. Accept only a capability
+            // error; permissions, disk pressure, and other failures stay red.
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     #[cfg(unix)]

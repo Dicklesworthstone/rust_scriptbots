@@ -24,7 +24,7 @@ fn batch(tick: u64, agent_count: usize, energy: f32) -> PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),
             agent_count,
-            births: 1,
+            births: 0,
             deaths: 0,
             total_energy: energy,
             average_energy: if agent_count == 0 {
@@ -297,11 +297,21 @@ fn reader_is_verified_read_only_and_never_creates_databases() {
         );
 
         let hardlink = dir.path().join("run-hardlink.sqlite");
-        std::fs::hard_link(&path, &hardlink).expect("create hard-link alias");
-        assert!(
-            ReaderCtx::open(&hardlink.display().to_string()).is_err(),
-            "verified reader accepted a multiply linked database"
-        );
+        match std::fs::hard_link(&path, &hardlink) {
+            Ok(()) => assert!(
+                ReaderCtx::open(&hardlink.display().to_string()).is_err(),
+                "verified reader accepted a multiply linked database"
+            ),
+            // On filesystems without hard-link support there is no second path
+            // through which the alias attack can be mounted. Accept only the
+            // precise capability error; permissions, disk pressure, and other
+            // failures must not silently disable this security assertion.
+            Err(error) => assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ENOTSUP),
+                "hard-link security check did not run for an unexplained reason: {error}"
+            ),
+        }
     }
 }
 

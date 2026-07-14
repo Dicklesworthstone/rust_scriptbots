@@ -2542,6 +2542,7 @@ struct SpawnOrder {
 struct PopulationSpawnReceipt {
     inserted: Vec<AgentId>,
     arena_checkpoint: (SlotMap<AgentId, usize>, usize),
+    pending_birth_records_before: usize,
     rng_before: SmallRngStream,
     next_agent_uid_before: u64,
     next_spawn_ordinal_before: u64,
@@ -3108,10 +3109,19 @@ pub struct TickEvents {
 }
 
 /// Summary emitted to persistence hooks each tick.
+///
+/// [`Self::births`] is deliberately a demographic counter: it counts only
+/// [`BirthOrigin::Born`] offspring. It is not the number of agents that arrived
+/// during the tick. The complete typed arrival stream is carried separately by
+/// [`PersistenceBatch::births`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TickSummary {
     pub tick: Tick,
     pub agent_count: usize,
+    /// Number of [`BirthOrigin::Born`] offspring produced by reproduction.
+    ///
+    /// This excludes [`BirthOrigin::Seeded`] and [`BirthOrigin::Injected`]
+    /// arrivals. Use [`PersistenceBatch::births`] for the complete origin stream.
     pub births: usize,
     pub deaths: usize,
     pub total_energy: f32,
@@ -3128,6 +3138,7 @@ pub struct TickSummary {
 pub struct TickSummaryDto {
     pub tick: u64,
     pub agent_count: usize,
+    /// Born-only demographic count; Seeded and Injected arrivals are excluded.
     pub births: usize,
     pub deaths: usize,
     pub total_energy: f32,
@@ -3298,20 +3309,96 @@ pub enum DeathCause {
     Unknown,
 }
 
-/// Metadata captured when an agent is spawned.
+impl DeathCause {
+    /// Stable tag used by canonical scientific digests.
+    ///
+    /// Explicit values keep persisted comparisons independent of declaration
+    /// order and Rust's enum representation.
+    #[must_use]
+    pub const fn digest_tag(self) -> u64 {
+        match self {
+            Self::CombatCarnivore => 0x01,
+            Self::CombatHerbivore => 0x02,
+            Self::Starvation => 0x03,
+            Self::Aging => 0x04,
+            Self::Unknown => 0x05,
+        }
+    }
+}
+
+/// How an agent first entered the simulated world.
+///
+/// This is deliberately distinct from parentage. A scheduled crossover can
+/// carry two real parents while still being an externally injected population
+/// arrival rather than a demographic birth.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum BirthOrigin {
+    /// Offspring produced by the world's reproduction stage.
+    Born,
+    /// A founder supplied at tick zero while constructing or seeding a world.
+    Seeded,
+    /// An agent introduced after seeding, including population-policy arrivals.
+    Injected,
+}
+
+impl BirthOrigin {
+    /// Stable snake-case label for persistence and protocol surfaces.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Born => "born",
+            Self::Seeded => "seeded",
+            Self::Injected => "injected",
+        }
+    }
+
+    /// Stable tag used by canonical digests.
+    ///
+    /// Explicit values keep the digest independent of enum declaration order
+    /// and compiler representation choices.
+    #[must_use]
+    pub const fn digest_tag(self) -> u64 {
+        match self {
+            Self::Born => 0x01,
+            Self::Seeded => 0x02,
+            Self::Injected => 0x03,
+        }
+    }
+}
+
+/// Metadata captured for every agent arrival.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BirthRecord {
+    /// Simulation tick whose arrival boundary contains this record.
     pub tick: Tick,
+    /// Stable logical identity of the arriving agent; never reused within a run.
     pub agent_uid: AgentUid,
+    /// Monotonic ordinal among all successful agent insertions, regardless of origin.
     pub spawn_ordinal: u64,
-    pub birth_ordinal: u64,
+    /// Monotonic demographic-birth ordinal.
+    ///
+    /// This is `Some` if and only if [`Self::origin`] is [`BirthOrigin::Born`].
+    /// [`BirthOrigin::Seeded`] and [`BirthOrigin::Injected`] records always carry
+    /// `None`; they must never use a sentinel ordinal.
+    pub birth_ordinal: Option<u64>,
+    /// Typed reason this agent entered the world.
+    pub origin: BirthOrigin,
+    /// First logical parent, when the arrival carries lineage.
     pub parent_a: Option<AgentUid>,
+    /// Second logical parent, when the arrival carries lineage.
     pub parent_b: Option<AgentUid>,
+    /// Brain-family label observed at the arrival boundary, when bound.
     pub brain_kind: Option<String>,
+    /// Stable registry key of the bound brain, when present.
     pub brain_key: Option<u64>,
+    /// Clamped herbivore tendency observed at arrival.
     pub herbivore_tendency: f32,
+    /// Lineage generation assigned to the arriving agent.
     pub generation: Generation,
+    /// World position at which the agent arrived.
     pub position: Position,
+    /// Whether the arrival combines two parental lineages.
     pub is_hybrid: bool,
 }
 
@@ -3391,6 +3478,12 @@ pub struct PersistenceBatch {
     pub metrics: Vec<MetricSample>,
     pub events: Vec<PersistenceEvent>,
     pub agents: Vec<AgentState>,
+    /// Complete one-record-per-arrival stream for this boundary.
+    ///
+    /// Unlike [`TickSummary::births`], this includes every [`BirthOrigin::Born`],
+    /// [`BirthOrigin::Seeded`], and [`BirthOrigin::Injected`] record. Consumers
+    /// needing the demographic count must filter this stream to `Born` rather
+    /// than treating its length as the summary's birth count.
     pub births: Vec<BirthRecord>,
     pub deaths: Vec<DeathRecord>,
     pub replay_events: Vec<ReplayEvent>,
@@ -3468,6 +3561,9 @@ impl PersistenceAdmissionError {
 /// Failure while executing a simulation tick.
 #[derive(Debug, Clone, Error)]
 pub enum WorldStepError {
+    /// A lineage or other scientific invariant rejected the tick before it began.
+    #[error(transparent)]
+    ScientificState(#[from] ScientificStateError),
     /// A registered brain factory could not construct a runner.
     #[error(transparent)]
     BrainSpawn(#[from] BrainSpawnError),
@@ -3482,6 +3578,22 @@ pub enum WorldStepError {
         brain: BrainSpawnError,
         persistence: PersistenceAdmissionError,
     },
+    /// Scientific-state validation and persistence admission both failed at one boundary.
+    #[error(
+        "scientific state was rejected while the completed tick was also rejected by persistence: {scientific_state}; {persistence}"
+    )]
+    ScientificStateAndPersistence {
+        scientific_state: ScientificStateError,
+        persistence: PersistenceAdmissionError,
+    },
+}
+
+#[derive(Debug, Error)]
+enum PopulationSpawnError {
+    #[error(transparent)]
+    ScientificState(#[from] ScientificStateError),
+    #[error(transparent)]
+    BrainSpawn(#[from] BrainSpawnError),
 }
 
 /// No-op persistence sink.
@@ -4388,10 +4500,24 @@ impl Velocity {
 pub struct Generation(pub u32);
 
 impl Generation {
-    /// Advances to the next lineage generation.
-    #[must_use]
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+    /// Advances to the next lineage generation without wrapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScientificStateError::GenerationOverflow`] when this generation is already
+    /// [`u32::MAX`].
+    pub fn next(self) -> Result<Self, ScientificStateError> {
+        self.next_at("generation")
+    }
+
+    fn next_at(self, path: impl Into<String>) -> Result<Self, ScientificStateError> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or_else(|| ScientificStateError::GenerationOverflow {
+                path: path.into(),
+                generation: self.0,
+            })
     }
 }
 
@@ -4972,6 +5098,47 @@ pub enum ScientificStateError {
     /// A coupled imported state supplied only one half of a required pair.
     #[error("incomplete coupled scientific state at `{path}`")]
     IncompletePair { path: String },
+    /// An external closure attempted to rewrite immutable ancestry metadata.
+    #[error("external ancestry mutation is not permitted at `{path}`")]
+    ExternalLineageMutation { path: String },
+    /// A child generation could not be represented without wrapping the lineage counter.
+    #[error(
+        "lineage generation {generation} cannot advance at `{path}` because the u32 generation space is exhausted"
+    )]
+    GenerationOverflow { path: String, generation: u32 },
+    /// Scientific mutation was attempted while the current persistence admission was unresolved.
+    #[error(
+        "persistence boundary for tick {tick} is unresolved at `{path}`; retry the exact retained persistence batch before advancing the world or mutating scientific state"
+    )]
+    PersistenceBoundaryUnresolved { path: String, tick: u64 },
+    /// An external arrival was attempted after the current persistence boundary was admitted.
+    #[error(
+        "persistence boundary for tick {tick} is already sealed at `{path}`; advance to a new tick before adding an external arrival"
+    )]
+    PersistenceBoundarySealed { path: String, tick: u64 },
+    /// A caller attempted to label a post-start external arrival as a seeded founder.
+    #[error(
+        "seeded arrivals are only valid at the tick-zero bootstrap boundary at `{path}`; current tick is {tick}, so use an injected arrival"
+    )]
+    SeededArrivalAfterBootstrap { path: String, tick: u64 },
+    /// Disabling persistence would strand scientific material that has not reached its sink.
+    #[error(
+        "cannot disable persistence at `{path}` because tick {tick} has an unadmitted scientific tail; call `WorldState::finalize_persistence()` before disabling persistence"
+    )]
+    PersistenceDisableRequiresFinalization { path: String, tick: u64 },
+    /// Persistence was disabled long enough to discard scientific records from this run.
+    #[error(
+        "cannot re-enable persistence at `{path}` because scientific records were discarded while persistence was disabled at tick {discarded_at_tick}; construct a new world and storage identity instead of creating a run with a hidden history gap"
+    )]
+    PersistenceHistoryGap {
+        path: String,
+        discarded_at_tick: u64,
+    },
+    /// Resetting time is only valid as a no-op on a pristine tick-zero world.
+    #[error(
+        "cannot reset time at `{path}` because the world is not a pristine tick-zero boundary (tick {tick}, epoch {epoch}); construct a new world and storage identity for the new run"
+    )]
+    TimeResetRequiresNewRun { path: String, tick: u64, epoch: u64 },
 }
 
 impl ScientificStateError {
@@ -4983,7 +5150,15 @@ impl ScientificStateError {
             | Self::LengthMismatch { path, .. }
             | Self::DimensionOverflow { path }
             | Self::DimensionsMismatch { path, .. }
-            | Self::IncompletePair { path } => path,
+            | Self::IncompletePair { path }
+            | Self::ExternalLineageMutation { path }
+            | Self::GenerationOverflow { path, .. }
+            | Self::PersistenceBoundaryUnresolved { path, .. }
+            | Self::PersistenceBoundarySealed { path, .. }
+            | Self::SeededArrivalAfterBootstrap { path, .. }
+            | Self::PersistenceDisableRequiresFinalization { path, .. }
+            | Self::PersistenceHistoryGap { path, .. }
+            | Self::TimeResetRequiresNewRun { path, .. } => path,
         }
     }
 }
@@ -5038,6 +5213,9 @@ pub enum WorldStateError {
     /// A direct-Rust or imported-map state payload violated the finite-state contract.
     #[error(transparent)]
     InvalidState(#[from] ScientificStateError),
+    /// A registered brain factory failed while applying a live-world mutation.
+    #[error(transparent)]
+    BrainSpawn(#[from] BrainSpawnError),
 }
 
 /// Control-related runtime behavior toggles.
@@ -5096,7 +5274,7 @@ pub struct ConfigAuditEntry {
 }
 
 /// Static configuration for a ScriptBots world.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScriptBotsConfig {
     /// Width of the world in world units.
     pub world_width: u32,
@@ -9033,6 +9211,7 @@ pub struct WorldState {
     persistence_fault: Option<PersistenceAdmissionError>,
     brain_fault: Option<BrainSpawnError>,
     last_admitted_persistence_tick: Option<Tick>,
+    persistence_discarded_records_at: Option<Tick>,
     pending_persistence_runtime_tail: AgentMap<PersistenceRuntimeTail>,
     pending_birth_events: usize,
     pending_death_events: usize,
@@ -9162,6 +9341,7 @@ impl WorldState {
             persistence_fault: None,
             brain_fault: None,
             last_admitted_persistence_tick: None,
+            persistence_discarded_records_at: None,
             pending_persistence_runtime_tail: AgentMap::new(),
             pending_birth_events: 0,
             pending_death_events: 0,
@@ -11192,6 +11372,9 @@ impl WorldState {
     ///
     /// # Errors
     ///
+    /// Returns [`ScientificStateError::PersistenceBoundaryUnresolved`] while an exact completed
+    /// persistence batch still needs admission.
+    ///
     /// Returns [`WorldStateError::InvalidConfig`] when the intervention is not
     /// honourable as asked. It is rejected, never silently clamped into a
     /// different experiment.
@@ -11199,6 +11382,7 @@ impl WorldState {
         &mut self,
         intervention: Intervention,
     ) -> Result<(), WorldStateError> {
+        self.ensure_scientific_mutation_allowed("interventions")?;
         intervention.validate()?;
         self.pending_interventions.push(intervention);
         Ok(())
@@ -11527,16 +11711,42 @@ impl WorldState {
         }
         activity
     }
-    fn spawn_crossover_agent(&mut self) -> Result<Option<AgentId>, BrainSpawnError> {
-        let handles: Vec<AgentId> = self.agents.iter_handles().collect();
+    fn spawn_crossover_agent(
+        &mut self,
+        record_tick: Tick,
+        eligible_parents: &[AgentId],
+    ) -> Result<Option<AgentId>, PopulationSpawnError> {
+        let handles = eligible_parents;
         let count = handles.len();
         if count < 2 {
             return Ok(None);
         }
 
-        let (idx1, idx2) = {
+        // Validate the entire eligible set before parent selection consumes RNG. This is
+        // deliberately conservative: every handle is a possible selected parent, and a
+        // max-generation candidate must reject the scheduled crossover transaction without
+        // changing which random pair a later retry would see.
+        for id in handles {
+            let Some(index) = self.agents.index_of(*id) else {
+                return Ok(None);
+            };
+            self.agents.columns().generations()[index]
+                .next_at(format!("agents[{}].generation", id.data().as_ffi()))?;
+        }
+
+        let eligible_ages = {
             let columns = self.agents.columns();
             let ages = columns.ages();
+            let mut eligible_ages = Vec::with_capacity(count);
+            for id in handles {
+                let Some(index) = self.agents.index_of(*id) else {
+                    return Ok(None);
+                };
+                eligible_ages.push(ages[index]);
+            }
+            eligible_ages
+        };
+        let (idx1, idx2) = {
             let mut first = self.rng.random_range(0..count);
             let mut second = if count > 1 {
                 self.rng.random_range(0..count)
@@ -11548,11 +11758,14 @@ impl WorldState {
                     second = self.rng.random_range(0..count);
                 }
             }
-            for (idx, &age) in ages.iter().enumerate() {
-                if age > ages[first] && self.rng.random_range(0.0..1.0) < 0.1 {
+            for (idx, &age) in eligible_ages.iter().enumerate() {
+                if age > eligible_ages[first] && self.rng.random_range(0.0..1.0) < 0.1 {
                     first = idx;
                 }
-                if idx != first && age > ages[second] && self.rng.random_range(0.0..1.0) < 0.1 {
+                if idx != first
+                    && age > eligible_ages[second]
+                    && self.rng.random_range(0.0..1.0) < 0.1
+                {
                     second = idx;
                 }
             }
@@ -11568,14 +11781,15 @@ impl WorldState {
         let parent_id = handles[idx1];
         let partner_id = handles[idx2];
 
-        let parent_data = {
-            let columns = self.agents.columns();
-            columns.snapshot(idx1)
+        let Some(parent_index) = self.agents.index_of(parent_id) else {
+            return Ok(None);
         };
-        let partner_data = {
-            let columns = self.agents.columns();
-            columns.snapshot(idx2)
+        let Some(partner_index) = self.agents.index_of(partner_id) else {
+            return Ok(None);
         };
+        let columns = self.agents.columns();
+        let parent_data = columns.snapshot(parent_index);
+        let partner_data = columns.snapshot(partner_index);
         let parent_runtime = match self.runtime.get(parent_id).cloned() {
             Some(rt) => rt,
             None => return Ok(None),
@@ -11610,7 +11824,7 @@ impl WorldState {
             self.config.reproduction_color_jitter,
             width,
             height,
-        );
+        )?;
         let mut child_runtime = self.build_child_runtime(
             &parent_runtime,
             partner_runtime.as_ref(),
@@ -11656,17 +11870,21 @@ impl WorldState {
             let Some(binding) =
                 BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
             else {
-                return Err(BrainSpawnError::new(
-                    parent_kind.clone(),
-                    MissingBrainFactory { key },
-                ));
+                return Err(
+                    BrainSpawnError::new(parent_kind.clone(), MissingBrainFactory { key }).into(),
+                );
             };
             child_runtime.brain = binding;
         } else if parent_was_bound {
-            return Err(BrainSpawnError::new(parent_kind, MissingHeritableBrain));
+            return Err(BrainSpawnError::new(parent_kind, MissingHeritableBrain).into());
         }
 
-        let child_id = self.insert_agent(child_data, child_runtime, true);
+        let child_id = self.insert_agent(
+            child_data,
+            child_runtime,
+            record_tick,
+            BirthOrigin::Injected,
+        );
         Ok(Some(child_id))
     }
 
@@ -11679,6 +11897,8 @@ impl WorldState {
         }
         self.agents
             .restore_append_checkpoint(receipt.arena_checkpoint);
+        self.pending_birth_records
+            .truncate(receipt.pending_birth_records_before);
         self.rng = receipt.rng_before;
         self.next_agent_uid = receipt.next_agent_uid_before;
         self.next_spawn_ordinal = receipt.next_spawn_ordinal_before;
@@ -11688,7 +11908,7 @@ impl WorldState {
     fn stage_population(
         &mut self,
         next_tick: Tick,
-    ) -> Result<Option<PopulationSpawnReceipt>, BrainSpawnError> {
+    ) -> Result<Option<PopulationSpawnReceipt>, PopulationSpawnError> {
         if self.config.closed {
             return Ok(None);
         }
@@ -11704,32 +11924,38 @@ impl WorldState {
         let mut receipt = PopulationSpawnReceipt {
             inserted: Vec::new(),
             arena_checkpoint: self.agents.append_checkpoint(),
+            pending_birth_records_before: self.pending_birth_records.len(),
             rng_before: self.rng.clone(),
             next_agent_uid_before: self.next_agent_uid,
             next_spawn_ordinal_before: self.next_spawn_ordinal,
             next_birth_ordinal_before: self.next_birth_ordinal,
         };
-        let result: Result<(), BrainSpawnError> = (|| {
+        // Freeze crossover eligibility before this population transaction inserts
+        // anyone. An injected parent and its injected child would otherwise share
+        // `next_tick`, violating the ancestry graph's strict parent-before-child
+        // invariant and making an append-only log impossible to replay in order.
+        let crossover_eligible: Vec<AgentId> = self.agents.iter_handles().collect();
+        let result: Result<(), PopulationSpawnError> = (|| {
             while self.agents.len() < minimum {
-                receipt.inserted.push(self.spawn_random_agent()?);
+                receipt.inserted.push(self.spawn_random_agent(next_tick)?);
             }
 
             if scheduled_spawn {
                 let spawn_count = self.config.population_spawn_count.max(1);
                 let crossover_chance = self.config.population_crossover_chance.clamp(0.0, 1.0);
                 for _ in 0..spawn_count {
-                    let use_crossover = self.agents.len() >= 2
+                    let use_crossover = crossover_eligible.len() >= 2
                         && crossover_chance > 0.0
                         && self.rng.random_range(0.0..1.0) < crossover_chance;
                     let spawned = if use_crossover {
-                        self.spawn_crossover_agent()?
+                        self.spawn_crossover_agent(next_tick, &crossover_eligible)?
                     } else {
                         None
                     };
                     if let Some(id) = spawned {
                         receipt.inserted.push(id);
                     } else {
-                        receipt.inserted.push(self.spawn_random_agent()?);
+                        receipt.inserted.push(self.spawn_random_agent(next_tick)?);
                     }
                 }
             }
@@ -11744,7 +11970,7 @@ impl WorldState {
         }
     }
 
-    fn spawn_random_agent(&mut self) -> Result<AgentId, BrainSpawnError> {
+    fn spawn_random_agent(&mut self, record_tick: Tick) -> Result<AgentId, BrainSpawnError> {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
         let position = Position::new(
@@ -11782,11 +12008,11 @@ impl WorldState {
         if let Some(binding) = binding {
             runtime.brain = binding;
         }
-        let id = self.insert_agent(data, runtime, false);
+        let id = self.insert_agent(data, runtime, record_tick, BirthOrigin::Injected);
         Ok(id)
     }
 
-    fn allocate_identity(&mut self, is_birth: bool) -> AgentIdentity {
+    fn allocate_identity(&mut self, origin: BirthOrigin) -> AgentIdentity {
         assert!(
             self.next_agent_uid < u64::MAX,
             "AgentUid space exhausted for this run"
@@ -11795,7 +12021,7 @@ impl WorldState {
             self.next_spawn_ordinal < u64::MAX,
             "agent spawn ordinal space exhausted for this run"
         );
-        let birth_ordinal = if is_birth {
+        let birth_ordinal = if origin == BirthOrigin::Born {
             assert!(
                 self.next_birth_ordinal < u64::MAX,
                 "agent birth ordinal space exhausted for this run"
@@ -11816,11 +12042,36 @@ impl WorldState {
         identity
     }
 
-    fn insert_agent(&mut self, data: AgentData, runtime: AgentRuntime, is_birth: bool) -> AgentId {
-        let identity = self.allocate_identity(is_birth);
+    fn insert_agent(
+        &mut self,
+        data: AgentData,
+        runtime: AgentRuntime,
+        record_tick: Tick,
+        origin: BirthOrigin,
+    ) -> AgentId {
+        let identity = self.allocate_identity(origin);
+        let record = BirthRecord {
+            tick: record_tick,
+            agent_uid: identity.uid,
+            spawn_ordinal: identity.spawn_ordinal,
+            birth_ordinal: identity.birth_ordinal,
+            origin,
+            parent_a: runtime.lineage[0],
+            parent_b: runtime.lineage[1],
+            brain_kind: runtime.brain.kind().map(str::to_owned),
+            brain_key: runtime.brain.registry_key(),
+            herbivore_tendency: clamp01(runtime.herbivore_tendency),
+            generation: data.generation,
+            position: data.position,
+            is_hybrid: runtime.hybrid,
+        };
         let id = self.agents.insert(data);
         self.identities.insert(id, identity);
         self.runtime.insert(id, runtime);
+        if origin == BirthOrigin::Born {
+            self.pending_lifecycle_birth_metrics.push(record.clone());
+        }
+        self.pending_birth_records.push(record);
         id
     }
 
@@ -12523,9 +12774,43 @@ impl WorldState {
             rejected,
         }
     }
-    fn stage_reproduction(&mut self) {
+    fn validate_live_generation_headroom(&self) -> Result<(), ScientificStateError> {
+        for (index, generation) in self
+            .agents
+            .columns()
+            .generations()
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            generation.next_at(format!("agents[{index}].generation"))?;
+        }
+        Ok(())
+    }
+
+    fn validate_step_generation_headroom(
+        &self,
+        next_tick: Tick,
+    ) -> Result<(), ScientificStateError> {
+        let natural_crossover_or_birth = self.config.reproduction_energy_threshold > 0.0
+            && self.cadence.reproduction_window(next_tick)
+            && self.cadence.reproduction_chance() > 0.0;
+        let scheduled_crossover = !self.config.closed
+            && self.config.population_spawn_interval != 0
+            && next_tick
+                .0
+                .is_multiple_of(self.config.population_spawn_interval as u64)
+            && self.config.population_crossover_chance > 0.0
+            && self.agents.len() >= 2;
+        if natural_crossover_or_birth || scheduled_crossover {
+            self.validate_live_generation_headroom()?;
+        }
+        Ok(())
+    }
+
+    fn stage_reproduction(&mut self) -> Result<(), ScientificStateError> {
         if self.config.reproduction_energy_threshold <= 0.0 {
-            return;
+            return Ok(());
         }
 
         let width = self.config.world_width as f32;
@@ -12541,7 +12826,13 @@ impl WorldState {
 
         let handles: Vec<AgentId> = self.agents.iter_handles().collect();
         if handles.is_empty() {
-            return;
+            return Ok(());
+        }
+
+        let reproduction_window = self.cadence.reproduction_window(self.tick.next());
+        let reproduction_chance = self.cadence.reproduction_chance();
+        if reproduction_window && reproduction_chance > 0.0 {
+            self.validate_live_generation_headroom()?;
         }
 
         let columns = self.agents.columns();
@@ -12549,9 +12840,6 @@ impl WorldState {
             .map(|idx| columns.snapshot(idx))
             .collect();
         let ages: Vec<u32> = columns.ages().to_vec();
-        let reproduction_window = self.cadence.reproduction_window(self.tick.next());
-        let reproduction_chance = self.cadence.reproduction_chance();
-
         for (idx, agent_id) in handles.iter().enumerate() {
             {
                 let runtime = match self.runtime.get_mut(*agent_id) {
@@ -12617,7 +12905,7 @@ impl WorldState {
                 color_jitter,
                 width,
                 height,
-            );
+            )?;
             let parent_uid = self
                 .agent_uid(*agent_id)
                 .expect("live birth parent must have stable identity");
@@ -12643,6 +12931,7 @@ impl WorldState {
                 runtime: child_runtime,
             });
         }
+        Ok(())
     }
 
     fn select_partner_index(
@@ -12778,42 +13067,7 @@ impl WorldState {
                 data,
                 runtime,
             } = order;
-            let child_id = self.insert_agent(data, runtime, true);
-            let child_runtime = self
-                .runtime
-                .get(child_id)
-                .expect("newborn agent must have runtime state");
-            let identity = self
-                .identities
-                .get(child_id)
-                .copied()
-                .expect("newborn agent must have stable identity");
-            let birth_ordinal = identity
-                .birth_ordinal
-                .expect("newborn agent must have a birth ordinal");
-            let idx = self
-                .agents
-                .index_of(child_id)
-                .expect("newborn agent must have dense scalar state");
-            let snapshot = self.agents.columns().snapshot(idx);
-            let brain_kind = child_runtime.brain.kind().map(str::to_string);
-            let brain_key = child_runtime.brain.registry_key();
-            let record = BirthRecord {
-                tick,
-                agent_uid: identity.uid,
-                spawn_ordinal: identity.spawn_ordinal,
-                birth_ordinal,
-                parent_a: child_runtime.lineage[0],
-                parent_b: child_runtime.lineage[1],
-                brain_kind,
-                brain_key,
-                herbivore_tendency: clamp01(child_runtime.herbivore_tendency),
-                generation: snapshot.generation,
-                position: snapshot.position,
-                is_hybrid: child_runtime.hybrid,
-            };
-            self.pending_lifecycle_birth_metrics.push(record.clone());
-            self.pending_birth_records.push(record);
+            self.insert_agent(data, runtime, tick, BirthOrigin::Born);
         }
         Ok(())
     }
@@ -12827,7 +13081,15 @@ impl WorldState {
         color_jitter: f32,
         width: f32,
         height: f32,
-    ) -> AgentData {
+    ) -> Result<AgentData, ScientificStateError> {
+        let generation = match partner {
+            Some(partner) => Self::crossover_child_generation(
+                parent.generation,
+                partner.generation,
+                "agent.generation",
+            )?,
+            None => parent.generation.next_at("agent.generation")?,
+        };
         let mut child = *parent;
         let heading = parent.heading;
         let base_dx = -heading.cos() * back_offset;
@@ -12850,7 +13112,7 @@ impl WorldState {
         child.boost = false;
         child.age = 0;
         child.spike_length = 0.0;
-        child.generation = parent.generation.next();
+        child.generation = generation;
 
         if let Some(partner) = partner {
             for (channel, partner_channel) in child.color.iter_mut().zip(partner.color.iter()) {
@@ -12864,7 +13126,15 @@ impl WorldState {
                     (*channel + self.rng.random_range(-color_jitter..color_jitter)).clamp(0.0, 1.0);
             }
         }
-        child
+        Ok(child)
+    }
+
+    fn crossover_child_generation(
+        parent_a: Generation,
+        parent_b: Generation,
+        path: &str,
+    ) -> Result<Generation, ScientificStateError> {
+        parent_a.max(parent_b).next_at(path)
     }
 
     fn build_child_runtime(
@@ -13216,6 +13486,13 @@ impl WorldState {
         force_partial_batch: bool,
     ) -> Result<(), PersistenceAdmissionError> {
         if self.config.persistence_interval == 0 {
+            // A completed boundary is itself part of the scientific timeline, even when that
+            // particular tick produced no lifecycle or replay rows. Remember the first disabled
+            // boundary so a later re-enable cannot silently splice two recorded segments around
+            // an apparently empty gap.
+            if self.persistence_discarded_records_at.is_none() {
+                self.persistence_discarded_records_at = Some(next_tick);
+            }
             self.pending_birth_records.clear();
             self.pending_death_records.clear();
             self.pending_lifecycle_birth_metrics.clear();
@@ -13806,13 +14083,16 @@ impl WorldState {
     /// Execute one simulation tick pipeline returning emitted events.
     ///
     /// A returned error can describe a tick that has already reached its completed boundary. A
-    /// persistence rejection retains that exact completed batch for explicit retry and sets
+    /// A generation-capacity rejection occurs before the first stage, RNG draw, or state
+    /// mutation. A persistence rejection retains that exact completed batch for explicit retry and sets
     /// [`Self::persistence_fault`]. A brain-construction failure rolls back population inserts and
     /// refuses a partial queued-birth commit, completes the remaining tick bookkeeping and
     /// persistence boundary, advances `tick`, and sets [`Self::brain_fault`]. If both fail, both faults are retained and
-    /// [`WorldStepError::BrainAndPersistence`] reports them together. In every case, a latched fault
-    /// blocks later science ticks without mutation; callers must not retry `step` as though the
-    /// failed return meant the current tick was unapplied.
+    /// [`WorldStepError::BrainAndPersistence`] reports them together. Completed-boundary failures
+    /// latch and block later science ticks without mutation; callers must not retry `step` as
+    /// though those failed returns meant the current tick was unapplied. A pre-tick generation
+    /// rejection is not latched because no part of that tick was applied; callers may disable the
+    /// relevant reproduction policy or replace the offending scientific state before retrying.
     pub fn step(&mut self) -> Result<TickEvents, WorldStepError> {
         self.step_observed(&mut NoopWorldStepObserver)
     }
@@ -13838,6 +14118,7 @@ impl WorldState {
         }
 
         let next_tick = self.tick.next();
+        self.validate_step_generation_headroom(next_tick)?;
         let step_started_at = observer.begin_step(next_tick);
         let previous_epoch = self.epoch;
 
@@ -13947,17 +14228,21 @@ impl WorldState {
                 death_activity.rejected,
             );
         });
-        observed_stage!(WorldStepStage::Reproduction, {
+        let reproduction_result = observed_stage!(WorldStepStage::Reproduction, {
             let reproduction_before = self.capture_resource_amounts();
-            self.stage_reproduction();
+            let result = self.stage_reproduction();
             self.record_resource_change(
                 ResourceFlowKind::ReproductionAllocation,
                 reproduction_before,
             );
+            result
         });
-        let brain_result = observed_stage!(WorldStepStage::Population, {
+        let population_result = observed_stage!(WorldStepStage::Population, {
             let population_before = self.capture_resource_amounts();
-            let population_result = self.stage_population(next_tick);
+            let population_result = match reproduction_result {
+                Ok(()) => self.stage_population(next_tick),
+                Err(error) => Err(error.into()),
+            };
             self.record_resource_change(ResourceFlowKind::PopulationInjection, population_before);
             match population_result {
                 Ok(population_receipt) => {
@@ -13978,7 +14263,7 @@ impl WorldState {
                                     rollback_before,
                                 );
                             }
-                            Err(error)
+                            Err(error.into())
                         }
                     }
                 }
@@ -14024,16 +14309,25 @@ impl WorldState {
             events.tick = self.tick;
             events.epoch_rolled = self.epoch != previous_epoch;
         });
-        let result = match (brain_result, persistence_result) {
+        let result = match (population_result, persistence_result) {
             (Ok(()), Ok(())) => Ok(events),
             (Ok(()), Err(persistence)) => Err(persistence.into()),
-            (Err(brain), Ok(())) => {
+            (Err(PopulationSpawnError::BrainSpawn(brain)), Ok(())) => {
                 self.brain_fault = Some(brain.clone());
                 Err(brain.into())
             }
-            (Err(brain), Err(persistence)) => {
+            (Err(PopulationSpawnError::BrainSpawn(brain)), Err(persistence)) => {
                 self.brain_fault = Some(brain.clone());
                 Err(WorldStepError::BrainAndPersistence { brain, persistence })
+            }
+            (Err(PopulationSpawnError::ScientificState(scientific_state)), Ok(())) => {
+                Err(scientific_state.into())
+            }
+            (Err(PopulationSpawnError::ScientificState(scientific_state)), Err(persistence)) => {
+                Err(WorldStepError::ScientificStateAndPersistence {
+                    scientific_state,
+                    persistence,
+                })
             }
         };
         observer.end_step(step_started_at);
@@ -14478,11 +14772,84 @@ impl WorldState {
         }
     }
 
+    fn has_pending_persistence_material(&self) -> bool {
+        !self.pending_birth_records.is_empty()
+            || !self.pending_death_records.is_empty()
+            || !self.pending_lifecycle_birth_metrics.is_empty()
+            || !self.pending_lifecycle_death_metrics.is_empty()
+            || !self.replay_events.is_empty()
+            || !self.pending_persistence_runtime_tail.is_empty()
+            || self.pending_birth_events != 0
+            || self.pending_death_events != 0
+            || self.pending_spike_attempt_events != 0
+            || self.pending_spike_hit_events != 0
+            || self.last_births != 0
+            || self.last_deaths != 0
+            || self.combat_spike_attempts != 0
+            || self.combat_spike_hits != 0
+            || self.carcass_health_distributed > 0.0
+            || self.carcass_reproduction_bonus > 0.0
+    }
+
+    fn has_unadmitted_scientific_tail(&self) -> bool {
+        let completed_tick_is_unadmitted =
+            self.tick != Tick::zero() && self.last_admitted_persistence_tick != Some(self.tick);
+        completed_tick_is_unadmitted || self.has_pending_persistence_material()
+    }
+
+    fn ensure_scientific_mutation_allowed(&self, path: &str) -> Result<(), ScientificStateError> {
+        if self.persistence_fault.is_some() || self.pending_persistence_batch.is_some() {
+            return Err(ScientificStateError::PersistenceBoundaryUnresolved {
+                path: path.to_owned(),
+                tick: self.tick.0,
+            });
+        }
+        Ok(())
+    }
+
     /// Apply a new configuration, refreshing derived caches while preserving runtime state.
     pub fn apply_config_update(
         &mut self,
         new_config: ScriptBotsConfig,
     ) -> Result<(), WorldStateError> {
+        let unresolved_admission =
+            self.persistence_fault.is_some() || self.pending_persistence_batch.is_some();
+        let pure_disable_during_unresolved = if unresolved_admission
+            && self.config.persistence_interval != 0
+            && new_config.persistence_interval == 0
+        {
+            let mut expected = self.config.clone();
+            expected.persistence_interval = 0;
+            new_config == expected
+        } else {
+            false
+        };
+        if !pure_disable_during_unresolved {
+            self.ensure_scientific_mutation_allowed("config")?;
+        }
+        if self.config.persistence_interval != 0
+            && new_config.persistence_interval == 0
+            && !unresolved_admission
+            && self.has_unadmitted_scientific_tail()
+        {
+            return Err(
+                ScientificStateError::PersistenceDisableRequiresFinalization {
+                    path: "config.persistence_interval".to_owned(),
+                    tick: self.tick.0,
+                }
+                .into(),
+            );
+        }
+        if self.config.persistence_interval == 0
+            && new_config.persistence_interval != 0
+            && let Some(discarded_at_tick) = self.persistence_discarded_records_at
+        {
+            return Err(ScientificStateError::PersistenceHistoryGap {
+                path: "config.persistence_interval".to_owned(),
+                discarded_at_tick: discarded_at_tick.0,
+            }
+            .into());
+        }
         let (food_w, food_h) = new_config.food_dimensions()?;
         let current_dims = (self.food.width(), self.food.height());
         // Compare the raw geometry too: proportional width/cell_size changes
@@ -14556,11 +14923,6 @@ impl WorldState {
         self.activation_probe = agent;
     }
 
-    /// Replace the persistence sink.
-    pub fn set_persistence(&mut self, persistence: Box<dyn WorldPersistence>) {
-        self.persistence = persistence;
-    }
-
     /// Retry the exact completed batch retained after an unacknowledged admission attempt.
     ///
     /// Returns `Ok(true)` after admitting a retained batch, `Ok(false)` when no retry was
@@ -14596,14 +14958,34 @@ impl WorldState {
             return Err(error.clone());
         }
         if self.config.persistence_interval == 0
-            || self.tick == Tick::zero()
             || self.last_admitted_persistence_tick == Some(self.tick)
+        {
+            return Ok(false);
+        }
+
+        // Tick zero has no completed simulation step to summarize, but bootstrap
+        // arrivals are still scientific origin records. Admit them when present;
+        // keep an untouched empty world idempotently empty.
+        if self.tick == Tick::zero()
+            && self.pending_birth_records.is_empty()
+            && self.pending_death_records.is_empty()
+            && self.replay_events.is_empty()
         {
             return Ok(false);
         }
 
         self.stage_persistence(self.tick, true)?;
         Ok(true)
+    }
+
+    /// Most recent simulation boundary synchronously admitted by the persistence sink.
+    ///
+    /// This is historical admission state, independent of the current persistence cadence.
+    /// Shutdown code uses it to validate the worker receipt even when configuration changed
+    /// after admission.
+    #[must_use]
+    pub const fn last_admitted_persistence_tick(&self) -> Option<Tick> {
+        self.last_admitted_persistence_tick
     }
 
     /// Whether a completed tick is paused at the persistence admission boundary.
@@ -14665,13 +15047,15 @@ impl WorldState {
     /// Closing disables both floor enforcement and scheduled injection without altering their
     /// configured values. Scheduled opportunities while closed are skipped, not deferred. A later
     /// open transition makes the existing floor and cadence effective for subsequent ticks.
-    pub fn set_closed(&mut self, closed: bool) {
+    pub fn set_closed(&mut self, closed: bool) -> Result<(), ScientificStateError> {
+        self.ensure_scientific_mutation_allowed("config.closed")?;
         if self.config.closed == closed {
-            return;
+            return Ok(());
         }
         self.config.closed = closed;
         self.config_revision = self.config_revision.saturating_add(1);
         self.record_config_audit(serde_json::json!({ "closed": closed }));
+        Ok(())
     }
 
     /// Iterate over retained tick summaries.
@@ -14680,23 +15064,56 @@ impl WorldState {
     }
 
     /// Advances the world tick counter, rolling epochs when needed.
-    pub fn advance_tick(&mut self) {
+    fn advance_tick(&mut self) {
         self.tick = self.tick.next();
         if self.tick.0.is_multiple_of(10_000) {
             self.epoch += 1;
         }
     }
 
-    /// Resets ticks and epochs (useful for restarts).
-    pub fn reset_time(&mut self) {
-        self.tick = Tick::zero();
-        self.epoch = 0;
+    /// Confirm that time is already at a pristine, no-op tick-zero boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScientificStateError::PersistenceBoundaryUnresolved`] while an exact retained
+    /// batch still needs admission. Any other non-pristine clock, pending time-stamped material,
+    /// history, or admission marker returns [`ScientificStateError::TimeResetRequiresNewRun`];
+    /// construct a new world and storage identity instead of relabeling existing science.
+    pub fn reset_time(&self) -> Result<(), ScientificStateError> {
+        if self.persistence_fault.is_some() || self.pending_persistence_batch.is_some() {
+            return Err(ScientificStateError::PersistenceBoundaryUnresolved {
+                path: "world.tick".to_owned(),
+                tick: self.tick.0,
+            });
+        }
+
+        let pristine_tick_zero = self.tick == Tick::zero()
+            && self.epoch == 0
+            && self.last_admitted_persistence_tick.is_none()
+            && self.persistence_discarded_records_at.is_none()
+            && self.pending_deaths.is_empty()
+            && self.pending_spawns.is_empty()
+            && !self.has_pending_persistence_material()
+            && self.history.is_empty()
+            && self.narrative.events().is_empty()
+            && self.config_audit.is_empty()
+            && self.pending_interventions.is_empty()
+            && self.active_effects.is_empty()
+            && self.simulation_commands.is_empty();
+        if !pristine_tick_zero {
+            return Err(ScientificStateError::TimeResetRequiresNewRun {
+                path: "world.tick".to_owned(),
+                tick: self.tick.0,
+                epoch: self.epoch,
+            });
+        }
+        Ok(())
     }
 
     /// Borrow the world RNG mutably for deterministic sampling.
-    #[must_use]
-    pub fn rng(&mut self) -> &mut dyn RandomStream {
-        &mut self.rng
+    pub fn rng(&mut self) -> Result<&mut dyn RandomStream, ScientificStateError> {
+        self.ensure_scientific_mutation_allowed("world.rng")?;
+        Ok(&mut self.rng)
     }
 
     /// Read-only access to the agent arena.
@@ -14757,7 +15174,8 @@ impl WorldState {
     }
 
     /// Validate and spawn one direct-Rust agent without consuming RNG or allocator state on
-    /// rejection.
+    /// rejection. This tick-zero-only founding path records the agent as
+    /// [`BirthOrigin::Seeded`].
     pub fn try_spawn_agent(&mut self, agent: AgentData) -> Result<AgentId, ScientificStateError> {
         self.try_spawn_agent_with(agent, |_| {})
     }
@@ -14768,15 +15186,169 @@ impl WorldState {
         agent: AgentData,
         update_runtime: impl FnOnce(&mut AgentRuntime),
     ) -> Result<AgentId, ScientificStateError> {
-        agent.validate()?;
+        self.try_insert_agent_with_origin(agent, update_runtime, BirthOrigin::Seeded)
+    }
+
+    /// Validate and inject one post-seeding agent without consuming RNG or allocator state on
+    /// rejection.
+    pub fn try_inject_agent(&mut self, agent: AgentData) -> Result<AgentId, ScientificStateError> {
+        self.try_inject_agent_with(agent, |_| {})
+    }
+
+    /// Validate scalar and caller-customized runtime state as one atomic injected arrival.
+    pub fn try_inject_agent_with(
+        &mut self,
+        agent: AgentData,
+        update_runtime: impl FnOnce(&mut AgentRuntime),
+    ) -> Result<AgentId, ScientificStateError> {
+        self.try_insert_agent_with_origin(agent, update_runtime, BirthOrigin::Injected)
+    }
+
+    fn pending_current_origin_record(&self, id: AgentId) -> Option<&BirthRecord> {
+        let uid = self.identities.get(id)?.uid;
+        self.pending_birth_records
+            .iter()
+            .rev()
+            .find(|record| record.agent_uid == uid && record.tick == self.tick)
+    }
+
+    /// Inject a crossover arrival whose lineage is derived from two live handles.
+    ///
+    /// The persistence boundary and both parents are validated before RNG or identity allocation.
+    /// Identical or stale handles return `Ok(None)` without invoking `update`. Core owns the
+    /// scientific fields: after the callback it restores both resolved parent UIDs, marks the
+    /// child hybrid, and assigns one generation beyond the older parent. The caller may customize
+    /// ordinary scalar and runtime traits but cannot fabricate crossover lineage.
+    pub fn try_inject_crossover_agent_with(
+        &mut self,
+        parent_a: AgentId,
+        parent_b: AgentId,
+        mut agent: AgentData,
+        update: impl FnOnce(&mut AgentData, &mut AgentRuntime),
+    ) -> Result<Option<AgentId>, ScientificStateError> {
+        self.validate_external_arrival_boundary()?;
+        if parent_a == parent_b {
+            return Ok(None);
+        }
+        let Some(parent_a_state) = self.snapshot_agent(parent_a) else {
+            return Ok(None);
+        };
+        let Some(parent_b_state) = self.snapshot_agent(parent_b) else {
+            return Ok(None);
+        };
+        // Parent origins must precede their child in the append-only ancestry log. A parent
+        // still pending at this boundary would give the child the same tick and make replay
+        // order invalid, so reject before the first random draw.
+        if self.pending_current_origin_record(parent_a).is_some()
+            || self.pending_current_origin_record(parent_b).is_some()
+        {
+            return Ok(None);
+        }
+
+        let generation = Self::crossover_child_generation(
+            parent_a_state.data.generation,
+            parent_b_state.data.generation,
+            "agent.generation",
+        )?;
+        let lineage = [
+            Some(parent_a_state.identity.uid),
+            Some(parent_b_state.identity.uid),
+        ];
         let rng_before = self.rng.clone();
         let mut runtime = AgentRuntime::new_random(&mut self.rng);
-        update_runtime(&mut runtime);
+        update(&mut agent, &mut runtime);
+        agent.generation = generation;
+        runtime.lineage = lineage;
+        runtime.hybrid = true;
+        if let Err(error) = agent.validate() {
+            self.rng = rng_before;
+            return Err(error);
+        }
         if let Err(error) = runtime.validate_at("agent.runtime") {
             self.rng = rng_before;
             return Err(error);
         }
-        let id = self.insert_agent(agent, runtime, false);
+
+        Ok(Some(self.insert_agent(
+            agent,
+            runtime,
+            self.tick,
+            BirthOrigin::Injected,
+        )))
+    }
+
+    /// Verify that a new external arrival can still join the current boundary.
+    ///
+    /// Frontends that must derive an arrival from the world's RNG should call
+    /// this before sampling. [`Self::try_spawn_agent_with`] and
+    /// [`Self::try_inject_agent_with`] repeat the same check transactionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScientificStateError::PersistenceBoundaryUnresolved`] while a
+    /// fault or retained batch leaves the current admission outcome unresolved.
+    /// This takes precedence over the admitted marker so callers are directed to
+    /// retry persistence before doing anything else.
+    ///
+    /// Returns [`ScientificStateError::PersistenceBoundarySealed`] only when the
+    /// current tick was successfully admitted. The caller must advance the world
+    /// to a new tick before adding an external arrival.
+    pub fn validate_external_arrival_boundary(&self) -> Result<(), ScientificStateError> {
+        let unresolved_admission =
+            self.persistence_fault.is_some() || self.pending_persistence_batch.is_some();
+        if unresolved_admission {
+            return Err(ScientificStateError::PersistenceBoundaryUnresolved {
+                path: "agent".to_owned(),
+                tick: self.tick.0,
+            });
+        }
+
+        // Sealing is historical for this tick. A temporary runtime toggle to
+        // persistence_interval=0 must not reopen an already-admitted identity;
+        // re-enabling later would otherwise make finalization skip new material.
+        let admitted_current_tick = self.last_admitted_persistence_tick == Some(self.tick);
+        if admitted_current_tick {
+            return Err(ScientificStateError::PersistenceBoundarySealed {
+                path: "agent".to_owned(),
+                tick: self.tick.0,
+            });
+        }
+        Ok(())
+    }
+
+    fn try_insert_agent_with_origin(
+        &mut self,
+        agent: AgentData,
+        update_runtime: impl FnOnce(&mut AgentRuntime),
+        origin: BirthOrigin,
+    ) -> Result<AgentId, ScientificStateError> {
+        // A durable outbox admits one immutable payload per completed tick. An
+        // arrival after that boundary (or while its admission is unresolved)
+        // could only be lost or rewrite history under the same tick identity.
+        // Refuse it before validation, RNG use, or allocation; callers may apply
+        // it after the world advances to an unsealed boundary.
+        self.validate_external_arrival_boundary()?;
+        if origin == BirthOrigin::Seeded && self.tick != Tick::zero() {
+            return Err(ScientificStateError::SeededArrivalAfterBootstrap {
+                path: "agent.origin".to_owned(),
+                tick: self.tick.0,
+            });
+        }
+        agent.validate()?;
+        let rng_before = self.rng.clone();
+        let mut runtime = AgentRuntime::new_random(&mut self.rng);
+        update_runtime(&mut runtime);
+        if runtime.lineage != [None, None] {
+            self.rng = rng_before;
+            return Err(ScientificStateError::ExternalLineageMutation {
+                path: "agent.runtime.lineage".to_owned(),
+            });
+        }
+        if let Err(error) = runtime.validate_at("agent.runtime") {
+            self.rng = rng_before;
+            return Err(error);
+        }
+        let id = self.insert_agent(agent, runtime, self.tick, origin);
         Ok(id)
     }
 
@@ -14786,11 +15358,11 @@ impl WorldState {
         debug_assert!(agent.validate().is_ok());
         let runtime = AgentRuntime::new_random(&mut self.rng);
         debug_assert!(runtime.validate().is_ok());
-        self.insert_agent(agent, runtime, false)
+        self.insert_agent(agent, runtime, self.tick, BirthOrigin::Seeded)
     }
 
-    /// Remove an agent by handle, returning its last known data.
-    pub fn remove_agent(&mut self, id: AgentId) -> Option<AgentData> {
+    /// Trusted internal removal path for simulation cleanup and invariant tests.
+    fn remove_agent(&mut self, id: AgentId) -> Option<AgentData> {
         self.runtime.remove(id);
         self.identities.remove(id);
         self.agents.remove(id)
@@ -14807,6 +15379,7 @@ impl WorldState {
         &mut self,
         update: impl FnOnce(&mut [f32]),
     ) -> Result<(), ScientificStateError> {
+        self.ensure_scientific_mutation_allowed("food.cells")?;
         self.food.try_update_cells(update)
     }
 
@@ -14833,6 +15406,7 @@ impl WorldState {
     }
     /// Replace the current terrain and food fields using a pre-generated map artifact.
     pub fn apply_map_artifact(&mut self, artifact: &MapArtifact) -> Result<(), WorldStateError> {
+        self.ensure_scientific_mutation_allowed("map")?;
         artifact.validate()?;
         let terrain = artifact.terrain();
         if terrain.width() != self.food.width() || terrain.height() != self.food.height() {
@@ -14891,13 +15465,21 @@ impl WorldState {
     }
 
     /// Mutable access to the brain registry.
-    #[must_use]
-    pub fn brain_registry_mut(&mut self) -> &mut BrainRegistry {
-        &mut self.brain_registry
+    pub fn brain_registry_mut(&mut self) -> Result<&mut BrainRegistry, ScientificStateError> {
+        self.ensure_scientific_mutation_allowed("brain_registry")?;
+        Ok(&mut self.brain_registry)
     }
 
     /// Bind a brain from the registry to the specified agent. Returns `true` on success.
-    pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> Result<bool, BrainSpawnError> {
+    ///
+    /// A pending Seeded/Injected origin row at the agent's insertion boundary is refreshed with
+    /// the binding. Once that boundary is admitted, the binding affects only live simulation
+    /// state; persisted origin metadata is immutable and is neither recreated nor rewritten.
+    pub fn bind_agent_brain(&mut self, id: AgentId, key: u64) -> Result<bool, WorldStateError> {
+        self.ensure_scientific_mutation_allowed(&format!(
+            "agents[{}].runtime.brain",
+            id.data().as_ffi()
+        ))?;
         if !self.agents.contains(id) {
             return Ok(false);
         }
@@ -14910,7 +15492,7 @@ impl WorldState {
             }
             Err(error) => {
                 self.rng = rng_before;
-                return Err(error);
+                return Err(error.into());
             }
         };
         let Some(runtime) = self.runtime.get_mut(id) else {
@@ -14918,6 +15500,7 @@ impl WorldState {
             return Ok(false);
         };
         runtime.brain = binding;
+        self.refresh_current_tick_origin_record(id);
         Ok(true)
     }
 
@@ -14934,11 +15517,17 @@ impl WorldState {
     }
 
     /// Transactionally edit both scalar and runtime state for one agent.
+    ///
+    /// Same-boundary edits may customize generation and hybrid status while refreshing a still-
+    /// pending Seeded/Injected root-origin row. Crossover rows already carry core-derived parents,
+    /// generation, and hybrid status, so those fields are immutable immediately. Once any root
+    /// row is admitted, its ancestry fields are immutable too; ordinary live fields remain editable.
     pub fn try_update_agent(
         &mut self,
         id: AgentId,
         update: impl FnOnce(&mut AgentData, &mut AgentRuntime),
     ) -> Result<bool, ScientificStateError> {
+        self.ensure_scientific_mutation_allowed(&format!("agents[{}]", id.data().as_ffi()))?;
         let Some(mut data) = self.agents.snapshot(id) else {
             return Ok(false);
         };
@@ -14947,9 +15536,34 @@ impl WorldState {
         };
         let original_brain_key = original_runtime.brain.registry_key();
         let original_brain_kind = original_runtime.brain.kind().map(str::to_owned);
+        let original_lineage = original_runtime.lineage;
+        let original_generation = data.generation;
+        let original_hybrid = original_runtime.hybrid;
+        let ancestry_is_pending = self
+            .pending_current_origin_record(id)
+            .is_some_and(|record| {
+                record.origin != BirthOrigin::Born
+                    && record.parent_a.is_none()
+                    && record.parent_b.is_none()
+            });
         let mut runtime = original_runtime.clone();
         update(&mut data, &mut runtime);
         let agent_path = format!("agents[{}]", id.data().as_ffi());
+        if runtime.lineage != original_lineage {
+            return Err(ScientificStateError::ExternalLineageMutation {
+                path: format!("{agent_path}.runtime.lineage"),
+            });
+        }
+        if data.generation != original_generation && !ancestry_is_pending {
+            return Err(ScientificStateError::ExternalLineageMutation {
+                path: format!("{agent_path}.generation"),
+            });
+        }
+        if runtime.hybrid != original_hybrid && !ancestry_is_pending {
+            return Err(ScientificStateError::ExternalLineageMutation {
+                path: format!("{agent_path}.runtime.hybrid"),
+            });
+        }
         data.validate_at(&agent_path)?;
         runtime.validate_at(&format!("{agent_path}.runtime"))?;
         let replaced = self.agents.replace_trusted(id, data);
@@ -14962,23 +15576,52 @@ impl WorldState {
             runtime.brain = std::mem::take(&mut original_runtime.brain);
         }
         self.runtime.insert(id, runtime);
+        self.refresh_current_tick_origin_record(id);
         Ok(true)
     }
 
     /// Transactionally edit runtime metadata for one agent.
+    ///
+    /// Same-boundary edits may customize hybrid status while refreshing a still-pending
+    /// Seeded/Injected root-origin row. Crossover hybrid status is immutable immediately, and
+    /// root hybrid status becomes immutable on admission.
     pub fn try_update_agent_runtime(
         &mut self,
         id: AgentId,
         update: impl FnOnce(&mut AgentRuntime),
     ) -> Result<bool, ScientificStateError> {
+        self.ensure_scientific_mutation_allowed(&format!(
+            "agents[{}].runtime",
+            id.data().as_ffi()
+        ))?;
         let Some(original_runtime) = self.runtime.get(id) else {
             return Ok(false);
         };
         let original_brain_key = original_runtime.brain.registry_key();
         let original_brain_kind = original_runtime.brain.kind().map(str::to_owned);
+        let original_lineage = original_runtime.lineage;
+        let original_hybrid = original_runtime.hybrid;
+        let ancestry_is_pending = self
+            .pending_current_origin_record(id)
+            .is_some_and(|record| {
+                record.origin != BirthOrigin::Born
+                    && record.parent_a.is_none()
+                    && record.parent_b.is_none()
+            });
         let mut runtime = original_runtime.clone();
         update(&mut runtime);
-        runtime.validate_at(&format!("agents[{}].runtime", id.data().as_ffi()))?;
+        let runtime_path = format!("agents[{}].runtime", id.data().as_ffi());
+        if runtime.lineage != original_lineage {
+            return Err(ScientificStateError::ExternalLineageMutation {
+                path: format!("{runtime_path}.lineage"),
+            });
+        }
+        if runtime.hybrid != original_hybrid && !ancestry_is_pending {
+            return Err(ScientificStateError::ExternalLineageMutation {
+                path: format!("{runtime_path}.hybrid"),
+            });
+        }
+        runtime.validate_at(&runtime_path)?;
         if !runtime.brain.is_bound()
             && runtime.brain.registry_key() == original_brain_key
             && runtime.brain.kind() == original_brain_kind.as_deref()
@@ -14987,7 +15630,47 @@ impl WorldState {
             runtime.brain = std::mem::take(&mut original_runtime.brain);
         }
         self.runtime.insert(id, runtime);
+        self.refresh_current_tick_origin_record(id);
         Ok(true)
+    }
+
+    /// Refresh a just-recorded non-birth arrival after its host finishes binding
+    /// or customizing it at the same completed tick boundary.
+    ///
+    /// Natural offspring are recorded only after their inherited brain is final,
+    /// and older rows are immutable scientific history. Restricting this repair
+    /// to a pending Seeded/Injected row at `self.tick` keeps both guarantees.
+    /// Admission removes that pending row, so later bindings and updates cannot
+    /// recreate or rewrite it. Parent fields are insertion-time ancestry facts
+    /// and are never refreshed.
+    fn refresh_current_tick_origin_record(&mut self, id: AgentId) {
+        let Some(identity) = self.identities.get(id).copied() else {
+            return;
+        };
+        let Some(data) = self.agents.snapshot(id) else {
+            return;
+        };
+        let Some(runtime) = self.runtime.get(id) else {
+            return;
+        };
+        let brain_kind = runtime.brain.kind().map(str::to_owned);
+        let brain_key = runtime.brain.registry_key();
+        let herbivore_tendency = clamp01(runtime.herbivore_tendency);
+        let is_hybrid = runtime.hybrid;
+
+        let Some(record) = self.pending_birth_records.iter_mut().rev().find(|record| {
+            record.agent_uid == identity.uid
+                && record.tick == self.tick
+                && record.origin != BirthOrigin::Born
+        }) else {
+            return;
+        };
+        record.brain_kind = brain_kind;
+        record.brain_key = brain_key;
+        record.herbivore_tendency = herbivore_tendency;
+        record.generation = data.generation;
+        record.position = data.position;
+        record.is_hybrid = is_hybrid;
     }
 
     /// Internal mutable borrow for trusted tick logic and in-module oracle setup.
@@ -15191,6 +15874,7 @@ impl WorldState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -15378,12 +16062,14 @@ mod tests {
     }
 
     fn invalid_config_message(error: WorldStateError) -> &'static str {
-        match error {
-            WorldStateError::InvalidConfig(message) => message,
-            WorldStateError::InvalidState(error) => {
-                panic!("expected configuration rejection, got state rejection: {error}")
-            }
-        }
+        assert!(
+            matches!(&error, WorldStateError::InvalidConfig(_)),
+            "expected configuration rejection, got {error}"
+        );
+        let WorldStateError::InvalidConfig(message) = error else {
+            return "unexpected non-configuration error";
+        };
+        message
     }
 
     fn sample_agent(seed: u32) -> AgentData {
@@ -15398,6 +16084,18 @@ mod tests {
             age: seed,
             generation: Generation(seed),
         }
+    }
+
+    #[test]
+    fn generation_next_rejects_counter_exhaustion_without_wrapping() {
+        assert_eq!(Generation(41).next(), Ok(Generation(42)));
+        assert_eq!(
+            Generation(u32::MAX).next(),
+            Err(ScientificStateError::GenerationOverflow {
+                path: "generation".to_owned(),
+                generation: u32::MAX,
+            })
+        );
     }
 
     #[test]
@@ -15446,8 +16144,18 @@ mod tests {
             let survivor = world.spawn_agent(sample_agent(1));
             world.remove_agent(removed).expect("remove first spawn");
             let replacement = world.spawn_agent(sample_agent(2));
-            let first_birth = world.insert_agent(sample_agent(3), AgentRuntime::default(), true);
-            let second_birth = world.insert_agent(sample_agent(4), AgentRuntime::default(), true);
+            let first_birth = world.insert_agent(
+                sample_agent(3),
+                AgentRuntime::default(),
+                Tick(1),
+                BirthOrigin::Born,
+            );
+            let second_birth = world.insert_agent(
+                sample_agent(4),
+                AgentRuntime::default(),
+                Tick(1),
+                BirthOrigin::Born,
+            );
             [survivor, replacement, first_birth, second_birth]
                 .map(|id| (id.raw(), world.agent_identity(id).expect("stable identity")))
         };
@@ -15472,14 +16180,671 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_arrival_gets_one_typed_origin_record_but_only_born_agents_get_birth_ordinals() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x0A11_0A11),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let seeded = world
+            .try_spawn_agent(sample_agent(1))
+            .expect("seeded founder");
+        let injected = world
+            .try_inject_agent(sample_agent(2))
+            .expect("manual injection");
+        let born = world.insert_agent(
+            sample_agent(3),
+            AgentRuntime::default(),
+            Tick(1),
+            BirthOrigin::Born,
+        );
+
+        assert_eq!(
+            world
+                .pending_birth_records
+                .iter()
+                .map(|record| record.origin)
+                .collect::<Vec<_>>(),
+            vec![
+                BirthOrigin::Seeded,
+                BirthOrigin::Injected,
+                BirthOrigin::Born,
+            ]
+        );
+        assert_eq!(world.pending_birth_records[0].birth_ordinal, None);
+        assert_eq!(world.pending_birth_records[1].birth_ordinal, None);
+        assert_eq!(world.pending_birth_records[2].birth_ordinal, Some(0));
+        assert_eq!(world.agent_identity(seeded).unwrap().birth_ordinal, None);
+        assert_eq!(world.agent_identity(injected).unwrap().birth_ordinal, None);
+        assert_eq!(world.agent_identity(born).unwrap().birth_ordinal, Some(0));
+        assert_eq!(world.pending_lifecycle_birth_metrics.len(), 1);
+        assert_eq!(
+            world.pending_lifecycle_birth_metrics[0].origin,
+            BirthOrigin::Born
+        );
+        assert_eq!(world.identity_sequence_state(), (4, 3, 1));
+
+        assert_eq!(BirthOrigin::Born.as_str(), "born");
+        assert_eq!(BirthOrigin::Seeded.as_str(), "seeded");
+        assert_eq!(BirthOrigin::Injected.as_str(), "injected");
+        assert_ne!(
+            BirthOrigin::Born.digest_tag(),
+            BirthOrigin::Seeded.digest_tag()
+        );
+        assert_ne!(
+            BirthOrigin::Seeded.digest_tag(),
+            BirthOrigin::Injected.digest_tag()
+        );
+        assert_eq!(
+            serde_json::to_string(&BirthOrigin::Injected).expect("serialize origin"),
+            "\"injected\""
+        );
+    }
+
+    #[test]
+    fn seeded_arrivals_are_tick_zero_only_and_post_start_injections_remain_typed() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(0x5EED_0A11),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        world.step().expect("advance beyond bootstrap");
+
+        let callback_calls = Cell::new(0usize);
+        let rng_before = world.random_stream_state();
+        let identity_before = world.identity_sequence_state();
+        let records_before = world.pending_birth_records.clone();
+        let digest_before = world
+            .characterization_digest_v0()
+            .expect("pre-rejection digest");
+        let error = world
+            .try_spawn_agent_with(sample_agent(7), |_| {
+                callback_calls.set(callback_calls.get() + 1);
+            })
+            .expect_err("post-start arrival must not be labeled as a seeded founder");
+        assert_eq!(
+            error,
+            ScientificStateError::SeededArrivalAfterBootstrap {
+                path: "agent.origin".to_owned(),
+                tick: 1,
+            }
+        );
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.agent_count(), 0);
+        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
+        assert_eq!(world.pending_birth_records, records_before);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-rejection digest"),
+            digest_before
+        );
+
+        let injected = world
+            .try_inject_agent(sample_agent(8))
+            .expect("post-start injection");
+        assert_eq!(world.agent_identity(injected).unwrap().birth_ordinal, None);
+        let record = world
+            .pending_birth_records
+            .last()
+            .expect("injected origin record");
+        assert_eq!(record.tick, Tick(1));
+        assert_eq!(record.origin, BirthOrigin::Injected);
+    }
+
+    #[test]
+    fn trusted_crossover_resolves_exact_parents_and_owns_scientific_lineage_fields() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xC205_50A4),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let parent_a = world.spawn_agent(sample_agent(2));
+        let parent_b = world.spawn_agent(sample_agent(5));
+        let parent_a_uid = world.agent_uid(parent_a).expect("first parent uid");
+        let parent_b_uid = world.agent_uid(parent_b).expect("second parent uid");
+        world.advance_tick();
+        let records_before = world.pending_birth_records.len();
+        let callback_calls = Cell::new(0usize);
+        let child = AgentData {
+            generation: Generation(999),
+            ..AgentData::default()
+        };
+
+        let child_id = world
+            .try_inject_crossover_agent_with(parent_a, parent_b, child, |child, runtime| {
+                callback_calls.set(callback_calls.get() + 1);
+                child.position = Position::new(17.0, 23.0);
+                child.generation = Generation(1_000);
+                runtime.herbivore_tendency = 0.75;
+                runtime.lineage = [Some(AgentUid(9_001)), Some(AgentUid(9_002))];
+                runtime.hybrid = false;
+            })
+            .expect("trusted crossover insertion")
+            .expect("both parents are live and distinct");
+
+        assert_eq!(callback_calls.get(), 1);
+        let child = world.snapshot_agent(child_id).expect("crossover child");
+        assert_eq!(child.data.position, Position::new(17.0, 23.0));
+        assert_eq!(child.data.generation, Generation(6));
+        assert_eq!(
+            child.runtime.lineage,
+            [Some(parent_a_uid), Some(parent_b_uid)]
+        );
+        assert!(child.runtime.hybrid);
+        assert!((child.runtime.herbivore_tendency - 0.75).abs() < f32::EPSILON);
+        assert_eq!(child.identity.birth_ordinal, None);
+
+        assert_eq!(world.pending_birth_records.len(), records_before + 1);
+        let record = world
+            .pending_birth_records
+            .last()
+            .cloned()
+            .expect("origin record");
+        assert_eq!(record.tick, Tick(1));
+        assert_eq!(record.agent_uid, child.identity.uid);
+        assert_eq!(record.origin, BirthOrigin::Injected);
+        assert_eq!(record.birth_ordinal, None);
+        assert_eq!(record.parent_a, Some(parent_a_uid));
+        assert_eq!(record.parent_b, Some(parent_b_uid));
+        assert_eq!(record.generation, Generation(6));
+        assert!(record.is_hybrid);
+        assert_eq!(world.last_births, 0);
+        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.identity_sequence_state(), (4, 3, 0));
+
+        let state_before_rewrites = world.snapshot_agent(child_id).expect("crossover child");
+        let rng_before_rewrites = world.random_stream_state();
+        let digest_before_rewrites = world
+            .characterization_digest_v0()
+            .expect("pre-rewrite digest");
+        assert_eq!(
+            world.try_update_agent(child_id, |data, runtime| {
+                data.position = Position::new(90.0, 91.0);
+                data.generation = Generation(77);
+                runtime.energy = 0.1;
+            }),
+            Err(ScientificStateError::ExternalLineageMutation {
+                path: format!("agents[{}].generation", child_id.raw()),
+            })
+        );
+        assert_eq!(
+            world.try_update_agent_runtime(child_id, |runtime| {
+                runtime.energy = 0.2;
+                runtime.hybrid = false;
+            }),
+            Err(ScientificStateError::ExternalLineageMutation {
+                path: format!("agents[{}].runtime.hybrid", child_id.raw()),
+            })
+        );
+        let state_after_rewrites = world.snapshot_agent(child_id).expect("unchanged child");
+        assert_eq!(state_after_rewrites.data, state_before_rewrites.data);
+        assert_eq!(
+            state_after_rewrites.runtime.lineage,
+            state_before_rewrites.runtime.lineage
+        );
+        assert_eq!(
+            state_after_rewrites.runtime.hybrid,
+            state_before_rewrites.runtime.hybrid
+        );
+        assert!(
+            (state_after_rewrites.runtime.energy - state_before_rewrites.runtime.energy).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(world.pending_birth_records.last(), Some(&record));
+        assert_eq!(world.random_stream_state(), rng_before_rewrites);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-rewrite digest"),
+            digest_before_rewrites
+        );
+    }
+
+    #[test]
+    fn trusted_crossover_rejects_generation_exhaustion_before_rng_or_callback() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.0,
+            rng_seed: Some(0xC205_FFFF),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut exhausted_parent = sample_agent(2);
+        exhausted_parent.generation = Generation(u32::MAX);
+        let parent_a = world
+            .try_spawn_agent(exhausted_parent)
+            .expect("max-generation parent is valid until lineage advancement");
+        let parent_b = world
+            .try_spawn_agent(sample_agent(5))
+            .expect("second parent");
+        world.advance_tick();
+
+        let rng_before = world.random_stream_state();
+        let identity_before = world.identity_sequence_state();
+        let records_before = world.pending_birth_records.clone();
+        let digest_before = world
+            .characterization_digest_v0()
+            .expect("pre-overflow digest");
+        let callback_calls = Cell::new(0usize);
+
+        assert_eq!(
+            world.try_inject_crossover_agent_with(
+                parent_a,
+                parent_b,
+                AgentData::default(),
+                |_, _| callback_calls.set(callback_calls.get() + 1),
+            ),
+            Err(ScientificStateError::GenerationOverflow {
+                path: "agent.generation".to_owned(),
+                generation: u32::MAX,
+            })
+        );
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.agent_count(), 2);
+        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
+        assert_eq!(world.pending_birth_records, records_before);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-overflow digest"),
+            digest_before
+        );
+    }
+
+    #[test]
+    fn natural_reproduction_rejects_generation_exhaustion_before_tick_or_rng_mutation() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.2,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
+            persistence_interval: 0,
+            rng_seed: Some(0xA5E1_FFFF),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut exhausted_parent = sample_agent(2);
+        exhausted_parent.generation = Generation(u32::MAX);
+        let parent = world
+            .try_spawn_agent(exhausted_parent)
+            .expect("max-generation parent");
+        world
+            .try_update_agent_runtime(parent, |runtime| {
+                runtime.energy = 2.0;
+                runtime.reproduction_counter = 1.0;
+            })
+            .expect("make parent reproduction-eligible");
+
+        let tick_before = world.tick();
+        let rng_before = world.random_stream_state();
+        let identity_before = world.identity_sequence_state();
+        let records_before = world.pending_birth_records.clone();
+        let digest_before = world
+            .characterization_digest_v0()
+            .expect("pre-overflow digest");
+        let error = world
+            .step()
+            .expect_err("max-generation natural reproduction must be rejected");
+        assert!(
+            matches!(&error, WorldStepError::ScientificState(_)),
+            "expected typed scientific-state rejection, got {error:?}"
+        );
+        let WorldStepError::ScientificState(error) = error else {
+            return;
+        };
+        assert_eq!(
+            error,
+            ScientificStateError::GenerationOverflow {
+                path: "agents[0].generation".to_owned(),
+                generation: u32::MAX,
+            }
+        );
+        assert_eq!(world.tick(), tick_before);
+        assert_eq!(world.agent_count(), 1);
+        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
+        assert_eq!(world.pending_birth_records, records_before);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-overflow digest"),
+            digest_before
+        );
+    }
+
+    #[test]
+    fn scheduled_crossover_rejects_generation_exhaustion_before_tick_or_rng_mutation() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 1,
+            population_spawn_count: 1,
+            population_crossover_chance: 1.0,
+            reproduction_energy_threshold: 0.0,
+            persistence_interval: 0,
+            rng_seed: Some(0x5CED_FFFF),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let brain_key = world
+            .brain_registry_mut()
+            .expect("scheduled crossover registry mutation")
+            .register("test.generation-boundary", |_rng| Ok(Box::new(StubBrain)));
+        let mut exhausted_parent = sample_agent(2);
+        exhausted_parent.generation = Generation(u32::MAX);
+        let parent_a = world
+            .try_spawn_agent(exhausted_parent)
+            .expect("max-generation parent");
+        let parent_b = world
+            .try_spawn_agent(sample_agent(5))
+            .expect("second parent");
+        assert!(
+            world
+                .bind_agent_brain(parent_a, brain_key)
+                .expect("bind first parent")
+        );
+        assert!(
+            world
+                .bind_agent_brain(parent_b, brain_key)
+                .expect("bind second parent")
+        );
+
+        let tick_before = world.tick();
+        let rng_before = world.random_stream_state();
+        let identity_before = world.identity_sequence_state();
+        let records_before = world.pending_birth_records.clone();
+        let digest_before = world
+            .characterization_digest_v0()
+            .expect("pre-overflow digest");
+        let error = world
+            .step()
+            .expect_err("max-generation scheduled crossover must be rejected");
+        assert!(
+            matches!(&error, WorldStepError::ScientificState(_)),
+            "expected typed scientific-state rejection, got {error:?}"
+        );
+        let WorldStepError::ScientificState(error) = error else {
+            return;
+        };
+        assert_eq!(
+            error,
+            ScientificStateError::GenerationOverflow {
+                path: "agents[0].generation".to_owned(),
+                generation: u32::MAX,
+            }
+        );
+        assert_eq!(world.tick(), tick_before);
+        assert_eq!(world.agent_count(), 2);
+        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
+        assert_eq!(world.pending_birth_records, records_before);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-overflow digest"),
+            digest_before
+        );
+    }
+
+    #[test]
+    fn trusted_crossover_rejects_same_or_missing_handles_without_state_drift() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xC205_50A5),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let live = world.spawn_agent(sample_agent(2));
+        let missing = world.spawn_agent(sample_agent(5));
+        let callback_calls = Cell::new(0usize);
+
+        let same_tick_rng = world.random_stream_state();
+        let same_tick_identity = world.identity_sequence_state();
+        let same_tick_records = world.pending_birth_records.clone();
+        let same_tick = world
+            .try_inject_crossover_agent_with(live, missing, AgentData::default(), |_, _| {
+                callback_calls.set(callback_calls.get() + 1);
+            })
+            .expect("same-boundary parent rejection is typed");
+        assert_eq!(same_tick, None);
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.random_stream_state(), same_tick_rng);
+        assert_eq!(world.identity_sequence_state(), same_tick_identity);
+        assert_eq!(world.pending_birth_records, same_tick_records);
+
+        world.remove_agent(missing).expect("remove second parent");
+
+        let rng_before = world.random_stream_state();
+        let identity_before = world.identity_sequence_state();
+        let records_before = world.pending_birth_records.clone();
+        let agent_count_before = world.agent_count();
+
+        let same = world
+            .try_inject_crossover_agent_with(live, live, AgentData::default(), |_, _| {
+                callback_calls.set(callback_calls.get() + 1);
+            })
+            .expect("same-parent rejection is typed");
+        let stale = world
+            .try_inject_crossover_agent_with(live, missing, AgentData::default(), |_, _| {
+                callback_calls.set(callback_calls.get() + 1);
+            })
+            .expect("missing-parent rejection is typed");
+
+        assert_eq!(same, None);
+        assert_eq!(stale, None);
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
+        assert_eq!(world.pending_birth_records, records_before);
+        assert_eq!(world.agent_count(), agent_count_before);
+        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.last_births, 0);
+    }
+
+    #[test]
+    fn external_origin_lineage_is_rejected_without_rng_allocator_or_record_drift() {
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x011A_EA6E),
+            ..ScriptBotsConfig::default()
+        };
+        let mut rejected = WorldState::new(config.clone()).expect("rejected world");
+        let mut reference = WorldState::new(config).expect("reference world");
+        let before_rng = rejected.random_stream_state();
+        let before_identity = rejected.identity_sequence_state();
+        let before_digest = rejected
+            .characterization_digest_v0()
+            .expect("pre-rejection digest");
+
+        for injected in [false, true] {
+            let result = if injected {
+                rejected.try_inject_agent_with(sample_agent(1), |runtime| {
+                    runtime.lineage = [Some(AgentUid(999)), None];
+                })
+            } else {
+                rejected.try_spawn_agent_with(sample_agent(1), |runtime| {
+                    runtime.lineage = [Some(AgentUid(999)), None];
+                })
+            };
+            assert_eq!(
+                result,
+                Err(ScientificStateError::ExternalLineageMutation {
+                    path: "agent.runtime.lineage".to_owned(),
+                })
+            );
+            assert_eq!(rejected.agent_count(), 0);
+            assert!(rejected.pending_birth_records.is_empty());
+            assert_eq!(rejected.random_stream_state(), before_rng);
+            assert_eq!(rejected.identity_sequence_state(), before_identity);
+            assert_eq!(
+                rejected
+                    .characterization_digest_v0()
+                    .expect("unchanged digest"),
+                before_digest
+            );
+        }
+
+        let actual = rejected
+            .try_inject_agent(sample_agent(2))
+            .expect("valid follow-up injection");
+        let expected = reference
+            .try_inject_agent(sample_agent(2))
+            .expect("reference injection");
+        assert_eq!(actual, expected);
+        assert_eq!(
+            rejected.random_stream_state(),
+            reference.random_stream_state()
+        );
+        assert_eq!(
+            rejected.identity_sequence_state(),
+            reference.identity_sequence_state()
+        );
+        assert_eq!(
+            rejected.pending_birth_records,
+            reference.pending_birth_records
+        );
+    }
+
+    #[test]
+    fn same_tick_seed_metadata_tracks_successful_host_customization_only() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x5EED_DA7A),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let key = world
+            .brain_registry_mut()
+            .expect("seed metadata registry mutation")
+            .register("test.seed-metadata", |_rng| Ok(Box::new(StubBrain)));
+        let id = world
+            .try_spawn_agent(sample_agent(1))
+            .expect("seeded founder");
+
+        assert!(world.pending_birth_records[0].brain_key.is_none());
+        assert!(world.bind_agent_brain(id, key).expect("bind founder"));
+        assert_eq!(world.pending_birth_records[0].brain_key, Some(key));
+        assert_eq!(
+            world.pending_birth_records[0].brain_kind.as_deref(),
+            Some("test.seed-metadata")
+        );
+
+        world
+            .try_update_agent(id, |data, runtime| {
+                data.position = Position::new(17.0, 19.0);
+                data.generation = Generation(4);
+                runtime.herbivore_tendency = 0.25;
+                runtime.hybrid = true;
+            })
+            .expect("same-tick scalar/runtime update");
+        assert!(world.pending_birth_records[0].is_hybrid);
+        world
+            .try_update_agent_runtime(id, |runtime| {
+                runtime.herbivore_tendency = 0.75;
+                runtime.hybrid = false;
+            })
+            .expect("same-tick runtime update");
+        let record = &world.pending_birth_records[0];
+        assert_eq!(record.position, Position::new(17.0, 19.0));
+        assert_eq!(record.generation, Generation(4));
+        assert!((record.herbivore_tendency - 0.75).abs() < f32::EPSILON);
+        assert!(!record.is_hybrid);
+        assert_eq!([record.parent_a, record.parent_b], [None, None]);
+
+        let error = world
+            .try_update_agent(id, |data, runtime| {
+                data.position = Position::new(90.0, 91.0);
+                runtime.lineage = [Some(AgentUid(41)), None];
+            })
+            .expect_err("combined update must reject lineage mutation atomically");
+        assert_eq!(
+            error,
+            ScientificStateError::ExternalLineageMutation {
+                path: format!("agents[{}].runtime.lineage", id.raw()),
+            }
+        );
+        assert_eq!(
+            world
+                .snapshot_agent(id)
+                .expect("unchanged agent")
+                .data
+                .position,
+            Position::new(17.0, 19.0)
+        );
+        assert_eq!(world.agent_runtime(id).unwrap().lineage, [None, None]);
+
+        let error = world
+            .try_update_agent_runtime(id, |runtime| {
+                runtime.herbivore_tendency = 0.1;
+                runtime.lineage = [None, Some(AgentUid(42))];
+            })
+            .expect_err("runtime update must reject lineage mutation atomically");
+        assert_eq!(
+            error,
+            ScientificStateError::ExternalLineageMutation {
+                path: format!("agents[{}].runtime.lineage", id.raw()),
+            }
+        );
+        assert!((world.agent_runtime(id).unwrap().herbivore_tendency - 0.75).abs() < f32::EPSILON);
+
+        world.agent_runtime_mut(id).unwrap().lineage = [Some(AgentUid(123)), None];
+        assert!(
+            world
+                .bind_agent_brain(id, key)
+                .expect("same-tick metadata refresh")
+        );
+        assert_eq!(
+            [
+                world.pending_birth_records[0].parent_a,
+                world.pending_birth_records[0].parent_b,
+            ],
+            [None, None],
+            "metadata refresh must never rewrite insertion-time ancestry"
+        );
+        world.agent_runtime_mut(id).unwrap().lineage = [None, None];
+
+        world.advance_tick();
+        world
+            .try_update_agent_runtime(id, |runtime| {
+                runtime.herbivore_tendency = 0.9;
+            })
+            .expect("later runtime update");
+        assert!(
+            (world.pending_birth_records[0].herbivore_tendency - 0.75).abs() < f32::EPSILON,
+            "a later tick must not rewrite immutable origin history"
+        );
+    }
+
     fn assert_non_finite_path(error: ScientificStateError, expected_path: &str) {
         assert_eq!(error.path(), expected_path);
         assert!(matches!(error, ScientificStateError::NonFinite { .. }));
     }
 
     fn assert_dimension_overflow(error: WorldStateError, expected_path: &str) {
+        assert!(
+            matches!(&error, WorldStateError::InvalidState(_)),
+            "expected typed scientific-state rejection, got {error}"
+        );
         let WorldStateError::InvalidState(error) = error else {
-            panic!("expected typed scientific-state rejection");
+            return;
         };
         assert_eq!(error.path(), expected_path);
         assert!(matches!(
@@ -15661,8 +17026,12 @@ mod tests {
         assert_eq!(error.path(), "food.cells");
         assert_eq!(food.cells(), before);
         let error = FoodGrid::new(1, 1, f32::NAN).expect_err("invalid single cell");
+        assert!(
+            matches!(&error, WorldStateError::InvalidState(_)),
+            "expected typed state error, got {error}"
+        );
         let WorldStateError::InvalidState(error) = error else {
-            panic!("expected typed state error");
+            return;
         };
         assert_non_finite_path(error, "food.initial");
     }
@@ -16764,6 +18133,7 @@ mod tests {
         let mut world = WorldState::new(config).expect("world");
         let key = world
             .brain_registry_mut()
+            .expect("heritable registry mutation")
             .register("heritable", |_rng| Ok(Box::new(HeritableBrain::new(0.5))));
 
         let parent = world.spawn_agent(sample_agent(0));
@@ -16908,6 +18278,7 @@ mod tests {
         let id = world.spawn_agent(sample_agent(0));
         let key = world
             .brain_registry_mut()
+            .expect("stub registry mutation")
             .register("stub", |_rng| Ok(Box::new(StubBrain)));
         assert!(world.bind_agent_brain(id, key).expect("stub brain factory"));
 
@@ -17790,6 +19161,7 @@ mod tests {
         .expect("world");
         let key = world
             .brain_registry_mut()
+            .expect("activation registry mutation")
             .register("chatty", |_rng| Ok(Box::new(ChattyBrain)));
 
         let mut ids = Vec::new();
@@ -17844,6 +19216,7 @@ mod tests {
         let mut bind_world = WorldState::new(ScriptBotsConfig::default()).expect("bind world");
         let bind_key = bind_world
             .brain_registry_mut()
+            .expect("fallible registry mutation")
             .register("test.fallible", |rng| {
                 let _ = rng.next_u64();
                 Err(BrainSpawnError::new(
@@ -17858,6 +19231,13 @@ mod tests {
         let bind_error = bind_world
             .bind_agent_brain(agent, bind_key)
             .expect_err("binding must preserve the factory error");
+        assert!(
+            matches!(&bind_error, WorldStateError::BrainSpawn(_)),
+            "expected brain factory error, got {bind_error}"
+        );
+        let WorldStateError::BrainSpawn(bind_error) = bind_error else {
+            return;
+        };
         assert_eq!(bind_error.kind(), "test.fallible");
         assert!(
             std::error::Error::source(&bind_error)
@@ -17885,6 +19265,7 @@ mod tests {
         let mut step_world = WorldState::new(config).expect("step world");
         let stable_key = step_world
             .brain_registry_mut()
+            .expect("stable registry mutation")
             .register("test.stable", |_rng| Ok(Box::new(StubBrain)));
         let existing_agent = step_world.spawn_agent(sample_agent(1));
         assert_eq!(existing_agent, reference_existing);
@@ -17893,11 +19274,17 @@ mod tests {
                 .bind_agent_brain(existing_agent, stable_key)
                 .expect("stable brain factory")
         );
-        assert!(step_world.brain_registry_mut().unregister(stable_key));
+        assert!(
+            step_world
+                .brain_registry_mut()
+                .expect("stable registry removal")
+                .unregister(stable_key)
+        );
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let factory_attempts = std::sync::Arc::clone(&attempts);
         step_world
             .brain_registry_mut()
+            .expect("fallible step registry mutation")
             .register("test.fallible", move |_rng| {
                 if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     Ok(Box::new(StubBrain))
@@ -18000,6 +19387,7 @@ mod tests {
         }
         world
             .brain_registry_mut()
+            .expect("population failure registry mutation")
             .register("test.population-failure", |_rng| {
                 Err(BrainSpawnError::new(
                     "test.population-failure",
@@ -18120,10 +19508,13 @@ mod tests {
                 FailureMode::Snapshot => "test.snapshot-failure",
                 FailureMode::Mutation => "test.mutation-failure",
             };
-            let key = world.brain_registry_mut().register(kind, move |_rng| {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(Box::new(FailingHeritageRunner { mode }))
-            });
+            let key = world
+                .brain_registry_mut()
+                .expect("heritage registry mutation")
+                .register(kind, move |_rng| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Box::new(FailingHeritageRunner { mode }))
+                });
             let parent = world.spawn_agent(sample_agent(0));
             assert!(
                 world
@@ -18200,6 +19591,7 @@ mod tests {
             let registry_key = stale_registry_key.then(|| {
                 world
                     .brain_registry_mut()
+                    .expect("non-heritable registry mutation")
                     .register("test.non-heritable", |_rng| {
                         Ok(Box::new(NonHeritableRunner))
                     })
@@ -18218,7 +19610,12 @@ mod tests {
                 }
             }
             if let Some(key) = registry_key {
-                assert!(world.brain_registry_mut().unregister(key));
+                assert!(
+                    world
+                        .brain_registry_mut()
+                        .expect("non-heritable registry removal")
+                        .unregister(key)
+                );
             }
 
             let error = world
@@ -18239,10 +19636,13 @@ mod tests {
     fn fallible_random_spawn_preserves_the_seeded_rng_order() {
         fn register_rng_consuming_brains(world: &mut WorldState) {
             for kind in ["test.rng-a", "test.rng-b"] {
-                world.brain_registry_mut().register(kind, move |rng| {
-                    let _ = rng.next_u64();
-                    Ok(Box::new(StubBrain))
-                });
+                world
+                    .brain_registry_mut()
+                    .expect("RNG-consuming registry mutation")
+                    .register(kind, move |rng| {
+                        let _ = rng.next_u64();
+                        Ok(Box::new(StubBrain))
+                    });
             }
         }
 
@@ -18258,7 +19658,7 @@ mod tests {
         register_rng_consuming_brains(&mut reference_world);
 
         fallible_world
-            .spawn_random_agent()
+            .spawn_random_agent(Tick(1))
             .expect("fallible random spawn");
 
         let width = reference_world.config.world_width as f32;
@@ -19276,6 +20676,1067 @@ mod tests {
         }
     }
 
+    fn sealed_agent_boundary(tick: u64) -> ScientificStateError {
+        ScientificStateError::PersistenceBoundarySealed {
+            path: "agent".to_owned(),
+            tick,
+        }
+    }
+
+    fn unresolved_agent_boundary(tick: u64) -> ScientificStateError {
+        ScientificStateError::PersistenceBoundaryUnresolved {
+            path: "agent".to_owned(),
+            tick,
+        }
+    }
+
+    #[test]
+    fn tick_zero_seed_finalizes_exactly_once() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x71C0_5EED),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let seeded = world
+            .try_spawn_agent(sample_agent(2))
+            .expect("tick-zero seed");
+        let seeded_uid = world.agent_uid(seeded).expect("seeded uid");
+
+        assert!(world.finalize_persistence().expect("first finalization"));
+        assert!(
+            !world
+                .finalize_persistence()
+                .expect("idempotent second finalization")
+        );
+
+        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.last_admitted_persistence_tick, Some(Tick::zero()));
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let batch = &entries[0];
+        assert_eq!(batch.summary.tick, Tick::zero());
+        assert_eq!(batch.summary.births, 0);
+        assert_eq!(batch.agents.len(), 1);
+        assert_eq!(batch.births.len(), 1);
+        assert_eq!(batch.births[0].tick, Tick::zero());
+        assert_eq!(batch.births[0].agent_uid, seeded_uid);
+        assert_eq!(batch.births[0].origin, BirthOrigin::Seeded);
+    }
+
+    #[test]
+    fn empty_tick_zero_remains_unfinalized() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xE0_71C0),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+
+        assert!(!world.finalize_persistence().expect("empty finalization"));
+        assert!(
+            !world
+                .finalize_persistence()
+                .expect("repeated empty finalization")
+        );
+        assert_eq!(world.validate_external_arrival_boundary(), Ok(()));
+        assert_eq!(world.last_admitted_persistence_tick, None);
+        assert!(logs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sealed_tick_zero_rejects_every_public_ingress_before_callback_or_mutation() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x5EA1_ED00),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        world
+            .try_spawn_agent(sample_agent(1))
+            .expect("initial tick-zero seed");
+        assert!(world.finalize_persistence().expect("tick-zero admission"));
+
+        // The admitted marker is historical: temporarily disabling persistence
+        // must not reopen this already-admitted tick to a second origin row.
+        let mut disabled = world.config().clone();
+        disabled.persistence_interval = 0;
+        world
+            .apply_config_update(disabled)
+            .expect("disable persistence after admission");
+
+        let expected = sealed_agent_boundary(0);
+        assert_eq!(
+            world.validate_external_arrival_boundary(),
+            Err(expected.clone())
+        );
+        let before_rng = world.random_stream_state();
+        let before_identity = world.identity_sequence_state();
+        let before_agent_count = world.agent_count();
+        let before_births = world.pending_birth_records.clone();
+        let before_lifecycle_births = world.pending_lifecycle_birth_metrics.clone();
+        let before_deaths = world.pending_death_records.clone();
+        let before_replay = world.replay_events.clone();
+        let before_digest = world
+            .characterization_digest_v0()
+            .expect("pre-rejection digest");
+        let before_log_count = logs.lock().unwrap().len();
+        let callback_calls = Cell::new(0usize);
+
+        let invalid_seed = AgentData {
+            position: Position::new(f32::NAN, 0.0),
+            ..sample_agent(2)
+        };
+        assert_eq!(
+            world.try_spawn_agent_with(invalid_seed, |_| {
+                callback_calls.set(callback_calls.get() + 1);
+            }),
+            Err(expected.clone())
+        );
+        let invalid_injection = AgentData {
+            position: Position::new(f32::NAN, 0.0),
+            ..sample_agent(3)
+        };
+        assert_eq!(
+            world.try_inject_agent_with(invalid_injection, |_| {
+                callback_calls.set(callback_calls.get() + 1);
+            }),
+            Err(expected.clone())
+        );
+
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.random_stream_state(), before_rng);
+        assert_eq!(world.identity_sequence_state(), before_identity);
+        assert_eq!(world.agent_count(), before_agent_count);
+        assert_eq!(world.pending_birth_records, before_births);
+        assert_eq!(
+            world.pending_lifecycle_birth_metrics,
+            before_lifecycle_births
+        );
+        assert_eq!(world.pending_death_records, before_deaths);
+        assert_eq!(world.replay_events, before_replay);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-rejection digest"),
+            before_digest
+        );
+        assert_eq!(logs.lock().unwrap().len(), before_log_count);
+
+        let mut reenabled = world.config().clone();
+        reenabled.persistence_interval = 1;
+        world
+            .apply_config_update(reenabled)
+            .expect("re-enable persistence after admitted marker");
+        assert!(
+            !world
+                .finalize_persistence()
+                .expect("historical admission remains final")
+        );
+        assert_eq!(
+            world.validate_external_arrival_boundary(),
+            Err(expected.clone())
+        );
+        let reenabled_rng = world.random_stream_state();
+        let reenabled_identity = world.identity_sequence_state();
+        assert_eq!(
+            world.try_inject_agent_with(sample_agent(4), |_| {
+                callback_calls.set(callback_calls.get() + 1);
+            }),
+            Err(expected)
+        );
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.random_stream_state(), reenabled_rng);
+        assert_eq!(world.identity_sequence_state(), reenabled_identity);
+        assert_eq!(logs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cadence_admitted_boundary_rejects_external_arrival_without_mutation() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xCAD3_ACE0),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        world.step().expect("tick-one cadence admission");
+
+        let expected = sealed_agent_boundary(1);
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(world.last_admitted_persistence_tick, Some(Tick(1)));
+        assert_eq!(
+            world.validate_external_arrival_boundary(),
+            Err(expected.clone())
+        );
+        let before_rng = world.random_stream_state();
+        let before_identity = world.identity_sequence_state();
+        let before_history = world.history().cloned().collect::<Vec<_>>();
+        let before_digest = world
+            .characterization_digest_v0()
+            .expect("pre-rejection digest");
+        let callback_calls = Cell::new(0usize);
+
+        assert_eq!(
+            world.try_inject_agent_with(sample_agent(4), |_| {
+                callback_calls.set(callback_calls.get() + 1);
+            }),
+            Err(expected)
+        );
+
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.random_stream_state(), before_rng);
+        assert_eq!(world.identity_sequence_state(), before_identity);
+        assert_eq!(world.agent_count(), 0);
+        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.history().cloned().collect::<Vec<_>>(), before_history);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-rejection digest"),
+            before_digest
+        );
+        assert_eq!(logs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unresolved_persistence_rejects_external_arrival_even_after_interval_is_disabled() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xFA17_0B0E),
+            ..ScriptBotsConfig::default()
+        };
+        let rejected_logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence = RejectOncePersistence {
+            logs: Arc::clone(&rejected_logs),
+            reject_next: true,
+        };
+        let mut world = WorldState::with_persistence(config, Box::new(persistence)).expect("world");
+        assert!(matches!(world.step(), Err(WorldStepError::Persistence(_))));
+        assert!(world.has_pending_persistence_batch());
+        assert!(world.persistence_fault().is_some());
+
+        let config_before = world.config().clone();
+        let revision_before = world.config_revision();
+        let audit_before = world.config_audit().to_vec();
+        let food_before = world.food().cells().to_vec();
+        let rng_before_bundled_update = world.random_stream_state();
+        let digest_before_bundled_update = world
+            .characterization_digest_v0()
+            .expect("pre-config-rejection digest");
+        let retained_summary_before = world
+            .pending_persistence_batch
+            .as_ref()
+            .expect("retained batch")
+            .summary
+            .clone();
+        let mut bundled = config_before.clone();
+        bundled.persistence_interval = 0;
+        bundled.closed = !bundled.closed;
+        bundled.food_max = 0.0;
+        let bundled_error = world
+            .apply_config_update(bundled)
+            .expect_err("bundled mutation must be rejected");
+        assert!(
+            matches!(&bundled_error, WorldStateError::InvalidState(_)),
+            "expected scientific-state rejection, got {bundled_error}"
+        );
+        let WorldStateError::InvalidState(bundled_error) = bundled_error else {
+            return;
+        };
+        assert_eq!(
+            bundled_error,
+            ScientificStateError::PersistenceBoundaryUnresolved {
+                path: "config".to_owned(),
+                tick: 1,
+            }
+        );
+        assert_eq!(world.config(), &config_before);
+        assert_eq!(world.config_revision(), revision_before);
+        assert_eq!(world.config_audit(), audit_before.as_slice());
+        assert_eq!(world.food().cells(), food_before.as_slice());
+        assert_eq!(world.random_stream_state(), rng_before_bundled_update);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-config-rejection digest"),
+            digest_before_bundled_update
+        );
+        assert_eq!(
+            world
+                .pending_persistence_batch
+                .as_ref()
+                .expect("unchanged retained batch")
+                .summary,
+            retained_summary_before
+        );
+
+        let mut disabled = world.config().clone();
+        disabled.persistence_interval = 0;
+        world
+            .apply_config_update(disabled)
+            .expect("disable persistence with unresolved admission");
+
+        let expected = unresolved_agent_boundary(1);
+        assert!(
+            expected
+                .to_string()
+                .contains("retry the exact retained persistence batch"),
+            "the unresolved-boundary diagnostic must tell the caller how to recover"
+        );
+        assert_eq!(
+            world.validate_external_arrival_boundary(),
+            Err(expected.clone())
+        );
+        let before_rng = world.random_stream_state();
+        let before_identity = world.identity_sequence_state();
+        let before_digest = world
+            .characterization_digest_v0()
+            .expect("pre-rejection digest");
+        let fault_before = world.persistence_fault().cloned().expect("latched fault");
+        let retained_before = world
+            .pending_persistence_batch
+            .as_ref()
+            .expect("retained batch")
+            .clone();
+        let callback_calls = Cell::new(0usize);
+
+        assert_eq!(
+            world.try_spawn_agent_with(sample_agent(5), |_| {
+                callback_calls.set(callback_calls.get() + 1);
+            }),
+            Err(expected)
+        );
+
+        assert_eq!(callback_calls.get(), 0);
+        assert_eq!(world.random_stream_state(), before_rng);
+        assert_eq!(world.identity_sequence_state(), before_identity);
+        assert_eq!(world.agent_count(), 0);
+        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.persistence_fault(), Some(&fault_before));
+        let retained_after = world
+            .pending_persistence_batch
+            .as_ref()
+            .expect("unchanged retained batch");
+        assert_eq!(retained_after.summary, retained_before.summary);
+        assert_eq!(retained_after.epoch, retained_before.epoch);
+        assert_eq!(retained_after.closed, retained_before.closed);
+        assert_eq!(retained_after.metrics, retained_before.metrics);
+        assert_eq!(retained_after.events, retained_before.events);
+        assert_eq!(retained_after.births, retained_before.births);
+        assert_eq!(retained_after.deaths, retained_before.deaths);
+        assert_eq!(retained_after.replay_events, retained_before.replay_events);
+        assert!(retained_after.agents.is_empty());
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-rejection digest"),
+            before_digest
+        );
+        assert_eq!(rejected_logs.lock().unwrap().len(), 1);
+
+        // Defensive precedence: even if an admitted marker coexists with the
+        // retained failure state, callers must be sent to the retry path rather
+        // than being told merely to advance past a successfully sealed tick.
+        world.last_admitted_persistence_tick = Some(world.tick());
+        assert_eq!(
+            world.validate_external_arrival_boundary(),
+            Err(unresolved_agent_boundary(1))
+        );
+        assert!(
+            world
+                .retry_pending_persistence()
+                .expect("the retained exact batch remains retryable while disabled")
+        );
+        assert_eq!(world.config().persistence_interval, 0);
+        assert!(world.persistence_fault().is_none());
+        assert!(!world.has_pending_persistence_batch());
+        assert_eq!(rejected_logs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unresolved_persistence_guards_every_public_scientific_mutation_door_atomically() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.0,
+            rng_seed: Some(0xB0A1_DA4D),
+            ..ScriptBotsConfig::default()
+        };
+        let rejected_logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence = RejectOncePersistence {
+            logs: Arc::clone(&rejected_logs),
+            reject_next: true,
+        };
+        let mut world = WorldState::with_persistence(config, Box::new(persistence)).expect("world");
+        let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_factory_calls = Arc::clone(&factory_calls);
+        let brain_key = world
+            .brain_registry_mut()
+            .expect("initial registry mutation")
+            .register("test.unresolved-guard", move |_rng| {
+                counted_factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(StubBrain))
+            });
+        let agent_id = world
+            .try_spawn_agent(sample_agent(3))
+            .expect("initial seeded agent");
+        assert!(
+            world
+                .bind_agent_brain(agent_id, brain_key)
+                .expect("initial brain binding")
+        );
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let artifact = MapArtifact::new(
+            world.terrain().clone(),
+            None,
+            None,
+            None,
+            None,
+            MapArtifactMetadata {
+                generator: MapGeneratorKind::RuleBased,
+                tileset_id: "unresolved-guard".to_owned(),
+                tileset_hash: 0xB0A1_DA4D,
+                seed: 0xB0A1_DA4D,
+                width: world.terrain().width(),
+                height: world.terrain().height(),
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )
+        .expect("valid same-shape map artifact");
+
+        assert!(matches!(world.step(), Err(WorldStepError::Persistence(_))));
+        assert!(world.has_pending_persistence_batch());
+        assert!(world.persistence_fault().is_some());
+
+        let unresolved =
+            |path: String| ScientificStateError::PersistenceBoundaryUnresolved { path, tick: 1 };
+        let agent_path = format!("agents[{}]", agent_id.data().as_ffi());
+        let config_before = world.config().clone();
+        let food_before = world.food().cells().to_vec();
+        let agent_before = world.snapshot_agent(agent_id).expect("guarded agent").data;
+        let registry_before = world.brain_registry().descriptors();
+        let rng_before = world.random_stream_state();
+        let identity_before = world.identity_sequence_state();
+        let interventions_before = world.pending_interventions.clone();
+        let digest_before = world
+            .characterization_digest_v0()
+            .expect("pre-guard digest");
+        let retained_before = world
+            .pending_persistence_batch
+            .as_ref()
+            .expect("retained batch")
+            .clone();
+        let food_callback_calls = Cell::new(0usize);
+        let agent_callback_calls = Cell::new(0usize);
+        let runtime_callback_calls = Cell::new(0usize);
+
+        assert_eq!(
+            world.set_closed(!config_before.closed),
+            Err(unresolved("config.closed".to_owned()))
+        );
+        assert_eq!(
+            world.try_update_food(|cells| {
+                food_callback_calls.set(food_callback_calls.get() + 1);
+                cells.fill(0.0);
+            }),
+            Err(unresolved("food.cells".to_owned()))
+        );
+        let map_error = world
+            .apply_map_artifact(&artifact)
+            .expect_err("unresolved boundary must reject map replacement");
+        assert!(
+            matches!(&map_error, WorldStateError::InvalidState(_)),
+            "expected scientific-state map rejection, got {map_error}"
+        );
+        let WorldStateError::InvalidState(map_error) = map_error else {
+            return;
+        };
+        assert_eq!(map_error, unresolved("map".to_owned()));
+        let bind_error = world
+            .bind_agent_brain(agent_id, brain_key)
+            .expect_err("unresolved boundary must reject brain binding");
+        assert!(
+            matches!(&bind_error, WorldStateError::InvalidState(_)),
+            "expected scientific-state brain-binding rejection, got {bind_error}"
+        );
+        let WorldStateError::InvalidState(bind_error) = bind_error else {
+            return;
+        };
+        assert_eq!(
+            bind_error,
+            unresolved(format!("{agent_path}.runtime.brain"))
+        );
+        assert_eq!(
+            world.try_update_agent(agent_id, |data, _runtime| {
+                agent_callback_calls.set(agent_callback_calls.get() + 1);
+                data.health = 0.0;
+            }),
+            Err(unresolved(agent_path.clone()))
+        );
+        assert_eq!(
+            world.try_update_agent_runtime(agent_id, |runtime| {
+                runtime_callback_calls.set(runtime_callback_calls.get() + 1);
+                runtime.energy = 0.0;
+            }),
+            Err(unresolved(format!("{agent_path}.runtime")))
+        );
+        let intervention_error = world
+            .enqueue_intervention(Intervention::Bloom {
+                region: Region::All,
+                amount: 0.25,
+            })
+            .expect_err("unresolved boundary must reject queued intervention");
+        assert!(
+            matches!(&intervention_error, WorldStateError::InvalidState(_)),
+            "expected scientific-state intervention rejection, got {intervention_error}"
+        );
+        let WorldStateError::InvalidState(intervention_error) = intervention_error else {
+            return;
+        };
+        assert_eq!(intervention_error, unresolved("interventions".to_owned()));
+        let rng_result = world.rng();
+        assert!(
+            rng_result.is_err(),
+            "unresolved boundary exposed the mutable RNG"
+        );
+        let Err(rng_error) = rng_result else {
+            return;
+        };
+        assert_eq!(rng_error, unresolved("world.rng".to_owned()));
+        let registry_result = world.brain_registry_mut();
+        assert!(
+            registry_result.is_err(),
+            "unresolved boundary exposed the mutable brain registry"
+        );
+        let Err(registry_error) = registry_result else {
+            return;
+        };
+        assert_eq!(registry_error, unresolved("brain_registry".to_owned()));
+
+        assert_eq!(food_callback_calls.get(), 0);
+        assert_eq!(agent_callback_calls.get(), 0);
+        assert_eq!(runtime_callback_calls.get(), 0);
+        assert_eq!(
+            factory_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "rejected brain binding must not invoke its factory"
+        );
+        assert_eq!(world.config(), &config_before);
+        assert_eq!(world.food().cells(), food_before.as_slice());
+        assert!(world.map_metadata().is_none());
+        assert_eq!(
+            world
+                .snapshot_agent(agent_id)
+                .expect("unchanged agent")
+                .data,
+            agent_before
+        );
+        assert_eq!(world.brain_registry().descriptors(), registry_before);
+        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
+        assert_eq!(world.pending_interventions, interventions_before);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-guard digest"),
+            digest_before
+        );
+        let retained_after = world
+            .pending_persistence_batch
+            .as_ref()
+            .expect("unchanged retained batch");
+        assert_eq!(retained_after.summary, retained_before.summary);
+        assert_eq!(retained_after.metrics, retained_before.metrics);
+        assert_eq!(retained_after.events, retained_before.events);
+        assert_eq!(
+            postcard::to_allocvec(&retained_after.agents).expect("encode retained agents after"),
+            postcard::to_allocvec(&retained_before.agents).expect("encode retained agents before")
+        );
+        assert_eq!(retained_after.births, retained_before.births);
+        assert_eq!(retained_after.deaths, retained_before.deaths);
+        assert_eq!(retained_after.replay_events, retained_before.replay_events);
+        assert_eq!(rejected_logs.lock().unwrap().len(), 1);
+
+        let mut disabled = world.config().clone();
+        disabled.persistence_interval = 0;
+        world
+            .apply_config_update(disabled)
+            .expect("pure persistence disable remains the deliberate exception");
+        assert!(
+            world
+                .retry_pending_persistence()
+                .expect("exact retained batch remains retryable")
+        );
+        assert!(world.persistence_fault().is_none());
+        assert!(!world.has_pending_persistence_batch());
+        assert_eq!(rejected_logs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn disabling_persistence_rejects_a_pending_tick_zero_origin_atomically() {
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(
+            ScriptBotsConfig {
+                persistence_interval: 3,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                rng_seed: Some(0xD15A_B1E0),
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(spy),
+        )
+        .expect("world");
+        world
+            .try_spawn_agent(sample_agent(1))
+            .expect("pending tick-zero origin");
+
+        let previous_config = world.config().clone();
+        let previous_revision = world.config_revision();
+        let previous_audit = world.config_audit().to_vec();
+        let previous_food = world.food().cells().to_vec();
+        let previous_births = world.pending_birth_records.clone();
+        let mut disabled = previous_config.clone();
+        disabled.persistence_interval = 0;
+        disabled.closed = !previous_config.closed;
+        disabled.food_max = 0.0;
+
+        let error = world
+            .apply_config_update(disabled.clone())
+            .expect_err("a pending origin must be finalized before persistence is disabled");
+        assert!(matches!(
+            &error,
+            WorldStateError::InvalidState(
+                ScientificStateError::PersistenceDisableRequiresFinalization {
+                    path,
+                    tick: 0,
+                }
+            ) if path == "config.persistence_interval"
+        ));
+        assert!(
+            error.to_string().contains("finalize_persistence"),
+            "the diagnostic must name the required finalization step"
+        );
+        assert_eq!(
+            world.config().persistence_interval,
+            previous_config.persistence_interval
+        );
+        assert_eq!(world.config().closed, previous_config.closed);
+        assert_eq!(world.config().food_max, previous_config.food_max);
+        assert_eq!(world.config_revision(), previous_revision);
+        assert_eq!(world.config_audit(), previous_audit.as_slice());
+        assert_eq!(world.food().cells(), previous_food.as_slice());
+        assert_eq!(world.pending_birth_records, previous_births);
+        assert!(logs.lock().unwrap().is_empty());
+
+        assert!(
+            world
+                .finalize_persistence()
+                .expect("finalize tick-zero origin")
+        );
+        disabled.food_max = previous_config.food_max;
+        world
+            .apply_config_update(disabled)
+            .expect("disable after admitting the current boundary");
+        assert_eq!(world.config().persistence_interval, 0);
+        assert_eq!(logs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn disabling_persistence_rejects_an_empty_non_cadence_tick_gap() {
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(
+            ScriptBotsConfig {
+                persistence_interval: 3,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                reproduction_attempt_chance: 0.0,
+                rng_seed: Some(0xD15A_B1E1),
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(spy),
+        )
+        .expect("world");
+        world.step().expect("empty non-cadence tick");
+        assert_eq!(world.tick(), Tick(1));
+        assert!(logs.lock().unwrap().is_empty());
+        assert!(!world.has_pending_persistence_material());
+
+        let mut disabled = world.config().clone();
+        disabled.persistence_interval = 0;
+        assert!(matches!(
+            world.apply_config_update(disabled.clone()),
+            Err(WorldStateError::InvalidState(
+                ScientificStateError::PersistenceDisableRequiresFinalization {
+                    ref path,
+                    tick: 1,
+                }
+            )) if path == "config.persistence_interval"
+        ));
+
+        assert!(
+            world
+                .finalize_persistence()
+                .expect("finalize empty tick tail")
+        );
+        world
+            .apply_config_update(disabled)
+            .expect("disable after empty tick admission");
+        assert_eq!(world.config().persistence_interval, 0);
+        assert_eq!(logs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn disabled_persistence_marks_every_discarded_scientific_record_class() {
+        let make_world = || {
+            WorldState::new(ScriptBotsConfig {
+                persistence_interval: 0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                rng_seed: Some(0xD15C_A2D0),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("world")
+        };
+
+        let mut origin_world = make_world();
+        origin_world
+            .try_spawn_agent(sample_agent(1))
+            .expect("seeded origin");
+        origin_world
+            .stage_persistence(Tick(7), false)
+            .expect("disabled persistence stage");
+        assert_eq!(origin_world.persistence_discarded_records_at, Some(Tick(7)));
+        assert!(origin_world.pending_birth_records.is_empty());
+
+        let mut death_world = make_world();
+        death_world.pending_death_records.push(lifecycle_death(3));
+        death_world
+            .stage_persistence(Tick(8), false)
+            .expect("disabled persistence stage");
+        assert_eq!(death_world.persistence_discarded_records_at, Some(Tick(8)));
+        assert!(death_world.pending_death_records.is_empty());
+
+        let mut replay_world = make_world();
+        replay_world.replay_events.push(ReplayEvent {
+            agent_uid: None,
+            kind: ReplayEventKind::BrainOutputs {
+                outputs: Vec::new(),
+            },
+        });
+        replay_world
+            .stage_persistence(Tick(9), false)
+            .expect("disabled persistence stage");
+        assert_eq!(replay_world.persistence_discarded_records_at, Some(Tick(9)));
+        assert!(replay_world.replay_events.is_empty());
+    }
+
+    #[test]
+    fn persistence_can_toggle_off_and_on_when_no_scientific_record_was_discarded() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let mut disabled = world.config().clone();
+        disabled.persistence_interval = 0;
+        world
+            .apply_config_update(disabled)
+            .expect("disable persistence without a discarded record");
+        let mut reenabled = world.config().clone();
+        reenabled.persistence_interval = 1;
+        world
+            .apply_config_update(reenabled)
+            .expect("immediate re-enable remains lossless");
+
+        assert_eq!(world.config().persistence_interval, 1);
+        assert_eq!(world.persistence_discarded_records_at, None);
+    }
+
+    #[test]
+    fn re_enabling_persistence_after_a_disabled_gap_is_rejected_atomically() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_attempt_chance: 0.0,
+            rng_seed: Some(0x6A90_5EED),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        assert!(world.pending_birth_records.is_empty());
+        assert!(world.pending_death_records.is_empty());
+        assert!(world.replay_events.is_empty());
+        world.step().expect("disabled persistence step");
+        assert_eq!(world.persistence_discarded_records_at, Some(Tick(1)));
+
+        let previous_interval = world.config().persistence_interval;
+        let previous_closed = world.config().closed;
+        let previous_food_max = world.config().food_max;
+        let previous_revision = world.config_revision();
+        let previous_audit = world.config_audit().to_vec();
+        let previous_food = world.food().cells().to_vec();
+        let mut reenabled = world.config().clone();
+        reenabled.persistence_interval = 1;
+        reenabled.closed = !previous_closed;
+        reenabled.food_max = 0.0;
+
+        let error = world
+            .apply_config_update(reenabled)
+            .expect_err("a run with a disabled completed tick cannot silently resume persistence");
+        assert!(matches!(
+            error,
+            WorldStateError::InvalidState(ScientificStateError::PersistenceHistoryGap {
+                ref path,
+                discarded_at_tick: 1,
+            }) if path == "config.persistence_interval"
+        ));
+        assert_eq!(world.config().persistence_interval, previous_interval);
+        assert_eq!(world.config().closed, previous_closed);
+        assert_eq!(world.config().food_max, previous_food_max);
+        assert_eq!(world.config_revision(), previous_revision);
+        assert_eq!(world.config_audit(), previous_audit.as_slice());
+        assert_eq!(world.food().cells(), previous_food.as_slice());
+    }
+
+    #[test]
+    fn reset_time_is_only_a_noop_on_a_pristine_tick_zero_world() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        world.reset_time().expect("pristine tick-zero no-op");
+
+        world.tick = Tick(42);
+        world.epoch = 7;
+        let tick_before = world.tick();
+        let epoch_before = world.epoch();
+
+        assert_eq!(
+            world.reset_time(),
+            Err(ScientificStateError::TimeResetRequiresNewRun {
+                path: "world.tick".to_owned(),
+                tick: 42,
+                epoch: 7,
+            })
+        );
+        assert_eq!(world.tick(), tick_before);
+        assert_eq!(world.epoch(), epoch_before);
+    }
+
+    #[test]
+    fn reset_time_refuses_an_admitted_tick_without_mutating_the_clock() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::with_persistence(config, Box::new(SpyPersistence::default()))
+            .expect("world");
+        world.step().expect("admit tick one");
+        let tick_before = world.tick();
+        let epoch_before = world.epoch();
+
+        assert_eq!(
+            world.reset_time(),
+            Err(ScientificStateError::TimeResetRequiresNewRun {
+                path: "world.tick".to_owned(),
+                tick: 1,
+                epoch: 0,
+            })
+        );
+        assert_eq!(world.tick(), tick_before);
+        assert_eq!(world.epoch(), epoch_before);
+    }
+
+    #[test]
+    fn reset_time_reports_an_unresolved_batch_before_admitted_history() {
+        let persistence = RejectOncePersistence {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            reject_next: true,
+        };
+        let mut world = WorldState::with_persistence(
+            ScriptBotsConfig {
+                persistence_interval: 1,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(persistence),
+        )
+        .expect("world");
+        assert!(matches!(world.step(), Err(WorldStepError::Persistence(_))));
+        world.last_admitted_persistence_tick = Some(world.tick());
+        let tick_before = world.tick();
+
+        assert_eq!(
+            world.reset_time(),
+            Err(ScientificStateError::PersistenceBoundaryUnresolved {
+                path: "world.tick".to_owned(),
+                tick: 1,
+            })
+        );
+        assert_eq!(world.tick(), tick_before);
+        assert!(world.has_pending_persistence_batch());
+    }
+
+    #[test]
+    fn reset_time_rejects_a_future_dated_pending_origin_at_tick_zero() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        world.pending_birth_records.push(lifecycle_birth(17));
+        let records_before = world.pending_birth_records.clone();
+
+        assert_eq!(
+            world.reset_time(),
+            Err(ScientificStateError::TimeResetRequiresNewRun {
+                path: "world.tick".to_owned(),
+                tick: 0,
+                epoch: 0,
+            })
+        );
+        assert_eq!(world.tick(), Tick::zero());
+        assert_eq!(world.epoch(), 0);
+        assert_eq!(world.pending_birth_records, records_before);
+    }
+
+    #[test]
+    fn post_admission_updates_cannot_diverge_generation_or_hybrid_from_lifecycle_history() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xAD11_77ED),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let brain_key = world
+            .brain_registry_mut()
+            .expect("post-admission registry mutation")
+            .register("test.post-admission-origin", |_rng| Ok(Box::new(StubBrain)));
+        let agent = world
+            .try_spawn_agent(sample_agent(1))
+            .expect("tick-zero seed");
+        let insertion_record = world.pending_birth_records[0].clone();
+        assert!(insertion_record.brain_key.is_none());
+        assert!(world.finalize_persistence().expect("origin admission"));
+        assert!(world.pending_birth_records.is_empty());
+
+        assert!(
+            world
+                .bind_agent_brain(agent, brain_key)
+                .expect("post-admission binding")
+        );
+        world
+            .try_update_agent(agent, |data, runtime| {
+                data.position = Position::new(17.0, 19.0);
+                runtime.herbivore_tendency = 0.75;
+            })
+            .expect("ordinary post-admission update");
+
+        let stable = world.snapshot_agent(agent).expect("updated live agent");
+        let rng_before = world.random_stream_state();
+        let identity_before = world.identity_sequence_state();
+        let digest_before = world
+            .characterization_digest_v0()
+            .expect("pre-rejection digest");
+        let generation_error = world
+            .try_update_agent(agent, |data, runtime| {
+                data.position = Position::new(90.0, 91.0);
+                data.generation = Generation(7);
+                runtime.herbivore_tendency = 0.1;
+            })
+            .expect_err("admitted generation must be immutable");
+        assert_eq!(
+            generation_error,
+            ScientificStateError::ExternalLineageMutation {
+                path: format!("agents[{}].generation", agent.raw()),
+            }
+        );
+        let hybrid_error = world
+            .try_update_agent_runtime(agent, |runtime| {
+                runtime.energy = 0.25;
+                runtime.hybrid = true;
+            })
+            .expect_err("admitted hybrid status must be immutable");
+        assert_eq!(
+            hybrid_error,
+            ScientificStateError::ExternalLineageMutation {
+                path: format!("agents[{}].runtime.hybrid", agent.raw()),
+            }
+        );
+
+        let live = world.snapshot_agent(agent).expect("unchanged live agent");
+        assert_eq!(live.data, stable.data);
+        assert_eq!(live.runtime.lineage, stable.runtime.lineage);
+        assert_eq!(live.runtime.hybrid, stable.runtime.hybrid);
+        assert!((live.runtime.energy - stable.runtime.energy).abs() < f32::EPSILON);
+        assert!(
+            (live.runtime.herbivore_tendency - stable.runtime.herbivore_tendency).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.identity_sequence_state(), identity_before);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("post-rejection digest"),
+            digest_before
+        );
+        assert!(world.pending_birth_records.is_empty());
+        assert!(
+            !world
+                .finalize_persistence()
+                .expect("admitted boundary remains idempotent")
+        );
+
+        {
+            let entries = logs.lock().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].births, vec![insertion_record.clone()]);
+            assert_eq!(entries[0].births[0].generation, live.data.generation);
+            assert_eq!(entries[0].births[0].is_hybrid, live.runtime.hybrid);
+        }
+
+        world.advance_tick();
+        world
+            .try_update_agent(agent, |data, runtime| {
+                data.health = 0.0;
+                runtime.energy = 0.0;
+            })
+            .expect("ordinary pre-death state update");
+        world.pending_deaths.push(agent);
+        world.stage_death_cleanup(Tick(1));
+        let death = world.pending_death_records.last().expect("death record");
+        assert_eq!(death.agent_uid, insertion_record.agent_uid);
+        assert_eq!(death.generation, insertion_record.generation);
+        assert_eq!(death.was_hybrid, insertion_record.is_hybrid);
+    }
+
     #[test]
     fn simultaneous_brain_and_persistence_failures_are_both_latched() {
         #[derive(Debug, Error)]
@@ -19300,6 +21761,7 @@ mod tests {
         let factory_attempts = Arc::clone(&attempts);
         world
             .brain_registry_mut()
+            .expect("double-fault registry mutation")
             .register("test.double-fault", move |_rng| {
                 if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     Ok(Box::new(StubBrain))
@@ -19360,7 +21822,8 @@ mod tests {
             tick: Tick(tick),
             agent_uid: AgentUid(tick + 1),
             spawn_ordinal: tick,
-            birth_ordinal: tick,
+            birth_ordinal: Some(tick),
+            origin: BirthOrigin::Born,
             parent_a: None,
             parent_b: None,
             brain_kind: Some("test".to_owned()),
@@ -19410,9 +21873,9 @@ mod tests {
             rng_seed: Some(77),
             ..ScriptBotsConfig::default()
         };
-        let rejected_logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence_logs = Arc::new(Mutex::new(Vec::new()));
         let rejecting = RejectOncePersistence {
-            logs: Arc::clone(&rejected_logs),
+            logs: Arc::clone(&persistence_logs),
             reject_next: true,
         };
         let mut world =
@@ -19442,7 +21905,7 @@ mod tests {
         let digest_after_failure = world
             .characterization_digest_v0()
             .expect("failed tick must end at a quiescent science boundary");
-        let rejected_call_count = rejected_logs.lock().unwrap().len();
+        let rejected_call_count = persistence_logs.lock().unwrap().len();
         let repeated_error = world
             .step()
             .expect_err("a latched failure must prevent tick two from starting");
@@ -19452,43 +21915,37 @@ mod tests {
         };
         assert_eq!(repeated_error, first_error);
         assert_eq!(world.tick(), Tick(1));
-        assert_eq!(rejected_logs.lock().unwrap().len(), rejected_call_count);
+        assert_eq!(persistence_logs.lock().unwrap().len(), rejected_call_count);
         assert_eq!(
             world.characterization_digest_v0().unwrap(),
             digest_after_failure,
             "latched step must not mutate science state"
         );
 
-        let accepted = SpyPersistence::default();
-        let accepted_logs = Arc::clone(&accepted.logs);
-        world.set_persistence(Box::new(accepted));
         assert!(
             world
                 .retry_pending_persistence()
-                .expect("replacement sink must accept retained batch")
+                .expect("the original sink must accept the retained batch on retry")
         );
         assert!(!world.has_pending_persistence_batch());
         assert!(world.persistence_fault().is_none());
 
-        let rejected = rejected_logs.lock().unwrap();
-        let accepted = accepted_logs.lock().unwrap();
-        assert_eq!(rejected.len(), 1);
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].summary, rejected[0].summary);
-        assert_eq!(accepted[0].metrics, rejected[0].metrics);
-        assert_eq!(accepted[0].events, rejected[0].events);
-        assert_eq!(accepted[0].births, rejected[0].births);
-        assert_eq!(accepted[0].deaths, rejected[0].deaths);
-        assert_eq!(accepted[0].replay_events, rejected[0].replay_events);
-        assert_eq!(accepted[0].agents.len(), rejected[0].agents.len());
-        drop(accepted);
-        drop(rejected);
+        let attempts = persistence_logs.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1].summary, attempts[0].summary);
+        assert_eq!(attempts[1].metrics, attempts[0].metrics);
+        assert_eq!(attempts[1].events, attempts[0].events);
+        assert_eq!(attempts[1].births, attempts[0].births);
+        assert_eq!(attempts[1].deaths, attempts[0].deaths);
+        assert_eq!(attempts[1].replay_events, attempts[0].replay_events);
+        assert_eq!(attempts[1].agents.len(), attempts[0].agents.len());
+        drop(attempts);
 
         world
             .step()
             .expect("world may advance only after retained batch admission");
         assert_eq!(world.tick(), Tick(2));
-        assert_eq!(accepted_logs.lock().unwrap().len(), 2);
+        assert_eq!(persistence_logs.lock().unwrap().len(), 3);
     }
 
     #[test]
@@ -19794,15 +22251,19 @@ mod tests {
             .filter(|event| matches!(event.kind, PersistenceEventKind::Births))
             .map(|event| event.count)
             .sum();
-        let raw_birth_total: usize = entries.iter().map(|batch| batch.births.len()).sum();
-        assert_eq!(birth_event_total, raw_birth_total);
+        let born_row_total = entries
+            .iter()
+            .flat_map(|batch| &batch.births)
+            .filter(|record| record.origin == BirthOrigin::Born)
+            .count();
+        assert_eq!(birth_event_total, born_row_total);
         let lifecycle_metric_total: f64 = entries
             .iter()
             .flat_map(|batch| &batch.metrics)
             .filter(|metric| metric.name == "births.total.count")
             .map(|metric| metric.value)
             .sum();
-        assert_eq!(lifecycle_metric_total, raw_birth_total as f64);
+        assert_eq!(lifecycle_metric_total, born_row_total as f64);
         assert_eq!(
             entries
                 .iter()
@@ -19863,7 +22324,9 @@ mod tests {
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].summary.tick, Tick(3));
-        assert_eq!(entries[0].births, vec![lifecycle_birth(1)]);
+        assert_eq!(entries[0].births.len(), 2);
+        assert_eq!(entries[0].births[0].origin, BirthOrigin::Seeded);
+        assert_eq!(entries[0].births[1], lifecycle_birth(1));
         let tail = &entries[1];
         assert_eq!(tail.summary.tick, Tick(4));
         assert_eq!(tail.summary.births, 1);
@@ -19970,6 +22433,9 @@ mod tests {
         assert_eq!(summary.births, 0);
         assert_eq!(summary.deaths, 0);
         assert!((summary.average_energy - 1.0).abs() < 1e-6);
+        assert_eq!(batch.births.len(), 1);
+        assert_eq!(batch.births[0].origin, BirthOrigin::Seeded);
+        assert_eq!(batch.births[0].tick, Tick::zero());
 
         let history: Vec<_> = world.history().cloned().collect();
         assert_eq!(history.len(), 1);
@@ -20012,7 +22478,9 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
 
-        let mut world = WorldState::new(config).expect("world");
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
         let parent_id = world.spawn_agent(sample_agent(0));
         {
             let runtime = world.agent_runtime_mut(parent_id).expect("runtime");
@@ -20044,6 +22512,27 @@ mod tests {
                 .energy
                 < 1.0
         );
+
+        let entries = logs.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].summary.births, 1);
+        assert_eq!(
+            entries[0]
+                .births
+                .iter()
+                .map(|record| record.origin)
+                .collect::<Vec<_>>(),
+            vec![BirthOrigin::Seeded, BirthOrigin::Born]
+        );
+        let born = entries[0]
+            .births
+            .iter()
+            .find(|record| record.origin == BirthOrigin::Born)
+            .expect("natural birth record");
+        assert_eq!(born.tick, Tick(1));
+        assert_eq!(born.parent_a, Some(parent_uid));
+        assert_eq!(born.parent_b, None);
+        assert_eq!(born.generation, Generation(1));
     }
 
     #[test]
@@ -20364,6 +22853,7 @@ mod tests {
 
         let idle_key = world
             .brain_registry_mut()
+            .expect("idle registry mutation")
             .register("test.idle", |_rng| Ok(Box::new(IdleBrain)));
         assert!(
             world
@@ -21500,11 +23990,15 @@ mod tests {
             }
             world.agent_runtime_mut(receiver).unwrap().energy = 0.5;
 
-            let giver_key = world.brain_registry_mut().register("test.giver", |_rng| {
-                Ok(Box::new(SharingBrain { give: 1.0 }))
-            });
+            let giver_key = world
+                .brain_registry_mut()
+                .expect("giver registry mutation")
+                .register("test.giver", |_rng| {
+                    Ok(Box::new(SharingBrain { give: 1.0 }))
+                });
             let receiver_key = world
                 .brain_registry_mut()
+                .expect("receiver registry mutation")
                 .register("test.receiver", |_rng| {
                     Ok(Box::new(SharingBrain { give: 0.0 }))
                 });
@@ -21589,7 +24083,7 @@ mod tests {
             "closed world should not seed agents"
         );
 
-        world.set_closed(false);
+        world.set_closed(false).expect("open world");
         assert!(!world.is_closed());
         assert_eq!(world.config_revision(), 1);
         assert_eq!(
@@ -21629,8 +24123,8 @@ mod tests {
         world.step().expect("open tick one");
         assert_eq!(world.agent_count(), 0);
 
-        world.set_closed(true);
-        world.set_closed(true);
+        world.set_closed(true).expect("close world");
+        world.set_closed(true).expect("idempotent close");
         assert_eq!(
             world.config_revision(),
             1,
@@ -21643,7 +24137,7 @@ mod tests {
             "closed scheduled opportunity must be skipped"
         );
 
-        world.set_closed(false);
+        world.set_closed(false).expect("reopen world");
         assert_eq!(world.config_revision(), 2);
         world.step().expect("open nonscheduled tick three");
         assert_eq!(
@@ -21715,6 +24209,126 @@ mod tests {
         assert_eq!(world.agent_count(), 0, "no spawn on first step");
         world.step().expect("second population interval step");
         assert_eq!(world.agent_count(), 1, "expected spawn on interval");
+    }
+
+    #[test]
+    fn same_stage_population_injections_are_not_eligible_as_crossover_parents() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 2,
+            population_spawn_interval: 7,
+            population_spawn_count: 1,
+            population_crossover_chance: 1.0,
+            reproduction_energy_threshold: 10.0,
+            rng_seed: Some(0xF100_12E7),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let rng_before = world.random_stream_state();
+
+        let receipt = world
+            .stage_population(Tick(7))
+            .expect("population stage")
+            .expect("population transaction");
+        assert_eq!(world.agent_count(), 3);
+        assert_eq!(world.pending_birth_records.len(), 3);
+        assert!(world.pending_birth_records.iter().all(|record| {
+            record.tick == Tick(7)
+                && record.origin == BirthOrigin::Injected
+                && record.parent_a.is_none()
+                && record.parent_b.is_none()
+                && record.birth_ordinal.is_none()
+        }));
+        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.last_births, 0);
+
+        let mut graph = ancestry::AncestryGraph::new();
+        for record in &world.pending_birth_records {
+            graph
+                .apply_birth(record)
+                .expect("same-tick roots form a valid append-only ancestry log");
+        }
+
+        world.rollback_population_spawns(receipt);
+        assert_eq!(world.agent_count(), 0);
+        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.identity_sequence_state(), (1, 0, 0));
+        assert_eq!(world.random_stream_state(), rng_before);
+    }
+
+    #[test]
+    fn scheduled_crossover_is_an_injected_next_tick_arrival_with_preserved_lineage() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 3,
+            population_spawn_interval: 7,
+            population_spawn_count: 1,
+            population_crossover_chance: 1.0,
+            reproduction_energy_threshold: 10.0,
+            reproduction_mutation_scale: 0.0,
+            reproduction_meta_mutation_chance: 0.0,
+            rng_seed: Some(0xC205_50A3),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let key = world
+            .brain_registry_mut()
+            .expect("population crossover registry mutation")
+            .register("test.population-crossover", |_rng| Ok(Box::new(StubBrain)));
+        let left = world.spawn_agent(sample_agent(2));
+        let right = world.spawn_agent(sample_agent(5));
+        assert!(world.bind_agent_brain(left, key).expect("left brain"));
+        assert!(world.bind_agent_brain(right, key).expect("right brain"));
+        let records_before = world.pending_birth_records.len();
+
+        let receipt = world
+            .stage_population(Tick(7))
+            .expect("population stage")
+            .expect("population transaction");
+        assert_eq!(world.agent_count(), 4);
+        assert_eq!(world.pending_birth_records.len(), records_before + 2);
+        let floor_record = &world.pending_birth_records[records_before];
+        assert_eq!(floor_record.origin, BirthOrigin::Injected);
+        assert_eq!(floor_record.tick, Tick(7));
+        assert_eq!([floor_record.parent_a, floor_record.parent_b], [None, None]);
+        let record = world
+            .pending_birth_records
+            .last()
+            .expect("crossover record");
+        assert_eq!(record.tick, Tick(7));
+        assert_eq!(record.origin, BirthOrigin::Injected);
+        assert_eq!(record.birth_ordinal, None);
+        assert!(record.parent_a.is_some());
+        assert!(record.parent_b.is_some());
+        assert_ne!(record.parent_a, record.parent_b);
+        assert!(record.is_hybrid);
+        assert_eq!(record.generation, Generation(6));
+        let child = *receipt.inserted.last().expect("crossover child");
+        assert_eq!(world.agent_identity(child).unwrap().birth_ordinal, None);
+        assert_eq!(
+            world.snapshot_agent(child).unwrap().data.generation,
+            Generation(6)
+        );
+        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.last_births, 0);
+
+        let mut graph = ancestry::AncestryGraph::new();
+        for record in &world.pending_birth_records {
+            graph.apply_birth(record).expect("complete ancestry log");
+        }
+        assert_eq!(
+            graph.parents_of(record.agent_uid),
+            [record.parent_a, record.parent_b]
+        );
+
+        world.rollback_population_spawns(receipt);
+        assert_eq!(world.agent_count(), 2);
+        assert_eq!(world.pending_birth_records.len(), records_before);
+        assert!(
+            world
+                .pending_birth_records
+                .iter()
+                .all(|record| record.origin == BirthOrigin::Seeded),
+            "rolling back population insertion must not leak its origin row"
+        );
     }
 
     #[test]
@@ -21921,7 +24535,10 @@ mod tests {
         let peer = world_b.characterization_digest_v0().expect("peer digest");
         assert_eq!(first, second);
         assert_eq!(first, peer);
-        assert_eq!(world_a.rng().next_u64(), world_b.rng().next_u64());
+        assert_eq!(
+            world_a.rng().expect("first RNG access").next_u64(),
+            world_b.rng().expect("second RNG access").next_u64()
+        );
     }
 
     #[test]
@@ -21969,7 +24586,7 @@ mod tests {
         assert_ne!(baseline.overall, changed.overall);
 
         let (mut closed_world, _) = characterization_world(42);
-        closed_world.set_closed(true);
+        closed_world.set_closed(true).expect("close digest world");
         let changed = closed_world
             .characterization_digest_v0()
             .expect("closed digest");
@@ -21984,7 +24601,7 @@ mod tests {
         assert_ne!(baseline.overall, changed.overall);
 
         let (mut rng_world, _) = characterization_world(42);
-        rng_world.rng().next_u64();
+        rng_world.rng().expect("digest RNG access").next_u64();
         let changed = rng_world.characterization_digest_v0().expect("rng digest");
         assert_ne!(baseline.rng_probe, changed.rng_probe);
         assert_ne!(baseline.overall, changed.overall);
@@ -21992,6 +24609,7 @@ mod tests {
         let (mut registry_world, _) = characterization_world(42);
         registry_world
             .brain_registry_mut()
+            .expect("digest registry mutation")
             .register("stub", |_rng| Ok(Box::new(StubBrain)));
         let changed = registry_world
             .characterization_digest_v0()
@@ -22226,11 +24844,13 @@ mod tests {
         let victim = world.spawn_agent(sample_agent(1));
         let attacker_brain = world
             .brain_registry_mut()
+            .expect("aggressor registry mutation")
             .register("test.resource-ledger-aggressor", |_rng| {
                 Ok(Box::new(LedgerAggressorBrain))
             });
         let idle_brain = world
             .brain_registry_mut()
+            .expect("ledger idle registry mutation")
             .register("test.resource-ledger-idle", |_rng| {
                 Ok(Box::new(LedgerIdleBrain))
             });
@@ -22485,9 +25105,11 @@ mod tests {
         let mut profiler = WorldStepProfiler::default();
         let control_brain = control
             .brain_registry_mut()
+            .expect("control profiler registry mutation")
             .register("profile-parity", |_rng| Ok(Box::new(StubBrain)));
         let profiled_brain = profiled
             .brain_registry_mut()
+            .expect("profiled registry mutation")
             .register("profile-parity", |_rng| Ok(Box::new(StubBrain)));
         for ordinal in 0..2 {
             let control_agent = control.spawn_agent(sample_agent(ordinal));

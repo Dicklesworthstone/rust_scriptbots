@@ -21,7 +21,7 @@ fn seed_visible_agents(world: &mut WorldState) {
             agent.heading = (row * 4 + column) as f32 * std::f32::consts::FRAC_PI_8;
             agent.spike_length = 10.0;
             world
-                .try_spawn_agent(agent)
+                .try_inject_agent(agent)
                 .expect("snapshot agent is finite");
         }
     }

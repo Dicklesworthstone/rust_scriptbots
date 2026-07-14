@@ -1,6 +1,7 @@
 use fsqlite::{Connection, FrankenError, compat::RowExt};
 use scriptbots_core::{
-    AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, MetricSample, PersistenceBatch,
+    AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
+    CombatEventFlags, DeathCause, DeathRecord, Generation, MetricSample, PersistenceBatch,
     PersistenceEvent, PersistenceEventKind, Position, Tick, TickSummary,
 };
 use scriptbots_storage::Storage;
@@ -24,14 +25,26 @@ fn temp_db_path(prefix: &str) -> PathBuf {
     path
 }
 
-fn make_agent_state(uid: u64, energy: f32, position: (f32, f32)) -> AgentState {
+fn make_agent_state(
+    uid: u64,
+    generation: u32,
+    parents: Option<(u64, u64)>,
+    energy: f32,
+    position: (f32, f32),
+) -> AgentState {
     let data = AgentData {
         position: Position::new(position.0, position.1),
         health: energy,
+        generation: Generation(generation),
         ..AgentData::default()
     };
+    let (lineage, hybrid) = parents.map_or(([None, None], false), |(parent_a, parent_b)| {
+        ([Some(AgentUid(parent_a)), Some(AgentUid(parent_b))], true)
+    });
     let runtime = AgentRuntime {
         energy,
+        hybrid,
+        lineage,
         ..AgentRuntime::default()
     };
     AgentState {
@@ -39,22 +52,87 @@ fn make_agent_state(uid: u64, energy: f32, position: (f32, f32)) -> AgentState {
         identity: AgentIdentity {
             uid: AgentUid(uid),
             spawn_ordinal: uid - 1,
-            birth_ordinal: None,
+            birth_ordinal: uid.checked_sub(3),
         },
         data,
         runtime,
     }
 }
 
+fn make_seeded(tick: u64, uid: u64) -> BirthRecord {
+    BirthRecord {
+        tick: Tick(tick),
+        agent_uid: AgentUid(uid),
+        spawn_ordinal: uid.saturating_sub(1),
+        birth_ordinal: None,
+        origin: BirthOrigin::Seeded,
+        parent_a: None,
+        parent_b: None,
+        brain_kind: None,
+        brain_key: None,
+        herbivore_tendency: 0.5,
+        generation: Generation::default(),
+        position: Position::new(0.0, 0.0),
+        is_hybrid: false,
+    }
+}
+
+fn make_born(
+    tick: u64,
+    uid: u64,
+    birth_ordinal: u64,
+    parent_a: u64,
+    parent_b: u64,
+    generation: u32,
+) -> BirthRecord {
+    BirthRecord {
+        tick: Tick(tick),
+        agent_uid: AgentUid(uid),
+        spawn_ordinal: uid.saturating_sub(1),
+        birth_ordinal: Some(birth_ordinal),
+        origin: BirthOrigin::Born,
+        parent_a: Some(AgentUid(parent_a)),
+        parent_b: Some(AgentUid(parent_b)),
+        brain_kind: None,
+        brain_key: None,
+        herbivore_tendency: 0.5,
+        generation: Generation(generation),
+        position: Position::new(0.0, 0.0),
+        is_hybrid: true,
+    }
+}
+
+fn make_death(tick: u64, uid: u64) -> DeathRecord {
+    DeathRecord {
+        tick: Tick(tick),
+        agent_uid: AgentUid(uid),
+        age: 2,
+        generation: Generation::default(),
+        herbivore_tendency: 0.5,
+        brain_kind: None,
+        brain_key: None,
+        energy: 0.0,
+        food_balance_total: 0.0,
+        cause: DeathCause::Unknown,
+        was_hybrid: false,
+        combat_flags: CombatEventFlags::default(),
+    }
+}
+
 fn make_batch(
     tick: u64,
     agent_count: usize,
-    births: usize,
-    deaths: usize,
     total_energy: f32,
     agents: Vec<AgentState>,
     events: Vec<PersistenceEvent>,
+    birth_records: Vec<BirthRecord>,
+    death_records: Vec<DeathRecord>,
 ) -> PersistenceBatch {
+    let births = birth_records
+        .iter()
+        .filter(|record| record.origin == BirthOrigin::Born)
+        .count();
+    let deaths = death_records.len();
     let average_energy = if agent_count > 0 {
         total_energy / agent_count as f32
     } else {
@@ -81,8 +159,8 @@ fn make_batch(
         ],
         events,
         agents,
-        births: Vec::new(),
-        deaths: Vec::new(),
+        births: birth_records,
+        deaths: death_records,
         replay_events: Vec::new(),
     }
 }
@@ -98,47 +176,51 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
         make_batch(
             1,
             3,
-            1,
-            0,
             3.6,
             vec![
-                make_agent_state(1, 1.0, (10.0, 10.0)),
-                make_agent_state(2, 1.2, (15.0, 12.0)),
-                make_agent_state(3, 1.4, (20.0, 18.0)),
+                make_agent_state(1, 0, None, 1.0, (10.0, 10.0)),
+                make_agent_state(2, 0, None, 1.2, (15.0, 12.0)),
+                make_agent_state(3, 1, Some((1, 2)), 1.4, (20.0, 18.0)),
             ],
             vec![PersistenceEvent::new(PersistenceEventKind::Births, 1)],
+            vec![
+                make_seeded(0, 1),
+                make_seeded(0, 2),
+                make_born(1, 3, 0, 1, 2, 1),
+            ],
+            Vec::new(),
         ),
         make_batch(
             2,
             4,
-            2,
-            1,
             4.8,
             vec![
-                make_agent_state(1, 1.3, (11.0, 11.0)),
-                make_agent_state(2, 1.1, (14.0, 16.0)),
-                make_agent_state(3, 1.0, (21.0, 19.0)),
-                make_agent_state(4, 1.4, (24.0, 22.0)),
+                make_agent_state(1, 0, None, 1.3, (11.0, 11.0)),
+                make_agent_state(3, 1, Some((1, 2)), 1.1, (14.0, 16.0)),
+                make_agent_state(4, 2, Some((1, 3)), 1.0, (21.0, 19.0)),
+                make_agent_state(5, 2, Some((2, 3)), 1.4, (24.0, 22.0)),
             ],
             vec![
                 PersistenceEvent::new(PersistenceEventKind::Births, 2),
                 PersistenceEvent::new(PersistenceEventKind::Deaths, 1),
             ],
+            vec![make_born(2, 4, 1, 1, 3, 2), make_born(2, 5, 2, 2, 3, 2)],
+            vec![make_death(2, 2)],
         ),
         make_batch(
             3,
             5,
-            1,
-            0,
             6.5,
             vec![
-                make_agent_state(1, 1.3, (13.0, 11.0)),
-                make_agent_state(2, 1.5, (17.0, 16.0)),
-                make_agent_state(3, 1.2, (23.0, 21.0)),
-                make_agent_state(4, 1.0, (25.0, 24.0)),
-                make_agent_state(5, 1.5, (28.0, 26.0)),
+                make_agent_state(1, 0, None, 1.3, (13.0, 11.0)),
+                make_agent_state(3, 1, Some((1, 2)), 1.5, (17.0, 16.0)),
+                make_agent_state(4, 2, Some((1, 3)), 1.2, (23.0, 21.0)),
+                make_agent_state(5, 2, Some((2, 3)), 1.0, (25.0, 24.0)),
+                make_agent_state(6, 3, Some((3, 4)), 1.5, (28.0, 26.0)),
             ],
             vec![PersistenceEvent::new(PersistenceEventKind::Births, 1)],
+            vec![make_born(3, 6, 3, 3, 4, 3)],
+            Vec::new(),
         ),
     ];
 

@@ -8,19 +8,19 @@
 
 use scriptbots_core::ancestry::AncestryGraph;
 use scriptbots_core::{
-    AgentData, BirthRecord, Generation, PersistenceAdmissionError, PersistenceBatch, Position,
-    ScriptBotsConfig, Tick, WorldPersistence, WorldState,
+    AgentData, BirthOrigin, PersistenceAdmissionError, PersistenceBatch, ScientificStateError,
+    ScriptBotsConfig, WorldPersistence, WorldState,
 };
 use scriptbots_storage::{StoragePipeline, StorageReader, rebuild_ancestry};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A sink that forwards to storage AND records what it forwarded.
+/// A sink that records exactly what storage successfully admitted.
 ///
-/// The live graph must be built from EXACTLY the records that reach the disk. If
-/// the test built it from some other source, a mismatch between live and rebuilt
-/// could be blamed on the test rather than on the database, and the comparison
-/// would prove nothing.
+/// Admission happens first so a definite rejection cannot mutate the live oracle
+/// and then duplicate its rows when the world retries the retained batch. If the
+/// test recorded a different stream from storage, a mismatch between live and
+/// rebuilt could be blamed on the test rather than on the database.
 struct TeeSink {
     inner: Box<dyn WorldPersistence>,
     seen: Arc<Mutex<AncestryGraph>>,
@@ -28,6 +28,7 @@ struct TeeSink {
 
 impl WorldPersistence for TeeSink {
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
+        self.inner.on_tick(payload)?;
         {
             let mut graph = self.seen.lock().expect("tee graph lock");
             for birth in &payload.births {
@@ -37,7 +38,7 @@ impl WorldPersistence for TeeSink {
                 graph.apply_death(death).expect("live death is well formed");
             }
         }
-        self.inner.on_tick(payload)
+        Ok(())
     }
 }
 
@@ -77,52 +78,35 @@ fn the_run_database_alone_rebuilds_the_identical_ancestry_graph() {
     // Run a world long enough that agents are actually born and actually die —
     // a rebuild proven only on an empty graph proves nothing at all.
     let seen = Arc::new(Mutex::new(AncestryGraph::new()));
-    {
+    let identity_sequence = {
         let tee = TeeSink {
             inner: Box::new(pipeline.sink()),
             seen: Arc::clone(&seen),
         };
         let mut world = WorldState::with_persistence(config, Box::new(tee)).expect("world");
 
-        // THE FOUNDING POPULATION. Founders are seeded at bootstrap, so they never
-        // pass through the spawn-commit stage and emit NO BirthRecord — which
-        // means the live graph cannot be built from birth records alone either.
-        // Both graphs must therefore learn their founders the same way, or the
-        // comparison below would be measuring the test rather than the database.
-        let mut founder_uids = Vec::new();
+        // Every agent that enters the world now emits an origin record. The tee
+        // must observe these roots from the production stream; synthesizing them
+        // in the test would conceal the exact defect this test guards against.
         for _ in 0..16 {
-            let id = world
+            world
                 .try_spawn_agent(AgentData::default())
                 .expect("seed agent");
-            founder_uids.push(world.agent_uid(id).expect("a spawned agent has a uid"));
-        }
-        {
-            let mut graph = seen.lock().expect("tee graph lock");
-            for uid in &founder_uids {
-                graph
-                    .apply_birth(&BirthRecord {
-                        tick: Tick(0),
-                        agent_uid: *uid,
-                        spawn_ordinal: 0,
-                        birth_ordinal: 0,
-                        parent_a: None,
-                        parent_b: None,
-                        brain_kind: None,
-                        brain_key: None,
-                        herbivore_tendency: 0.0,
-                        generation: Generation(0),
-                        position: Position::new(0.0, 0.0),
-                        is_hybrid: false,
-                    })
-                    .expect("a founder is a root");
-            }
         }
 
         for _ in 0..600 {
             world.step().expect("step");
         }
-    }
+        world.identity_sequence_state()
+    };
     let live_graph = seen.lock().expect("tee graph lock").clone();
+    let allocated_agent_count = usize::try_from(identity_sequence.1)
+        .expect("the allocated-agent count fits in usize on the test host");
+    assert_eq!(
+        identity_sequence.0,
+        identity_sequence.1 + 1,
+        "uid and spawn-ordinal identity counters diverged"
+    );
 
     let shutdown = pipeline.shutdown().expect("durable shutdown");
     assert!(
@@ -143,65 +127,66 @@ fn the_run_database_alone_rebuilds_the_identical_ancestry_graph() {
     // in-memory state, nothing but what was persisted — which is precisely the
     // situation an offline analyst is in.
     let reader = StorageReader::open(&path).expect("reopen the run database");
-    let founders = reader.load_ancestry_founders().expect("load founders");
     let births = reader.load_ancestry_births().expect("load births");
     let deaths = reader.load_ancestry_deaths().expect("load deaths");
     assert!(
-        !founders.is_empty(),
-        "the founding population is invisible in the database — every \
-         first-generation child would name a parent that was never born, and no \
-         phylogeny could be reconstructed at all"
+        !births.is_empty(),
+        "the persisted origin stream is empty — an empty rebuild proves nothing"
     );
-    let rebuilt =
-        rebuild_ancestry(&founders, &births, &deaths).expect("the persisted log is well formed");
-
-    // THE DATABASE IS STRICTLY MORE COMPLETE THAN THE RECORD STREAM, and that gap
-    // is a finding, not a nuisance to be papered over.
-    //
-    // Agents enter this world by two different doors. Most are BORN, through the
-    // spawn-commit stage, which emits a BirthRecord. But the founding population
-    // is seeded at bootstrap, and the population floor INJECTS agents when the
-    // world would otherwise die out — and neither of those paths emits a
-    // BirthRecord at all. A live consumer building a phylogeny from the record
-    // stream therefore never sees them: they are invisible, and their descendants
-    // would be orphan roots.
-    //
-    // The database does not have this problem, because `agents` records every
-    // agent that ever existed. So the rebuilt graph is a strict SUPERSET of the
-    // record-derived one, and the difference is exactly the agents the record
-    // stream dropped.
     assert!(
-        rebuilt.len() >= live_graph.len(),
-        "the database must know at least as much as the record stream, but it \
-         rebuilt {} nodes against the stream's {}",
+        births.iter().any(|birth| birth.origin == BirthOrigin::Born),
+        "the run produced no demographic birth, so parent-edge reconstruction was not exercised"
+    );
+    assert!(
+        births
+            .iter()
+            .any(|birth| birth.origin == BirthOrigin::Seeded),
+        "the run persisted no seeded root, so bootstrap completeness was not exercised"
+    );
+    assert!(
+        births
+            .iter()
+            .any(|birth| birth.origin == BirthOrigin::Injected),
+        "the run persisted no injected root, so population-policy completeness was not exercised"
+    );
+    assert!(
+        !deaths.is_empty(),
+        "the run produced no death, so death replay was not exercised"
+    );
+    assert_eq!(
+        births.len(),
+        allocated_agent_count,
+        "durable origin-row count differs from the core identity allocator's independent count"
+    );
+    assert_eq!(
+        births.len(),
+        live_graph.len(),
+        "the database must contain exactly one origin row for every agent the live stream saw"
+    );
+    let rebuilt = rebuild_ancestry(&births, &deaths).expect("the persisted log is well formed");
+
+    // THE ACCEPTANCE CRITERION: a graph rebuilt from nothing but persisted origin
+    // and death rows is exactly the graph the live run held. There is no agents-
+    // table founder inference and no test-only repair path.
+    assert!(
+        rebuilt.len() > 16,
+        "the complete stream never advanced beyond its initial roots ({} nodes)",
+        rebuilt.len()
+    );
+    assert_eq!(
         rebuilt.len(),
-        live_graph.len()
+        live_graph.len(),
+        "the rebuilt graph has a different node count from the live graph"
     );
-    for uid in live_graph.roots() {
-        assert!(
-            rebuilt.node(uid).is_some(),
-            "an agent the record stream saw is missing from the database rebuild"
-        );
-    }
-    assert!(
-        rebuilt.len() > live_graph.len(),
-        "EXPECTED GAP NOT PRESENT. This test documents a real defect: agents \
-         injected by the population floor (and the bootstrap founders) emit no \
-         BirthRecord, so the record stream is incomplete and the database rebuild \
-         is strictly larger. If this assertion ever fails, the defect has been \
-         FIXED — delete this assertion and assert digest equality instead."
+    assert_eq!(
+        rebuilt.canonical_digest(),
+        live_graph.canonical_digest(),
+        "the graph rebuilt from the run database differs from the live graph"
     );
-
-    // The rebuild is internally sound: every parent resolves to a node that is
-    // actually present. A phylogeny with an edge into nothing would have to choose
-    // between panicking and silently truncating a lineage.
-    for uid in rebuilt.roots() {
-        assert!(rebuilt.node(uid).is_some());
-    }
 
     // And it is DETERMINISTIC: two rebuilds of the same database agree bit for
     // bit. That is the property an offline analyst actually depends on.
-    let again = rebuild_ancestry(&founders, &births, &deaths).expect("second rebuild");
+    let again = rebuild_ancestry(&births, &deaths).expect("second rebuild");
     assert_eq!(
         again.canonical_digest(),
         rebuilt.canonical_digest(),
@@ -210,6 +195,59 @@ fn the_run_database_alone_rebuilds_the_identical_ancestry_graph() {
     );
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn tick_zero_origins_finalize_once_and_seal_the_real_storage_boundary() {
+    let path = temp_db("tick-zero-origins");
+    let mut pipeline =
+        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+    let mut world = WorldState::with_persistence(
+        ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x71C0_0A10),
+            ..ScriptBotsConfig::default()
+        },
+        Box::new(pipeline.sink()),
+    )
+    .expect("world");
+
+    world
+        .try_spawn_agent(AgentData::default())
+        .expect("tick-zero founder");
+    assert!(world.finalize_persistence().expect("tick-zero admission"));
+    assert!(
+        !world
+            .finalize_persistence()
+            .expect("idempotent tick-zero finalization")
+    );
+
+    let callback_ran = std::cell::Cell::new(false);
+    let error = world
+        .try_inject_agent_with(AgentData::default(), |_| callback_ran.set(true))
+        .expect_err("an admitted tick-zero boundary must reject a conflicting arrival");
+    assert_eq!(
+        error,
+        ScientificStateError::PersistenceBoundarySealed {
+            path: "agent".to_owned(),
+            tick: 0,
+        }
+    );
+    assert!(!callback_ran.get(), "sealed ingress invoked its callback");
+    drop(world);
+
+    let shutdown = pipeline.shutdown().expect("durable shutdown");
+    assert_eq!(shutdown.committed_tick, Some(0));
+    let reader = StorageReader::open(&path).expect("reopen tick-zero run");
+    let births = reader
+        .load_ancestry_births()
+        .expect("load tick-zero origins");
+    assert_eq!(births.len(), 1);
+    assert_eq!(births[0].tick.0, 0);
+    assert_eq!(births[0].origin, BirthOrigin::Seeded);
+    reader.close().expect("close reader");
 }
 
 #[test]
@@ -222,13 +260,11 @@ fn a_rebuild_from_an_empty_database_is_empty_rather_than_wrong() {
     pipeline.shutdown().expect("shutdown");
 
     let reader = StorageReader::open(&path).expect("reopen");
-    let founders = reader.load_ancestry_founders().expect("load founders");
     let births = reader.load_ancestry_births().expect("load births");
     let deaths = reader.load_ancestry_deaths().expect("load deaths");
-    assert!(founders.is_empty() && births.is_empty() && deaths.is_empty());
+    assert!(births.is_empty() && deaths.is_empty());
 
-    let rebuilt =
-        rebuild_ancestry(&founders, &births, &deaths).expect("an empty log is a valid log");
+    let rebuilt = rebuild_ancestry(&births, &deaths).expect("an empty log is a valid log");
     assert!(rebuilt.is_empty());
     assert_eq!(
         rebuilt.canonical_digest(),

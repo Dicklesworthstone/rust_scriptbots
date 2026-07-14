@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use scriptbots_brain::{Brain, BrainCloneError, BrainKind, BrainMutationError, into_runner};
 use scriptbots_core::{
     ActivationLayer, BrainActivations, BrainRunner, BrainSpawnError, NeuroflowActivationKind,
-    NeuroflowSettings, RandomStream, WorldState,
+    NeuroflowSettings, RandomStream, ScientificStateError, WorldState,
 };
 use std::sync::Arc;
 
@@ -67,6 +67,8 @@ pub struct NeuroflowBrainConfig {
 /// Failure while validating or constructing a NeuroFlow-backed brain.
 #[derive(Debug)]
 pub enum NeuroflowBrainError {
+    /// The world rejected registry mutation at an unresolved persistence boundary.
+    ScientificState(ScientificStateError),
     /// A public floating-point field was NaN or infinite.
     NonFinite { field: &'static str, value: f64 },
     /// A layer dimension cannot be represented by NeuroFlow or is zero.
@@ -110,6 +112,7 @@ impl NeuroflowBrainError {
 impl std::fmt::Display for NeuroflowBrainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ScientificState(error) => std::fmt::Display::fmt(error, f),
             Self::NonFinite { field, value } => {
                 write!(f, "NeuroFlow `{field}` must be finite, got {value}")
             }
@@ -155,12 +158,19 @@ impl std::fmt::Display for NeuroflowBrainError {
 impl std::error::Error for NeuroflowBrainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::ScientificState(error) => Some(error),
             Self::Allocation { source, .. } => Some(source),
             Self::SeedSerialization { source } | Self::NetworkConstruction { source } => {
                 Some(source)
             }
             _ => None,
         }
+    }
+}
+
+impl From<ScientificStateError> for NeuroflowBrainError {
+    fn from(error: ScientificStateError) -> Self {
+        Self::ScientificState(error)
     }
 }
 
@@ -354,7 +364,7 @@ impl NeuroflowBrain {
         config.validate()?;
         let config = Arc::new(config);
         let key = world
-            .brain_registry_mut()
+            .brain_registry_mut()?
             .register(Self::KIND.as_str(), move |rng| {
                 Self::runner((*config).clone(), rng)
                     .map_err(|source| BrainSpawnError::new(Self::KIND.as_str(), source))

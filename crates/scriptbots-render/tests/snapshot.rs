@@ -22,6 +22,7 @@ fn golden_dir() -> PathBuf {
 fn register_brains(world: &mut WorldState) -> u64 {
     world
         .brain_registry_mut()
+        .expect("snapshot registry mutation")
         .register(MlpBrain::KIND.as_str(), |seed_rng| {
             Ok(MlpBrain::runner(seed_rng))
         })

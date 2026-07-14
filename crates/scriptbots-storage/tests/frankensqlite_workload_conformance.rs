@@ -85,21 +85,29 @@ const SCHEMA_SQL: &str = r#"
         PRIMARY KEY (tick, agent_uid)
     );
     CREATE TABLE births (
-        tick INTEGER,
-        agent_uid INTEGER,
-        spawn_ordinal INTEGER,
-        birth_ordinal INTEGER,
-        parent_a INTEGER,
-        parent_b INTEGER,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
+        birth_ordinal INTEGER CHECK (birth_ordinal IS NULL OR birth_ordinal >= 0),
+        parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
+        parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
         brain_kind TEXT,
-        brain_key INTEGER,
-        herbivore_tendency REAL,
-        generation INTEGER,
-        position_x REAL,
-        position_y REAL,
-        is_hybrid INTEGER,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        herbivore_tendency REAL NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
+        origin TEXT NOT NULL CHECK (origin IN ('born', 'seeded', 'injected')),
+        CHECK (
+            (origin = 'born' AND birth_ordinal IS NOT NULL)
+            OR (origin IN ('seeded', 'injected') AND birth_ordinal IS NULL)
+        ),
         PRIMARY KEY (tick, agent_uid)
     );
+    CREATE UNIQUE INDEX births_agent_uid_unique ON births (agent_uid);
+    CREATE UNIQUE INDEX births_spawn_ordinal_unique ON births (spawn_ordinal);
+    CREATE UNIQUE INDEX births_birth_ordinal_unique ON births (birth_ordinal);
     CREATE TABLE deaths (
         tick INTEGER,
         agent_uid INTEGER,
@@ -120,6 +128,7 @@ const SCHEMA_SQL: &str = r#"
         hit_by_herbivore INTEGER,
         PRIMARY KEY (tick, agent_uid)
     );
+    CREATE UNIQUE INDEX deaths_agent_uid_unique ON deaths (agent_uid);
 "#;
 
 const AGENT_INSERT_SQL: &str = r#"
@@ -238,7 +247,7 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
         .expect("agent insert should bind all 39 numbered parameters");
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO births VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO births VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             &[
                 tick.into(),
                 agent_uid.into(),
@@ -253,12 +262,13 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
                 12.25_f64.into(),
                 18.75_f64.into(),
                 0_i64.into(),
+                "born".into(),
             ],
         )
         .expect("birth insert should preserve nullable parent and brain keys");
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO deaths VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO deaths VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             &[
                 tick.into(),
                 agent_uid.into(),
@@ -514,6 +524,178 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
         !agent
             .get_typed::<bool>(4)
             .expect("agent hit_by_herbivore flag should be boolean-compatible")
+    );
+
+    let duplicate_uid = connection.execute_with_params(
+        "INSERT INTO births (
+            tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+            brain_kind, brain_key, herbivore_tendency, generation,
+            position_x, position_y, is_hybrid, origin
+         ) SELECT tick + 1000, agent_uid, spawn_ordinal + 1000, birth_ordinal + 1000,
+                  parent_a, parent_b, brain_kind, brain_key, herbivore_tendency,
+                  generation, position_x, position_y, is_hybrid, origin
+           FROM births WHERE tick = ?1 AND agent_uid = ?2",
+        &[FIRST_TICK.into(), 7_i64.into()],
+    );
+    assert!(
+        duplicate_uid.is_err(),
+        "birth uid UNIQUE index must reject a second origin row at another tick"
+    );
+
+    let duplicate_spawn_ordinal = connection.execute_with_params(
+        "INSERT INTO births (
+            tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+            brain_kind, brain_key, herbivore_tendency, generation,
+            position_x, position_y, is_hybrid, origin
+         ) SELECT tick + 2000, agent_uid + 2000, spawn_ordinal, birth_ordinal + 2000,
+                  parent_a, parent_b, brain_kind, brain_key, herbivore_tendency,
+                  generation, position_x, position_y, is_hybrid, origin
+           FROM births WHERE tick = ?1 AND agent_uid = ?2",
+        &[FIRST_TICK.into(), 7_i64.into()],
+    );
+    assert!(
+        duplicate_spawn_ordinal.is_err(),
+        "birth spawn ordinal UNIQUE index must reject a second insertion ordinal"
+    );
+
+    let duplicate_birth_ordinal = connection.execute_with_params(
+        "INSERT INTO births (
+            tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+            brain_kind, brain_key, herbivore_tendency, generation,
+            position_x, position_y, is_hybrid, origin
+         ) SELECT tick + 3000, agent_uid + 3000, spawn_ordinal + 3000, birth_ordinal,
+                  parent_a, parent_b, brain_kind, brain_key, herbivore_tendency,
+                  generation, position_x, position_y, is_hybrid, origin
+           FROM births WHERE tick = ?1 AND agent_uid = ?2",
+        &[FIRST_TICK.into(), 7_i64.into()],
+    );
+    assert!(
+        duplicate_birth_ordinal.is_err(),
+        "birth ordinal UNIQUE index must reject a second demographic ordinal"
+    );
+
+    connection
+        .begin_transaction()
+        .expect("nullable birth ordinal probe transaction should begin");
+    connection
+        .execute(
+            "INSERT INTO births (
+                tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+             ) VALUES (2003, 2003, 2002, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+        )
+        .expect("birth ordinal UNIQUE index must accept a seeded NULL ordinal");
+    connection
+        .execute(
+            "INSERT INTO births (
+                tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+             ) VALUES (2004, 2004, 2003, NULL, 0.5, 0, 1.0, 2.0, 0, 'injected')",
+        )
+        .expect("birth ordinal UNIQUE index must permit multiple non-born NULL ordinals");
+    connection
+        .rollback_transaction()
+        .expect("nullable birth ordinal probe must not mutate the committed workload");
+
+    let duplicate_death_uid = connection.execute_with_params(
+        "INSERT INTO deaths
+         SELECT tick + 1000, agent_uid, age, generation, herbivore_tendency,
+                brain_kind, brain_key, energy, food_balance_total, cause, was_hybrid,
+                spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
+                hit_by_carnivore, hit_by_herbivore
+           FROM deaths WHERE tick = ?1 AND agent_uid = ?2",
+        &[FIRST_TICK.into(), 7_i64.into()],
+    );
+    assert!(
+        duplicate_death_uid.is_err(),
+        "death uid UNIQUE index must reject a second death at another tick"
+    );
+
+    let replacement_death = connection.execute_with_params(
+        "INSERT INTO deaths
+         SELECT tick, agent_uid, age, generation, herbivore_tendency,
+                brain_kind, brain_key, energy, food_balance_total, 'aging', was_hybrid,
+                spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
+                hit_by_carnivore, hit_by_herbivore
+           FROM deaths WHERE tick = ?1 AND agent_uid = ?2",
+        &[FIRST_TICK.into(), 7_i64.into()],
+    );
+    assert!(
+        replacement_death.is_err(),
+        "plain death INSERT must reject a same-tick differing-cause replacement"
+    );
+
+    let lifecycle_unique_indices = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name IN (
+                 'births_agent_uid_unique',
+                 'births_spawn_ordinal_unique',
+                 'births_birth_ordinal_unique',
+                 'deaths_agent_uid_unique'
+             )",
+        )
+        .expect("lifecycle uniqueness indices should be queryable")
+        .get_typed::<i64>(0)
+        .expect("lifecycle uniqueness index count should be INTEGER");
+    assert_eq!(
+        lifecycle_unique_indices, 4,
+        "conformance schema must mirror all production lifecycle uniqueness indices"
+    );
+
+    let invalid_origin = connection.execute_with_params(
+        "UPDATE births SET origin = ?1 WHERE tick = ?2 AND agent_uid = ?3",
+        &["unknown".into(), FIRST_TICK.into(), 7_i64.into()],
+    );
+    assert!(
+        invalid_origin.is_err(),
+        "birth origin CHECK must reject values outside the typed domain"
+    );
+
+    let missing_origin = connection.execute(
+        "INSERT INTO births (
+            tick, agent_uid, spawn_ordinal, birth_ordinal,
+            herbivore_tendency, generation, position_x, position_y, is_hybrid
+         ) VALUES (2001, 2001, 2000, 2000, 0.5, 0, 1.0, 2.0, 0)",
+    );
+    assert!(
+        missing_origin.is_err(),
+        "birth origin must be explicit; the final schema must not supply a default"
+    );
+
+    let non_birth_with_ordinal = connection.execute(
+        "INSERT INTO births (
+            tick, agent_uid, spawn_ordinal, birth_ordinal,
+            herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+         ) VALUES (2002, 2002, 2001, 2001, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+    );
+    assert!(
+        non_birth_with_ordinal.is_err(),
+        "a seeded arrival must not persist a demographic birth ordinal"
+    );
+
+    let births_schema = connection
+        .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'")
+        .expect("births schema should be queryable");
+    let births_schema = births_schema
+        .get_typed::<String>(0)
+        .expect("births schema should decode as TEXT");
+    assert!(
+        !births_schema.to_ascii_uppercase().contains("DEFAULT"),
+        "conformance schema must mirror the default-free production origin column"
+    );
+
+    let birth = connection
+        .query_row_with_params(
+            "SELECT origin FROM births WHERE tick = ?1 AND agent_uid = ?2",
+            &[FIRST_TICK.into(), 7_i64.into()],
+        )
+        .expect("birth origin should be queryable by its composite key");
+    assert_eq!(
+        birth
+            .get_typed::<String>(0)
+            .expect("birth origin should decode as TEXT"),
+        "born"
     );
 }
 

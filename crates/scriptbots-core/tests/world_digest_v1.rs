@@ -29,6 +29,7 @@ fn world_with_brain_seed(brain_seed: u64, agent_count: usize) -> WorldState {
 
     let key = world
         .brain_registry_mut()
+        .expect("digest registry mutation")
         .register(MlpBrain::KIND.as_str(), move |_world_rng| {
             let mut fixed = SmallRngStream::seed_from_u64(brain_seed);
             Ok(MlpBrain::runner(&mut fixed))

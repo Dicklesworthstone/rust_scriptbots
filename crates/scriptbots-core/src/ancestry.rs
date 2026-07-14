@@ -34,13 +34,13 @@
 //!
 //! # Memory
 //!
-//! A node carries two parent uids, a birth tick, a death tick, a cause, a
-//! generation, a brain key, and its child list. Excluding the child vector's heap
-//! that is on the order of 64 bytes, so roughly 80 bytes per node once an average
-//! of one child is counted. At 10k living agents whose full ancestry is retained,
-//! a 100k-node graph therefore costs on the order of 8 MB — which is why the graph
-//! is PRUNED rather than kept forever, and why the bound is asserted by a test
-//! rather than hoped for.
+//! A node carries two parent uids, an arrival tick, a death tick, a cause, a
+//! generation, a brain key, and its descendant list. Excluding that vector's heap,
+//! this is on the order of 64 bytes, so roughly 80 bytes per node once an average
+//! of one direct descendant is counted. At 10k living agents whose full ancestry
+//! is retained, a 100k-node graph therefore costs on the order of 8 MB — which is
+//! why the graph is PRUNED rather than kept forever, and why the bound is asserted
+//! by a test rather than hoped for.
 //!
 //! # Purity
 //!
@@ -48,7 +48,7 @@
 //! dependency and must not acquire one). The graph returns typed reports; the
 //! layer above it does the logging.
 
-use crate::{AgentUid, BirthRecord, DeathCause, DeathRecord, Generation, Tick};
+use crate::{AgentUid, BirthOrigin, BirthRecord, DeathCause, DeathRecord, Generation, Tick};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -60,8 +60,10 @@ pub const APPROX_BYTES_PER_NODE: usize = 80;
 pub struct AncestryNode {
     /// Logical identity. Never reused, unlike a slot handle.
     pub uid: AgentUid,
-    /// When it was born.
+    /// When its typed arrival was recorded.
     pub birth_tick: Tick,
+    /// How it first entered the world.
+    pub origin: BirthOrigin,
     /// When it died, if it has.
     pub death_tick: Option<Tick>,
     /// How it died, if it has.
@@ -70,7 +72,7 @@ pub struct AncestryNode {
     /// respawned at the population floor, is a legitimate ROOT rather than an
     /// orphan whose parent got lost.
     pub parents: [Option<AgentUid>; 2],
-    /// Its children, in birth order.
+    /// Its direct descendants, in arrival order.
     pub children: Vec<AgentUid>,
     /// Generations since a root.
     pub generation: Generation,
@@ -93,40 +95,60 @@ pub struct AncestryNode {
 /// worse — it will render, and it will be a lie.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AncestryError {
-    /// This child is already in the graph.
-    #[error("duplicate birth for uid {0:?}")]
+    /// This arrival's logical identity is already in the graph.
+    #[error("duplicate arrival for uid {0:?}")]
     DuplicateBirth(AgentUid),
-    /// A parent that was never born.
-    #[error("birth of {child:?} names parent {parent:?}, which is not in the graph")]
+    /// A named parent's arrival was never recorded.
+    #[error("arrival of {child:?} names parent {parent:?}, which is not in the graph")]
     UnknownParent {
-        /// The child.
+        /// The arriving descendant.
         child: AgentUid,
         /// The parent nobody has seen.
         parent: AgentUid,
     },
-    /// A child born before its parent.
+    /// Both parent slots name the same logical agent.
+    #[error("arrival of {child:?} names {parent:?} as both parents")]
+    DuplicateParent {
+        /// The arriving descendant.
+        child: AgentUid,
+        /// The repeated parent identity.
+        parent: AgentUid,
+    },
+    /// A descendant arrived no later than its parent.
     #[error(
-        "birth of {child:?} at tick {child_tick} precedes its parent {parent:?} at tick {parent_tick}"
+        "arrival of {child:?} at tick {child_tick} does not follow its parent {parent:?} at tick {parent_tick}"
     )]
     ChildPrecedesParent {
-        /// The child.
+        /// The arriving descendant.
         child: AgentUid,
-        /// When the child claims to have been born.
+        /// When the descendant's arrival was recorded.
         child_tick: u64,
         /// The parent.
         parent: AgentUid,
-        /// When the parent was born.
+        /// When the parent's arrival was recorded.
         parent_tick: u64,
     },
     /// An agent that is its own ancestor.
-    #[error("birth of {0:?} would close a cycle")]
+    #[error("arrival of {0:?} would close a lineage cycle")]
     Cycle(AgentUid),
-    /// A death for somebody who was never born.
+    /// A death whose corresponding arrival was never recorded.
     #[error("death for uid {0:?}, which is not in the graph")]
     UnknownDeath(AgentUid),
     /// A second death for the same agent.
     #[error("uid {0:?} died twice")]
     DuplicateDeath(AgentUid),
+    /// A death recorded no later than the corresponding arrival.
+    #[error(
+        "death of {uid:?} at tick {death_tick} does not follow its arrival at tick {birth_tick}"
+    )]
+    DeathPrecedesBirth {
+        /// The agent whose lifecycle ordering is invalid.
+        uid: AgentUid,
+        /// When the death was recorded.
+        death_tick: u64,
+        /// When the arrival was recorded.
+        birth_tick: u64,
+    },
 }
 
 /// What to keep when pruning.
@@ -219,7 +241,7 @@ impl AncestryGraph {
             .count()
     }
 
-    /// Record a birth.
+    /// Record one typed agent arrival.
     ///
     /// # Errors
     ///
@@ -232,6 +254,14 @@ impl AncestryGraph {
         }
 
         let parents = [record.parent_a, record.parent_b];
+        if let [Some(parent_a), Some(parent_b)] = parents
+            && parent_a == parent_b
+        {
+            return Err(AncestryError::DuplicateParent {
+                child,
+                parent: parent_a,
+            });
+        }
         for parent in parents.into_iter().flatten() {
             // A parent we have never seen is a hole in the log. Accepting it would
             // produce an edge into nothing, and every consumer that walked it
@@ -239,8 +269,8 @@ impl AncestryGraph {
             let Some(parent_node) = self.nodes.get(&parent) else {
                 return Err(AncestryError::UnknownParent { child, parent });
             };
-            // Time only runs one way. A child older than its parent is not a
-            // lineage, and a graph that accepted it could contain a cycle.
+            // Time only runs one way. A descendant that arrived no later than
+            // its parent is not a lineage, and accepting it could create a cycle.
             if record.tick.0 <= parent_node.birth_tick.0 {
                 return Err(AncestryError::ChildPrecedesParent {
                     child,
@@ -250,8 +280,9 @@ impl AncestryGraph {
                 });
             }
             // Self-parenthood is the degenerate cycle, and the strictly-increasing
-            // birth tick above rules out every longer one: an ancestor is always
-            // strictly older, so no chain of edges can return to its start.
+            // arrival-tick ordering above rules out every longer one: an
+            // ancestor is always strictly older, so no chain of edges can return
+            // to its start.
             if parent == child {
                 return Err(AncestryError::Cycle(child));
             }
@@ -268,6 +299,7 @@ impl AncestryGraph {
             AncestryNode {
                 uid: child,
                 birth_tick: record.tick,
+                origin: record.origin,
                 death_tick: None,
                 death_cause: None,
                 parents,
@@ -285,13 +317,21 @@ impl AncestryGraph {
     ///
     /// # Errors
     ///
-    /// [`AncestryError::UnknownDeath`] or [`AncestryError::DuplicateDeath`].
+    /// [`AncestryError::UnknownDeath`], [`AncestryError::DuplicateDeath`], or
+    /// [`AncestryError::DeathPrecedesBirth`].
     pub fn apply_death(&mut self, record: &DeathRecord) -> Result<(), AncestryError> {
         let Some(node) = self.nodes.get_mut(&record.agent_uid) else {
             return Err(AncestryError::UnknownDeath(record.agent_uid));
         };
         if node.death_tick.is_some() {
             return Err(AncestryError::DuplicateDeath(record.agent_uid));
+        }
+        if record.tick.0 <= node.birth_tick.0 {
+            return Err(AncestryError::DeathPrecedesBirth {
+                uid: record.agent_uid,
+                death_tick: record.tick.0,
+                birth_tick: node.birth_tick.0,
+            });
         }
         node.death_tick = Some(record.tick);
         node.death_cause = Some(record.cause);
@@ -436,7 +476,9 @@ impl AncestryGraph {
         for node in self.nodes.values() {
             mix(node.uid.0);
             mix(node.birth_tick.0);
+            mix(node.origin.digest_tag());
             mix(node.death_tick.map_or(u64::MAX, |tick| tick.0));
+            mix(node.death_cause.map_or(u64::MAX, DeathCause::digest_tag));
             mix(u64::from(node.generation.0));
             mix(node.brain_key.unwrap_or(u64::MAX));
             mix(u64::from(node.is_hybrid));
@@ -466,11 +508,22 @@ mod tests {
     use crate::{CombatEventFlags, Position};
 
     fn birth(uid: u64, tick: u64, parents: [Option<u64>; 2], generation: u32) -> BirthRecord {
+        birth_with_origin(uid, tick, parents, generation, BirthOrigin::Born)
+    }
+
+    fn birth_with_origin(
+        uid: u64,
+        tick: u64,
+        parents: [Option<u64>; 2],
+        generation: u32,
+        origin: BirthOrigin,
+    ) -> BirthRecord {
         BirthRecord {
             tick: Tick(tick),
             agent_uid: AgentUid(uid),
             spawn_ordinal: uid,
-            birth_ordinal: uid,
+            birth_ordinal: (origin == BirthOrigin::Born).then_some(uid),
+            origin,
             parent_a: parents[0].map(AgentUid),
             parent_b: parents[1].map(AgentUid),
             brain_kind: Some("mlp.baseline".to_owned()),
@@ -483,6 +536,10 @@ mod tests {
     }
 
     fn death(uid: u64, tick: u64) -> DeathRecord {
+        death_with_cause(uid, tick, DeathCause::Starvation)
+    }
+
+    fn death_with_cause(uid: u64, tick: u64, cause: DeathCause) -> DeathRecord {
         DeathRecord {
             tick: Tick(tick),
             agent_uid: AgentUid(uid),
@@ -493,7 +550,7 @@ mod tests {
             brain_key: None,
             energy: 0.0,
             food_balance_total: 0.0,
-            cause: DeathCause::Starvation,
+            cause,
             was_hybrid: false,
             combat_flags: CombatEventFlags::default(),
         }
@@ -506,10 +563,22 @@ mod tests {
         // A seeded root: no parents. This is NOT an orphan whose parent got lost —
         // the world seeds agents, and they are descendants of nothing.
         graph
-            .apply_birth(&birth(1, 0, [None, None], 0))
+            .apply_birth(&birth_with_origin(
+                1,
+                0,
+                [None, None],
+                0,
+                BirthOrigin::Seeded,
+            ))
             .expect("seeded root");
         graph
-            .apply_birth(&birth(2, 0, [None, None], 0))
+            .apply_birth(&birth_with_origin(
+                2,
+                0,
+                [None, None],
+                0,
+                BirthOrigin::Seeded,
+            ))
             .expect("second root");
 
         // Asexual: one parent.
@@ -528,6 +597,14 @@ mod tests {
         assert_eq!(graph.len(), 5);
         assert_eq!(graph.roots(), vec![AgentUid(1), AgentUid(2)]);
         assert_eq!(
+            graph.node(AgentUid(1)).expect("root").origin,
+            BirthOrigin::Seeded
+        );
+        assert_eq!(
+            graph.node(AgentUid(4)).expect("child").origin,
+            BirthOrigin::Born
+        );
+        assert_eq!(
             graph.parents_of(AgentUid(4)),
             [Some(AgentUid(1)), Some(AgentUid(2))]
         );
@@ -543,11 +620,21 @@ mod tests {
             vec![AgentUid(5), AgentUid(4), AgentUid(1)]
         );
 
-        // A floor-respawn root born mid-run is still a root.
+        // A floor-respawn root that arrives mid-run is still a root.
         graph
-            .apply_birth(&birth(6, 40, [None, None], 0))
+            .apply_birth(&birth_with_origin(
+                6,
+                40,
+                [None, None],
+                0,
+                BirthOrigin::Injected,
+            ))
             .expect("floor respawn");
         assert!(graph.roots().contains(&AgentUid(6)));
+        assert_eq!(
+            graph.node(AgentUid(6)).expect("injected root").origin,
+            BirthOrigin::Injected
+        );
     }
 
     #[test]
@@ -626,6 +713,13 @@ mod tests {
             graph.apply_birth(&birth(3, 12, [Some(999), None], 1)),
             Err(AncestryError::UnknownParent { .. })
         ));
+        assert_eq!(
+            graph.apply_birth(&birth(3, 12, [Some(1), Some(1)], 1)),
+            Err(AncestryError::DuplicateParent {
+                child: AgentUid(3),
+                parent: AgentUid(1),
+            })
+        );
         // A child older than its parent — time runs one way.
         assert!(matches!(
             graph.apply_birth(&birth(4, 1, [Some(1), None], 1)),
@@ -645,6 +739,22 @@ mod tests {
         assert_eq!(
             graph.apply_death(&death(999, 30)),
             Err(AncestryError::UnknownDeath(AgentUid(999)))
+        );
+        assert_eq!(
+            graph.apply_death(&death(2, 10)),
+            Err(AncestryError::DeathPrecedesBirth {
+                uid: AgentUid(2),
+                death_tick: 10,
+                birth_tick: 10,
+            })
+        );
+        assert_eq!(
+            graph.apply_death(&death(2, 9)),
+            Err(AncestryError::DeathPrecedesBirth {
+                uid: AgentUid(2),
+                death_tick: 9,
+                birth_tick: 10,
+            })
         );
         graph.apply_death(&death(2, 30)).expect("first death");
         assert_eq!(
@@ -805,6 +915,45 @@ mod tests {
             bytes <= ceiling,
             "the graph costs {bytes} bytes, over the documented ceiling of {ceiling}"
         );
+    }
+
+    #[test]
+    fn the_digest_distinguishes_identical_agents_with_different_origins() {
+        let build = |origin| {
+            let mut graph = AncestryGraph::new();
+            graph
+                .apply_birth(&birth_with_origin(1, 0, [None, None], 0, origin))
+                .expect("origin record");
+            graph
+        };
+
+        let born = build(BirthOrigin::Born).canonical_digest();
+        let seeded = build(BirthOrigin::Seeded).canonical_digest();
+        let injected = build(BirthOrigin::Injected).canonical_digest();
+        assert_ne!(born, seeded);
+        assert_ne!(born, injected);
+        assert_ne!(seeded, injected);
+    }
+
+    #[test]
+    fn the_digest_distinguishes_identical_deaths_with_different_causes() {
+        let build = |cause| {
+            let mut graph = AncestryGraph::new();
+            graph
+                .apply_birth(&birth(1, 0, [None, None], 0))
+                .expect("root");
+            graph
+                .apply_death(&death_with_cause(1, 5, cause))
+                .expect("death");
+            graph
+        };
+
+        let combat = build(DeathCause::CombatCarnivore).canonical_digest();
+        let starvation = build(DeathCause::Starvation).canonical_digest();
+        let aging = build(DeathCause::Aging).canonical_digest();
+        assert_ne!(combat, starvation);
+        assert_ne!(combat, aging);
+        assert_ne!(starvation, aging);
     }
 
     #[test]

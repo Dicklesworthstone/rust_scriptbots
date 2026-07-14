@@ -10,9 +10,10 @@ use fsqlite::{
     migrate::MigrationRunner,
 };
 use scriptbots_core::{
-    AgentState, AgentUid, BirthRecord, BrainBinding, DeathCause, DeathRecord, Generation,
-    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
-    ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick, WorldPersistence,
+    AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding, DeathCause, DeathRecord,
+    Generation, PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch,
+    PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick,
+    WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -43,7 +44,7 @@ const DEFAULT_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
-const OUTBOX_PAYLOAD_VERSION: u32 = 2;
+const OUTBOX_PAYLOAD_VERSION: u32 = 3;
 const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
 
 /// Files FrankenSQLite may create beside its primary database.
@@ -196,6 +197,47 @@ const SCRIPTBOTS_SCHEMA_V4: &str = "
     );
 ";
 
+const SCRIPTBOTS_SCHEMA_V5: &str = "
+    CREATE TABLE births_v5 (
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
+        birth_ordinal INTEGER CHECK (birth_ordinal IS NULL OR birth_ordinal >= 0),
+        parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
+        parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
+        brain_kind TEXT,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        herbivore_tendency REAL NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
+        origin TEXT NOT NULL CHECK (origin IN ('born', 'seeded', 'injected')),
+        CHECK (origin <> 'seeded' OR tick = 0),
+        CHECK (
+            (origin = 'born' AND birth_ordinal IS NOT NULL)
+            OR (origin IN ('seeded', 'injected') AND birth_ordinal IS NULL)
+        ),
+        PRIMARY KEY (tick, agent_uid)
+    );
+    INSERT INTO births_v5 (
+        tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+        brain_kind, brain_key, herbivore_tendency, generation,
+        position_x, position_y, is_hybrid, origin
+    )
+    SELECT
+        tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+        brain_kind, brain_key, herbivore_tendency, generation,
+        position_x, position_y, is_hybrid, 'born'
+    FROM births;
+    DROP TABLE births;
+    ALTER TABLE births_v5 RENAME TO births;
+    CREATE UNIQUE INDEX births_agent_uid_unique ON births (agent_uid);
+    CREATE UNIQUE INDEX births_spawn_ordinal_unique ON births (spawn_ordinal);
+    CREATE UNIQUE INDEX births_birth_ordinal_unique ON births (birth_ordinal);
+    CREATE UNIQUE INDEX deaths_agent_uid_unique ON deaths (agent_uid);
+";
+
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
     object_type: String,
@@ -225,6 +267,7 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
             "create_stable_uid_persistence_outbox",
             SCRIPTBOTS_SCHEMA_V4,
         )
+        .add(5, "record_birth_origin", SCRIPTBOTS_SCHEMA_V5)
         .run(connection)?;
     Ok(())
 }
@@ -951,6 +994,7 @@ pub struct PersistedTick {
 pub struct RunLedgerSummary {
     pub tick_count: u64,
     pub latest_tick: Option<PersistedTick>,
+    /// Demographic reproduction rows only (`origin = 'born'`).
     pub birth_records: u64,
     pub death_records: u64,
     pub birth_events: u64,
@@ -1282,7 +1326,7 @@ struct BirthRow {
     tick: i64,
     agent_uid: i64,
     spawn_ordinal: i64,
-    birth_ordinal: i64,
+    birth_ordinal: Option<i64>,
     parent_a: Option<i64>,
     parent_b: Option<i64>,
     brain_kind: Option<String>,
@@ -1292,6 +1336,7 @@ struct BirthRow {
     position_x: f64,
     position_y: f64,
     is_hybrid: bool,
+    origin: BirthOrigin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1332,16 +1377,22 @@ pub struct ReplayEventCount {
     pub count: u64,
 }
 
-/// One ancestry edge, read back out of the run database.
+/// One agent-arrival ancestry edge, read back out of the run database.
 ///
-/// The birth row IS the edge: child, both parents, and everything the graph needs
-/// to reconstruct the node.
+/// The physical `births` row is the edge for every origin: the arriving agent,
+/// both optional parents, and everything the graph needs to reconstruct the node.
+/// The historical type name follows that table name; it is not limited to
+/// [`BirthOrigin::Born`] records.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersistedAncestryBirth {
-    /// When the child was born.
+    /// When the agent entered the world.
     pub tick: Tick,
-    /// The child's logical identity — never a slot handle.
+    /// The arriving agent's logical identity — never a slot handle.
     pub agent_uid: AgentUid,
+    /// Monotonic ordinal among every successful agent insertion.
+    pub spawn_ordinal: u64,
+    /// Monotonic demographic-birth ordinal, present only for born agents.
+    pub birth_ordinal: Option<u64>,
     /// First parent, if any.
     pub parent_a: Option<AgentUid>,
     /// Second parent, if any.
@@ -1352,6 +1403,8 @@ pub struct PersistedAncestryBirth {
     pub brain_key: Option<u64>,
     /// Whether it was a hybrid.
     pub is_hybrid: bool,
+    /// How the agent entered the world.
+    pub origin: BirthOrigin,
 }
 
 /// One death, read back out of the run database.
@@ -1361,6 +1414,8 @@ pub struct PersistedAncestryDeath {
     pub tick: Tick,
     /// Who died.
     pub agent_uid: AgentUid,
+    /// The exact cause recorded by the live run.
+    pub cause: DeathCause,
 }
 
 /// Rebuild an ancestry graph from a run database alone.
@@ -1372,10 +1427,15 @@ pub struct PersistedAncestryDeath {
 /// The test that compares the two by `canonical_digest` is what turns that from
 /// an aspiration into a checked property.
 ///
-/// Deaths are applied AFTER all births, deliberately. An agent can die on the
-/// same tick another is born, and the two tables are ordered independently; if a
-/// death were applied before the birth it terminates, the rebuild would report an
-/// unknown-uid error for a log that is perfectly well formed.
+/// Each reconstructed [`BirthRecord`] carries the exact persisted insertion and
+/// demographic ordinals. The graph does not currently hash those fields, but
+/// fabricating placeholders here would make this record-rebuild boundary lossy.
+///
+/// Deaths are applied AFTER all arrival records, deliberately. An agent can die
+/// on the same tick another enters the world, and the two tables are ordered
+/// independently; if a death were applied before the arrival it terminates, the
+/// rebuild would report an unknown-uid error for a log that is perfectly well
+/// formed.
 ///
 /// # Errors
 ///
@@ -1383,20 +1443,16 @@ pub struct PersistedAncestryDeath {
 /// would itself be a finding: it would mean the writer emitted rows the graph's
 /// invariants reject.
 pub fn rebuild_ancestry(
-    founders: &[PersistedAncestryBirth],
     births: &[PersistedAncestryBirth],
     deaths: &[PersistedAncestryDeath],
 ) -> Result<AncestryGraph, AncestryError> {
     let mut graph = AncestryGraph::new();
-    // Founders FIRST. They have no birth row of their own, and every
-    // first-generation child names one as a parent, so a rebuild that skipped
-    // them would fail on the very first descendant.
-    for birth in founders.iter().chain(births) {
+    for birth in births {
         graph.apply_birth(&BirthRecord {
             tick: birth.tick,
             agent_uid: birth.agent_uid,
-            spawn_ordinal: 0,
-            birth_ordinal: 0,
+            spawn_ordinal: birth.spawn_ordinal,
+            birth_ordinal: birth.birth_ordinal,
             parent_a: birth.parent_a,
             parent_b: birth.parent_b,
             brain_kind: None,
@@ -1405,10 +1461,11 @@ pub fn rebuild_ancestry(
             generation: birth.generation,
             position: scriptbots_core::Position::new(0.0, 0.0),
             is_hybrid: birth.is_hybrid,
+            origin: birth.origin,
         })?;
     }
     for death in deaths {
-        // A death for an agent this run never recorded a birth for is a hole in
+        // A death for an agent this run never recorded an arrival for is a hole in
         // the log, not something to paper over.
         graph.apply_death(&DeathRecord {
             tick: death.tick,
@@ -1420,7 +1477,7 @@ pub fn rebuild_ancestry(
             brain_key: None,
             energy: 0.0,
             food_balance_total: 0.0,
-            cause: DeathCause::Starvation,
+            cause: death.cause,
             was_hybrid: false,
             combat_flags: scriptbots_core::CombatEventFlags::default(),
         })?;
@@ -1546,6 +1603,12 @@ struct OutboxPayload {
     storage: StorageBuffer,
 }
 
+#[derive(Debug, Deserialize)]
+struct OutboxPayloadEnvelope {
+    version: u32,
+    tick: u64,
+}
+
 #[derive(Serialize)]
 struct OutboxPayloadRef<'a> {
     version: u32,
@@ -1665,25 +1728,82 @@ impl StorageBuffer {
         self.replay_events.append(&mut other.replay_events);
     }
 
-    fn validate_finite(&self) -> Result<(), StorageError> {
+    fn validate_contents(&self, enclosing_tick: u64) -> Result<(), StorageError> {
         let invalid = |context: &'static str, value: f64| StorageError::InvalidData {
             context,
             reason: format!("non-finite value {value}"),
         };
-        for row in &self.ticks {
-            for (context, value) in [
-                ("ticks.total_energy", row.total_energy),
-                ("ticks.average_energy", row.average_energy),
-                ("ticks.average_health", row.average_health),
-            ] {
-                if !value.is_finite() {
-                    return Err(invalid(context, value));
-                }
+        let [summary] = self.ticks.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "ticks",
+                reason: format!(
+                    "an outbox batch must contain exactly one tick summary, found {}",
+                    self.ticks.len()
+                ),
+            });
+        };
+        let summary_tick = checked_u64("ticks.tick", summary.tick)?;
+        if summary_tick != enclosing_tick {
+            return Err(StorageError::InvalidData {
+                context: "ticks.tick",
+                reason: format!(
+                    "tick summary {summary_tick} does not match enclosing batch tick {enclosing_tick}"
+                ),
+            });
+        }
+        checked_u64("ticks.epoch", summary.epoch)?;
+        checked_usize("ticks.agent_count", summary.agent_count)?;
+        let summary_births = checked_usize("ticks.births", summary.births)?;
+        let summary_deaths = checked_usize("ticks.deaths", summary.deaths)?;
+        for (context, value) in [
+            ("ticks.total_energy", summary.total_energy),
+            ("ticks.average_energy", summary.average_energy),
+            ("ticks.average_health", summary.average_health),
+        ] {
+            if !value.is_finite() {
+                return Err(invalid(context, value));
             }
         }
         for row in &self.metrics {
             if !row.value.is_finite() {
                 return Err(invalid("metrics.value", row.value));
+            }
+        }
+        let mut birth_event_rows = 0usize;
+        let mut birth_event_total = 0usize;
+        let mut death_event_rows = 0usize;
+        let mut death_event_total = 0usize;
+        for row in &self.events {
+            let row_tick = checked_u64("events.tick", row.tick)?;
+            if row_tick != enclosing_tick {
+                return Err(StorageError::InvalidData {
+                    context: "events.tick",
+                    reason: format!(
+                        "event tick {row_tick} does not match enclosing batch tick {enclosing_tick}"
+                    ),
+                });
+            }
+            let count = checked_usize("events.count", row.count)?;
+            match row.kind.as_str() {
+                "births" => {
+                    birth_event_rows += 1;
+                    birth_event_total = birth_event_total.checked_add(count).ok_or_else(|| {
+                        StorageError::InvalidData {
+                            context: "events.births",
+                            reason: "birth event total overflow".to_owned(),
+                        }
+                    })?;
+                }
+                "deaths" => {
+                    death_event_rows += 1;
+                    death_event_total = death_event_total.checked_add(count).ok_or_else(|| {
+                        StorageError::InvalidData {
+                            context: "events.deaths",
+                            reason: "death event total overflow".to_owned(),
+                        }
+                    })?;
+                }
+                _ => {}
             }
         }
         for row in &self.agents {
@@ -1721,7 +1841,55 @@ impl StorageBuffer {
                 }
             }
         }
+        let mut birth_agent_uids = BTreeSet::new();
+        let mut birth_spawn_ordinals = BTreeSet::new();
+        let mut birth_ordinals = BTreeSet::new();
         for row in &self.births {
+            let row_tick = checked_u64("births.tick", row.tick)?;
+            validate_lifecycle_record_tick("births.tick", row_tick, enclosing_tick)?;
+            let agent_uid = checked_u64("births.agent_uid", row.agent_uid)?;
+            validate_birth_origin_tick(row.origin, row_tick, agent_uid)?;
+            checked_u64("births.spawn_ordinal", row.spawn_ordinal)?;
+            if let Some(parent_a) = row.parent_a {
+                checked_u64("births.parent_a", parent_a)?;
+            }
+            if let Some(parent_b) = row.parent_b {
+                checked_u64("births.parent_b", parent_b)?;
+            }
+            checked_u32("births.generation", row.generation)?;
+            if !birth_agent_uids.insert(row.agent_uid) {
+                return Err(StorageError::InvalidData {
+                    context: "births.agent_uid",
+                    reason: format!(
+                        "agent uid {} has more than one arrival in the enclosing batch",
+                        row.agent_uid
+                    ),
+                });
+            }
+            if !birth_spawn_ordinals.insert(row.spawn_ordinal) {
+                return Err(StorageError::InvalidData {
+                    context: "births.spawn_ordinal",
+                    reason: format!(
+                        "spawn ordinal {} has more than one arrival in the enclosing batch",
+                        row.spawn_ordinal
+                    ),
+                });
+            }
+            let birth_ordinal = row
+                .birth_ordinal
+                .map(|raw| checked_u64("births.birth_ordinal", raw))
+                .transpose()?;
+            validate_birth_origin_ordinal(row.origin, birth_ordinal)?;
+            if let Some(birth_ordinal) = row.birth_ordinal
+                && !birth_ordinals.insert(birth_ordinal)
+            {
+                return Err(StorageError::InvalidData {
+                    context: "births.birth_ordinal",
+                    reason: format!(
+                        "birth ordinal {birth_ordinal} has more than one birth in the enclosing batch"
+                    ),
+                });
+            }
             for (context, value) in [
                 ("births.herbivore_tendency", row.herbivore_tendency),
                 ("births.position_x", row.position_x),
@@ -1732,7 +1900,22 @@ impl StorageBuffer {
                 }
             }
         }
+        let mut death_uids = BTreeSet::new();
         for row in &self.deaths {
+            let row_tick = checked_u64("deaths.tick", row.tick)?;
+            validate_lifecycle_record_tick("deaths.tick", row_tick, enclosing_tick)?;
+            checked_u64("deaths.agent_uid", row.agent_uid)?;
+            checked_u32("deaths.age", row.age)?;
+            checked_u32("deaths.generation", row.generation)?;
+            if !death_uids.insert(row.agent_uid) {
+                return Err(StorageError::InvalidData {
+                    context: "deaths.agent_uid",
+                    reason: format!(
+                        "agent uid {} has more than one death in the enclosing batch",
+                        row.agent_uid
+                    ),
+                });
+            }
             for (context, value) in [
                 ("deaths.herbivore_tendency", row.herbivore_tendency),
                 ("deaths.energy", row.energy),
@@ -1743,11 +1926,57 @@ impl StorageBuffer {
                 }
             }
         }
+        let born_records = self
+            .births
+            .iter()
+            .filter(|row| row.origin == BirthOrigin::Born)
+            .count();
+        if summary_births != born_records {
+            return Err(StorageError::InvalidData {
+                context: "ticks.births",
+                reason: format!(
+                    "tick summary reports {summary_births} demographic births, but the batch carries {born_records} Born origin rows"
+                ),
+            });
+        }
+        if summary_deaths != self.deaths.len() {
+            return Err(StorageError::InvalidData {
+                context: "ticks.deaths",
+                reason: format!(
+                    "tick summary reports {summary_deaths} deaths, but the batch carries {} death rows",
+                    self.deaths.len()
+                ),
+            });
+        }
+        for (context, expected, rows, total) in [
+            (
+                "events.births",
+                summary_births,
+                birth_event_rows,
+                birth_event_total,
+            ),
+            (
+                "events.deaths",
+                summary_deaths,
+                death_event_rows,
+                death_event_total,
+            ),
+        ] {
+            let expected_rows = usize::from(expected > 0);
+            if rows != expected_rows || total != expected {
+                return Err(StorageError::InvalidData {
+                    context,
+                    reason: format!(
+                        "expected {expected_rows} canonical event row(s) totaling {expected}, found {rows} row(s) totaling {total}"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
     fn encode_outbox(&self, tick: u64) -> Result<(String, String), StorageError> {
-        self.validate_finite()?;
+        self.validate_contents(tick)?;
         let payload = serde_json::to_string(&OutboxPayloadRef {
             version: OUTBOX_PAYLOAD_VERSION,
             tick,
@@ -1773,27 +2002,37 @@ impl StorageBuffer {
                 reason: format!("expected {expected_digest}, computed {actual_digest}"),
             });
         }
+        let envelope: OutboxPayloadEnvelope =
+            serde_json::from_str(payload).map_err(|error| StorageError::InvalidData {
+                context: "storage_outbox.payload",
+                reason: error.to_string(),
+            })?;
+        if envelope.version != OUTBOX_PAYLOAD_VERSION {
+            return Err(StorageError::InvalidData {
+                context: "storage_outbox.payload.version",
+                reason: format!(
+                    "unsupported version {}, expected {}",
+                    envelope.version, OUTBOX_PAYLOAD_VERSION
+                ),
+            });
+        }
+        if envelope.tick != expected_tick {
+            return Err(StorageError::InvalidData {
+                context: "storage_outbox.payload.tick",
+                reason: format!(
+                    "ledger tick {expected_tick}, payload tick {}",
+                    envelope.tick
+                ),
+            });
+        }
         let decoded: OutboxPayload =
             serde_json::from_str(payload).map_err(|error| StorageError::InvalidData {
                 context: "storage_outbox.payload",
                 reason: error.to_string(),
             })?;
-        if decoded.version != OUTBOX_PAYLOAD_VERSION {
-            return Err(StorageError::InvalidData {
-                context: "storage_outbox.payload.version",
-                reason: format!(
-                    "unsupported version {}, expected {}",
-                    decoded.version, OUTBOX_PAYLOAD_VERSION
-                ),
-            });
-        }
-        if decoded.tick != expected_tick {
-            return Err(StorageError::InvalidData {
-                context: "storage_outbox.payload.tick",
-                reason: format!("ledger tick {expected_tick}, payload tick {}", decoded.tick),
-            });
-        }
-        decoded.storage.validate_finite()?;
+        debug_assert_eq!(decoded.version, envelope.version);
+        debug_assert_eq!(decoded.tick, envelope.tick);
+        decoded.storage.validate_contents(expected_tick)?;
         Ok(decoded.storage)
     }
 }
@@ -1822,8 +2061,81 @@ fn sqlite_optional_text(value: Option<&str>) -> SqliteValue {
     value.map_or(SqliteValue::Null, SqliteValue::from)
 }
 
+fn decode_birth_origin(value: &str) -> Result<BirthOrigin, StorageError> {
+    match value {
+        "born" => Ok(BirthOrigin::Born),
+        "seeded" => Ok(BirthOrigin::Seeded),
+        "injected" => Ok(BirthOrigin::Injected),
+        other => Err(StorageError::InvalidData {
+            context: "births.origin",
+            reason: format!("unknown birth origin {other:?}"),
+        }),
+    }
+}
+
+fn validate_birth_origin_ordinal(
+    origin: BirthOrigin,
+    birth_ordinal: Option<u64>,
+) -> Result<(), StorageError> {
+    match (origin, birth_ordinal) {
+        (BirthOrigin::Born, None) => Err(StorageError::InvalidData {
+            context: "births.birth_ordinal",
+            reason: "born origin requires a demographic birth ordinal".to_owned(),
+        }),
+        (BirthOrigin::Seeded | BirthOrigin::Injected, Some(_)) => Err(StorageError::InvalidData {
+            context: "births.birth_ordinal",
+            reason: format!(
+                "{} origin must not carry a demographic birth ordinal",
+                origin.as_str()
+            ),
+        }),
+        (BirthOrigin::Born, Some(_)) | (BirthOrigin::Seeded | BirthOrigin::Injected, None) => {
+            Ok(())
+        }
+    }
+}
+
+fn validate_birth_origin_tick(
+    origin: BirthOrigin,
+    tick: u64,
+    agent_uid: u64,
+) -> Result<(), StorageError> {
+    if origin == BirthOrigin::Seeded && tick != 0 {
+        return Err(StorageError::InvalidData {
+            context: "births.origin",
+            reason: format!(
+                "seeded founder uid {agent_uid} must arrive at tick zero, found tick {tick}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_lifecycle_record_tick(
+    context: &'static str,
+    record_tick: u64,
+    enclosing_tick: u64,
+) -> Result<(), StorageError> {
+    if record_tick > enclosing_tick {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!(
+                "lifecycle record tick {record_tick} exceeds enclosing batch tick {enclosing_tick}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn checked_u64(context: &'static str, value: i64) -> Result<u64, StorageError> {
     u64::try_from(value).map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+fn checked_u32(context: &'static str, value: i64) -> Result<u32, StorageError> {
+    u32::try_from(value).map_err(|error| StorageError::InvalidData {
         context,
         reason: error.to_string(),
     })
@@ -2020,116 +2332,85 @@ impl StorageReader {
         Ok(events)
     }
 
-    /// Load every ancestry edge recorded in this run, ready for an offline rebuild.
+    /// Load every agent-arrival ancestry edge recorded in this run for offline rebuild.
     ///
-    /// THE BIRTH ROW IS THE EDGE. Every field the graph needs — the child's uid,
-    /// both parents' uids, the birth tick, the generation, the brain key, and the
-    /// hybrid flag — is already on `births`, so there is no second table to keep
-    /// in sync and no join that could silently drop a parent.
+    /// THE PHYSICAL `births` ROW IS THE EDGE FOR EVERY ORIGIN. Every field the
+    /// graph needs — the arriving agent's uid, exact insertion and demographic
+    /// ordinals, both parents' uids, the arrival tick, the generation, the brain
+    /// key, the hybrid flag, and the origin — is already present, so there is no
+    /// second table to keep in sync and no join that could silently drop a parent.
+    /// Despite this method's historical table-derived name, the returned rows
+    /// include born, seeded, and injected arrivals.
     ///
     /// Ordered by `(tick, agent_uid)`, and that order is LOAD-BEARING rather than
     /// tidy: a rebuilt graph is checked against the live one by digest, and the
-    /// digest only means something if the replay order is fixed. It also
-    /// guarantees a parent is always inserted before its child, because a child's
-    /// birth tick is strictly greater than its parent's.
+    /// digest only means something if the replay order is fixed. Monotonic UIDs
+    /// also keep an existing parent before a same-tick injected crossover arrival.
     ///
     /// # Errors
     ///
-    /// [`StorageError`] if the connection is unavailable or a row does not decode.
+    /// [`StorageError`] if the connection is unavailable, a row does not decode,
+    /// a seeded founder is recorded after tick zero, or an origin carries an
+    /// inconsistent demographic-birth ordinal.
     pub fn load_ancestry_births(&self) -> Result<Vec<PersistedAncestryBirth>, StorageError> {
         let rows = self.connection()?.query(
-            "SELECT tick, agent_uid, parent_a, parent_b, generation, brain_key, is_hybrid
+            "SELECT tick, agent_uid, spawn_ordinal, birth_ordinal,
+                    parent_a, parent_b, generation, brain_key, is_hybrid, origin
              FROM births
              ORDER BY tick ASC, agent_uid ASC",
         )?;
         let mut births = Vec::with_capacity(rows.len());
         for row in rows {
-            let tick: i64 = decode(&row, 0, "births.tick")?;
-            let agent_uid: i64 = decode(&row, 1, "births.agent_uid")?;
-            let parent_a: Option<i64> = decode(&row, 2, "births.parent_a")?;
-            let parent_b: Option<i64> = decode(&row, 3, "births.parent_b")?;
-            let generation: i64 = decode(&row, 4, "births.generation")?;
-            let brain_key: Option<i64> = decode(&row, 5, "births.brain_key")?;
-            let is_hybrid: i64 = decode(&row, 6, "births.is_hybrid")?;
+            let tick = checked_u64("births.tick", decode::<i64>(&row, 0, "births.tick")?)?;
+            let agent_uid = checked_u64(
+                "births.agent_uid",
+                decode::<i64>(&row, 1, "births.agent_uid")?,
+            )?;
+            let spawn_ordinal: i64 = decode(&row, 2, "births.spawn_ordinal")?;
+            let birth_ordinal: Option<i64> = decode(&row, 3, "births.birth_ordinal")?;
+            let parent_a: Option<i64> = decode(&row, 4, "births.parent_a")?;
+            let parent_b: Option<i64> = decode(&row, 5, "births.parent_b")?;
+            let generation: i64 = decode(&row, 6, "births.generation")?;
+            let brain_key: Option<i64> = decode(&row, 7, "births.brain_key")?;
+            let is_hybrid: i64 = decode(&row, 8, "births.is_hybrid")?;
+            let origin: String = decode(&row, 9, "births.origin")?;
+            let birth_ordinal = birth_ordinal
+                .map(|raw| checked_u64("births.birth_ordinal", raw))
+                .transpose()?;
+            let origin = decode_birth_origin(&origin)?;
+            validate_birth_origin_ordinal(origin, birth_ordinal)?;
+            validate_birth_origin_tick(origin, tick, agent_uid)?;
 
             births.push(PersistedAncestryBirth {
-                tick: Tick(checked_u64("births.tick", tick)?),
-                agent_uid: AgentUid(checked_u64("births.agent_uid", agent_uid)?),
+                tick: Tick(tick),
+                agent_uid: AgentUid(agent_uid),
+                spawn_ordinal: checked_u64("births.spawn_ordinal", spawn_ordinal)?,
+                birth_ordinal,
                 parent_a: parent_a
                     .map(|raw| checked_u64("births.parent_a", raw).map(AgentUid))
                     .transpose()?,
                 parent_b: parent_b
                     .map(|raw| checked_u64("births.parent_b", raw).map(AgentUid))
                     .transpose()?,
-                generation: Generation(
-                    u32::try_from(checked_u64("births.generation", generation)?)
-                        .unwrap_or(u32::MAX),
-                ),
+                generation: Generation(checked_u32("births.generation", generation)?),
                 brain_key: brain_key
                     .map(|raw| checked_u64("births.brain_key", raw))
                     .transpose()?,
                 is_hybrid: is_hybrid != 0,
+                origin,
             });
         }
         Ok(births)
     }
 
-    /// Load the FOUNDING population: agents that exist but were never born.
-    ///
-    /// The founders are seeded at bootstrap, so they never pass through the
-    /// spawn-commit stage and therefore have NO ROW IN `births`. Reading only the
-    /// birth table, an offline rebuild sees every first-generation child name a
-    /// parent it has never heard of, and the whole phylogeny fails to construct.
-    ///
-    /// The founders are not missing from the database, though — they are in
-    /// `agents`. A founder is exactly an agent that exists and has no birth row,
-    /// which is what this query says, and it is the reason the run database really
-    /// is sufficient for offline ancestry rather than merely almost sufficient.
-    ///
-    /// Their earliest observed tick is used as a birth tick, which is correct in
-    /// the only sense that matters here: a founder must be strictly older than its
-    /// children, and it is.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageError`] if the connection is unavailable or a row does not decode.
-    pub fn load_ancestry_founders(&self) -> Result<Vec<PersistedAncestryBirth>, StorageError> {
-        let rows = self.connection()?.query(
-            "SELECT MIN(a.tick) AS first_tick, a.agent_uid, MIN(a.generation) AS generation
-             FROM agents a
-             WHERE a.agent_uid NOT IN (SELECT b.agent_uid FROM births b)
-             GROUP BY a.agent_uid
-             ORDER BY a.agent_uid ASC",
-        )?;
-        let mut founders = Vec::with_capacity(rows.len());
-        for row in rows {
-            let tick: i64 = decode(&row, 0, "agents.tick")?;
-            let agent_uid: i64 = decode(&row, 1, "agents.agent_uid")?;
-            let generation: i64 = decode(&row, 2, "agents.generation")?;
-            founders.push(PersistedAncestryBirth {
-                tick: Tick(checked_u64("agents.tick", tick)?),
-                agent_uid: AgentUid(checked_u64("agents.agent_uid", agent_uid)?),
-                parent_a: None,
-                parent_b: None,
-                generation: Generation(
-                    u32::try_from(checked_u64("agents.generation", generation)?)
-                        .unwrap_or(u32::MAX),
-                ),
-                brain_key: None,
-                is_hybrid: false,
-            });
-        }
-        Ok(founders)
-    }
-
-    /// Load every death recorded in this run, ordered to match the birth replay.
+    /// Load every death recorded in this run, ordered to match the arrival replay.
     ///
     /// # Errors
     ///
     /// [`StorageError`] if the connection is unavailable or a row does not decode.
     pub fn load_ancestry_deaths(&self) -> Result<Vec<PersistedAncestryDeath>, StorageError> {
         let rows = self.connection()?.query(
-            "SELECT tick, agent_uid
+            "SELECT tick, agent_uid, cause
              FROM deaths
              ORDER BY tick ASC, agent_uid ASC",
         )?;
@@ -2137,9 +2418,11 @@ impl StorageReader {
         for row in rows {
             let tick: i64 = decode(&row, 0, "deaths.tick")?;
             let agent_uid: i64 = decode(&row, 1, "deaths.agent_uid")?;
+            let cause: String = decode(&row, 2, "deaths.cause")?;
             deaths.push(PersistedAncestryDeath {
                 tick: Tick(checked_u64("deaths.tick", tick)?),
                 agent_uid: AgentUid(checked_u64("deaths.agent_uid", agent_uid)?),
+                cause: decode_death_cause(&cause)?,
             });
         }
         Ok(deaths)
@@ -2286,7 +2569,8 @@ impl StorageReader {
             let tick_count_row = tx.query_row("SELECT COUNT(*) FROM ticks")?;
             let tick_count =
                 checked_u64("ticks.count", decode(&tick_count_row, 0, "ticks.count")?)?;
-            let birth_count_row = tx.query_row("SELECT COUNT(*) FROM births")?;
+            let birth_count_row =
+                tx.query_row("SELECT COUNT(*) FROM births WHERE origin = 'born'")?;
             let birth_records =
                 checked_u64("births.count", decode(&birth_count_row, 0, "births.count")?)?;
             let death_count_row = tx.query_row("SELECT COUNT(*) FROM deaths")?;
@@ -3114,11 +3398,11 @@ impl Storage {
             "SELECT version, name FROM _schema_migrations
              ORDER BY version ASC",
         )?;
-        if migrations.len() != 2 {
+        if migrations.len() != 3 {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_schema",
                 reason: format!(
-                    "expected exactly two ScriptBots migrations, found {}",
+                    "expected exactly three ScriptBots migrations, found {}",
                     migrations.len()
                 ),
             });
@@ -3126,6 +3410,7 @@ impl Storage {
         let expected_migrations = [
             (3_i64, "create_stable_agent_uid_schema"),
             (4_i64, "create_stable_uid_persistence_outbox"),
+            (5_i64, "record_birth_origin"),
         ];
         for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
             let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
@@ -3339,6 +3624,296 @@ impl Storage {
             .transpose()
     }
 
+    fn validate_new_birth_identities(&self, prepared: &StorageBuffer) -> Result<(), StorageError> {
+        if prepared.births.is_empty() {
+            return Ok(());
+        }
+
+        let buffered_agent_uids = self
+            .buffer
+            .births
+            .iter()
+            .map(|row| row.agent_uid)
+            .collect::<BTreeSet<_>>();
+        let buffered_spawn_ordinals = self
+            .buffer
+            .births
+            .iter()
+            .map(|row| row.spawn_ordinal)
+            .collect::<BTreeSet<_>>();
+        let buffered_birth_ordinals = self
+            .buffer
+            .births
+            .iter()
+            .filter_map(|row| row.birth_ordinal)
+            .collect::<BTreeSet<_>>();
+        for row in &prepared.births {
+            if buffered_agent_uids.contains(&row.agent_uid) {
+                return Err(StorageError::InvalidData {
+                    context: "births.agent_uid",
+                    reason: format!("agent uid {} already has a staged arrival", row.agent_uid),
+                });
+            }
+            if buffered_spawn_ordinals.contains(&row.spawn_ordinal) {
+                return Err(StorageError::InvalidData {
+                    context: "births.spawn_ordinal",
+                    reason: format!(
+                        "spawn ordinal {} already has a staged arrival",
+                        row.spawn_ordinal
+                    ),
+                });
+            }
+            if let Some(ordinal) = row.birth_ordinal
+                && buffered_birth_ordinals.contains(&ordinal)
+            {
+                return Err(StorageError::InvalidData {
+                    context: "births.birth_ordinal",
+                    reason: format!("birth ordinal {ordinal} already has a staged birth"),
+                });
+            }
+
+            let existing = self.connection()?.query_with_params(
+                "SELECT agent_uid, spawn_ordinal, birth_ordinal
+                 FROM births
+                 WHERE agent_uid = ?1 OR spawn_ordinal = ?2 OR birth_ordinal = ?3
+                 LIMIT 1",
+                &[
+                    row.agent_uid.into(),
+                    row.spawn_ordinal.into(),
+                    sqlite_optional_i64(row.birth_ordinal),
+                ],
+            )?;
+            if let Some(existing) = existing.first() {
+                let existing_agent_uid =
+                    checked_u64("births.agent_uid", decode(existing, 0, "births.agent_uid")?)?;
+                let existing_spawn_ordinal = checked_u64(
+                    "births.spawn_ordinal",
+                    decode(existing, 1, "births.spawn_ordinal")?,
+                )?;
+                let existing_birth_ordinal =
+                    decode::<Option<i64>>(existing, 2, "births.birth_ordinal")?
+                        .map(|raw| checked_u64("births.birth_ordinal", raw))
+                        .transpose()?;
+                let new_agent_uid = checked_u64("births.agent_uid", row.agent_uid)?;
+                let new_spawn_ordinal = checked_u64("births.spawn_ordinal", row.spawn_ordinal)?;
+                let new_birth_ordinal = row
+                    .birth_ordinal
+                    .map(|raw| checked_u64("births.birth_ordinal", raw))
+                    .transpose()?;
+                let (context, detail) = if existing_agent_uid == new_agent_uid {
+                    (
+                        "births.agent_uid",
+                        format!("agent uid {new_agent_uid} already has a persisted arrival"),
+                    )
+                } else if existing_spawn_ordinal == new_spawn_ordinal {
+                    (
+                        "births.spawn_ordinal",
+                        format!(
+                            "spawn ordinal {new_spawn_ordinal} already has a persisted arrival"
+                        ),
+                    )
+                } else if let Some(ordinal) = new_birth_ordinal {
+                    debug_assert_eq!(existing_birth_ordinal, new_birth_ordinal);
+                    (
+                        "births.birth_ordinal",
+                        format!("birth ordinal {ordinal} already has a persisted birth"),
+                    )
+                } else {
+                    return Err(StorageError::InvalidData {
+                        context: "births.birth_ordinal",
+                        reason: "a NULL birth ordinal matched an indexed persisted value"
+                            .to_owned(),
+                    });
+                };
+                return Err(StorageError::InvalidData {
+                    context,
+                    reason: detail,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_new_death_uids(&self, prepared: &StorageBuffer) -> Result<(), StorageError> {
+        if prepared.deaths.is_empty() {
+            return Ok(());
+        }
+
+        let buffered = self
+            .buffer
+            .deaths
+            .iter()
+            .map(|row| row.agent_uid)
+            .collect::<BTreeSet<_>>();
+        for row in &prepared.deaths {
+            if buffered.contains(&row.agent_uid) {
+                return Err(StorageError::InvalidData {
+                    context: "deaths.agent_uid",
+                    reason: format!("agent uid {} already has a staged death", row.agent_uid),
+                });
+            }
+            let existing = self.connection()?.query_with_params(
+                "SELECT agent_uid, tick FROM deaths WHERE agent_uid = ?1 LIMIT 1",
+                &[row.agent_uid.into()],
+            )?;
+            if let Some(existing) = existing.first() {
+                let existing_uid =
+                    checked_u64("deaths.agent_uid", decode(existing, 0, "deaths.agent_uid")?)?;
+                let new_uid = checked_u64("deaths.agent_uid", row.agent_uid)?;
+                if existing_uid != new_uid {
+                    return Err(StorageError::InvalidData {
+                        context: "deaths.agent_uid",
+                        reason: format!(
+                            "death lookup for uid {new_uid} returned uid {existing_uid}"
+                        ),
+                    });
+                }
+                let existing_tick =
+                    checked_u64("deaths.tick", decode(existing, 1, "deaths.tick")?)?;
+                return Err(StorageError::InvalidData {
+                    context: "deaths.agent_uid",
+                    reason: format!(
+                        "agent uid {new_uid} already has a persisted death at tick {existing_tick}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_new_ancestry_relationships(
+        &self,
+        prepared: &StorageBuffer,
+    ) -> Result<(), StorageError> {
+        if prepared.births.is_empty() && prepared.deaths.is_empty() {
+            return Ok(());
+        }
+
+        // Unapplied admitted batches live in `buffer`; applied batches live in
+        // `births`; and the current batch can contain a parent arrival followed by
+        // a later child or death. Build one read-only view across all three
+        // locations before the new outbox identity is assigned.
+        let mut known_birth_ticks = BTreeMap::new();
+        for row in self.buffer.births.iter().chain(&prepared.births) {
+            known_birth_ticks.insert(
+                checked_u64("births.agent_uid", row.agent_uid)?,
+                checked_u64("births.tick", row.tick)?,
+            );
+        }
+        let mut referenced_uids = BTreeSet::new();
+
+        for row in &prepared.births {
+            let parent_a = row
+                .parent_a
+                .map(|raw| checked_u64("births.parent_a", raw))
+                .transpose()?;
+            let parent_b = row
+                .parent_b
+                .map(|raw| checked_u64("births.parent_b", raw))
+                .transpose()?;
+            if let (Some(parent_a), Some(parent_b)) = (parent_a, parent_b)
+                && parent_a == parent_b
+            {
+                return Err(StorageError::InvalidData {
+                    context: "births.parent_b",
+                    reason: format!(
+                        "arrival uid {} names parent uid {parent_a} in both parent slots",
+                        row.agent_uid
+                    ),
+                });
+            }
+            referenced_uids.extend([parent_a, parent_b].into_iter().flatten());
+        }
+        for row in &prepared.deaths {
+            referenced_uids.insert(checked_u64("deaths.agent_uid", row.agent_uid)?);
+        }
+
+        for agent_uid in referenced_uids {
+            let std::collections::btree_map::Entry::Vacant(entry) =
+                known_birth_ticks.entry(agent_uid)
+            else {
+                continue;
+            };
+            let existing = self.connection()?.query_with_params(
+                "SELECT agent_uid, tick FROM births WHERE agent_uid = ?1 LIMIT 1",
+                &[encode_u64("births.agent_uid", agent_uid)?.into()],
+            )?;
+            if let Some(row) = existing.first() {
+                let persisted_uid =
+                    checked_u64("births.agent_uid", decode(row, 0, "births.agent_uid")?)?;
+                if persisted_uid != agent_uid {
+                    return Err(StorageError::InvalidData {
+                        context: "births.agent_uid",
+                        reason: format!(
+                            "arrival lookup for uid {agent_uid} returned uid {persisted_uid}"
+                        ),
+                    });
+                }
+                entry.insert(checked_u64("births.tick", decode(row, 1, "births.tick")?)?);
+            }
+        }
+
+        for row in &prepared.births {
+            let child_uid = checked_u64("births.agent_uid", row.agent_uid)?;
+            let child_tick = checked_u64("births.tick", row.tick)?;
+            for (context, parent_uid) in [
+                ("births.parent_a", row.parent_a),
+                ("births.parent_b", row.parent_b),
+            ] {
+                let Some(parent_uid) = parent_uid else {
+                    continue;
+                };
+                let parent_uid = checked_u64(context, parent_uid)?;
+                let Some(parent_tick) = known_birth_ticks.get(&parent_uid).copied() else {
+                    return Err(StorageError::InvalidData {
+                        context,
+                        reason: format!(
+                            "arrival uid {child_uid} names parent uid {parent_uid}, whose arrival was not recorded"
+                        ),
+                    });
+                };
+                if child_tick <= parent_tick {
+                    return Err(StorageError::InvalidData {
+                        context,
+                        reason: format!(
+                            "arrival uid {child_uid} at tick {child_tick} does not follow parent uid {parent_uid} at tick {parent_tick}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        for row in &prepared.deaths {
+            let agent_uid = checked_u64("deaths.agent_uid", row.agent_uid)?;
+            let death_tick = checked_u64("deaths.tick", row.tick)?;
+            let Some(birth_tick) = known_birth_ticks.get(&agent_uid).copied() else {
+                return Err(StorageError::InvalidData {
+                    context: "deaths.agent_uid",
+                    reason: format!("death uid {agent_uid} has no recorded arrival"),
+                });
+            };
+            if death_tick <= birth_tick {
+                return Err(StorageError::InvalidData {
+                    context: "deaths.tick",
+                    reason: format!(
+                        "death uid {agent_uid} at tick {death_tick} does not follow its arrival at tick {birth_tick}"
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_new_lifecycle_identities(
+        &self,
+        prepared: &StorageBuffer,
+    ) -> Result<(), StorageError> {
+        self.validate_new_birth_identities(prepared)?;
+        self.validate_new_death_uids(prepared)?;
+        self.validate_new_ancestry_relationships(prepared)
+    }
+
     fn stage_outbox(
         &mut self,
         tick: u64,
@@ -3393,6 +3968,7 @@ impl Storage {
             ));
         }
 
+        self.validate_new_lifecycle_identities(prepared)?;
         let batch_id = PersistenceBatchId::new(self.next_batch_id)?;
         let expected_previous = batch_id.as_i64() - 1;
         if before.admitted_raw() != expected_previous {
@@ -3547,6 +4123,7 @@ impl Storage {
                 batch.storage.ticks.last().map(|row| row.tick as u64),
                 Some(batch.tick)
             );
+            self.validate_new_lifecycle_identities(&batch.storage)?;
             self.buffer.append(batch.storage);
             self.buffered_outbox_ids.push(batch.batch_id);
             next_unapplied += 1;
@@ -3620,6 +4197,7 @@ impl Storage {
                 .push(replay_row_from_event(event, tick, seq)?);
         }
 
+        prepared.validate_contents(summary.tick.0)?;
         Ok(prepared)
     }
 
@@ -3790,11 +4368,11 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into births (
+        let sql = "insert into births (
                 tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
                 brain_kind, brain_key, herbivore_tendency,
-                generation, position_x, position_y, is_hybrid
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
+                generation, position_x, position_y, is_hybrid, origin
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -3802,7 +4380,7 @@ impl Storage {
                     row.tick.into(),
                     row.agent_uid.into(),
                     row.spawn_ordinal.into(),
-                    row.birth_ordinal.into(),
+                    sqlite_optional_i64(row.birth_ordinal),
                     sqlite_optional_i64(row.parent_a),
                     sqlite_optional_i64(row.parent_b),
                     sqlite_optional_text(row.brain_kind.as_deref()),
@@ -3812,6 +4390,7 @@ impl Storage {
                     row.position_x.into(),
                     row.position_y.into(),
                     sqlite_bool(row.is_hybrid),
+                    row.origin.as_str().into(),
                 ],
             )?;
         }
@@ -3822,7 +4401,7 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into deaths (
+        let sql = "insert into deaths (
                 tick, agent_uid, age, generation,
                 herbivore_tendency, brain_kind, brain_key,
                 energy, food_balance_total, cause, was_hybrid,
@@ -6310,11 +6889,16 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
 }
 
 fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError> {
+    validate_birth_origin_ordinal(record.origin, record.birth_ordinal)?;
+    let birth_ordinal = record
+        .birth_ordinal
+        .map(|ordinal| encode_u64("births.birth_ordinal", ordinal))
+        .transpose()?;
     Ok(BirthRow {
         tick: encode_u64("births.tick", record.tick.0)?,
         agent_uid: encode_u64("births.agent_uid", record.agent_uid.get())?,
         spawn_ordinal: encode_u64("births.spawn_ordinal", record.spawn_ordinal)?,
-        birth_ordinal: encode_u64("births.birth_ordinal", record.birth_ordinal)?,
+        birth_ordinal,
         parent_a: optional_agent_uid("births.parent_a", record.parent_a)?,
         parent_b: optional_agent_uid("births.parent_b", record.parent_b)?,
         brain_kind: record.brain_kind.clone(),
@@ -6327,6 +6911,7 @@ fn birth_row_from_record(record: &BirthRecord) -> Result<BirthRow, StorageError>
         position_x: f64::from(record.position.x),
         position_y: f64::from(record.position.y),
         is_hybrid: record.is_hybrid,
+        origin: record.origin,
     })
 }
 
@@ -6337,6 +6922,20 @@ fn death_cause_to_string(cause: DeathCause) -> &'static str {
         DeathCause::Starvation => "starvation",
         DeathCause::Aging => "aging",
         DeathCause::Unknown => "unknown",
+    }
+}
+
+fn decode_death_cause(value: &str) -> Result<DeathCause, StorageError> {
+    match value {
+        "combat_carnivore" => Ok(DeathCause::CombatCarnivore),
+        "combat_herbivore" => Ok(DeathCause::CombatHerbivore),
+        "starvation" => Ok(DeathCause::Starvation),
+        "aging" => Ok(DeathCause::Aging),
+        "unknown" => Ok(DeathCause::Unknown),
+        other => Err(StorageError::InvalidData {
+            context: "deaths.cause",
+            reason: format!("unknown death cause {other:?}"),
+        }),
     }
 }
 
@@ -6425,7 +7024,7 @@ mod tests {
             summary: TickSummary {
                 tick: Tick(tick),
                 agent_count: 1,
-                births: 1,
+                births: 0,
                 deaths: 0,
                 total_energy: energy,
                 average_energy: energy,
@@ -6440,11 +7039,76 @@ mod tests {
                 MetricSample::from_f32("average_energy", energy),
                 MetricSample::from_f32("average_health", 1.0),
             ],
-            events: vec![PersistenceEvent::new(PersistenceEventKind::Births, 1)],
+            events: vec![PersistenceEvent::new(
+                PersistenceEventKind::Custom("sample".into()),
+                1,
+            )],
             agents: vec![sample_agent(energy)],
             births: Vec::new(),
             deaths: Vec::new(),
             replay_events: Vec::new(),
+        }
+    }
+
+    fn synchronize_lifecycle_counts(batch: &mut PersistenceBatch) {
+        let births = batch
+            .births
+            .iter()
+            .filter(|record| record.origin == BirthOrigin::Born)
+            .count();
+        let deaths = batch.deaths.len();
+        batch.summary.births = births;
+        batch.summary.deaths = deaths;
+        batch.events.retain(|event| {
+            !matches!(
+                &event.kind,
+                PersistenceEventKind::Births | PersistenceEventKind::Deaths
+            )
+        });
+        if births > 0 {
+            batch
+                .events
+                .push(PersistenceEvent::new(PersistenceEventKind::Births, births));
+        }
+        if deaths > 0 {
+            batch
+                .events
+                .push(PersistenceEvent::new(PersistenceEventKind::Deaths, deaths));
+        }
+    }
+
+    fn sample_birth(tick: u64, uid: u64, origin: BirthOrigin) -> BirthRecord {
+        BirthRecord {
+            tick: Tick(tick),
+            agent_uid: AgentUid(uid),
+            spawn_ordinal: uid.saturating_sub(1),
+            birth_ordinal: (origin == BirthOrigin::Born).then_some(uid),
+            origin,
+            parent_a: None,
+            parent_b: None,
+            brain_kind: Some("test.origin".to_owned()),
+            brain_key: None,
+            herbivore_tendency: 0.5,
+            generation: Generation(0),
+            position: Position::new(1.0, 2.0),
+            is_hybrid: false,
+        }
+    }
+
+    fn sample_death(tick: u64, uid: u64, cause: DeathCause) -> DeathRecord {
+        DeathRecord {
+            tick: Tick(tick),
+            agent_uid: AgentUid(uid),
+            age: 1,
+            generation: Generation(0),
+            herbivore_tendency: 0.5,
+            brain_kind: Some("test.death".to_owned()),
+            brain_key: None,
+            energy: 0.0,
+            food_balance_total: 0.0,
+            cause,
+            was_hybrid: false,
+            combat_flags: scriptbots_core::CombatEventFlags::default(),
         }
     }
 
@@ -7087,15 +7751,356 @@ mod tests {
     }
 
     #[test]
+    fn birth_origin_migration_backfills_historical_rows_without_a_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        MigrationRunner::new()
+            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
+            .add(
+                4,
+                "create_stable_uid_persistence_outbox",
+                SCRIPTBOTS_SCHEMA_V4,
+            )
+            .run(&connection)?;
+        connection.execute(
+            "INSERT INTO births (
+                tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+                brain_kind, brain_key, herbivore_tendency, generation,
+                position_x, position_y, is_hybrid
+             ) VALUES (1, 2, 1, 0, NULL, NULL, NULL, NULL, 0.5, 0, 1.0, 2.0, 0)",
+        )?;
+
+        install_scriptbots_schema(&connection)?;
+
+        let origin: String = connection
+            .query_row("SELECT origin FROM births WHERE tick = 1 AND agent_uid = 2")?
+            .get_typed(0)?;
+        assert_eq!(origin, "born");
+        let historical_ordinal: Option<i64> = connection
+            .query_row("SELECT birth_ordinal FROM births WHERE tick = 1 AND agent_uid = 2")?
+            .get_typed(0)?;
+        assert_eq!(historical_ordinal, Some(0));
+        let births_schema: String = connection
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'")?
+            .get_typed(0)?;
+        assert!(
+            !births_schema.to_ascii_uppercase().contains("DEFAULT"),
+            "the final origin column must not retain a DEFAULT: {births_schema}"
+        );
+        assert!(
+            births_schema.contains("PRIMARY KEY (tick, agent_uid)"),
+            "the table rebuild did not preserve the composite primary key: {births_schema}"
+        );
+        assert!(
+            connection
+                .execute("UPDATE births SET origin = 'unknown' WHERE tick = 1")
+                .is_err(),
+            "the V5 origin domain must remain strict after migrating a historical row"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO births (
+                        tick, agent_uid, spawn_ordinal, birth_ordinal,
+                        herbivore_tendency, generation, position_x, position_y, is_hybrid
+                     ) VALUES (2, 3, 2, NULL, 0.5, 0, 3.0, 4.0, 0)",
+                )
+                .is_err(),
+            "omitting origin must fail instead of silently defaulting to born"
+        );
+        connection.execute(
+            "INSERT INTO births (
+                tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+             ) VALUES (0, 1, 0, NULL, 0.5, 0, 3.0, 4.0, 0, 'seeded')",
+        )?;
+        let seeded_ordinal: Option<i64> = connection
+            .query_row("SELECT birth_ordinal FROM births WHERE agent_uid = 1")?
+            .get_typed(0)?;
+        assert_eq!(seeded_ordinal, None);
+        assert!(
+            connection
+                .execute("UPDATE births SET tick = 2 WHERE agent_uid = 1")
+                .is_err(),
+            "the V5 schema must keep seeded founders at tick zero"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO births (
+                        tick, agent_uid, spawn_ordinal, birth_ordinal,
+                        herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+                     ) VALUES (3, 3, 2, 2, 0.5, 0, 3.0, 4.0, 0, 'injected')",
+                )
+                .is_err(),
+            "non-born origins must not persist a demographic birth ordinal"
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn birth_origin_migration_rejects_historical_duplicate_uids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        MigrationRunner::new()
+            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
+            .add(
+                4,
+                "create_stable_uid_persistence_outbox",
+                SCRIPTBOTS_SCHEMA_V4,
+            )
+            .run(&connection)?;
+        connection.execute(
+            "INSERT INTO births (
+                tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid
+             ) VALUES (1, 7, 0, 0, 0.5, 0, 1.0, 2.0, 0)",
+        )?;
+        connection.execute(
+            "INSERT INTO births (
+                tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid
+             ) VALUES (2, 7, 1, 1, 0.5, 0, 3.0, 4.0, 0)",
+        )?;
+
+        install_scriptbots_schema(&connection)
+            .expect_err("V5 must reject historical databases with duplicate origin UIDs");
+        let v5_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM _schema_migrations WHERE version = 5")?
+            .get_typed(0)?;
+        assert_eq!(v5_count, 0, "a failed uniqueness migration was recorded");
+
+        let births_schema: String = connection
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'")?
+            .get_typed(0)?;
+        assert!(
+            !births_schema.contains("origin"),
+            "failed V5 leaked its replacement schema instead of rolling back: {births_schema}"
+        );
+        let replacement_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'births_v5'",
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            replacement_count, 0,
+            "failed V5 left its rebuild table behind"
+        );
+        let historical_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM births WHERE agent_uid = 7")?
+            .get_typed(0)?;
+        assert_eq!(
+            historical_rows, 2,
+            "failed V5 did not restore both historical duplicate rows"
+        );
+
+        connection.execute("UPDATE births SET agent_uid = 8 WHERE tick = 2 AND agent_uid = 7")?;
+        install_scriptbots_schema(&connection)?;
+        let migrated_origins: i64 = connection
+            .query_row("SELECT COUNT(*) FROM births WHERE origin = 'born'")?
+            .get_typed(0)?;
+        assert_eq!(migrated_origins, 2, "retry did not backfill every V4 row");
+        let unique_index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                     'births_agent_uid_unique',
+                     'births_spawn_ordinal_unique',
+                     'births_birth_ordinal_unique',
+                     'deaths_agent_uid_unique'
+                 )",
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            unique_index_count, 4,
+            "retry did not finish every V5 lifecycle uniqueness index"
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn birth_origin_migration_rejects_duplicate_ordinals_atomically_and_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (duplicate_kind, rows, repair_sql) in [
+            (
+                "spawn",
+                [(1_i64, 7_i64, 9_i64, 0_i64), (2, 8, 9, 1)],
+                "UPDATE births SET spawn_ordinal = 10 WHERE tick = 2",
+            ),
+            (
+                "birth",
+                [(1_i64, 7_i64, 9_i64, 9_i64), (2, 8, 10, 9)],
+                "UPDATE births SET birth_ordinal = 10 WHERE tick = 2",
+            ),
+        ] {
+            let connection = Connection::open(":memory:")?;
+            MigrationRunner::new()
+                .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
+                .add(
+                    4,
+                    "create_stable_uid_persistence_outbox",
+                    SCRIPTBOTS_SCHEMA_V4,
+                )
+                .run(&connection)?;
+            for (tick, agent_uid, spawn_ordinal, birth_ordinal) in rows {
+                connection.execute_with_params(
+                    "INSERT INTO births (
+                        tick, agent_uid, spawn_ordinal, birth_ordinal,
+                        herbivore_tendency, generation, position_x, position_y, is_hybrid
+                     ) VALUES (?1, ?2, ?3, ?4, 0.5, 0, 1.0, 2.0, 0)",
+                    &[
+                        tick.into(),
+                        agent_uid.into(),
+                        spawn_ordinal.into(),
+                        birth_ordinal.into(),
+                    ],
+                )?;
+            }
+
+            let expected_failure = format!(
+                "V5 must reject historical databases with duplicate {duplicate_kind} ordinals"
+            );
+            install_scriptbots_schema(&connection).expect_err(&expected_failure);
+            let v5_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM _schema_migrations WHERE version = 5")?
+                .get_typed(0)?;
+            assert_eq!(
+                v5_count, 0,
+                "a failed {duplicate_kind}-ordinal migration was recorded"
+            );
+            let births_schema: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'",
+                )?
+                .get_typed(0)?;
+            assert!(
+                !births_schema.contains("origin"),
+                "failed {duplicate_kind}-ordinal V5 leaked its replacement schema: {births_schema}"
+            );
+            let replacement_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'births_v5'",
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                replacement_count, 0,
+                "failed {duplicate_kind}-ordinal V5 left its rebuild table behind"
+            );
+            let historical_rows: i64 = connection
+                .query_row("SELECT COUNT(*) FROM births")?
+                .get_typed(0)?;
+            assert_eq!(
+                historical_rows, 2,
+                "failed {duplicate_kind}-ordinal V5 did not restore both historical rows"
+            );
+
+            connection.execute(repair_sql)?;
+            install_scriptbots_schema(&connection)?;
+            let index_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name IN (
+                         'births_agent_uid_unique',
+                         'births_spawn_ordinal_unique',
+                         'births_birth_ordinal_unique'
+                     )",
+                )?
+                .get_typed(0)?;
+            assert_eq!(
+                index_count, 3,
+                "retry after repairing duplicate {duplicate_kind} ordinals missed an index"
+            );
+            connection.execute(
+                "INSERT INTO births (
+                    tick, agent_uid, spawn_ordinal, birth_ordinal,
+                    herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+                 ) VALUES (0, 1, 0, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+            )?;
+            connection.execute(
+                "INSERT INTO births (
+                    tick, agent_uid, spawn_ordinal, birth_ordinal,
+                    herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+                 ) VALUES (21, 21, 21, NULL, 0.5, 0, 1.0, 2.0, 0, 'injected')",
+            )?;
+            connection.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn birth_origin_migration_rejects_duplicate_death_uids_atomically_and_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        MigrationRunner::new()
+            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
+            .add(
+                4,
+                "create_stable_uid_persistence_outbox",
+                SCRIPTBOTS_SCHEMA_V4,
+            )
+            .run(&connection)?;
+        for (tick, cause) in [(1_i64, "starvation"), (2_i64, "aging")] {
+            connection.execute_with_params(
+                "INSERT INTO deaths (
+                    tick, agent_uid, age, generation, herbivore_tendency,
+                    energy, food_balance_total, cause, was_hybrid,
+                    spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
+                    hit_by_carnivore, hit_by_herbivore
+                 ) VALUES (?1, 7, 1, 0, 0.5, 0.0, 0.0, ?2, 0, 0, 0, 0, 0, 0, 0)",
+                &[tick.into(), cause.into()],
+            )?;
+        }
+
+        install_scriptbots_schema(&connection)
+            .expect_err("V5 must reject historical databases with duplicate death UIDs");
+        let v5_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM _schema_migrations WHERE version = 5")?
+            .get_typed(0)?;
+        assert_eq!(v5_count, 0, "a failed death-UID migration was recorded");
+        let births_schema: String = connection
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'")?
+            .get_typed(0)?;
+        assert!(
+            !births_schema.contains("origin"),
+            "failed death-UID V5 leaked the birth-table rebuild: {births_schema}"
+        );
+        let death_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM deaths WHERE agent_uid = 7")?
+            .get_typed(0)?;
+        assert_eq!(
+            death_rows, 2,
+            "failed death-UID V5 did not restore both historical rows"
+        );
+
+        connection.execute("UPDATE deaths SET agent_uid = 8 WHERE tick = 2")?;
+        install_scriptbots_schema(&connection)?;
+        let death_index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'deaths_agent_uid_unique'",
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            death_index_count, 1,
+            "retry did not finish the death UID uniqueness index"
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn recovery_requires_the_exact_supported_migration_set_without_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let future = temp_db_path("storage-recovery-future-migration");
         create_valid_database(&future)?;
         add_schema_object(
             &future,
-            "INSERT INTO _schema_migrations (version, name) VALUES (5, 'future_schema')",
+            "INSERT INTO _schema_migrations (version, name) VALUES (6, 'future_schema')",
         )?;
-        assert_recovery_refused_without_database_mutation(&future, "exactly two")?;
+        assert_recovery_refused_without_database_mutation(&future, "exactly three")?;
 
         let incomplete = temp_db_path("storage-recovery-incomplete-migration-set");
         let incomplete_connection = Connection::open(incomplete.to_string_lossy().as_ref())?;
@@ -7103,7 +8108,7 @@ mod tests {
             .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
             .run(&incomplete_connection)?;
         incomplete_connection.close()?;
-        assert_recovery_refused_without_database_mutation(&incomplete, "exactly two")?;
+        assert_recovery_refused_without_database_mutation(&incomplete, "exactly three")?;
         Ok(())
     }
 
@@ -7122,6 +8127,8 @@ mod tests {
              VALUES (3, 'create_stable_agent_uid_schema', 'forged');
              INSERT INTO _schema_migrations (version, name, applied_at)
              VALUES (4, 'create_stable_uid_persistence_outbox', 'forged');
+             INSERT INTO _schema_migrations (version, name, applied_at)
+             VALUES (5, 'record_birth_origin', 'forged');
              CREATE TABLE storage_progress (
                 singleton INTEGER PRIMARY KEY,
                 admitted_batch_id INTEGER NOT NULL,
@@ -7407,11 +8414,20 @@ mod tests {
     }
 
     #[test]
-    fn durable_outbox_recovers_an_admitted_batch_after_the_worker_boundary()
+    fn durable_outbox_recovers_all_birth_origins_after_the_worker_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-outbox-admission-recovery");
         let path_string = path.to_string_lossy().to_string();
-        let batch = sample_batch(21, 2.1);
+        let mut batch = sample_batch(21, 2.1);
+        let mut born = sample_birth(21, 17, BirthOrigin::Born);
+        born.spawn_ordinal = 41;
+        born.birth_ordinal = Some(73);
+        let mut seeded = sample_birth(0, 29, BirthOrigin::Seeded);
+        seeded.spawn_ordinal = 0;
+        let mut injected = sample_birth(21, 37, BirthOrigin::Injected);
+        injected.spawn_ordinal = 64;
+        batch.births = vec![born, seeded, injected];
+        synchronize_lifecycle_counts(&mut batch);
         let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
         let mut interrupted = create_file_storage(&path_string)?;
         let (admission, newly_admitted) =
@@ -7441,6 +8457,55 @@ mod tests {
         let shutdown = recovered.shutdown()?;
         assert_eq!(shutdown.watermarks, snapshot.watermarks);
 
+        let reader = StorageReader::open(&path_string)?;
+        let persisted_arrivals = reader
+            .load_ancestry_births()?
+            .into_iter()
+            .map(|birth| {
+                (
+                    birth.agent_uid,
+                    birth.spawn_ordinal,
+                    birth.birth_ordinal,
+                    birth.origin,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_arrivals,
+            vec![
+                (AgentUid(29), 0, None, BirthOrigin::Seeded),
+                (AgentUid(17), 41, Some(73), BirthOrigin::Born),
+                (AgentUid(37), 64, None, BirthOrigin::Injected),
+            ],
+            "durable outbox recovery changed an origin or persisted ordinal"
+        );
+        let ordinal_rows = reader.connection()?.query(
+            "SELECT agent_uid, spawn_ordinal, birth_ordinal, origin
+                 FROM births ORDER BY agent_uid ASC",
+        )?;
+        let persisted_ordinals = ordinal_rows
+            .iter()
+            .map(|row| {
+                Ok::<_, StorageError>((
+                    decode::<i64>(row, 0, "births.agent_uid")?,
+                    decode::<i64>(row, 1, "births.spawn_ordinal")?,
+                    decode::<Option<i64>>(row, 2, "births.birth_ordinal")?,
+                    decode::<String>(row, 3, "births.origin")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            persisted_ordinals,
+            vec![
+                (17, 41, Some(73), "born".to_owned()),
+                (29, 0, None, "seeded".to_owned()),
+                (37, 64, None, "injected".to_owned()),
+            ],
+            "durable outbox recovery did not preserve exact raw identity and ordinal columns"
+        );
+        assert_eq!(reader.run_ledger_summary()?.birth_records, 1);
+        reader.close()?;
+
         let durable = recover_file_storage(&path_string)?;
         assert_eq!(
             durable
@@ -7455,6 +8520,443 @@ mod tests {
         assert_eq!(tick_count, 1);
         assert_integrity(&durable)?;
         durable.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_ancestry_incoherence_before_partial_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-outbox-ancestry-corruption");
+        let path_string = path.to_string_lossy().to_string();
+        let mut interrupted = create_file_storage(&path_string)?;
+
+        let mut root_batch = sample_batch(10, 1.0);
+        root_batch.summary.births = 0;
+        root_batch.births = vec![sample_birth(10, 200, BirthOrigin::Injected)];
+        synchronize_lifecycle_counts(&mut root_batch);
+        let root = PreparedPersistenceBatch::from_batch(&root_batch)?;
+        let (root_admission, root_is_new) = interrupted.stage_outbox(root.tick, &root.storage)?;
+        assert!(root_is_new);
+        assert!(!interrupted.enqueue_staged(root_admission.batch_id, root.storage)?);
+
+        let mut child_batch = sample_batch(11, 1.1);
+        let mut child = sample_birth(11, 201, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(200));
+        child_batch.births = vec![child];
+        synchronize_lifecycle_counts(&mut child_batch);
+        let child = PreparedPersistenceBatch::from_batch(&child_batch)?;
+        let (child_admission, child_is_new) =
+            interrupted.stage_outbox(child.tick, &child.storage)?;
+        assert!(child_is_new);
+        assert!(!interrupted.enqueue_staged(child_admission.batch_id, child.storage)?);
+        interrupted.abandon_after_error();
+
+        // Model a correctly hashed but semantically corrupted durable outbox.
+        // Decode-level shape checks must pass so the recovery-only relational
+        // validator is the layer that refuses it.
+        let corruptor = Connection::open(&path_string)?;
+        let original_payload: String = corruptor
+            .query_row_with_params(
+                "SELECT payload FROM storage_outbox WHERE batch_id = ?1",
+                &[child_admission.batch_id.as_i64().into()],
+            )?
+            .get_typed(0)?;
+        let mut corrupted: Value = serde_json::from_str(&original_payload)?;
+        corrupted["storage"]["births"][0]["parent_a"] = json!(999_i64);
+        let corrupted_payload = serde_json::to_string(&corrupted)?;
+        let corrupted_digest = format!(
+            "blake3:{}",
+            blake3::hash(corrupted_payload.as_bytes()).to_hex()
+        );
+        assert_eq!(
+            corruptor.execute_with_params(
+                "UPDATE storage_outbox SET payload = ?1 WHERE batch_id = ?2",
+                &[
+                    corrupted_payload.as_str().into(),
+                    child_admission.batch_id.as_i64().into(),
+                ],
+            )?,
+            1
+        );
+        assert_eq!(
+            corruptor.execute_with_params(
+                "UPDATE storage_batch_ledger SET payload_digest = ?1 WHERE batch_id = ?2",
+                &[
+                    corrupted_digest.as_str().into(),
+                    child_admission.batch_id.as_i64().into(),
+                ],
+            )?,
+            1
+        );
+        corruptor.close()?;
+
+        let error = recover_file_storage(&path_string)
+            .err()
+            .expect("recovery accepted an outbox child whose parent was never recorded");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "births.parent_a",
+                ..
+            }
+        ));
+
+        let inspector = Connection::open(&path_string)?;
+        let tick_count: i64 = inspector
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        assert_eq!(
+            tick_count, 0,
+            "failed recovery partially replayed the root batch"
+        );
+        let progress = inspector.query_row(
+            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress WHERE singleton = 1",
+        )?;
+        assert_eq!(
+            progress.get_typed::<i64>(0)?,
+            child_admission.batch_id.as_i64()
+        );
+        assert_eq!(progress.get_typed::<i64>(1)?, 0);
+        assert_eq!(progress.get_typed::<i64>(2)?, 0);
+        inspector.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_rehashed_lifecycle_count_divergence_before_partial_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-outbox-lifecycle-count-corruption");
+        let path_string = path.to_string_lossy().to_string();
+        let mut interrupted = create_file_storage(&path_string)?;
+
+        let root = PreparedPersistenceBatch::from_batch(&sample_batch(10, 1.0))?;
+        let (root_admission, root_is_new) = interrupted.stage_outbox(root.tick, &root.storage)?;
+        assert!(root_is_new);
+        assert!(!interrupted.enqueue_staged(root_admission.batch_id, root.storage)?);
+
+        let mut born_batch = sample_batch(11, 1.1);
+        born_batch.births = vec![sample_birth(11, 401, BirthOrigin::Born)];
+        synchronize_lifecycle_counts(&mut born_batch);
+        let born = PreparedPersistenceBatch::from_batch(&born_batch)?;
+        let (born_admission, born_is_new) = interrupted.stage_outbox(born.tick, &born.storage)?;
+        assert!(born_is_new);
+        assert!(!interrupted.enqueue_staged(born_admission.batch_id, born.storage)?);
+        interrupted.abandon_after_error();
+
+        // Rehash both durable identities after deleting the origin row. Digest
+        // integrity therefore passes; semantic cross-field validation must be
+        // what refuses replay before the valid root batch is partially applied.
+        let corruptor = Connection::open(&path_string)?;
+        let original_payload: String = corruptor
+            .query_row_with_params(
+                "SELECT payload FROM storage_outbox WHERE batch_id = ?1",
+                &[born_admission.batch_id.as_i64().into()],
+            )?
+            .get_typed(0)?;
+        let mut corrupted: Value = serde_json::from_str(&original_payload)?;
+        corrupted["storage"]["births"] = json!([]);
+        let corrupted_payload = serde_json::to_string(&corrupted)?;
+        let corrupted_digest = format!(
+            "blake3:{}",
+            blake3::hash(corrupted_payload.as_bytes()).to_hex()
+        );
+        assert_eq!(
+            corruptor.execute_with_params(
+                "UPDATE storage_outbox SET payload = ?1 WHERE batch_id = ?2",
+                &[
+                    corrupted_payload.as_str().into(),
+                    born_admission.batch_id.as_i64().into(),
+                ],
+            )?,
+            1
+        );
+        assert_eq!(
+            corruptor.execute_with_params(
+                "UPDATE storage_batch_ledger SET payload_digest = ?1 WHERE batch_id = ?2",
+                &[
+                    corrupted_digest.as_str().into(),
+                    born_admission.batch_id.as_i64().into(),
+                ],
+            )?,
+            1
+        );
+        corruptor.close()?;
+
+        let error = recover_file_storage(&path_string)
+            .err()
+            .expect("recovery accepted a demographic birth with no Born origin row");
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "ticks.births",
+                ..
+            }
+        ));
+
+        let inspector = Connection::open(&path_string)?;
+        let tick_count: i64 = inspector
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        assert_eq!(
+            tick_count, 0,
+            "failed recovery partially replayed the valid root batch"
+        );
+        let progress = inspector.query_row(
+            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress WHERE singleton = 1",
+        )?;
+        assert_eq!(
+            progress.get_typed::<i64>(0)?,
+            born_admission.batch_id.as_i64()
+        );
+        assert_eq!(progress.get_typed::<i64>(1)?, 0);
+        assert_eq!(progress.get_typed::<i64>(2)?, 0);
+        inspector.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_lifecycle_values_outside_core_u32_before_partial_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let overflow = i64::from(u32::MAX) + 1;
+        for (label, collection, field, context) in [
+            (
+                "birth-generation",
+                "births",
+                "generation",
+                "births.generation",
+            ),
+            ("death-age", "deaths", "age", "deaths.age"),
+            (
+                "death-generation",
+                "deaths",
+                "generation",
+                "deaths.generation",
+            ),
+        ] {
+            let path = temp_db_path(&format!("storage-outbox-{label}-overflow"));
+            let path_string = path.to_string_lossy().to_string();
+            let mut interrupted = create_file_storage(&path_string)?;
+
+            let mut root_batch = sample_batch(10, 1.0);
+            root_batch.summary.births = 0;
+            root_batch.births = vec![sample_birth(10, 400, BirthOrigin::Injected)];
+            synchronize_lifecycle_counts(&mut root_batch);
+            let root = PreparedPersistenceBatch::from_batch(&root_batch)?;
+            let (root_admission, root_is_new) =
+                interrupted.stage_outbox(root.tick, &root.storage)?;
+            assert!(root_is_new);
+            assert!(!interrupted.enqueue_staged(root_admission.batch_id, root.storage)?);
+
+            let mut second_batch = sample_batch(11, 1.1);
+            if collection == "births" {
+                let mut child = sample_birth(11, 401, BirthOrigin::Born);
+                child.parent_a = Some(AgentUid(400));
+                second_batch.births = vec![child];
+            } else {
+                second_batch.summary.births = 0;
+                second_batch.summary.deaths = 1;
+                second_batch.deaths = vec![sample_death(11, 400, DeathCause::Aging)];
+            }
+            synchronize_lifecycle_counts(&mut second_batch);
+            let second = PreparedPersistenceBatch::from_batch(&second_batch)?;
+            let (second_admission, second_is_new) =
+                interrupted.stage_outbox(second.tick, &second.storage)?;
+            assert!(second_is_new);
+            assert!(!interrupted.enqueue_staged(second_admission.batch_id, second.storage)?);
+            interrupted.abandon_after_error();
+
+            let corruptor = Connection::open(&path_string)?;
+            let original_payload: String = corruptor
+                .query_row_with_params(
+                    "SELECT payload FROM storage_outbox WHERE batch_id = ?1",
+                    &[second_admission.batch_id.as_i64().into()],
+                )?
+                .get_typed(0)?;
+            let mut corrupted: Value = serde_json::from_str(&original_payload)?;
+            corrupted["storage"][collection][0][field] = json!(overflow);
+            let corrupted_payload = serde_json::to_string(&corrupted)?;
+            let corrupted_digest = format!(
+                "blake3:{}",
+                blake3::hash(corrupted_payload.as_bytes()).to_hex()
+            );
+            assert_eq!(
+                corruptor.execute_with_params(
+                    "UPDATE storage_outbox SET payload = ?1 WHERE batch_id = ?2",
+                    &[
+                        corrupted_payload.as_str().into(),
+                        second_admission.batch_id.as_i64().into(),
+                    ],
+                )?,
+                1
+            );
+            assert_eq!(
+                corruptor.execute_with_params(
+                    "UPDATE storage_batch_ledger SET payload_digest = ?1 WHERE batch_id = ?2",
+                    &[
+                        corrupted_digest.as_str().into(),
+                        second_admission.batch_id.as_i64().into(),
+                    ],
+                )?,
+                1
+            );
+            corruptor.close()?;
+
+            let recovery = recover_file_storage(&path_string);
+            assert!(recovery.is_err(), "recovery accepted overflowing {context}");
+            let Err(error) = recovery else {
+                continue;
+            };
+            assert!(matches!(
+                error,
+                StorageError::InvalidData {
+                    context: actual,
+                    ..
+                } if actual == context
+            ));
+
+            let inspector = Connection::open(&path_string)?;
+            let tick_count: i64 = inspector
+                .query_row("SELECT COUNT(*) FROM ticks")?
+                .get_typed(0)?;
+            assert_eq!(
+                tick_count, 0,
+                "failed {context} recovery partially replayed its valid prefix"
+            );
+            let progress = inspector.query_row(
+                "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
+                 FROM storage_progress WHERE singleton = 1",
+            )?;
+            assert_eq!(
+                progress.get_typed::<i64>(0)?,
+                second_admission.batch_id.as_i64()
+            );
+            assert_eq!(progress.get_typed::<i64>(1)?, 0);
+            assert_eq!(progress.get_typed::<i64>(2)?, 0);
+            inspector.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ancestry_reader_rejects_generation_outside_the_core_u32_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-ancestry-generation-domain");
+        let path_string = path.to_string_lossy().to_string();
+        let mut batch = sample_batch(23, 2.3);
+        batch.births = vec![sample_birth(23, 11, BirthOrigin::Injected)];
+        synchronize_lifecycle_counts(&mut batch);
+
+        let mut storage = create_file_storage(&path_string)?;
+        storage.persist(&batch)?;
+        storage.flush()?;
+        storage.close()?;
+
+        let connection = Connection::open(&path_string)?;
+        connection.execute_with_params(
+            "UPDATE births SET generation = ?1 WHERE agent_uid = 11",
+            &[(i64::from(u32::MAX) + 1).into()],
+        )?;
+        connection.close()?;
+
+        let reader = StorageReader::open(&path_string)?;
+        assert_invalid_data_context(reader.load_ancestry_births(), "births.generation");
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stale_or_tampered_birth_origin_outbox_payload_is_refused() -> Result<(), StorageError> {
+        let mut batch = sample_batch(22, 2.2);
+        batch.births = vec![
+            sample_birth(22, 1, BirthOrigin::Born),
+            sample_birth(0, 2, BirthOrigin::Seeded),
+            sample_birth(22, 3, BirthOrigin::Injected),
+        ];
+        synchronize_lifecycle_counts(&mut batch);
+        let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
+        let (payload, payload_digest) = prepared.storage.encode_outbox(prepared.tick)?;
+        let stale_payload = r#"{"version":2,"tick":22,"storage":{"ticks":[],"metrics":[],"events":[],"agents":[],"births":[{"tick":22,"agent_uid":1,"spawn_ordinal":0,"birth_ordinal":0,"parent_a":null,"parent_b":null,"brain_kind":"legacy","brain_key":null,"herbivore_tendency":0.5,"generation":0,"position_x":1.0,"position_y":2.0,"is_hybrid":false}],"deaths":[],"replay_events":[]}}"#;
+        assert!(
+            !stale_payload.contains("\"origin\""),
+            "the V2 fixture accidentally included the V3-only origin field"
+        );
+        let stale_digest = format!("blake3:{}", blake3::hash(stale_payload.as_bytes()).to_hex());
+        let version_error =
+            StorageBuffer::decode_outbox(stale_payload, prepared.tick, &stale_digest)
+                .expect_err("a correctly hashed V2-shaped payload must still be refused");
+        assert!(matches!(
+            version_error,
+            StorageError::InvalidData {
+                context: "storage_outbox.payload.version",
+                ..
+            }
+        ));
+
+        let inconsistent_payload =
+            payload.replacen("\"birth_ordinal\":1", "\"birth_ordinal\":null", 1);
+        assert_ne!(
+            inconsistent_payload, payload,
+            "the test failed to remove the born arrival's ordinal"
+        );
+        let inconsistent_digest = format!(
+            "blake3:{}",
+            blake3::hash(inconsistent_payload.as_bytes()).to_hex()
+        );
+        let invariant_error = StorageBuffer::decode_outbox(
+            &inconsistent_payload,
+            prepared.tick,
+            &inconsistent_digest,
+        )
+        .expect_err("a correctly hashed payload with an inconsistent ordinal must be refused");
+        assert!(matches!(
+            invariant_error,
+            StorageError::InvalidData {
+                context: "births.birth_ordinal",
+                ..
+            }
+        ));
+
+        let late_seeded_payload = payload.replacen(
+            "\"tick\":0,\"agent_uid\":2",
+            "\"tick\":22,\"agent_uid\":2",
+            1,
+        );
+        assert_ne!(
+            late_seeded_payload, payload,
+            "the test failed to move the seeded founder after bootstrap"
+        );
+        let late_seeded_digest = format!(
+            "blake3:{}",
+            blake3::hash(late_seeded_payload.as_bytes()).to_hex()
+        );
+        let late_seeded_error =
+            StorageBuffer::decode_outbox(&late_seeded_payload, prepared.tick, &late_seeded_digest)
+                .expect_err("a correctly hashed nonzero seeded arrival must be refused");
+        assert!(matches!(
+            late_seeded_error,
+            StorageError::InvalidData {
+                context: "births.origin",
+                ..
+            }
+        ));
+
+        let tampered_payload = payload.replacen("\"tick\":22", "\"tick\":23", 1);
+        assert_ne!(
+            tampered_payload, payload,
+            "the test failed to tamper with the current outbox payload"
+        );
+        let tamper_error =
+            StorageBuffer::decode_outbox(&tampered_payload, prepared.tick, &payload_digest)
+                .expect_err("changing the payload without its digest must be refused");
+        assert!(matches!(
+            tamper_error,
+            StorageError::InvalidData {
+                context: "storage_outbox.payload_digest",
+                ..
+            }
+        ));
         Ok(())
     }
 
@@ -7717,7 +9219,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-outbox-duplicate");
         let path_string = path.to_string_lossy().to_string();
-        let batch = sample_batch(51, 5.1);
+        let mut batch = sample_batch(51, 5.1);
+        let mut birth = sample_birth(51, 17, BirthOrigin::Born);
+        birth.spawn_ordinal = 41;
+        birth.birth_ordinal = Some(73);
+        batch.births.push(birth);
+        synchronize_lifecycle_counts(&mut batch);
         let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
         let mut storage = create_file_storage(&path_string)?;
         let (first, first_is_new) = storage.stage_outbox(prepared.tick, &prepared.storage)?;
@@ -7965,6 +9472,7 @@ mod tests {
             was_hybrid: false,
             combat_flags: scriptbots_core::CombatEventFlags::default(),
         });
+        synchronize_lifecycle_counts(&mut invalid);
         assert_invalid_data_context(storage.persist(&invalid), "deaths.brain_key");
         assert_eq!(
             (
@@ -8085,6 +9593,705 @@ mod tests {
     }
 
     #[test]
+    fn production_birth_insert_rejects_duplicate_uid_across_ticks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::memory()?;
+        let rows = [
+            birth_row_from_record(&sample_birth(0, 7, BirthOrigin::Seeded))?,
+            birth_row_from_record(&sample_birth(12, 7, BirthOrigin::Injected))?,
+        ];
+        {
+            let mut first = storage.connection()?.transaction()?;
+            Storage::insert_births(&first, &rows[..1])?;
+            first.commit()?;
+        }
+        {
+            let mut conflicting = storage.connection()?.transaction()?;
+            Storage::insert_births(&conflicting, &rows[1..])
+                .expect_err("a second origin row for one uid must not replace the first");
+            conflicting.rollback()?;
+        }
+
+        let persisted = storage.connection()?.query_row(
+            "SELECT tick, agent_uid, spawn_ordinal, birth_ordinal,
+                        position_x, position_y, origin
+                 FROM births WHERE agent_uid = 7",
+        )?;
+        assert_eq!(persisted.get_typed::<i64>(0)?, 0);
+        assert_eq!(persisted.get_typed::<i64>(1)?, 7);
+        assert_eq!(persisted.get_typed::<i64>(2)?, 6);
+        assert_eq!(persisted.get_typed::<Option<i64>>(3)?, None);
+        assert_eq!(persisted.get_typed::<f64>(4)?, 1.0);
+        assert_eq!(persisted.get_typed::<f64>(5)?, 2.0);
+        assert_eq!(persisted.get_typed::<String>(6)?, "seeded");
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn production_birth_insert_enforces_unique_ordinals_and_nullable_non_birth_ordinals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::memory()?;
+        let mut canonical = sample_birth(11, 7, BirthOrigin::Born);
+        canonical.spawn_ordinal = 20;
+        canonical.birth_ordinal = Some(30);
+        let canonical = birth_row_from_record(&canonical)?;
+        {
+            let mut transaction = storage.connection()?.transaction()?;
+            Storage::insert_births(&transaction, std::slice::from_ref(&canonical))?;
+            transaction.commit()?;
+        }
+
+        let mut duplicate_spawn = sample_birth(12, 8, BirthOrigin::Born);
+        duplicate_spawn.spawn_ordinal = 20;
+        duplicate_spawn.birth_ordinal = Some(31);
+        let mut duplicate_birth = sample_birth(13, 9, BirthOrigin::Born);
+        duplicate_birth.spawn_ordinal = 21;
+        duplicate_birth.birth_ordinal = Some(30);
+        for conflicting in [duplicate_spawn, duplicate_birth] {
+            let conflicting = birth_row_from_record(&conflicting)?;
+            let mut transaction = storage.connection()?.transaction()?;
+            Storage::insert_births(&transaction, &[conflicting])
+                .expect_err("a duplicate insertion or birth ordinal must not replace a row");
+            transaction.rollback()?;
+        }
+
+        let mut seeded = sample_birth(0, 10, BirthOrigin::Seeded);
+        seeded.spawn_ordinal = 22;
+        let mut injected = sample_birth(15, 11, BirthOrigin::Injected);
+        injected.spawn_ordinal = 23;
+        let nullable_rows = [
+            birth_row_from_record(&seeded)?,
+            birth_row_from_record(&injected)?,
+        ];
+        {
+            let mut transaction = storage.connection()?.transaction()?;
+            Storage::insert_births(&transaction, &nullable_rows)?;
+            transaction.commit()?;
+        }
+
+        let mut late_seeded = sample_birth(16, 12, BirthOrigin::Seeded);
+        late_seeded.spawn_ordinal = 24;
+        let late_seeded = birth_row_from_record(&late_seeded)?;
+        {
+            let mut transaction = storage.connection()?.transaction()?;
+            Storage::insert_births(&transaction, &[late_seeded])
+                .expect_err("the schema must reject a seeded founder after tick zero");
+            transaction.rollback()?;
+        }
+
+        let persisted: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM births")?
+            .get_typed(0)?;
+        assert_eq!(
+            persisted, 3,
+            "unique optional birth ordinals must allow multiple NULL values"
+        );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn production_death_insert_never_replaces_an_existing_uid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::memory()?;
+        let original = death_row_from_record(&sample_death(11, 7, DeathCause::Starvation))?;
+        {
+            let mut transaction = storage.connection()?.transaction()?;
+            Storage::insert_deaths(&transaction, std::slice::from_ref(&original))?;
+            transaction.commit()?;
+        }
+
+        for conflicting in [
+            sample_death(11, 7, DeathCause::Aging),
+            sample_death(12, 7, DeathCause::CombatCarnivore),
+        ] {
+            let conflicting = death_row_from_record(&conflicting)?;
+            let mut transaction = storage.connection()?.transaction()?;
+            Storage::insert_deaths(&transaction, &[conflicting])
+                .expect_err("a second death for one uid must fail instead of replacing it");
+            transaction.rollback()?;
+        }
+
+        let persisted = storage
+            .connection()?
+            .query_row("SELECT tick, cause FROM deaths WHERE agent_uid = 7")?;
+        assert_eq!(persisted.get_typed::<i64>(0)?, 11);
+        assert_eq!(persisted.get_typed::<String>(1)?, "starvation");
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn birth_preparation_rejects_origin_ordinal_mismatches() {
+        let mut born_without_ordinal = sample_birth(11, 1, BirthOrigin::Born);
+        born_without_ordinal.birth_ordinal = None;
+        assert!(matches!(
+            birth_row_from_record(&born_without_ordinal),
+            Err(StorageError::InvalidData {
+                context: "births.birth_ordinal",
+                ..
+            })
+        ));
+
+        let mut seeded_with_ordinal = sample_birth(0, 2, BirthOrigin::Seeded);
+        seeded_with_ordinal.birth_ordinal = Some(1);
+        assert!(matches!(
+            birth_row_from_record(&seeded_with_ordinal),
+            Err(StorageError::InvalidData {
+                context: "births.birth_ordinal",
+                ..
+            })
+        ));
+
+        let mut injected_with_ordinal = sample_birth(11, 3, BirthOrigin::Injected);
+        injected_with_ordinal.birth_ordinal = Some(2);
+        assert!(matches!(
+            birth_row_from_record(&injected_with_ordinal),
+            Err(StorageError::InvalidData {
+                context: "births.birth_ordinal",
+                ..
+            })
+        ));
+
+        assert!(validate_birth_origin_ordinal(BirthOrigin::Born, Some(0)).is_ok());
+        assert!(validate_birth_origin_ordinal(BirthOrigin::Seeded, None).is_ok());
+        assert!(validate_birth_origin_ordinal(BirthOrigin::Injected, None).is_ok());
+        assert!(validate_birth_origin_tick(BirthOrigin::Seeded, 0, 4).is_ok());
+        assert!(validate_birth_origin_tick(BirthOrigin::Injected, 11, 5).is_ok());
+        assert_invalid_data_context(
+            validate_birth_origin_tick(BirthOrigin::Seeded, 11, 6),
+            "births.origin",
+        );
+    }
+
+    #[test]
+    fn lifecycle_summary_rows_and_events_must_agree_before_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut missing_birth_row = sample_batch(35, 3.5);
+        missing_birth_row.summary.births = 1;
+        missing_birth_row
+            .events
+            .push(PersistenceEvent::new(PersistenceEventKind::Births, 1));
+
+        let mut missing_death_row = sample_batch(36, 3.6);
+        missing_death_row.summary.deaths = 1;
+        missing_death_row
+            .events
+            .push(PersistenceEvent::new(PersistenceEventKind::Deaths, 1));
+
+        let mut wrong_birth_event = sample_batch(37, 3.7);
+        wrong_birth_event.births = vec![sample_birth(37, 370, BirthOrigin::Born)];
+        synchronize_lifecycle_counts(&mut wrong_birth_event);
+        wrong_birth_event
+            .events
+            .iter_mut()
+            .find(|event| matches!(event.kind, PersistenceEventKind::Births))
+            .expect("synchronized birth event")
+            .count = 2;
+
+        let mut missing_death_event = sample_batch(38, 3.8);
+        missing_death_event.deaths = vec![sample_death(38, 380, DeathCause::Aging)];
+        synchronize_lifecycle_counts(&mut missing_death_event);
+        missing_death_event
+            .events
+            .retain(|event| !matches!(event.kind, PersistenceEventKind::Deaths));
+
+        let mut late_seeded = sample_batch(39, 3.9);
+        late_seeded.births = vec![sample_birth(39, 390, BirthOrigin::Seeded)];
+        synchronize_lifecycle_counts(&mut late_seeded);
+
+        let mut storage = Storage::memory()?;
+        for (context, malformed) in [
+            ("ticks.births", missing_birth_row),
+            ("ticks.deaths", missing_death_row),
+            ("events.births", wrong_birth_event),
+            ("events.deaths", missing_death_event),
+            ("births.origin", late_seeded),
+        ] {
+            assert_invalid_data_context(PreparedPersistenceBatch::from_batch(&malformed), context);
+            assert_invalid_data_context(storage.persist(&malformed), context);
+            assert!(storage.buffer.is_empty());
+            assert_eq!(
+                storage.persistence_watermarks()?,
+                PersistenceWatermarks {
+                    admitted: None,
+                    applied: None,
+                    durable: None,
+                },
+                "cross-field lifecycle mismatch received an outbox identity"
+            );
+        }
+
+        storage.persist(&sample_batch(39, 3.9))?;
+        storage.flush()?;
+        let tick_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 1, "rejected mismatch poisoned the writer");
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_records_after_the_summary_tick_are_rejected_before_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut storage = Storage::memory()?;
+
+        let mut future_birth = sample_batch(40, 4.0);
+        future_birth
+            .births
+            .push(sample_birth(41, 7, BirthOrigin::Born));
+        synchronize_lifecycle_counts(&mut future_birth);
+        assert_invalid_data_context(
+            PreparedPersistenceBatch::from_batch(&future_birth),
+            "births.tick",
+        );
+        assert_invalid_data_context(storage.persist(&future_birth), "births.tick");
+        assert!(storage.buffer.is_empty());
+
+        let mut future_death = sample_batch(40, 4.0);
+        future_death
+            .deaths
+            .push(sample_death(41, 7, DeathCause::Starvation));
+        synchronize_lifecycle_counts(&mut future_death);
+        assert_invalid_data_context(
+            PreparedPersistenceBatch::from_batch(&future_death),
+            "deaths.tick",
+        );
+        assert_invalid_data_context(storage.persist(&future_death), "deaths.tick");
+        assert!(storage.buffer.is_empty());
+        assert_eq!(
+            storage.persistence_watermarks()?,
+            PersistenceWatermarks {
+                admitted: None,
+                applied: None,
+                durable: None,
+            },
+            "future lifecycle rows must fail before an outbox identity is assigned"
+        );
+
+        storage.persist(&sample_batch(42, 4.2))?;
+        storage.flush()?;
+        let tick_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM ticks")?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 1, "rejected lifecycle rows poisoned the writer");
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_validation_rejects_lifecycle_rows_after_the_enclosing_tick()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut birth_batch = sample_batch(50, 5.0);
+        birth_batch
+            .births
+            .push(sample_birth(50, 7, BirthOrigin::Born));
+        synchronize_lifecycle_counts(&mut birth_batch);
+        let mut future_birth = Storage::prepare_batch(&birth_batch)?;
+        future_birth.births[0].tick = 51;
+
+        let mut death_batch = sample_batch(50, 5.0);
+        death_batch
+            .deaths
+            .push(sample_death(50, 8, DeathCause::Aging));
+        synchronize_lifecycle_counts(&mut death_batch);
+        let mut future_death = Storage::prepare_batch(&death_batch)?;
+        future_death.deaths[0].tick = 51;
+
+        for (context, invalid) in [("births.tick", future_birth), ("deaths.tick", future_death)] {
+            assert_invalid_data_context(invalid.encode_outbox(50), context);
+
+            let payload = serde_json::to_string(&OutboxPayloadRef {
+                version: OUTBOX_PAYLOAD_VERSION,
+                tick: 50,
+                storage: &invalid,
+            })?;
+            let digest = format!("blake3:{}", blake3::hash(payload.as_bytes()).to_hex());
+            assert_invalid_data_context(
+                StorageBuffer::decode_outbox(&payload, 50, &digest),
+                context,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ancestry_incoherence_is_rejected_before_new_outbox_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut storage = Storage::memory()?;
+        let no_watermarks = PersistenceWatermarks {
+            admitted: None,
+            applied: None,
+            durable: None,
+        };
+
+        let mut unknown_parent = sample_batch(100, 10.0);
+        let mut child = sample_birth(100, 20, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(999));
+        unknown_parent.births = vec![child];
+        synchronize_lifecycle_counts(&mut unknown_parent);
+
+        let mut duplicate_parent = sample_batch(101, 10.1);
+        let parent = sample_birth(100, 30, BirthOrigin::Injected);
+        let mut child = sample_birth(101, 31, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(30));
+        child.parent_b = Some(AgentUid(30));
+        duplicate_parent.births = vec![parent, child];
+        synchronize_lifecycle_counts(&mut duplicate_parent);
+
+        let mut same_tick_parent = sample_batch(110, 11.0);
+        let parent = sample_birth(110, 40, BirthOrigin::Injected);
+        let mut child = sample_birth(110, 41, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(40));
+        same_tick_parent.births = vec![parent, child];
+        synchronize_lifecycle_counts(&mut same_tick_parent);
+
+        let mut unknown_death = sample_batch(120, 12.0);
+        unknown_death.summary.births = 0;
+        unknown_death.summary.deaths = 1;
+        unknown_death.deaths = vec![sample_death(120, 50, DeathCause::Starvation)];
+        synchronize_lifecycle_counts(&mut unknown_death);
+
+        let mut same_tick_death = sample_batch(130, 13.0);
+        same_tick_death.summary.deaths = 1;
+        same_tick_death.births = vec![sample_birth(130, 60, BirthOrigin::Born)];
+        same_tick_death.deaths = vec![sample_death(130, 60, DeathCause::Aging)];
+        synchronize_lifecycle_counts(&mut same_tick_death);
+
+        for (context, malformed) in [
+            ("births.parent_a", unknown_parent),
+            ("births.parent_b", duplicate_parent),
+            ("births.parent_a", same_tick_parent),
+            ("deaths.agent_uid", unknown_death),
+            ("deaths.tick", same_tick_death),
+        ] {
+            assert_invalid_data_context(storage.persist(&malformed), context);
+            assert!(
+                storage.buffer.is_empty(),
+                "rejected ancestry rows reached the scientific buffer"
+            );
+            assert_eq!(
+                storage.persistence_watermarks()?,
+                no_watermarks,
+                "rejected ancestry rows received an outbox identity"
+            );
+        }
+        let ledger_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(ledger_count, 0);
+
+        // Prove the validator is relational rather than a blanket rejection: a
+        // current batch may carry an earlier root, its later child, and the
+        // root's later death.
+        let mut valid = sample_batch(141, 14.1);
+        valid.summary.deaths = 1;
+        let root = sample_birth(140, 70, BirthOrigin::Injected);
+        let mut child = sample_birth(141, 71, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(70));
+        valid.births = vec![root, child];
+        valid.deaths = vec![sample_death(141, 70, DeathCause::Aging)];
+        synchronize_lifecycle_counts(&mut valid);
+        storage.persist(&valid)?;
+        assert!(storage.persistence_watermarks()?.admitted.is_some());
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn ancestry_checks_cover_staged_and_persisted_arrivals_without_moving_watermarks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut storage = Storage::memory()?;
+        let mut root_batch = sample_batch(200, 20.0);
+        root_batch.summary.births = 0;
+        root_batch.births = vec![sample_birth(200, 80, BirthOrigin::Injected)];
+        synchronize_lifecycle_counts(&mut root_batch);
+        storage.persist(&root_batch)?;
+        let staged_watermarks = storage.persistence_watermarks()?;
+
+        let mut same_tick_child = sample_batch(201, 20.1);
+        let mut child = sample_birth(200, 81, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(80));
+        same_tick_child.births = vec![child];
+        synchronize_lifecycle_counts(&mut same_tick_child);
+        assert_invalid_data_context(storage.persist(&same_tick_child), "births.parent_a");
+        assert_eq!(storage.persistence_watermarks()?, staged_watermarks);
+
+        storage.flush()?;
+        let persisted_watermarks = storage.persistence_watermarks()?;
+        let mut same_tick_death = sample_batch(202, 20.2);
+        same_tick_death.summary.births = 0;
+        same_tick_death.summary.deaths = 1;
+        same_tick_death.deaths = vec![sample_death(200, 80, DeathCause::Unknown)];
+        synchronize_lifecycle_counts(&mut same_tick_death);
+        assert_invalid_data_context(storage.persist(&same_tick_death), "deaths.tick");
+        assert_eq!(storage.persistence_watermarks()?, persisted_watermarks);
+
+        let ledger_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(ledger_count, 1);
+
+        let mut valid = sample_batch(202, 20.2);
+        valid.summary.deaths = 1;
+        let mut child = sample_birth(201, 81, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(80));
+        valid.births = vec![child];
+        valid.deaths = vec![sample_death(201, 80, DeathCause::Unknown)];
+        synchronize_lifecycle_counts(&mut valid);
+        storage.persist(&valid)?;
+        assert_ne!(storage.persistence_watermarks()?, persisted_watermarks);
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn negative_persisted_arrival_tick_is_rejected_before_new_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut storage = Storage::memory()?;
+        let mut root_batch = sample_batch(300, 30.0);
+        root_batch.summary.births = 0;
+        root_batch.births = vec![sample_birth(300, 90, BirthOrigin::Injected)];
+        synchronize_lifecycle_counts(&mut root_batch);
+        storage.persist(&root_batch)?;
+        storage.flush()?;
+        let before = storage.persistence_watermarks()?;
+
+        // Rebuild only this table without its CHECK constraints to model a
+        // corrupted persisted row. The writer remains live so the next
+        // admission must validate the decoded database value, not rely on the
+        // schema having prevented corruption in the first place.
+        storage.connection()?.execute(
+            "CREATE TABLE births_unchecked AS SELECT * FROM births;
+             DROP TABLE births;
+             ALTER TABLE births_unchecked RENAME TO births;
+             UPDATE births SET tick = -1 WHERE agent_uid = 90;",
+        )?;
+
+        let mut child_batch = sample_batch(301, 30.1);
+        let mut child = sample_birth(301, 91, BirthOrigin::Born);
+        child.parent_a = Some(AgentUid(90));
+        child_batch.births = vec![child];
+        synchronize_lifecycle_counts(&mut child_batch);
+        assert_invalid_data_context(storage.persist(&child_batch), "births.tick");
+        assert_eq!(storage.persistence_watermarks()?, before);
+        assert!(storage.buffer.is_empty());
+        let ledger_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(ledger_count, 1);
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_birth_identities_are_rejected_before_new_outbox_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let make_birth = |tick: u64, uid: u64, spawn: u64, birth: u64| {
+            let mut record = sample_birth(tick, uid, BirthOrigin::Born);
+            record.spawn_ordinal = spawn;
+            record.birth_ordinal = Some(birth);
+            record
+        };
+
+        for (context, births) in [
+            (
+                "births.agent_uid",
+                vec![make_birth(55, 40, 50, 60), make_birth(55, 40, 51, 61)],
+            ),
+            (
+                "births.spawn_ordinal",
+                vec![make_birth(55, 41, 52, 62), make_birth(55, 42, 52, 63)],
+            ),
+            (
+                "births.birth_ordinal",
+                vec![make_birth(55, 43, 53, 64), make_birth(55, 44, 54, 64)],
+            ),
+        ] {
+            let mut duplicate_batch = sample_batch(55, 5.5);
+            duplicate_batch.births = births;
+            synchronize_lifecycle_counts(&mut duplicate_batch);
+            assert_invalid_data_context(
+                PreparedPersistenceBatch::from_batch(&duplicate_batch),
+                context,
+            );
+        }
+
+        let mut storage = Storage::memory()?;
+        let mut first = sample_batch(70, 7.0);
+        first.births = vec![make_birth(70, 7, 20, 30)];
+        synchronize_lifecycle_counts(&mut first);
+        storage.persist(&first)?;
+        let admitted_once = storage.persistence_watermarks()?;
+
+        for (tick, context, conflicting) in [
+            (71, "births.agent_uid", make_birth(71, 7, 21, 31)),
+            (72, "births.spawn_ordinal", make_birth(72, 8, 20, 32)),
+            (73, "births.birth_ordinal", make_birth(73, 9, 22, 30)),
+        ] {
+            let mut batch = sample_batch(tick, 7.1);
+            batch.births = vec![conflicting];
+            synchronize_lifecycle_counts(&mut batch);
+            assert_invalid_data_context(storage.persist(&batch), context);
+            assert_eq!(storage.persistence_watermarks()?, admitted_once);
+        }
+
+        storage.flush()?;
+        let durable_once = storage.persistence_watermarks()?;
+        for (tick, context, conflicting) in [
+            (81, "births.agent_uid", make_birth(81, 7, 23, 33)),
+            (82, "births.spawn_ordinal", make_birth(82, 10, 20, 34)),
+            (83, "births.birth_ordinal", make_birth(83, 11, 24, 30)),
+        ] {
+            let mut batch = sample_batch(tick, 8.1);
+            batch.births = vec![conflicting];
+            synchronize_lifecycle_counts(&mut batch);
+            assert_invalid_data_context(storage.persist(&batch), context);
+            assert_eq!(storage.persistence_watermarks()?, durable_once);
+        }
+
+        let admitted_batches: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(
+            admitted_batches, 1,
+            "duplicate birth identities leaked rejected batches into the admission ledger"
+        );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_death_uids_are_rejected_before_new_outbox_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut storage = Storage::memory()?;
+        let mut first = sample_batch(60, 6.0);
+        first.births.push(sample_birth(59, 7, BirthOrigin::Born));
+        first
+            .deaths
+            .push(sample_death(60, 7, DeathCause::Starvation));
+        synchronize_lifecycle_counts(&mut first);
+        storage.persist(&first)?;
+        let admitted_once = storage.persistence_watermarks()?;
+
+        let mut duplicate_staged = sample_batch(61, 6.1);
+        duplicate_staged
+            .deaths
+            .push(sample_death(61, 7, DeathCause::Aging));
+        synchronize_lifecycle_counts(&mut duplicate_staged);
+        assert_invalid_data_context(storage.persist(&duplicate_staged), "deaths.agent_uid");
+        assert_eq!(
+            storage.persistence_watermarks()?,
+            admitted_once,
+            "a death conflicting with a staged row received an outbox identity"
+        );
+
+        storage.flush()?;
+        let durable_once = storage.persistence_watermarks()?;
+        let mut duplicate_persisted = sample_batch(62, 6.2);
+        duplicate_persisted
+            .deaths
+            .push(sample_death(62, 7, DeathCause::CombatCarnivore));
+        synchronize_lifecycle_counts(&mut duplicate_persisted);
+        assert_invalid_data_context(storage.persist(&duplicate_persisted), "deaths.agent_uid");
+        assert_eq!(
+            storage.persistence_watermarks()?,
+            durable_once,
+            "a death conflicting with a persisted row received an outbox identity"
+        );
+
+        let mut same_batch = sample_batch(63, 6.3);
+        same_batch.deaths = vec![
+            sample_death(63, 8, DeathCause::Starvation),
+            sample_death(63, 8, DeathCause::Aging),
+        ];
+        synchronize_lifecycle_counts(&mut same_batch);
+        assert_invalid_data_context(
+            PreparedPersistenceBatch::from_batch(&same_batch),
+            "deaths.agent_uid",
+        );
+        assert_invalid_data_context(storage.persist(&same_batch), "deaths.agent_uid");
+        assert_eq!(storage.persistence_watermarks()?, durable_once);
+
+        let persisted: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM deaths WHERE agent_uid = 7")?
+            .get_typed(0)?;
+        assert_eq!(persisted, 1);
+        let admitted_batches: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        assert_eq!(
+            admitted_batches, 1,
+            "duplicate deaths leaked rejected batches into the admission ledger"
+        );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_ledger_counts_only_demographic_births() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-birth-origin-ledger");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::create_new_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+        let mut batch = sample_batch(11, 1.0);
+        let base = BirthRecord {
+            tick: Tick(11),
+            agent_uid: AgentUid(2),
+            spawn_ordinal: 1,
+            birth_ordinal: Some(0),
+            parent_a: None,
+            parent_b: None,
+            brain_kind: Some("origin-ledger".to_owned()),
+            brain_key: None,
+            herbivore_tendency: 0.5,
+            generation: Generation(0),
+            position: Position::new(1.0, 2.0),
+            is_hybrid: false,
+            origin: BirthOrigin::Born,
+        };
+        batch.births = vec![
+            BirthRecord {
+                tick: Tick::zero(),
+                agent_uid: AgentUid(1),
+                spawn_ordinal: 0,
+                birth_ordinal: None,
+                origin: BirthOrigin::Seeded,
+                ..base.clone()
+            },
+            base.clone(),
+            BirthRecord {
+                agent_uid: AgentUid(3),
+                spawn_ordinal: 2,
+                birth_ordinal: None,
+                origin: BirthOrigin::Injected,
+                ..base
+            },
+        ];
+        synchronize_lifecycle_counts(&mut batch);
+        storage.persist(&batch)?;
+        storage.flush()?;
+        storage.close()?;
+
+        let reader = StorageReader::open(&path_string)?;
+        let ledger = reader.run_ledger_summary()?;
+        assert_eq!(ledger.birth_records, 1);
+        assert_eq!(reader.load_ancestry_births()?.len(), 3);
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn production_schema_constraints_and_type_errors_are_observable()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-production-schema");
@@ -8113,10 +10320,13 @@ mod tests {
         let mut batch = sample_batch(11, 1.0);
         let agent_uid = batch.agents[0].identity.uid;
         batch.births.push(BirthRecord {
-            tick: Tick(11),
+            // Lifecycle rows can trail the enclosing persistence cadence. Keep
+            // this arrival strictly before the death below so the fixture is a
+            // valid ancestry log as well as a schema-constraint probe.
+            tick: Tick(10),
             agent_uid,
             spawn_ordinal: 0,
-            birth_ordinal: 0,
+            birth_ordinal: Some(0),
             parent_a: None,
             parent_b: None,
             brain_kind: Some("schema-test".to_owned()),
@@ -8125,6 +10335,7 @@ mod tests {
             generation: scriptbots_core::Generation(0),
             position: Position::new(1.0, 2.0),
             is_hybrid: false,
+            origin: BirthOrigin::Born,
         });
         batch.deaths.push(DeathRecord {
             tick: Tick(11),
@@ -8140,6 +10351,7 @@ mod tests {
             was_hybrid: false,
             combat_flags: scriptbots_core::CombatEventFlags::default(),
         });
+        synchronize_lifecycle_counts(&mut batch);
         batch.replay_events.push(ReplayEvent {
             agent_uid: None,
             kind: ReplayEventKind::BrainOutputs {
@@ -8199,34 +10411,34 @@ mod tests {
                 "agents.brain_key",
                 "UPDATE agents SET brain_key = -1 WHERE tick = 11",
             ),
-            ("births.tick", "UPDATE births SET tick = -1 WHERE tick = 11"),
+            ("births.tick", "UPDATE births SET tick = -1 WHERE tick = 10"),
             (
                 "births.agent_uid",
-                "UPDATE births SET agent_uid = -1 WHERE tick = 11",
+                "UPDATE births SET agent_uid = -1 WHERE tick = 10",
             ),
             (
                 "births.spawn_ordinal",
-                "UPDATE births SET spawn_ordinal = -1 WHERE tick = 11",
+                "UPDATE births SET spawn_ordinal = -1 WHERE tick = 10",
             ),
             (
                 "births.birth_ordinal",
-                "UPDATE births SET birth_ordinal = -1 WHERE tick = 11",
+                "UPDATE births SET birth_ordinal = -1 WHERE tick = 10",
             ),
             (
                 "births.parent_a",
-                "UPDATE births SET parent_a = -1 WHERE tick = 11",
+                "UPDATE births SET parent_a = -1 WHERE tick = 10",
             ),
             (
                 "births.parent_b",
-                "UPDATE births SET parent_b = -1 WHERE tick = 11",
+                "UPDATE births SET parent_b = -1 WHERE tick = 10",
             ),
             (
                 "births.brain_key",
-                "UPDATE births SET brain_key = -1 WHERE tick = 11",
+                "UPDATE births SET brain_key = -1 WHERE tick = 10",
             ),
             (
                 "births.generation",
-                "UPDATE births SET generation = -1 WHERE tick = 11",
+                "UPDATE births SET generation = -1 WHERE tick = 10",
             ),
             ("deaths.tick", "UPDATE deaths SET tick = -1 WHERE tick = 11"),
             (
@@ -8249,6 +10461,13 @@ mod tests {
                 "{context} CHECK must reject negative values"
             );
         }
+        assert!(
+            storage
+                .connection()?
+                .execute("UPDATE births SET origin = 'unknown' WHERE tick = 10")
+                .is_err(),
+            "births.origin CHECK must reject values outside the typed domain"
+        );
 
         storage.connection()?.execute(
             "INSERT INTO ticks (
@@ -8256,9 +10475,22 @@ mod tests {
                 total_energy, average_energy, average_health
              ) VALUES (3, 'invalid-epoch', 0, 0, 0, 0, 0.0, 0.0, 0.0)",
         )?;
+        storage
+            .connection()?
+            .execute("UPDATE deaths SET cause = 'not-a-cause' WHERE tick = 11")?;
         storage.close()?;
 
         let reader = StorageReader::open(&path_string)?;
+        let cause_error = reader
+            .load_ancestry_deaths()
+            .expect_err("typed ancestry reader must reject an unknown death cause");
+        assert!(matches!(
+            cause_error,
+            StorageError::InvalidData {
+                context: "deaths.cause",
+                ..
+            }
+        ));
         let decode_error = reader
             .recent_ticks(None)
             .expect_err("typed reader must reject a TEXT epoch in an INTEGER domain field");
@@ -8273,6 +10505,80 @@ mod tests {
 
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn birth_origin_decode_is_fail_closed() {
+        assert!(matches!(decode_birth_origin("born"), Ok(BirthOrigin::Born)));
+        assert!(matches!(
+            decode_birth_origin("seeded"),
+            Ok(BirthOrigin::Seeded)
+        ));
+        assert!(matches!(
+            decode_birth_origin("injected"),
+            Ok(BirthOrigin::Injected)
+        ));
+        assert!(matches!(
+            decode_birth_origin("unknown"),
+            Err(StorageError::InvalidData {
+                context: "births.origin",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ancestry_death_decode_and_rebuild_preserve_non_starvation_cause() {
+        for (encoded, expected) in [
+            ("combat_carnivore", DeathCause::CombatCarnivore),
+            ("combat_herbivore", DeathCause::CombatHerbivore),
+            ("starvation", DeathCause::Starvation),
+            ("aging", DeathCause::Aging),
+            ("unknown", DeathCause::Unknown),
+        ] {
+            assert!(matches!(decode_death_cause(encoded), Ok(actual) if actual == expected));
+        }
+        assert!(matches!(
+            decode_death_cause("not-a-cause"),
+            Err(StorageError::InvalidData {
+                context: "deaths.cause",
+                ..
+            })
+        ));
+
+        let births = [PersistedAncestryBirth {
+            tick: Tick(0),
+            agent_uid: AgentUid(1),
+            spawn_ordinal: 0,
+            birth_ordinal: None,
+            parent_a: None,
+            parent_b: None,
+            generation: Generation(0),
+            brain_key: None,
+            is_hybrid: false,
+            origin: BirthOrigin::Seeded,
+        }];
+        let aging_deaths = [PersistedAncestryDeath {
+            tick: Tick(1),
+            agent_uid: AgentUid(1),
+            cause: DeathCause::Aging,
+        }];
+        let starvation_deaths = [PersistedAncestryDeath {
+            cause: DeathCause::Starvation,
+            ..aging_deaths[0]
+        }];
+
+        let aging = rebuild_ancestry(&births, &aging_deaths).expect("aging rebuild");
+        let starvation = rebuild_ancestry(&births, &starvation_deaths).expect("starvation rebuild");
+        assert_eq!(
+            aging.node(AgentUid(1)).and_then(|node| node.death_cause),
+            Some(DeathCause::Aging)
+        );
+        assert_ne!(
+            aging.canonical_digest(),
+            starvation.canonical_digest(),
+            "substituting Starvation for the persisted cause must change the ancestry oracle"
+        );
     }
 
     #[test]
@@ -9093,7 +11399,7 @@ mod tests {
             tick: Tick(9),
             agent_uid: AgentUid(1),
             spawn_ordinal: 0,
-            birth_ordinal: 0,
+            birth_ordinal: Some(0),
             parent_a: None,
             parent_b: None,
             brain_kind: Some("test.keyed".to_owned()),
@@ -9102,6 +11408,7 @@ mod tests {
             generation: scriptbots_core::Generation(1),
             position: Position::new(1.0, 2.0),
             is_hybrid: false,
+            origin: BirthOrigin::Born,
         };
         let mut birth = base_birth.clone();
         birth.tick = Tick(u64::MAX);
@@ -9113,7 +11420,7 @@ mod tests {
         birth.spawn_ordinal = u64::MAX;
         assert_invalid_data_context(birth_row_from_record(&birth), "births.spawn_ordinal");
         let mut birth = base_birth.clone();
-        birth.birth_ordinal = u64::MAX;
+        birth.birth_ordinal = Some(u64::MAX);
         assert_invalid_data_context(birth_row_from_record(&birth), "births.birth_ordinal");
         let mut birth = base_birth.clone();
         birth.parent_a = Some(invalid_uid);

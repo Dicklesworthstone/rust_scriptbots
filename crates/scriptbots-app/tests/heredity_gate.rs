@@ -245,11 +245,13 @@ fn a_non_heritable_family_never_founds_a_population() {
 
     let good = world
         .brain_registry_mut()
+        .expect("heritable registry mutation")
         .register("test.heritable", |_rng| {
             Ok(Box::new(HeritableRunner { weight: 1.0 }) as Box<dyn BrainRunner>)
         });
     let bad = world
         .brain_registry_mut()
+        .expect("placeholder registry mutation")
         .register("test.placeholder", |_rng| {
             Ok(Box::new(SilentlyNonHeritableRunner) as Box<dyn BrainRunner>)
         });
@@ -304,6 +306,7 @@ fn a_world_with_only_non_heritable_families_has_no_eligible_founders() {
     let mut world = world();
     world
         .brain_registry_mut()
+        .expect("placeholder registry mutation")
         .register("test.placeholder", |_rng| {
             Ok(Box::new(SilentlyNonHeritableRunner) as Box<dyn BrainRunner>)
         });

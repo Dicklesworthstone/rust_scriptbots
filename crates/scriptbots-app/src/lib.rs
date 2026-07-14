@@ -251,7 +251,7 @@ pub struct RunManifestV1 {
     ///
     /// `None` only for a manifest built outside the binary (tests, tooling), where no policy was
     /// resolved. A real run always records one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_policy: Option<ThreadPolicyV0>,
     pub random_stream: RandomStreamState,
     pub next_agent_uid: u64,
@@ -758,7 +758,7 @@ mod characterization_tests {
                 .expect("open manifest");
         assert_eq!(open_manifest.normalized_config["closed"], false);
 
-        world.set_closed(true);
+        world.set_closed(true).expect("close manifest world");
         let closed_manifest = RunManifestV1::from_world_with_provenance(scenario, &world, build)
             .expect("closed manifest");
 

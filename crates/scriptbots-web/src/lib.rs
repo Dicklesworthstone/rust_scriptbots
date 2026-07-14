@@ -155,7 +155,7 @@ impl Simulation {
         }
         let key = self
             .world
-            .brain_registry_mut()
+            .brain_registry_mut()?
             .register(MlpBrain::KIND.as_str(), |rng| Ok(MlpBrain::runner(rng)));
         self.mlp_key = Some(key);
         Ok(key)
@@ -174,15 +174,16 @@ impl Simulation {
         Ok(())
     }
 
-    fn apply_wander_to_all(&mut self) {
+    fn apply_wander_to_all(&mut self) -> Result<()> {
         let handles: Vec<_> = self.world.agents().iter_handles().collect();
         for id in handles {
             let seed = {
-                let rng = self.world.rng();
+                let rng = self.world.rng()?;
                 rng.random::<u64>()
             };
-            let _ = bind_wander_brain(&mut self.world, id, seed);
+            bind_wander_brain(&mut self.world, id, seed)?;
         }
+        Ok(())
     }
 }
 
@@ -278,7 +279,7 @@ impl SimHandle {
             "wander" => {
                 simulation.spec.default_brain = None;
                 simulation.spec.seed_strategy = SeedStrategy::Wander;
-                simulation.apply_wander_to_all();
+                simulation.apply_wander_to_all().map_err(js_error)?;
                 Ok(())
             }
             "none" => {
@@ -331,7 +332,7 @@ fn seed_agents(
             Some(key) => *key,
             None => {
                 let key = world
-                    .brain_registry_mut()
+                    .brain_registry_mut()?
                     .register(MlpBrain::KIND.as_str(), |rng| Ok(MlpBrain::runner(rng)));
                 *mlp_key_cache = Some(key);
                 key
@@ -343,7 +344,7 @@ fn seed_agents(
 
     for _ in 0..count {
         let (agent, wander_seed) = {
-            let rng = world.rng();
+            let rng = world.rng()?;
             let x = rng.random_range(0.0..world_width);
             let y = rng.random_range(0.0..world_height);
             let heading = rng.random_range(-std::f32::consts::PI..std::f32::consts::PI);
@@ -499,7 +500,8 @@ fn clamp01(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::ScriptBotsConfig;
+    use scriptbots_core::{BirthOrigin, ScriptBotsConfig};
+    use std::sync::{Arc, Mutex};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -581,6 +583,86 @@ mod tests {
         assert_eq!(
             to_allocvec(&decoded).expect("re-encode postcard snapshot"),
             encoded
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn seeded_birth_records_capture_registry_and_runtime_brains_after_binding() {
+        struct BirthCapture {
+            batches: Arc<Mutex<Vec<scriptbots_core::PersistenceBatch>>>,
+        }
+
+        impl scriptbots_core::WorldPersistence for BirthCapture {
+            fn on_tick(
+                &mut self,
+                payload: &scriptbots_core::PersistenceBatch,
+            ) -> std::result::Result<(), scriptbots_core::PersistenceAdmissionError> {
+                self.batches
+                    .lock()
+                    .expect("birth capture lock")
+                    .push(payload.clone());
+                Ok(())
+            }
+        }
+
+        let capture = |strategy, default_brain| {
+            let batches = Arc::new(Mutex::new(Vec::new()));
+            let mut world = WorldState::with_persistence(
+                ScriptBotsConfig {
+                    world_width: 200,
+                    world_height: 200,
+                    food_cell_size: 20,
+                    persistence_interval: 1,
+                    population_minimum: 0,
+                    population_spawn_interval: 0,
+                    reproduction_attempt_chance: 0.0,
+                    rng_seed: Some(0xB17A_0A5A),
+                    ..ScriptBotsConfig::default()
+                },
+                Box::new(BirthCapture {
+                    batches: Arc::clone(&batches),
+                }),
+            )
+            .expect("world");
+            let mut mlp_key = None;
+            seed_agents(&mut world, 3, strategy, default_brain, &mut mlp_key)
+                .expect("seed web agents");
+            let random_stream = world.random_stream_state();
+            world.step().expect("persist seeded lifecycle records");
+            let births = batches
+                .lock()
+                .expect("birth capture lock")
+                .last()
+                .expect("first persistence cadence batch")
+                .births
+                .clone();
+            (births, mlp_key, random_stream)
+        };
+
+        let (mlp_births, mlp_key, _) = capture(SeedStrategy::None, Some(BrainPreset::Mlp));
+        let mlp_key = mlp_key.expect("MLP seeding registers its brain family");
+        assert_eq!(mlp_births.len(), 3);
+        for birth in mlp_births {
+            assert_eq!(birth.origin, BirthOrigin::Seeded);
+            assert_eq!(birth.brain_kind.as_deref(), Some(MlpBrain::KIND.as_str()));
+            assert_eq!(birth.brain_key, Some(mlp_key));
+        }
+
+        let (wander_births, wander_key, wander_random_stream) = capture(SeedStrategy::Wander, None);
+        assert!(wander_key.is_none());
+        assert_eq!(wander_births.len(), 3);
+        for birth in wander_births {
+            assert_eq!(birth.origin, BirthOrigin::Seeded);
+            assert_eq!(birth.brain_kind.as_deref(), Some("wasm.wander"));
+            assert_eq!(birth.brain_key, None);
+        }
+
+        let (_, unbound_key, unbound_random_stream) = capture(SeedStrategy::None, None);
+        assert!(unbound_key.is_none());
+        assert_eq!(
+            wander_random_stream, unbound_random_stream,
+            "installing per-agent wander runners and refreshing their seeded origin records must not consume the world RNG"
         );
     }
 

@@ -406,9 +406,11 @@ fn finalize_world_persistence(world: &mut WorldState) -> Result<StorageFinalizat
 
     Ok(StorageFinalization {
         admitted_tail,
-        required_tick: (world.config().persistence_interval != 0
-            && world.tick() != scriptbots_core::Tick::zero())
-        .then_some(world.tick().0),
+        // Admission history, rather than the current cadence setting, is the
+        // shutdown contract. A runtime update may disable persistence after a
+        // batch was admitted, and bootstrap origins can admit a real tick-zero
+        // batch even though an untouched tick-zero world has no batch at all.
+        required_tick: world.last_admitted_persistence_tick().map(|tick| tick.0),
     })
 }
 
@@ -2695,7 +2697,7 @@ fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
     };
 
     let mlp_key = world
-        .brain_registry_mut()
+        .brain_registry_mut()?
         .register(MlpBrain::KIND.as_str(), |seed_rng| {
             Ok(MlpBrain::runner(seed_rng))
         });
@@ -2716,7 +2718,7 @@ fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
         let label = prototype.kind().to_string();
         let heritable = probe_heredity(prototype.as_ref())?;
         let key = world
-            .brain_registry_mut()
+            .brain_registry_mut()?
             .register(label.clone(), |_seed_rng| Ok(scriptbots_brain_ml::runner()));
         admit(label, key, heritable);
     }
@@ -2983,6 +2985,7 @@ fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scriptbots_core::BirthOrigin;
     use scriptbots_storage::{StoragePipeline, StorageReader};
     use serial_test::serial;
     use std::fs;
@@ -3063,6 +3066,61 @@ mod tests {
                 "`ml.placeholder` must be recorded as WITHHELD. An exclusion nobody can see is \
                  folklore rather than a decision, and the next reader will re-seed it."
             );
+        }
+    }
+
+    #[test]
+    fn seeded_birth_records_capture_the_post_bind_brain_identity() {
+        struct BirthCapture {
+            batches: Arc<Mutex<Vec<scriptbots_core::PersistenceBatch>>>,
+        }
+
+        impl WorldPersistence for BirthCapture {
+            fn on_tick(
+                &mut self,
+                payload: &scriptbots_core::PersistenceBatch,
+            ) -> std::result::Result<(), scriptbots_core::PersistenceAdmissionError> {
+                self.batches
+                    .lock()
+                    .expect("birth capture lock")
+                    .push(payload.clone());
+                Ok(())
+            }
+        }
+
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let mut world = WorldState::with_persistence(
+            ScriptBotsConfig {
+                persistence_interval: 1,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                reproduction_attempt_chance: 0.0,
+                rng_seed: Some(0x5EED_B17A),
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(BirthCapture {
+                batches: Arc::clone(&batches),
+            }),
+        )
+        .expect("world");
+        let installed = install_brains(&mut world).expect("install seed brains");
+        seed_agents(&mut world, &installed.population).expect("seed founding population");
+
+        world.step().expect("persist seeded lifecycle records");
+
+        let batches = batches.lock().expect("birth capture lock");
+        let batch = batches.last().expect("first persistence cadence batch");
+        assert_eq!(batch.births.len(), 16, "every founder must be recorded");
+        for (index, birth) in batch.births.iter().enumerate() {
+            let expected_key = installed.population[index % installed.population.len()];
+            let expected_kind = world
+                .brain_registry()
+                .kind(expected_key)
+                .expect("seed brain remains registered");
+            assert_eq!(birth.origin, BirthOrigin::Seeded);
+            assert_eq!(birth.brain_key, Some(expected_key));
+            assert_eq!(birth.brain_kind.as_deref(), Some(expected_kind));
+            assert_eq!((birth.parent_a, birth.parent_b), (None, None));
         }
     }
 
@@ -3380,6 +3438,66 @@ mod tests {
             deaths: Vec::new(),
             replay_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn shutdown_finalization_requires_committed_tick_zero_for_bootstrap_origins() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 5,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut pipeline = StoragePipeline::memory().expect("volatile pipeline");
+        let mut world = WorldState::with_persistence(config, Box::new(pipeline.sink()))
+            .expect("world with persistence");
+        world
+            .try_spawn_agent(AgentData::default())
+            .expect("seeded bootstrap arrival");
+
+        let finalization =
+            finalize_world_persistence(&mut world).expect("tick-zero origin finalization");
+        assert!(finalization.admitted_tail);
+        assert_eq!(finalization.required_tick, Some(0));
+
+        let receipt = pipeline.shutdown().expect("volatile shutdown");
+        assert_eq!(receipt.committed_tick, Some(0));
+        validate_shutdown_receipt(finalization, receipt)
+            .expect("tick-zero origin batch must close the admitted prefix");
+    }
+
+    #[test]
+    fn shutdown_receipt_tracks_admitted_history_after_persistence_is_disabled() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut pipeline = StoragePipeline::memory().expect("volatile pipeline");
+        let mut world = WorldState::with_persistence(config, Box::new(pipeline.sink()))
+            .expect("world with persistence");
+        world.step().expect("cadence admission");
+        assert_eq!(
+            world.last_admitted_persistence_tick(),
+            Some(scriptbots_core::Tick(1))
+        );
+
+        let mut disabled = world.config().clone();
+        disabled.persistence_interval = 0;
+        world
+            .apply_config_update(disabled)
+            .expect("disable persistence after admission");
+
+        let finalization =
+            finalize_world_persistence(&mut world).expect("shutdown after disabling persistence");
+        assert!(!finalization.admitted_tail);
+        assert_eq!(finalization.required_tick, Some(1));
+
+        let receipt = pipeline.shutdown().expect("volatile shutdown");
+        assert_eq!(receipt.committed_tick, Some(1));
+        validate_shutdown_receipt(finalization, receipt)
+            .expect("shutdown must validate the historically admitted tick");
     }
 
     #[test]
@@ -3902,6 +4020,14 @@ activation = "Sigmoid"
         let accepted_batches = Arc::new(Mutex::new(Vec::new()));
         let mut accepted = make_world(1, Arc::clone(&accepted_batches));
         accepted.step().expect("non-boundary tick");
+        accepted
+            .finalize_persistence()
+            .expect_err("first tail admission is rejected and retained");
+        let mut disabled = accepted.config().clone();
+        disabled.persistence_interval = 0;
+        accepted
+            .apply_config_update(disabled)
+            .expect("disable persistence while the exact tail is retained");
         let finalization = finalize_world_persistence(&mut accepted)
             .expect("exact retained final tail should succeed on bounded retry");
         assert!(finalization.admitted_tail);

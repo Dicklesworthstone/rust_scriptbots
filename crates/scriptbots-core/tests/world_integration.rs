@@ -114,6 +114,7 @@ impl BrainRunner for ZeroBrain {
 fn bind_zero_brain(world: &mut WorldState, agents: &[AgentId]) {
     let key = world
         .brain_registry_mut()
+        .expect("zero-brain registry mutation")
         .register("test.oracle.zero", |_rng| Ok(Box::new(ZeroBrain)));
 
     for &agent in agents {
@@ -271,6 +272,7 @@ fn registry_executes_custom_brain() {
 
     let key = world
         .brain_registry_mut()
+        .expect("constant-brain registry mutation")
         .register("test.constant", |_rng| {
             Ok(Box::new(ConstantBrain { value: 0.75 }))
         });
@@ -346,6 +348,7 @@ fn combat_records_carnivore_event_flags() {
 
     let spike_key = world
         .brain_registry_mut()
+        .expect("spike-brain registry mutation")
         .register("test.spike", |_rng| Ok(Box::new(SpikeBrain)));
     assert!(
         world
@@ -418,7 +421,7 @@ fn legacy_eye_density_micro_oracle_single_neighbor() {
         ..ScriptBotsConfig::default()
     };
     let mut world = WorldState::new(config).expect("legacy eye oracle world");
-    world.set_closed(true);
+    world.set_closed(true).expect("close world");
 
     let subject = world
         .try_spawn_agent(AgentData {
@@ -563,7 +566,7 @@ fn legacy_eye_chunk_boundary_oracle_is_feature_invariant() {
             ..ScriptBotsConfig::default()
         };
         let mut world = WorldState::new(config).expect("legacy eye chunk-boundary oracle world");
-        world.set_closed(true);
+        world.set_closed(true).expect("close world");
 
         let subject = world
             .try_spawn_agent(AgentData {
@@ -708,7 +711,7 @@ fn fixed_seed_blood_sensor_reading(seed: u64, target_angle: f32, target_health: 
         ..ScriptBotsConfig::default()
     };
     let mut world = WorldState::new(config).expect("legacy blood oracle world");
-    world.set_closed(true);
+    world.set_closed(true).expect("close world");
 
     let subject_position = Position::new(200.0, 200.0);
     let target_distance = 40.0;
@@ -1016,7 +1019,7 @@ fn ground_food_micro_oracle_documents_energy_policy() {
         ..ScriptBotsConfig::default()
     };
     let mut world = WorldState::new(config).expect("ground-food oracle world");
-    world.set_closed(true);
+    world.set_closed(true).expect("close world");
 
     let agent = world
         .try_spawn_agent(AgentData {

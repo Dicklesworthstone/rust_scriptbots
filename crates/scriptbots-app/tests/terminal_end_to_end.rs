@@ -439,7 +439,6 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
     config.food_sharing_rate = 0.16;
     config.food_transfer_rate = 0.002;
 
-    let mut world = WorldState::new(config.clone())?;
     let mut pipeline = StoragePipeline::create_new_file_with_thresholds(
         storage_path
             .to_str()
@@ -450,7 +449,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         1,
     )?;
     let analytics = pipeline.analytics_provider();
-    world.set_persistence(Box::new(pipeline.sink()));
+    let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
 
     let mut rng = SmallRng::seed_from_u64(0xDECAF00D);
     for index in 0..24 {
@@ -686,7 +685,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
     assert_eq!(
         ledger.birth_records,
         u64::try_from(summary.total_births).expect("birth total fits in u64"),
-        "birth records should match reported total"
+        "born-origin lifecycle records should match the reported reproduction total"
     );
 
     assert_eq!(
