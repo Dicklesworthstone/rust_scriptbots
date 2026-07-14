@@ -1031,6 +1031,19 @@ fn rustc_field(rustc_verbose: &str, label: &str) -> GateResult<String> {
         .ok_or_else(|| format!("rustc -Vv did not report `{label}`"))
 }
 
+fn macos_mount_filesystem_kind(device: &str, mounts: &str) -> Option<String> {
+    let prefix = format!("{device} on ");
+    mounts
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .and_then(|line| line.rsplit_once(" ("))
+        .and_then(|(_, properties)| properties.strip_suffix(')'))
+        .and_then(|properties| properties.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn filesystem_kind() -> String {
     if cfg!(target_os = "linux") {
         command_output("stat", &["-f", "-c", "%T", "."])
@@ -1044,7 +1057,7 @@ fn filesystem_kind() -> String {
         if device.is_empty() {
             return String::new();
         }
-        command_output("diskutil", &["info", &device])
+        let diskutil_kind = command_output("diskutil", &["info", &device])
             .lines()
             .find_map(|line| {
                 line.trim()
@@ -1052,8 +1065,10 @@ fn filesystem_kind() -> String {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned)
-            })
-            .unwrap_or_default()
+            });
+        diskutil_kind.unwrap_or_else(|| {
+            macos_mount_filesystem_kind(&device, &command_output("mount", &[])).unwrap_or_default()
+        })
     } else {
         String::new()
     }
@@ -2344,6 +2359,18 @@ fn run_self_test() -> GateResult<()> {
         "perf-gate self-test: live Git and machine identity: {}",
         live_fingerprint.machine_class_id
     );
+
+    let mount_fixture = concat!(
+        "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)\n",
+        "tmpfs on /Volumes/ScriptBotsRAM (tmpfs, local)"
+    );
+    if macos_mount_filesystem_kind("tmpfs", mount_fixture).as_deref() != Some("tmpfs")
+        || macos_mount_filesystem_kind("/dev/disk3s5", mount_fixture).as_deref() != Some("apfs")
+        || macos_mount_filesystem_kind("missing", mount_fixture).is_some()
+    {
+        return Err("macOS mount-table filesystem identity parsing is unstable".to_owned());
+    }
+    println!("perf-gate self-test: macOS mount-table filesystem identity");
 
     let linux_memory = memory_class_identity("MemTotal: 16377688 kB")?;
     let page_drift_memory = memory_class_identity("MemTotal: 16377692 kB")?;
