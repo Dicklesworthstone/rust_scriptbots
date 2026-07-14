@@ -13,9 +13,9 @@ ScriptBots itself (all `scriptbots-*` crates) is licensed under
 §2 below; the repository `LICENSE` file carries it verbatim (owner
 relicensing decision, 2026-07-13; formerly declared `MIT OR Apache-2.0`).
 
-## 2. Embedded FrankenSQLite / asupersync components — MIT with OpenAI/Anthropic Rider
+## 2. Franken-family components — MIT with OpenAI/Anthropic Rider
 
-ScriptBots binaries statically link the following components, which are
+Default ScriptBots binaries statically link the following components, which are
 **not** plain MIT/Apache and whose license must accompany any distribution
 of this software or derivative works, unmodified, per its own terms:
 
@@ -23,7 +23,14 @@ of this software or derivative works, unmodified, per its own terms:
 - `asupersync`
 - `franken-kernel`, `franken-evidence`, `franken-decision`
 
-Each of these carries the byte-identical license reproduced in full below
+Builds that explicitly enable the non-default `brain-ft` feature additionally
+admit and compile the pinned Frankentorch family: `ft-api`, `ft-nn`, `ft-optim`,
+`ft-autograd`, `ft-core`, `ft-dispatch`, `ft-kernel-cpu`, and `ft-runtime`.
+The future `FtBrain` adapter (`bd-2z0.3.12.3`) will link that family into the
+application. Default release products do not embed these optional crates.
+`ft-serialize` and its runtime integrations are deliberately excluded.
+
+Each listed component carries the byte-identical license reproduced in full below
 (canonical upstream sha256
 `32a82e0a5754e72e51fae44b65a936c831c07376f21c90f5fb9e76897fcc3509`).
 

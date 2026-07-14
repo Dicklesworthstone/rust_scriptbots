@@ -23,6 +23,99 @@ incompatible, scientific output changes without an approved version boundary,
 licensing is unclear, or the migration crosses the review circuit breakers in
 the rearchitecture plan.
 
+## 2026-07-13 — Admit Frankentorch behind `brain-ft`
+
+- **Bead:** `bd-2z0.3.12.1`
+- **Change class:** new optional Git dependency family; dependency admission
+  only, with no `FtBrain` implementation or inference behavior
+- **Before:** Frankentorch was absent from every manifest, lockfile, and product
+  graph.
+- **Target:** `ft-api`, `ft-nn`, and `ft-optim` 0.1.0 from immutable revision
+  `e4c6bdd5ec629ae70b40da9314da345ade012ca7`, each declared with
+  `default-features = false` and activated only by the non-default `brain-ft`
+  feature in `scriptbots-brain-ml`. `scriptbots-app/brain-ft` is the only app
+  propagation edge and also remains non-default.
+- **Primary source:** upstream commit
+  <https://github.com/Dicklesworthstone/frankentorch/commit/e4c6bdd5ec629ae70b40da9314da345ade012ca7>,
+  its pinned
+  [license](https://github.com/Dicklesworthstone/frankentorch/blob/e4c6bdd5ec629ae70b40da9314da345ade012ca7/LICENSE),
+  and Phase-2C reliability
+  [run 29206656988](https://github.com/Dicklesworthstone/frankentorch/actions/runs/29206656988).
+- **Upstream reliability residual:** the selected revision was current `main`
+  when surveyed on 2026-07-13; the repository has no tags or releases. Its
+  latest Phase-2C run is red in G1 on ten strict-Clippy findings in
+  `ft-kernel-cpu` under upstream's floating nightly, so G2-G8 were skipped; no
+  main-branch success appears in the most recent 100 runs. Admission explicitly
+  waives upstream-green preference rather than misreporting it, and instead
+  owns a downstream build matrix on the project's pinned
+  `nightly-2026-07-09`.
+- **License/provenance:** MIT with the OpenAI/Anthropic rider, canonical license
+  SHA-256
+  `32a82e0a5754e72e51fae44b65a936c831c07376f21c90f5fb9e76897fcc3509`.
+  The family and exact pin are recorded in `docs/licenses.md` and
+  `THIRD-PARTY-LICENSES.md`; distribution already carries the rider text.
+- **Resolved normal closure:** exactly `ft-api`, `ft-autograd`, `ft-core`,
+  `ft-dispatch`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`, and `ft-runtime`.
+  `ft-serialize`, `ft-device`, `ft-data`, `ft-conformance`, `ft-kernel-metal`,
+  `asupersync`, and `ftui` are excluded from the brain feature's graph.
+- **Numeric universe:** `half` 2.7.1 and `matrixmultiply` 0.3.10 remain
+  single-version. Frankentorch requires `wide` 0.7.33 / `safe_arch` 0.7.4 beside
+  ScriptBots' existing `wide` 1.5.0 / `safe_arch` 1.0.0. Those two documented
+  splits are confined to `brain-ft`; the default app and wasm graphs are
+  unchanged.
+- **Allowed manifest delta:** three shared exact Git declarations; three
+  optional `scriptbots-brain-ml` dependencies and one non-default feature; one
+  explicit app propagation feature. No default feature changes and no source
+  references are permitted in this admission bead.
+- **Allowed lock delta:** eight 0.1.0 Frankentorch packages at the same exact
+  Git source, `wide` 0.7.33, and `safe_arch` 0.7.4; add the three optional
+  dependencies to the `scriptbots-brain-ml` package record and disambiguate the
+  existing `wide`/`safe_arch` references. The reviewed lock diff is 114
+  additions and two deletions; the deletions are the two disambiguation
+  replacements. No unrelated version, checksum, or source moved.
+- **Build measurements:** one-shot observations on a shared 10-core AMD EPYC
+  Linux worker, pinned nightly, locked graph, debug profile, and isolated
+  target directories. With incremental compilation enabled, clean
+  `scriptbots-brain-ml` builds took 32.71 s / 487,456 KiB peak RSS feature-off
+  and 101.12 s / 2,933,752 KiB feature-on. After touching only that crate's
+  `src/lib.rs`, true incremental rebuilds took 1.03 s / 153,672 KiB off and
+  2.77 s / 152,808 KiB on. Separate non-incremental no-op repeats took 0.69 s
+  off and 3.10 s on.
+- **Debug binary measurement:** comparable `scriptbots-app` binaries built with
+  `--no-default-features --features ml` and
+  `--no-default-features --features brain-ft` were 244,025,312 and 244,050,976
+  bytes respectively, a 25,664-byte opt-in increase before `FtBrain` exists.
+- **Release binary measurement:** under the project's shipped profile
+  (`opt-level = 3`, ThinLTO, one codegen unit, stripped, aborting panics), the
+  same feature-off/on binaries were 30,420,656 and 30,420,544 bytes. The
+  feature-on observation is 112 bytes smaller, so the admitted-but-unreferenced
+  crates add no measurable shipped-binary cost before the adapter exists.
+- **Default-product proof:** the pre-admission and admitted default app graphs
+  both contain exactly 372 unique package names and hash to
+  `ddf80cd7849140c6f2f3a36e51f8239ebb99f7ed98547f7e01e967eef748d1bb`.
+  The live guard scans normal, build, and dev edges and rejects any default
+  `ft-*` occurrence, so default compilation cost remains unchanged.
+- **CI:** `frankentorch-admission` builds the dependency-only brain feature and
+  checks explicit app propagation on Linux x86_64, macOS AArch64, and Windows
+  x86_64. `ci/check_wasm_graph.sh` separately freezes the exact eight-crate
+  normal closure, immutable source/version, numeric universe, exclusions, and
+  feature-off boundaries.
+- **Verification:** exact graph and license guards; guard self-tests; Bash,
+  ShellCheck, and Actionlint validation; focused feature-on build, app check,
+  strict Clippy, and the crate's currently empty unit/doc-test harness; locked
+  workspace/all-targets check and strict Clippy; formatting; and the full
+  locked workspace test suite all pass. Cargo emits only the pre-existing
+  future-incompatibility notice for `proc-macro-error2` 2.0.1.
+- **Result:** accepted as dependency-only scaffolding. It changes no simulation
+  behavior and makes no claim that upstream's floating-nightly reliability
+  workflow is green.
+- **Rollback:** manually remove only the three root declarations, the three ML
+  dependency lines, the two `brain-ft` feature entries, the admission CI job,
+  and the Frankentorch-specific guard/documentation blocks; then regenerate and
+  review `Cargo.lock` so only the ten admitted package records and two
+  disambiguations reverse. Do not use checkout, reset, clean, or broad file
+  replacement.
+
 ## 2026-07-11 — Freeze the existing GPUI source resolution
 
 - **Bead:** `bd-2z0.1.2`

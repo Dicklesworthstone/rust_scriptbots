@@ -36,7 +36,7 @@ rust_scriptbots/
 ├── crates/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
-│   ├── scriptbots-brain-ml   # Feature probes/placeholders for future Candle/Tract/tch adapters
+│   ├── scriptbots-brain-ml   # Compile probes for Candle/Tract/tch/Frankentorch; no inference yet
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
 │   ├── scriptbots-index      # Uniform-grid index; alternate backends are not implemented
 │   ├── scriptbots-storage    # FrankenSQLite persistence worker & analytics snapshots
@@ -113,7 +113,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 ### Crate roles
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
-- **`scriptbots-brain-ml`**: Feature selection and a sensor-copy placeholder for future Candle, Tract, and tch inference. It does not load or execute models yet.
+- **`scriptbots-brain-ml`**: Feature selection and a sensor-copy placeholder for future Candle, Tract, tch, and Frankentorch inference. It does not load or execute models yet; `brain-ft` currently admits and compiles the pinned Frankentorch dependency family only.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
 - **`scriptbots-index`**: Production uniform-grid neighborhood index. The declared `rstar` and `kd` dependency features are compile-time scaffolding, not implemented index backends.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
@@ -372,9 +372,11 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
 ### Feature flags & variants
 - **`scriptbots-app` features**:
   - `ml` → enable `scriptbots-brain-ml`
+  - `brain-ft` → explicitly propagate the non-default pinned Frankentorch compile probe through `scriptbots-brain-ml`; no `FtBrain` inference exists until `bd-2z0.3.12.3`
   - `neuro` → enable `scriptbots-brain-neuro`
   - `fast-alloc` → enable mimalloc as the global allocator for improved multithreaded performance
   - Example: `cargo run -p scriptbots-app --features neuro`
+  - Frankentorch admission check: `cargo build -p scriptbots-app --no-default-features --features brain-ft`
   - Note: default features enable `ml`, `neuro`, and `fast-alloc`. To disable defaults, use `--no-default-features` and opt-in explicitly.
 - **`scriptbots-render`**:
   - `audio` → enable Kira-driven audio in the UI layer
@@ -382,13 +384,14 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `grid` is the implemented backend; `rstar` and `kd` currently enable dependencies only.
   - Example: `cargo build -p scriptbots-index --features rstar`
 - **`scriptbots-brain-ml`** (backend compile probes; inference remains a placeholder):
-  - `candle`, `tract`, `tch` (all optional dependency features)
+  - `candle`, `tract`, `tch`, `brain-ft` (all optional dependency features)
   - Examples:
     - `cargo build -p scriptbots-brain-ml --features candle`
     - `cargo build -p scriptbots-brain-ml --features tract`
     - `cargo build -p scriptbots-brain-ml --features tch`
+    - `cargo build -p scriptbots-brain-ml --no-default-features --features brain-ft`
 
-Note: NeuroFlow and the native brain implementations are functional. The alternate spatial-index and Candle/Tract/tch execution paths remain tracked implementation work despite their dependency features compiling.
+Note: NeuroFlow and the native brain implementations are functional. The alternate spatial-index and Candle/Tract/tch/Frankentorch execution paths remain tracked implementation work despite their dependency features compiling.
 
 ### NeuroFlow runtime configuration (optional)
 If built with the `neuro` feature, runtime toggles can be applied via env vars before launch:

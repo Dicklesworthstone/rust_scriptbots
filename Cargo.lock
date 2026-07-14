@@ -4773,6 +4773,96 @@ dependencies = [
 ]
 
 [[package]]
+name = "ft-api"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "ft-autograd",
+ "ft-core",
+ "ft-dispatch",
+ "ft-kernel-cpu",
+ "ft-runtime",
+ "libm",
+ "rayon",
+ "wide 0.7.33",
+]
+
+[[package]]
+name = "ft-autograd"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "ft-core",
+ "ft-dispatch",
+ "ft-kernel-cpu",
+ "libm",
+ "rayon",
+]
+
+[[package]]
+name = "ft-core"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "half",
+ "num-complex",
+]
+
+[[package]]
+name = "ft-dispatch"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "ft-core",
+ "ft-kernel-cpu",
+]
+
+[[package]]
+name = "ft-kernel-cpu"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "ft-core",
+ "libm",
+ "matrixmultiply",
+ "rayon",
+ "wide 0.7.33",
+]
+
+[[package]]
+name = "ft-nn"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "ft-api",
+ "ft-autograd",
+ "ft-core",
+ "ft-dispatch",
+ "ft-kernel-cpu",
+ "rayon",
+]
+
+[[package]]
+name = "ft-optim"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "ft-api",
+ "ft-autograd",
+ "ft-core",
+ "ft-dispatch",
+ "rayon",
+]
+
+[[package]]
+name = "ft-runtime"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=e4c6bdd5ec629ae70b40da9314da345ade012ca7#e4c6bdd5ec629ae70b40da9314da345ade012ca7"
+dependencies = [
+ "ft-core",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9836,6 +9926,15 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safe_arch"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "safe_arch"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
@@ -10059,6 +10158,9 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "ft-api",
+ "ft-nn",
+ "ft-optim",
  "scriptbots-brain",
  "scriptbots-core",
  "tch",
@@ -10096,7 +10198,7 @@ dependencies = [
  "slotmap",
  "thiserror 2.0.18",
  "wfc",
- "wide",
+ "wide 1.5.0",
 ]
 
 [[package]]
@@ -13343,12 +13445,22 @@ dependencies = [
 
 [[package]]
 name = "wide"
+version = "0.7.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
+dependencies = [
+ "bytemuck",
+ "safe_arch 0.7.4",
+]
+
+[[package]]
+name = "wide"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfdfe6a32973f2d1b268b8895845a8a96cac2f0191e72c27cc929036060dbf89"
 dependencies = [
  "bytemuck",
- "safe_arch",
+ "safe_arch 1.0.0",
 ]
 
 [[package]]

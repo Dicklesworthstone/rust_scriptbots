@@ -1,6 +1,6 @@
 # Franken Ecosystem Integration — Program Guide (bd-2js6)
 
-Last reconciled: **2026-07-12** (update this line whenever a program bead
+Last reconciled: **2026-07-13** (update this line whenever a program bead
 closes — that is part of each bead's close checklist by convention). This
 document is what a new contributor reads INSTEAD of re-running the six-repo
 survey that produced the program. Style: terse, factual. Authority order when
@@ -13,7 +13,8 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB |
 | `asupersync` 0.3.6 | transitive via fsqlite (direct planned: bd-2z0.4.12) | crates.io — guard: `ci/check_asupersync_universe.sh` | n/a | in tree, unexploited by first-party code |
 | `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
-| everything else (ftui, fnx, frankenpandas, fsci, ft, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
+| `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | dependency admitted; FtBrain implementation remains bd-2z0.3.12.3 |
+| everything else (ftui, fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
 
 ## 2. Verdicts (with the one-paragraph why)
 
@@ -73,7 +74,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | fnx-classes/-algorithms | **yes 0.2.0 — git repo unusable** (absolute `/dp/frankentui` path dep) | stable-ish | **no** (rayon) | MIT+Rider |
 | frankenpandas | yes (0.1.2) | stable-ish | **no** (rusqlite default feature) | MIT+Rider |
 | frankenscipy | **git only** | nightly (`std::simd`) | untested | MIT+Rider |
-| frankentorch | **git only**, no tags | nightly | **no** (rayon) | MIT+Rider |
+| frankentorch | **git only**, no tags; pinned `e4c6bdd5…` | nightly | **no** (rayon) | MIT+Rider |
 | franken_numpy | **git only** | nightly | **no** (getrandom backend) | MIT+Rider |
 
 Workspace pins `nightly-2026-07-09`, so nightly-only deps are admissible.
@@ -110,19 +111,21 @@ and review log). Status at last reconcile:
 
 - **CLOSED**: bd-2z0.8.15 (license/rider audit → `docs/licenses.md` + CI
   guard), bd-2z0.8.17 (asupersync universe guard), bd-2z0.8.9.14 (fsqlite pin
-  reconciliation → `ci/check_fsqlite_pin.sh`).
-- **IN PROGRESS**: bd-2z0.8.16 (wasm graph guard — script + self-tests landed;
-  snapshot + CI wiring pending a free cargo lane).
-- **OPEN, ready**: bd-2z0.11.5 (analytics scaffold), bd-2z0.3.12.1
-  (frankentorch admission — unblocked by the license audit), bd-2z0.3.12.2
+  reconciliation → `ci/check_fsqlite_pin.sh`), bd-2z0.8.16 (wasm graph
+  denylist + golden), bd-2z0.11.5 (analytics scaffold), bd-2z0.13.6 (rider
+  release packaging), bd-2z0.3.12.1 (frankentorch dependency admission).
+- **OPEN, ready**: bd-2z0.3.12.2
   (BatchBrain — sequenced after the bd-16g.15.x sense-lane digest move),
-  bd-2z0.8.18 (perf gates), bd-2z0.13.6 (rider release packaging).
+  bd-2z0.8.18 (perf gates).
 - **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.12/.13
   (async-api / MVCC decision), bd-2z0.4.12/.13/.14 + bd-2z0.8.9.15 +
   bd-2z0.12.4 (asupersync spine chain), bd-2z0.11.6/.7/.8/.9 (analytics
   implementations), bd-2z0.3.12.3–.6 (FtBrain chain), bd-2z0.5.9
   (interaction persistence, rides bd-2z0.5.2).
 
-CI guards live in `.github/workflows/ci.yml` (security job):
-`check_franken_licenses.sh`, `check_asupersync_universe.sh`,
-`check_fsqlite_pin.sh`. Each has `--self-test`.
+CI controls live in `.github/workflows/ci.yml`: the security job runs
+`check_franken_licenses.sh`, `check_asupersync_universe.sh`, and
+`check_fsqlite_pin.sh`; the wasm job runs `check_wasm_graph.sh` before its
+expensive build; and the `frankentorch-admission` matrix compiles `brain-ft`
+and checks its explicit app propagation on Linux, macOS, and Windows. Each
+standalone guard has a `--self-test` mode.

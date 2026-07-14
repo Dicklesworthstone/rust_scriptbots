@@ -209,6 +209,70 @@ jobs:
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
+  # Frankentorch is intentionally absent from every default lane. This
+  # build-only matrix proves the exact git pin against our dated nightly and
+  # the explicit app feature propagation without pretending the FtBrain
+  # adapter exists before bd-2z0.3.12.3.
+  frankentorch-admission:
+    name: Frankentorch feature build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            cargo_target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            cargo_target: aarch64-apple-darwin
+          - os: windows-2022
+            cargo_target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install mold linker and system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly-2026-07-09
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: frankentorch-admission-${{ matrix.os }}-${{ matrix.cargo_target }}
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+      - name: Build the admitted dependency closure
+        run: >-
+          cargo build --locked -p scriptbots-brain-ml
+          --no-default-features --features brain-ft
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
+      - name: Check explicit application feature propagation
+        run: >-
+          cargo check --locked -p scriptbots-app
+          --no-default-features --features brain-ft
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+
   # Security audit for dependencies
   security:
     name: Security Audit
