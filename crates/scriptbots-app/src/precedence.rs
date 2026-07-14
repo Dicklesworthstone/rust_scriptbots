@@ -59,6 +59,27 @@ pub enum ThreadSource {
     BuiltinDefault,
 }
 
+impl ThreadSource {
+    /// Stable identifier for PERSISTED records — the run manifest.
+    ///
+    /// Deliberately separate from [`fmt::Display`]. The Display string is prose written for a
+    /// human reading a log line, and someone will eventually reword it. This is a WIRE VALUE that
+    /// lands in a manifest on disk and is compared across runs. Tying the two together would mean
+    /// that improving a log message silently changed a persisted provenance record — and every
+    /// manifest written before the reword would disagree with every one written after, for no
+    /// reason a reader could see.
+    #[must_use]
+    pub const fn wire_tag(self) -> &'static str {
+        match self {
+            Self::CliFlag => "cli-flag",
+            Self::Environment => "environment",
+            Self::AutoTune => "auto-tune",
+            Self::LowPowerDefault => "low-power-default",
+            Self::BuiltinDefault => "builtin-default",
+        }
+    }
+}
+
 impl fmt::Display for ThreadSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {

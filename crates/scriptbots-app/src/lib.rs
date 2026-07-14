@@ -205,6 +205,36 @@ impl Default for CharacterizationLimitationsV0 {
     }
 }
 
+/// The thread policy a run actually resolved to, and WHICH LAYER decided it.
+///
+/// `BuildProvenanceV0` already captures `RAYON_NUM_THREADS` and `SCRIPTBOTS_MAX_THREADS` — but
+/// those are what the ENVIRONMENT said, not what the run DECIDED, and those are different facts.
+/// A user who exported `SCRIPTBOTS_MAX_THREADS=16` and passed `--threads 8` RAN ON 8, while the
+/// environment capture still says 16. A manifest carrying only the environment therefore describes
+/// a run that did not happen — and it does so precisely in the case the precedence rules exist to
+/// handle.
+///
+/// `source` matters as much as the number. Two runs that both used 8 threads — one because the
+/// operator asked for 8, the other because the auto-tune probe measured its way there — have
+/// different provenance, and a reader comparing them needs to tell which is which.
+///
+/// `overridden` names a layer whose suggestion was DECLINED because a more specific layer had
+/// already spoken. That is the normal, correct outcome of the rules rather than a mistake — but it
+/// must be visible: a user who passes `--low-power` alongside `--threads 16` deserves to learn
+/// that low-power did not lower their thread count from the run's own record, not from a power
+/// bill.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadPolicyV0 {
+    /// The resolved cap. `None` means no layer named a value and Rayon's own default was left
+    /// alone — which is itself a decision, recorded as one rather than as a silent absence.
+    pub threads: Option<usize>,
+    /// Which layer won: `cli-flag`, `environment`, `auto-tune`, `low-power-default`, or
+    /// `builtin-default`.
+    pub source: String,
+    /// The layer whose suggestion was declined, if any.
+    pub overridden: Option<String>,
+}
+
 /// Version-one record tying scenario construction, stable identity allocation, random-stream
 /// continuation, and normalized configuration to a build.
 ///
@@ -217,6 +247,12 @@ pub struct RunManifestV1 {
     pub schema_version: u16,
     pub purpose: String,
     pub root_seed: u64,
+    /// How many threads this run actually used, and which layer decided — see [`ThreadPolicyV0`].
+    ///
+    /// `None` only for a manifest built outside the binary (tests, tooling), where no policy was
+    /// resolved. A real run always records one.
+    #[serde(default)]
+    pub thread_policy: Option<ThreadPolicyV0>,
     pub random_stream: RandomStreamState,
     pub next_agent_uid: u64,
     pub next_spawn_ordinal: u64,
@@ -246,6 +282,20 @@ pub enum RunManifestError {
 }
 
 impl RunManifestV1 {
+    /// Record the thread policy the startup path actually resolved.
+    ///
+    /// This is the only way the policy reaches the manifest: `from_world` cannot know it, because
+    /// a world does not know how it was launched. Without this call a real run's manifest would
+    /// carry only `BuildProvenanceV0`'s environment capture — which reports what the ENVIRONMENT
+    /// said rather than what the run DECIDED, and those differ precisely when a more specific
+    /// layer overrode the environment. A manifest describing a run that did not happen is worse
+    /// than one that says nothing.
+    #[must_use]
+    pub fn with_thread_policy(mut self, policy: ThreadPolicyV0) -> Self {
+        self.thread_policy = Some(policy);
+        self
+    }
+
     /// Capture a run manifest using provenance embedded in the current build.
     pub fn from_world(
         scenario_id: impl Into<String>,
@@ -298,6 +348,11 @@ impl RunManifestV1 {
             schema_version: 1,
             purpose: "characterization_only".to_owned(),
             root_seed,
+            // Left empty here on purpose: a manifest built from a world alone has no way to know
+            // what the STARTUP path decided about threads. The binary attaches it via
+            // `with_thread_policy`, so a manifest that carries no policy is one that was built
+            // outside a real run — which is a true statement, not a missing field.
+            thread_policy: None,
             random_stream,
             next_agent_uid,
             next_spawn_ordinal,

@@ -4,7 +4,7 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     CharacterizationTraceV0, ControlServerConfig, ControlServerReservation, RunManifestV1,
-    ScenarioIdentityV0, SharedAnalytics, SharedWorld,
+    ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
     precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
@@ -845,6 +845,21 @@ fn emit_run_manifest(world: &WorldState, storage_path: Option<&str>, thread_poli
             return;
         }
     };
+
+    // Record what the run DECIDED, not merely what the environment said.
+    //
+    // BuildProvenanceV0 already captures RAYON_NUM_THREADS and SCRIPTBOTS_MAX_THREADS from the
+    // environment. Those are a different fact: a user who exported SCRIPTBOTS_MAX_THREADS=16 and
+    // then passed `--threads 8` RAN ON 8, while the environment capture says 16. Without this, the
+    // manifest would describe a run that did not happen — and the discrepancy would appear exactly
+    // in the case this bead's precedence rules exist to handle.
+    let manifest = manifest.with_thread_policy(ThreadPolicyV0 {
+        threads: thread_policy.threads,
+        source: thread_policy.source.wire_tag().to_owned(),
+        overridden: thread_policy
+            .overridden
+            .map(|declined| declined.wire_tag().to_owned()),
+    });
 
     match manifest.canonical_json_bytes() {
         Ok(encoded) => {
