@@ -3,6 +3,7 @@
 pub mod ancestry;
 pub mod channels;
 pub mod detect;
+pub mod rng_domains;
 pub mod sense_fixed;
 
 pub use channels::{
