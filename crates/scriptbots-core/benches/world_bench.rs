@@ -2413,10 +2413,11 @@ fn run_self_test() -> GateResult<()> {
     );
 
     let mut changed_science = synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
-    for repetition in changed_science.scenarios[0]
+    let changed_scenario = &mut changed_science.scenarios[0];
+    for repetition in changed_scenario
         .warmups
         .iter_mut()
-        .chain(&mut changed_science.scenarios[0].measurements)
+        .chain(&mut changed_scenario.measurements)
     {
         repetition.final_digest = "synthetic-different-science".to_owned();
     }
