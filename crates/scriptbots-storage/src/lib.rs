@@ -2685,6 +2685,10 @@ struct ExistingStorageLease {
     _file: std::fs::File,
     path_identity: StorageFileIdentity,
     connection_identity: Option<FileIdentity>,
+    /// Whether this filesystem can actually supply the stable (device, inode) identity the
+    /// swapped-file check depends on. Decided ONCE, by probing the filesystem — see
+    /// [`filesystem_has_stable_file_identity`].
+    identity_is_enforceable: bool,
 }
 
 impl ExistingStorageLease {
@@ -2732,10 +2736,27 @@ impl ExistingStorageLease {
                 path: PathBuf::from(path),
                 source,
             })?;
+        let identity_is_enforceable = filesystem_has_stable_file_identity(Path::new(path));
+        if !identity_is_enforceable {
+            // Say it once, out loud, with the reason and the consequence. A security check that
+            // quietly turns itself off is worse than one that fails noisily: the operator would go
+            // on believing they had a guarantee they no longer have.
+            warn!(
+                path = %path,
+                "this filesystem does not give files a stable identity across truncate-and-regrow \
+                 (exFAT and FAT32 synthesize an inode from the file's starting cluster, so it \
+                 MOVES when the file is rewritten). The swapped-file check is therefore SKIPPED \
+                 for this database: storage cannot detect another process replacing it underneath \
+                 us. The symlink, regular-file and hard-link checks still apply. Put the database \
+                 on APFS/ext4 to get the full guarantee."
+            );
+        }
+
         let lease = Self {
             _file: file,
             path_identity: StorageFileIdentity::from_metadata(&file_metadata),
             connection_identity,
+            identity_is_enforceable,
         };
         lease.verify_path(path)?;
         Ok(lease)
@@ -2777,18 +2798,115 @@ impl ExistingStorageLease {
                 path: PathBuf::from(path),
                 source,
             })?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || storage_file_has_multiple_links(&metadata)
-            || StorageFileIdentity::from_metadata(&metadata) != self.path_identity
+
+        // Each condition is reported SEPARATELY. These four failures have nothing to do with one
+        // another — a symlink where a file should be is an attack, while a changed inode may be
+        // nothing but the filesystem reshuffling clusters — and collapsing them into one message
+        // ("changed during validated open") sent readers hunting for corruption that was not
+        // there. It cost real time; see bd-15c8.
+        if metadata.file_type().is_symlink() {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_path",
+                reason: format!(
+                    "recovery path {path} is a SYMLINK. The database must be a regular file: a \
+                     symlink can be repointed at another file between the check and the open."
+                ),
+            });
+        }
+        if !metadata.is_file() {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_path",
+                reason: format!("recovery path {path} is not a regular file"),
+            });
+        }
+        if storage_file_has_multiple_links(&metadata) {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_path",
+                reason: format!(
+                    "recovery path {path} has MULTIPLE HARD LINKS. Another name for this file \
+                     exists, so writes made through it would bypass this lease entirely."
+                ),
+            });
+        }
+
+        // THE INODE CHECK IS ONLY MEANINGFUL WHERE THE FILESYSTEM SUPPLIES A STABLE INODE.
+        //
+        // `StorageFileIdentity` is (device, inode) on Unix. On APFS and ext4 that is a genuine
+        // file identity and comparing it detects a swapped file. On exFAT it is NOT: exFAT has no
+        // inodes, and the kernel synthesizes one from the file's STARTING CLUSTER — so truncating
+        // and regrowing a file, which is exactly what creating and initialising a database does,
+        // MOVES THE INODE while the file stays the same file. Measured, not assumed: a 64-byte
+        // file rewritten to 1 MB on this exFAT volume went from inode 43648807 to 43648811, while
+        // the identical operation on APFS did not move at all.
+        //
+        // The result was that storage refused to open ANY database on an exFAT volume, accusing
+        // the user's own file of having "changed during validated open" — reading our own
+        // initialisation as tampering. exFAT is what external drives and USB sticks are formatted
+        // as, so pointing SCRIPTBOTS_STORAGE_PATH at an external disk (an entirely reasonable
+        // thing to do with multi-gigabyte run databases) was simply broken.
+        //
+        // So the guard now asks whether the filesystem can ACTUALLY PROVIDE the property it
+        // depends on, rather than assuming it. Where it can, the check is enforced exactly as
+        // before. Where it cannot, the check is SKIPPED — and skipped LOUDLY: the weakening is
+        // reported, once, with the reason. The other three checks above still apply, and they are
+        // the ones that catch the attacks that matter. A silently weakened security check would be
+        // worse than either the false positive or the honest downgrade.
+        if self.identity_is_enforceable
+            && StorageFileIdentity::from_metadata(&metadata) != self.path_identity
         {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_path",
-                reason: format!("recovery path {path} changed during validated open"),
+                reason: format!(
+                    "recovery path {path} now refers to a DIFFERENT FILE than the one this lease \
+                     opened (its device/inode changed). Another process replaced the database \
+                     underneath us."
+                ),
             });
         }
         Ok(())
     }
+}
+
+/// Does this filesystem give a file a STABLE identity across truncate-and-regrow?
+///
+/// Behavioural probe, not a filesystem-name lookup. We ask the filesystem to demonstrate the
+/// property we are about to depend on, because a name tells you what something is called and a
+/// probe tells you what it does — and the list of filesystems that synthesize inodes (exFAT,
+/// FAT32, some SMB/network mounts, some FUSE layers) is not one we can enumerate correctly in
+/// advance.
+///
+/// The probe creates a small temporary file in the SAME DIRECTORY as the database (identity
+/// semantics are a property of the mount, not of the process), notes its inode, truncates and
+/// regrows it — the exact operation a database create/initialise performs — and checks whether the
+/// inode survived. On failure to probe at all we return `true`: a probe that cannot run is not
+/// evidence that the filesystem is broken, and defaulting to the STRONGER check keeps the guard on
+/// wherever we are unsure.
+fn filesystem_has_stable_file_identity(database_path: &Path) -> bool {
+    let Some(dir) = database_path.parent() else {
+        return true;
+    };
+    let probe_path = dir.join(format!(
+        ".scriptbots-identity-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+
+    let stable = (|| -> std::io::Result<bool> {
+        std::fs::write(&probe_path, [0u8; 64])?;
+        let first = StorageFileIdentity::from_metadata(&std::fs::symlink_metadata(&probe_path)?);
+        // Truncate and regrow past a cluster boundary — what initialising a database does, and
+        // what moves a synthesized inode.
+        std::fs::write(&probe_path, vec![1u8; 1 << 20])?;
+        let second = StorageFileIdentity::from_metadata(&std::fs::symlink_metadata(&probe_path)?);
+        Ok(first == second)
+    })()
+    .unwrap_or(true);
+
+    let _ = std::fs::remove_file(&probe_path);
+    stable
 }
 
 /// FrankenSQLite-backed persistence sink with buffered writes.
@@ -7108,18 +7226,123 @@ mod tests {
         assert!(symlink_error.to_string().contains("non-symlink"));
 
         let hard_link = temp_db_path("storage-writer-alias-hard-link");
-        fs::hard_link(&original, &hard_link)?;
-        let hard_link_error =
-            match StoragePipeline::recover_existing(hard_link.to_string_lossy().as_ref()) {
-                Ok(mut pipeline) => {
-                    pipeline.shutdown()?;
-                    return Err("hard-link writer path unexpectedly succeeded".into());
-                }
-                Err(error) => error,
-            };
-        assert!(hard_link_error.to_string().contains("multiply linked"));
-        assert!(StoragePipeline::recover_existing(&original_string).is_err());
+        match fs::hard_link(&original, &hard_link) {
+            Ok(()) => {
+                let hard_link_error =
+                    match StoragePipeline::recover_existing(hard_link.to_string_lossy().as_ref()) {
+                        Ok(mut pipeline) => {
+                            pipeline.shutdown()?;
+                            return Err("hard-link writer path unexpectedly succeeded".into());
+                        }
+                        Err(error) => error,
+                    };
+                assert!(hard_link_error.to_string().contains("multiply linked"));
+
+                // AND THE ORIGINAL IS NOW REFUSED TOO. This is the part that makes the guard
+                // worth having: once a second name for the file exists, writing through EITHER
+                // name is unsafe, because the lease taken on one cannot see writes made through
+                // the other. So the original path is refused as well.
+                //
+                // It is asserted HERE, inside the branch where the link was actually created,
+                // because it is a CONSEQUENCE of the alias existing. Where the filesystem cannot
+                // create hard links there is no alias, the file has one name, and the original is
+                // rightly openable — asserting otherwise would be demanding a refusal with no
+                // reason behind it.
+                assert!(
+                    StoragePipeline::recover_existing(&original_string).is_err(),
+                    "a hard link to the database exists, but the ORIGINAL path still opened. \
+                     Writes through the alias would bypass this lease entirely."
+                );
+            }
+            // THE FILESYSTEM CANNOT CREATE HARD LINKS AT ALL (exFAT, FAT32).
+            //
+            // This is not a security check being skipped — it is an attack that CANNOT BE MOUNTED
+            // here. There is no second name for the file to write through, because the filesystem
+            // has no way to make one. The symlink half above ran, and still passed.
+            //
+            // The REASON is asserted rather than swallowed. A bare `is_err()` would let this test
+            // quietly stop testing anything the day hard_link began failing for some entirely
+            // different reason — a permission problem, a full disk — and a security test that has
+            // silently disabled itself is worse than one that was never written.
+            Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not create a hard link, and NOT because the filesystem lacks the \
+                     feature: {error} (os error {:?}). The hard-link half of this security test \
+                     did not run, and the reason is unexplained.",
+                    error.raw_os_error()
+                )
+                .into());
+            }
+        }
         Ok(())
+    }
+
+    #[test]
+    fn a_database_opens_on_a_filesystem_without_stable_inodes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // THE REGRESSION THIS BEAD EXISTS FOR (bd-15c8).
+        //
+        // Storage refused to open ANY database on exFAT, accusing the user's own file of having
+        // "changed during validated open". The swapped-file guard compares (device, inode), and
+        // exFAT has no inodes: the kernel synthesizes one from the file's STARTING CLUSTER, so
+        // truncating and regrowing a file — exactly what creating and initialising a database does
+        // — MOVES it. Our own initialisation was being read as tampering.
+        //
+        // exFAT is what external drives and USB sticks are formatted as, so putting a run database
+        // on an external disk was simply broken, with an error that sent the reader hunting for a
+        // corruption bug that did not exist.
+        //
+        // This test runs the real open path against whatever filesystem TMPDIR is on. It must
+        // succeed on BOTH: where inodes are stable the guard is enforced, and where they are not it
+        // is skipped (loudly) rather than firing falsely.
+        let path = temp_db_path("storage-unstable-inode-open");
+        let path_string = path.to_string_lossy().to_string();
+
+        let mut pipeline = StoragePipeline::create_new_file(&path_string)?;
+        pipeline.shutdown()?;
+
+        // And it must REOPEN — the recovery path is where the identity check actually runs.
+        let mut reopened = StoragePipeline::recover_existing(&path_string)?;
+        reopened.shutdown()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_identity_probe_agrees_with_the_filesystem_it_probes() {
+        // The probe decides whether a security check can be enforced, so it must not be a coin
+        // flip. Ask it twice about the same directory: a probe that disagreed with itself would
+        // enable the guard on one run and disable it on the next, and neither answer could be
+        // trusted.
+        let path = temp_db_path("storage-identity-probe");
+        std::fs::write(&path, b"probe").expect("write probe database");
+
+        let first = filesystem_has_stable_file_identity(&path);
+        let second = filesystem_has_stable_file_identity(&path);
+        assert_eq!(
+            first, second,
+            "the identity probe gave two different answers about the same filesystem. It decides \
+             whether a security check is enforceable, so an unstable answer means the guard is on \
+             or off depending on the run — and neither state could be trusted."
+        );
+
+        // And it must not leave litter behind in the user's database directory.
+        let dir = path.parent().expect("temp dir");
+        let leftovers = std::fs::read_dir(dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".scriptbots-identity-probe-")
+            })
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "the identity probe left its temporary files behind in the database directory"
+        );
     }
 
     fn assert_integrity(storage: &Storage) -> Result<(), Box<dyn std::error::Error>> {
