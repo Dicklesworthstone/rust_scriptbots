@@ -207,7 +207,7 @@ cargo test --workspace --all-features
 `scripts/perf_gate.sh` is the executable regression sentinel for the recovery plan's CPU budgets. It runs fresh deterministic worlds for the production-default MLP and NeuroFlow families, uses three warmups plus five measured repetitions, records every raw nanosecond sample, and gates on the median of the five whole-run TPS values so infrequent cadence work cannot disappear behind a median of short windows. It emits:
 
 - `perf_result.json` — scenario inputs, raw TPS windows, raw snapshot samples, per-stage timings, digests, and derived statistics;
-- `fingerprint.json` — the exact machine class, toolchain, build target, thread budget, filesystem, lockfile blob, and source commit;
+- `fingerprint.json` — the comparison machine class plus exact raw host evidence, toolchain, build target, thread budget, filesystem, lockfile blob, and source commit;
 - `perf_verdict.json` — the machine-readable pass/fail/advisory/refusal decision;
 - `perf_summary.md` — the human comparison report used by CI job summaries;
 - `perf_baseline.json` — only for an explicitly requested, admissible baseline candidate.
@@ -244,7 +244,7 @@ RCH_CANONICAL_PROJECT_ROOT=/Users/jemanuel/projects rch exec -- \
   --output-dir target/criterion/scriptbots-perf
 ```
 
-Comparisons are exact-class only. A CPU, runner image, OS/architecture, filesystem, full `rustc -Vv` identity, effective Cargo target/linker/rustflags configuration, Rayon/thread budget, feature set, or scenario/science-digest mismatch returns refusal (exit 2); the harness never invents a cross-class delta. Exit 1 is a stable budget failure. Exit 0 covers pass, explicit bootstrap-required, baseline-candidate, and advisory results, so automation must also inspect `perf_verdict.json` when it expects a particular proof state.
+Comparisons are exact-class only. A CPU, runner image, OS/architecture, filesystem, memory-capacity bucket, full `rustc -Vv` identity, effective Cargo target/linker/rustflags configuration, Rayon/thread budget, feature set, or scenario/science-digest mismatch returns refusal (exit 2); the harness never invents a cross-class delta. The comparison class rounds installed memory upward to the next 256 MiB capacity tier so reserved-page `MemTotal` jitter cannot create a false class, while `fingerprint.memory` retains the exact raw value for audit. Exit 1 is a stable budget failure. Exit 0 covers pass, explicit bootstrap-required, baseline-candidate, and advisory results, so automation must also inspect `perf_verdict.json` when it expects a particular proof state.
 
 CI treats that typed verdict more strictly than the local executable contract. Normal short/full lanes accept only `pass` or `advisory`, require both the process and typed exit code to be zero, and independently require `perf_result.json.fingerprint.git_dirty` to be `false`. They fail closed on missing artifacts, bootstrap-required, baseline-candidate, stable failure, class refusal, or an unknown status. For pull requests, the comparison baseline is materialized with `git show` from the event's validated base commit into runner-temporary storage; a candidate-tree baseline can therefore never approve its own change.
 

@@ -193,6 +193,7 @@ const MAX_CV_PCT: f64 = 5.0;
 const MAX_TPS_REGRESSION_PCT: f64 = 10.0;
 const MIN_TPS_1K: f64 = 60.0;
 const MAX_SNAPSHOT_P95_NS_1K: u64 = 4_000_000;
+const MEMORY_CLASS_BUCKET_MIB: u64 = 256;
 
 type GateResult<T> = Result<T, String>;
 
@@ -1080,6 +1081,41 @@ fn memory_fingerprint() -> String {
     }
 }
 
+fn memory_class_identity(raw: &str) -> GateResult<String> {
+    let raw = raw.trim();
+    let total_bytes = if let Some(fields) = raw.strip_prefix("MemTotal:") {
+        let mut fields = fields.split_whitespace();
+        let kib = fields
+            .next()
+            .ok_or_else(|| "Linux memory identity has no capacity".to_owned())?
+            .parse::<u64>()
+            .map_err(|error| format!("invalid Linux memory capacity: {error}"))?;
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return Err(format!(
+                "unsupported Linux memory identity `{raw}`; expected `MemTotal: <KiB> kB`"
+            ));
+        }
+        kib.checked_mul(1_024)
+            .ok_or_else(|| "Linux memory capacity overflowed bytes".to_owned())?
+    } else {
+        raw.parse::<u64>()
+            .map_err(|error| format!("invalid byte-count memory identity `{raw}`: {error}"))?
+    };
+    let bucket_bytes = MEMORY_CLASS_BUCKET_MIB
+        .checked_mul(1_024 * 1_024)
+        .ok_or_else(|| "memory class bucket overflowed bytes".to_owned())?;
+    let buckets = (total_bytes / bucket_bytes)
+        .checked_add(u64::from(total_bytes % bucket_bytes != 0))
+        .ok_or_else(|| "memory capacity overflowed its class bucket".to_owned())?;
+    let rounded_mib = buckets
+        .checked_mul(MEMORY_CLASS_BUCKET_MIB)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "memory capacity is below the minimum class bucket".to_owned())?;
+    Ok(format!(
+        "{rounded_mib} MiB (ceiling {MEMORY_CLASS_BUCKET_MIB} MiB)"
+    ))
+}
+
 fn capture_fingerprint() -> GateResult<Fingerprint> {
     let workspace_root = workspace_root()?;
     let logical_cpus = thread::available_parallelism()
@@ -1150,6 +1186,7 @@ fn capture_fingerprint() -> GateResult<Fingerprint> {
     let rust_host = rustc_field(&rustc_verbose, "host:")?;
     let kernel = command_output("uname", &["-srvmo"]);
     let memory = memory_fingerprint();
+    let memory_class = memory_class_identity(&memory)?;
     let clang_identity = checked_command_output("clang", &["--version"], false)?;
     let mold_identity = command_output("mold", &["--version"]);
     let linker = format!(
@@ -1184,7 +1221,7 @@ fn capture_fingerprint() -> GateResult<Fingerprint> {
         cpu_quota,
         filesystem: filesystem_kind(),
         kernel: kernel.clone(),
-        memory: memory.clone(),
+        memory: memory_class,
         rust_release,
         build_target,
         rust_host,
@@ -1525,9 +1562,10 @@ fn validate_artifact(artifact: &PerfArtifact, require_baseline: bool) -> GateRes
         return Err("artifact has no verified Git commit or Cargo.lock identity".to_owned());
     }
     validate_machine_class_identity(&artifact.fingerprint.class)?;
+    let expected_memory_class = memory_class_identity(&artifact.fingerprint.memory)?;
     if artifact.fingerprint.cpu_brand != artifact.fingerprint.class.cpu_brand
         || artifact.fingerprint.kernel != artifact.fingerprint.class.kernel
-        || artifact.fingerprint.memory != artifact.fingerprint.class.memory
+        || expected_memory_class != artifact.fingerprint.class.memory
     {
         return Err("fingerprint host identity disagrees with its machine class".to_owned());
     }
@@ -2156,6 +2194,8 @@ fn synthetic_artifact(
     tps: [f64; PERF_REPETITIONS],
     snapshot_p95_ns: [u64; PERF_REPETITIONS],
 ) -> PerfArtifact {
+    let memory = "MemTotal: 16777216 kB".to_owned();
+    let memory_class = memory_class_identity(&memory).expect("normalize test memory class");
     let class = MachineClass {
         provider: format!("self-test-{class_suffix}"),
         runner_os: "linux".to_owned(),
@@ -2170,7 +2210,7 @@ fn synthetic_artifact(
         cpu_quota: "4".to_owned(),
         filesystem: "ext2/ext3".to_owned(),
         kernel: "test-kernel".to_owned(),
-        memory: "test-memory".to_owned(),
+        memory: memory_class,
         rust_release: "nightly-test".to_owned(),
         rust_host: "x86_64-unknown-linux-gnu".to_owned(),
         rustc_verbose: "rustc nightly-test (self-test)\nbinary: rustc\ncommit-hash: test\ncommit-date: test\nhost: x86_64-unknown-linux-gnu\nrelease: nightly-test\nLLVM version: test".to_owned(),
@@ -2252,7 +2292,7 @@ fn synthetic_artifact(
             class,
             cpu_brand: "Synthetic CPU".to_owned(),
             kernel: "test-kernel".to_owned(),
-            memory: "test-memory".to_owned(),
+            memory,
             cargo_lock_git_blob: "test".to_owned(),
             git_commit: "self-test".to_owned(),
             git_dirty: false,
@@ -2304,6 +2344,27 @@ fn run_self_test() -> GateResult<()> {
         "perf-gate self-test: live Git and machine identity: {}",
         live_fingerprint.machine_class_id
     );
+
+    let linux_memory = memory_class_identity("MemTotal: 16377688 kB")?;
+    let page_drift_memory = memory_class_identity("MemTotal: 16377692 kB")?;
+    let old_midpoint_memory = memory_class_identity("MemTotal: 16384004 kB")?;
+    let macos_memory = memory_class_identity("16770752512")?;
+    let larger_memory = memory_class_identity("MemTotal: 33554432 kB")?;
+    if linux_memory != page_drift_memory
+        || linux_memory != old_midpoint_memory
+        || linux_memory != macos_memory
+    {
+        return Err(
+            "reserved-page or platform-format memory drift changed the machine class".to_owned(),
+        );
+    }
+    if linux_memory == larger_memory {
+        return Err("materially different memory capacities collapsed into one class".to_owned());
+    }
+    if memory_class_identity("MemTotal: 16377688 MB").is_ok() {
+        return Err("unsupported Linux memory units were accepted".to_owned());
+    }
+    println!("perf-gate self-test: stable memory capacity class: {linux_memory}");
 
     let baseline = synthetic_artifact("baseline", "same", [100.0; 5], [1_000_000; 5]);
 
