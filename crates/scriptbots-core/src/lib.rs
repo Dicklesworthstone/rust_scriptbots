@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use slotmap::{Key, KeyData, SecondaryMap, SlotMap, new_key_type};
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 use std::sync::OnceLock;
@@ -1231,6 +1231,26 @@ pub trait BrainRunner: Send + Sync {
         None
     }
 
+    /// Stable digest of everything this brain CARRIES — its genome and its evaluator state.
+    ///
+    /// This is what `CharacterizationDigestV0` cannot see. That digest encodes a brain's registry
+    /// key, its family name, and whether it is bound — and nothing else. So two worlds whose
+    /// agents have been evolving for a million ticks into completely different brains produce the
+    /// SAME v0 digest, as long as the families and bindings match. The oracle that decides whether
+    /// two runs are the same run is blind to the only thing that is actually evolving.
+    ///
+    /// That limitation is declared rather than hidden (`RunManifestV1`'s
+    /// `CharacterizationLimitationsV0::evaluator_state_covered = false`, `superseded_by:
+    /// WorldDigestV1`), and this method is how `WorldDigestV1` closes it.
+    ///
+    /// `None` means the family cannot expose its state. That is permitted — but it is NOT
+    /// silently permitted: a `WorldDigestV1` computed over a world containing such a family
+    /// reports `evaluator_state_covered = false` and names the family. An omission the reader
+    /// cannot see is precisely the failure this whole lane exists to remove.
+    fn state_digest(&self) -> Option<u64> {
+        None
+    }
+
     /// Duplicate this runner including all evolved parameters.
     ///
     /// `None` marks the family as non-heritable; reproduction then falls back
@@ -1762,6 +1782,50 @@ pub struct CharacterizationDigestV0 {
     pub hydrology: Option<String>,
     pub rng_probe: String,
     pub brain_registry: String,
+}
+
+/// Schema tag for [`WorldDigestV1`].
+pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1";
+
+/// The world's science-state oracle, version one — see [`WorldState::world_digest_v1`].
+///
+/// Supersedes [`CharacterizationDigestV0`], which is blind to brain state, identifies agents by a
+/// recycled slot key, and samples the RNG with a four-draw probe instead of capturing its state.
+///
+/// The per-lane hashes are DIAGNOSTIC, and that is the point of keeping them: when two runs
+/// disagree, `overall` tells you only *that* they differ. The lanes tell you *where* — the brains
+/// moved, or the food did, or only the counters did — which is the difference between a bug you
+/// can find in an hour and one you cannot find at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldDigestV1 {
+    pub schema: String,
+    pub algorithm: String,
+    pub tick: Tick,
+    /// Hash over every lane below, including the coverage flags.
+    pub overall: String,
+    /// Agent bodies, ordered by stable `AgentUid`.
+    pub agents: String,
+    /// Agent BRAINS — genome and evaluator state — kept in their own lane so that "the brains
+    /// changed" is distinguishable from "the bodies changed".
+    pub brains: String,
+    pub food: String,
+    pub terrain: String,
+    pub hydrology: Option<String>,
+    /// The RNG's restorable checkpoint, algorithm identity included.
+    pub rng: String,
+    /// Future-affecting allocation counters.
+    pub counters: String,
+    pub brain_registry: String,
+    /// `false` when some BOUND brain could not expose its state. The digest is still valid — but
+    /// it is valid over less than the whole world, and it says so rather than letting a reader
+    /// assume otherwise.
+    pub evaluator_state_covered: bool,
+    /// The families responsible, named. An omission the reader cannot see is not an omission —
+    /// it is a lie of composition.
+    pub uncovered_families: Vec<String>,
+    /// Which identity the agent lane is keyed on. Pinned so a future change to agent identity
+    /// cannot silently move the oracle.
+    pub agent_identity: String,
 }
 
 /// Compile-lane identity needed to interpret a characterization digest honestly.
@@ -14197,6 +14261,185 @@ impl WorldState {
             hydrology,
             rng_probe,
             brain_registry,
+        })
+    }
+
+    /// The world's science-state oracle, version one.
+    ///
+    /// `CharacterizationDigestV0` has three limitations, and it DECLARES all three rather than
+    /// hiding them (`RunManifestV1` carries them in `CharacterizationLimitationsV0`, whose
+    /// `superseded_by` field names this very method). V1 closes them:
+    ///
+    /// 1. **v0 is blind to the brains.** It encodes a brain's registry key, family name and
+    ///    bound-ness — and nothing about its weights. Two populations that have evolved for a
+    ///    million ticks into completely different brains produce the SAME v0 digest. The oracle
+    ///    that decides whether two runs are the same run could not see the only thing that is
+    ///    actually evolving. V1 hashes each brain's genome AND evaluator state via
+    ///    [`BrainRunner::state_digest`].
+    ///
+    /// 2. **v0 identifies agents by a REUSABLE slot key.** It orders by, and encodes,
+    ///    `AgentId::data().as_ffi()` — a slotmap key whose slots are recycled when agents die.
+    ///    Identity that is recycled is not identity: a world restored from a checkpoint may
+    ///    allocate the same agents into different slots and digest differently while being the
+    ///    same world. V1 orders by and encodes the stable [`AgentUid`].
+    ///
+    /// 3. **v0's RNG lane is a four-draw PROBE, not the stream's state.** Drawing four numbers
+    ///    from a clone tells you the stream is *positioned* somewhere; it does not capture what
+    ///    is needed to continue it. V1 encodes the restorable checkpoint — algorithm identity
+    ///    included, so a run cannot be silently compared against one produced by a different
+    ///    generator.
+    ///
+    /// It also encodes the future-affecting counters (`next_agent_uid`, `next_spawn_ordinal`,
+    /// `next_birth_ordinal`). Two worlds identical in every visible respect but poised to assign
+    /// different UIDs to their next offspring are NOT the same world, and every downstream
+    /// lineage claim would diverge from that tick onward.
+    ///
+    /// **Honesty about coverage is part of the output, not a footnote.** If any bound brain
+    /// cannot expose its state, `evaluator_state_covered` is `false` and the family is NAMED in
+    /// `uncovered_families`. A digest that quietly skipped those brains would be the same
+    /// failure as v0's, wearing a higher version number.
+    pub fn world_digest_v1(&self) -> Result<WorldDigestV1, CharacterizationError> {
+        // The environmental lanes are IDENTITY-INDEPENDENT — food, terrain, hydrology and the
+        // registry roster do not depend on how agents are keyed — so v0 computes them correctly
+        // and there is nothing to be gained by duplicating that code here.
+        let v0 = self.characterization_digest_v0()?;
+
+        // AGENTS, ordered by STABLE identity.
+        let mut ordered: Vec<(AgentUid, AgentId)> = self
+            .agents
+            .iter_handles()
+            .map(|id| {
+                let uid = self
+                    .agent_uid(id)
+                    .ok_or(CharacterizationError::MissingAgentData {
+                        agent_id: id.data().as_ffi(),
+                    })?;
+                Ok((uid, id))
+            })
+            .collect::<Result<_, CharacterizationError>>()?;
+        ordered.sort_unstable_by_key(|(uid, _)| uid.0);
+
+        let mut agents_encoder = CharacterizationEncoderV0::new("agents-v1");
+        let mut brains_encoder = CharacterizationEncoderV0::new("brains-v1");
+        let mut uncovered: BTreeSet<String> = BTreeSet::new();
+
+        agents_encoder.usize(ordered.len());
+        brains_encoder.usize(ordered.len());
+        for (uid, id) in ordered {
+            let raw_id = id.data().as_ffi();
+            let data = self
+                .agents
+                .snapshot(id)
+                .ok_or(CharacterizationError::MissingAgentData { agent_id: raw_id })?;
+            let runtime = self
+                .runtime
+                .get(id)
+                .ok_or(CharacterizationError::MissingAgentRuntime { agent_id: raw_id })?;
+            let identity = self
+                .identities
+                .get(id)
+                .ok_or(CharacterizationError::MissingAgentData { agent_id: raw_id })?;
+
+            // The stable UID, NOT the recycled slot key.
+            agents_encoder.u64(uid.0);
+            agents_encoder.u64(identity.spawn_ordinal);
+            agents_encoder.option_u64(identity.birth_ordinal);
+            encode_agent_data_v0(&mut agents_encoder, data);
+            encode_agent_runtime_v0(&mut agents_encoder, runtime);
+
+            // The brains lane is kept SEPARATE so that "the brains changed" and "the bodies
+            // changed" are distinguishable at a glance. A single fused hash tells you only that
+            // something moved.
+            brains_encoder.u64(uid.0);
+            brains_encoder.option_string(runtime.brain.kind());
+            match runtime.brain.runner().and_then(BrainRunner::state_digest) {
+                Some(digest) => {
+                    brains_encoder.bool(true);
+                    brains_encoder.u64(digest);
+                }
+                None => {
+                    brains_encoder.bool(false);
+                    // An UNBOUND agent has no brain to cover, and that is not a gap. A BOUND
+                    // agent whose family cannot expose its state IS a gap, and it is named.
+                    if runtime.brain.is_bound() {
+                        uncovered.insert(
+                            runtime
+                                .brain
+                                .kind()
+                                .unwrap_or("<unnamed family>")
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+        let agents = agents_encoder.finish();
+        let brains = brains_encoder.finish();
+
+        // RNG: the RESTORABLE state, not a probe. The algorithm id rides along, so a digest can
+        // never silently compare a run against one produced by a different generator.
+        let checkpoint = self.rng.checkpoint();
+        let mut rng_encoder = CharacterizationEncoderV0::new("rng-v1");
+        rng_encoder.string(&checkpoint.algorithm);
+        rng_encoder.u16(checkpoint.version);
+        rng_encoder.u16(checkpoint.codec_version);
+        rng_encoder.usize(checkpoint.state.len());
+        for byte in &checkpoint.state {
+            rng_encoder.u8(*byte);
+        }
+        let rng = rng_encoder.finish();
+
+        // FUTURE-AFFECTING COUNTERS. Two worlds that look identical but are poised to hand
+        // different UIDs to their next offspring will diverge from that tick onward.
+        let mut counters_encoder = CharacterizationEncoderV0::new("counters-v1");
+        counters_encoder.u64(self.tick.0);
+        counters_encoder.u64(self.epoch);
+        counters_encoder.u64(self.next_agent_uid);
+        counters_encoder.u64(self.next_spawn_ordinal);
+        counters_encoder.u64(self.next_birth_ordinal);
+        let counters = counters_encoder.finish();
+
+        let evaluator_state_covered = uncovered.is_empty();
+        let uncovered_families: Vec<String> = uncovered.into_iter().collect();
+
+        let mut overall_encoder = CharacterizationEncoderV0::new("overall-v1");
+        overall_encoder.string(WORLD_DIGEST_V1_SCHEMA);
+        overall_encoder.string(&agents);
+        overall_encoder.string(&brains);
+        overall_encoder.string(&v0.food);
+        overall_encoder.string(&v0.terrain);
+        overall_encoder.bool(v0.hydrology.is_some());
+        if let Some(hydrology) = &v0.hydrology {
+            overall_encoder.string(hydrology);
+        }
+        overall_encoder.string(&rng);
+        overall_encoder.string(&counters);
+        overall_encoder.string(&v0.brain_registry);
+        // Coverage is part of the identity: a digest computed while blind to some brains must
+        // never collide with one computed while seeing them all.
+        overall_encoder.bool(evaluator_state_covered);
+        overall_encoder.usize(uncovered_families.len());
+        for family in &uncovered_families {
+            overall_encoder.string(family);
+        }
+        let overall = overall_encoder.finish();
+
+        Ok(WorldDigestV1 {
+            schema: WORLD_DIGEST_V1_SCHEMA.to_owned(),
+            algorithm: "fnv1a64-v0".to_owned(),
+            tick: self.tick,
+            overall,
+            agents,
+            brains,
+            food: v0.food,
+            terrain: v0.terrain,
+            hydrology: v0.hydrology,
+            rng,
+            counters,
+            brain_registry: v0.brain_registry,
+            evaluator_state_covered,
+            uncovered_families,
+            agent_identity: "AgentUid".to_owned(),
         })
     }
 

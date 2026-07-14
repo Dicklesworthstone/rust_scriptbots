@@ -984,6 +984,69 @@ impl Brain for MlpBrain {
     fn snapshot_activations(&self) -> Option<BrainActivations> {
         Some(self.activations())
     }
+
+    /// Hash everything this brain carries: the GENOME (`nodes` — weights, targets, synapse kinds,
+    /// gain, damping, bias) and the EVALUATOR STATE (`state` — the recurrent outputs that make
+    /// this network's next tick depend on its last one).
+    ///
+    /// Both halves are required. Hashing only the genome would make two brains with identical
+    /// weights but different recurrent state compare equal, and they are NOT equal: they will
+    /// produce different outputs on the very next tick. A checkpoint restored without the
+    /// recurrent state would pass a genome-only digest while silently resuming a different
+    /// experiment.
+    ///
+    /// Floats are hashed through `to_bits`, not by value: `-0.0` and `+0.0` compare equal as
+    /// numbers but are different genomes, and a NaN weight must not silently equal any other NaN
+    /// weight. This is an IDENTITY digest, not a numeric comparison.
+    fn state_digest(&self) -> Option<u64> {
+        let mut bytes = Vec::with_capacity(self.nodes.len() * 64 + self.state.len() * 12);
+
+        bytes.extend_from_slice(&(self.nodes.len() as u64).to_le_bytes());
+        for node in &self.nodes {
+            for weight in &node.weights {
+                bytes.extend_from_slice(&weight.to_bits().to_le_bytes());
+            }
+            for target in &node.targets {
+                bytes.extend_from_slice(&(*target as u64).to_le_bytes());
+            }
+            for kind in &node.kinds {
+                bytes.push(match kind {
+                    SynapseKind::Regular => 0,
+                    SynapseKind::ChangeSensitive => 1,
+                });
+            }
+            bytes.extend_from_slice(&node.gain.to_bits().to_le_bytes());
+            bytes.extend_from_slice(&node.damping.to_bits().to_le_bytes());
+            bytes.extend_from_slice(&node.bias.to_bits().to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&(self.state.len() as u64).to_le_bytes());
+        for state in &self.state {
+            bytes.extend_from_slice(&state.output.to_bits().to_le_bytes());
+            bytes.extend_from_slice(&state.previous_output.to_bits().to_le_bytes());
+            bytes.extend_from_slice(&state.target.to_bits().to_le_bytes());
+        }
+
+        Some(fnv1a64(&bytes))
+    }
+}
+
+/// FNV-1a: a SPECIFIED algorithm, pinned forever.
+///
+/// Deliberately not `std::hash::DefaultHasher`, whose algorithm std explicitly does not promise
+/// across Rust releases — using it here would let a *compiler upgrade* silently change the
+/// identity of every brain in the project (see bd-2z0.8.4, where exactly that bug was found
+/// feeding the characterization digest).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 // Specialized adapter impl removed; generic adapter in lib.rs downcasts to call `activations()`.

@@ -146,6 +146,20 @@ pub trait Brain: Send + Sync + Any {
     fn snapshot_activations(&self) -> Option<BrainActivations> {
         None
     }
+
+    /// Stable digest of the brain's GENOME and EVALUATOR STATE.
+    ///
+    /// `CharacterizationDigestV0` records only which family a brain belongs to — not what it
+    /// has become. Two populations that have evolved for a million ticks into entirely
+    /// different brains therefore produce identical v0 digests. `WorldDigestV1` closes that
+    /// hole, and this is the hook it uses.
+    ///
+    /// Returning `None` is allowed for a family that genuinely cannot expose its state, but it
+    /// is never silent: the world digest then reports `evaluator_state_covered = false` and
+    /// names the family, so the reader knows the oracle could not see inside those brains.
+    fn state_digest(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Summary emitted after each brain evaluation.
@@ -248,6 +262,10 @@ impl BrainRunner for BrainRunnerAdapter {
 
     fn snapshot_activations(&self) -> Option<BrainActivations> {
         self.brain.snapshot_activations()
+    }
+
+    fn state_digest(&self) -> Option<u64> {
+        self.brain.state_digest()
     }
 
     fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
