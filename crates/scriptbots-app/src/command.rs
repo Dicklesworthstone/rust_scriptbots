@@ -1029,13 +1029,7 @@ mod tests {
 
     #[test]
     fn seeded_command_schedule_matches_direct_world_digest_each_tick() {
-        const FOOD_MAX_SCHEDULE: &[&[f32]] = &[
-            &[0.61, 0.47],
-            &[],
-            &[0.58],
-            &[],
-            &[0.52, 0.63],
-        ];
+        const FOOD_MAX_SCHEDULE: &[&[f32]] = &[&[0.61, 0.47], &[], &[0.58], &[], &[0.52, 0.63]];
         let config = ScriptBotsConfig::default();
         let mut direct = WorldState::new(config.clone()).expect("direct seeded world");
         let mut queued = WorldState::new(config).expect("queued seeded world");
