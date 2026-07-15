@@ -36,6 +36,15 @@ use serde::Serialize;
 /// bd-2z0.11.3's adapter decision consumes. Never enters core or any tick path.
 pub mod stats;
 
+/// Statistical certification of narrative events (bd-2z0.11.6, item 1).
+///
+/// Answers "is this detected event real, or the tail of noise?" for the events the detector
+/// fires, with Benjamini-Hochberg false-discovery-rate control across a whole run — the
+/// principled replacement for eyeballed per-event thresholds that bd-16g.2.3's false-positive
+/// budget needs. Pure functions over a metric series; the report that reads real `EventRecord`s
+/// from a database is a thin adapter on top.
+pub mod certify;
+
 /// Schema version stamped into every machine-readable report payload.
 ///
 /// Bump ONLY with a migration note in the owning Bead/release evidence. Full
