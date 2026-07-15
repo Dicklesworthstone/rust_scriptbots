@@ -3143,8 +3143,16 @@ impl ResourceLedgerState {
     }
 }
 
-/// Schema identifier for opt-in per-stage simulation-step timing.
+/// Schema identifier for legacy opt-in per-stage simulation-step timing.
+///
+/// Version 2 includes downstream persistence admission in the Persistence stage and whole-step
+/// total. It remains the schema consumed by the reviewed performance baseline.
 pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
+/// Schema identifier for deterministic-core timing returned by profiled outcome steps.
+///
+/// Version 3 stops at the completed core boundary: Persistence covers policy projection and batch
+/// materialization, while downstream sink admission is deliberately excluded.
+pub const WORLD_STEP_OUTCOME_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v3";
 
 /// Schema identifier for opt-in per-stage scientific-state digests.
 pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.1";
@@ -3156,8 +3164,9 @@ pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
 
 /// Stable stage identifiers emitted by [`WorldStepProfile`].
 ///
-/// The order is part of [`WORLD_STEP_PROFILE_SCHEMA`]. New or regrouped stages require a new
-/// schema identifier so a performance baseline cannot silently compare different work.
+/// The order is shared by [`WORLD_STEP_PROFILE_SCHEMA`] and
+/// [`WORLD_STEP_OUTCOME_PROFILE_SCHEMA`]. New or regrouped stages require a new schema identifier
+/// so a performance baseline cannot silently compare different work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldStepStage {
@@ -3187,7 +3196,10 @@ pub enum WorldStepStage {
     Population,
     /// Accumulate tick counters, history, and narrative state.
     Bookkeeping,
-    /// Materialize and admit the persistence batch when due.
+    /// Project persistence policy and materialize the exact batch when due.
+    ///
+    /// Legacy v2 profiles add downstream admission time to this stage; core-only v3 profiles do
+    /// not admit the batch.
     Persistence,
     /// Reset transient events, finish diagnostic ledgers, and advance the tick.
     Finalize,
@@ -3309,16 +3321,18 @@ pub struct WorldStepProfile {
     pub schema: String,
     /// Completed tick described by this profile.
     pub tick: Tick,
-    /// Whole-step elapsed time, including accounting and error finalization.
+    /// Whole-step elapsed time under the profile's declared schema.
+    ///
+    /// Legacy v2 includes downstream admission; core-only v3 ends after finalization.
     pub total_ns: u64,
     stage_ns: [u64; WorldStepStage::COUNT],
     stage_executed: [bool; WorldStepStage::COUNT],
 }
 
 impl WorldStepProfile {
-    fn new(tick: Tick) -> Self {
+    fn new(tick: Tick, schema: &str) -> Self {
         Self {
-            schema: WORLD_STEP_PROFILE_SCHEMA.to_owned(),
+            schema: schema.to_owned(),
             tick,
             total_ns: 0,
             stage_ns: [0; WorldStepStage::COUNT],
@@ -3326,7 +3340,9 @@ impl WorldStepProfile {
         }
     }
 
-    fn reset(&mut self, tick: Tick) {
+    fn reset(&mut self, tick: Tick, schema: &str) {
+        self.schema.clear();
+        self.schema.push_str(schema);
         self.tick = tick;
         self.total_ns = 0;
         self.stage_ns.fill(0);
@@ -3356,13 +3372,26 @@ impl WorldStepProfile {
     }
 }
 
-/// Opt-in monotonic-clock observer for [`WorldState::step_profiled`].
+/// Opt-in monotonic-clock observer for [`WorldState::step_profiled`] and
+/// [`WorldState::step_profiled_outcome`].
 ///
 /// Ordinary [`WorldState::step`] uses a monomorphized no-op observer, so enabling this type for a
 /// dedicated measurement pass cannot add clock reads to production or pure-throughput steps.
-#[derive(Debug, Default)]
+/// Core-only v3 profiles end after finalization. Legacy v2 profiles retain their historical
+/// contract by adding downstream persistence admission to both the Persistence stage and total.
+#[derive(Debug)]
 pub struct WorldStepProfiler {
     latest: Option<WorldStepProfile>,
+    next_schema: &'static str,
+}
+
+impl Default for WorldStepProfiler {
+    fn default() -> Self {
+        Self {
+            latest: None,
+            next_schema: WORLD_STEP_PROFILE_SCHEMA,
+        }
+    }
 }
 
 impl WorldStepProfiler {
@@ -3370,6 +3399,27 @@ impl WorldStepProfiler {
     #[must_use]
     pub const fn latest(&self) -> Option<&WorldStepProfile> {
         self.latest.as_ref()
+    }
+
+    fn select_schema(&mut self, schema: &'static str) {
+        self.next_schema = schema;
+    }
+
+    fn finish_legacy_boundary(
+        &mut self,
+        admission_elapsed: Duration,
+        total_tail_elapsed: Duration,
+    ) {
+        let Some(latest) = self.latest.as_mut() else {
+            return;
+        };
+        let admission_ns = duration_ns(admission_elapsed);
+        let persistence_index = WorldStepStage::Persistence.index();
+        latest.stage_ns[persistence_index] =
+            latest.stage_ns[persistence_index].saturating_add(admission_ns);
+        latest.total_ns = latest
+            .total_ns
+            .saturating_add(duration_ns(total_tail_elapsed));
     }
 }
 
@@ -4156,9 +4206,9 @@ impl WorldStepObserver for WorldStepProfiler {
 
     fn begin_step(&mut self, tick: Tick) -> Instant {
         if let Some(latest) = self.latest.as_mut() {
-            latest.reset(tick);
+            latest.reset(tick, self.next_schema);
         } else {
-            self.latest = Some(WorldStepProfile::new(tick));
+            self.latest = Some(WorldStepProfile::new(tick, self.next_schema));
         }
         Instant::now()
     }
@@ -4674,7 +4724,7 @@ pub struct PersistenceBatch {
 /// the batch owns. Admission is deliberately a separate operation so a rejected
 /// sink cannot cause those values to be projected a second time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistenceProjectionStatus {
+pub enum PersistenceProjectionStatus {
     /// Persistence is disabled and the completed boundary was deliberately discarded.
     Disabled,
     /// The configured cadence retained this boundary for a later aggregate batch.
@@ -4685,7 +4735,7 @@ enum PersistenceProjectionStatus {
 
 #[derive(Debug)]
 #[must_use = "a ready persistence projection owns drained scientific records"]
-struct PersistenceProjection {
+pub struct PersistenceProjection {
     status: PersistenceProjectionStatus,
     batch: Option<PersistenceBatch>,
 }
@@ -4712,13 +4762,91 @@ impl PersistenceProjection {
         }
     }
 
-    fn into_ready(self) -> Option<PersistenceBatch> {
+    /// Whether persistence is disabled, retaining cadence state, or ready to admit a batch.
+    #[must_use]
+    pub const fn status(&self) -> PersistenceProjectionStatus {
+        self.status
+    }
+
+    /// Borrow the exact ready batch without consuming this projection.
+    #[must_use]
+    pub const fn batch(&self) -> Option<&PersistenceBatch> {
+        self.batch.as_ref()
+    }
+
+    /// Move the exact ready batch to its downstream owner.
+    #[must_use]
+    pub fn into_batch(self) -> Option<PersistenceBatch> {
         debug_assert_eq!(
             self.status == PersistenceProjectionStatus::Ready,
             self.batch.is_some()
         );
         self.batch
     }
+}
+
+/// Current-tick combat counters emitted at the completed science boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickCombatSummary {
+    /// Existing persistence counter for attackers that produced at least one resolved spike hit.
+    pub spike_attempts: u32,
+    /// Number of spike attacks that hit a target during this tick.
+    pub spike_hits: u32,
+}
+
+/// Scientific fault discovered after a tick had already reached its completed boundary.
+///
+/// Unlike an error returned before a transition starts, this fault travels with the
+/// [`StepCompletion`] so lifecycle records and persistence projection data cannot be lost.
+#[derive(Debug, Clone, Error)]
+pub enum CompletedStepFault {
+    /// A registered brain factory failed during population commitment.
+    #[error(transparent)]
+    BrainSpawn(BrainSpawnError),
+    /// A scientific-state invariant failed during population commitment.
+    #[error(transparent)]
+    ScientificState(ScientificStateError),
+}
+
+/// Complete deterministic result of one advanced simulation tick.
+///
+/// This value is renderer- and storage-engine-neutral. A ready persistence projection
+/// owns the exact cadence batch and must be moved to its admission owner rather than
+/// reconstructed from mutable world state.
+#[derive(Debug)]
+#[must_use = "a completed step outcome may own lifecycle and persistence records"]
+pub struct StepOutcome {
+    /// User-facing events emitted by the completed tick.
+    pub events: TickEvents,
+    /// Exact current-tick summary also appended to world history.
+    pub summary: TickSummary,
+    /// Birth records created during this tick, independent of persistence cadence.
+    pub births: Vec<BirthRecord>,
+    /// Death records created during this tick, independent of persistence cadence.
+    pub deaths: Vec<DeathRecord>,
+    /// Combat counters accumulated during this tick.
+    pub combat: TickCombatSummary,
+    /// Configuration revision in force at the completed boundary.
+    pub config_revision: u64,
+    /// Current-tick resource accounting, when the ledger was enabled for this transition.
+    pub resource_tick: Option<ResourceLedgerTick>,
+    /// Exact persistence-policy projection prepared without downstream I/O.
+    pub persistence: PersistenceProjection,
+}
+
+/// Result of an invocation that advanced through the completed simulation boundary.
+///
+/// `outcome` is always the complete deterministic boundary payload. `fault` reports a
+/// population-commit failure discovered after science had already completed; it is kept
+/// outside [`StepOutcome`] so downstream consumers cannot mistake the payload itself for
+/// a partial or invalid transition.
+#[derive(Debug)]
+#[must_use = "a completed step may own lifecycle and persistence records"]
+pub struct StepCompletion {
+    /// Complete deterministic result of the advanced tick.
+    pub outcome: StepOutcome,
+    /// Optional fault discovered after the tick's scientific work completed.
+    pub fault: Option<CompletedStepFault>,
 }
 
 /// Persistence sink invoked after each tick.
@@ -12578,7 +12706,7 @@ impl WorldState {
         self.combat_spike_hits = 0;
     }
 
-    fn stage_record_history(&mut self, next_tick: Tick) {
+    fn stage_record_history(&mut self, next_tick: Tick) -> TickSummary {
         let agent_count = self.agents.len();
         let total_energy: f32 = self.runtime.values().map(|runtime| runtime.energy).sum();
         let total_health: f32 = self.agents.columns().health().iter().copied().sum();
@@ -12613,9 +12741,10 @@ impl WorldState {
         if self.history.len() >= self.config.history_capacity {
             self.history.pop_front();
         }
-        self.history.push_back(summary);
+        self.history.push_back(summary.clone());
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = max_age;
+        summary
     }
 
     /// Queue a deliberate perturbation of the world.
@@ -15349,7 +15478,7 @@ impl WorldState {
     ) -> Result<(), PersistenceAdmissionError> {
         if let Some(batch) = self
             .prepare_persistence(next_tick, force_partial_batch)
-            .into_ready()
+            .into_batch()
         {
             self.admit_prepared_persistence(batch)
         } else {
@@ -15360,7 +15489,7 @@ impl WorldState {
     /// Execute one simulation tick pipeline returning emitted events.
     ///
     /// A returned error can describe a tick that has already reached its completed boundary. A
-    /// A generation-capacity rejection occurs before the first stage, RNG draw, or state
+    /// generation-capacity rejection occurs before the first stage, RNG draw, or state
     /// mutation. A persistence rejection retains that exact completed batch for explicit retry and sets
     /// [`Self::persistence_fault`]. A brain-construction failure rolls back population inserts and
     /// refuses a partial queued-birth commit, completes the remaining tick bookkeeping and
@@ -15371,7 +15500,18 @@ impl WorldState {
     /// rejection is not latched because no part of that tick was applied; callers may disable the
     /// relevant reproduction policy or replace the offending scientific state before retrying.
     pub fn step(&mut self) -> Result<TickEvents, WorldStepError> {
-        self.step_observed(&mut NoopWorldStepObserver)
+        let completion = self.step_outcome()?;
+        self.finish_legacy_step(completion)
+    }
+
+    /// Execute one simulation transition without performing downstream persistence I/O.
+    ///
+    /// `Err` means no new transition started. Once a tick advances, this always returns its
+    /// [`StepCompletion`]; a population fault discovered at that completed boundary is carried in
+    /// [`StepCompletion::fault`]. A ready [`StepOutcome::persistence`] owns the exact
+    /// cadence batch and has not been offered to this world's legacy persistence sink.
+    pub fn step_outcome(&mut self) -> Result<StepCompletion, WorldStepError> {
+        self.step_outcome_observed(&mut NoopWorldStepObserver)
     }
 
     /// Execute one simulation tick while recording opt-in per-stage wall-clock timings.
@@ -15383,7 +15523,22 @@ impl WorldState {
         &mut self,
         profiler: &mut WorldStepProfiler,
     ) -> Result<TickEvents, WorldStepError> {
-        self.step_observed(profiler)
+        profiler.select_schema(WORLD_STEP_PROFILE_SCHEMA);
+        let completion = self.step_outcome_observed(profiler)?;
+        self.finish_profiled_legacy_step(completion, profiler)
+    }
+
+    /// Execute the no-storage-I/O transition while recording per-stage wall-clock timings.
+    ///
+    /// This diagnostic API reads the process monotonic clock and therefore is not the clock-free
+    /// pure boundary. Persistence projection remains a timed core stage; downstream admission is
+    /// excluded and the resulting profile uses [`WORLD_STEP_OUTCOME_PROFILE_SCHEMA`].
+    pub fn step_profiled_outcome(
+        &mut self,
+        profiler: &mut WorldStepProfiler,
+    ) -> Result<StepCompletion, WorldStepError> {
+        profiler.select_schema(WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
+        self.step_outcome_observed(profiler)
     }
 
     /// Execute one simulation tick while capturing six deterministic first-divergence points.
@@ -15403,13 +15558,22 @@ impl WorldState {
         &mut self,
         tracer: &mut WorldStepTracer,
     ) -> Result<TickEvents, WorldStepError> {
-        self.step_observed(tracer)
+        let completion = self.step_traced_outcome(tracer)?;
+        self.finish_legacy_step(completion)
     }
 
-    fn step_observed<O: WorldStepObserver>(
+    /// Execute the pure transition while capturing the six deterministic trace points.
+    pub fn step_traced_outcome(
+        &mut self,
+        tracer: &mut WorldStepTracer,
+    ) -> Result<StepCompletion, WorldStepError> {
+        self.step_outcome_observed(tracer)
+    }
+
+    fn step_outcome_observed<O: WorldStepObserver>(
         &mut self,
         observer: &mut O,
-    ) -> Result<TickEvents, WorldStepError> {
+    ) -> Result<StepCompletion, WorldStepError> {
         if let Some(error) = self.latched_step_error() {
             return Err(error);
         }
@@ -15418,6 +15582,8 @@ impl WorldState {
         self.validate_step_generation_headroom(next_tick)?;
         let step_started_at = observer.begin_step(next_tick);
         let previous_epoch = self.epoch;
+        let birth_record_start = self.pending_birth_records.len();
+        let death_record_start = self.pending_death_records.len();
 
         macro_rules! observed_stage {
             ($stage:expr, $body:block) => {{
@@ -15576,18 +15742,25 @@ impl WorldState {
                 }
             }
         });
-        observed_stage!(WorldStepStage::Bookkeeping, {
+        let summary = observed_stage!(WorldStepStage::Bookkeeping, {
             self.stage_accumulate_food_balance();
             self.stage_accumulate_tick_events();
-            self.stage_record_history(next_tick);
+            let summary = self.stage_record_history(next_tick);
             self.stage_narrative(next_tick);
+            summary
         });
+        let births = self.pending_birth_records[birth_record_start..].to_vec();
+        let deaths = self.pending_death_records[death_record_start..].to_vec();
+        let combat = TickCombatSummary {
+            spike_attempts: self.combat_spike_attempts,
+            spike_hits: self.combat_spike_hits,
+        };
         let preserve_persistence_tail = self.config.persistence_interval != 0
             && !next_tick
                 .0
                 .is_multiple_of(self.config.persistence_interval as u64);
-        let persistence_result = observed_stage!(WorldStepStage::Persistence, {
-            self.stage_persistence(next_tick, false)
+        let persistence = observed_stage!(WorldStepStage::Persistence, {
+            self.prepare_persistence(next_tick, false)
         });
 
         let mut events = TickEvents {
@@ -15607,29 +15780,105 @@ impl WorldState {
             events.tick = self.tick;
             events.epoch_rolled = self.epoch != previous_epoch;
         });
-        let result = match (population_result, persistence_result) {
-            (Ok(()), Ok(())) => Ok(events),
-            (Ok(()), Err(persistence)) => Err(persistence.into()),
-            (Err(PopulationSpawnError::BrainSpawn(brain)), Ok(())) => {
+
+        let resource_tick = if self.resource_ledger.enabled {
+            self.resource_ledger.report.latest.clone()
+        } else {
+            None
+        };
+        let completed_fault = match population_result {
+            Ok(()) => None,
+            Err(PopulationSpawnError::BrainSpawn(brain)) => {
                 self.brain_fault = Some(brain.clone());
-                Err(brain.into())
+                Some(CompletedStepFault::BrainSpawn(brain))
             }
-            (Err(PopulationSpawnError::BrainSpawn(brain)), Err(persistence)) => {
-                self.brain_fault = Some(brain.clone());
+            Err(PopulationSpawnError::ScientificState(scientific_state)) => {
+                Some(CompletedStepFault::ScientificState(scientific_state))
+            }
+        };
+        observer.end_step(step_started_at);
+        Ok(StepCompletion {
+            outcome: StepOutcome {
+                events,
+                summary,
+                births,
+                deaths,
+                combat,
+                config_revision: self.config_revision,
+                resource_tick,
+                persistence,
+            },
+            fault: completed_fault,
+        })
+    }
+
+    fn finish_legacy_step(
+        &mut self,
+        completion: StepCompletion,
+    ) -> Result<TickEvents, WorldStepError> {
+        let StepCompletion { outcome, fault } = completion;
+        let StepOutcome {
+            events,
+            persistence,
+            ..
+        } = outcome;
+        let persistence_result = self.admit_persistence_projection(persistence);
+        Self::combine_legacy_step_result(events, fault, persistence_result)
+    }
+
+    fn finish_profiled_legacy_step(
+        &mut self,
+        completion: StepCompletion,
+        profiler: &mut WorldStepProfiler,
+    ) -> Result<TickEvents, WorldStepError> {
+        let total_tail_started_at = Instant::now();
+        let StepCompletion { outcome, fault } = completion;
+        let StepOutcome {
+            events,
+            persistence,
+            ..
+        } = outcome;
+        let admission_started_at = Instant::now();
+        let persistence_result = self.admit_persistence_projection(persistence);
+        let admission_elapsed = admission_started_at.elapsed();
+        let result = Self::combine_legacy_step_result(events, fault, persistence_result);
+        profiler.finish_legacy_boundary(admission_elapsed, total_tail_started_at.elapsed());
+        result
+    }
+
+    fn admit_persistence_projection(
+        &mut self,
+        persistence: PersistenceProjection,
+    ) -> Result<(), PersistenceAdmissionError> {
+        if let Some(batch) = persistence.into_batch() {
+            self.admit_prepared_persistence(batch)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn combine_legacy_step_result(
+        events: TickEvents,
+        fault: Option<CompletedStepFault>,
+        persistence_result: Result<(), PersistenceAdmissionError>,
+    ) -> Result<TickEvents, WorldStepError> {
+        match (fault, persistence_result) {
+            (None, Ok(())) => Ok(events),
+            (None, Err(persistence)) => Err(persistence.into()),
+            (Some(CompletedStepFault::BrainSpawn(brain)), Ok(())) => Err(brain.into()),
+            (Some(CompletedStepFault::BrainSpawn(brain)), Err(persistence)) => {
                 Err(WorldStepError::BrainAndPersistence { brain, persistence })
             }
-            (Err(PopulationSpawnError::ScientificState(scientific_state)), Ok(())) => {
+            (Some(CompletedStepFault::ScientificState(scientific_state)), Ok(())) => {
                 Err(scientific_state.into())
             }
-            (Err(PopulationSpawnError::ScientificState(scientific_state)), Err(persistence)) => {
+            (Some(CompletedStepFault::ScientificState(scientific_state)), Err(persistence)) => {
                 Err(WorldStepError::ScientificStateAndPersistence {
                     scientific_state,
                     persistence,
                 })
             }
-        };
-        observer.end_step(step_started_at);
-        result
+        }
     }
 
     /// Returns an immutable reference to configuration.
@@ -22281,6 +22530,19 @@ mod tests {
         }
     }
 
+    struct DelayedSpyPersistence {
+        logs: Arc<Mutex<Vec<PersistenceBatch>>>,
+        delay: Duration,
+    }
+
+    impl WorldPersistence for DelayedSpyPersistence {
+        fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
+            std::thread::sleep(self.delay);
+            self.logs.lock().unwrap().push(payload.clone());
+            Ok(())
+        }
+    }
+
     fn sealed_agent_boundary(tick: u64) -> ScientificStateError {
         ScientificStateError::PersistenceBoundarySealed {
             path: "agent".to_owned(),
@@ -22346,8 +22608,8 @@ mod tests {
 
         let projection = world.prepare_persistence(Tick(1), false);
         assert!(logs.lock().unwrap().is_empty());
-        assert_eq!(projection.status, PersistenceProjectionStatus::Ready);
-        let Some(batch) = projection.into_ready() else {
+        assert_eq!(projection.status(), PersistenceProjectionStatus::Ready);
+        let Some(batch) = projection.into_batch() else {
             panic!("cadence boundary must prepare an owned batch");
         };
         assert_eq!(batch.summary.tick, Tick(1));
@@ -22438,6 +22700,364 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&attempts[0].agents).expect("encode first attempt agents"),
             postcard::to_allocvec(&attempts[1].agents).expect("encode retry agents")
+        );
+    }
+
+    #[test]
+    fn step_outcome_is_sink_inert_and_carries_the_full_completed_boundary() {
+        let mut config = quiet_trace_config(0x57E0_0A7C, 1);
+        config.closed = false;
+        config.population_minimum = 2;
+        config.spike_radius = 20.0;
+        config.spike_damage = 0.5;
+        config.spike_energy_cost = 0.0;
+        config.spike_min_length = 0.1;
+        config.spike_alignment_cosine = 0.1;
+        config.spike_speed_damage_bonus = 0.0;
+        config.spike_length_damage_bonus = 0.0;
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence = RejectOncePersistence {
+            logs: Arc::clone(&logs),
+            reject_next: true,
+        };
+        let mut world =
+            WorldState::with_persistence(config, Box::new(persistence)).expect("outcome world");
+        let mut updated = world.config().clone();
+        updated.chart_flush_interval = 1;
+        world
+            .apply_config_update(updated)
+            .expect("harmless outcome revision");
+
+        let attacker = world.spawn_agent(sample_agent(0));
+        let victim = world.spawn_agent(sample_agent(1));
+        let victim_uid = world.agent_uid(victim).expect("victim uid");
+        let attacker_brain = world
+            .brain_registry_mut()
+            .expect("outcome aggressor registry mutation")
+            .register("test.outcome-aggressor", |_rng| {
+                Ok(Box::new(LedgerAggressorBrain))
+            });
+        let idle_brain = world
+            .brain_registry_mut()
+            .expect("outcome idle registry mutation")
+            .register("test.outcome-idle", |_rng| Ok(Box::new(LedgerIdleBrain)));
+        assert!(
+            world
+                .bind_agent_brain(attacker, attacker_brain)
+                .expect("outcome aggressor brain")
+        );
+        assert!(
+            world
+                .bind_agent_brain(victim, idle_brain)
+                .expect("outcome idle brain")
+        );
+        {
+            let attacker_index = world.agents.index_of(attacker).expect("attacker index");
+            let victim_index = world.agents.index_of(victim).expect("victim index");
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[attacker_index] = Position::new(10.0, 10.0);
+            columns.positions_mut()[victim_index] = Position::new(15.0, 10.0);
+            columns.headings_mut()[attacker_index] = 0.0;
+            columns.headings_mut()[victim_index] = 0.0;
+            columns.health_mut()[attacker_index] = 1.0;
+            columns.health_mut()[victim_index] = 0.08;
+            columns.spike_lengths_mut()[attacker_index] = 1.0;
+        }
+        {
+            let runtime = world
+                .agent_runtime_mut(attacker)
+                .expect("outcome attacker runtime");
+            runtime.energy = 1.0;
+            runtime.herbivore_tendency = 0.0;
+        }
+        {
+            let runtime = world
+                .agent_runtime_mut(victim)
+                .expect("outcome victim runtime");
+            runtime.energy = 0.2;
+            runtime.herbivore_tendency = 1.0;
+        }
+        world.set_resource_ledger_enabled(true);
+
+        let StepCompletion { outcome, fault } =
+            world.step_outcome().expect("completed outcome step");
+
+        assert!(fault.is_none());
+        assert!(logs.lock().unwrap().is_empty());
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(outcome.events.tick, Tick(1));
+        assert!(outcome.events.charts_flushed);
+        assert_eq!(
+            &outcome.summary,
+            world.history().next_back().expect("completed summary")
+        );
+        assert_eq!(outcome.summary.agent_count, 2);
+        assert_eq!(outcome.summary.births, 0);
+        assert_eq!(outcome.summary.deaths, 1);
+        assert_eq!(outcome.summary.spike_hits, 1);
+        assert_eq!(outcome.births.len(), 1);
+        assert!(
+            outcome
+                .births
+                .iter()
+                .all(|record| { record.tick == Tick(1) && record.origin == BirthOrigin::Injected })
+        );
+        assert_eq!(outcome.deaths.len(), 1);
+        assert_eq!(outcome.deaths[0].tick, Tick(1));
+        assert_eq!(outcome.deaths[0].agent_uid, victim_uid);
+        assert_eq!(
+            outcome.combat,
+            TickCombatSummary {
+                spike_attempts: 1,
+                spike_hits: 1,
+            }
+        );
+        assert_eq!(outcome.config_revision, 1);
+        assert_eq!(outcome.config_revision, world.config_revision());
+        assert_eq!(
+            outcome.resource_tick.as_ref(),
+            world.resource_ledger().latest.as_ref()
+        );
+        assert_latest_ledger_reconciles(&world);
+        assert_eq!(
+            outcome.persistence.status(),
+            PersistenceProjectionStatus::Ready
+        );
+        {
+            let batch = outcome.persistence.batch().expect("ready exact batch");
+            assert_eq!(batch.summary, outcome.summary);
+            assert_eq!(batch.deaths, outcome.deaths);
+            let current_births = batch
+                .births
+                .iter()
+                .filter(|record| record.tick == Tick(1))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(current_births, outcome.births);
+            assert_eq!(batch.births.len(), outcome.births.len() + 2);
+        }
+        assert_eq!(world.last_admitted_persistence_tick(), None);
+        assert!(!world.has_pending_persistence_batch());
+        assert!(world.persistence_fault().is_none());
+
+        let science_before_admission = world
+            .world_digest_v1_inner(false)
+            .expect("completed outcome science lanes");
+        let tick_before_admission = world.tick();
+        let history_before_admission = world.history().cloned().collect::<Vec<_>>();
+        let resource_before_admission = world.resource_ledger().clone();
+        let config_revision_before_admission = world.config_revision();
+        let last_spike_hits_before_admission = world.last_spike_hits();
+        let last_max_age_before_admission = world.last_max_age();
+        let expected = outcome
+            .persistence
+            .into_batch()
+            .expect("move exact ready batch");
+        let rejection = world
+            .admit_prepared_persistence(expected.clone())
+            .expect_err("injected downstream rejection");
+        assert_eq!(rejection.state(), PersistenceAdmissionState::NotAdmitted);
+        assert_eq!(logs.lock().unwrap().len(), 1);
+        assert!(world.has_pending_persistence_batch());
+        assert_eq!(
+            world
+                .world_digest_v1_inner(false)
+                .expect("science lanes after downstream rejection"),
+            science_before_admission
+        );
+        assert_eq!(world.tick(), tick_before_admission);
+        assert_eq!(
+            world.history().cloned().collect::<Vec<_>>(),
+            history_before_admission
+        );
+        assert_eq!(world.resource_ledger(), &resource_before_admission);
+        assert_eq!(world.config_revision(), config_revision_before_admission);
+        assert_eq!(world.last_spike_hits(), last_spike_hits_before_admission);
+        assert_eq!(world.last_max_age(), last_max_age_before_admission);
+        let retained = world
+            .pending_persistence_batch
+            .as_ref()
+            .expect("exact outcome batch retained");
+        assert_eq!(retained.summary, expected.summary);
+        assert_eq!(retained.births, expected.births);
+        assert_eq!(retained.deaths, expected.deaths);
+        assert_eq!(retained.metrics, expected.metrics);
+        assert_eq!(retained.events, expected.events);
+        assert_eq!(retained.replay_events, expected.replay_events);
+        assert_eq!(
+            postcard::to_allocvec(&retained.agents).expect("encode retained outcome agents"),
+            postcard::to_allocvec(&expected.agents).expect("encode expected outcome agents")
+        );
+    }
+
+    #[test]
+    fn outcome_step_variants_never_admit_the_installed_sink() {
+        fn outcome_world(seed: u64) -> (WorldState, Arc<Mutex<Vec<PersistenceBatch>>>) {
+            let spy = SpyPersistence::default();
+            let logs = Arc::clone(&spy.logs);
+            let world = WorldState::with_persistence(quiet_trace_config(seed, 1), Box::new(spy))
+                .expect("outcome variant world");
+            (world, logs)
+        }
+
+        let (mut plain, plain_logs) = outcome_world(0x0A71_0001);
+        let plain_completion = plain.step_outcome().expect("plain outcome");
+        assert_eq!(
+            plain_completion.outcome.persistence.status(),
+            PersistenceProjectionStatus::Ready
+        );
+        assert!(plain_logs.lock().unwrap().is_empty());
+
+        let (mut profiled, profiled_logs) = outcome_world(0x0A71_0002);
+        let mut profiler = WorldStepProfiler::default();
+        let profiled_completion = profiled
+            .step_profiled_outcome(&mut profiler)
+            .expect("profiled outcome");
+        assert_eq!(
+            profiled_completion.outcome.persistence.status(),
+            PersistenceProjectionStatus::Ready
+        );
+        assert!(profiled_logs.lock().unwrap().is_empty());
+        assert_eq!(
+            profiler.latest().expect("core profile").schema,
+            WORLD_STEP_OUTCOME_PROFILE_SCHEMA
+        );
+
+        let (mut traced, traced_logs) = outcome_world(0x0A71_0003);
+        let mut tracer = WorldStepTracer::default();
+        let traced_completion = traced
+            .step_traced_outcome(&mut tracer)
+            .expect("traced outcome");
+        assert_eq!(
+            traced_completion.outcome.persistence.status(),
+            PersistenceProjectionStatus::Ready
+        );
+        assert!(traced_logs.lock().unwrap().is_empty());
+        tracer
+            .latest()
+            .expect("outcome trace")
+            .validate_contract()
+            .expect("valid outcome trace");
+
+        let legacy_delay = Duration::from_millis(10);
+        let legacy_logs = Arc::new(Mutex::new(Vec::new()));
+        let legacy_persistence = DelayedSpyPersistence {
+            logs: Arc::clone(&legacy_logs),
+            delay: legacy_delay,
+        };
+        let mut legacy = WorldState::with_persistence(
+            quiet_trace_config(0x0A71_0004, 1),
+            Box::new(legacy_persistence),
+        )
+        .expect("legacy profiled world");
+        let mut legacy_profiler = WorldStepProfiler::default();
+        legacy
+            .step_profiled(&mut legacy_profiler)
+            .expect("legacy profiled step");
+        assert_eq!(legacy_logs.lock().unwrap().len(), 1);
+        let legacy_profile = legacy_profiler.latest().expect("legacy profile");
+        assert_eq!(legacy_profile.schema, WORLD_STEP_PROFILE_SCHEMA);
+        assert!(
+            legacy_profile
+                .elapsed_ns(WorldStepStage::Persistence)
+                .expect("legacy persistence timing")
+                >= duration_ns(legacy_delay),
+            "legacy v2 persistence timing must include downstream admission"
+        );
+        assert!(
+            legacy_profile.total_ns
+                >= legacy_profile
+                    .elapsed_ns(WorldStepStage::Persistence)
+                    .expect("legacy persistence timing")
+        );
+    }
+
+    #[test]
+    fn step_outcomes_are_tick_local_while_ready_persistence_accumulates_cadence() {
+        let mut config = quiet_trace_config(0x0A7C_CADE, 2);
+        config.aging_tick_interval = 1;
+        config.aging_health_decay_start = 0;
+        config.aging_health_decay_rate = 0.1;
+        config.aging_health_decay_max = 0.1;
+        let mut world = WorldState::new(config).expect("outcome cadence world");
+        let first = world.spawn_agent(sample_agent(0));
+        let second = world.spawn_agent(sample_agent(1));
+        let first_uid = world.agent_uid(first).expect("first cadence uid");
+        let second_uid = world.agent_uid(second).expect("second cadence uid");
+        {
+            let first_index = world.agents.index_of(first).expect("first cadence index");
+            let second_index = world.agents.index_of(second).expect("second cadence index");
+            let health = world.agents.columns_mut().health_mut();
+            health[first_index] = 0.05;
+            health[second_index] = 0.15;
+        }
+
+        let first_completion = world.step_outcome().expect("first cadence outcome");
+        assert!(first_completion.fault.is_none());
+        assert_eq!(first_completion.outcome.summary.deaths, 1);
+        assert_eq!(first_completion.outcome.deaths.len(), 1);
+        assert_eq!(first_completion.outcome.deaths[0].agent_uid, first_uid);
+        assert_eq!(
+            first_completion.outcome.persistence.status(),
+            PersistenceProjectionStatus::Deferred
+        );
+        assert!(first_completion.outcome.persistence.batch().is_none());
+
+        let second_completion = world.step_outcome().expect("second cadence outcome");
+        assert!(second_completion.fault.is_none());
+        assert_eq!(second_completion.outcome.summary.deaths, 1);
+        assert_eq!(second_completion.outcome.deaths.len(), 1);
+        assert_eq!(second_completion.outcome.deaths[0].agent_uid, second_uid);
+        assert_eq!(
+            second_completion.outcome.persistence.status(),
+            PersistenceProjectionStatus::Ready
+        );
+        let batch = second_completion
+            .outcome
+            .persistence
+            .batch()
+            .expect("cadence aggregate batch");
+        assert_eq!(batch.summary.tick, Tick(2));
+        assert_eq!(batch.summary.deaths, 2);
+        assert_eq!(batch.deaths.len(), 2);
+        assert_eq!(
+            batch
+                .deaths
+                .iter()
+                .map(|death| death.agent_uid)
+                .collect::<Vec<_>>(),
+            vec![first_uid, second_uid]
+        );
+        assert_ne!(batch.summary, second_completion.outcome.summary);
+    }
+
+    #[test]
+    fn disabled_resource_ledger_does_not_republish_a_stale_tick_in_outcome() {
+        let mut world =
+            WorldState::new(quiet_trace_config(0x0A7C_1ED6, 0)).expect("outcome ledger world");
+        world.set_resource_ledger_enabled(true);
+        let first = world.step_outcome().expect("instrumented outcome");
+        assert_eq!(
+            first
+                .outcome
+                .resource_tick
+                .as_ref()
+                .map(|report| report.tick),
+            Some(Tick(1))
+        );
+
+        world.set_resource_ledger_enabled(false);
+        let second = world.step_outcome().expect("uninstrumented outcome");
+        assert!(second.outcome.resource_tick.is_none());
+        assert_eq!(
+            world
+                .resource_ledger()
+                .latest
+                .as_ref()
+                .map(|report| report.tick),
+            Some(Tick(1)),
+            "the retained diagnostic report must not masquerade as tick two"
         );
     }
 
@@ -23178,7 +23798,7 @@ mod tests {
             .expect("seeded origin");
         assert!(matches!(
             origin_world.prepare_persistence(Tick(7), false),
-            projection if projection.status == PersistenceProjectionStatus::Disabled
+            projection if projection.status() == PersistenceProjectionStatus::Disabled
         ));
         assert_eq!(origin_world.persistence_discarded_records_at, Some(Tick(7)));
         assert!(origin_world.pending_birth_records.is_empty());
@@ -23567,6 +24187,143 @@ mod tests {
             completed_digest,
             "repeated step must not mutate after a combined terminal fault"
         );
+        assert!(world.has_pending_persistence_batch());
+        assert_eq!(world.last_admitted_persistence_tick(), None);
+        assert_eq!(
+            persistence_logs.lock().unwrap()[0].summary,
+            *world.history().next_back().expect("completed summary")
+        );
+    }
+
+    #[test]
+    fn step_outcome_returns_completed_population_fault_with_owned_persistence() {
+        #[derive(Debug, Error)]
+        #[error("deliberate outcome population factory failure")]
+        struct DeliberateOutcomeFactoryError;
+
+        let config = ScriptBotsConfig {
+            population_minimum: 3,
+            population_spawn_interval: 0,
+            persistence_interval: 1,
+            rng_seed: Some(0x0A7C_0F11),
+            ..ScriptBotsConfig::default()
+        };
+        let spy = SpyPersistence::default();
+        let persistence_logs = Arc::clone(&spy.logs);
+        let mut world =
+            WorldState::with_persistence(config, Box::new(spy)).expect("outcome fault world");
+        let mut doomed = sample_agent(9);
+        doomed.health = 0.0;
+        let doomed = world.spawn_agent(doomed);
+        let doomed_uid = world.agent_uid(doomed).expect("doomed outcome uid");
+        world.set_resource_ledger_enabled(true);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_attempts = Arc::clone(&attempts);
+        world
+            .brain_registry_mut()
+            .expect("outcome fault registry mutation")
+            .register("test.outcome-fault", move |_rng| {
+                if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(Box::new(StubBrain))
+                } else {
+                    Err(BrainSpawnError::new(
+                        "test.outcome-fault",
+                        DeliberateOutcomeFactoryError,
+                    ))
+                }
+            });
+
+        let StepCompletion { outcome, fault } = world
+            .step_outcome()
+            .expect("completed population failure must retain its outcome");
+
+        assert!(persistence_logs.lock().unwrap().is_empty());
+        assert_eq!(world.tick(), Tick(1));
+        assert!(world.agents().is_empty());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(outcome.events.tick, Tick(1));
+        assert_eq!(
+            &outcome.summary,
+            world
+                .history()
+                .next_back()
+                .expect("faulted completed summary")
+        );
+        assert_eq!(outcome.summary.agent_count, 0);
+        assert_eq!(outcome.summary.deaths, 1);
+        assert!(outcome.births.is_empty());
+        assert_eq!(outcome.deaths.len(), 1);
+        assert_eq!(outcome.deaths[0].agent_uid, doomed_uid);
+        assert_eq!(
+            outcome.resource_tick.as_ref().map(|report| report.tick),
+            Some(Tick(1))
+        );
+        assert_latest_ledger_reconciles(&world);
+        let Some(CompletedStepFault::BrainSpawn(brain)) = fault.as_ref() else {
+            panic!("expected a completed brain-spawn fault");
+        };
+        assert_eq!(brain.kind(), "test.outcome-fault");
+        assert_eq!(
+            world.brain_fault().map(BrainSpawnError::kind),
+            Some("test.outcome-fault")
+        );
+        assert_eq!(
+            outcome.persistence.status(),
+            PersistenceProjectionStatus::Ready
+        );
+        let batch = outcome.persistence.batch().expect("fault boundary batch");
+        assert_eq!(batch.summary, outcome.summary);
+        assert_eq!(batch.deaths, outcome.deaths);
+        assert_eq!(batch.births.len(), 1);
+        assert_eq!(batch.births[0].origin, BirthOrigin::Seeded);
+        assert!(world.persistence_fault().is_none());
+        assert!(!world.has_pending_persistence_batch());
+        assert_eq!(world.last_admitted_persistence_tick(), None);
+    }
+
+    #[test]
+    fn legacy_adapter_combines_completed_scientific_and_persistence_faults() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence = RejectOncePersistence {
+            logs: Arc::clone(&logs),
+            reject_next: true,
+        };
+        let mut world =
+            WorldState::with_persistence(quiet_trace_config(0x5C13_0C3E, 1), Box::new(persistence))
+                .expect("scientific adapter world");
+        let StepCompletion { outcome, fault } =
+            world.step_outcome().expect("completed adapter boundary");
+        assert!(fault.is_none());
+        assert!(logs.lock().unwrap().is_empty());
+        let scientific_state = ScientificStateError::GenerationOverflow {
+            path: "pending_spawns[0].generation".to_owned(),
+            generation: u32::MAX,
+        };
+
+        let error = world
+            .finish_legacy_step(StepCompletion {
+                outcome,
+                fault: Some(CompletedStepFault::ScientificState(
+                    scientific_state.clone(),
+                )),
+            })
+            .expect_err("legacy adapter must retain both completed faults");
+        let WorldStepError::ScientificStateAndPersistence {
+            scientific_state: returned_scientific_state,
+            persistence: returned_persistence,
+        } = error
+        else {
+            panic!("expected combined scientific-state and persistence fault");
+        };
+        assert_eq!(returned_scientific_state, scientific_state);
+        assert_eq!(returned_persistence.tick(), 1);
+        assert_eq!(
+            returned_persistence.state(),
+            PersistenceAdmissionState::NotAdmitted
+        );
+        assert_eq!(logs.lock().unwrap().len(), 1);
+        assert!(world.has_pending_persistence_batch());
+        assert_eq!(world.persistence_fault(), Some(&returned_persistence));
     }
 
     fn lifecycle_birth(tick: u64) -> BirthRecord {
@@ -23720,7 +24477,7 @@ mod tests {
 
         assert!(matches!(
             world.prepare_persistence(Tick(1), false),
-            projection if projection.status == PersistenceProjectionStatus::Deferred
+            projection if projection.status() == PersistenceProjectionStatus::Deferred
         ));
 
         assert_eq!(world.pending_birth_events, 2);
