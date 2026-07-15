@@ -62,23 +62,23 @@ fn run_report(path: &str) -> serde_json::Value {
     out.machine
 }
 
-fn metric<'a>(machine: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+fn metric<'a>(machine: &'a serde_json::Value, name: &str) -> Result<&'a serde_json::Value, String> {
     machine["metrics"]
         .as_array()
         .expect("metrics array")
         .iter()
         .find(|m| m["name"] == name)
-        .unwrap_or_else(|| panic!("metric `{name}` missing from the report"))
+        .ok_or_else(|| format!("metric `{name}` missing from the report"))
 }
 
 #[test]
-fn the_report_computes_the_hand_verified_summary_of_a_real_run() {
+fn the_report_computes_the_hand_verified_summary_of_a_real_run() -> Result<(), String> {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = fixture(&dir);
     let machine = run_report(&path);
 
     // `probe` = {1,2,3,4,5}: mean 3, median 3, min 1, max 5, sd = sqrt(2.5) ≈ 1.5811 (n-1).
-    let probe = metric(&machine, "probe");
+    let probe = metric(&machine, "probe")?;
     assert_eq!(
         probe["n"], 5,
         "the report must see all five persisted values"
@@ -106,7 +106,7 @@ fn the_report_computes_the_hand_verified_summary_of_a_real_run() {
 
     // `flat` = constant 7.0: zero spread, and the CV is reported as present-but-zero (the mean is
     // far from zero), not omitted.
-    let flat = metric(&machine, "flat");
+    let flat = metric(&machine, "flat")?;
     assert_eq!(flat["n"], 5);
     assert!((flat["mean"].as_f64().unwrap() - 7.0).abs() < 1e-9);
     assert_eq!(
@@ -119,6 +119,7 @@ fn the_report_computes_the_hand_verified_summary_of_a_real_run() {
         0.0_f64.to_bits(),
         "a constant non-zero metric has CV 0, not null"
     );
+    Ok(())
 }
 
 #[test]
