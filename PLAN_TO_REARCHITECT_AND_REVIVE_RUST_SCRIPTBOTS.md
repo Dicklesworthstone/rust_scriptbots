@@ -2175,7 +2175,7 @@ and authoritative snapshot guard, and compiled `scriptbots-runtime` by itself fo
 `wasm32-unknown-unknown`. The final WASM proof also verifies that core owns both required
 `getrandom` browser backends, rather than relying on a consumer-only feature accident.
 
-#### 2.4 pure host state machine
+#### 2.4 pure host state machine [Currently In Progress — `bd-2z0.4.5`, TopazCastle, 2026-07-15]
 
 - sole world ownership;
 - deterministic command drain;
