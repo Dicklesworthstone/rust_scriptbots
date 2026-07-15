@@ -7,8 +7,7 @@
 
 use super::{
     CommandEnvelope, CommandStatus, DriveReceipt, HostAccessError, HostCore, HostDriveInterest,
-    HostPort, JournalAdmission, LocalHostPort, ManualHostDriver, ManualInstant,
-    SnapshotHub,
+    HostPort, JournalAdmission, LocalHostPort, ManualHostDriver, ManualInstant, SnapshotHub,
 };
 use thiserror::Error;
 
@@ -2672,10 +2671,12 @@ mod tests {
                 .expect("disconnect runner");
         let snapshots = control.snapshot_hub();
         let mut subscription = snapshots.subscribe();
-        assert!(snapshots
-            .poll_latest(&mut subscription)
-            .expect("initial detached snapshot poll")
-            .is_some());
+        assert!(
+            snapshots
+                .poll_latest(&mut subscription)
+                .expect("initial detached snapshot poll")
+                .is_some()
+        );
         drop(control);
 
         assert!(matches!(

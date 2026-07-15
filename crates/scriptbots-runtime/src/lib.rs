@@ -43,10 +43,7 @@ mod serde_optional_arc {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::sync::Arc;
 
-    pub(super) fn serialize<T, S>(
-        value: &Option<Arc<T>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<T, S>(value: &Option<Arc<T>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         T: Serialize,
         S: Serializer,
@@ -54,9 +51,7 @@ mod serde_optional_arc {
         value.as_deref().serialize(serializer)
     }
 
-    pub(super) fn deserialize<'de, T, D>(
-        deserializer: D,
-    ) -> Result<Option<Arc<T>>, D::Error>
+    pub(super) fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<Arc<T>>, D::Error>
     where
         T: Deserialize<'de>,
         D: Deserializer<'de>,
@@ -1431,9 +1426,12 @@ impl SnapshotSubscription {
         if revision <= last_seen {
             return Ok(false);
         }
-        self.skipped_revisions = self
-            .skipped_revisions
-            .saturating_add(revision.get().saturating_sub(last_seen.get()).saturating_sub(1));
+        self.skipped_revisions = self.skipped_revisions.saturating_add(
+            revision
+                .get()
+                .saturating_sub(last_seen.get())
+                .saturating_sub(1),
+        );
         self.last_seen = Some(revision);
         Ok(true)
     }
@@ -2208,8 +2206,9 @@ mod tests {
                         && layers.food.height == food_height
                 })
                 .unwrap_or_else(|| {
-                    let cell_count = usize::try_from(u64::from(food_width) * u64::from(food_height))
-                        .expect("fake snapshot dimensions fit usize");
+                    let cell_count =
+                        usize::try_from(u64::from(food_width) * u64::from(food_height))
+                            .expect("fake snapshot dimensions fit usize");
                     let prior = self
                         .latest_snapshot
                         .as_ref()

@@ -393,11 +393,7 @@ impl SnapshotLayerCache {
             .tiles
             .capacity()
             .saturating_mul(size_of::<TerrainTileSnapshot>());
-        let food = self
-            .food
-            .cells
-            .capacity()
-            .saturating_mul(size_of::<f32>());
+        let food = self.food.cells.capacity().saturating_mul(size_of::<f32>());
         let hydrology = self
             .hydrology
             .as_deref()
@@ -452,9 +448,7 @@ fn capture_food_layer(world: &WorldState) -> FoodLayerSnapshot {
     }
 }
 
-fn capture_hydrology_layer(
-    hydrology: &scriptbots_core::HydrologyState,
-) -> HydrologyLayerSnapshot {
+fn capture_hydrology_layer(hydrology: &scriptbots_core::HydrologyState) -> HydrologyLayerSnapshot {
     let tiles = hydrology.tiles();
     let field = hydrology.field();
     HydrologyLayerSnapshot {
@@ -588,9 +582,8 @@ fn add_hydrology_allocation_stats(
     stats: &mut LayerRefreshStats,
 ) {
     stats.add_vector::<HydrologyTileSnapshot>(snapshot.tiles.capacity());
-    stats.add_vector::<scriptbots_core::HydrologyFlowDirection>(
-        snapshot.flow_directions.capacity(),
-    );
+    stats
+        .add_vector::<scriptbots_core::HydrologyFlowDirection>(snapshot.flow_directions.capacity());
     stats.add_vector::<f32>(snapshot.accumulation.capacity());
     stats.add_vector::<f32>(snapshot.spill_elevation.capacity());
     stats.add_vector::<u32>(snapshot.basin_ids.capacity());
@@ -1777,6 +1770,10 @@ impl ManualHostDriver for HostCore {
         self.session_id
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the sole-owner boundary keeps its ordered command, science, health, and publication phases visible together"
+    )]
     fn drive(&mut self, now: ManualInstant) -> Result<DriveReceipt, HostAccessError> {
         if self.last_now.is_some_and(|last| now < last) {
             return Err(protocol_violation("manual time moved backwards"));
@@ -2232,10 +2229,11 @@ mod tests {
             .expect("stalled cursor jumps to newest");
         assert_eq!(stalled_latest.revision, newest);
         assert_eq!(stalled.skipped_revisions(), 2);
-        assert!(hub
-            .poll_latest(&mut stalled)
-            .expect("idempotent stalled repoll")
-            .is_none());
+        assert!(
+            hub.poll_latest(&mut stalled)
+                .expect("idempotent stalled repoll")
+                .is_none()
+        );
 
         let mut reconnecting = hub.resume_after(SnapshotRevision::new(2));
         let reconnected = hub
@@ -2248,12 +2246,8 @@ mod tests {
 
     #[test]
     fn snapshots_publish_exact_completed_summary_without_persistence_cadence() {
-        let mut core = HostCore::new(
-            HostSessionId::new(71),
-            world(3),
-            options(true),
-        )
-        .expect("host with sparse persistence cadence");
+        let mut core = HostCore::new(HostSessionId::new(71), world(3), options(true))
+            .expect("host with sparse persistence cadence");
         let mut port = core.local_port();
         assert!(core.latest_snapshot().completed_summary.is_none());
 
@@ -2300,6 +2294,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one acceptance scenario makes every terrain, food, and hydrology Arc/revision transition explicit"
+    )]
     fn layer_arcs_and_revisions_change_together_on_exact_content_bits() {
         let mut config = ScriptBotsConfig {
             rng_seed: Some(0x51a7_1c5),
@@ -2309,8 +2307,8 @@ mod tests {
         };
         let world = WorldState::new(config.clone()).expect("layer test world");
         let (base_map, changed_map, map_without_hydrology) = snapshot_map_artifacts(&world);
-        let mut core = HostCore::new(HostSessionId::new(72), world, options(true))
-            .expect("layer test host");
+        let mut core =
+            HostCore::new(HostSessionId::new(72), world, options(true)).expect("layer test host");
         let mut port = core.local_port();
         let initial = core.latest_snapshot();
         assert!(initial.layers.hydrology.is_none());
@@ -2331,8 +2329,7 @@ mod tests {
         core.world
             .apply_map_artifact(&base_map)
             .expect("install initial hydrology");
-        core.publish_snapshot()
-            .expect("hydrology-add publication");
+        core.publish_snapshot().expect("hydrology-add publication");
         let hydrology_added = core.latest_snapshot();
         assert!(Arc::ptr_eq(
             &control_only.layers.terrain,
@@ -2368,11 +2365,7 @@ mod tests {
         config.food_max = 0.25;
         config.initial_food = 0.25;
         config.food_respawn_amount = 0.25;
-        submit(
-            &mut port,
-            2,
-            HostCommand::UpdateConfig(Box::new(config)),
-        );
+        submit(&mut port, 2, HostCommand::UpdateConfig(Box::new(config)));
         core.drive(ManualInstant::from_nanos(2))
             .expect("food-changing configuration publication");
         let food_changed = core.latest_snapshot();
@@ -2524,14 +2517,14 @@ mod tests {
         )
         .expect("sparse host");
         let busy_hub = every.snapshot_hub();
-        let mut readers = (0..128)
-            .map(|_| busy_hub.subscribe())
-            .collect::<Vec<_>>();
+        let mut readers = (0..128).map(|_| busy_hub.subscribe()).collect::<Vec<_>>();
         for reader in &mut readers {
-            assert!(busy_hub
-                .poll_latest(reader)
-                .expect("initial busy-reader poll")
-                .is_some());
+            assert!(
+                busy_hub
+                    .poll_latest(reader)
+                    .expect("initial busy-reader poll")
+                    .is_some()
+            );
         }
 
         every
@@ -2558,12 +2551,8 @@ mod tests {
                 .snapshots_published;
             assert_eq!(every.world_tick(), sparse.world_tick());
             assert_eq!(
-                every
-                    .scientific_digest_v1()
-                    .expect("every digest"),
-                sparse
-                    .scientific_digest_v1()
-                    .expect("sparse digest")
+                every.scientific_digest_v1().expect("every digest"),
+                sparse.scientific_digest_v1().expect("sparse digest")
             );
         }
         assert_eq!(every.world_tick(), Tick(6));
@@ -2607,8 +2596,8 @@ mod tests {
 
     #[allow(clippy::cast_precision_loss)]
     fn snapshot_measurement_world(agent_count: usize) -> WorldState {
-        let mut world = WorldState::new(snapshot_measurement_config())
-            .expect("snapshot measurement world");
+        let mut world =
+            WorldState::new(snapshot_measurement_config()).expect("snapshot measurement world");
         for ordinal in 0..agent_count {
             let x = (ordinal % 800) as f32;
             let y = ((ordinal * 37) % 800) as f32;
@@ -2653,6 +2642,10 @@ mod tests {
 
     #[test]
     #[ignore = "DSR-only reference-hardware snapshot measurement"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one DSR evidence record keeps warmups, raw samples, digests, capacity accounting, and both reference scales coherent"
+    )]
     fn measure_snapshot_builds_at_1k_and_10k_agents() {
         const WARMUPS: usize = 20;
         const SAMPLES: usize = 200;
@@ -2666,8 +2659,8 @@ mod tests {
             let session_id = HostSessionId::new(
                 u64::try_from(agent_count).expect("measured agent count fits session id"),
             );
-            let mut core = HostCore::new(session_id, world, options(true))
-                .expect("snapshot measurement host");
+            let mut core =
+                HostCore::new(session_id, world, options(true)).expect("snapshot measurement host");
             let initial_stats = core.latest_snapshot().build;
             assert_eq!(initial_stats.dynamic_agent_count, agent_count);
             let initial_digest = core
@@ -3085,10 +3078,7 @@ mod tests {
         journal_state
             .borrow_mut()
             .receipts
-            .push_back(JournalReceipt::new(
-                old_batch,
-                JournalReceiptState::Durable,
-            ));
+            .push_back(JournalReceipt::new(old_batch, JournalReceiptState::Durable));
         core.drive(ManualInstant::from_nanos(1))
             .expect("delayed old receipt");
         core.publish_snapshot().expect("diagnostic republish");
