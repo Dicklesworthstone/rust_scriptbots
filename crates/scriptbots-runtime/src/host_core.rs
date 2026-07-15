@@ -1198,8 +1198,9 @@ impl HostCore {
     fn automatic_budget(&mut self, elapsed_nanos: u64, speed_multiplier: f32) -> usize {
         let speed_units = speed_units(speed_multiplier);
         let threshold = u128::from(self.options.tick_period_nanos) * SPEED_SCALE;
-        let maximum_credit =
-            threshold.saturating_mul(u128::from(self.options.max_automatic_steps_per_drive));
+        let maximum_steps = u128::try_from(self.options.max_automatic_steps_per_drive)
+            .unwrap_or(u128::MAX);
+        let maximum_credit = threshold.saturating_mul(maximum_steps);
         self.cadence_credit = self
             .cadence_credit
             .saturating_add(u128::from(elapsed_nanos).saturating_mul(u128::from(speed_units)))
