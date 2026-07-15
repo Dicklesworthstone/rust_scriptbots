@@ -2020,7 +2020,7 @@ pub struct SelectedBrainTelemetry {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SelectedBrainTelemetryOutcome {
     Ready {
-        telemetry: SelectedBrainTelemetry,
+        telemetry: Box<SelectedBrainTelemetry>,
     },
     Unavailable {
         agent_uid: AgentUid,
@@ -17524,14 +17524,14 @@ impl WorldState {
             retained_payload_bytes =
                 retained_payload_bytes.saturating_add(snapshot.build.retained_payload_bytes);
             telemetry.push(SelectedBrainTelemetryOutcome::Ready {
-                telemetry: SelectedBrainTelemetry {
+                telemetry: Box::new(SelectedBrainTelemetry {
                     agent_id,
                     agent_uid,
                     sensors: runtime.sensors,
                     outputs: runtime.outputs,
                     lineage: runtime.lineage,
                     inspection: snapshot,
-                },
+                }),
             });
         }
 
