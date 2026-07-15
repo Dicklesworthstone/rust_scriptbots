@@ -8,13 +8,62 @@
 
 #![warn(missing_docs, unsafe_code)]
 
+use arc_swap::ArcSwap;
 use scriptbots_core::{
-    BirthRecord, DeathRecord, DynamicWorldSnapshot, PersistenceBatch, ResourceLedgerTick,
-    ScriptBotsConfig, SelectionUpdate, Tick, TickCombatSummary, TickEvents, TickSummary,
+    BirthRecord, DeathRecord, DynamicWorldSnapshot, HydrologyFlowDirection, PersistenceBatch,
+    ResourceLedgerTick, ScriptBotsConfig, SelectionUpdate, TerrainKind, Tick, TickCombatSummary,
+    TickEvents, TickSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
 use thiserror::Error;
+
+mod serde_arc {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub(super) fn serialize<T, S>(value: &Arc<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        value.as_ref().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, T, D>(deserializer: D) -> Result<Arc<T>, D::Error>
+    where
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(Arc::new)
+    }
+}
+
+mod serde_optional_arc {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub(super) fn serialize<T, S>(
+        value: &Option<Arc<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        value.as_deref().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, T, D>(
+        deserializer: D,
+    ) -> Result<Option<Arc<T>>, D::Error>
+    where
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(|value| value.map(Arc::new))
+    }
+}
 
 mod host_core;
 mod native;
@@ -180,6 +229,10 @@ monotonic_newtype!(
     SnapshotRevision
 );
 monotonic_newtype!(
+    /// Revision of one immutable renderer layer's exact content.
+    LayerRevision
+);
+monotonic_newtype!(
     /// Sequence number in the ordered host event stream.
     EventSequence
 );
@@ -247,10 +300,142 @@ pub enum HostLifecycle {
     Stopped,
 }
 
+/// Independent exact-content revisions for renderer-facing world layers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotLayerRevisions {
+    /// Revision of the terrain tile payload.
+    pub terrain: LayerRevision,
+    /// Revision of the dense food payload.
+    pub food: LayerRevision,
+    /// Revision of the optional hydrology payload.
+    pub hydrology: LayerRevision,
+}
+
+/// Renderer-neutral copy of one terrain tile.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerrainTileSnapshot {
+    /// Terrain classification.
+    pub kind: TerrainKind,
+    /// Normalized elevation.
+    pub elevation: f32,
+    /// Normalized moisture.
+    pub moisture: f32,
+    /// Renderer accent value.
+    pub accent: f32,
+    /// Fertility contribution applied by the scientific kernel.
+    pub fertility_bias: f32,
+    /// Temperature contribution applied by the scientific kernel.
+    pub temperature_bias: f32,
+    /// Stable palette lookup index.
+    pub palette_index: u16,
+}
+
+/// Immutable terrain payload shared across render publications until its content changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerrainLayerSnapshot {
+    /// Tile width.
+    pub width: u32,
+    /// Tile height.
+    pub height: u32,
+    /// Tile edge length in world units.
+    pub cell_size: u32,
+    /// Dense row-major terrain tiles.
+    pub tiles: Vec<TerrainTileSnapshot>,
+}
+
+/// Immutable dense food payload shared until one exact cell bit-pattern changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoodLayerSnapshot {
+    /// Grid width.
+    pub width: u32,
+    /// Grid height.
+    pub height: u32,
+    /// Dense row-major food values.
+    pub cells: Vec<f32>,
+}
+
+/// Renderer-neutral copy of one hydrology policy tile.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HydrologyTileSnapshot {
+    /// Terrain permeability.
+    pub permeability: f32,
+    /// Runoff bias.
+    pub runoff_bias: f32,
+    /// Basin ordering rank.
+    pub basin_rank: f32,
+    /// Channel-selection priority.
+    pub channel_priority: f32,
+    /// Agent swim-cost multiplier.
+    pub swim_cost: f32,
+}
+
+/// Immutable hydrology payload shared until one exact field bit-pattern changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HydrologyLayerSnapshot {
+    /// Grid width.
+    pub width: u32,
+    /// Grid height.
+    pub height: u32,
+    /// Dense row-major hydrology policy tiles.
+    pub tiles: Vec<HydrologyTileSnapshot>,
+    /// Precomputed flow direction per cell.
+    pub flow_directions: Vec<HydrologyFlowDirection>,
+    /// Precomputed flow accumulation per cell.
+    pub accumulation: Vec<f32>,
+    /// Precomputed spill elevation per cell.
+    pub spill_elevation: Vec<f32>,
+    /// Stable basin identity per cell.
+    pub basin_ids: Vec<u32>,
+    /// Current water depth per cell.
+    pub water_depth: Vec<f32>,
+}
+
+/// Arc-shared world layers captured coherently with one render publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotLayers {
+    /// Exact-content revisions paired with the payload pointers.
+    pub revisions: SnapshotLayerRevisions,
+    /// Terrain payload; pointer-stable while `revisions.terrain` is unchanged.
+    #[serde(with = "serde_arc")]
+    pub terrain: Arc<TerrainLayerSnapshot>,
+    /// Food payload; pointer-stable while `revisions.food` is unchanged.
+    #[serde(with = "serde_arc")]
+    pub food: Arc<FoodLayerSnapshot>,
+    /// Hydrology payload; pointer-stable while `revisions.hydrology` is unchanged.
+    #[serde(with = "serde_optional_arc")]
+    pub hydrology: Option<Arc<HydrologyLayerSnapshot>>,
+}
+
+/// Deterministic bulk-payload accounting for one render-snapshot build.
+///
+/// Counts deliberately exclude allocator headers and small control structs. They cover the
+/// large vectors whose cost scales with agent or layer cardinality, making allocation and byte
+/// regressions comparable across native allocators.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotBuildStats {
+    /// Dynamic agents copied into this publication.
+    pub dynamic_agent_count: usize,
+    /// Bulk vector allocations created by this build.
+    pub bulk_allocations: usize,
+    /// Capacity bytes newly allocated for dynamic agents and changed layers.
+    pub newly_allocated_capacity_bytes: usize,
+    /// Capacity bytes reused through layer Arcs.
+    pub reused_layer_capacity_bytes: usize,
+    /// Total capacity bytes referenced by the dynamic and layer payloads.
+    pub total_payload_capacity_bytes: usize,
+}
+
 /// Immutable renderer-neutral publication from the sole-owner host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HostSnapshot {
-    /// Monotonic publication revision.
+pub struct RenderSnapshot {
+    /// Stable identity of the publishing host session.
+    pub session_id: HostSessionId,
+    /// Monotonic publication revision within `session_id`.
     pub revision: SnapshotRevision,
     /// Revisions captured atomically with the payload.
     pub revisions: HostRevisions,
@@ -260,8 +445,108 @@ pub struct HostSnapshot {
     pub lifecycle: HostLifecycle,
     /// Queryable health captured at this boundary.
     pub health: HostHealth,
-    /// Existing renderer-neutral dynamic world projection.
+    /// Admitted envelopes still waiting behind the owner boundary.
+    pub command_queue_depth: usize,
+    /// Most recently applied command, independent of journal durability.
+    pub last_applied_command: Option<CommandId>,
+    /// Exact latest completed `StepOutcome` summary; absent before the first completed tick.
+    pub completed_summary: Option<TickSummary>,
+    /// Content-revisioned Arc-shared terrain, food, and hydrology payloads.
+    pub layers: SnapshotLayers,
+    /// Deterministic payload allocation and byte accounting.
+    pub build: SnapshotBuildStats,
+    /// Compact renderer-neutral dynamic world projection.
     pub world: DynamicWorldSnapshot,
+}
+
+/// Cloneable, thread-safe latest-value read handle for render snapshots.
+///
+/// The hub retains exactly one current `Arc`. Every subscriber owns only scalar cursor state, so
+/// a stalled subscriber may skip revisions but never creates a host-side backlog. Holding a
+/// previously returned `Arc` intentionally keeps that one immutable value alive.
+#[derive(Clone)]
+pub struct SnapshotHub {
+    session_id: HostSessionId,
+    latest: Arc<ArcSwap<RenderSnapshot>>,
+}
+
+impl fmt::Debug for SnapshotHub {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotHub")
+            .field("session_id", &self.session_id)
+            .field("revision", &self.latest.load().revision)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotHub {
+    #[must_use]
+    pub(crate) fn new(initial: Arc<RenderSnapshot>) -> Self {
+        Self {
+            session_id: initial.session_id,
+            latest: Arc::new(ArcSwap::from(initial)),
+        }
+    }
+
+    /// Stable host session published by this hub.
+    #[must_use]
+    pub const fn session_id(&self) -> HostSessionId {
+        self.session_id
+    }
+
+    /// Load the newest complete immutable publication.
+    #[must_use]
+    pub fn latest(&self) -> Arc<RenderSnapshot> {
+        self.latest.load_full()
+    }
+
+    /// Create an independent cursor that first observes the current publication.
+    #[must_use]
+    pub const fn subscribe(&self) -> SnapshotSubscription {
+        SnapshotSubscription::current(self.session_id)
+    }
+
+    /// Reconnect after a publication already observed in this host session.
+    #[must_use]
+    pub const fn resume_after(&self, revision: SnapshotRevision) -> SnapshotSubscription {
+        SnapshotSubscription::after(self.session_id, revision)
+    }
+
+    /// Load the newest publication and advance only the supplied cursor.
+    pub fn poll_latest(
+        &self,
+        subscription: &mut SnapshotSubscription,
+    ) -> Result<Option<Arc<RenderSnapshot>>, HostAccessError> {
+        let snapshot = self.latest();
+        if subscription.observe(self.session_id, snapshot.revision)? {
+            Ok(Some(snapshot))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn snapshot_after(&self, after: Option<SnapshotRevision>) -> Option<Arc<RenderSnapshot>> {
+        let snapshot = self.latest();
+        after
+            .is_none_or(|revision| snapshot.revision > revision)
+            .then_some(snapshot)
+    }
+
+    pub(crate) fn publish(&self, snapshot: Arc<RenderSnapshot>) -> Result<(), HostAccessError> {
+        if snapshot.session_id != self.session_id {
+            return Err(protocol_violation(
+                "snapshot publisher changed its host session identity",
+            ));
+        }
+        if snapshot.revision <= self.latest.load().revision {
+            return Err(protocol_violation(
+                "snapshot publisher did not advance its publication revision",
+            ));
+        }
+        self.latest.store(snapshot);
+        Ok(())
+    }
 }
 
 /// A state-changing request understood by the runtime boundary.
@@ -1045,8 +1330,6 @@ pub struct HostEvent {
 pub enum HostEventKind {
     /// One command's application or journal status changed.
     CommandStatusChanged(CommandStatus),
-    /// A new immutable snapshot became visible.
-    SnapshotPublished(SnapshotRevision),
     /// Host lifecycle changed.
     LifecycleChanged(HostLifecycle),
     /// Queryable host health changed.
@@ -1083,31 +1366,76 @@ impl EventCursor {
     }
 }
 
-/// Opaque client-side subscription to immutable snapshots.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Opaque, host-session-bound cursor over latest-value render snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotSubscription {
+    session_id: HostSessionId,
     last_seen: Option<SnapshotRevision>,
+    skipped_revisions: u64,
 }
 
 impl SnapshotSubscription {
-    /// Subscribe to the current publication followed by all newer revisions.
+    /// Subscribe to the current publication from one exact host session.
     #[must_use]
-    pub const fn current() -> Self {
-        Self { last_seen: None }
+    pub const fn current(session_id: HostSessionId) -> Self {
+        Self {
+            session_id,
+            last_seen: None,
+            skipped_revisions: 0,
+        }
     }
 
-    /// Resume after an already-observed snapshot.
+    /// Resume after an already-observed publication from one exact host session.
     #[must_use]
-    pub const fn after(revision: SnapshotRevision) -> Self {
+    pub const fn after(session_id: HostSessionId, revision: SnapshotRevision) -> Self {
         Self {
+            session_id,
             last_seen: Some(revision),
+            skipped_revisions: 0,
         }
+    }
+
+    /// Host session to which this cursor is bound.
+    #[must_use]
+    pub const fn session_id(self) -> HostSessionId {
+        self.session_id
     }
 
     /// Last snapshot observed through this subscription.
     #[must_use]
     pub const fn last_seen(self) -> Option<SnapshotRevision> {
         self.last_seen
+    }
+
+    /// Number of older render publications deliberately skipped by latest-value polling.
+    #[must_use]
+    pub const fn skipped_revisions(self) -> u64 {
+        self.skipped_revisions
+    }
+
+    fn observe(
+        &mut self,
+        session_id: HostSessionId,
+        revision: SnapshotRevision,
+    ) -> Result<bool, HostAccessError> {
+        if session_id != self.session_id {
+            return Err(HostAccessError::SnapshotSessionMismatch {
+                expected: self.session_id,
+                actual: session_id,
+            });
+        }
+        let Some(last_seen) = self.last_seen else {
+            self.last_seen = Some(revision);
+            return Ok(true);
+        };
+        if revision <= last_seen {
+            return Ok(false);
+        }
+        self.skipped_revisions = self
+            .skipped_revisions
+            .saturating_add(revision.get().saturating_sub(last_seen.get()).saturating_sub(1));
+        self.last_seen = Some(revision);
+        Ok(true)
     }
 }
 
@@ -1122,6 +1450,14 @@ pub enum HostAccessError {
     ProtocolViolation {
         /// Diagnostic identifying the violated invariant.
         message: String,
+    },
+    /// A snapshot cursor was reused against a different host session.
+    #[error("snapshot session {actual:?} does not match subscription session {expected:?}")]
+    SnapshotSessionMismatch {
+        /// Session bound to the snapshot cursor.
+        expected: HostSessionId,
+        /// Session reported by the snapshot source.
+        actual: HostSessionId,
     },
     /// A manual driver belongs to a different host than the frontend's ingress port.
     #[error("manual driver session {actual:?} does not match client session {expected:?}")]
@@ -1187,11 +1523,11 @@ pub trait HostPort {
         command_id: CommandId,
     ) -> Result<Option<CommandStatus>, HostAccessError>;
 
-    /// Return a snapshot newer than `after`, or the current snapshot when `after` is `None`.
+    /// Return the newest snapshot when it is newer than `after`.
     fn snapshot_after(
         &mut self,
         after: Option<SnapshotRevision>,
-    ) -> Result<Option<Arc<HostSnapshot>>, HostAccessError>;
+    ) -> Result<Option<Arc<RenderSnapshot>>, HostAccessError>;
 
     /// Return at most `limit` events whose sequence is strictly greater than the cursor.
     fn events_after(
@@ -1286,26 +1622,35 @@ impl<P: HostPort> HostClient<P> {
 
     /// Create a snapshot subscription starting with the current publication.
     #[must_use]
-    pub const fn subscribe_snapshots(&self) -> SnapshotSubscription {
-        SnapshotSubscription::current()
+    pub fn subscribe_snapshots(&self) -> SnapshotSubscription {
+        SnapshotSubscription::current(self.port.session_id())
     }
 
     /// Poll one immutable snapshot and advance the subscription only on success.
     pub fn poll_snapshot(
         &mut self,
         subscription: &mut SnapshotSubscription,
-    ) -> Result<Option<Arc<HostSnapshot>>, HostAccessError> {
+    ) -> Result<Option<Arc<RenderSnapshot>>, HostAccessError> {
+        let session_id = self.port.session_id();
+        if subscription.session_id() != session_id {
+            return Err(HostAccessError::SnapshotSessionMismatch {
+                expected: subscription.session_id(),
+                actual: session_id,
+            });
+        }
         let snapshot = self.port.snapshot_after(subscription.last_seen)?;
         if let Some(snapshot) = snapshot {
-            if subscription
-                .last_seen
-                .is_some_and(|seen| snapshot.revision <= seen)
-            {
+            if snapshot.session_id != session_id {
+                return Err(HostAccessError::SnapshotSessionMismatch {
+                    expected: session_id,
+                    actual: snapshot.session_id,
+                });
+            }
+            if !subscription.observe(snapshot.session_id, snapshot.revision)? {
                 return Err(protocol_violation(
                     "snapshot revision did not advance beyond the subscription",
                 ));
             }
-            subscription.last_seen = Some(snapshot.revision);
             Ok(Some(snapshot))
         } else {
             Ok(None)
@@ -1374,7 +1719,7 @@ impl<P: HostPort> NullFrontend<P> {
             host_session_id,
             client_namespace,
             next_sequence: Some(1),
-            snapshots: SnapshotSubscription::current(),
+            snapshots: SnapshotSubscription::current(host_session_id),
             events: EventCursor::beginning(),
             last_drive: None,
         }
@@ -1454,7 +1799,7 @@ impl<P: HostPort> NullFrontend<P> {
     }
 
     /// Poll the next immutable snapshot for this frontend.
-    pub fn poll_snapshot(&mut self) -> Result<Option<Arc<HostSnapshot>>, HostAccessError> {
+    pub fn poll_snapshot(&mut self) -> Result<Option<Arc<RenderSnapshot>>, HostAccessError> {
         self.client.poll_snapshot(&mut self.snapshots)
     }
 
@@ -1581,17 +1926,13 @@ mod tests {
         fn snapshot_after(
             &mut self,
             after: Option<SnapshotRevision>,
-        ) -> Result<Option<Arc<HostSnapshot>>, HostAccessError> {
+        ) -> Result<Option<Arc<RenderSnapshot>>, HostAccessError> {
             let host = self.lock();
-            Ok(after.map_or_else(
-                || host.snapshots.last().cloned(),
-                |revision| {
-                    host.snapshots
-                        .iter()
-                        .find(|snapshot| snapshot.revision > revision)
-                        .cloned()
-                },
-            ))
+            Ok(host.latest_snapshot.as_ref().and_then(|snapshot| {
+                after
+                    .is_none_or(|revision| snapshot.revision > revision)
+                    .then(|| Arc::clone(snapshot))
+            }))
         }
 
         fn events_after(
@@ -1657,7 +1998,7 @@ mod tests {
         queue: VecDeque<CommandEnvelope>,
         statuses: HashMap<CommandId, CommandStatus>,
         admission_order: Vec<CommandId>,
-        snapshots: Vec<Arc<HostSnapshot>>,
+        latest_snapshot: Option<Arc<RenderSnapshot>>,
         events: Vec<HostEvent>,
         fail_on_application: HashSet<CommandId>,
         lost_submission_receipts: HashSet<CommandId>,
@@ -1680,7 +2021,7 @@ mod tests {
                 queue: VecDeque::new(),
                 statuses: HashMap::new(),
                 admission_order: Vec::new(),
-                snapshots: Vec::new(),
+                latest_snapshot: None,
                 events: Vec::new(),
                 fail_on_application: HashSet::new(),
                 lost_submission_receipts: HashSet::new(),
@@ -1853,12 +2194,96 @@ mod tests {
             self.next_snapshot = revision
                 .checked_next()
                 .expect("test snapshot sequence must have headroom");
-            self.snapshots.push(Arc::new(HostSnapshot {
+            let food_width = self.config.world_width / self.config.food_cell_size;
+            let food_height = self.config.world_height / self.config.food_cell_size;
+            let layers = self
+                .latest_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.layers.clone())
+                .filter(|layers| {
+                    layers.terrain.width == food_width
+                        && layers.terrain.height == food_height
+                        && layers.terrain.cell_size == self.config.food_cell_size
+                        && layers.food.width == food_width
+                        && layers.food.height == food_height
+                })
+                .unwrap_or_else(|| {
+                    let cell_count = usize::try_from(u64::from(food_width) * u64::from(food_height))
+                        .expect("fake snapshot dimensions fit usize");
+                    let prior = self
+                        .latest_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.layers.revisions)
+                        .unwrap_or_default();
+                    SnapshotLayers {
+                        revisions: SnapshotLayerRevisions {
+                            terrain: prior
+                                .terrain
+                                .checked_next()
+                                .expect("fake terrain revision has headroom"),
+                            food: prior
+                                .food
+                                .checked_next()
+                                .expect("fake food revision has headroom"),
+                            hydrology: prior.hydrology,
+                        },
+                        terrain: Arc::new(TerrainLayerSnapshot {
+                            width: food_width,
+                            height: food_height,
+                            cell_size: self.config.food_cell_size,
+                            tiles: vec![
+                                TerrainTileSnapshot {
+                                    kind: TerrainKind::Grass,
+                                    elevation: 0.5,
+                                    moisture: 0.5,
+                                    accent: 0.0,
+                                    fertility_bias: 0.5,
+                                    temperature_bias: 0.5,
+                                    palette_index: 3,
+                                };
+                                cell_count
+                            ],
+                        }),
+                        food: Arc::new(FoodLayerSnapshot {
+                            width: food_width,
+                            height: food_height,
+                            cells: vec![0.0; cell_count],
+                        }),
+                        hydrology: None,
+                    }
+                });
+            let last_applied_command = self
+                .admission_order
+                .iter()
+                .rev()
+                .find(|command_id| {
+                    self.statuses.get(command_id).is_some_and(|status| {
+                        matches!(status.application(), ApplicationState::Applied(_))
+                    })
+                })
+                .copied();
+            self.latest_snapshot = Some(Arc::new(RenderSnapshot {
+                session_id: self.session_id,
                 revision,
                 revisions: self.revisions,
                 playback: self.playback,
                 lifecycle: self.lifecycle,
                 health: HostHealth::Healthy,
+                command_queue_depth: self.queue.len(),
+                last_applied_command,
+                completed_summary: (self.tick != Tick::zero()).then(|| TickSummary {
+                    tick: self.tick,
+                    agent_count: 0,
+                    births: 0,
+                    deaths: 0,
+                    total_energy: 0.0,
+                    average_energy: 0.0,
+                    average_health: 0.0,
+                    max_age: 0,
+                    spike_hits: 0,
+                }),
+                layers,
+                build: SnapshotBuildStats::default(),
                 world: DynamicWorldSnapshot {
                     tick: self.tick.0,
                     epoch: 0,
@@ -1878,7 +2303,6 @@ mod tests {
                     agents: Vec::new(),
                 },
             }));
-            self.emit(HostEventKind::SnapshotPublished(revision));
         }
 
         fn emit_status(&mut self, status: CommandStatus) {
@@ -2219,6 +2643,48 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_from_another_session_is_rejected_without_advancing_cursor() {
+        let shared = SharedFakeHost::new();
+        let expected = shared.lock().session_id;
+        let mut client = HostClient::new(shared.clone());
+        let mut subscription = client.subscribe_snapshots();
+        {
+            let mut host = shared.lock();
+            let snapshot = host
+                .latest_snapshot
+                .as_mut()
+                .expect("fake initial snapshot");
+            Arc::make_mut(snapshot).session_id = HostSessionId::new(9_999);
+        }
+
+        assert_eq!(
+            client.poll_snapshot(&mut subscription),
+            Err(HostAccessError::SnapshotSessionMismatch {
+                expected,
+                actual: HostSessionId::new(9_999),
+            })
+        );
+        assert_eq!(subscription.last_seen(), None);
+    }
+
+    #[test]
+    fn snapshot_read_handles_are_thread_safe_and_runtime_has_no_storage_dependency() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<SnapshotHub>();
+        assert_send::<SnapshotSubscription>();
+
+        let manifest = include_str!("../Cargo.toml");
+        for forbidden in ["scriptbots-storage", "fsqlite"] {
+            assert!(
+                !manifest.contains(forbidden),
+                "renderer-neutral runtime manifest must not depend on {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn revisions_snapshots_and_events_are_monotonic_in_their_typed_domains() {
         let shared = SharedFakeHost::new();
         let mut driver = shared.driver();
@@ -2291,7 +2757,7 @@ mod tests {
         let events = client
             .read_events(&mut cursor, usize::MAX)
             .expect("ordered event read");
-        assert!(events.len() >= 9);
+        assert_eq!(events.len(), 6);
         assert!(
             events
                 .windows(2)

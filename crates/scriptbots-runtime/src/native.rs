@@ -8,6 +8,7 @@
 use super::{
     CommandEnvelope, CommandStatus, DriveReceipt, HostAccessError, HostCore, HostDriveInterest,
     HostPort, JournalAdmission, LocalHostPort, ManualHostDriver, ManualInstant,
+    SnapshotHub,
 };
 use thiserror::Error;
 
@@ -128,6 +129,14 @@ impl FixedDeadlineHost {
     #[must_use]
     pub fn local_port(&self) -> LocalHostPort {
         self.port.clone()
+    }
+
+    /// Clone the thread-safe latest-value snapshot handle.
+    ///
+    /// This handle contains no native command sender and cannot keep ingress connected.
+    #[must_use]
+    pub fn snapshot_hub(&self) -> SnapshotHub {
+        self.core.snapshot_hub()
     }
 
     /// Read the exact sole-owner host for diagnostics and immutable projections.
@@ -277,7 +286,7 @@ impl FixedDeadlineHost {
 mod asupersync_runner {
     use super::{
         CommandEnvelope, FixedDeadlineHost, HostDriveInterest, ManualInstant, NativeDriveReceipt,
-        NativeDriveTrigger, NativeScheduleError,
+        NativeDriveTrigger, NativeScheduleError, SnapshotHub,
     };
     use crate::{ApplicationState, CommandId, HostFault, HostHealth, JournalBatchId};
     use asupersync::Cx;
@@ -485,9 +494,19 @@ mod asupersync_runner {
     pub struct NativeControl {
         sender: Sender<NativeMessage>,
         state: Arc<NativeControlState>,
+        snapshots: SnapshotHub,
     }
 
     impl NativeControl {
+        /// Clone the detached latest-value snapshot read handle.
+        ///
+        /// The returned hub does not clone command ingress, so display-only readers cannot
+        /// prevent producer-disconnect shutdown.
+        #[must_use]
+        pub fn snapshot_hub(&self) -> SnapshotHub {
+            self.snapshots.clone()
+        }
+
         /// Try to enqueue one exact command without waiting.
         ///
         /// # Panics
@@ -775,9 +794,11 @@ mod asupersync_runner {
             let options = options.validate()?;
             let (sender, receiver) = mpsc::channel(options.ingress_capacity);
             let state = Arc::new(NativeControlState::new());
+            let snapshots = host.snapshot_hub();
             let control = NativeControl {
                 sender,
                 state: Arc::clone(&state),
+                snapshots,
             };
             Ok((
                 Self {
@@ -1778,6 +1799,7 @@ mod tests {
             command_capacity: 32,
             tick_period_nanos: 10,
             max_automatic_steps_per_drive: 4,
+            snapshot_interval_ticks: 1,
         }
     }
 
@@ -2648,16 +2670,25 @@ mod tests {
         let (mut runner, control) =
             NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
                 .expect("disconnect runner");
+        let snapshots = control.snapshot_hub();
+        let mut subscription = snapshots.subscribe();
+        assert!(snapshots
+            .poll_latest(&mut subscription)
+            .expect("initial detached snapshot poll")
+            .is_some());
         drop(control);
 
         assert!(matches!(
             runner.run_until_terminal().expect("disconnect shutdown"),
             NativeRunOutcome::ControllerDisconnected { .. }
         ));
-        assert_eq!(
-            runner.host().core().latest_snapshot().lifecycle,
-            HostLifecycle::Stopped
-        );
+        let detached_terminal = snapshots
+            .poll_latest(&mut subscription)
+            .expect("detached terminal snapshot poll")
+            .expect("detached hub publishes terminal state");
+        let runner_terminal = runner.host().core().latest_snapshot();
+        assert_eq!(detached_terminal.lifecycle, HostLifecycle::Stopped);
+        assert!(Arc::ptr_eq(&detached_terminal, &runner_terminal));
         assert_eq!(runner.metrics().shutdown_requests, 1);
     }
 

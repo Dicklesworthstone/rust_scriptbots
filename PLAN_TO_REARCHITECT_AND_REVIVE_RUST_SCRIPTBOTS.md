@@ -2225,7 +2225,7 @@ guard at `0.3.6`, the 32-package franken license audit, the authoritative 62-cra
 and the standalone default-feature `scriptbots-runtime` `wasm32-unknown-unknown` check on exact
 source `5b1a5a8d6c8d7629c3822712e59361e3fa9014e0`.
 
-#### 2.6 canonical snapshot hub and projections
+#### 2.6 canonical snapshot hub and projections [Currently In Progress — bd-2z0.4.7, TopazCastle, 2026-07-15]
 
 - current summary;
 - revisioned static layers;

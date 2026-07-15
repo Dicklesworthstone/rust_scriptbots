@@ -13,6 +13,7 @@ default = []
 native-asupersync = ["dep:asupersync"]
 
 [dependencies]
+arc-swap = { workspace = true }
 asupersync = { workspace = true, optional = true }
 scriptbots-core = { path = "../scriptbots-core", default-features = false }
 serde = { workspace = true }

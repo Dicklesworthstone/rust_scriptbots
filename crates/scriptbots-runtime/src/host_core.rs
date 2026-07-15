@@ -3,21 +3,24 @@
 use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
     CommandId, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt, EventSequence,
-    HostAccessError, HostBlocker, HostCommand, HostDriveInterest, HostEvent, HostEventKind,
-    HostFault, HostHealth, HostLifecycle, HostPort, HostRevisions, HostSessionId, HostSnapshot,
-    JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
-    JournalReceiptState, JournalState, ManualHostDriver, ManualInstant, PlaybackSnapshot,
-    RejectionReason, ScientificBoundary, ScientificBoundaryFault, ScientificRevision,
-    ShutdownCommitRequirement, SnapshotRevision, StatusCombinationError,
+    FoodLayerSnapshot, HostAccessError, HostBlocker, HostCommand, HostDriveInterest, HostEvent,
+    HostEventKind, HostFault, HostHealth, HostLifecycle, HostPort, HostRevisions, HostSessionId,
+    HydrologyLayerSnapshot, HydrologyTileSnapshot, JournalAdmission, JournalBatch, JournalBatchId,
+    JournalFailure, JournalPort, JournalReceipt, JournalReceiptState, JournalState, LayerRevision,
+    ManualHostDriver, ManualInstant, PlaybackSnapshot, RejectionReason, RenderSnapshot,
+    ScientificBoundary, ScientificBoundaryFault, ScientificRevision, ShutdownCommitRequirement,
+    SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions, SnapshotLayers, SnapshotRevision,
+    StatusCombinationError, TerrainLayerSnapshot, TerrainTileSnapshot,
 };
 use scriptbots_core::{
-    CharacterizationError, CompletedStepFault, DynamicWorldSnapshot, NullPersistence,
-    PersistenceAdmissionSession, PersistenceSessionError, ScriptBotsConfig, Tick, WorldDigestV1,
-    WorldState,
+    CharacterizationError, CompletedStepFault, DynamicAgentSnapshot, DynamicWorldSnapshot,
+    NullPersistence, PersistenceAdmissionSession, PersistenceSessionError, ScriptBotsConfig, Tick,
+    TickSummary, WorldDigestV1, WorldState,
 };
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
+    mem::size_of,
     rc::Rc,
     sync::Arc,
 };
@@ -27,6 +30,7 @@ const SPEED_SCALE: u128 = 1_000_000;
 const DEFAULT_TICK_PERIOD_NANOS: u64 = 16_666_667;
 const DEFAULT_COMMAND_CAPACITY: usize = 32;
 const DEFAULT_MAX_AUTOMATIC_STEPS: usize = 8;
+const DEFAULT_SNAPSHOT_INTERVAL_TICKS: u64 = 1;
 const RECEIPT_POLL_LIMIT: usize = 4_096;
 const LIFECYCLE_COMMAND_NAMESPACE: u64 = u64::MAX;
 
@@ -41,6 +45,11 @@ pub struct HostCoreOptions {
     pub tick_period_nanos: u64,
     /// Maximum automatic catch-up work performed by one drive call.
     pub max_automatic_steps_per_drive: usize,
+    /// Completed automatic science revisions between render publications.
+    ///
+    /// Control, lifecycle, health, configuration, and explicit-step changes still publish
+    /// immediately. This deterministic stride changes presentation work only.
+    pub snapshot_interval_ticks: u64,
 }
 
 impl Default for HostCoreOptions {
@@ -50,6 +59,7 @@ impl Default for HostCoreOptions {
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             tick_period_nanos: DEFAULT_TICK_PERIOD_NANOS,
             max_automatic_steps_per_drive: DEFAULT_MAX_AUTOMATIC_STEPS,
+            snapshot_interval_ticks: DEFAULT_SNAPSHOT_INTERVAL_TICKS,
         }
     }
 }
@@ -126,7 +136,7 @@ struct SharedHostState {
     shutdown_command_id: Option<CommandId>,
     queue: VecDeque<AdmittedEnvelope>,
     statuses: HashMap<CommandId, CommandStatus>,
-    latest_snapshot: Arc<HostSnapshot>,
+    last_applied: Option<(AdmissionSequence, CommandId)>,
     events: Vec<HostEvent>,
     visible_tick: Tick,
 }
@@ -146,6 +156,14 @@ impl SharedHostState {
     }
 
     fn store_status(&mut self, status: CommandStatus) -> Result<(), HostAccessError> {
+        if matches!(status.application(), ApplicationState::Applied(_))
+            && let Some(admission) = status.admission_sequence()
+            && self
+                .last_applied
+                .is_none_or(|(current, _)| admission > current)
+        {
+            self.last_applied = Some((admission, status.command_id()));
+        }
         self.statuses.insert(status.command_id(), status.clone());
         self.emit(HostEventKind::CommandStatusChanged(status))
     }
@@ -227,6 +245,7 @@ impl SharedHostState {
 #[derive(Clone)]
 pub struct LocalHostPort {
     shared: Rc<RefCell<SharedHostState>>,
+    snapshots: SnapshotHub,
 }
 
 impl LocalHostPort {
@@ -256,11 +275,8 @@ impl HostPort for LocalHostPort {
     fn snapshot_after(
         &mut self,
         after: Option<SnapshotRevision>,
-    ) -> Result<Option<Arc<HostSnapshot>>, HostAccessError> {
-        let snapshot = Arc::clone(&self.shared.borrow().latest_snapshot);
-        Ok(after
-            .is_none_or(|revision| snapshot.revision > revision)
-            .then_some(snapshot))
+    ) -> Result<Option<Arc<RenderSnapshot>>, HostAccessError> {
+        Ok(self.snapshots.snapshot_after(after))
     }
 
     fn events_after(
@@ -287,6 +303,324 @@ struct InflightJournal {
     committed_volatile: bool,
 }
 
+#[derive(Clone)]
+struct SnapshotLayerCache {
+    revisions: SnapshotLayerRevisions,
+    terrain: Arc<TerrainLayerSnapshot>,
+    food: Arc<FoodLayerSnapshot>,
+    hydrology: Option<Arc<HydrologyLayerSnapshot>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LayerRefreshStats {
+    bulk_allocations: usize,
+    newly_allocated_capacity_bytes: usize,
+}
+
+impl LayerRefreshStats {
+    fn add_vector<T>(&mut self, capacity: usize) {
+        if capacity != 0 {
+            self.bulk_allocations = self.bulk_allocations.saturating_add(1);
+            self.newly_allocated_capacity_bytes = self
+                .newly_allocated_capacity_bytes
+                .saturating_add(capacity.saturating_mul(size_of::<T>()));
+        }
+    }
+}
+
+impl SnapshotLayerCache {
+    fn new(world: &WorldState) -> (Self, LayerRefreshStats) {
+        let terrain = Arc::new(capture_terrain_layer(world));
+        let food = Arc::new(capture_food_layer(world));
+        let hydrology = world.hydrology().map(capture_hydrology_layer).map(Arc::new);
+        let cache = Self {
+            revisions: SnapshotLayerRevisions {
+                terrain: LayerRevision::new(1),
+                food: LayerRevision::new(1),
+                hydrology: LayerRevision::new(u64::from(hydrology.is_some())),
+            },
+            terrain,
+            food,
+            hydrology,
+        };
+        let mut stats = LayerRefreshStats::default();
+        cache.add_allocation_stats(&mut stats);
+        (cache, stats)
+    }
+
+    fn refresh(&mut self, world: &WorldState) -> Result<LayerRefreshStats, HostAccessError> {
+        let mut stats = LayerRefreshStats::default();
+        if !terrain_layer_matches(&self.terrain, world) {
+            let terrain = Arc::new(capture_terrain_layer(world));
+            stats.add_vector::<TerrainTileSnapshot>(terrain.tiles.capacity());
+            self.terrain = terrain;
+            self.revisions.terrain = next_layer_revision(self.revisions.terrain, "terrain")?;
+        }
+        if !food_layer_matches(&self.food, world) {
+            let food = Arc::new(capture_food_layer(world));
+            stats.add_vector::<f32>(food.cells.capacity());
+            self.food = food;
+            self.revisions.food = next_layer_revision(self.revisions.food, "food")?;
+        }
+        match (&self.hydrology, world.hydrology()) {
+            (None, None) => {}
+            (Some(current), Some(world_hydrology))
+                if hydrology_layer_matches(current, world_hydrology) => {}
+            (_, next) => {
+                self.hydrology = next.map(capture_hydrology_layer).map(Arc::new);
+                if let Some(hydrology) = &self.hydrology {
+                    add_hydrology_allocation_stats(hydrology, &mut stats);
+                }
+                self.revisions.hydrology =
+                    next_layer_revision(self.revisions.hydrology, "hydrology")?;
+            }
+        }
+        Ok(stats)
+    }
+
+    fn snapshot(&self) -> SnapshotLayers {
+        SnapshotLayers {
+            revisions: self.revisions,
+            terrain: Arc::clone(&self.terrain),
+            food: Arc::clone(&self.food),
+            hydrology: self.hydrology.as_ref().map(Arc::clone),
+        }
+    }
+
+    fn total_capacity_bytes(&self) -> usize {
+        let terrain = self
+            .terrain
+            .tiles
+            .capacity()
+            .saturating_mul(size_of::<TerrainTileSnapshot>());
+        let food = self
+            .food
+            .cells
+            .capacity()
+            .saturating_mul(size_of::<f32>());
+        let hydrology = self
+            .hydrology
+            .as_deref()
+            .map_or(0, hydrology_capacity_bytes);
+        terrain.saturating_add(food).saturating_add(hydrology)
+    }
+
+    fn add_allocation_stats(&self, stats: &mut LayerRefreshStats) {
+        stats.add_vector::<TerrainTileSnapshot>(self.terrain.tiles.capacity());
+        stats.add_vector::<f32>(self.food.cells.capacity());
+        if let Some(hydrology) = &self.hydrology {
+            add_hydrology_allocation_stats(hydrology, stats);
+        }
+    }
+}
+
+fn next_layer_revision(
+    revision: LayerRevision,
+    layer: &'static str,
+) -> Result<LayerRevision, HostAccessError> {
+    revision
+        .checked_next()
+        .ok_or_else(|| protocol_violation(format!("{layer} layer revision exhausted")))
+}
+
+fn capture_terrain_layer(world: &WorldState) -> TerrainLayerSnapshot {
+    let terrain = world.terrain();
+    let mut tiles = Vec::with_capacity(terrain.tiles().len());
+    tiles.extend(terrain.tiles().iter().map(|tile| TerrainTileSnapshot {
+        kind: tile.kind,
+        elevation: tile.elevation,
+        moisture: tile.moisture,
+        accent: tile.accent,
+        fertility_bias: tile.fertility_bias,
+        temperature_bias: tile.temperature_bias,
+        palette_index: tile.palette_index,
+    }));
+    TerrainLayerSnapshot {
+        width: terrain.width(),
+        height: terrain.height(),
+        cell_size: terrain.cell_size(),
+        tiles,
+    }
+}
+
+fn capture_food_layer(world: &WorldState) -> FoodLayerSnapshot {
+    let food = world.food();
+    FoodLayerSnapshot {
+        width: food.width(),
+        height: food.height(),
+        cells: food.cells().to_vec(),
+    }
+}
+
+fn capture_hydrology_layer(
+    hydrology: &scriptbots_core::HydrologyState,
+) -> HydrologyLayerSnapshot {
+    let tiles = hydrology.tiles();
+    let field = hydrology.field();
+    HydrologyLayerSnapshot {
+        width: hydrology.width(),
+        height: hydrology.height(),
+        tiles: tiles
+            .tiles()
+            .iter()
+            .map(|tile| HydrologyTileSnapshot {
+                permeability: tile.permeability,
+                runoff_bias: tile.runoff_bias,
+                basin_rank: tile.basin_rank,
+                channel_priority: tile.channel_priority,
+                swim_cost: tile.swim_cost,
+            })
+            .collect(),
+        flow_directions: field.flow_directions().to_vec(),
+        accumulation: field.accumulation().to_vec(),
+        spill_elevation: field.spill_elevation().to_vec(),
+        basin_ids: field.basin_ids().to_vec(),
+        water_depth: hydrology.water_depth().to_vec(),
+    }
+}
+
+fn terrain_layer_matches(snapshot: &TerrainLayerSnapshot, world: &WorldState) -> bool {
+    let terrain = world.terrain();
+    snapshot.width == terrain.width()
+        && snapshot.height == terrain.height()
+        && snapshot.cell_size == terrain.cell_size()
+        && snapshot.tiles.len() == terrain.tiles().len()
+        && snapshot
+            .tiles
+            .iter()
+            .zip(terrain.tiles())
+            .all(|(snapshot, tile)| {
+                snapshot.kind == tile.kind
+                    && same_f32(snapshot.elevation, tile.elevation)
+                    && same_f32(snapshot.moisture, tile.moisture)
+                    && same_f32(snapshot.accent, tile.accent)
+                    && same_f32(snapshot.fertility_bias, tile.fertility_bias)
+                    && same_f32(snapshot.temperature_bias, tile.temperature_bias)
+                    && snapshot.palette_index == tile.palette_index
+            })
+}
+
+fn food_layer_matches(snapshot: &FoodLayerSnapshot, world: &WorldState) -> bool {
+    let food = world.food();
+    snapshot.width == food.width()
+        && snapshot.height == food.height()
+        && same_f32_slice(&snapshot.cells, food.cells())
+}
+
+fn hydrology_layer_matches(
+    snapshot: &HydrologyLayerSnapshot,
+    hydrology: &scriptbots_core::HydrologyState,
+) -> bool {
+    let tiles = hydrology.tiles();
+    let field = hydrology.field();
+    snapshot.width == hydrology.width()
+        && snapshot.height == hydrology.height()
+        && snapshot.tiles.len() == tiles.tiles().len()
+        && snapshot
+            .tiles
+            .iter()
+            .zip(tiles.tiles())
+            .all(|(snapshot, tile)| {
+                same_f32(snapshot.permeability, tile.permeability)
+                    && same_f32(snapshot.runoff_bias, tile.runoff_bias)
+                    && same_f32(snapshot.basin_rank, tile.basin_rank)
+                    && same_f32(snapshot.channel_priority, tile.channel_priority)
+                    && same_f32(snapshot.swim_cost, tile.swim_cost)
+            })
+        && snapshot.flow_directions == field.flow_directions()
+        && same_f32_slice(&snapshot.accumulation, field.accumulation())
+        && same_f32_slice(&snapshot.spill_elevation, field.spill_elevation())
+        && snapshot.basin_ids == field.basin_ids()
+        && same_f32_slice(&snapshot.water_depth, hydrology.water_depth())
+}
+
+fn same_f32(left: f32, right: f32) -> bool {
+    left.to_bits() == right.to_bits()
+}
+
+fn same_f32_slice(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| same_f32(*left, *right))
+}
+
+fn hydrology_capacity_bytes(snapshot: &HydrologyLayerSnapshot) -> usize {
+    snapshot
+        .tiles
+        .capacity()
+        .saturating_mul(size_of::<HydrologyTileSnapshot>())
+        .saturating_add(
+            snapshot
+                .flow_directions
+                .capacity()
+                .saturating_mul(size_of::<scriptbots_core::HydrologyFlowDirection>()),
+        )
+        .saturating_add(
+            snapshot
+                .accumulation
+                .capacity()
+                .saturating_mul(size_of::<f32>()),
+        )
+        .saturating_add(
+            snapshot
+                .spill_elevation
+                .capacity()
+                .saturating_mul(size_of::<f32>()),
+        )
+        .saturating_add(
+            snapshot
+                .basin_ids
+                .capacity()
+                .saturating_mul(size_of::<u32>()),
+        )
+        .saturating_add(
+            snapshot
+                .water_depth
+                .capacity()
+                .saturating_mul(size_of::<f32>()),
+        )
+}
+
+fn add_hydrology_allocation_stats(
+    snapshot: &HydrologyLayerSnapshot,
+    stats: &mut LayerRefreshStats,
+) {
+    stats.add_vector::<HydrologyTileSnapshot>(snapshot.tiles.capacity());
+    stats.add_vector::<scriptbots_core::HydrologyFlowDirection>(
+        snapshot.flow_directions.capacity(),
+    );
+    stats.add_vector::<f32>(snapshot.accumulation.capacity());
+    stats.add_vector::<f32>(snapshot.spill_elevation.capacity());
+    stats.add_vector::<u32>(snapshot.basin_ids.capacity());
+    stats.add_vector::<f32>(snapshot.water_depth.capacity());
+}
+
+fn snapshot_build_stats(
+    world: &DynamicWorldSnapshot,
+    layers: &SnapshotLayerCache,
+    refresh: LayerRefreshStats,
+) -> SnapshotBuildStats {
+    let dynamic_agent_bytes = world
+        .agents
+        .capacity()
+        .saturating_mul(size_of::<DynamicAgentSnapshot>());
+    let layer_bytes = layers.total_capacity_bytes();
+    SnapshotBuildStats {
+        dynamic_agent_count: world.agents.len(),
+        bulk_allocations: refresh
+            .bulk_allocations
+            .saturating_add(usize::from(world.agents.capacity() != 0)),
+        newly_allocated_capacity_bytes: refresh
+            .newly_allocated_capacity_bytes
+            .saturating_add(dynamic_agent_bytes),
+        reused_layer_capacity_bytes: layer_bytes
+            .saturating_sub(refresh.newly_allocated_capacity_bytes),
+        total_payload_capacity_bytes: dynamic_agent_bytes.saturating_add(layer_bytes),
+    }
+}
+
 /// Pure synchronous authority for command order and scientific time.
 ///
 /// `HostCore` owns its world and persistence-admission session by value. It
@@ -298,6 +632,8 @@ pub struct HostCore {
     persistence: PersistenceAdmissionSession,
     journal: Box<dyn JournalPort>,
     shared: Rc<RefCell<SharedHostState>>,
+    snapshots: SnapshotHub,
+    snapshot_layers: SnapshotLayerCache,
     options: HostCoreOptions,
     playback: PlaybackSnapshot,
     lifecycle: HostLifecycle,
@@ -306,6 +642,8 @@ pub struct HostCore {
     last_now: Option<ManualInstant>,
     cadence_credit: u128,
     next_snapshot: SnapshotRevision,
+    last_published_scientific: ScientificRevision,
+    latest_completed_summary: Option<TickSummary>,
     next_journal_sequence: u64,
     next_lifecycle_command_sequence: u64,
     active_command: Option<AdmittedEnvelope>,
@@ -351,14 +689,29 @@ impl HostCore {
         let playback = options.initial_playback;
         let lifecycle = HostLifecycle::Running;
         let health = HostHealth::Healthy;
-        let initial_snapshot = Arc::new(HostSnapshot {
+        let (snapshot_layers, layer_refresh) = SnapshotLayerCache::new(&world);
+        let dynamic_world = DynamicWorldSnapshot::from_world(&world);
+        let build = snapshot_build_stats(&dynamic_world, &snapshot_layers, layer_refresh);
+        let latest_completed_summary = world
+            .history()
+            .next_back()
+            .filter(|summary| summary.tick == world.tick())
+            .cloned();
+        let initial_snapshot = Arc::new(RenderSnapshot {
+            session_id,
             revision: SnapshotRevision::new(1),
             revisions,
             playback,
             lifecycle,
             health: health.clone(),
-            world: DynamicWorldSnapshot::from_world(&world),
+            command_queue_depth: 0,
+            last_applied_command: None,
+            completed_summary: latest_completed_summary.clone(),
+            layers: snapshot_layers.snapshot(),
+            build,
+            world: dynamic_world,
         });
+        let snapshots = SnapshotHub::new(initial_snapshot);
         let shared = Rc::new(RefCell::new(SharedHostState {
             session_id,
             command_capacity: options.command_capacity,
@@ -368,7 +721,7 @@ impl HostCore {
             shutdown_command_id: None,
             queue: VecDeque::with_capacity(options.command_capacity),
             statuses: HashMap::new(),
-            latest_snapshot: initial_snapshot,
+            last_applied: None,
             events: Vec::new(),
             visible_tick: world.tick(),
         }));
@@ -378,6 +731,8 @@ impl HostCore {
             persistence,
             journal,
             shared,
+            snapshots,
+            snapshot_layers,
             options,
             playback,
             lifecycle,
@@ -386,6 +741,8 @@ impl HostCore {
             last_now: None,
             cadence_credit: 0,
             next_snapshot: SnapshotRevision::new(2),
+            last_published_scientific: revisions.scientific,
+            latest_completed_summary,
             next_journal_sequence: 1,
             next_lifecycle_command_sequence: session_id.get(),
             active_command: None,
@@ -405,7 +762,16 @@ impl HostCore {
     pub fn local_port(&self) -> LocalHostPort {
         LocalHostPort {
             shared: Rc::clone(&self.shared),
+            snapshots: self.snapshots.clone(),
         }
+    }
+
+    /// Clone the thread-safe latest-value snapshot read handle.
+    ///
+    /// The returned hub owns no command sender and cannot keep native ingress alive.
+    #[must_use]
+    pub fn snapshot_hub(&self) -> SnapshotHub {
+        self.snapshots.clone()
     }
 
     /// Admit or reuse the host-owned ordered shutdown command.
@@ -458,8 +824,8 @@ impl HostCore {
 
     /// Latest immutable host publication.
     #[must_use]
-    pub fn latest_snapshot(&self) -> Arc<HostSnapshot> {
-        Arc::clone(&self.shared.borrow().latest_snapshot)
+    pub fn latest_snapshot(&self) -> Arc<RenderSnapshot> {
+        self.snapshots.latest()
     }
 
     /// Current queryable health.
@@ -859,21 +1225,40 @@ impl HostCore {
 
     fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
         let revision = self.next_snapshot;
-        self.next_snapshot = revision
+        let following_revision = revision
             .checked_next()
             .ok_or_else(|| protocol_violation("snapshot revision exhausted"))?;
-        let snapshot = Arc::new(HostSnapshot {
+        let mut layers = self.snapshot_layers.clone();
+        let refresh = layers.refresh(&self.world)?;
+        let dynamic_world = DynamicWorldSnapshot::from_world(&self.world);
+        let build = snapshot_build_stats(&dynamic_world, &layers, refresh);
+        let (command_queue_depth, last_applied_command) = {
+            let shared = self.shared.borrow();
+            (
+                shared.queue.len(),
+                shared.last_applied.map(|(_, command_id)| command_id),
+            )
+        };
+        let snapshot = Arc::new(RenderSnapshot {
+            session_id: self.session_id,
             revision,
             revisions: self.revisions,
             playback: self.playback,
             lifecycle: self.lifecycle,
             health: self.health.clone(),
-            world: DynamicWorldSnapshot::from_world(&self.world),
+            command_queue_depth,
+            last_applied_command,
+            completed_summary: self.latest_completed_summary.clone(),
+            layers: layers.snapshot(),
+            build,
+            world: dynamic_world,
         });
-        let mut shared = self.shared.borrow_mut();
-        shared.visible_tick = self.world.tick();
-        shared.latest_snapshot = snapshot;
-        shared.emit(HostEventKind::SnapshotPublished(revision))
+        self.snapshots.publish(snapshot)?;
+        self.snapshot_layers = layers;
+        self.next_snapshot = following_revision;
+        self.last_published_scientific = self.revisions.scientific;
+        self.shared.borrow_mut().visible_tick = self.world.tick();
+        Ok(())
     }
 
     fn pop_command(&self) -> Option<AdmittedEnvelope> {
@@ -1044,6 +1429,7 @@ impl HostCore {
         self.revisions.control = next_control;
         self.revisions.scientific = next_scientific;
         self.revisions.config = ConfigRevision::new(config_revision);
+        self.latest_completed_summary = Some(summary.clone());
         let tick = summary.tick;
         let completed_fault = completed_fault.as_ref().map(completed_fault_record);
         let mut scientific = ScientificBoundary::new(
@@ -1326,6 +1712,7 @@ impl HostCore {
         } = outcome;
         self.revisions.scientific = next_scientific;
         self.revisions.config = ConfigRevision::new(config_revision);
+        self.latest_completed_summary = Some(summary.clone());
         let tick = summary.tick;
         self.shared.borrow_mut().visible_tick = tick;
         let completed_fault = completed_fault.as_ref().map(completed_fault_record);
@@ -1403,7 +1790,7 @@ impl ManualHostDriver for HostCore {
         self.last_now = Some(now);
 
         let events_before = self.shared.borrow().events.len();
-        let mut changed = self.poll_journal_receipts()?;
+        self.poll_journal_receipts()?;
         let mut commands_completed = 0;
         let mut scientific_steps = 0;
         let mut automatic_steps_due = 0;
@@ -1421,7 +1808,6 @@ impl ManualHostDriver for HostCore {
                 commands_completed += usize::from(result.command_completed);
                 scientific_steps += usize::from(result.science_completed);
                 explicit_step_applied |= result.science_completed;
-                changed |= result.command_completed || result.science_completed;
                 if result.blocked {
                     break;
                 }
@@ -1444,7 +1830,6 @@ impl ManualHostDriver for HostCore {
                 if result.science_completed {
                     self.consume_automatic_credit();
                     scientific_steps += 1;
-                    changed = true;
                 }
                 if result.blocked {
                     break;
@@ -1454,9 +1839,32 @@ impl ManualHostDriver for HostCore {
             self.cadence_credit = 0;
         }
 
-        changed |= self.synchronize_health()?;
-        let snapshots_published = usize::from(changed);
-        if changed {
+        self.synchronize_health()?;
+        let latest = self.snapshots.latest();
+        let (command_queue_depth, last_applied_command) = {
+            let shared = self.shared.borrow();
+            (
+                shared.queue.len(),
+                shared.last_applied.map(|(_, command_id)| command_id),
+            )
+        };
+        let presentation_changed = latest.revisions.control != self.revisions.control
+            || latest.revisions.config != self.revisions.config
+            || latest.playback != self.playback
+            || latest.lifecycle != self.lifecycle
+            || latest.health != self.health
+            || latest.command_queue_depth != command_queue_depth
+            || latest.last_applied_command != last_applied_command;
+        let scientific_since_publication = self
+            .revisions
+            .scientific
+            .get()
+            .saturating_sub(self.last_published_scientific.get());
+        let science_cadence_due = scientific_steps != 0
+            && scientific_since_publication >= self.options.snapshot_interval_ticks;
+        let should_publish = presentation_changed || science_cadence_due;
+        let snapshots_published = usize::from(should_publish);
+        if should_publish {
             self.publish_snapshot()?;
         }
         let events_published = self.shared.borrow().events.len() - events_before;
@@ -1535,6 +1943,11 @@ fn validate_options(options: HostCoreOptions) -> Result<(), HostCoreBuildError> 
             message: "max_automatic_steps_per_drive must be nonzero".to_owned(),
         });
     }
+    if options.snapshot_interval_ticks == 0 {
+        return Err(HostCoreBuildError::InvalidOptions {
+            message: "snapshot_interval_ticks must be nonzero".to_owned(),
+        });
+    }
     if !options.initial_playback.speed_multiplier.is_finite()
         || options.initial_playback.speed_multiplier < 0.0
     {
@@ -1580,7 +1993,12 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::ScriptBotsConfig;
+    use scriptbots_core::{
+        AgentData, Generation, HydrologyField, HydrologyFlowDirection, HydrologyTile,
+        HydrologyTileLayer, MapArtifact, MapArtifactMetadata, MapGeneratorKind, Position,
+        ScriptBotsConfig, TerrainLayer, Velocity,
+    };
+    use std::{hint::black_box, time::Instant};
 
     fn world(persistence_interval: u32) -> WorldState {
         WorldState::new(ScriptBotsConfig {
@@ -1589,6 +2007,107 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("deterministic test world")
+    }
+
+    fn snapshot_map_artifacts(world: &WorldState) -> (MapArtifact, MapArtifact, MapArtifact) {
+        let base_terrain = world.terrain().clone();
+        let width = base_terrain.width();
+        let height = base_terrain.height();
+        let cell_size = base_terrain.cell_size();
+        let cell_count = base_terrain.tiles().len();
+        let mut changed_tiles = base_terrain.tiles().to_vec();
+        let first = changed_tiles
+            .first_mut()
+            .expect("snapshot map has at least one terrain tile");
+        first.accent = if first.accent.to_bits() == 0.25_f32.to_bits() {
+            0.75
+        } else {
+            0.25
+        };
+        let changed_terrain = TerrainLayer::from_tiles(width, height, cell_size, changed_tiles)
+            .expect("changed snapshot terrain");
+
+        let artifact = |terrain: TerrainLayer, changed: bool| {
+            let mut hydrology_tiles = vec![
+                HydrologyTile {
+                    permeability: 0.4,
+                    runoff_bias: 0.2,
+                    basin_rank: 0.5,
+                    channel_priority: 0.3,
+                    swim_cost: 0.6,
+                };
+                cell_count
+            ];
+            let mut water_depth = vec![0.0; cell_count];
+            if changed {
+                hydrology_tiles[0].permeability = 0.8;
+                water_depth[0] = 0.125;
+            }
+            MapArtifact::new(
+                terrain,
+                None,
+                None,
+                Some(
+                    HydrologyTileLayer::new(width, height, hydrology_tiles)
+                        .expect("snapshot hydrology tiles"),
+                ),
+                Some(
+                    HydrologyField::new(
+                        width,
+                        height,
+                        vec![HydrologyFlowDirection::None; cell_count],
+                        vec![1.0; cell_count],
+                        vec![0.5; cell_count],
+                        vec![0; cell_count],
+                        water_depth,
+                    )
+                    .expect("snapshot hydrology field"),
+                ),
+                MapArtifactMetadata {
+                    generator: MapGeneratorKind::RuleBased,
+                    tileset_id: if changed {
+                        "snapshot-layer-b"
+                    } else {
+                        "snapshot-layer-a"
+                    }
+                    .to_owned(),
+                    tileset_hash: u64::from(changed),
+                    seed: 0x5a4f_4d41 + u64::from(changed),
+                    width,
+                    height,
+                    attempt_count: 1,
+                    succeeded_on: 1,
+                    generated_at_epoch_ms: 0,
+                },
+            )
+            .expect("snapshot map artifact")
+        };
+
+        let without_hydrology = MapArtifact::new(
+            changed_terrain.clone(),
+            None,
+            None,
+            None,
+            None,
+            MapArtifactMetadata {
+                generator: MapGeneratorKind::RuleBased,
+                tileset_id: "snapshot-layer-no-hydrology".to_owned(),
+                tileset_hash: 2,
+                seed: 0x5a4f_4d43,
+                width,
+                height,
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )
+        .expect("snapshot map without hydrology");
+
+        (
+            artifact(base_terrain, false),
+            artifact(changed_terrain, true),
+            without_hydrology,
+        )
     }
 
     fn options(paused: bool) -> HostCoreOptions {
@@ -1600,6 +2119,7 @@ mod tests {
             command_capacity: 32,
             tick_period_nanos: 10,
             max_automatic_steps_per_drive: 4,
+            snapshot_interval_ticks: 1,
         }
     }
 
@@ -1646,6 +2166,620 @@ mod tests {
                 .expect("first manual boundary");
             assert_eq!(receipt.scientific_steps, 0);
             assert_eq!(core.world_tick(), Tick(0));
+        }
+    }
+
+    #[test]
+    fn snapshot_hub_keeps_independent_latest_only_cursors_without_a_backlog() {
+        let (mut core, mut port) = host(true);
+        let hub = core.snapshot_hub();
+        let mut fast_a = hub.subscribe();
+        let mut fast_b = hub.subscribe();
+        let mut stalled = hub.subscribe();
+        let mut dropped = hub.subscribe();
+
+        let initial_a = hub
+            .poll_latest(&mut fast_a)
+            .expect("first fast poll")
+            .expect("initial publication");
+        let initial_b = hub
+            .poll_latest(&mut fast_b)
+            .expect("second fast poll")
+            .expect("same initial publication");
+        let stalled_initial = hub
+            .poll_latest(&mut stalled)
+            .expect("stalled initial poll")
+            .expect("stalled cursor starts current");
+        let dropped_initial = hub
+            .poll_latest(&mut dropped)
+            .expect("dropped initial poll")
+            .expect("dropped cursor starts current");
+        assert!(Arc::ptr_eq(&initial_a, &initial_b));
+        assert!(Arc::ptr_eq(&initial_a, &stalled_initial));
+        let initial_weak = Arc::downgrade(&initial_a);
+        drop(initial_a);
+        drop(initial_b);
+        drop(stalled_initial);
+        drop(dropped_initial);
+        drop(dropped);
+
+        let mut newest = SnapshotRevision::new(1);
+        for sequence in 1_u128..=3 {
+            submit(&mut port, sequence, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(
+                u64::try_from(sequence).expect("small test sequence"),
+            ))
+            .expect("explicit step publication");
+            let snapshot_a = hub
+                .poll_latest(&mut fast_a)
+                .expect("fast A poll")
+                .expect("fast A sees every publication");
+            let snapshot_b = hub
+                .poll_latest(&mut fast_b)
+                .expect("fast B poll")
+                .expect("fast B sees every publication");
+            assert!(Arc::ptr_eq(&snapshot_a, &snapshot_b));
+            newest = snapshot_a.revision;
+        }
+
+        assert!(
+            initial_weak.upgrade().is_none(),
+            "a scalar stalled cursor must not retain an obsolete snapshot Arc"
+        );
+        let stalled_latest = hub
+            .poll_latest(&mut stalled)
+            .expect("stalled latest poll")
+            .expect("stalled cursor jumps to newest");
+        assert_eq!(stalled_latest.revision, newest);
+        assert_eq!(stalled.skipped_revisions(), 2);
+        assert!(hub
+            .poll_latest(&mut stalled)
+            .expect("idempotent stalled repoll")
+            .is_none());
+
+        let mut reconnecting = hub.resume_after(SnapshotRevision::new(2));
+        let reconnected = hub
+            .poll_latest(&mut reconnecting)
+            .expect("reconnected poll")
+            .expect("reconnected cursor receives newest");
+        assert_eq!(reconnected.revision, newest);
+        assert_eq!(reconnecting.skipped_revisions(), 1);
+    }
+
+    #[test]
+    fn snapshots_publish_exact_completed_summary_without_persistence_cadence() {
+        let mut core = HostCore::new(
+            HostSessionId::new(71),
+            world(3),
+            options(true),
+        )
+        .expect("host with sparse persistence cadence");
+        let mut port = core.local_port();
+        assert!(core.latest_snapshot().completed_summary.is_none());
+
+        for tick in 1_u128..=2 {
+            submit(&mut port, tick, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(
+                u64::try_from(tick).expect("small tick"),
+            ))
+            .expect("completed explicit step");
+            let snapshot = core.latest_snapshot();
+            let summary = snapshot
+                .completed_summary
+                .as_ref()
+                .expect("completed summary is retained independently of persistence");
+            let expected = core
+                .world
+                .history()
+                .next_back()
+                .expect("current summary remains in history");
+            assert_eq!(summary, expected);
+            assert_eq!(summary.tick, Tick(u64::try_from(tick).expect("small tick")));
+            assert_eq!(snapshot.world.tick, summary.tick.0);
+            assert_eq!(snapshot.world.summary.agent_count, summary.agent_count);
+            assert_eq!(snapshot.world.summary.births, summary.births);
+            assert_eq!(snapshot.world.summary.deaths, summary.deaths);
+        }
+    }
+
+    #[test]
+    fn construction_preserves_an_existing_current_tick_summary_exactly() {
+        let mut prestepped = world(0);
+        prestepped.step().expect("pre-host scientific tick");
+        let expected = prestepped
+            .history()
+            .next_back()
+            .expect("pre-host summary")
+            .clone();
+
+        let core = HostCore::new(HostSessionId::new(76), prestepped, options(true))
+            .expect("host from prestepped world");
+        let initial = core.latest_snapshot();
+        assert_eq!(initial.world.tick, expected.tick.0);
+        assert_eq!(initial.completed_summary.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn layer_arcs_and_revisions_change_together_on_exact_content_bits() {
+        let mut config = ScriptBotsConfig {
+            rng_seed: Some(0x51a7_1c5),
+            initial_food: 0.5,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let world = WorldState::new(config.clone()).expect("layer test world");
+        let (base_map, changed_map, map_without_hydrology) = snapshot_map_artifacts(&world);
+        let mut core = HostCore::new(HostSessionId::new(72), world, options(true))
+            .expect("layer test host");
+        let mut port = core.local_port();
+        let initial = core.latest_snapshot();
+        assert!(initial.layers.hydrology.is_none());
+        assert_eq!(initial.layers.revisions.hydrology, LayerRevision::new(0));
+
+        submit(&mut port, 1, HostCommand::Pause);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("control-only publication");
+        let control_only = core.latest_snapshot();
+        assert!(Arc::ptr_eq(
+            &initial.layers.terrain,
+            &control_only.layers.terrain
+        ));
+        assert!(Arc::ptr_eq(&initial.layers.food, &control_only.layers.food));
+        assert_eq!(initial.layers.revisions, control_only.layers.revisions);
+        assert_eq!(control_only.build.bulk_allocations, 0);
+
+        core.world
+            .apply_map_artifact(&base_map)
+            .expect("install initial hydrology");
+        core.publish_snapshot()
+            .expect("hydrology-add publication");
+        let hydrology_added = core.latest_snapshot();
+        assert!(Arc::ptr_eq(
+            &control_only.layers.terrain,
+            &hydrology_added.layers.terrain
+        ));
+        assert!(Arc::ptr_eq(
+            &control_only.layers.food,
+            &hydrology_added.layers.food
+        ));
+        assert_eq!(
+            hydrology_added.layers.revisions.terrain,
+            control_only.layers.revisions.terrain
+        );
+        assert_eq!(
+            hydrology_added.layers.revisions.food,
+            control_only.layers.revisions.food
+        );
+        assert_eq!(
+            hydrology_added.layers.revisions.hydrology,
+            control_only
+                .layers
+                .revisions
+                .hydrology
+                .checked_next()
+                .expect("hydrology-add revision headroom")
+        );
+        let initial_hydrology = hydrology_added
+            .layers
+            .hydrology
+            .as_ref()
+            .expect("hydrology payload added");
+
+        config.food_max = 0.25;
+        config.initial_food = 0.25;
+        config.food_respawn_amount = 0.25;
+        submit(
+            &mut port,
+            2,
+            HostCommand::UpdateConfig(Box::new(config)),
+        );
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("food-changing configuration publication");
+        let food_changed = core.latest_snapshot();
+        assert!(Arc::ptr_eq(
+            &hydrology_added.layers.terrain,
+            &food_changed.layers.terrain
+        ));
+        assert_eq!(
+            hydrology_added.layers.revisions.terrain,
+            food_changed.layers.revisions.terrain
+        );
+        assert!(!Arc::ptr_eq(
+            &hydrology_added.layers.food,
+            &food_changed.layers.food
+        ));
+        assert!(Arc::ptr_eq(
+            initial_hydrology,
+            food_changed
+                .layers
+                .hydrology
+                .as_ref()
+                .expect("food-only change retains hydrology")
+        ));
+        assert_eq!(
+            food_changed.layers.revisions.food,
+            hydrology_added
+                .layers
+                .revisions
+                .food
+                .checked_next()
+                .expect("food revision headroom")
+        );
+        assert_eq!(food_changed.build.bulk_allocations, 1);
+        assert!(food_changed.build.newly_allocated_capacity_bytes > 0);
+        assert!(food_changed.build.reused_layer_capacity_bytes > 0);
+        assert!(!same_f32_slice(&[0.0], &[-0.0]));
+
+        core.world
+            .apply_map_artifact(&changed_map)
+            .expect("change terrain and hydrology");
+        core.publish_snapshot()
+            .expect("terrain and hydrology publication");
+        let terrain_and_hydrology_changed = core.latest_snapshot();
+        assert!(!Arc::ptr_eq(
+            &food_changed.layers.terrain,
+            &terrain_and_hydrology_changed.layers.terrain
+        ));
+        assert!(Arc::ptr_eq(
+            &food_changed.layers.food,
+            &terrain_and_hydrology_changed.layers.food
+        ));
+        assert!(!Arc::ptr_eq(
+            food_changed
+                .layers
+                .hydrology
+                .as_ref()
+                .expect("old hydrology"),
+            terrain_and_hydrology_changed
+                .layers
+                .hydrology
+                .as_ref()
+                .expect("changed hydrology")
+        ));
+        let changed_hydrology = terrain_and_hydrology_changed
+            .layers
+            .hydrology
+            .as_ref()
+            .expect("changed hydrology payload");
+        assert_eq!(
+            changed_hydrology.tiles[0].permeability.to_bits(),
+            0.8_f32.to_bits()
+        );
+        assert_eq!(
+            changed_hydrology.water_depth[0].to_bits(),
+            0.125_f32.to_bits()
+        );
+        assert_eq!(
+            terrain_and_hydrology_changed.layers.revisions.terrain,
+            food_changed
+                .layers
+                .revisions
+                .terrain
+                .checked_next()
+                .expect("terrain revision headroom")
+        );
+        assert_eq!(
+            terrain_and_hydrology_changed.layers.revisions.hydrology,
+            food_changed
+                .layers
+                .revisions
+                .hydrology
+                .checked_next()
+                .expect("hydrology revision headroom")
+        );
+
+        core.world
+            .apply_map_artifact(&map_without_hydrology)
+            .expect("remove hydrology");
+        core.publish_snapshot()
+            .expect("hydrology-removal publication");
+        let hydrology_removed = core.latest_snapshot();
+        assert!(Arc::ptr_eq(
+            &terrain_and_hydrology_changed.layers.terrain,
+            &hydrology_removed.layers.terrain
+        ));
+        assert!(Arc::ptr_eq(
+            &terrain_and_hydrology_changed.layers.food,
+            &hydrology_removed.layers.food
+        ));
+        assert!(hydrology_removed.layers.hydrology.is_none());
+        assert_eq!(
+            hydrology_removed.layers.revisions.hydrology,
+            terrain_and_hydrology_changed
+                .layers
+                .revisions
+                .hydrology
+                .checked_next()
+                .expect("hydrology-removal revision headroom")
+        );
+
+        let encoded =
+            serde_json::to_vec(hydrology_removed.as_ref()).expect("snapshot serialization");
+        let decoded: RenderSnapshot =
+            serde_json::from_slice(&encoded).expect("snapshot deserialization");
+        assert_eq!(decoded, *hydrology_removed);
+    }
+
+    #[test]
+    fn snapshot_stride_and_subscriber_load_cannot_change_science() {
+        let config = ScriptBotsConfig {
+            rng_seed: Some(0x5a4f_5707),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut every_options = options(false);
+        every_options.snapshot_interval_ticks = 1;
+        let mut sparse_options = every_options;
+        sparse_options.snapshot_interval_ticks = 3;
+        let mut every = HostCore::new(
+            HostSessionId::new(73),
+            WorldState::new(config.clone()).expect("every world"),
+            every_options,
+        )
+        .expect("every host");
+        let mut sparse = HostCore::new(
+            HostSessionId::new(74),
+            WorldState::new(config).expect("sparse world"),
+            sparse_options,
+        )
+        .expect("sparse host");
+        let busy_hub = every.snapshot_hub();
+        let mut readers = (0..128)
+            .map(|_| busy_hub.subscribe())
+            .collect::<Vec<_>>();
+        for reader in &mut readers {
+            assert!(busy_hub
+                .poll_latest(reader)
+                .expect("initial busy-reader poll")
+                .is_some());
+        }
+
+        every
+            .drive(ManualInstant::from_nanos(0))
+            .expect("every epoch");
+        sparse
+            .drive(ManualInstant::from_nanos(0))
+            .expect("sparse epoch");
+        let mut every_publications = 0usize;
+        let mut sparse_publications = 0usize;
+        for tick in 1_u64..=6 {
+            every_publications += every
+                .drive(ManualInstant::from_nanos(tick * 10))
+                .expect("every cadence drive")
+                .snapshots_published;
+            for reader in &mut readers {
+                let _ = busy_hub
+                    .poll_latest(reader)
+                    .expect("busy-reader latest poll");
+            }
+            sparse_publications += sparse
+                .drive(ManualInstant::from_nanos(tick * 10))
+                .expect("sparse cadence drive")
+                .snapshots_published;
+            assert_eq!(every.world_tick(), sparse.world_tick());
+            assert_eq!(
+                every
+                    .scientific_digest_v1()
+                    .expect("every digest"),
+                sparse
+                    .scientific_digest_v1()
+                    .expect("sparse digest")
+            );
+        }
+        assert_eq!(every.world_tick(), Tick(6));
+        assert_eq!(every_publications, 6);
+        assert_eq!(sparse_publications, 2);
+    }
+
+    fn snapshot_measurement_config() -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            world_width: 800,
+            world_height: 800,
+            food_cell_size: 20,
+            rng_seed: Some(0x5eed_ba5e),
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            population_crossover_chance: 0.0,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_floor: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            aging_health_decay_max: 0.0,
+            aging_energy_penalty_rate: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            food_max: 2.0,
+            food_growth_rate: 0.02,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.1,
+            food_waste_rate: 0.0,
+            history_capacity: 1,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn snapshot_measurement_world(agent_count: usize) -> WorldState {
+        let mut world = WorldState::new(snapshot_measurement_config())
+            .expect("snapshot measurement world");
+        for ordinal in 0..agent_count {
+            let x = (ordinal % 800) as f32;
+            let y = ((ordinal * 37) % 800) as f32;
+            world
+                .try_spawn_agent(AgentData::new(
+                    Position::new(x, y),
+                    Velocity::default(),
+                    0.0,
+                    1.0,
+                    [0.5, 0.5, 0.5],
+                    0.0,
+                    false,
+                    0,
+                    Generation(0),
+                ))
+                .unwrap_or_else(|error| panic!("snapshot agent {ordinal} failed: {error}"));
+        }
+        world
+    }
+
+    fn measured_snapshot_publication(core: &mut HostCore) -> (u64, SnapshotBuildStats) {
+        let started = Instant::now();
+        core.publish_snapshot()
+            .expect("measured full snapshot publication");
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let snapshot = core.latest_snapshot();
+        black_box(&snapshot);
+        (elapsed, snapshot.build)
+    }
+
+    fn nearest_rank(samples: &[u64], percentile: usize) -> u64 {
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        let rank = ordered
+            .len()
+            .saturating_mul(percentile)
+            .div_ceil(100)
+            .saturating_sub(1)
+            .min(ordered.len().saturating_sub(1));
+        ordered[rank]
+    }
+
+    #[test]
+    #[ignore = "DSR-only reference-hardware snapshot measurement"]
+    fn measure_snapshot_builds_at_1k_and_10k_agents() {
+        const WARMUPS: usize = 20;
+        const SAMPLES: usize = 200;
+        for agent_count in [1_000, 10_000] {
+            let mut world = snapshot_measurement_world(agent_count);
+            let (base_map, changed_map, _) = snapshot_map_artifacts(&world);
+            world
+                .apply_map_artifact(&base_map)
+                .expect("install measured base map");
+            let scenario_config = world.config().clone();
+            let session_id = HostSessionId::new(
+                u64::try_from(agent_count).expect("measured agent count fits session id"),
+            );
+            let mut core = HostCore::new(session_id, world, options(true))
+                .expect("snapshot measurement host");
+            let initial_stats = core.latest_snapshot().build;
+            assert_eq!(initial_stats.dynamic_agent_count, agent_count);
+            let initial_digest = core
+                .scientific_digest_v1()
+                .expect("initial measurement digest");
+
+            for _ in 0..WARMUPS {
+                black_box(measured_snapshot_publication(&mut core));
+            }
+
+            let mut steady_samples = Vec::with_capacity(SAMPLES);
+            let mut steady_stats = SnapshotBuildStats::default();
+            for _ in 0..SAMPLES {
+                let (elapsed, stats) = measured_snapshot_publication(&mut core);
+                steady_stats = stats;
+                steady_samples.push(elapsed);
+            }
+            assert_eq!(steady_stats.dynamic_agent_count, agent_count);
+            assert_eq!(steady_stats.bulk_allocations, 1);
+            assert_eq!(
+                core.scientific_digest_v1()
+                    .expect("post-steady measurement digest"),
+                initial_digest,
+                "steady snapshot publication must not alter science"
+            );
+
+            for sample in 0..WARMUPS {
+                let map = if sample.is_multiple_of(2) {
+                    &changed_map
+                } else {
+                    &base_map
+                };
+                core.world
+                    .apply_map_artifact(map)
+                    .expect("changed-layer warmup map");
+                black_box(measured_snapshot_publication(&mut core));
+            }
+            let mut changed_layer_samples = Vec::with_capacity(SAMPLES);
+            let mut changed_layer_stats = SnapshotBuildStats::default();
+            for sample in 0..SAMPLES {
+                let map = if sample.is_multiple_of(2) {
+                    &changed_map
+                } else {
+                    &base_map
+                };
+                core.world
+                    .apply_map_artifact(map)
+                    .expect("changed-layer measurement map");
+                let (elapsed, stats) = measured_snapshot_publication(&mut core);
+                changed_layer_stats = stats;
+                changed_layer_samples.push(elapsed);
+            }
+            assert_eq!(changed_layer_stats.dynamic_agent_count, agent_count);
+            assert!(changed_layer_stats.bulk_allocations > steady_stats.bulk_allocations);
+
+            core.world
+                .apply_map_artifact(&changed_map)
+                .expect("publication-invariance probe map");
+            let digest_before_probe = core
+                .scientific_digest_v1()
+                .expect("pre-publication probe digest");
+            black_box(measured_snapshot_publication(&mut core));
+            let digest_after_probe = core
+                .scientific_digest_v1()
+                .expect("post-publication probe digest");
+            assert_eq!(digest_before_probe, digest_after_probe);
+
+            let steady_p50_ns = nearest_rank(&steady_samples, 50);
+            let steady_p95_ns = nearest_rank(&steady_samples, 95);
+            let changed_layer_p50_ns = nearest_rank(&changed_layer_samples, 50);
+            let changed_layer_p95_ns = nearest_rank(&changed_layer_samples, 95);
+            let budget_p95_ns = if agent_count == 1_000 {
+                4_000_000
+            } else {
+                16_000_000
+            };
+            let evidence = serde_json::json!({
+                "schema": "scriptbots.render_snapshot.measurement.v1",
+                "scenario_contract": "standard-800x800-food20-seed-0x5eedba5e",
+                "agent_count": agent_count,
+                "warmups_per_case": WARMUPS,
+                "samples_per_case": SAMPLES,
+                "config": scenario_config,
+                "initial_scientific_digest": initial_digest.overall,
+                "changed_layer_scientific_digest": digest_after_probe.overall,
+                "budget_p95_ns": budget_p95_ns,
+                "steady": {
+                    "raw_ns": steady_samples,
+                    "p50_ns": steady_p50_ns,
+                    "p95_ns": steady_p95_ns,
+                    "bulk_vector_capacity_stats": steady_stats,
+                },
+                "changed_layer": {
+                    "raw_ns": changed_layer_samples,
+                    "p50_ns": changed_layer_p50_ns,
+                    "p95_ns": changed_layer_p95_ns,
+                    "bulk_vector_capacity_stats": changed_layer_stats,
+                },
+                "initial_bulk_vector_capacity_stats": initial_stats,
+            });
+            eprintln!(
+                "{}",
+                serde_json::to_string(&evidence).expect("serialize snapshot measurement evidence")
+            );
+            assert!(
+                steady_p95_ns < budget_p95_ns,
+                "steady snapshot p95 {steady_p95_ns}ns exceeded {budget_p95_ns}ns"
+            );
+            assert!(
+                changed_layer_p95_ns < budget_p95_ns,
+                "changed-layer snapshot p95 {changed_layer_p95_ns}ns exceeded {budget_p95_ns}ns"
+            );
         }
     }
 
@@ -1920,6 +3054,48 @@ mod tests {
             let count = limit.min(state.receipts.len());
             state.receipts.drain(..count).collect()
         }
+    }
+
+    #[test]
+    fn delayed_old_journal_receipt_cannot_rewind_last_applied_command() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState {
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(75),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("host with delayed receipts");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        submit(&mut port, 2, HostCommand::Pause);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("step then newer control application");
+        assert_eq!(
+            core.latest_snapshot().last_applied_command,
+            Some(CommandId::new(2))
+        );
+
+        let old_batch = journal_state.borrow().attempts[0].id();
+        journal_state
+            .borrow_mut()
+            .receipts
+            .push_back(JournalReceipt::new(
+                old_batch,
+                JournalReceiptState::Durable,
+            ));
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("delayed old receipt");
+        core.publish_snapshot().expect("diagnostic republish");
+        assert_eq!(
+            core.latest_snapshot().last_applied_command,
+            Some(CommandId::new(2))
+        );
     }
 
     #[test]
