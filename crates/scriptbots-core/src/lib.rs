@@ -2055,7 +2055,7 @@ impl BrainInspectionResponse {
     pub fn ready_for(&self, target: AgentUid) -> Option<&SelectedBrainTelemetry> {
         self.telemetry.iter().find_map(|outcome| match outcome {
             SelectedBrainTelemetryOutcome::Ready { telemetry } if telemetry.agent_uid == target => {
-                Some(telemetry)
+                Some(telemetry.as_ref())
             }
             _ => None,
         })
