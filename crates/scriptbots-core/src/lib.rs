@@ -1270,7 +1270,7 @@ pub trait BrainRunner: Send + Sync {
     /// SAME v0 digest, as long as the families and bindings match. The oracle that decides whether
     /// two runs are the same run is blind to the only thing that is actually evolving.
     ///
-    /// That limitation is declared rather than hidden (`RunManifestV1`'s
+    /// That limitation is declared rather than hidden (`RunManifestV2`'s
     /// `CharacterizationLimitationsV0::evaluator_state_covered = false`, `superseded_by:
     /// WorldDigestV1`), and this method is how `WorldDigestV1` closes it.
     ///
@@ -16302,7 +16302,7 @@ impl WorldState {
     /// The world's science-state oracle, version one.
     ///
     /// `CharacterizationDigestV0` has three limitations, and it DECLARES all three rather than
-    /// hiding them (`RunManifestV1` carries them in `CharacterizationLimitationsV0`, whose
+    /// hiding them (`RunManifestV2` carries them in `CharacterizationLimitationsV0`, whose
     /// `superseded_by` field names this very method). V1 closes them:
     ///
     /// 1. **v0 is blind to the brains.** It encodes a brain's registry key, family name and

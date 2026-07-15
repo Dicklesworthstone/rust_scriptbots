@@ -1898,7 +1898,7 @@ Writer errors, queue bounds, flush, and cancellation belong to the runtime/stora
 
 #### 1.4 scenario/startup construction
 
-- minimal scenario schema on `RunManifestV1`;
+- minimal scenario schema on `RunManifestV2`;
 - full-world seeding;
 - remove hidden 120 ticks;
 - preserve current ecology parameters until honest brains/RNG/digests exist;
@@ -1917,7 +1917,7 @@ Writer errors, queue bounds, flush, and cancellation belong to the runtime/stora
 Completion evidence:
 
 - `AgentUid` plus deterministic spawn/birth ordinals now cross snapshots, lineage, replay,
-  telemetry, lifecycle records, FrankenSQLite rows, analytics, and the V1 run manifest without
+  telemetry, lifecycle records, FrankenSQLite rows, analytics, and the V2 run manifest without
   replacing `AgentId` as the live arena handle;
 - the object-safe `RandomStream` boundary wraps the exact `rand 0.9.5` `SmallRng` behavior with a
   bounded/versioned opaque state envelope, fixed codec golden, differential sampling proof, and

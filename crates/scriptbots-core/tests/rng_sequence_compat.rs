@@ -83,7 +83,7 @@ fn the_random_stream_produces_its_pinned_sequence() {
 
 #[test]
 fn the_algorithm_identity_is_stable() {
-    // The manifest records this string (`RunManifestV1::random_stream.algorithm`) and the
+    // The manifest records this string (`RunManifestV2::random_stream.algorithm`) and the
     // restore path REFUSES a state whose algorithm id does not match. If the id drifted
     // silently, an old checkpoint would either be rejected for the wrong reason or — far
     // worse — be accepted by a generator that no longer produces the same numbers.

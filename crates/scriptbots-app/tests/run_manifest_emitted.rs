@@ -1,15 +1,22 @@
 //! A real run must leave a provenance record behind.
 //!
-//! `RunManifestV1` was well-built and thoroughly tested and was NEVER WRITTEN by
+//! The former V1 run manifest was well-built and thoroughly tested and was NEVER WRITTEN by
 //! the binary a user actually runs. Every claim about provenanced, reproducible
 //! runs was therefore true of the library and false of the product: a user could
 //! not tell which build, which seed, or which config produced a run directory.
 //!
-//! This test is the difference. It runs the real binary and looks on disk.
+//! The current contract is stronger: a base `RunManifestV2` is registered in the
+//! run database before tick zero, and the adjacent V2.1 sidecar supplements that
+//! durable record with post-bootstrap evidence. These tests drive the real binary
+//! and inspect both records on disk.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use scriptbots_app::{RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA, RUN_MANIFEST_V2_SCHEMA, RunManifestV2};
+use scriptbots_runtime::RunId;
+use scriptbots_storage::StorageReader;
 
 fn run_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -208,9 +215,10 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         "the manifest records a different seed than the run actually used"
     );
     assert_eq!(
-        manifest["schema"], "scriptbots.run-manifest.v1.1",
-        "bootstrap evidence must move the manifest onto its compatible minor schema"
+        manifest["schema"], RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA,
+        "bootstrap evidence must move the V2 manifest onto its compatible V2.1 schema"
     );
+    assert_eq!(manifest["schema_version"], 2);
     let bootstrap = &manifest["bootstrap_evidence"];
     assert_eq!(bootstrap["requested"], 2);
     assert_eq!(bootstrap["completed"], 2);
@@ -223,6 +231,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     for field in [
         "schema",
         "schema_version",
+        "identity",
         "config_digest",
         "normalized_config",
         "build",
@@ -233,6 +242,147 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
             "the manifest is missing `{field}`, so it cannot answer what produced this run"
         );
     }
+
+    let sidecar: RunManifestV2 = serde_json::from_value(manifest.clone())
+        .expect("the supplemental sidecar must satisfy the typed V2 manifest contract");
+    let run_id_text = manifest["identity"]["run_id"]
+        .as_str()
+        .expect("the run identity must encode its durable RunId as text");
+    let parsed_run_id: RunId = run_id_text
+        .parse()
+        .expect("the run identity must use the canonical RunId wire format");
+    assert_eq!(parsed_run_id, sidecar.identity.run_id);
+    assert_ne!(
+        parsed_run_id.get(),
+        0,
+        "a real run must not use the zero RunId sentinel"
+    );
+    assert!(
+        sidecar.identity.started_at_unix_ms > 0,
+        "the run identity must record a real launch boundary"
+    );
+    assert_ne!(
+        sidecar.identity.requested_tick_budget.is_some(),
+        sidecar.identity.live_run_policy.is_some(),
+        "the run identity must carry exactly one finite or live execution boundary"
+    );
+    assert_eq!(sidecar.identity.requested_tick_budget, None);
+    assert_eq!(
+        sidecar.identity.live_run_policy.as_deref(),
+        Some("operator-controlled-until-stop-v1"),
+        "the terminal application is a live run whose stop policy must be explicit"
+    );
+
+    let build = manifest["build"]
+        .as_object()
+        .expect("build provenance must be a structured record");
+    for field in [
+        "source_revision",
+        "source_tree_clean",
+        "source_status_digest",
+        "source_diff_digest",
+        "declared_toolchain",
+        "compiler_toolchain",
+        "rustc_vv",
+        "toolchain_file_digest",
+        "lockfile_digest",
+        "provenance_complete",
+    ] {
+        assert!(
+            build.contains_key(field),
+            "build provenance must represent `{field}` explicitly, using null when it is unknown"
+        );
+    }
+    assert!(
+        build["declared_toolchain"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "the tracked Rust toolchain declaration must not be blank"
+    );
+    assert!(
+        build["toolchain_file_digest"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "the tracked toolchain file must be content-addressed"
+    );
+    assert!(
+        build["lockfile_digest"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "the Cargo lockfile must be content-addressed"
+    );
+    let provenance_is_complete = build["source_revision"]
+        .as_str()
+        .is_some_and(|value| !value.trim().is_empty())
+        && build["source_tree_clean"] == true
+        && build["source_status_digest"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        && build["source_diff_digest"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        && build["rustc_vv"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty());
+    assert_eq!(
+        build["provenance_complete"], provenance_is_complete,
+        "the completeness flag must report the captured source/toolchain evidence honestly"
+    );
+    assert_eq!(
+        sidecar.reproducible, provenance_is_complete,
+        "the run must not claim reproducibility when source or compiler identity is unknown"
+    );
+
+    // The sidecar is supplemental. The authoritative run row must already contain the same
+    // identity and launch provenance, but remain at base V2 because it was registered before any
+    // bootstrap transition executed.
+    let database_path = dir.join("run.sqlite");
+    let database_path = database_path
+        .to_str()
+        .expect("the temporary database path must be valid Unicode");
+    let reader = StorageReader::open(database_path)
+        .expect("the completed run database must be queryable read-only");
+    assert_eq!(reader.run_id(), parsed_run_id);
+    let durable = reader
+        .run_manifest()
+        .expect("the run database must contain its validated durable manifest");
+    assert_eq!(durable.run_id, parsed_run_id);
+    assert_eq!(durable.manifest_schema_version, 2);
+    assert_eq!(durable.root_seed, sidecar.root_seed);
+    assert_eq!(durable.config_digest, sidecar.config_digest);
+    assert_eq!(
+        durable.requested_tick_budget,
+        sidecar.identity.requested_tick_budget
+    );
+    assert_eq!(durable.live_run_policy, sidecar.identity.live_run_policy);
+    assert_eq!(durable.source_revision, sidecar.build.source_revision);
+    assert_eq!(
+        durable.source_tree_dirty,
+        sidecar.build.source_tree_clean.map(|clean| !clean)
+    );
+    assert_eq!(
+        durable.rust_toolchain,
+        sidecar
+            .build
+            .compiler_toolchain
+            .clone()
+            .unwrap_or_else(|| sidecar.build.declared_toolchain.clone())
+    );
+    assert_eq!(durable.cargo_lock_digest, sidecar.build.lockfile_digest);
+
+    let pre_tick: RunManifestV2 = serde_json::from_str(&durable.manifest_json)
+        .expect("the durable launch manifest must retain its typed V2 representation");
+    assert_eq!(pre_tick.schema, RUN_MANIFEST_V2_SCHEMA);
+    assert_eq!(pre_tick.schema_version, 2);
+    assert_eq!(pre_tick.identity, sidecar.identity);
+    assert_eq!(pre_tick.root_seed, sidecar.root_seed);
+    assert_eq!(pre_tick.normalized_config, sidecar.normalized_config);
+    assert_eq!(pre_tick.build, sidecar.build);
+    assert!(
+        pre_tick.bootstrap_evidence.is_none(),
+        "the database manifest must prove registration before bootstrap, not rewrite history afterward"
+    );
+    drop(reader);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

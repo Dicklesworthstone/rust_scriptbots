@@ -123,6 +123,84 @@ macro_rules! monotonic_newtype {
     };
 }
 
+fn parse_fixed_lower_hex_u128(encoded: &str) -> Option<u128> {
+    if encoded.len() != 32
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    u128::from_str_radix(encoded, 16).ok()
+}
+
+/// Stable namespace for one durable simulation run.
+///
+/// Every run-scoped scientific and provenance record uses this identifier as
+/// its outer database key. The canonical text and serialization form is
+/// exactly 32 lowercase hexadecimal characters, including leading zeroes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunId(u128);
+
+impl RunId {
+    /// Construct an identifier from its protocol representation.
+    #[must_use]
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    /// Construct an identifier from a stable namespace and its local sequence.
+    ///
+    /// The namespace occupies the high 64 bits and the sequence occupies the
+    /// low 64 bits, so separate allocators can issue run identifiers without
+    /// sharing a counter.
+    #[must_use]
+    pub fn from_namespace_sequence(namespace: u64, sequence: u64) -> Self {
+        Self((u128::from(namespace) << 64) | u128::from(sequence))
+    }
+
+    /// Return the protocol representation.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:032x}", self.0)
+    }
+}
+
+/// Error returned when a run identifier is not in canonical wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("run id must be exactly 32 lowercase hexadecimal characters")]
+pub struct RunIdParseError;
+
+impl std::str::FromStr for RunId {
+    type Err = RunIdParseError;
+
+    fn from_str(encoded: &str) -> Result<Self, Self::Err> {
+        parse_fixed_lower_hex_u128(encoded)
+            .map(Self)
+            .ok_or(RunIdParseError)
+    }
+}
+
+impl Serialize for RunId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Stable idempotency key supplied by a client for one logical command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommandId(u128);
@@ -162,18 +240,13 @@ impl Serialize for CommandId {
 impl<'de> Deserialize<'de> for CommandId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        if encoded.len() != 32
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(serde::de::Error::custom(
-                "command id must be exactly 32 lowercase hexadecimal characters",
-            ));
-        }
-        u128::from_str_radix(&encoded, 16)
+        parse_fixed_lower_hex_u128(&encoded)
             .map(Self)
-            .map_err(serde::de::Error::custom)
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "command id must be exactly 32 lowercase hexadecimal characters",
+                )
+            })
     }
 }
 
@@ -5545,6 +5618,50 @@ mod tests {
         assert!(serde_json::from_str::<CommandId>("1").is_err());
         assert!(serde_json::from_str::<CommandId>("\"abc\"").is_err());
         assert!(serde_json::from_str::<CommandId>("\"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\"").is_err());
+    }
+
+    #[test]
+    fn run_ids_use_canonical_fixed_width_strings() {
+        let namespaced =
+            RunId::from_namespace_sequence(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        assert_eq!(namespaced.get(), 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+
+        for (run_id, expected) in [
+            (RunId::new(0), "00000000000000000000000000000000"),
+            (namespaced, "0123456789abcdeffedcba9876543210"),
+            (RunId::new(u128::MAX), "ffffffffffffffffffffffffffffffff"),
+        ] {
+            assert_eq!(run_id.to_string(), expected);
+            assert_eq!(
+                expected.parse::<RunId>().expect("canonical run id parses"),
+                run_id
+            );
+
+            let encoded = serde_json::to_string(&run_id).expect("run id should encode");
+            assert_eq!(encoded, format!("\"{expected}\""));
+            let decoded: RunId = serde_json::from_str(&encoded).expect("run id should round trip");
+            assert_eq!(decoded, run_id);
+        }
+    }
+
+    #[test]
+    fn run_id_parsing_rejects_noncanonical_text() {
+        for invalid in [
+            "",
+            "0000000000000000000000000000000",
+            "000000000000000000000000000000000",
+            "0000000000000000000000000000000g",
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            "0123456789abcdeFfedcba9876543210",
+            " 0000000000000000000000000000000",
+            "00000000000000000000000000000000 ",
+        ] {
+            assert_eq!(invalid.parse::<RunId>(), Err(RunIdParseError));
+        }
+
+        assert!(serde_json::from_str::<RunId>("0").is_err());
+        assert!(serde_json::from_str::<RunId>("\"abc\"").is_err());
+        assert!(serde_json::from_str::<RunId>("\"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\"").is_err());
     }
 
     #[test]

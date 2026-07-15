@@ -1,6 +1,6 @@
 use fsqlite::{Connection, SqliteValue, compat::RowExt};
 use scriptbots_storage::{
-    SCRIPTBOTS_AGENT_COLUMN_COUNT, SCRIPTBOTS_SCHEMA_V1, scriptbots_agent_insert_sql,
+    SCRIPTBOTS_AGENT_COLUMN_COUNT, SCRIPTBOTS_SCHEMA_V6, scriptbots_agent_insert_sql,
 };
 use std::{
     fs,
@@ -11,9 +11,11 @@ use std::{
 const FIRST_TICK: i64 = 41;
 const SECOND_TICK: i64 = 42;
 const ROLLED_BACK_TICK: i64 = 9_001;
+const RUN_ID: &str = "00000000000000000000000000000001";
 
 fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; SCRIPTBOTS_AGENT_COLUMN_COUNT] {
     [
+        RUN_ID.into(),
         tick.into(),
         agent_uid.into(),
         3_i64.into(),
@@ -57,24 +59,52 @@ fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; SCRIPTBOTS_AGENT_COL
 }
 
 fn create_schema(connection: &Connection) {
-    let statement_count = SCRIPTBOTS_SCHEMA_V1
+    let statement_count = SCRIPTBOTS_SCHEMA_V6
         .split(';')
         .filter(|statement| !statement.trim().is_empty())
         .count();
     eprintln!(
-        "scriptbots conformance: applying canonical schema v1 DDL batch: {} bytes, {statement_count} statements",
-        SCRIPTBOTS_SCHEMA_V1.len()
+        "scriptbots conformance: applying canonical schema v6 DDL batch: {} bytes, {statement_count} statements",
+        SCRIPTBOTS_SCHEMA_V6.len()
     );
     connection
-        .execute_batch(SCRIPTBOTS_SCHEMA_V1)
+        .execute_batch(SCRIPTBOTS_SCHEMA_V6)
         .expect("FrankenSQLite should execute the canonical ScriptBots schema batch");
+    connection
+        .execute_with_params(
+            "INSERT INTO runs (
+                run_id, manifest_schema_version, experiment_id, variant_id,
+                scenario_id, scenario_version, normalized_config_json, config_digest,
+                root_seed_hex, rng_algorithm, rng_version, brain_roster_json,
+                source_revision, source_tree_digest, source_tree_dirty, source_bundle_digest,
+                rust_toolchain, cargo_lock_digest, target_triple, started_at_unix_ms_hex,
+                requested_tick_budget_hex, live_run_policy, reproducible,
+                manifest_json, manifest_digest
+             ) VALUES (
+                ?1, 1, 'fsqlite-conformance', 'single-run',
+                'storage-workload', 1, '{}', 'blake3:config',
+                '000000000000002a', 'small-rng', 1, '[]',
+                'conformance-source', 'blake3:source', 0, NULL,
+                'conformance-toolchain', 'blake3:lock', 'conformance-target',
+                '0000000000000000', '000000000000002a', NULL, 1,
+                ?2, 'blake3:manifest'
+             )",
+            &[
+                RUN_ID.into(),
+                format!("{{\"run_id\":\"{RUN_ID}\",\"schema\":\"scriptbots.run-manifest.v1\"}}")
+                    .into(),
+            ],
+        )
+        .expect("the conformance run manifest should be registered before scientific rows");
 }
 
 fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO ticks VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO tick_summaries
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             &[
+                RUN_ID.into(),
                 tick.into(),
                 2_i64.into(),
                 0_i64.into(),
@@ -86,23 +116,25 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
                 0.85_f64.into(),
             ],
         )
-        .expect("ticks insert should accept nine numbered parameters");
+        .expect("tick summary insert should accept the run id and nine scientific parameters");
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO metrics VALUES (?1, ?2, ?3)",
-            &[tick.into(), "energy".into(), 14.5_f64.into()],
+            "INSERT OR REPLACE INTO metrics VALUES (?1, ?2, ?3, ?4)",
+            &[RUN_ID.into(), tick.into(), "energy".into(), 14.5_f64.into()],
         )
         .expect("metrics insert should accept a REAL value");
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO events VALUES (?1, ?2, ?3)",
-            &[tick.into(), "births".into(), 1_i64.into()],
+            "INSERT OR REPLACE INTO events VALUES (?1, ?2, ?3, ?4)",
+            &[RUN_ID.into(), tick.into(), "births".into(), 1_i64.into()],
         )
         .expect("events insert should preserve an integer count");
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO replay_events VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO replay_events
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             &[
+                RUN_ID.into(),
                 tick.into(),
                 0_i64.into(),
                 SqliteValue::Null,
@@ -120,8 +152,10 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
         .expect("canonical agent insert should bind every production column");
     connection
         .execute_with_params(
-            "INSERT INTO births VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO births
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             &[
+                RUN_ID.into(),
                 tick.into(),
                 agent_uid.into(),
                 (agent_uid - 1).into(),
@@ -141,8 +175,10 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
         .expect("birth insert should preserve nullable parent and brain keys");
     connection
         .execute_with_params(
-            "INSERT INTO deaths VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO deaths
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             &[
+                RUN_ID.into(),
                 tick.into(),
                 agent_uid.into(),
                 17_i64.into(),
@@ -175,16 +211,23 @@ fn insert_committed_workload(connection: &Connection) {
     for (tick, population) in [(FIRST_TICK, 3.0_f64), (SECOND_TICK, 4.0_f64)] {
         connection
             .execute_with_params(
-                "INSERT OR REPLACE INTO metrics VALUES (?1, ?2, ?3)",
-                &[tick.into(), "population".into(), population.into()],
+                "INSERT OR REPLACE INTO metrics VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    RUN_ID.into(),
+                    tick.into(),
+                    "population".into(),
+                    population.into(),
+                ],
             )
             .expect("population metric insert should succeed");
     }
 
     connection
         .execute_with_params(
-            "INSERT OR REPLACE INTO ticks VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO tick_summaries
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             &[
+                RUN_ID.into(),
                 FIRST_TICK.into(),
                 2_i64.into(),
                 1_i64.into(),
@@ -209,8 +252,8 @@ fn prove_failed_transaction_rolls_back_every_table(connection: &Connection) {
     insert_table_group(connection, ROLLED_BACK_TICK, 99);
 
     let expected_failure = connection.execute_with_params(
-        "INSERT INTO ticks (tick, missing_column) VALUES (?1, ?2)",
-        &[ROLLED_BACK_TICK.into(), 1_i64.into()],
+        "INSERT INTO tick_summaries (run_id, tick, missing_column) VALUES (?1, ?2, ?3)",
+        &[RUN_ID.into(), ROLLED_BACK_TICK.into(), 1_i64.into()],
     );
     assert!(
         expected_failure.is_err(),
@@ -221,7 +264,7 @@ fn prove_failed_transaction_rolls_back_every_table(connection: &Connection) {
         .expect("the failed transaction should remain explicitly rollbackable");
 
     for table in [
-        "ticks",
+        "tick_summaries",
         "metrics",
         "events",
         "replay_events",
@@ -229,9 +272,9 @@ fn prove_failed_transaction_rolls_back_every_table(connection: &Connection) {
         "births",
         "deaths",
     ] {
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE tick = ?1");
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1 AND tick = ?2");
         let row = connection
-            .query_row_with_params(&sql, &[ROLLED_BACK_TICK.into()])
+            .query_row_with_params(&sql, &[RUN_ID.into(), ROLLED_BACK_TICK.into()])
             .expect("rollback count query should succeed");
         let count = row
             .get_typed::<i64>(0)
@@ -241,18 +284,20 @@ fn prove_failed_transaction_rolls_back_every_table(connection: &Connection) {
 }
 
 fn verify_production_constraints(connection: &Connection) {
-    let missing_metric_value = connection.execute(
-        "INSERT INTO metrics (tick, name, value)
-         VALUES (9102, 'missing-value-probe', NULL)",
+    let missing_metric_value = connection.execute_with_params(
+        "INSERT INTO metrics (run_id, tick, name, value)
+         VALUES (?1, 9102, 'missing-value-probe', NULL)",
+        &[RUN_ID.into()],
     );
     assert!(
         missing_metric_value.is_err(),
         "production metrics.value NOT NULL constraint must reject NULL"
     );
 
-    let negative_event_count = connection.execute(
-        "INSERT INTO events (tick, kind, count)
-         VALUES (9103, 'negative-count-probe', -1)",
+    let negative_event_count = connection.execute_with_params(
+        "INSERT INTO events (run_id, tick, kind, count)
+         VALUES (?1, 9103, 'negative-count-probe', -1)",
+        &[RUN_ID.into()],
     );
     assert!(
         negative_event_count.is_err(),
@@ -260,9 +305,9 @@ fn verify_production_constraints(connection: &Connection) {
     );
 
     for (table, tick) in [("metrics", 9_102_i64), ("events", 9_103_i64)] {
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE tick = ?1");
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1 AND tick = ?2");
         let count = connection
-            .query_row_with_params(&sql, &[tick.into()])
+            .query_row_with_params(&sql, &[RUN_ID.into(), tick.into()])
             .expect("constraint-probe count should be queryable")
             .get_typed::<i64>(0)
             .expect("constraint-probe count should be INTEGER");
@@ -276,8 +321,12 @@ fn verify_production_constraints(connection: &Connection) {
 fn verify_tick_queries(connection: &Connection) {
     let tick_rows = connection
         .query_with_params(
-            "SELECT tick, closed, agent_count FROM ticks ORDER BY tick DESC LIMIT ?1",
-            &[2_i64.into()],
+            "SELECT tick, closed, agent_count
+             FROM tick_summaries
+             WHERE run_id = ?1
+             ORDER BY tick DESC
+             LIMIT ?2",
+            &[RUN_ID.into(), 2_i64.into()],
         )
         .expect("ordered tick query with a bound LIMIT should succeed");
     assert_eq!(tick_rows.len(), 2, "bound LIMIT should return two ticks");
@@ -303,7 +352,10 @@ fn verify_tick_queries(connection: &Connection) {
     );
 
     let max_tick = connection
-        .query_row("SELECT MAX(tick) FROM ticks")
+        .query_row_with_params(
+            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+            &[RUN_ID.into()],
+        )
         .expect("MAX(tick) should return exactly one aggregate row")
         .get_typed::<i64>(0)
         .expect("MAX(tick) should decode as an integer");
@@ -324,9 +376,9 @@ fn verify_metric_aggregates(connection: &Connection) {
     let aggregate_rows = connection
         .query_with_params(
             "SELECT name, COUNT(*), SUM(value), AVG(value) \
-             FROM metrics WHERE tick >= ?1 \
-             GROUP BY name ORDER BY name ASC LIMIT ?2",
-            &[FIRST_TICK.into(), 2_i64.into()],
+             FROM metrics WHERE run_id = ?1 AND tick >= ?2 \
+             GROUP BY name ORDER BY name ASC LIMIT ?3",
+            &[RUN_ID.into(), FIRST_TICK.into(), 2_i64.into()],
         )
         .expect("grouped aggregate query with a bound LIMIT should succeed");
     assert_eq!(
@@ -378,8 +430,10 @@ fn verify_metric_aggregates(connection: &Connection) {
 fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
     let replay = connection
         .query_row_with_params(
-            "SELECT agent_uid, payload FROM replay_events WHERE tick = ?1 AND seq = ?2",
-            &[FIRST_TICK.into(), 0_i64.into()],
+            "SELECT agent_uid, payload
+             FROM replay_events
+             WHERE run_id = ?1 AND tick = ?2 AND seq = ?3",
+            &[RUN_ID.into(), FIRST_TICK.into(), 0_i64.into()],
         )
         .expect("replay row should be queryable with numbered parameters");
     assert_eq!(
@@ -398,10 +452,10 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
     let agent = connection
         .query_row_with_params(
             "SELECT brain_binding, brain_key, spiked, sound_output, hit_by_herbivore \
-             FROM agents WHERE tick = ?1 AND agent_uid = ?2",
-            &[FIRST_TICK.into(), 7_i64.into()],
+             FROM agents WHERE run_id = ?1 AND tick = ?2 AND agent_uid = ?3",
+            &[RUN_ID.into(), FIRST_TICK.into(), 7_i64.into()],
         )
-        .expect("39-column agent row should be queryable by its composite key");
+        .expect("40-column agent row should be queryable by its run-scoped composite key");
     assert_eq!(
         agent
             .get_typed::<String>(0)
@@ -434,14 +488,14 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
 
     let duplicate_uid = connection.execute_with_params(
         "INSERT INTO births (
-            tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+            run_id, tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
             brain_kind, brain_key, herbivore_tendency, generation,
             position_x, position_y, is_hybrid, origin
-         ) SELECT tick + 1000, agent_uid, spawn_ordinal + 1000, birth_ordinal + 1000,
+         ) SELECT run_id, tick + 1000, agent_uid, spawn_ordinal + 1000, birth_ordinal + 1000,
                   parent_a, parent_b, brain_kind, brain_key, herbivore_tendency,
                   generation, position_x, position_y, is_hybrid, origin
-           FROM births WHERE tick = ?1 AND agent_uid = ?2",
-        &[FIRST_TICK.into(), 7_i64.into()],
+           FROM births WHERE run_id = ?1 AND tick = ?2 AND agent_uid = ?3",
+        &[RUN_ID.into(), FIRST_TICK.into(), 7_i64.into()],
     );
     assert!(
         duplicate_uid.is_err(),
@@ -450,14 +504,14 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
 
     let duplicate_spawn_ordinal = connection.execute_with_params(
         "INSERT INTO births (
-            tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+            run_id, tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
             brain_kind, brain_key, herbivore_tendency, generation,
             position_x, position_y, is_hybrid, origin
-         ) SELECT tick + 2000, agent_uid + 2000, spawn_ordinal, birth_ordinal + 2000,
+         ) SELECT run_id, tick + 2000, agent_uid + 2000, spawn_ordinal, birth_ordinal + 2000,
                   parent_a, parent_b, brain_kind, brain_key, herbivore_tendency,
                   generation, position_x, position_y, is_hybrid, origin
-           FROM births WHERE tick = ?1 AND agent_uid = ?2",
-        &[FIRST_TICK.into(), 7_i64.into()],
+           FROM births WHERE run_id = ?1 AND tick = ?2 AND agent_uid = ?3",
+        &[RUN_ID.into(), FIRST_TICK.into(), 7_i64.into()],
     );
     assert!(
         duplicate_spawn_ordinal.is_err(),
@@ -466,14 +520,14 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
 
     let duplicate_birth_ordinal = connection.execute_with_params(
         "INSERT INTO births (
-            tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+            run_id, tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
             brain_kind, brain_key, herbivore_tendency, generation,
             position_x, position_y, is_hybrid, origin
-         ) SELECT tick + 3000, agent_uid + 3000, spawn_ordinal + 3000, birth_ordinal,
+         ) SELECT run_id, tick + 3000, agent_uid + 3000, spawn_ordinal + 3000, birth_ordinal,
                   parent_a, parent_b, brain_kind, brain_key, herbivore_tendency,
                   generation, position_x, position_y, is_hybrid, origin
-           FROM births WHERE tick = ?1 AND agent_uid = ?2",
-        &[FIRST_TICK.into(), 7_i64.into()],
+           FROM births WHERE run_id = ?1 AND tick = ?2 AND agent_uid = ?3",
+        &[RUN_ID.into(), FIRST_TICK.into(), 7_i64.into()],
     );
     assert!(
         duplicate_birth_ordinal.is_err(),
@@ -484,19 +538,21 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
         .begin_transaction()
         .expect("nullable birth ordinal probe transaction should begin");
     connection
-        .execute(
+        .execute_with_params(
             "INSERT INTO births (
-                tick, agent_uid, spawn_ordinal, birth_ordinal,
+                run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
                 herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-             ) VALUES (0, 2003, 2002, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+             ) VALUES (?1, 0, 2003, 2002, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+            &[RUN_ID.into()],
         )
         .expect("birth ordinal UNIQUE index must accept a tick-zero seeded NULL ordinal");
     connection
-        .execute(
+        .execute_with_params(
             "INSERT INTO births (
-                tick, agent_uid, spawn_ordinal, birth_ordinal,
+                run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
                 herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-             ) VALUES (2004, 2004, 2003, NULL, 0.5, 0, 1.0, 2.0, 0, 'injected')",
+             ) VALUES (?1, 2004, 2004, 2003, NULL, 0.5, 0, 1.0, 2.0, 0, 'injected')",
+            &[RUN_ID.into()],
         )
         .expect("birth ordinal UNIQUE index must permit multiple non-born NULL ordinals");
     connection
@@ -505,12 +561,12 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
 
     let duplicate_death_uid = connection.execute_with_params(
         "INSERT INTO deaths
-         SELECT tick + 1000, agent_uid, age, generation, herbivore_tendency,
+         SELECT run_id, tick + 1000, agent_uid, age, generation, herbivore_tendency,
                 brain_kind, brain_key, energy, food_balance_total, cause, was_hybrid,
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
                 hit_by_carnivore, hit_by_herbivore
-           FROM deaths WHERE tick = ?1 AND agent_uid = ?2",
-        &[FIRST_TICK.into(), 7_i64.into()],
+           FROM deaths WHERE run_id = ?1 AND tick = ?2 AND agent_uid = ?3",
+        &[RUN_ID.into(), FIRST_TICK.into(), 7_i64.into()],
     );
     assert!(
         duplicate_death_uid.is_err(),
@@ -519,12 +575,12 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
 
     let replacement_death = connection.execute_with_params(
         "INSERT INTO deaths
-         SELECT tick, agent_uid, age, generation, herbivore_tendency,
+         SELECT run_id, tick, agent_uid, age, generation, herbivore_tendency,
                 brain_kind, brain_key, energy, food_balance_total, 'aging', was_hybrid,
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
                 hit_by_carnivore, hit_by_herbivore
-           FROM deaths WHERE tick = ?1 AND agent_uid = ?2",
-        &[FIRST_TICK.into(), 7_i64.into()],
+           FROM deaths WHERE run_id = ?1 AND tick = ?2 AND agent_uid = ?3",
+        &[RUN_ID.into(), FIRST_TICK.into(), 7_i64.into()],
     );
     assert!(
         replacement_death.is_err(),
@@ -535,10 +591,10 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type = 'index' AND name IN (
-                 'births_agent_uid_unique',
-                 'births_spawn_ordinal_unique',
-                 'births_birth_ordinal_unique',
-                 'deaths_agent_uid_unique'
+                 'births_run_agent_uid_unique',
+                 'births_run_spawn_ordinal_unique',
+                 'births_run_birth_ordinal_unique',
+                 'deaths_run_agent_uid_unique'
              )",
         )
         .expect("lifecycle uniqueness indices should be queryable")
@@ -550,30 +606,39 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
     );
 
     let invalid_origin = connection.execute_with_params(
-        "UPDATE births SET origin = ?1 WHERE tick = ?2 AND agent_uid = ?3",
-        &["unknown".into(), FIRST_TICK.into(), 7_i64.into()],
+        "UPDATE births
+         SET origin = ?1
+         WHERE run_id = ?2 AND tick = ?3 AND agent_uid = ?4",
+        &[
+            "unknown".into(),
+            RUN_ID.into(),
+            FIRST_TICK.into(),
+            7_i64.into(),
+        ],
     );
     assert!(
         invalid_origin.is_err(),
         "birth origin CHECK must reject values outside the typed domain"
     );
 
-    let missing_origin = connection.execute(
+    let missing_origin = connection.execute_with_params(
         "INSERT INTO births (
-            tick, agent_uid, spawn_ordinal, birth_ordinal,
+            run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
             herbivore_tendency, generation, position_x, position_y, is_hybrid
-         ) VALUES (2001, 2001, 2000, 2000, 0.5, 0, 1.0, 2.0, 0)",
+         ) VALUES (?1, 2001, 2001, 2000, 2000, 0.5, 0, 1.0, 2.0, 0)",
+        &[RUN_ID.into()],
     );
     assert!(
         missing_origin.is_err(),
         "birth origin must be explicit; the final schema must not supply a default"
     );
 
-    let non_birth_with_ordinal = connection.execute(
+    let non_birth_with_ordinal = connection.execute_with_params(
         "INSERT INTO births (
-            tick, agent_uid, spawn_ordinal, birth_ordinal,
+            run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
             herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-         ) VALUES (2002, 2002, 2001, 2001, 0.5, 0, 1.0, 2.0, 0, 'injected')",
+         ) VALUES (?1, 2002, 2002, 2001, 2001, 0.5, 0, 1.0, 2.0, 0, 'injected')",
+        &[RUN_ID.into()],
     );
     assert!(
         non_birth_with_ordinal.is_err(),
@@ -593,8 +658,10 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
 
     let birth = connection
         .query_row_with_params(
-            "SELECT origin FROM births WHERE tick = ?1 AND agent_uid = ?2",
-            &[FIRST_TICK.into(), 7_i64.into()],
+            "SELECT origin
+             FROM births
+             WHERE run_id = ?1 AND tick = ?2 AND agent_uid = ?3",
+            &[RUN_ID.into(), FIRST_TICK.into(), 7_i64.into()],
         )
         .expect("birth origin should be queryable by its composite key");
     assert_eq!(
@@ -625,7 +692,7 @@ fn verify_committed_workload(connection: &Connection) {
 fn log_and_verify_reopened_row_counts(connection: &Connection) {
     eprintln!("scriptbots conformance: reopened committed workload row counts");
     for (table, expected) in [
-        ("ticks", 2_i64),
+        ("tick_summaries", 2_i64),
         ("metrics", 4),
         ("events", 2),
         ("replay_events", 2),
@@ -633,15 +700,27 @@ fn log_and_verify_reopened_row_counts(connection: &Connection) {
         ("births", 2),
         ("deaths", 2),
     ] {
-        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1");
         let count = connection
-            .query_row(&sql)
+            .query_row_with_params(&sql, &[RUN_ID.into()])
             .expect("reopened row count should be queryable")
             .get_typed::<i64>(0)
             .expect("reopened row count should be INTEGER");
         eprintln!("  table={table} rows={count} expected={expected}");
         assert_eq!(count, expected, "reopened {table} row count drifted");
     }
+    let run_count = connection
+        .query_row_with_params(
+            "SELECT COUNT(*) FROM runs WHERE run_id = ?1",
+            &[RUN_ID.into()],
+        )
+        .expect("registered run count should be queryable")
+        .get_typed::<i64>(0)
+        .expect("registered run count should be INTEGER");
+    assert_eq!(
+        run_count, 1,
+        "the reopened run manifest must remain registered"
+    );
 }
 
 fn exercise_workload(connection: &Connection) {

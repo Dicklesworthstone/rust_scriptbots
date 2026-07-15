@@ -61,8 +61,8 @@ fn temp_db(label: &str) -> String {
 fn the_run_database_alone_rebuilds_the_identical_ancestry_graph() {
     let path = temp_db("rebuild");
 
-    let mut pipeline =
-        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("pipeline");
 
     let config = ScriptBotsConfig {
         world_width: 400,
@@ -201,8 +201,8 @@ fn the_run_database_alone_rebuilds_the_identical_ancestry_graph() {
 #[test]
 fn tick_zero_origins_finalize_once_and_seal_the_real_storage_boundary() {
     let path = temp_db("tick-zero-origins");
-    let mut pipeline =
-        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("pipeline");
     let (mut world, mut persistence) = WorldState::with_persistence(
         ScriptBotsConfig {
             persistence_interval: 1,
@@ -261,8 +261,8 @@ fn a_rebuild_from_an_empty_database_is_empty_rather_than_wrong() {
     // The degenerate case must be honest: no rows means no graph, not a graph of
     // invented roots.
     let path = temp_db("empty");
-    let mut pipeline =
-        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("pipeline");
     pipeline.shutdown().expect("shutdown");
 
     let reader = StorageReader::open(&path).expect("reopen");

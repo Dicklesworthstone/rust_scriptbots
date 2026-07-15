@@ -92,7 +92,7 @@ enum Command {
         /// Destination CSV file path (directories created as needed).
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
-        /// Limit to the most recent N rows (oldest-first in the output). Omit for full export.
+        /// Limit to the most recent N rows (oldest-first in the output). Defaults to 4096.
         #[arg(long, value_name = "ROWS")]
         last: Option<usize>,
     },
@@ -325,7 +325,7 @@ fn export_metrics<W: Write>(
     writer: &mut Writer<W>,
     last: Option<usize>,
 ) -> Result<usize> {
-    let records = storage.recent_metrics(last)?;
+    let records = storage.recent_metrics(last.unwrap_or(4_096))?;
 
     writer
         .write_record(["tick", "name", "value"])
@@ -346,7 +346,7 @@ fn export_ticks<W: Write>(
     writer: &mut Writer<W>,
     last: Option<usize>,
 ) -> Result<usize> {
-    let records = storage.recent_ticks(last)?;
+    let records = storage.recent_ticks(last.unwrap_or(4_096))?;
 
     writer
         .write_record([
@@ -1189,7 +1189,7 @@ mod tests {
         let database = path
             .to_str()
             .context("temporary database path was not valid UTF-8")?;
-        let mut storage = Storage::create_new_file(database)?;
+        let mut storage = Storage::create_unattributed_file(database)?;
 
         // Persist deliberately out of order so the export contract, rather than insertion
         // order, proves chronological output.

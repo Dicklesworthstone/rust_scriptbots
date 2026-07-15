@@ -22,7 +22,8 @@ fn storage_persists_metrics_roundtrip() {
 
     let path_str = path.to_str().expect("utf8 path");
     let mut pipeline =
-        StoragePipeline::create_new_file_with_thresholds(path_str, 1, 1, 1, 1).expect("pipeline");
+        StoragePipeline::create_unattributed_file_with_thresholds(path_str, 1, 1, 1, 1)
+            .expect("pipeline");
     let analytics = pipeline.analytics_provider();
     pipeline
         .submit(&PersistenceBatch {

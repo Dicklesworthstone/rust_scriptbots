@@ -1,6 +1,6 @@
 //! `WorldDigestV1` must see what `CharacterizationDigestV0` could not.
 //!
-//! v0's limitations were DECLARED rather than hidden — `RunManifestV1` carries
+//! v0's limitations were DECLARED rather than hidden — `RunManifestV2` carries
 //! `CharacterizationLimitationsV0 { evaluator_state_covered: false, ..., superseded_by:
 //! "WorldDigestV1" }`. This file is where that promise is kept.
 //!

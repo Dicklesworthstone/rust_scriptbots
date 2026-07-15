@@ -3,8 +3,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    BootstrapEvidenceV0, CharacterizationTraceV0, ControlServerConfig, ControlServerReservation,
-    RunManifestV1, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
+    BootstrapEvidenceV0, CharacterizationTraceV1, ControlServerConfig, ControlServerReservation,
+    RunIdentityV1, RunManifestV2, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
     WorldStepDriver,
     precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
     renderer::{Renderer, RendererContext},
@@ -21,6 +21,7 @@ use scriptbots_core::{
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
+use scriptbots_runtime::RunId;
 use scriptbots_storage::{
     PersistedReplayEvent, PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
 };
@@ -31,10 +32,7 @@ use std::{
     env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-    },
+    sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, info, warn};
@@ -44,6 +42,7 @@ use tracing::{debug, info, warn};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DEFAULT_BOOTSTRAP_TICKS: u64 = 0;
+const LIVE_RUN_POLICY: &str = "operator-controlled-until-stop-v1";
 
 type SharedPersistenceAdmission = Arc<Mutex<PersistenceAdmissionSession>>;
 
@@ -87,10 +86,10 @@ fn main() -> Result<()> {
         run_det_child(&config, tick_limit)?;
         return Ok(());
     }
-    let config = compose_config(&cli)?;
+    let (config, launch_scenario) = compose_config_with_scenario(&cli)?;
 
     if let Some(ticks) = cli.characterize_v0 {
-        run_characterization_v0(&cli, config, ticks)?;
+        run_characterization_v0(&cli, config, launch_scenario, ticks)?;
         return Ok(());
     }
 
@@ -130,11 +129,33 @@ fn main() -> Result<()> {
     // Optional: profiling runs (headless). Execute and exit if specified.
     let thresholds = thresholds_from_cli(&cli);
     if cli.profile_steps.is_some() || cli.profile_storage_steps.is_some() {
+        let env_threads = std::env::var("SCRIPTBOTS_MAX_THREADS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|threads| *threads > 0);
+        let profile_thread_policy =
+            resolve_thread_policy(cli.threads, env_threads, None, cli.low_power);
+        if profile_thread_policy.source != ThreadSource::Environment
+            && let Some(threads) = profile_thread_policy.threads
+        {
+            // SAFETY: Profile dispatch happens before constructing a world or starting worker
+            // threads, so the resolved cap cannot race an environment reader.
+            unsafe {
+                std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
+            }
+        }
         if let Some(ticks) = cli.profile_steps {
             profile_world_steps(&config, ticks)?;
         }
         if let Some(ticks) = cli.profile_storage_steps {
-            profile_world_steps_with_storage(&config, ticks, cli.storage, thresholds)?;
+            profile_world_steps_with_storage(
+                &config,
+                ticks,
+                cli.storage,
+                thresholds,
+                profile_thread_policy,
+                launch_scenario.clone(),
+            )?;
         }
         return Ok(());
     }
@@ -246,8 +267,14 @@ fn main() -> Result<()> {
             std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
         }
     }
-    let (world, persistence, analytics, mut storage_pipeline) =
-        bootstrap_world(config, cli.storage, thresholds, cli.bootstrap_ticks, policy)?;
+    let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
+        config,
+        cli.storage,
+        thresholds,
+        cli.bootstrap_ticks,
+        policy,
+        launch_scenario,
+    )?;
     let simulation_step = persistence_step_driver(&world, &persistence);
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
@@ -566,31 +593,65 @@ fn init_tracing() {
         .try_init();
 }
 
-fn run_characterization_v0(cli: &AppCli, config: ScriptBotsConfig, ticks: u64) -> Result<()> {
+fn run_started_at_unix_ms() -> Result<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch; cannot identify this run")?;
+    u64::try_from(elapsed.as_millis())
+        .context("current Unix timestamp does not fit the run-manifest u64 contract")
+}
+
+fn materialize_run_seed(config: &mut ScriptBotsConfig) -> (u64, bool) {
+    match config.rng_seed {
+        Some(seed) => (seed, false),
+        None => {
+            let seed = rand::random::<u64>();
+            config.rng_seed = Some(seed);
+            (seed, true)
+        }
+    }
+}
+
+fn allocate_run_id() -> RunId {
+    // A run can outlive its originating process and be merged into a database produced on another
+    // host, so process-local counters and wall-clock namespaces are not durable identity. Draw the
+    // complete 128-bit identifier from the operating system-seeded RNG. Zero is reserved as an
+    // invalid/sentinel identity; it is the only value that requires a retry.
+    loop {
+        let candidate = rand::random::<u128>();
+        if candidate != 0 {
+            return RunId::new(candidate);
+        }
+    }
+}
+
+fn run_characterization_v0(
+    cli: &AppCli,
+    mut config: ScriptBotsConfig,
+    mut scenario: ScenarioIdentityV0,
+    ticks: u64,
+) -> Result<()> {
+    let (root_seed, generated_seed) = materialize_run_seed(&mut config);
+    if generated_seed {
+        info!(
+            root_seed,
+            "Generated and pinned the characterization run's previously unspecified scientific seed"
+        );
+    }
     let (mut world, mut persistence) =
         WorldState::with_persistence(config, Box::new(NullPersistence))?;
     let brain_keys = install_brains(&mut world)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
-    let scenario_id = if cli.config_layers.is_empty() {
-        "legacy_app_default_v0"
-    } else {
-        "legacy_layered_config_v0"
-    };
-    let mut scenario = ScenarioIdentityV0::caller_seeded(scenario_id);
-    scenario.population_recipe = "legacy_4x4_grid_v0".to_owned();
     scenario.bootstrap_ticks = 0;
-    for layer in &cli.config_layers {
-        let bytes = fs::read(layer).with_context(|| {
-            format!(
-                "failed to read configuration layer {} for characterization provenance",
-                layer.display()
-            )
-        })?;
-        scenario.record_config_layer(&bytes);
-    }
 
-    let trace = CharacterizationTraceV0::capture_with_scenario_and_session(
+    let started_at_unix_ms = run_started_at_unix_ms()?;
+    let identity = RunIdentityV1::new(allocate_run_id(), started_at_unix_ms, Some(ticks), None);
+    identity
+        .validate()
+        .context("invalid characterization run identity")?;
+    let trace = CharacterizationTraceV1::capture_with_scenario_and_session(
+        identity,
         scenario,
         &mut world,
         &mut persistence,
@@ -610,7 +671,7 @@ fn run_characterization_v0(cli: &AppCli, config: ScriptBotsConfig, ticks: u64) -
         }
         fs::write(path, bytes).with_context(|| {
             format!(
-                "failed to write V0 characterization trace to {}",
+                "failed to write V1 characterization trace to {}",
                 path.display()
             )
         })?;
@@ -618,9 +679,9 @@ fn run_characterization_v0(cli: &AppCli, config: ScriptBotsConfig, ticks: u64) -
         let stdout = io::stdout();
         let mut lock = stdout.lock();
         lock.write_all(&bytes)
-            .context("failed to write V0 characterization trace to stdout")?;
+            .context("failed to write V1 characterization trace to stdout")?;
         lock.flush()
-            .context("failed to flush V0 characterization trace to stdout")?;
+            .context("failed to flush V1 characterization trace to stdout")?;
     }
 
     Ok(())
@@ -862,29 +923,35 @@ fn recover_storage(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write the run's provenance record next to its database.
-///
-/// A provenance write must NEVER be able to kill the run: a manifest that took the
-/// simulation down with it would have inverted its own purpose. Every failure here
-/// is a warning and the run continues — but the warning names exactly what was
-/// lost, because a silent provenance failure is how you end up with a run
-/// directory nobody can explain.
+/// Build the canonical provenance record registered durably before tick zero.
 fn build_run_manifest(
     world: &WorldState,
-    bootstrap_ticks: u64,
-) -> std::result::Result<RunManifestV1, scriptbots_app::RunManifestError> {
-    let mut scenario = ScenarioIdentityV0::caller_seeded("default");
-    scenario.bootstrap_ticks = bootstrap_ticks;
-    RunManifestV1::from_world_with_provenance(
+    identity: RunIdentityV1,
+    scenario: ScenarioIdentityV0,
+    thread_policy: ThreadPolicy,
+) -> std::result::Result<RunManifestV2, scriptbots_app::RunManifestError> {
+    RunManifestV2::from_world_with_provenance(
+        identity,
         scenario,
         world,
         scriptbots_app::BuildProvenanceV0::current(),
     )
+    .map(|manifest| {
+        // Record what the run DECIDED, not merely what the environment said. Build provenance
+        // captures environment declarations, which may have lost to a more specific policy layer.
+        manifest.with_thread_policy(ThreadPolicyV0 {
+            threads: thread_policy.threads,
+            source: thread_policy.source.wire_tag().to_owned(),
+            overridden: thread_policy
+                .overridden
+                .map(|declined| declined.wire_tag().to_owned()),
+        })
+    })
 }
 
 struct PendingRunManifest {
     path: PathBuf,
-    manifest: RunManifestV1,
+    manifest: RunManifestV2,
     start: WorldDigestV1,
     requested: u64,
     thread_policy: ThreadPolicy,
@@ -893,27 +960,16 @@ struct PendingRunManifest {
 fn prepare_run_manifest(
     world: &WorldState,
     storage_path: Option<&str>,
+    manifest: RunManifestV2,
     thread_policy: ThreadPolicy,
     bootstrap_ticks: u64,
 ) -> Option<PendingRunManifest> {
     let Some(storage_path) = storage_path else {
-        // An in-memory run leaves no directory to describe.
+        // The in-memory database already contains the complete launch manifest; it simply has no
+        // durable directory beside which a supplemental post-bootstrap JSON artifact can live.
         return None;
     };
     let manifest_path = std::path::Path::new(storage_path).with_extension("manifest.json");
-
-    let manifest = match build_run_manifest(world, bootstrap_ticks) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            warn!(
-                error = %error,
-                path = %manifest_path.display(),
-                "could not build the run manifest; this run will carry NO provenance \
-                 record and nobody will be able to say what produced it"
-            );
-            return None;
-        }
-    };
 
     let start = match world.world_digest_v1() {
         Ok(digest) => digest,
@@ -921,27 +977,12 @@ fn prepare_run_manifest(
             warn!(
                 error = %error,
                 path = %manifest_path.display(),
-                "could not capture the launch-state WorldDigestV1; this run will carry NO \
-                 provenance record"
+                "could not capture the launch-state WorldDigestV1; the database provenance is \
+                 durable, but the supplemental bootstrap sidecar cannot be emitted"
             );
             return None;
         }
     };
-
-    // Record what the run DECIDED, not merely what the environment said.
-    //
-    // BuildProvenanceV0 already captures RAYON_NUM_THREADS and SCRIPTBOTS_MAX_THREADS from the
-    // environment. Those are a different fact: a user who exported SCRIPTBOTS_MAX_THREADS=16 and
-    // then passed `--threads 8` RAN ON 8, while the environment capture says 16. Without this, the
-    // manifest would describe a run that did not happen — and the discrepancy would appear exactly
-    // in the case this bead's precedence rules exist to handle.
-    let manifest = manifest.with_thread_policy(ThreadPolicyV0 {
-        threads: thread_policy.threads,
-        source: thread_policy.source.wire_tag().to_owned(),
-        overridden: thread_policy
-            .overridden
-            .map(|declined| declined.wire_tag().to_owned()),
-    });
 
     Some(PendingRunManifest {
         path: manifest_path,
@@ -970,8 +1011,8 @@ fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, co
                 error = %error,
                 path = %path.display(),
                 completed,
-                "could not capture the post-bootstrap WorldDigestV1; this run will carry NO \
-                 provenance record"
+                "could not capture the post-bootstrap WorldDigestV1; the database provenance is \
+                 durable, but the supplemental bootstrap sidecar cannot be emitted"
             );
             return;
         }
@@ -989,8 +1030,8 @@ fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, co
             warn!(
                 error = %error,
                 path = %path.display(),
-                "bootstrap evidence did not satisfy the run-manifest contract; this run will \
-                 carry NO provenance"
+                "bootstrap evidence did not satisfy the run-manifest contract; the database \
+                 provenance is durable, but the supplemental sidecar cannot be emitted"
             );
             return;
         }
@@ -1002,7 +1043,8 @@ fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, co
                 warn!(
                     error = %error,
                     path = %path.display(),
-                    "could not write the run manifest; the run continues WITHOUT provenance"
+                    "could not write the supplemental run-manifest sidecar; database provenance \
+                     remains durable"
                 );
                 return;
             }
@@ -1031,26 +1073,69 @@ fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, co
         }
         Err(error) => warn!(
             error = %error,
-            "could not encode the run manifest; the run continues WITHOUT provenance"
+            "could not encode the supplemental run-manifest sidecar; database provenance remains durable"
         ),
     }
 }
 
 fn bootstrap_world(
-    config: ScriptBotsConfig,
+    mut config: ScriptBotsConfig,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
     bootstrap_ticks: u64,
     thread_policy: ThreadPolicy,
+    mut scenario: ScenarioIdentityV0,
 ) -> Result<(
     SharedWorld,
     SharedPersistenceAdmission,
     SharedAnalytics,
     StoragePipeline,
 )> {
+    // This function owns bootstrap execution, so it also owns the authoritative requested count.
+    // Never trust a caller-populated scenario field that could disagree with the work done here.
+    scenario.bootstrap_ticks = bootstrap_ticks;
+    let (root_seed, generated_seed) = materialize_run_seed(&mut config);
+    if generated_seed {
+        info!(
+            root_seed,
+            "Generated and pinned the run's previously unspecified scientific seed"
+        );
+        println!(
+            "{} Run seed: {}",
+            "◆".bright_blue().bold(),
+            root_seed.to_string().cyan()
+        );
+    }
+
     #[cfg(feature = "neuro")]
     let _ = validated_neuroflow_config(&config)?;
 
+    // Establish the complete scientific launch state before opening a database. This keeps
+    // invalid brain/seed configuration from reserving a run path and lets the manifest describe
+    // the actual initial roster rather than a planned approximation.
+    let mut world =
+        WorldState::new(config).context("failed to construct world before tick zero")?;
+    let brain_keys = install_brains(&mut world)?.population;
+    seed_agents(&mut world, &brain_keys)?;
+
+    let started_at_unix_ms = run_started_at_unix_ms()?;
+    let identity = RunIdentityV1::new(
+        allocate_run_id(),
+        started_at_unix_ms,
+        None,
+        Some(LIVE_RUN_POLICY.to_owned()),
+    );
+    identity
+        .validate()
+        .context("invalid live-run identity before storage registration")?;
+    let manifest = build_run_manifest(&world, identity, scenario, thread_policy)
+        .context("failed to build durable run provenance before tick zero")?;
+    let storage_record = manifest
+        .to_storage_record()
+        .context("failed to project durable run provenance before tick zero")?;
+
+    // Pipeline startup atomically registers `storage_record`. A registration failure is fatal:
+    // no sink is bound and no bootstrap transition can run without queryable database provenance.
     let (mut pipeline, storage_path) = match storage_mode {
         StorageMode::File => {
             let storage_path = storage_path_from_env()?;
@@ -1061,69 +1146,66 @@ fn bootstrap_world(
                 thresholds.metric,
             ) {
                 (Some(t), Some(a), Some(e), Some(m)) => {
-                    StoragePipeline::create_new_file_with_thresholds(&storage_path, t, a, e, m)
+                    StoragePipeline::create_new_file_for_run_with_thresholds(
+                        &storage_path,
+                        storage_record,
+                        t,
+                        a,
+                        e,
+                        m,
+                    )
                 }
-                _ => StoragePipeline::create_new_file(&storage_path),
+                _ => StoragePipeline::create_new_file_for_run(&storage_path, storage_record),
             }
             .with_context(|| {
-                format!("failed to initialize FrankenSQLite storage at {storage_path}")
+                format!(
+                    "failed to register run provenance and initialize FrankenSQLite storage at {storage_path}"
+                )
             })?;
             (pipeline, Some(storage_path))
         }
         StorageMode::Memory => (
-            StoragePipeline::memory_with_thresholds(
+            StoragePipeline::memory_for_run_with_thresholds(
+                storage_record,
                 thresholds.tick.unwrap_or(64),
                 thresholds.agent.unwrap_or(2048),
                 thresholds.event.unwrap_or(512),
                 thresholds.metric.unwrap_or(512),
-            )?,
+            )
+            .context("failed to register run provenance in volatile FrankenSQLite storage")?,
             None,
         ),
     };
-    // Keep the path: the manifest is written next to the database, and the binding
-    // below moves it.
-    let manifest_storage_path = storage_path.clone();
-    if let Some(storage_path) = storage_path {
+    let run_id = pipeline.run_id();
+    if let Some(storage_path) = storage_path.as_deref() {
         info!(path = %storage_path, "Selected unique FrankenSQLite run database");
         println!(
-            "{} Run database: {}",
+            "{} Run {} database: {}",
             "◆".bright_blue().bold(),
+            run_id.to_string().cyan(),
             storage_path.cyan()
         );
     } else {
-        info!("Selected volatile in-memory FrankenSQLite storage");
+        info!(%run_id, "Selected volatile in-memory FrankenSQLite storage");
     }
+
+    let pending_manifest = prepare_run_manifest(
+        &world,
+        storage_path.as_deref(),
+        manifest,
+        thread_policy,
+        bootstrap_ticks,
+    );
     let analytics = pipeline.analytics_provider();
-    let (mut world, mut persistence) =
-        match WorldState::with_persistence(config, Box::new(pipeline.sink())) {
-            Ok(boundary) => boundary,
-            Err(error) => {
-                return finish_with_storage(Err(error.into()), "world construction", || {
-                    shutdown_storage(&mut pipeline).map(|_| ())
-                });
-            }
-        };
+    let mut persistence = match world.bind_persistence(Box::new(pipeline.sink())) {
+        Ok(persistence) => persistence,
+        Err(error) => {
+            return finish_with_storage(Err(error.into()), "world persistence binding", || {
+                shutdown_storage(&mut pipeline).map(|_| ())
+            });
+        }
+    };
     let bootstrap_result = (|| -> Result<()> {
-        let brain_keys = install_brains(&mut world)?.population;
-        seed_agents(&mut world, &brain_keys)?;
-
-        // PROVENANCE. Freeze the manifest and the first scientific digest here — after the brains
-        // are installed and the agents seeded, so the roster is real — and BEFORE any bootstrap
-        // tick, so those fields describe the run as it was launched. Disk emission waits until the
-        // requested session steps complete and the matching end digest exists.
-        //
-        // Until now `main` never wrote a manifest at all: the type was well-built
-        // and thoroughly tested and simply never reached disk, so every claim about
-        // provenanced, reproducible runs was true of the LIBRARY and false of the
-        // PRODUCT. A user could not tell which build, which seed, or which config
-        // produced a run directory.
-        let pending_manifest = prepare_run_manifest(
-            &world,
-            manifest_storage_path.as_deref(),
-            thread_policy,
-            bootstrap_ticks,
-        );
-
         for _ in 0..bootstrap_ticks {
             persistence.step(&mut world)?;
         }
@@ -1163,12 +1245,27 @@ fn bootstrap_world(
 }
 
 fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
+    compose_config_with_scenario(cli).map(|(config, _scenario)| config)
+}
+
+/// Compose the effective configuration and its exact ordered layer provenance in one pass.
+///
+/// Reading each layer once is load-bearing: re-reading files after composition could digest
+/// bytes different from those that actually configured the run.
+fn compose_config_with_scenario(cli: &AppCli) -> Result<(ScriptBotsConfig, ScenarioIdentityV0)> {
     let mut config = ScriptBotsConfig {
         persistence_interval: 60,
         history_capacity: 600,
         ..ScriptBotsConfig::default()
     };
-    config = apply_config_layers(config, &cli.config_layers)?;
+    let scenario_id = if cli.config_layers.is_empty() {
+        "scriptbots-app-default-v1"
+    } else {
+        "scriptbots-app-layered-v1"
+    };
+    let mut scenario = ScenarioIdentityV0::caller_seeded(scenario_id);
+    scenario.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
+    config = apply_config_layers_with_scenario(config, &cli.config_layers, &mut scenario)?;
     apply_env_overrides(&mut config);
     if let Some(seed) = cli.rng_seed {
         config.rng_seed = Some(seed);
@@ -1185,7 +1282,7 @@ fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
     config
         .validate()
         .context("invalid composed ScriptBots configuration")?;
-    Ok(config)
+    Ok((config, scenario))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1303,10 +1400,10 @@ struct AppCli {
     /// Exit immediately after emitting configuration output.
     #[arg(long = "config-only", action = ArgAction::SetTrue)]
     config_only: bool,
-    /// Capture a bounded V0 characterization trace from tick zero and exit (maximum 256 ticks).
+    /// Capture the bounded characterization trace from tick zero and exit (maximum 256 ticks).
     #[arg(long = "characterize-v0", value_name = "TICKS")]
     characterize_v0: Option<u64>,
-    /// Write the V0 characterization trace to this file instead of standard output.
+    /// Write the characterization trace to this file instead of standard output.
     #[arg(
         long = "characterization-out",
         value_name = "FILE",
@@ -1380,13 +1477,32 @@ enum ConfigFormat {
 }
 
 fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<ScriptBotsConfig> {
+    apply_config_layers_internal(base, layers, None)
+}
+
+fn apply_config_layers_with_scenario(
+    base: ScriptBotsConfig,
+    layers: &[PathBuf],
+    scenario: &mut ScenarioIdentityV0,
+) -> Result<ScriptBotsConfig> {
+    apply_config_layers_internal(base, layers, Some(scenario))
+}
+
+fn apply_config_layers_internal(
+    base: ScriptBotsConfig,
+    layers: &[PathBuf],
+    mut scenario: Option<&mut ScenarioIdentityV0>,
+) -> Result<ScriptBotsConfig> {
     if layers.is_empty() {
         return Ok(base);
     }
 
     let mut merged = serde_json::to_value(&base).context("failed to serialize base config")?;
     for path in layers {
-        let layer_value = load_config_layer(path)?;
+        let (layer_value, source_bytes) = load_config_layer_with_source(path)?;
+        if let Some(scenario) = scenario.as_mut() {
+            scenario.record_config_layer(&source_bytes);
+        }
         info!(
             layer = %path.display(),
             "Applying configuration layer"
@@ -1407,21 +1523,24 @@ fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<Scr
     )
 }
 
-fn load_config_layer(path: &Path) -> Result<JsonValue> {
-    let contents = fs::read_to_string(path)
+fn load_config_layer_with_source(path: &Path) -> Result<(JsonValue, Vec<u8>)> {
+    let source_bytes = fs::read(path)
         .with_context(|| format!("failed to read configuration layer {}", path.display()))?;
+    let contents = std::str::from_utf8(&source_bytes)
+        .with_context(|| format!("configuration layer {} is not valid UTF-8", path.display()))?;
 
-    match path
+    let value = match path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .as_deref()
     {
-        Some("ron") => ron::from_str(&contents)
+        Some("ron") => ron::from_str(contents)
             .with_context(|| format!("failed to parse RON config layer {}", path.display())),
-        _ => toml::from_str(&contents)
+        _ => toml::from_str(contents)
             .with_context(|| format!("failed to parse TOML config layer {}", path.display())),
-    }
+    }?;
+    Ok((value, source_bytes))
 }
 
 fn merge_layer(base: &mut JsonValue, layer: JsonValue) {
@@ -2204,9 +2323,46 @@ fn profile_world_steps_with_storage(
     tick_limit: u64,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
+    thread_policy: ThreadPolicy,
+    mut scenario: ScenarioIdentityV0,
 ) -> Result<()> {
+    // Storage profiling performs only the requested measured steps; it has no startup warmup.
+    scenario.bootstrap_ticks = 0;
+    let mut run_config = config.clone();
+    let (root_seed, generated_seed) = materialize_run_seed(&mut run_config);
+    if generated_seed {
+        info!(
+            root_seed,
+            "Generated and pinned the storage profile's previously unspecified scientific seed"
+        );
+    }
+
     #[cfg(feature = "neuro")]
-    let _ = validated_neuroflow_config(config)?;
+    let _ = validated_neuroflow_config(&run_config)?;
+
+    // Materialize the complete launch state before opening storage. The database registration
+    // below therefore describes the exact seeded roster that will produce tick one, and a
+    // configuration/brain error cannot leave a reserved run file behind.
+    let mut world = WorldState::new(run_config)
+        .context("failed to construct storage profile before tick zero")?;
+    let brain_keys = install_brains(&mut world)?.population;
+    seed_agents(&mut world, &brain_keys)?;
+
+    let started_at_unix_ms = run_started_at_unix_ms()?;
+    let identity = RunIdentityV1::new(
+        allocate_run_id(),
+        started_at_unix_ms,
+        Some(tick_limit),
+        None,
+    );
+    identity
+        .validate()
+        .context("invalid finite storage-profile identity before registration")?;
+    let manifest = build_run_manifest(&world, identity, scenario, thread_policy)
+        .context("failed to build storage-profile provenance before tick zero")?;
+    let storage_record = manifest
+        .to_storage_record()
+        .context("failed to project storage-profile provenance before tick zero")?;
 
     let mut pipeline = match storage_mode {
         StorageMode::File => {
@@ -2218,37 +2374,45 @@ fn profile_world_steps_with_storage(
                 thresholds.metric,
             ) {
                 (Some(t), Some(a), Some(e), Some(m)) => {
-                    StoragePipeline::create_new_file_with_thresholds(&storage_path, t, a, e, m)
+                    StoragePipeline::create_new_file_for_run_with_thresholds(
+                        &storage_path,
+                        storage_record,
+                        t,
+                        a,
+                        e,
+                        m,
+                    )
                 }
-                _ => StoragePipeline::create_new_file(&storage_path),
+                _ => StoragePipeline::create_new_file_for_run(&storage_path, storage_record),
             }
             .with_context(|| {
-                format!("failed to initialize FrankenSQLite storage at {storage_path}")
+                format!(
+                    "failed to register storage-profile provenance and initialize FrankenSQLite storage at {storage_path}"
+                )
             })?
         }
-        StorageMode::Memory => StoragePipeline::memory_with_thresholds(
+        StorageMode::Memory => StoragePipeline::memory_for_run_with_thresholds(
+            storage_record,
             thresholds.tick.unwrap_or(64),
             thresholds.agent.unwrap_or(2048),
             thresholds.event.unwrap_or(512),
             thresholds.metric.unwrap_or(512),
-        )?,
+        )
+        .context("failed to register storage-profile provenance in volatile storage")?,
     };
 
-    let (mut world, mut persistence) =
-        match WorldState::with_persistence(config.clone(), Box::new(pipeline.sink())) {
-            Ok(boundary) => boundary,
-            Err(error) => {
-                return finish_with_storage(
-                    Err(error.into()),
-                    "profile world construction",
-                    || shutdown_storage(&mut pipeline).map(|_| ()),
-                );
-            }
-        };
+    let mut persistence = match world.bind_persistence(Box::new(pipeline.sink())) {
+        Ok(persistence) => persistence,
+        Err(error) => {
+            return finish_with_storage(
+                Err(error.into()),
+                "profile world persistence binding",
+                || shutdown_storage(&mut pipeline).map(|_| ()),
+            );
+        }
+    };
     let start = Instant::now();
     let profile_result = (|| -> Result<()> {
-        let brain_keys = install_brains(&mut world)?.population;
-        seed_agents(&mut world, &brain_keys)?;
         for _ in 0..tick_limit {
             persistence.step(&mut world)?;
         }
@@ -2290,17 +2454,15 @@ fn parse_tps_from_stdout(stdout: &[u8]) -> Option<f64> {
     None
 }
 
-static PROFILE_STORAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 fn configure_profile_child_storage(command: &mut Command, storage: StorageMode) {
     match storage {
         StorageMode::File => {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_nanos());
-            let sequence = PROFILE_STORAGE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+            let path_nonce = allocate_run_id();
             let path = env::temp_dir().join(format!(
-                "scriptbots-profile-{}-{timestamp}-{sequence}.sqlite",
+                "scriptbots-profile-{}-{timestamp}-{path_nonce}.sqlite",
                 std::process::id()
             ));
             command.env("SCRIPTBOTS_STORAGE_PATH", path);
@@ -3326,23 +3488,77 @@ mod tests {
     }
 
     #[test]
+    fn run_seed_materialization_is_one_time_and_preserves_explicit_values() {
+        let mut generated = ScriptBotsConfig::default();
+        let (seed, was_generated) = materialize_run_seed(&mut generated);
+        assert!(was_generated);
+        assert_eq!(generated.rng_seed, Some(seed));
+
+        let (same_seed, was_generated_again) = materialize_run_seed(&mut generated);
+        assert!(!was_generated_again);
+        assert_eq!(same_seed, seed);
+
+        let mut explicit = ScriptBotsConfig {
+            rng_seed: Some(u64::MAX),
+            ..ScriptBotsConfig::default()
+        };
+        assert_eq!(materialize_run_seed(&mut explicit), (u64::MAX, false));
+        assert_eq!(explicit.rng_seed, Some(u64::MAX));
+    }
+
+    #[test]
+    fn run_id_allocator_returns_canonical_nonzero_distinct_ids() {
+        let first = allocate_run_id();
+        let second = allocate_run_id();
+
+        assert_ne!(first.get(), 0);
+        assert_ne!(second.get(), 0);
+        assert_ne!(first, second);
+        assert_eq!(first.to_string(), format!("{:032x}", first.get()));
+        assert_eq!(second.to_string(), format!("{:032x}", second.get()));
+    }
+
+    #[test]
     fn run_manifest_records_requested_bootstrap_before_tick_zero() {
         let world = WorldState::new(ScriptBotsConfig {
             rng_seed: Some(0xB007_57A4),
             ..ScriptBotsConfig::default()
         })
         .expect("world");
+        let identity = RunIdentityV1::new(
+            RunId::new(0xB007_57A4),
+            1_752_515_200_000,
+            None,
+            Some(LIVE_RUN_POLICY.to_owned()),
+        );
+        let thread_policy = resolve_thread_policy(None, None, None, false);
 
-        let manifest = build_run_manifest(&world, 37).expect("manifest");
+        let mut scenario = ScenarioIdentityV0::caller_seeded("manifest-test");
+        scenario.bootstrap_ticks = 37;
+        let manifest =
+            build_run_manifest(&world, identity, scenario, thread_policy).expect("manifest");
 
         assert_eq!(
             world.tick().0,
             0,
             "manifest emission must not advance science"
         );
+        assert_eq!(manifest.identity.run_id, RunId::new(0xB007_57A4));
+        assert_eq!(manifest.identity.requested_tick_budget, None);
+        assert_eq!(
+            manifest.identity.live_run_policy.as_deref(),
+            Some(LIVE_RUN_POLICY)
+        );
         assert_eq!(manifest.scenario.bootstrap_ticks, 37);
         assert!(manifest.bootstrap_evidence.is_none());
-        assert_eq!(manifest.schema, scriptbots_app::RUN_MANIFEST_V1_SCHEMA);
+        assert_eq!(manifest.schema, scriptbots_app::RUN_MANIFEST_V2_SCHEMA);
+        assert_eq!(
+            manifest
+                .thread_policy
+                .as_ref()
+                .map(|policy| policy.source.as_str()),
+            Some("builtin-default")
+        );
     }
 
     #[test]
@@ -3635,7 +3851,7 @@ mod tests {
             population_spawn_interval: 0,
             ..ScriptBotsConfig::default()
         };
-        let mut pipeline = StoragePipeline::memory().expect("volatile pipeline");
+        let mut pipeline = StoragePipeline::unattributed_memory().expect("volatile pipeline");
         let (mut world, mut persistence) =
             WorldState::with_persistence(config, Box::new(pipeline.sink()))
                 .expect("world with persistence");
@@ -3662,7 +3878,7 @@ mod tests {
             population_spawn_interval: 0,
             ..ScriptBotsConfig::default()
         };
-        let mut pipeline = StoragePipeline::memory().expect("volatile pipeline");
+        let mut pipeline = StoragePipeline::unattributed_memory().expect("volatile pipeline");
         let (mut world, mut persistence) =
             WorldState::with_persistence(config, Box::new(pipeline.sink()))
                 .expect("world with persistence");
@@ -3694,7 +3910,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("durable-receipt.sqlite");
         let mut durable_pipeline =
-            StoragePipeline::create_new_file(path.to_str().expect("utf8 test path"))
+            StoragePipeline::create_unattributed_file(path.to_str().expect("utf8 test path"))
                 .expect("durable pipeline");
         let durable_admission = durable_pipeline
             .submit_with_receipt(&persistence_batch_at(11))
@@ -3725,7 +3941,8 @@ mod tests {
         assert!(rendered.contains("applied=Some"));
         assert!(rendered.contains("durable=None"));
 
-        let mut volatile_pipeline = StoragePipeline::memory().expect("volatile pipeline");
+        let mut volatile_pipeline =
+            StoragePipeline::unattributed_memory().expect("volatile pipeline");
         let volatile_admission = volatile_pipeline
             .submit_with_receipt(&persistence_batch_at(12))
             .expect("volatile admission");
@@ -3769,9 +3986,10 @@ mod tests {
         let path = dir.path().join("run.sqlite");
         fs::write(&path, b"existing-run").expect("create existing run fixture");
 
-        let error = StoragePipeline::create_new_file(path.to_str().expect("utf8 test path"))
-            .err()
-            .expect("existing run path must be rejected");
+        let error =
+            StoragePipeline::create_unattributed_file(path.to_str().expect("utf8 test path"))
+                .err()
+                .expect("existing run path must be rejected");
         assert!(error.to_string().contains("refusing to reuse"));
         assert_eq!(fs::read(&path).expect("read existing run"), b"existing-run");
     }
@@ -3783,9 +4001,10 @@ mod tests {
         let wal = PathBuf::from(format!("{}-wal", path.display()));
         fs::write(&wal, b"stale-wal").expect("write stale WAL fixture");
 
-        let error = StoragePipeline::create_new_file(path.to_str().expect("utf8 test path"))
-            .err()
-            .expect("orphaned WAL must prevent run reuse");
+        let error =
+            StoragePipeline::create_unattributed_file(path.to_str().expect("utf8 test path"))
+                .err()
+                .expect("orphaned WAL must prevent run reuse");
         assert!(error.to_string().contains("stale FrankenSQLite sidecar"));
         assert!(!path.exists(), "reservation must not create the main file");
         assert_eq!(fs::read(wal).expect("read stale WAL"), b"stale-wal");
@@ -3820,9 +4039,14 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("interrupted.sqlite");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline =
-            StoragePipeline::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)
-                .expect("create recovery fixture");
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )
+        .expect("create recovery fixture");
         let admission = pipeline
             .submit_with_receipt(&scriptbots_core::PersistenceBatch {
                 summary: TickSummary {
@@ -3883,26 +4107,30 @@ mod tests {
 
     #[test]
     fn new_run_reservation_rejects_volatile_and_uri_path_shapes() {
-        let error = StoragePipeline::create_new_file(":memory:")
+        let error = StoragePipeline::create_unattributed_file(":memory:")
             .err()
             .expect("file mode must reject the in-memory engine path");
-        assert!(error.to_string().contains("StoragePipeline::memory"));
+        assert!(
+            error
+                .to_string()
+                .contains("explicit Storage or StoragePipeline memory constructors")
+        );
         assert!(
             !Path::new(":memory:").exists(),
             "reservation must not create a literal :memory: file"
         );
 
-        let error = StoragePipeline::create_new_file("")
+        let error = StoragePipeline::create_unattributed_file("")
             .err()
             .expect("file mode must reject an empty path");
         assert!(error.to_string().contains("non-empty path"));
 
-        let error = StoragePipeline::create_new_file("   \t")
+        let error = StoragePipeline::create_unattributed_file("   \t")
             .err()
             .expect("file mode must reject a whitespace-only path");
         assert!(error.to_string().contains("non-empty path"));
 
-        let error = StoragePipeline::create_new_file("file:run.sqlite?mode=memory")
+        let error = StoragePipeline::create_unattributed_file("file:run.sqlite?mode=memory")
             .err()
             .expect("file mode must reject file: URI paths");
         assert!(error.to_string().contains("file: URI"));
@@ -3964,6 +4192,31 @@ mod tests {
         let result =
             AppCli::try_parse_from(["scriptbots-app", "--characterization-out", "trace.json"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn characterization_materializes_and_records_an_unspecified_seed() {
+        let dir = tempdir().expect("tempdir");
+        let output = dir.path().join("trace.json");
+        let mut cli = default_cli();
+        cli.characterization_out = Some(output.clone());
+        let config = ScriptBotsConfig {
+            rng_seed: None,
+            ..ScriptBotsConfig::default()
+        };
+        let scenario = ScenarioIdentityV0::caller_seeded("characterization-seed-test");
+
+        run_characterization_v0(&cli, config, scenario, 0)
+            .expect("capture zero-tick characterization");
+        let trace: CharacterizationTraceV1 =
+            serde_json::from_slice(&fs::read(output).expect("read characterization artifact"))
+                .expect("decode characterization trace");
+        let root_seed = trace.manifest.root_seed;
+        assert_eq!(
+            trace.manifest.normalized_config["rng_seed"],
+            serde_json::json!(root_seed),
+            "the manifest must carry the exact materialized seed used by the world"
+        );
     }
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4030,6 +4283,32 @@ activation = "Sigmoid"
 
     #[test]
     #[serial]
+    fn composed_scenario_digests_the_exact_ordered_layer_bytes() {
+        let dir = tempdir().expect("tempdir");
+        let first_path = dir.path().join("first.toml");
+        let second_path = dir.path().join("second.toml");
+        let first = b"rng_seed = 41\nworld_width = 801\n";
+        let second = b"rng_seed = 42\nworld_height = 602\n";
+        fs::write(&first_path, first).expect("write first layer");
+        fs::write(&second_path, second).expect("write second layer");
+
+        let mut cli = default_cli();
+        cli.config_layers = vec![first_path, second_path];
+        let (config, scenario) =
+            compose_config_with_scenario(&cli).expect("compose scenario provenance");
+
+        let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v1");
+        expected.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
+        expected.record_config_layer(first);
+        expected.record_config_layer(second);
+        assert_eq!(scenario, expected);
+        assert_eq!(config.rng_seed, Some(42));
+        assert_eq!(config.world_width, 801);
+        assert_eq!(config.world_height, 602);
+    }
+
+    #[test]
+    #[serial]
     fn cli_config_layer_rejects_invalid_finite_float_with_field_path() {
         let dir = tempdir().expect("tempdir");
         let layer = dir.path().join("invalid.toml");
@@ -4082,7 +4361,7 @@ activation = "Sigmoid"
 
         {
             let mut pipeline =
-                StoragePipeline::create_new_file_with_thresholds(&db_str, 1, 1, 1, 1)
+                StoragePipeline::create_unattributed_file_with_thresholds(&db_str, 1, 1, 1, 1)
                     .expect("pipeline");
             let (mut world, mut persistence) =
                 WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))
@@ -4131,9 +4410,10 @@ activation = "Sigmoid"
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime-error.sqlite");
         let db_str = db_path.to_string_lossy().to_string();
-        let mut pipeline =
-            StoragePipeline::create_new_file_with_thresholds(&db_str, 64, 4096, 1024, 1024)
-                .expect("pipeline");
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &db_str, 64, 4096, 1024, 1024,
+        )
+        .expect("pipeline");
         let config = ScriptBotsConfig {
             persistence_interval: 5,
             population_minimum: 0,
@@ -4249,7 +4529,7 @@ activation = "Sigmoid"
         rejected_persistence
             .step(&mut rejected)
             .expect("non-boundary tick");
-        let mut pipeline = StoragePipeline::memory().expect("cleanup pipeline");
+        let mut pipeline = StoragePipeline::unattributed_memory().expect("cleanup pipeline");
         let operation: Result<()> = Err(anyhow::anyhow!("injected runtime failure"));
         let error = finish_with_storage(operation, "runtime", || {
             let finalization = finalize_world_persistence(&mut rejected, &mut rejected_persistence);
@@ -4440,6 +4720,7 @@ activation = "Sigmoid"
                 ThresholdsOverride::default(),
                 DEFAULT_BOOTSTRAP_TICKS,
                 resolve_thread_policy(None, None, None, false),
+                ScenarioIdentityV0::caller_seeded("invalid-neuroflow-test"),
             )
             .err()
             .expect("adapter validation must fail before storage setup");
@@ -4479,6 +4760,8 @@ activation = "Sigmoid"
                 1,
                 StorageMode::File,
                 ThresholdsOverride::default(),
+                resolve_thread_policy(None, None, None, false),
+                ScenarioIdentityV0::caller_seeded("invalid-neuroflow-profile-test"),
             )
             .expect_err("adapter validation must fail before profiling storage setup");
             let path_exists = path.exists();

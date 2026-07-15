@@ -3,7 +3,7 @@
 //! Deliberate design improvement over the original bead spec: instead of a
 //! checked-in binary fixture DB (+ regeneration script that inevitably
 //! drifts), every test synthesizes its own run database in a tempdir via the
-//! real storage write path (`Storage::create_new_file` → `persist` → `flush`
+//! real storage write path (`Storage::create_unattributed_file` → `persist` → `flush`
 //! → `close`) and then reads it back through the real read path
 //! (`StorageReader`). No binary blobs in git, no fixture drift, and the
 //! storage crate's own admission machinery is exercised end-to-end.
@@ -56,7 +56,7 @@ fn synth_db(dir: &tempfile::TempDir) -> String {
 
 fn synth_db_with_replay(dir: &tempfile::TempDir, include_replay: bool) -> String {
     let path = dir.path().join("run.sqlite").display().to_string();
-    let mut storage = Storage::create_new_file(&path).expect("create synth run db");
+    let mut storage = Storage::create_unattributed_file(&path).expect("create synth run db");
     for (tick, pop, energy) in [(1u64, 10usize, 100.0f32), (2, 12, 130.0), (3, 8, 90.0)] {
         let mut tick_batch = batch(tick, pop, energy);
         if include_replay && tick == 1 {
@@ -254,7 +254,10 @@ fn narrative_timeline_orders_serializes_and_limits_replay_events() {
         .expect("limited timeline");
     assert_eq!(limited.row_count, 1);
     assert_eq!(limited.machine["events"].as_array().map(Vec::len), Some(1));
-    assert_eq!(limited.machine["events"][0]["tick"], 1);
+    assert_eq!(
+        limited.machine["events"][0]["tick"], 3,
+        "a bounded timeline page must retain the newest event, not the oldest prefix"
+    );
     assert_eq!(limited.machine["truncated_to"], 1);
 }
 

@@ -16,6 +16,7 @@ use scriptbots_core::{
     WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
 };
+use scriptbots_runtime::RunId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,7 +45,8 @@ const DEFAULT_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
-const OUTBOX_PAYLOAD_VERSION: u32 = 3;
+const MAX_STORAGE_QUERY_PAGE: usize = 4_096;
+const OUTBOX_PAYLOAD_VERSION: u32 = 4;
 const STORAGE_WRITER_LOCK_SUFFIX: &str = ".scriptbots-writer.lock";
 
 /// Files FrankenSQLite may create beside its primary database.
@@ -58,286 +60,155 @@ pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
     "-lock-pending",
 ];
 
-/// Canonical one-shot DDL for the production ScriptBots scientific workload tables.
+/// Current schema version for new ScriptBots run databases.
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 6;
+
+/// Canonical fresh-install DDL for the run-scoped ScriptBots persistence schema.
 ///
-/// This export is versioned independently of the historical migration ledger. It exists for
-/// conformance harnesses that need the exact current table constraints without copying a weaker
-/// approximation of the production schema. Storage recovery continues to use the immutable
-/// migration sequence below.
-pub const SCRIPTBOTS_SCHEMA_V1: &str = r#"
-    CREATE TABLE ticks (
-        tick INTEGER PRIMARY KEY CHECK (tick >= 0),
-        epoch INTEGER NOT NULL CHECK (epoch >= 0),
-        closed INTEGER NOT NULL CHECK (closed IN (0, 1)),
-        agent_count INTEGER NOT NULL CHECK (agent_count >= 0),
-        births INTEGER NOT NULL CHECK (births >= 0),
-        deaths INTEGER NOT NULL CHECK (deaths >= 0),
-        total_energy REAL NOT NULL,
-        average_energy REAL NOT NULL,
-        average_health REAL NOT NULL
-    );
-    CREATE TABLE metrics (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        name TEXT NOT NULL,
-        value REAL NOT NULL,
-        PRIMARY KEY (tick, name)
-    );
-    CREATE TABLE events (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        kind TEXT NOT NULL,
-        count INTEGER NOT NULL CHECK (count >= 0),
-        PRIMARY KEY (tick, kind)
-    );
-    CREATE TABLE replay_events (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        seq INTEGER NOT NULL CHECK (seq >= 0),
-        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
-        scope TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        PRIMARY KEY (tick, seq)
-    );
-    CREATE TABLE agents (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
-        generation INTEGER NOT NULL CHECK (generation >= 0),
-        age INTEGER NOT NULL CHECK (age >= 0),
-        position_x REAL NOT NULL,
-        position_y REAL NOT NULL,
-        velocity_x REAL NOT NULL,
-        velocity_y REAL NOT NULL,
-        heading REAL NOT NULL,
-        health REAL NOT NULL,
-        energy REAL NOT NULL,
-        color_r REAL NOT NULL,
-        color_g REAL NOT NULL,
-        color_b REAL NOT NULL,
-        spike_length REAL NOT NULL,
-        boost INTEGER NOT NULL CHECK (boost IN (0, 1)),
-        herbivore_tendency REAL NOT NULL,
-        sound_multiplier REAL NOT NULL,
-        reproduction_counter REAL NOT NULL,
-        mutation_rate_primary REAL NOT NULL,
-        mutation_rate_secondary REAL NOT NULL,
-        trait_smell REAL NOT NULL,
-        trait_sound REAL NOT NULL,
-        trait_hearing REAL NOT NULL,
-        trait_eye REAL NOT NULL,
-        trait_blood REAL NOT NULL,
-        give_intent REAL NOT NULL,
-        brain_binding TEXT NOT NULL,
-        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
-        food_delta REAL NOT NULL,
-        spiked INTEGER NOT NULL CHECK (spiked IN (0, 1)),
-        hybrid INTEGER NOT NULL CHECK (hybrid IN (0, 1)),
-        sound_output REAL NOT NULL,
-        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
-        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
-        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
-        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
-        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
-        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
-        PRIMARY KEY (tick, agent_uid)
-    );
-    CREATE TABLE births (
-        tick INTEGER NOT NULL,
-        agent_uid INTEGER NOT NULL,
-        spawn_ordinal INTEGER NOT NULL,
-        birth_ordinal INTEGER,
-        parent_a INTEGER,
-        parent_b INTEGER,
-        brain_kind TEXT,
-        brain_key INTEGER,
-        herbivore_tendency REAL NOT NULL,
-        generation INTEGER NOT NULL,
-        position_x REAL NOT NULL,
-        position_y REAL NOT NULL,
-        is_hybrid INTEGER NOT NULL,
-        origin TEXT NOT NULL,
-        PRIMARY KEY (tick, agent_uid),
-        CHECK (tick >= 0),
-        CHECK (agent_uid >= 0),
-        CHECK (spawn_ordinal >= 0),
-        CHECK ((birth_ordinal IS NULL) OR (birth_ordinal >= 0)),
-        CHECK ((parent_a IS NULL) OR (parent_a >= 0)),
-        CHECK ((parent_b IS NULL) OR (parent_b >= 0)),
-        CHECK ((brain_key IS NULL) OR (brain_key >= 0)),
-        CHECK (generation >= 0),
-        CHECK (is_hybrid IN (0, 1)),
-        CHECK (origin IN ('born', 'seeded', 'injected')),
-        CHECK ((origin != 'seeded') OR (tick = 0)),
-        CHECK (
-            ((origin = 'born') AND (birth_ordinal IS NOT NULL))
-            OR ((origin IN ('seeded', 'injected')) AND (birth_ordinal IS NULL))
-        )
-    );
-    CREATE UNIQUE INDEX births_agent_uid_unique ON births (agent_uid);
-    CREATE UNIQUE INDEX births_spawn_ordinal_unique ON births (spawn_ordinal);
-    CREATE UNIQUE INDEX births_birth_ordinal_unique ON births (birth_ordinal);
-    CREATE TABLE deaths (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
-        age INTEGER NOT NULL CHECK (age >= 0),
-        generation INTEGER NOT NULL CHECK (generation >= 0),
-        herbivore_tendency REAL NOT NULL,
-        brain_kind TEXT,
-        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
-        energy REAL NOT NULL,
-        food_balance_total REAL NOT NULL,
-        cause TEXT NOT NULL,
-        was_hybrid INTEGER NOT NULL CHECK (was_hybrid IN (0, 1)),
-        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
-        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
-        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
-        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
-        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
-        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
-        PRIMARY KEY (tick, agent_uid)
-    );
-    CREATE UNIQUE INDEX deaths_agent_uid_unique ON deaths (agent_uid);
-"#;
-
-const SCRIPTBOTS_SCHEMA_V3: &str = "
-    CREATE TABLE ticks (
-        tick INTEGER PRIMARY KEY CHECK (tick >= 0),
-        epoch INTEGER NOT NULL CHECK (epoch >= 0),
-        closed INTEGER NOT NULL CHECK (closed IN (0, 1)),
-        agent_count INTEGER NOT NULL CHECK (agent_count >= 0),
-        births INTEGER NOT NULL CHECK (births >= 0),
-        deaths INTEGER NOT NULL CHECK (deaths >= 0),
-        total_energy REAL NOT NULL,
-        average_energy REAL NOT NULL,
-        average_health REAL NOT NULL
-    );
-    CREATE TABLE metrics (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        name TEXT NOT NULL,
-        value REAL NOT NULL,
-        PRIMARY KEY (tick, name)
-    );
-    CREATE TABLE events (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        kind TEXT NOT NULL,
-        count INTEGER NOT NULL CHECK (count >= 0),
-        PRIMARY KEY (tick, kind)
-    );
-    CREATE TABLE replay_events (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        seq INTEGER NOT NULL CHECK (seq >= 0),
-        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
-        scope TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        PRIMARY KEY (tick, seq)
-    );
-    CREATE TABLE agents (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
-        generation INTEGER NOT NULL CHECK (generation >= 0),
-        age INTEGER NOT NULL CHECK (age >= 0),
-        position_x REAL NOT NULL,
-        position_y REAL NOT NULL,
-        velocity_x REAL NOT NULL,
-        velocity_y REAL NOT NULL,
-        heading REAL NOT NULL,
-        health REAL NOT NULL,
-        energy REAL NOT NULL,
-        color_r REAL NOT NULL,
-        color_g REAL NOT NULL,
-        color_b REAL NOT NULL,
-        spike_length REAL NOT NULL,
-        boost INTEGER NOT NULL CHECK (boost IN (0, 1)),
-        herbivore_tendency REAL NOT NULL,
-        sound_multiplier REAL NOT NULL,
-        reproduction_counter REAL NOT NULL,
-        mutation_rate_primary REAL NOT NULL,
-        mutation_rate_secondary REAL NOT NULL,
-        trait_smell REAL NOT NULL,
-        trait_sound REAL NOT NULL,
-        trait_hearing REAL NOT NULL,
-        trait_eye REAL NOT NULL,
-        trait_blood REAL NOT NULL,
-        give_intent REAL NOT NULL,
-        brain_binding TEXT NOT NULL,
-        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
-        food_delta REAL NOT NULL,
-        spiked INTEGER NOT NULL CHECK (spiked IN (0, 1)),
-        hybrid INTEGER NOT NULL CHECK (hybrid IN (0, 1)),
-        sound_output REAL NOT NULL,
-        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
-        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
-        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
-        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
-        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
-        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
-        PRIMARY KEY (tick, agent_uid)
-    );
-    CREATE TABLE births (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
-        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
-        birth_ordinal INTEGER NOT NULL CHECK (birth_ordinal >= 0),
-        parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
-        parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
-        brain_kind TEXT,
-        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
-        herbivore_tendency REAL NOT NULL,
-        generation INTEGER NOT NULL CHECK (generation >= 0),
-        position_x REAL NOT NULL,
-        position_y REAL NOT NULL,
-        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
-        PRIMARY KEY (tick, agent_uid)
-    );
-    CREATE TABLE deaths (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
-        age INTEGER NOT NULL CHECK (age >= 0),
-        generation INTEGER NOT NULL CHECK (generation >= 0),
-        herbivore_tendency REAL NOT NULL,
-        brain_kind TEXT,
-        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
-        energy REAL NOT NULL,
-        food_balance_total REAL NOT NULL,
-        cause TEXT NOT NULL,
-        was_hybrid INTEGER NOT NULL CHECK (was_hybrid IN (0, 1)),
-        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
-        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
-        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
-        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
-        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
-        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
-        PRIMARY KEY (tick, agent_uid)
-    );
-";
-
-const SCRIPTBOTS_SCHEMA_V4: &str = "
-    CREATE TABLE storage_progress (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        admitted_batch_id INTEGER NOT NULL CHECK (admitted_batch_id >= 0),
-        applied_batch_id INTEGER NOT NULL CHECK (
-            applied_batch_id >= 0 AND applied_batch_id <= admitted_batch_id
+/// Run identifiers, explicitly lossless manifest scalars, opaque identifiers, canonical JSON,
+/// and digests use text. Scientific counters retain the existing checked signed-integer boundary.
+/// This is deliberately a clean lineage: existing v3-v5 databases require an explicit
+/// export/import migration rather than an in-place rewrite.
+pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
+    CREATE TABLE runs (
+        run_id TEXT PRIMARY KEY CHECK (run_id <> ''),
+        manifest_schema_version INTEGER NOT NULL CHECK (manifest_schema_version >= 0),
+        experiment_id TEXT,
+        variant_id TEXT,
+        scenario_id TEXT NOT NULL CHECK (scenario_id <> ''),
+        scenario_version INTEGER NOT NULL CHECK (scenario_version >= 0),
+        normalized_config_json TEXT NOT NULL CHECK (normalized_config_json <> ''),
+        config_digest TEXT NOT NULL CHECK (config_digest <> ''),
+        root_seed_hex TEXT NOT NULL CHECK (root_seed_hex <> ''),
+        rng_algorithm TEXT NOT NULL CHECK (rng_algorithm <> ''),
+        rng_version INTEGER NOT NULL CHECK (rng_version >= 0),
+        brain_roster_json TEXT NOT NULL CHECK (brain_roster_json <> ''),
+        source_revision TEXT,
+        source_tree_digest TEXT,
+        source_tree_dirty INTEGER CHECK (
+            source_tree_dirty IS NULL OR source_tree_dirty IN (0, 1)
         ),
-        durable_batch_id INTEGER NOT NULL CHECK (
-            durable_batch_id >= 0 AND durable_batch_id <= applied_batch_id
+        source_bundle_digest TEXT,
+        rust_toolchain TEXT NOT NULL CHECK (rust_toolchain <> ''),
+        cargo_lock_digest TEXT NOT NULL CHECK (cargo_lock_digest <> ''),
+        target_triple TEXT NOT NULL CHECK (target_triple <> ''),
+        started_at_unix_ms_hex TEXT NOT NULL CHECK (started_at_unix_ms_hex <> ''),
+        requested_tick_budget_hex TEXT,
+        live_run_policy TEXT,
+        reproducible INTEGER NOT NULL CHECK (reproducible IN (0, 1)),
+        manifest_json TEXT NOT NULL CHECK (manifest_json <> ''),
+        manifest_digest TEXT NOT NULL CHECK (manifest_digest <> ''),
+        CHECK (
+            (requested_tick_budget_hex IS NOT NULL AND live_run_policy IS NULL)
+            OR (requested_tick_budget_hex IS NULL AND live_run_policy IS NOT NULL)
         )
     );
-    INSERT INTO storage_progress (
-        singleton, admitted_batch_id, applied_batch_id, durable_batch_id
-    ) VALUES (1, 0, 0, 0);
-    CREATE TABLE storage_batch_ledger (
-        batch_id INTEGER PRIMARY KEY CHECK (batch_id > 0),
-        tick INTEGER NOT NULL UNIQUE CHECK (tick >= 0),
-        payload_digest TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('admitted', 'applied', 'durable'))
-    );
-    CREATE TABLE storage_outbox (
-        batch_id INTEGER PRIMARY KEY CHECK (batch_id > 0),
-        payload TEXT NOT NULL
-    );
-";
+    CREATE INDEX runs_started_at_index ON runs (started_at_unix_ms_hex, run_id);
 
-const SCRIPTBOTS_SCHEMA_V5: &str = "
-    CREATE TABLE births_v5 (
+    CREATE TABLE run_features (
+        run_id TEXT NOT NULL,
+        feature TEXT NOT NULL CHECK (feature <> ''),
+        PRIMARY KEY (run_id, feature),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+
+    CREATE TABLE tick_summaries (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        epoch INTEGER NOT NULL CHECK (epoch >= 0),
+        closed INTEGER NOT NULL CHECK (closed IN (0, 1)),
+        agent_count INTEGER NOT NULL CHECK (agent_count >= 0),
+        births INTEGER NOT NULL CHECK (births >= 0),
+        deaths INTEGER NOT NULL CHECK (deaths >= 0),
+        total_energy REAL NOT NULL,
+        average_energy REAL NOT NULL,
+        average_health REAL NOT NULL,
+        PRIMARY KEY (run_id, tick),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+
+    CREATE TABLE metrics (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        name TEXT NOT NULL CHECK (name <> ''),
+        value REAL NOT NULL,
+        PRIMARY KEY (run_id, tick, name),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX metrics_run_name_tick_index ON metrics (run_id, name, tick);
+
+    CREATE TABLE events (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        count INTEGER NOT NULL CHECK (count >= 0),
+        PRIMARY KEY (run_id, tick, kind),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX events_run_kind_tick_index ON events (run_id, kind, tick);
+
+    CREATE TABLE replay_events (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
+        scope TEXT NOT NULL CHECK (scope <> ''),
+        event_type TEXT NOT NULL CHECK (event_type <> ''),
+        payload TEXT NOT NULL,
+        PRIMARY KEY (run_id, tick, seq),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX replay_events_run_agent_tick_index
+        ON replay_events (run_id, agent_uid, tick, seq);
+
+    CREATE TABLE agents (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        age INTEGER NOT NULL CHECK (age >= 0),
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        velocity_x REAL NOT NULL,
+        velocity_y REAL NOT NULL,
+        heading REAL NOT NULL,
+        health REAL NOT NULL,
+        energy REAL NOT NULL,
+        color_r REAL NOT NULL,
+        color_g REAL NOT NULL,
+        color_b REAL NOT NULL,
+        spike_length REAL NOT NULL,
+        boost INTEGER NOT NULL CHECK (boost IN (0, 1)),
+        herbivore_tendency REAL NOT NULL,
+        sound_multiplier REAL NOT NULL,
+        reproduction_counter REAL NOT NULL,
+        mutation_rate_primary REAL NOT NULL,
+        mutation_rate_secondary REAL NOT NULL,
+        trait_smell REAL NOT NULL,
+        trait_sound REAL NOT NULL,
+        trait_hearing REAL NOT NULL,
+        trait_eye REAL NOT NULL,
+        trait_blood REAL NOT NULL,
+        give_intent REAL NOT NULL,
+        brain_binding TEXT NOT NULL,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        food_delta REAL NOT NULL,
+        spiked INTEGER NOT NULL CHECK (spiked IN (0, 1)),
+        hybrid INTEGER NOT NULL CHECK (hybrid IN (0, 1)),
+        sound_output REAL NOT NULL,
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        PRIMARY KEY (run_id, tick, agent_uid),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX agents_run_agent_tick_index ON agents (run_id, agent_uid, tick);
+
+    CREATE TABLE births (
+        run_id TEXT NOT NULL,
         tick INTEGER NOT NULL CHECK (tick >= 0),
         agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
         spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
@@ -357,25 +228,211 @@ const SCRIPTBOTS_SCHEMA_V5: &str = "
             (origin = 'born' AND birth_ordinal IS NOT NULL)
             OR (origin IN ('seeded', 'injected') AND birth_ordinal IS NULL)
         ),
-        PRIMARY KEY (tick, agent_uid)
+        PRIMARY KEY (run_id, tick, agent_uid),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
     );
-    INSERT INTO births_v5 (
-        tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
-        brain_kind, brain_key, herbivore_tendency, generation,
-        position_x, position_y, is_hybrid, origin
-    )
-    SELECT
-        tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
-        brain_kind, brain_key, herbivore_tendency, generation,
-        position_x, position_y, is_hybrid, 'born'
-    FROM births;
-    DROP TABLE births;
-    ALTER TABLE births_v5 RENAME TO births;
-    CREATE UNIQUE INDEX births_agent_uid_unique ON births (agent_uid);
-    CREATE UNIQUE INDEX births_spawn_ordinal_unique ON births (spawn_ordinal);
-    CREATE UNIQUE INDEX births_birth_ordinal_unique ON births (birth_ordinal);
-    CREATE UNIQUE INDEX deaths_agent_uid_unique ON deaths (agent_uid);
-";
+    CREATE UNIQUE INDEX births_run_agent_uid_unique ON births (run_id, agent_uid);
+    CREATE UNIQUE INDEX births_run_spawn_ordinal_unique ON births (run_id, spawn_ordinal);
+    CREATE UNIQUE INDEX births_run_birth_ordinal_unique ON births (run_id, birth_ordinal);
+    CREATE INDEX births_run_parent_a_tick_index ON births (run_id, parent_a, tick);
+    CREATE INDEX births_run_parent_b_tick_index ON births (run_id, parent_b, tick);
+
+    CREATE TABLE deaths (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        age INTEGER NOT NULL CHECK (age >= 0),
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        herbivore_tendency REAL NOT NULL,
+        brain_kind TEXT,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        energy REAL NOT NULL,
+        food_balance_total REAL NOT NULL,
+        cause TEXT NOT NULL CHECK (cause <> ''),
+        was_hybrid INTEGER NOT NULL CHECK (was_hybrid IN (0, 1)),
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        PRIMARY KEY (run_id, tick, agent_uid),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE UNIQUE INDEX deaths_run_agent_uid_unique ON deaths (run_id, agent_uid);
+    CREATE INDEX deaths_run_cause_tick_index ON deaths (run_id, cause, tick);
+
+    CREATE TABLE storage_progress (
+        run_id TEXT NOT NULL,
+        singleton INTEGER NOT NULL CHECK (singleton = 1),
+        admitted_batch_id INTEGER NOT NULL CHECK (admitted_batch_id >= 0),
+        applied_batch_id INTEGER NOT NULL CHECK (
+            applied_batch_id >= 0 AND applied_batch_id <= admitted_batch_id
+        ),
+        durable_batch_id INTEGER NOT NULL CHECK (
+            durable_batch_id >= 0 AND durable_batch_id <= applied_batch_id
+        ),
+        PRIMARY KEY (run_id, singleton),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+
+    CREATE TABLE storage_batch_ledger (
+        run_id TEXT NOT NULL,
+        batch_id INTEGER NOT NULL CHECK (batch_id > 0),
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        payload_digest TEXT NOT NULL CHECK (payload_digest <> ''),
+        state TEXT NOT NULL CHECK (state IN ('admitted', 'applied', 'durable')),
+        PRIMARY KEY (run_id, batch_id),
+        UNIQUE (run_id, tick),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX storage_batch_ledger_run_state_batch_index
+        ON storage_batch_ledger (run_id, state, batch_id);
+
+    CREATE TABLE storage_outbox (
+        run_id TEXT NOT NULL,
+        batch_id INTEGER NOT NULL CHECK (batch_id > 0),
+        payload TEXT NOT NULL,
+        PRIMARY KEY (run_id, batch_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+
+    CREATE TABLE commands (
+        run_id TEXT NOT NULL,
+        command_id TEXT NOT NULL CHECK (command_id <> ''),
+        issued_at_tick INTEGER NOT NULL CHECK (issued_at_tick >= 0),
+        issued_ordinal INTEGER NOT NULL CHECK (issued_ordinal >= 0),
+        command_type TEXT NOT NULL CHECK (command_type <> ''),
+        source TEXT NOT NULL CHECK (source <> ''),
+        payload_json TEXT NOT NULL CHECK (payload_json <> ''),
+        requested_at_utc TEXT NOT NULL CHECK (requested_at_utc <> ''),
+        PRIMARY KEY (run_id, command_id),
+        UNIQUE (run_id, issued_at_tick, issued_ordinal),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX commands_run_tick_ordinal_index
+        ON commands (run_id, issued_at_tick, issued_ordinal);
+
+    CREATE TABLE command_status_transitions (
+        run_id TEXT NOT NULL,
+        command_id TEXT NOT NULL CHECK (command_id <> ''),
+        transition_ordinal INTEGER NOT NULL CHECK (transition_ordinal >= 0),
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        status TEXT NOT NULL CHECK (status <> ''),
+        detail_json TEXT NOT NULL CHECK (detail_json <> ''),
+        recorded_at_utc TEXT NOT NULL CHECK (recorded_at_utc <> ''),
+        PRIMARY KEY (run_id, command_id, transition_ordinal),
+        FOREIGN KEY (run_id, command_id) REFERENCES commands (run_id, command_id)
+    );
+    CREATE INDEX command_status_run_tick_index
+        ON command_status_transitions (run_id, tick, transition_ordinal);
+
+    CREATE TABLE domain_events (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        actor_agent_uid INTEGER CHECK (actor_agent_uid IS NULL OR actor_agent_uid >= 0),
+        target_agent_uid INTEGER CHECK (target_agent_uid IS NULL OR target_agent_uid >= 0),
+        payload_json TEXT NOT NULL CHECK (payload_json <> ''),
+        PRIMARY KEY (run_id, tick, seq),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX domain_events_run_kind_tick_index
+        ON domain_events (run_id, kind, tick, seq);
+
+    CREATE TABLE checkpoints (
+        run_id TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL CHECK (checkpoint_id <> ''),
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0),
+        format TEXT NOT NULL CHECK (format <> ''),
+        payload TEXT NOT NULL,
+        payload_digest TEXT NOT NULL CHECK (payload_digest <> ''),
+        metadata_json TEXT NOT NULL CHECK (metadata_json <> ''),
+        PRIMARY KEY (run_id, checkpoint_id),
+        UNIQUE (run_id, tick, checkpoint_ordinal),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX checkpoints_run_tick_index
+        ON checkpoints (run_id, tick, checkpoint_ordinal);
+
+    CREATE TABLE state_digests (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        digest_kind TEXT NOT NULL CHECK (digest_kind <> ''),
+        digest TEXT NOT NULL CHECK (digest <> ''),
+        canonicalization_version INTEGER NOT NULL CHECK (canonicalization_version >= 0),
+        PRIMARY KEY (run_id, tick, digest_kind),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX state_digests_run_kind_tick_index
+        ON state_digests (run_id, digest_kind, tick);
+
+    CREATE TABLE artifacts (
+        run_id TEXT NOT NULL,
+        artifact_id TEXT NOT NULL CHECK (artifact_id <> ''),
+        tick INTEGER CHECK (tick IS NULL OR tick >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        path TEXT NOT NULL CHECK (path <> ''),
+        media_type TEXT NOT NULL CHECK (media_type <> ''),
+        size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+        content_digest TEXT NOT NULL CHECK (content_digest <> ''),
+        metadata_json TEXT NOT NULL CHECK (metadata_json <> ''),
+        PRIMARY KEY (run_id, artifact_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX artifacts_run_kind_tick_index ON artifacts (run_id, kind, tick);
+
+    CREATE TABLE genomes (
+        run_id TEXT NOT NULL,
+        genome_id TEXT NOT NULL CHECK (genome_id <> ''),
+        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
+        created_at_tick INTEGER NOT NULL CHECK (created_at_tick >= 0),
+        brain_kind TEXT NOT NULL CHECK (brain_kind <> ''),
+        genome_json TEXT NOT NULL CHECK (genome_json <> ''),
+        genome_digest TEXT NOT NULL CHECK (genome_digest <> ''),
+        provenance_json TEXT NOT NULL CHECK (provenance_json <> ''),
+        PRIMARY KEY (run_id, genome_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX genomes_run_agent_tick_index
+        ON genomes (run_id, agent_uid, created_at_tick);
+    CREATE INDEX genomes_run_digest_index ON genomes (run_id, genome_digest);
+
+    CREATE TABLE lineage_edges (
+        run_id TEXT NOT NULL,
+        child_agent_uid INTEGER NOT NULL CHECK (child_agent_uid >= 0),
+        parent_agent_uid INTEGER NOT NULL CHECK (parent_agent_uid >= 0),
+        parent_ordinal INTEGER NOT NULL CHECK (parent_ordinal >= 0),
+        relationship TEXT NOT NULL CHECK (relationship <> ''),
+        birth_tick INTEGER NOT NULL CHECK (birth_tick >= 0),
+        PRIMARY KEY (run_id, child_agent_uid, parent_ordinal),
+        UNIQUE (run_id, child_agent_uid, parent_agent_uid, relationship),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX lineage_edges_run_parent_index
+        ON lineage_edges (run_id, parent_agent_uid, birth_tick);
+
+    CREATE TABLE interactions (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        actor_agent_uid INTEGER CHECK (actor_agent_uid IS NULL OR actor_agent_uid >= 0),
+        target_agent_uid INTEGER CHECK (target_agent_uid IS NULL OR target_agent_uid >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        value REAL,
+        payload_json TEXT NOT NULL CHECK (payload_json <> ''),
+        PRIMARY KEY (run_id, tick, seq),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    CREATE INDEX interactions_run_actor_tick_index
+        ON interactions (run_id, actor_agent_uid, tick, seq);
+    CREATE INDEX interactions_run_target_tick_index
+        ON interactions (run_id, target_agent_uid, tick, seq);
+
+    PRAGMA user_version = 6;
+"#;
 
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaObject {
@@ -399,15 +456,24 @@ impl SchemaObject {
 }
 
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
-    MigrationRunner::new()
-        .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
+    let result = MigrationRunner::new()
         .add(
-            4,
-            "create_stable_uid_persistence_outbox",
-            SCRIPTBOTS_SCHEMA_V4,
+            SCRIPTBOTS_SCHEMA_VERSION,
+            "create_multi_run_schema",
+            SCRIPTBOTS_SCHEMA_V6,
         )
-        .add(5, "record_birth_origin", SCRIPTBOTS_SCHEMA_V5)
         .run(connection)?;
+    let applied_is_valid = result.applied.is_empty()
+        || (result.applied.len() == 1 && result.applied[0] == SCRIPTBOTS_SCHEMA_VERSION);
+    if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
+        return Err(StorageError::InvalidData {
+            context: "_schema_migrations",
+            reason: format!(
+                "expected schema version {SCRIPTBOTS_SCHEMA_VERSION} with no pending lineage, got current={} applied={:?} fresh={}",
+                result.current, result.applied, result.was_fresh
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -469,6 +535,7 @@ fn canonical_schema_objects() -> Result<Vec<SchemaObject>, StorageError> {
 }
 
 const AGENT_COLUMNS: &[&str] = &[
+    "run_id",
     "tick",
     "agent_uid",
     "generation",
@@ -528,6 +595,1076 @@ pub fn scriptbots_agent_insert_sql() -> &'static str {
             .join(", ");
         format!("insert or replace into agents ({columns}) values ({placeholders})")
     })
+}
+
+const MAX_RUN_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RUN_FEATURES: usize = 1_024;
+const MAX_RUN_LABEL_BYTES: usize = 512;
+const MAX_RUN_IDENTITY_BYTES: usize = 128;
+const MAX_LIVE_RUN_POLICY_BYTES: usize = 256;
+const MAX_MANIFEST_TEXT_BYTES: usize = 64 * 1024;
+const CONFIG_DIGEST_ENCODING_V1: &str = "blake3-canonical-json-v1";
+
+/// Queryable provenance registered atomically before a run may persist tick zero.
+///
+/// The complete canonical manifest remains available in [`Self::manifest_json`]. The
+/// duplicated scalar fields are the bounded, indexed projection needed by run browsers and
+/// experiment tooling; they must describe the same manifest and are intentionally storage-owned
+/// so the database crate never depends on an application frontend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunManifestRecord {
+    /// Durable outer key for every scientific and operational record in this run.
+    pub run_id: RunId,
+    /// Schema version of the canonical manifest JSON.
+    pub manifest_schema_version: u16,
+    /// Optional experiment grouping key.
+    pub experiment_id: Option<String>,
+    /// Optional matched-seed variant key within an experiment.
+    pub variant_id: Option<String>,
+    /// Stable scenario identifier.
+    pub scenario_id: String,
+    /// Scenario schema version.
+    pub scenario_version: u16,
+    /// Canonical normalized configuration JSON.
+    pub normalized_config_json: String,
+    /// Digest of the normalized configuration.
+    pub config_digest: String,
+    /// Root seed, preserved losslessly as an unsigned value and stored as fixed-width hex.
+    pub root_seed: u64,
+    /// Random-stream implementation identifier.
+    pub rng_algorithm: String,
+    /// Random-stream state protocol version.
+    pub rng_version: u16,
+    /// Canonical JSON describing the initial brain-family roster and versions.
+    pub brain_roster_json: String,
+    /// Source revision, when captured.
+    pub source_revision: Option<String>,
+    /// Digest covering the source state used for the run.
+    pub source_tree_digest: Option<String>,
+    /// Whether the source tree was known to be dirty.
+    pub source_tree_dirty: Option<bool>,
+    /// Digest of an exact reviewed dirty-source bundle, when present.
+    pub source_bundle_digest: Option<String>,
+    /// Compiler/toolchain identity.
+    pub rust_toolchain: String,
+    /// Digest of the resolved Cargo lockfile.
+    pub cargo_lock_digest: String,
+    /// Compilation target triple or equivalent stable target identity.
+    pub target_triple: String,
+    /// Wall-clock start metadata, never a deterministic input.
+    pub started_at_unix_ms: u64,
+    /// Requested finite scientific tick budget, if the run is bounded by ticks.
+    pub requested_tick_budget: Option<u64>,
+    /// Explicit policy name for an open-ended run.
+    pub live_run_policy: Option<String>,
+    /// Whether the captured provenance is sufficient for strict reproduction.
+    pub reproducible: bool,
+    /// Sorted, deduplicated compile/runtime feature names.
+    pub features: Vec<String>,
+    /// Canonical complete manifest JSON.
+    pub manifest_json: String,
+}
+
+/// Bounded run-browser row used to discover an explicit [`RunId`] without bypassing storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCatalogEntry {
+    pub run_id: RunId,
+    pub manifest_schema_version: u16,
+    pub experiment_id: Option<String>,
+    pub variant_id: Option<String>,
+    pub scenario_id: String,
+    pub scenario_version: u16,
+    pub started_at_unix_ms: u64,
+    pub reproducible: bool,
+}
+
+impl RunManifestRecord {
+    /// Create a minimal, explicitly non-reproducible record for tests and embedders that do not
+    /// yet supply application provenance.
+    ///
+    /// Production startup uses [`StoragePipeline::create_new_file_for_run`] with a complete
+    /// record. This constructor remains useful for isolated in-memory storage tests, while making
+    /// the missing provenance machine-readable rather than silently absent.
+    #[must_use]
+    pub fn unattributed(run_id: RunId) -> Self {
+        let run_id_text = run_id.to_string();
+        Self {
+            run_id,
+            manifest_schema_version: 0,
+            experiment_id: None,
+            variant_id: None,
+            scenario_id: "unattributed".to_owned(),
+            scenario_version: 0,
+            normalized_config_json: "{}".to_owned(),
+            config_digest: "unattributed".to_owned(),
+            root_seed: 0,
+            rng_algorithm: "unattributed".to_owned(),
+            rng_version: 0,
+            brain_roster_json: "[]".to_owned(),
+            source_revision: None,
+            source_tree_digest: None,
+            source_tree_dirty: None,
+            source_bundle_digest: None,
+            rust_toolchain: "unattributed".to_owned(),
+            cargo_lock_digest: "unattributed".to_owned(),
+            target_triple: "unattributed".to_owned(),
+            started_at_unix_ms: 0,
+            requested_tick_budget: None,
+            live_run_policy: Some("unattributed".to_owned()),
+            reproducible: false,
+            features: Vec::new(),
+            manifest_json: format!(
+                "{{\"run_id\":\"{run_id_text}\",\"schema\":\"scriptbots.run-manifest.unattributed.v0\"}}"
+            ),
+        }
+    }
+
+    fn validate_and_normalize(mut self) -> Result<Self, StorageError> {
+        fn validate_label(
+            context: &'static str,
+            value: &str,
+            allow_empty: bool,
+        ) -> Result<(), StorageError> {
+            if (!allow_empty && value.trim().is_empty())
+                || value.len() > MAX_RUN_LABEL_BYTES
+                || value.chars().any(char::is_control)
+            {
+                return Err(StorageError::InvalidData {
+                    context,
+                    reason: format!(
+                        "value must be nonblank, control-free, and at most {MAX_RUN_LABEL_BYTES} bytes"
+                    ),
+                });
+            }
+            Ok(())
+        }
+
+        if self.run_id.get() == 0 {
+            return Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                reason: "zero is reserved and cannot identify a durable run".to_owned(),
+            });
+        }
+
+        for (context, value) in [
+            ("runs.scenario_id", self.scenario_id.as_str()),
+            ("runs.config_digest", self.config_digest.as_str()),
+            ("runs.rng_algorithm", self.rng_algorithm.as_str()),
+            ("runs.rust_toolchain", self.rust_toolchain.as_str()),
+            ("runs.cargo_lock_digest", self.cargo_lock_digest.as_str()),
+            ("runs.target_triple", self.target_triple.as_str()),
+        ] {
+            validate_label(context, value, false)?;
+        }
+        for (context, value) in [
+            ("runs.experiment_id", self.experiment_id.as_deref()),
+            ("runs.variant_id", self.variant_id.as_deref()),
+            ("runs.source_revision", self.source_revision.as_deref()),
+            (
+                "runs.source_tree_digest",
+                self.source_tree_digest.as_deref(),
+            ),
+            (
+                "runs.source_bundle_digest",
+                self.source_bundle_digest.as_deref(),
+            ),
+            ("runs.live_run_policy", self.live_run_policy.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_label(context, value, false)?;
+            }
+        }
+        if self.requested_tick_budget.is_some() == self.live_run_policy.is_some() {
+            return Err(StorageError::InvalidData {
+                context: "runs.run_policy",
+                reason: "exactly one of requested_tick_budget or live_run_policy must be present"
+                    .to_owned(),
+            });
+        }
+        if self.normalized_config_json.len() > MAX_RUN_METADATA_BYTES
+            || self.brain_roster_json.len() > MAX_RUN_METADATA_BYTES
+            || self.manifest_json.len() > MAX_RUN_METADATA_BYTES
+        {
+            return Err(StorageError::InvalidData {
+                context: "runs.manifest_json",
+                reason: format!(
+                    "config, roster, and manifest JSON are each capped at {MAX_RUN_METADATA_BYTES} bytes"
+                ),
+            });
+        }
+        let config: Value =
+            serde_json::from_str(&self.normalized_config_json).map_err(|error| {
+                StorageError::InvalidData {
+                    context: "runs.normalized_config_json",
+                    reason: error.to_string(),
+                }
+            })?;
+        if !config.is_object() {
+            return Err(StorageError::InvalidData {
+                context: "runs.normalized_config_json",
+                reason: "normalized configuration must be a JSON object".to_owned(),
+            });
+        }
+        let roster: Value = serde_json::from_str(&self.brain_roster_json).map_err(|error| {
+            StorageError::InvalidData {
+                context: "runs.brain_roster_json",
+                reason: error.to_string(),
+            }
+        })?;
+        if !roster.is_array() {
+            return Err(StorageError::InvalidData {
+                context: "runs.brain_roster_json",
+                reason: "brain roster must be a JSON array".to_owned(),
+            });
+        }
+        let manifest: Value = serde_json::from_str(&self.manifest_json).map_err(|error| {
+            StorageError::InvalidData {
+                context: "runs.manifest_json",
+                reason: error.to_string(),
+            }
+        })?;
+        if !manifest.is_object() {
+            return Err(StorageError::InvalidData {
+                context: "runs.manifest_json",
+                reason: "run manifest must be a JSON object".to_owned(),
+            });
+        }
+        self.features.sort_unstable();
+        self.features.dedup();
+        if self.features.len() > MAX_RUN_FEATURES {
+            return Err(StorageError::InvalidData {
+                context: "run_features",
+                reason: format!("at most {MAX_RUN_FEATURES} features are accepted"),
+            });
+        }
+        for feature in &self.features {
+            validate_label("run_features.feature", feature, false)?;
+        }
+        match self.manifest_schema_version {
+            0 => {}
+            2 => validate_v2_manifest_projection(&self, &manifest, &config, &roster)?,
+            version => {
+                return Err(StorageError::InvalidData {
+                    context: "runs.manifest_schema_version",
+                    reason: format!("unsupported run manifest schema version {version}"),
+                });
+            }
+        }
+        if self.reproducible {
+            let source_is_reconstructable =
+                self.source_tree_dirty == Some(false) || self.source_bundle_digest.is_some();
+            if self.source_revision.is_none()
+                || self.source_tree_digest.is_none()
+                || !source_is_reconstructable
+            {
+                return Err(StorageError::InvalidData {
+                    context: "runs.reproducible",
+                    reason: "strict reproduction requires a source revision and tree digest plus either a clean tree or an exact source bundle"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(self)
+    }
+
+    fn manifest_digest(&self) -> Result<String, StorageError> {
+        let encoded = serde_json::to_vec(self).map_err(|error| StorageError::InvalidData {
+            context: "runs.manifest_digest",
+            reason: error.to_string(),
+        })?;
+        Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
+    }
+
+    fn root_seed_hex(&self) -> String {
+        format!("{:016x}", self.root_seed)
+    }
+
+    fn started_at_hex(&self) -> String {
+        format!("{:016x}", self.started_at_unix_ms)
+    }
+
+    fn tick_budget_hex(&self) -> Option<String> {
+        self.requested_tick_budget
+            .map(|value| format!("{value:016x}"))
+    }
+}
+
+fn validate_v2_manifest_projection(
+    record: &RunManifestRecord,
+    manifest: &Value,
+    normalized_config: &Value,
+    brain_roster: &Value,
+) -> Result<(), StorageError> {
+    let schema = manifest_required_bounded_string(manifest, "/schema", MAX_RUN_LABEL_BYTES)?;
+    if !matches!(
+        schema,
+        "scriptbots.run-manifest.v2" | "scriptbots.run-manifest.v2.1"
+    ) {
+        return Err(manifest_projection_error(format!(
+            "/schema is {schema:?}, expected a supported V2 manifest"
+        )));
+    }
+
+    require_manifest_projection(
+        manifest,
+        "/schema_version",
+        &json!(record.manifest_schema_version),
+    )?;
+    manifest_required_u16(manifest, "/schema_version")?;
+    let purpose = manifest_required_bounded_string(manifest, "/purpose", MAX_RUN_LABEL_BYTES)?;
+
+    validate_v2_identity(record, manifest)?;
+    validate_v2_thread_policy(manifest)?;
+    require_manifest_projection(manifest, "/root_seed", &json!(record.root_seed))?;
+    manifest_required_u64(manifest, "/root_seed")?;
+    validate_v2_random_stream(record, manifest)?;
+    for pointer in [
+        "/next_agent_uid",
+        "/next_spawn_ordinal",
+        "/next_birth_ordinal",
+    ] {
+        manifest_required_u64(manifest, pointer)?;
+    }
+    let bootstrap_ticks = validate_v2_scenario(record, manifest)?;
+
+    require_manifest_projection(manifest, "/normalized_config", normalized_config)?;
+    manifest_required_object(manifest, "/normalized_config")?;
+    let config_seed = manifest_required_u64(normalized_config, "/rng_seed")?;
+    if config_seed != record.root_seed {
+        return Err(manifest_projection_error(format!(
+            "/normalized_config/rng_seed is {config_seed}, expected root seed {}",
+            record.root_seed
+        )));
+    }
+    validate_v2_config_digest(record, manifest, normalized_config)?;
+    validate_v2_build(record, manifest)?;
+    validate_v2_brain_roster(manifest, brain_roster)?;
+    require_manifest_projection(manifest, "/reproducible", &json!(record.reproducible))?;
+    manifest_required_bool(manifest, "/reproducible")?;
+
+    let warnings = manifest_required_string_array(
+        manifest,
+        "/warnings",
+        MAX_RUN_FEATURES,
+        MAX_MANIFEST_TEXT_BYTES,
+    )?;
+    let build_warnings = manifest_required_string_array(
+        manifest,
+        "/build/warnings",
+        MAX_RUN_FEATURES,
+        MAX_MANIFEST_TEXT_BYTES,
+    )?;
+    if warnings != build_warnings {
+        return Err(manifest_projection_error(
+            "/warnings must exactly match /build/warnings",
+        ));
+    }
+    validate_v2_limitations(manifest, purpose)?;
+    validate_v2_bootstrap(manifest, schema, bootstrap_ticks)?;
+
+    Ok(())
+}
+
+fn validate_v2_identity(record: &RunManifestRecord, manifest: &Value) -> Result<(), StorageError> {
+    manifest_required_object(manifest, "/identity")?;
+    require_manifest_projection(manifest, "/identity/run_id", &json!(record.run_id))?;
+    require_omittable_manifest_projection(
+        manifest,
+        "/identity/experiment_id",
+        &json!(record.experiment_id),
+    )?;
+    require_omittable_manifest_projection(
+        manifest,
+        "/identity/variant_id",
+        &json!(record.variant_id),
+    )?;
+    manifest_omittable_nullable_string(
+        manifest,
+        "/identity/experiment_id",
+        MAX_RUN_IDENTITY_BYTES,
+    )?;
+    manifest_omittable_nullable_string(manifest, "/identity/variant_id", MAX_RUN_IDENTITY_BYTES)?;
+    for (pointer, expected) in [
+        (
+            "/identity/started_at_unix_ms",
+            json!(record.started_at_unix_ms),
+        ),
+        (
+            "/identity/requested_tick_budget",
+            json!(record.requested_tick_budget),
+        ),
+        ("/identity/live_run_policy", json!(record.live_run_policy)),
+    ] {
+        require_manifest_projection(manifest, pointer, &expected)?;
+    }
+    manifest_required_u64(manifest, "/identity/started_at_unix_ms")?;
+    manifest_required_nullable_u64(manifest, "/identity/requested_tick_budget")?;
+    manifest_required_nullable_string(
+        manifest,
+        "/identity/live_run_policy",
+        MAX_LIVE_RUN_POLICY_BYTES,
+        false,
+    )?;
+    Ok(())
+}
+
+fn validate_v2_thread_policy(manifest: &Value) -> Result<(), StorageError> {
+    manifest_required_object(manifest, "/thread_policy")?;
+    if let Some(threads) = manifest_required_nullable_u64(manifest, "/thread_policy/threads")? {
+        if threads == 0 || usize::try_from(threads).is_err() {
+            return Err(manifest_projection_error(
+                "/thread_policy/threads must fit usize and be greater than zero",
+            ));
+        }
+    }
+    manifest_required_bounded_string(manifest, "/thread_policy/source", MAX_RUN_LABEL_BYTES)?;
+    manifest_required_nullable_string(
+        manifest,
+        "/thread_policy/overridden",
+        MAX_RUN_LABEL_BYTES,
+        false,
+    )?;
+    Ok(())
+}
+
+fn validate_v2_random_stream(
+    record: &RunManifestRecord,
+    manifest: &Value,
+) -> Result<(), StorageError> {
+    manifest_required_object(manifest, "/random_stream")?;
+    require_manifest_projection(
+        manifest,
+        "/random_stream/algorithm",
+        &json!(record.rng_algorithm),
+    )?;
+    require_manifest_projection(
+        manifest,
+        "/random_stream/version",
+        &json!(record.rng_version),
+    )?;
+    manifest_required_bounded_string(manifest, "/random_stream/algorithm", MAX_RUN_LABEL_BYTES)?;
+    let version = manifest_required_u16(manifest, "/random_stream/version")?;
+    let codec_version = manifest_required_u16(manifest, "/random_stream/codec_version")?;
+    if version == 0 || codec_version == 0 {
+        return Err(manifest_projection_error(
+            "/random_stream version and codec_version must be greater than zero",
+        ));
+    }
+    let state = manifest_required_array(manifest, "/random_stream/state")?;
+    if state.is_empty() || state.len() > scriptbots_core::MAX_RANDOM_STREAM_STATE_BYTES {
+        return Err(manifest_projection_error(format!(
+            "/random_stream/state must contain 1..={} bytes",
+            scriptbots_core::MAX_RANDOM_STREAM_STATE_BYTES
+        )));
+    }
+    for (index, value) in state.iter().enumerate() {
+        if value.as_u64().is_none_or(|byte| byte > u64::from(u8::MAX)) {
+            return Err(manifest_projection_error(format!(
+                "/random_stream/state/{index} must be an integer byte"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_scenario(record: &RunManifestRecord, manifest: &Value) -> Result<u64, StorageError> {
+    manifest_required_object(manifest, "/scenario")?;
+    require_manifest_projection(manifest, "/scenario/id", &json!(record.scenario_id))?;
+    require_manifest_projection(
+        manifest,
+        "/scenario/schema_version",
+        &json!(record.scenario_version),
+    )?;
+    manifest_required_bounded_string(manifest, "/scenario/id", MAX_RUN_LABEL_BYTES)?;
+    manifest_required_u16(manifest, "/scenario/schema_version")?;
+    manifest_required_string_array(
+        manifest,
+        "/scenario/ordered_config_layer_digests",
+        MAX_RUN_FEATURES,
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    manifest_required_bounded_string(manifest, "/scenario/population_recipe", MAX_RUN_LABEL_BYTES)?;
+    manifest_required_u64(manifest, "/scenario/bootstrap_ticks")
+}
+
+fn validate_v2_config_digest(
+    record: &RunManifestRecord,
+    manifest: &Value,
+    normalized_config: &Value,
+) -> Result<(), StorageError> {
+    require_manifest_projection(manifest, "/config_digest", &json!(record.config_digest))?;
+    require_manifest_projection(
+        manifest,
+        "/config_digest_encoding",
+        &json!(CONFIG_DIGEST_ENCODING_V1),
+    )?;
+    manifest_required_bounded_string(manifest, "/config_digest", MAX_RUN_LABEL_BYTES)?;
+    manifest_required_bounded_string(manifest, "/config_digest_encoding", MAX_RUN_LABEL_BYTES)?;
+
+    let mut canonical_config = normalized_config.clone();
+    normalize_manifest_json_value(&mut canonical_config);
+    let encoded = serde_json::to_vec(&canonical_config).map_err(|error| {
+        manifest_projection_error(format!(
+            "could not encode /normalized_config canonically: {error}"
+        ))
+    })?;
+    let recomputed = format!("blake3:{}", blake3::hash(&encoded).to_hex());
+    if record.config_digest != recomputed {
+        return Err(manifest_projection_error(format!(
+            "/config_digest is {:?}, recomputed {recomputed:?} using {CONFIG_DIGEST_ENCODING_V1}",
+            record.config_digest
+        )));
+    }
+    Ok(())
+}
+
+fn validate_v2_build(record: &RunManifestRecord, manifest: &Value) -> Result<(), StorageError> {
+    manifest_required_object(manifest, "/build")?;
+    for pointer in ["/build/package_name", "/build/package_version"] {
+        manifest_required_bounded_string(manifest, pointer, MAX_RUN_LABEL_BYTES)?;
+    }
+    let source_revision = manifest_required_nullable_string(
+        manifest,
+        "/build/source_revision",
+        MAX_RUN_LABEL_BYTES,
+        false,
+    )?;
+    manifest_required_nullable_string(
+        manifest,
+        "/build/source_branch",
+        MAX_RUN_LABEL_BYTES,
+        false,
+    )?;
+    let source_tree_clean = manifest_required_nullable_bool(manifest, "/build/source_tree_clean")?;
+    let source_status_digest = manifest_required_nullable_string(
+        manifest,
+        "/build/source_status_digest",
+        MAX_RUN_LABEL_BYTES,
+        false,
+    )?;
+    let source_diff_digest = manifest_required_nullable_string(
+        manifest,
+        "/build/source_diff_digest",
+        MAX_RUN_LABEL_BYTES,
+        false,
+    )?;
+    let declared_toolchain = manifest_required_bounded_string(
+        manifest,
+        "/build/declared_toolchain",
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    let compiler_toolchain = manifest_required_nullable_string(
+        manifest,
+        "/build/compiler_toolchain",
+        MAX_RUN_LABEL_BYTES,
+        false,
+    )?;
+    let rustc_vv = manifest_required_nullable_string(
+        manifest,
+        "/build/rustc_vv",
+        MAX_MANIFEST_TEXT_BYTES,
+        false,
+    )?;
+    let toolchain_file_digest = manifest_required_bounded_string(
+        manifest,
+        "/build/toolchain_file_digest",
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    let lockfile_digest =
+        manifest_required_bounded_string(manifest, "/build/lockfile_digest", MAX_RUN_LABEL_BYTES)?;
+
+    require_manifest_projection(
+        manifest,
+        "/build/source_revision",
+        &json!(record.source_revision),
+    )?;
+    require_manifest_projection(
+        manifest,
+        "/build/source_tree_clean",
+        &json!(record.source_tree_dirty.map(|dirty| !dirty)),
+    )?;
+    require_manifest_projection(
+        manifest,
+        "/build/lockfile_digest",
+        &json!(record.cargo_lock_digest),
+    )?;
+    require_manifest_projection(
+        manifest,
+        "/build/compiled_features",
+        &json!(record.features),
+    )?;
+    manifest_required_string_array(
+        manifest,
+        "/build/compiled_features",
+        MAX_RUN_FEATURES,
+        MAX_RUN_LABEL_BYTES,
+    )?;
+
+    let projected_source_digest = source_diff_digest.or(source_status_digest);
+    if projected_source_digest != record.source_tree_digest.as_deref() {
+        return Err(manifest_projection_error(format!(
+            "source-tree digest projection is {:?}, expected {:?}",
+            projected_source_digest, record.source_tree_digest
+        )));
+    }
+    let source_bundle_digest = manifest_optional_extension_string(
+        manifest,
+        "/build/source_bundle_digest",
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    if source_bundle_digest != record.source_bundle_digest.as_deref() {
+        return Err(manifest_projection_error(format!(
+            "source-bundle digest projection is {:?}, expected {:?}",
+            source_bundle_digest, record.source_bundle_digest
+        )));
+    }
+
+    let projected_toolchain = compiler_toolchain.unwrap_or(declared_toolchain);
+    if projected_toolchain != record.rust_toolchain {
+        return Err(manifest_projection_error(format!(
+            "toolchain projection is {projected_toolchain:?}, expected {:?}",
+            record.rust_toolchain
+        )));
+    }
+
+    validate_v2_core_build(manifest)?;
+    for pointer in [
+        "/build/rustflags",
+        "/build/rayon_num_threads",
+        "/build/scriptbots_max_threads",
+    ] {
+        manifest_required_nullable_string(manifest, pointer, MAX_MANIFEST_TEXT_BYTES, true)?;
+    }
+    let provenance_complete = manifest_required_bool(manifest, "/build/provenance_complete")?;
+    if provenance_complete != record.reproducible {
+        return Err(manifest_projection_error(format!(
+            "/build/provenance_complete is {provenance_complete}, expected reproducible={}",
+            record.reproducible
+        )));
+    }
+    let derived_complete = source_revision.is_some()
+        && source_tree_clean == Some(true)
+        && source_status_digest.is_some()
+        && source_diff_digest.is_some()
+        && rustc_vv.is_some()
+        && !declared_toolchain.trim().is_empty()
+        && !toolchain_file_digest.trim().is_empty()
+        && !lockfile_digest.trim().is_empty();
+    if provenance_complete != derived_complete {
+        return Err(manifest_projection_error(format!(
+            "/build/provenance_complete is {provenance_complete}, but embedded evidence derives {derived_complete}"
+        )));
+    }
+
+    let target_arch =
+        manifest_required_bounded_string(manifest, "/build/core/target_arch", MAX_RUN_LABEL_BYTES)?;
+    let target_os =
+        manifest_required_bounded_string(manifest, "/build/core/target_os", MAX_RUN_LABEL_BYTES)?;
+    let target_triple = rustc_vv
+        .and_then(|details| details.lines().find_map(|line| line.strip_prefix("host: ")))
+        .filter(|host| !host.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{target_arch}-unknown-{target_os}"));
+    if target_triple != record.target_triple {
+        return Err(manifest_projection_error(format!(
+            "target projection is {target_triple:?}, expected {:?}",
+            record.target_triple
+        )));
+    }
+    Ok(())
+}
+
+fn validate_v2_core_build(manifest: &Value) -> Result<(), StorageError> {
+    manifest_required_object(manifest, "/build/core")?;
+    manifest_required_bool(manifest, "/build/core/parallel")?;
+    manifest_required_bool(manifest, "/build/core/simd_wide")?;
+    let rayon_threads = manifest_required_u64(manifest, "/build/core/rayon_threads")?;
+    if rayon_threads == 0 || usize::try_from(rayon_threads).is_err() {
+        return Err(manifest_projection_error(
+            "/build/core/rayon_threads must fit usize and be greater than zero",
+        ));
+    }
+    for pointer in [
+        "/build/core/target_arch",
+        "/build/core/target_os",
+        "/build/core/target_family",
+        "/build/core/target_endian",
+    ] {
+        manifest_required_bounded_string(manifest, pointer, MAX_RUN_LABEL_BYTES)?;
+    }
+    let pointer_width = manifest_required_u64(manifest, "/build/core/pointer_width")?;
+    if !matches!(pointer_width, 16 | 32 | 64) {
+        return Err(manifest_projection_error(
+            "/build/core/pointer_width must be 16, 32, or 64",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v2_brain_roster(manifest: &Value, brain_roster: &Value) -> Result<(), StorageError> {
+    require_manifest_projection(manifest, "/brain_roster", brain_roster)?;
+    let entries = manifest_required_array(manifest, "/brain_roster")?;
+    if entries.len() > MAX_RUN_FEATURES {
+        return Err(manifest_projection_error(format!(
+            "/brain_roster accepts at most {MAX_RUN_FEATURES} entries"
+        )));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(object) = entry.as_object() else {
+            return Err(manifest_projection_error(format!(
+                "/brain_roster/{index} must be an object"
+            )));
+        };
+        if object.get("registry_key").and_then(Value::as_u64).is_none() {
+            return Err(manifest_projection_error(format!(
+                "/brain_roster/{index}/registry_key must be an unsigned integer"
+            )));
+        }
+        let Some(kind) = object.get("kind").and_then(Value::as_str) else {
+            return Err(manifest_projection_error(format!(
+                "/brain_roster/{index}/kind must be a string"
+            )));
+        };
+        if kind.trim().is_empty() || kind.len() > MAX_RUN_LABEL_BYTES {
+            return Err(manifest_projection_error(format!(
+                "/brain_roster/{index}/kind must be nonblank and at most {MAX_RUN_LABEL_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_limitations(manifest: &Value, purpose: &str) -> Result<(), StorageError> {
+    manifest_required_object(manifest, "/limitations")?;
+    let limitations_purpose = manifest_required_bounded_string(
+        manifest,
+        "/limitations/purpose",
+        MAX_MANIFEST_TEXT_BYTES,
+    )?;
+    if limitations_purpose != purpose {
+        return Err(manifest_projection_error(format!(
+            "/limitations/purpose is {limitations_purpose:?}, expected /purpose {purpose:?}"
+        )));
+    }
+    for pointer in [
+        "/limitations/agent_identity",
+        "/limitations/source_identity",
+        "/limitations/comparison_lane",
+        "/limitations/superseded_by",
+    ] {
+        manifest_required_bounded_string(manifest, pointer, MAX_MANIFEST_TEXT_BYTES)?;
+    }
+    for pointer in [
+        "/limitations/evaluator_state_covered",
+        "/limitations/rng_state_restorable",
+        "/limitations/checkpoint_replay_guarantee",
+    ] {
+        manifest_required_bool(manifest, pointer)?;
+    }
+    Ok(())
+}
+
+fn validate_v2_bootstrap(
+    manifest: &Value,
+    schema: &str,
+    scenario_bootstrap_ticks: u64,
+) -> Result<(), StorageError> {
+    if schema == "scriptbots.run-manifest.v2" {
+        if manifest.pointer("/bootstrap_evidence").is_some() {
+            return Err(manifest_projection_error(
+                "/bootstrap_evidence is forbidden by scriptbots.run-manifest.v2",
+            ));
+        }
+        return Ok(());
+    }
+
+    manifest_required_object(manifest, "/bootstrap_evidence")?;
+    let requested = manifest_required_u64(manifest, "/bootstrap_evidence/requested")?;
+    let completed = manifest_required_u64(manifest, "/bootstrap_evidence/completed")?;
+    if requested != scenario_bootstrap_ticks {
+        return Err(manifest_projection_error(format!(
+            "/bootstrap_evidence/requested is {requested}, expected scenario bootstrap_ticks {scenario_bootstrap_ticks}"
+        )));
+    }
+    if completed != requested {
+        return Err(manifest_projection_error(format!(
+            "/bootstrap_evidence/completed is {completed}, expected requested {requested}"
+        )));
+    }
+    let start = validate_v2_world_digest(manifest, "/bootstrap_evidence/start")?;
+    let end = validate_v2_world_digest(manifest, "/bootstrap_evidence/end")?;
+    if start.tick.0 != 0 {
+        return Err(manifest_projection_error(format!(
+            "/bootstrap_evidence/start/tick is {}, expected 0",
+            start.tick.0
+        )));
+    }
+    let expected_end = start.tick.0.checked_add(completed).ok_or_else(|| {
+        manifest_projection_error("/bootstrap_evidence tick arithmetic overflowed")
+    })?;
+    if end.tick.0 != expected_end {
+        return Err(manifest_projection_error(format!(
+            "/bootstrap_evidence/end/tick is {}, expected {expected_end}",
+            end.tick.0
+        )));
+    }
+    if completed == 0 && start != end {
+        return Err(manifest_projection_error(
+            "zero-tick /bootstrap_evidence must carry identical start and end digests",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v2_world_digest(
+    manifest: &Value,
+    pointer: &str,
+) -> Result<scriptbots_core::WorldDigestV1, StorageError> {
+    let value = manifest_required_object(manifest, pointer)?;
+    for suffix in ["/uncovered_families", "/uncovered_factory_families"] {
+        manifest_required_string_array(value, suffix, MAX_RUN_FEATURES, MAX_RUN_LABEL_BYTES)?;
+    }
+    let digest: scriptbots_core::WorldDigestV1 =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            manifest_projection_error(format!(
+                "{pointer} is not a complete WorldDigestV1: {error}"
+            ))
+        })?;
+    digest.validate_contract().map_err(|error| {
+        manifest_projection_error(format!(
+            "{pointer} violates the WorldDigestV1 contract: {error}"
+        ))
+    })?;
+    Ok(digest)
+}
+
+fn require_manifest_projection(
+    manifest: &Value,
+    pointer: &str,
+    expected: &Value,
+) -> Result<(), StorageError> {
+    match manifest.pointer(pointer) {
+        Some(actual) if actual == expected => Ok(()),
+        actual => Err(manifest_projection_error(format!(
+            "{pointer} is {actual:?}, expected {expected}"
+        ))),
+    }
+}
+
+fn require_omittable_manifest_projection(
+    manifest: &Value,
+    pointer: &str,
+    expected: &Value,
+) -> Result<(), StorageError> {
+    match manifest.pointer(pointer) {
+        Some(actual) if actual == expected => Ok(()),
+        None if expected.is_null() => Ok(()),
+        actual => Err(manifest_projection_error(format!(
+            "{pointer} is {actual:?}, expected {expected}"
+        ))),
+    }
+}
+
+fn manifest_required_value<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+) -> Result<&'a Value, StorageError> {
+    manifest
+        .pointer(pointer)
+        .ok_or_else(|| manifest_projection_error(format!("{pointer} is required")))
+}
+
+fn manifest_required_object<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+) -> Result<&'a Value, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    if !value.is_object() {
+        return Err(manifest_projection_error(format!(
+            "{pointer} must be an object, found {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn manifest_required_array<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+) -> Result<&'a [Value], StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    value.as_array().map(Vec::as_slice).ok_or_else(|| {
+        manifest_projection_error(format!("{pointer} must be an array, found {value}"))
+    })
+}
+
+fn manifest_required_bounded_string<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+    maximum: usize,
+) -> Result<&'a str, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    let string = value.as_str().ok_or_else(|| {
+        manifest_projection_error(format!("{pointer} must be a string, found {value}"))
+    })?;
+    if string.trim().is_empty() || string.len() > maximum {
+        return Err(manifest_projection_error(format!(
+            "{pointer} must be nonblank and at most {maximum} bytes"
+        )));
+    }
+    Ok(string)
+}
+
+fn manifest_required_string_array<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+    maximum_items: usize,
+    maximum_string_bytes: usize,
+) -> Result<&'a [Value], StorageError> {
+    let values = manifest_required_array(manifest, pointer)?;
+    if values.len() > maximum_items {
+        return Err(manifest_projection_error(format!(
+            "{pointer} accepts at most {maximum_items} entries"
+        )));
+    }
+    for (index, value) in values.iter().enumerate() {
+        let Some(string) = value.as_str() else {
+            return Err(manifest_projection_error(format!(
+                "{pointer}/{index} must be a string"
+            )));
+        };
+        if string.trim().is_empty() || string.len() > maximum_string_bytes {
+            return Err(manifest_projection_error(format!(
+                "{pointer}/{index} must be nonblank and at most {maximum_string_bytes} bytes"
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn manifest_required_u64(manifest: &Value, pointer: &str) -> Result<u64, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    value.as_u64().ok_or_else(|| {
+        manifest_projection_error(format!(
+            "{pointer} must be an unsigned 64-bit integer, found {value}"
+        ))
+    })
+}
+
+fn manifest_required_u16(manifest: &Value, pointer: &str) -> Result<u16, StorageError> {
+    let value = manifest_required_u64(manifest, pointer)?;
+    u16::try_from(value).map_err(|_| {
+        manifest_projection_error(format!(
+            "{pointer} must fit an unsigned 16-bit integer, found {value}"
+        ))
+    })
+}
+
+fn manifest_required_bool(manifest: &Value, pointer: &str) -> Result<bool, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    value.as_bool().ok_or_else(|| {
+        manifest_projection_error(format!("{pointer} must be a boolean, found {value}"))
+    })
+}
+
+fn manifest_required_nullable_u64(
+    manifest: &Value,
+    pointer: &str,
+) -> Result<Option<u64>, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_u64().map(Some).ok_or_else(|| {
+        manifest_projection_error(format!(
+            "{pointer} must be an unsigned 64-bit integer or null, found {value}"
+        ))
+    })
+}
+
+fn manifest_required_nullable_bool(
+    manifest: &Value,
+    pointer: &str,
+) -> Result<Option<bool>, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_bool().map(Some).ok_or_else(|| {
+        manifest_projection_error(format!(
+            "{pointer} must be a boolean or null, found {value}"
+        ))
+    })
+}
+
+fn manifest_required_nullable_string<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+    maximum: usize,
+    allow_blank: bool,
+) -> Result<Option<&'a str>, StorageError> {
+    let value = manifest_required_value(manifest, pointer)?;
+    match manifest.pointer(pointer) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(string))
+            if string.len() <= maximum && (allow_blank || !string.trim().is_empty()) =>
+        {
+            Ok(Some(string))
+        }
+        _ => Err(manifest_projection_error(format!(
+            "{pointer} must be {}string or null and at most {maximum} bytes, found {value}",
+            if allow_blank { "a " } else { "a nonblank " }
+        ))),
+    }
+}
+
+fn manifest_omittable_nullable_string<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+    maximum: usize,
+) -> Result<Option<&'a str>, StorageError> {
+    match manifest.pointer(pointer) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(string)) if !string.trim().is_empty() && string.len() <= maximum => {
+            Ok(Some(string))
+        }
+        Some(value) => Err(manifest_projection_error(format!(
+            "{pointer} must be omitted, null, or a nonblank string of at most {maximum} bytes; found {value}"
+        ))),
+    }
+}
+
+fn manifest_optional_extension_string<'a>(
+    manifest: &'a Value,
+    pointer: &str,
+    maximum: usize,
+) -> Result<Option<&'a str>, StorageError> {
+    manifest_omittable_nullable_string(manifest, pointer, maximum)
+}
+
+fn normalize_manifest_json_value(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_manifest_json_value(value);
+            }
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<_> = std::mem::take(map).into_iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, mut value) in entries {
+                normalize_manifest_json_value(&mut value);
+                map.insert(key, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn manifest_projection_error(reason: impl Into<String>) -> StorageError {
+    StorageError::InvalidData {
+        context: "runs.manifest_json",
+        reason: reason.into(),
+    }
 }
 
 /// Storage error wrapper.
@@ -610,6 +1747,46 @@ enum StorageTarget {
     RecoverExisting(String),
 }
 
+#[derive(Debug)]
+enum RunOpen {
+    Register {
+        manifest: Box<ValidatedRunManifest>,
+        reject_existing: bool,
+    },
+    Recover(RunId),
+    RecoverSole,
+}
+
+#[derive(Debug)]
+struct ValidatedRunManifest(RunManifestRecord);
+
+impl ValidatedRunManifest {
+    fn new(manifest: RunManifestRecord) -> Result<Self, StorageError> {
+        manifest.validate_and_normalize().map(Self)
+    }
+}
+
+impl RunOpen {
+    fn register(manifest: RunManifestRecord, reject_existing: bool) -> Result<Self, StorageError> {
+        Ok(Self::Register {
+            manifest: Box::new(ValidatedRunManifest::new(manifest)?),
+            reject_existing,
+        })
+    }
+
+    fn unattributed() -> Result<Self, StorageError> {
+        Self::register(RunManifestRecord::unattributed(RunId::new(1)), false)
+    }
+
+    fn run_id(&self) -> Option<RunId> {
+        match self {
+            Self::Register { manifest, .. } => Some(manifest.0.run_id),
+            Self::Recover(run_id) => Some(*run_id),
+            Self::RecoverSole => None,
+        }
+    }
+}
+
 impl StorageTarget {
     fn path(&self) -> &str {
         match self {
@@ -646,7 +1823,7 @@ fn validate_durable_storage_path(path: &str) -> Result<(), StorageError> {
     }
     if trimmed == ":memory:" {
         return Err(invalid(
-            "the volatile :memory: engine is available only through Storage::memory or StoragePipeline::memory",
+            "the volatile :memory: engine is available only through the explicit Storage or StoragePipeline memory constructors",
         ));
     }
     if trimmed
@@ -718,7 +1895,8 @@ fn reserve_new_file_with_hook(
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
             return Err(StorageError::InvalidTarget {
                 path: path.display().to_string(),
-                reason: "refusing to reuse an existing single-run database path".to_owned(),
+                reason: "refusing to reuse an existing database path; use the explicit append-run or recovery API"
+                    .to_owned(),
             });
         }
         Err(source) => {
@@ -1246,6 +2424,7 @@ pub enum BatchPersistenceState {
 /// Query result for one batch in the compact persistence ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedBatchStatus {
+    pub run_id: RunId,
     pub batch_id: PersistenceBatchId,
     pub tick: u64,
     pub payload_digest: String,
@@ -1255,6 +2434,7 @@ pub struct PersistedBatchStatus {
 /// Synchronous proof that the exact batch payload entered the worker outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionReceipt {
+    pub run_id: RunId,
     pub batch_id: PersistenceBatchId,
     pub tick: u64,
     pub guarantee: PersistenceGuarantee,
@@ -1264,6 +2444,7 @@ pub struct AdmissionReceipt {
 /// Immutable, lock-free read model published after successful storage commits.
 #[derive(Debug, Clone)]
 pub struct AnalyticsSnapshot {
+    pub run_id: Option<RunId>,
     pub revision: u64,
     pub committed_tick: Option<u64>,
     pub committed_agent_count: Option<usize>,
@@ -1277,6 +2458,7 @@ pub struct AnalyticsSnapshot {
 impl Default for AnalyticsSnapshot {
     fn default() -> Self {
         Self {
+            run_id: None,
             revision: 0,
             committed_tick: None,
             committed_agent_count: None,
@@ -1303,6 +2485,34 @@ impl AnalyticsSnapshotProvider {
         }
     }
 
+    fn for_run(run_id: RunId) -> Self {
+        let mut snapshot = AnalyticsSnapshot::default();
+        snapshot.run_id = Some(run_id);
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(snapshot)),
+        }
+    }
+
+    fn bind_run(&self, run_id: RunId) {
+        self.inner.rcu(|current| {
+            if current.run_id == Some(run_id) {
+                return Arc::clone(current);
+            }
+            debug_assert!(current.run_id.is_none());
+            Arc::new(AnalyticsSnapshot {
+                run_id: Some(run_id),
+                revision: current.revision,
+                committed_tick: current.committed_tick,
+                committed_agent_count: current.committed_agent_count,
+                watermarks: current.watermarks,
+                readings: Arc::clone(&current.readings),
+                last_error: current.last_error.clone(),
+                last_failure: current.last_failure.clone(),
+                stopped: current.stopped,
+            })
+        });
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> Arc<AnalyticsSnapshot> {
         self.inner.load_full()
@@ -1314,6 +2524,7 @@ impl AnalyticsSnapshotProvider {
                 return Arc::clone(current);
             }
             Arc::new(AnalyticsSnapshot {
+                run_id: current.run_id,
                 revision: current.revision.saturating_add(1),
                 committed_tick: current.committed_tick,
                 committed_agent_count: current.committed_agent_count,
@@ -1332,6 +2543,7 @@ impl AnalyticsSnapshotProvider {
                 return Arc::clone(current);
             }
             Arc::new(AnalyticsSnapshot {
+                run_id: current.run_id,
                 revision: current.revision.saturating_add(1),
                 committed_tick: Some(pending.tick),
                 committed_agent_count: Some(pending.agent_count),
@@ -1357,6 +2569,7 @@ impl AnalyticsSnapshotProvider {
                 return Arc::clone(current);
             }
             Arc::new(AnalyticsSnapshot {
+                run_id: current.run_id,
                 revision: current.revision.saturating_add(1),
                 committed_tick: current.committed_tick,
                 committed_agent_count: current.committed_agent_count,
@@ -1375,6 +2588,7 @@ impl AnalyticsSnapshotProvider {
                 return Arc::clone(current);
             }
             Arc::new(AnalyticsSnapshot {
+                run_id: current.run_id,
                 revision: current.revision.saturating_add(1),
                 committed_tick: current.committed_tick,
                 committed_agent_count: current.committed_agent_count,
@@ -1758,6 +2972,7 @@ struct StorageBuffer {
 #[derive(Debug, Serialize, Deserialize)]
 struct OutboxPayload {
     version: u32,
+    run_id: RunId,
     tick: u64,
     storage: StorageBuffer,
 }
@@ -1765,18 +2980,21 @@ struct OutboxPayload {
 #[derive(Debug, Deserialize)]
 struct OutboxPayloadEnvelope {
     version: u32,
+    run_id: RunId,
     tick: u64,
 }
 
 #[derive(Serialize)]
 struct OutboxPayloadRef<'a> {
     version: u32,
+    run_id: RunId,
     tick: u64,
     storage: &'a StorageBuffer,
 }
 
 #[derive(Debug)]
 struct RecoveredOutboxBatch {
+    run_id: RunId,
     batch_id: PersistenceBatchId,
     tick: u64,
     payload_digest: String,
@@ -2134,10 +3352,11 @@ impl StorageBuffer {
         Ok(())
     }
 
-    fn encode_outbox(&self, tick: u64) -> Result<(String, String), StorageError> {
+    fn encode_outbox(&self, run_id: RunId, tick: u64) -> Result<(String, String), StorageError> {
         self.validate_contents(tick)?;
         let payload = serde_json::to_string(&OutboxPayloadRef {
             version: OUTBOX_PAYLOAD_VERSION,
+            run_id,
             tick,
             storage: self,
         })
@@ -2151,6 +3370,7 @@ impl StorageBuffer {
 
     fn decode_outbox(
         payload: &str,
+        expected_run_id: RunId,
         expected_tick: u64,
         expected_digest: &str,
     ) -> Result<Self, StorageError> {
@@ -2175,6 +3395,15 @@ impl StorageBuffer {
                 ),
             });
         }
+        if envelope.run_id != expected_run_id {
+            return Err(StorageError::InvalidData {
+                context: "storage_outbox.payload.run_id",
+                reason: format!(
+                    "ledger run {}, payload run {}",
+                    expected_run_id, envelope.run_id
+                ),
+            });
+        }
         if envelope.tick != expected_tick {
             return Err(StorageError::InvalidData {
                 context: "storage_outbox.payload.tick",
@@ -2190,6 +3419,7 @@ impl StorageBuffer {
                 reason: error.to_string(),
             })?;
         debug_assert_eq!(decoded.version, envelope.version);
+        debug_assert_eq!(decoded.run_id, envelope.run_id);
         debug_assert_eq!(decoded.tick, envelope.tick);
         decoded.storage.validate_contents(expected_tick)?;
         Ok(decoded.storage)
@@ -2210,6 +3440,37 @@ fn decode_batch_state(value: &str) -> Result<BatchPersistenceState, StorageError
 
 fn sqlite_bool(value: bool) -> SqliteValue {
     SqliteValue::Integer(i64::from(value))
+}
+
+fn sqlite_run_id(run_id: RunId) -> SqliteValue {
+    SqliteValue::from(run_id.to_string())
+}
+
+fn decode_run_id(row: &Row, index: usize, context: &'static str) -> Result<RunId, StorageError> {
+    let encoded: String = decode(row, index, context)?;
+    encoded.parse().map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
+}
+
+fn decode_hex_u64(context: &'static str, encoded: &str) -> Result<u64, StorageError> {
+    if encoded.len() != 16
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!(
+                "expected exactly 16 lowercase hexadecimal characters, got {encoded:?}"
+            ),
+        });
+    }
+    u64::from_str_radix(encoded, 16).map_err(|error| StorageError::InvalidData {
+        context,
+        reason: error.to_string(),
+    })
 }
 
 fn sqlite_optional_i64(value: Option<i64>) -> SqliteValue {
@@ -2314,6 +3575,18 @@ fn checked_i64(context: &'static str, value: usize) -> Result<i64, StorageError>
     })
 }
 
+fn checked_query_limit(context: &'static str, limit: usize) -> Result<i64, StorageError> {
+    if limit > MAX_STORAGE_QUERY_PAGE {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: format!(
+                "page size {limit} exceeds the bounded maximum {MAX_STORAGE_QUERY_PAGE}"
+            ),
+        });
+    }
+    checked_i64(context, limit)
+}
+
 /// Checked `u64` -> `i64` conversion for values headed into SQLite INTEGER
 /// columns. Values above `i64::MAX` would otherwise wrap negative on write
 /// while the read side rejects negatives, so out-of-range input must fail
@@ -2337,6 +3610,110 @@ fn decode<T: FromSqliteValue>(
         })
 }
 
+fn load_run_manifest(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<RunManifestRecord, StorageError> {
+    let row = connection.query_row_with_params(
+        "SELECT manifest_schema_version, experiment_id, variant_id,
+                scenario_id, scenario_version, normalized_config_json, config_digest,
+                root_seed_hex, rng_algorithm, rng_version, brain_roster_json,
+                source_revision, source_tree_digest, source_tree_dirty,
+                source_bundle_digest, rust_toolchain, cargo_lock_digest, target_triple,
+                started_at_unix_ms_hex, requested_tick_budget_hex, live_run_policy,
+                reproducible, manifest_json, manifest_digest
+         FROM runs
+         WHERE run_id = ?1",
+        &[sqlite_run_id(run_id)],
+    )?;
+    let manifest_schema_version = u16::try_from(checked_u32(
+        "runs.manifest_schema_version",
+        decode(&row, 0, "runs.manifest_schema_version")?,
+    )?)
+    .map_err(|error| StorageError::InvalidData {
+        context: "runs.manifest_schema_version",
+        reason: error.to_string(),
+    })?;
+    let scenario_version = u16::try_from(checked_u32(
+        "runs.scenario_version",
+        decode(&row, 4, "runs.scenario_version")?,
+    )?)
+    .map_err(|error| StorageError::InvalidData {
+        context: "runs.scenario_version",
+        reason: error.to_string(),
+    })?;
+    let rng_version = u16::try_from(checked_u32(
+        "runs.rng_version",
+        decode(&row, 9, "runs.rng_version")?,
+    )?)
+    .map_err(|error| StorageError::InvalidData {
+        context: "runs.rng_version",
+        reason: error.to_string(),
+    })?;
+    let root_seed_hex: String = decode(&row, 7, "runs.root_seed_hex")?;
+    let started_at_hex: String = decode(&row, 18, "runs.started_at_unix_ms_hex")?;
+    let tick_budget_hex: Option<String> = decode(&row, 19, "runs.requested_tick_budget_hex")?;
+    let source_tree_dirty = match decode::<Option<i64>>(&row, 13, "runs.source_tree_dirty")? {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(value) => {
+            return Err(StorageError::InvalidData {
+                context: "runs.source_tree_dirty",
+                reason: format!("expected NULL, 0, or 1; found {value}"),
+            });
+        }
+    };
+    let feature_rows = connection.query_with_params(
+        "SELECT feature FROM run_features WHERE run_id = ?1 ORDER BY feature ASC",
+        &[sqlite_run_id(run_id)],
+    )?;
+    let features = feature_rows
+        .iter()
+        .map(|row| decode(row, 0, "run_features.feature"))
+        .collect::<Result<Vec<String>, StorageError>>()?;
+    let manifest = RunManifestRecord {
+        run_id,
+        manifest_schema_version,
+        experiment_id: decode(&row, 1, "runs.experiment_id")?,
+        variant_id: decode(&row, 2, "runs.variant_id")?,
+        scenario_id: decode(&row, 3, "runs.scenario_id")?,
+        scenario_version,
+        normalized_config_json: decode(&row, 5, "runs.normalized_config_json")?,
+        config_digest: decode(&row, 6, "runs.config_digest")?,
+        root_seed: decode_hex_u64("runs.root_seed_hex", &root_seed_hex)?,
+        rng_algorithm: decode(&row, 8, "runs.rng_algorithm")?,
+        rng_version,
+        brain_roster_json: decode(&row, 10, "runs.brain_roster_json")?,
+        source_revision: decode(&row, 11, "runs.source_revision")?,
+        source_tree_digest: decode(&row, 12, "runs.source_tree_digest")?,
+        source_tree_dirty,
+        source_bundle_digest: decode(&row, 14, "runs.source_bundle_digest")?,
+        rust_toolchain: decode(&row, 15, "runs.rust_toolchain")?,
+        cargo_lock_digest: decode(&row, 16, "runs.cargo_lock_digest")?,
+        target_triple: decode(&row, 17, "runs.target_triple")?,
+        started_at_unix_ms: decode_hex_u64("runs.started_at_unix_ms_hex", &started_at_hex)?,
+        requested_tick_budget: tick_budget_hex
+            .as_deref()
+            .map(|encoded| decode_hex_u64("runs.requested_tick_budget_hex", encoded))
+            .transpose()?,
+        live_run_policy: decode(&row, 20, "runs.live_run_policy")?,
+        reproducible: decode(&row, 21, "runs.reproducible")?,
+        features,
+        manifest_json: decode(&row, 22, "runs.manifest_json")?,
+    }
+    .validate_and_normalize()?;
+    let stored_digest: String = decode(&row, 23, "runs.manifest_digest")?;
+    let actual_digest = manifest.manifest_digest()?;
+    if stored_digest != actual_digest {
+        return Err(StorageError::InvalidData {
+            context: "runs.manifest_digest",
+            reason: format!("stored {stored_digest}, computed {actual_digest}"),
+        });
+    }
+    Ok(manifest)
+}
+
 struct FinishedRunReaderLease {
     _path: StoragePathLease,
     _writer: StorageWriterLease,
@@ -2346,16 +3723,101 @@ struct FinishedRunReaderLease {
 /// Read-only view over an existing ScriptBots database.
 pub struct StorageReader {
     conn: Option<Connection>,
+    run_id: RunId,
     _finished_run_lease: Option<FinishedRunReaderLease>,
 }
 
 impl StorageReader {
-    /// Open an existing ScriptBots database read-only without creating or migrating it.
+    /// Read one bounded page of validated run identities, newest launch first.
+    ///
+    /// This catalog is the discovery path for multi-run frontends. Callers then bind every
+    /// scientific query through [`Self::open_for_run`]. Page sizes share the storage-wide 4096-row
+    /// ceiling, so browsing cannot materialize an arbitrarily large experiment database.
+    pub fn catalog_page(
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<RunCatalogEntry>, StorageError> {
+        validate_durable_storage_path(path)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = checked_query_limit("run_catalog.limit", limit)?;
+        let offset = i64::try_from(offset).map_err(|error| StorageError::InvalidData {
+            context: "run_catalog.offset",
+            reason: error.to_string(),
+        })?;
+        let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let result = (|| {
+            Storage::validate_existing_scriptbots_schema(&connection)?;
+            let rows = connection.query_with_params(
+                "SELECT runs.run_id, storage_progress.run_id, storage_progress.singleton
+                 FROM runs
+                 LEFT JOIN storage_progress USING (run_id)
+                 ORDER BY runs.started_at_unix_ms_hex DESC, runs.run_id DESC
+                 LIMIT ?1 OFFSET ?2",
+                &[limit.into(), offset.into()],
+            )?;
+            rows.iter()
+                .map(|row| {
+                    let run_id = decode_run_id(row, 0, "runs.run_id")?;
+                    let progress_run_id: Option<String> =
+                        decode(row, 1, "storage_progress.run_id")?;
+                    let progress_singleton: Option<i64> =
+                        decode(row, 2, "storage_progress.singleton")?;
+                    let run_id_text = run_id.to_string();
+                    if progress_run_id.as_deref() != Some(run_id_text.as_str())
+                        || progress_singleton != Some(1)
+                    {
+                        return Err(StorageError::InvalidData {
+                            context: "storage_progress",
+                            reason: format!(
+                                "run {run_id} lacks a canonical singleton progress row"
+                            ),
+                        });
+                    }
+                    let manifest = load_run_manifest(&connection, run_id)?;
+                    Ok(RunCatalogEntry {
+                        run_id,
+                        manifest_schema_version: manifest.manifest_schema_version,
+                        experiment_id: manifest.experiment_id,
+                        variant_id: manifest.variant_id,
+                        scenario_id: manifest.scenario_id,
+                        scenario_version: manifest.scenario_version,
+                        started_at_unix_ms: manifest.started_at_unix_ms,
+                        reproducible: manifest.reproducible,
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageError>>()
+        })();
+        let close_result = connection
+            .close_without_checkpoint()
+            .map_err(StorageError::from);
+        let entries = result?;
+        close_result?;
+        Ok(entries)
+    }
+
+    /// Open a single-run ScriptBots database read-only without creating or migrating it.
+    ///
+    /// A database containing more than one run is intentionally ambiguous and must be opened
+    /// with [`Self::open_for_run`]. Once constructed, every query on this handle is run-scoped.
     pub fn open(path: &str) -> Result<Self, StorageError> {
+        Self::open_selected(path, None)
+    }
+
+    /// Open one explicitly selected run from an existing ScriptBots database.
+    pub fn open_for_run(path: &str, run_id: RunId) -> Result<Self, StorageError> {
+        Self::open_selected(path, Some(run_id))
+    }
+
+    fn open_selected(path: &str, requested_run_id: Option<RunId>) -> Result<Self, StorageError> {
         validate_durable_storage_path(path)?;
         let conn = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let run_id = Self::resolve_run_id(&conn, requested_run_id)?;
         Ok(Self {
             conn: Some(conn),
+            run_id,
             _finished_run_lease: None,
         })
     }
@@ -2367,6 +3829,18 @@ impl StorageReader {
     /// identity leases remain held for the reader's lifetime, so validation and all
     /// later report queries observe an immutable finished-run database.
     pub fn open_finished(path: &str) -> Result<Self, StorageError> {
+        Self::open_finished_selected(path, None)
+    }
+
+    /// Open one finished run under an exclusive, identity-bound read lease.
+    pub fn open_finished_for_run(path: &str, run_id: RunId) -> Result<Self, StorageError> {
+        Self::open_finished_selected(path, Some(run_id))
+    }
+
+    fn open_finished_selected(
+        path: &str,
+        requested_run_id: Option<RunId>,
+    ) -> Result<Self, StorageError> {
         validate_durable_storage_path(path)?;
         let path_lease = StoragePathLease::acquire(path)?.ok_or(StorageError::InvalidData {
             context: "storage.finished_reader_path",
@@ -2378,7 +3852,7 @@ impl StorageReader {
         let validation = existing_lease
             .bind_connection(&conn, path)
             .and_then(|()| Storage::validate_existing_scriptbots_database(&conn))
-            .and_then(|()| Storage::validate_persistence_invariants_for_connection(&conn, true))
+            .and_then(|()| Storage::validate_all_persistence_invariants(&conn, true))
             .and_then(|()| existing_lease.verify_path(path));
         if let Err(error) = validation {
             if let Err(close_error) = conn.close_without_checkpoint() {
@@ -2390,14 +3864,59 @@ impl StorageReader {
             }
             return Err(error);
         }
+        let run_id = Self::resolve_run_id(&conn, requested_run_id)?;
         Ok(Self {
             conn: Some(conn),
+            run_id,
             _finished_run_lease: Some(FinishedRunReaderLease {
                 _path: path_lease,
                 _writer: writer_lease,
                 _identity: existing_lease,
             }),
         })
+    }
+
+    fn resolve_run_id(
+        connection: &Connection,
+        requested_run_id: Option<RunId>,
+    ) -> Result<RunId, StorageError> {
+        if let Some(run_id) = requested_run_id {
+            let rows = connection.query_with_params(
+                "SELECT run_id FROM runs WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if rows.is_empty() {
+                return Err(StorageError::InvalidData {
+                    context: "runs.run_id",
+                    reason: format!("run {run_id} does not exist"),
+                });
+            }
+            return Ok(run_id);
+        }
+
+        let rows = connection.query("SELECT run_id FROM runs ORDER BY run_id ASC LIMIT 2")?;
+        match rows.as_slice() {
+            [] => Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                reason: "database contains no registered runs".to_owned(),
+            }),
+            [row] => decode_run_id(row, 0, "runs.run_id"),
+            [..] => Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                reason: "database contains multiple runs; select one with open_for_run".to_owned(),
+            }),
+        }
+    }
+
+    /// Durable run identity bound to every query on this reader.
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Load and revalidate the complete queryable provenance record for this run.
+    pub fn run_manifest(&self) -> Result<RunManifestRecord, StorageError> {
+        load_run_manifest(self.connection()?, self.run_id)
     }
 
     fn connection(&self) -> Result<&Connection, StorageError> {
@@ -2413,20 +3932,22 @@ impl StorageReader {
 
     /// Return the maximum durable tick, if the database contains tick rows.
     pub fn max_tick(&self) -> Result<Option<u64>, StorageError> {
-        let row = self
-            .connection()?
-            .query_row("SELECT MAX(tick) FROM ticks")?;
-        decode::<Option<i64>>(&row, 0, "ticks.max_tick")?
-            .map(|tick| checked_u64("ticks.max_tick", tick))
+        let row = self.connection()?.query_row_with_params(
+            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        decode::<Option<i64>>(&row, 0, "tick_summaries.max_tick")?
+            .map(|tick| checked_u64("tick_summaries.max_tick", tick))
             .transpose()
     }
 
     /// Return durable outbox progress from an independent read connection.
     pub fn persistence_watermarks(&self) -> Result<PersistenceWatermarks, StorageError> {
-        let row = self.connection()?.query_row(
+        let row = self.connection()?.query_row_with_params(
             "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
              FROM storage_progress
-             WHERE singleton = 1",
+             WHERE run_id = ?1 AND singleton = 1",
+            &[sqlite_run_id(self.run_id)],
         )?;
         PersistenceWatermarks::from_raw(
             decode(&row, 0, "storage_progress.admitted_batch_id")?,
@@ -2443,8 +3964,8 @@ impl StorageReader {
         let rows = self.connection()?.query_with_params(
             "SELECT tick, payload_digest, state
              FROM storage_batch_ledger
-             WHERE batch_id = ?1",
-            &[batch_id.as_i64().into()],
+             WHERE run_id = ?1 AND batch_id = ?2",
+            &[sqlite_run_id(self.run_id), batch_id.as_i64().into()],
         )?;
         rows.first()
             .map(|row| {
@@ -2455,6 +3976,7 @@ impl StorageReader {
                 let payload_digest = decode(row, 1, "storage_batch_ledger.payload_digest")?;
                 let state_text: String = decode(row, 2, "storage_batch_ledger.state")?;
                 Ok(PersistedBatchStatus {
+                    run_id: self.run_id,
                     batch_id,
                     tick,
                     payload_digest,
@@ -2466,10 +3988,12 @@ impl StorageReader {
 
     /// Load replay events in deterministic tick/sequence order.
     pub fn load_replay_events(&self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
-        let rows = self.connection()?.query(
+        let rows = self.connection()?.query_with_params(
             "SELECT tick, seq, agent_uid, scope, event_type, payload
              FROM replay_events
+             WHERE run_id = ?1
              ORDER BY tick ASC, seq ASC",
+            &[sqlite_run_id(self.run_id)],
         )?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2488,6 +4012,43 @@ impl StorageReader {
                 event,
             });
         }
+        Ok(events)
+    }
+
+    /// Load a bounded page of the newest replay events in deterministic chronological order.
+    pub fn recent_replay_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PersistedReplayEvent>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bound = checked_query_limit("recent_replay_events.limit", limit)?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, seq, agent_uid, scope, event_type, payload
+             FROM replay_events
+             WHERE run_id = ?1
+             ORDER BY tick DESC, seq DESC
+             LIMIT ?2",
+            &[sqlite_run_id(self.run_id), bound.into()],
+        )?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let replay_row = ReplayEventRow {
+                tick: decode(&row, 0, "replay_events.tick")?,
+                seq: decode(&row, 1, "replay_events.seq")?,
+                agent_uid: decode(&row, 2, "replay_events.agent_uid")?,
+                scope: decode(&row, 3, "replay_events.scope")?,
+                event_type: decode(&row, 4, "replay_events.event_type")?,
+                payload: decode(&row, 5, "replay_events.payload")?,
+            };
+            events.push(PersistedReplayEvent {
+                tick: checked_u64("replay_events.tick", replay_row.tick)?,
+                seq: checked_u64("replay_events.seq", replay_row.seq)?,
+                event: replay_event_from_row(&replay_row)?,
+            });
+        }
+        events.reverse();
         Ok(events)
     }
 
@@ -2512,11 +4073,13 @@ impl StorageReader {
     /// a seeded founder is recorded after tick zero, or an origin carries an
     /// inconsistent demographic-birth ordinal.
     pub fn load_ancestry_births(&self) -> Result<Vec<PersistedAncestryBirth>, StorageError> {
-        let rows = self.connection()?.query(
+        let rows = self.connection()?.query_with_params(
             "SELECT tick, agent_uid, spawn_ordinal, birth_ordinal,
                     parent_a, parent_b, generation, brain_key, is_hybrid, origin
              FROM births
+             WHERE run_id = ?1
              ORDER BY tick ASC, agent_uid ASC",
+            &[sqlite_run_id(self.run_id)],
         )?;
         let mut births = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2568,10 +4131,12 @@ impl StorageReader {
     ///
     /// [`StorageError`] if the connection is unavailable or a row does not decode.
     pub fn load_ancestry_deaths(&self) -> Result<Vec<PersistedAncestryDeath>, StorageError> {
-        let rows = self.connection()?.query(
+        let rows = self.connection()?.query_with_params(
             "SELECT tick, agent_uid, cause
              FROM deaths
+             WHERE run_id = ?1
              ORDER BY tick ASC, agent_uid ASC",
+            &[sqlite_run_id(self.run_id)],
         )?;
         let mut deaths = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2589,11 +4154,13 @@ impl StorageReader {
 
     /// Return replay-event counts grouped by stable event type.
     pub fn replay_event_counts(&self) -> Result<Vec<ReplayEventCount>, StorageError> {
-        let rows = self.connection()?.query(
+        let rows = self.connection()?.query_with_params(
             "SELECT event_type, COUNT(*) AS total
              FROM replay_events
+             WHERE run_id = ?1
              GROUP BY event_type
              ORDER BY event_type",
+            &[sqlite_run_id(self.run_id)],
         )?;
         let mut counts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2613,17 +4180,18 @@ impl StorageReader {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let bound = checked_i64("top_predators.limit", limit)?;
+        let bound = checked_query_limit("top_predators.limit", limit)?;
         let rows = self.connection()?.query_with_params(
             "SELECT agent_uid,
                     AVG(energy) AS avg_energy,
                     MAX(spike_length) AS max_spike_length,
                     MAX(tick) AS last_tick
              FROM agents
+             WHERE run_id = ?1
              GROUP BY agent_uid
              ORDER BY avg_energy DESC
-             LIMIT ?1",
-            &[bound.into()],
+             LIMIT ?2",
+            &[sqlite_run_id(self.run_id), bound.into()],
         )?;
         let mut stats = Vec::with_capacity(limit.min(16));
         for row in rows {
@@ -2637,31 +4205,20 @@ impl StorageReader {
         Ok(stats)
     }
 
-    /// Load metric history in chronological order, optionally keeping only the newest rows.
-    pub fn recent_metrics(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<Vec<PersistedMetric>, StorageError> {
-        if matches!(limit, Some(0)) {
+    /// Load a bounded page of the newest metric rows in chronological order.
+    pub fn recent_metrics(&self, limit: usize) -> Result<Vec<PersistedMetric>, StorageError> {
+        if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let rows = if let Some(limit) = limit {
-            let bound = checked_i64("recent_metrics.limit", limit)?;
-            self.connection()?.query_with_params(
-                "SELECT tick, name, value
-                 FROM metrics
-                 ORDER BY tick DESC, name DESC
-                 LIMIT ?1",
-                &[bound.into()],
-            )?
-        } else {
-            self.connection()?.query(
-                "SELECT tick, name, value
-                 FROM metrics
-                 ORDER BY tick DESC, name DESC",
-            )?
-        };
+        let bound = checked_query_limit("recent_metrics.limit", limit)?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, name, value
+             FROM metrics
+             WHERE run_id = ?1
+             ORDER BY tick DESC, name DESC
+             LIMIT ?2",
+            &[sqlite_run_id(self.run_id), bound.into()],
+        )?;
 
         let mut readings = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2675,46 +4232,49 @@ impl StorageReader {
         Ok(readings)
     }
 
-    /// Load tick history in chronological order, optionally keeping only the newest rows.
-    pub fn recent_ticks(&self, limit: Option<usize>) -> Result<Vec<PersistedTick>, StorageError> {
-        if matches!(limit, Some(0)) {
+    /// Load a bounded page of the newest tick summaries in chronological order.
+    pub fn recent_ticks(&self, limit: usize) -> Result<Vec<PersistedTick>, StorageError> {
+        if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let rows = if let Some(limit) = limit {
-            let bound = checked_i64("recent_ticks.limit", limit)?;
-            self.connection()?.query_with_params(
-                "SELECT tick, epoch, closed, agent_count, births, deaths,
-                        total_energy, average_energy, average_health
-                 FROM ticks
-                 ORDER BY tick DESC
-                 LIMIT ?1",
-                &[bound.into()],
-            )?
-        } else {
-            self.connection()?.query(
-                "SELECT tick, epoch, closed, agent_count, births, deaths,
-                        total_energy, average_energy, average_health
-                 FROM ticks
-                 ORDER BY tick DESC",
-            )?
-        };
+        let bound = checked_query_limit("recent_ticks.limit", limit)?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, epoch, closed, agent_count, births, deaths,
+                    total_energy, average_energy, average_health
+             FROM tick_summaries
+             WHERE run_id = ?1
+             ORDER BY tick DESC
+             LIMIT ?2",
+            &[sqlite_run_id(self.run_id), bound.into()],
+        )?;
 
         let mut ticks = Vec::with_capacity(rows.len());
         for row in rows {
             ticks.push(PersistedTick {
-                tick: checked_u64("ticks.tick", decode(&row, 0, "ticks.tick")?)?,
-                epoch: checked_u64("ticks.epoch", decode(&row, 1, "ticks.epoch")?)?,
-                closed: decode(&row, 2, "ticks.closed")?,
-                agent_count: checked_usize(
-                    "ticks.agent_count",
-                    decode(&row, 3, "ticks.agent_count")?,
+                tick: checked_u64(
+                    "tick_summaries.tick",
+                    decode(&row, 0, "tick_summaries.tick")?,
                 )?,
-                births: checked_usize("ticks.births", decode(&row, 4, "ticks.births")?)?,
-                deaths: checked_usize("ticks.deaths", decode(&row, 5, "ticks.deaths")?)?,
-                total_energy: decode(&row, 6, "ticks.total_energy")?,
-                average_energy: decode(&row, 7, "ticks.average_energy")?,
-                average_health: decode(&row, 8, "ticks.average_health")?,
+                epoch: checked_u64(
+                    "tick_summaries.epoch",
+                    decode(&row, 1, "tick_summaries.epoch")?,
+                )?,
+                closed: decode(&row, 2, "tick_summaries.closed")?,
+                agent_count: checked_usize(
+                    "tick_summaries.agent_count",
+                    decode(&row, 3, "tick_summaries.agent_count")?,
+                )?,
+                births: checked_usize(
+                    "tick_summaries.births",
+                    decode(&row, 4, "tick_summaries.births")?,
+                )?,
+                deaths: checked_usize(
+                    "tick_summaries.deaths",
+                    decode(&row, 5, "tick_summaries.deaths")?,
+                )?,
+                total_energy: decode(&row, 6, "tick_summaries.total_energy")?,
+                average_energy: decode(&row, 7, "tick_summaries.average_energy")?,
+                average_health: decode(&row, 8, "tick_summaries.average_health")?,
             });
         }
         ticks.reverse();
@@ -2725,51 +4285,82 @@ impl StorageReader {
     pub fn run_ledger_summary(&self) -> Result<RunLedgerSummary, StorageError> {
         let mut tx = self.connection()?.transaction()?;
         let query_result = (|| -> Result<RunLedgerSummary, StorageError> {
-            let tick_count_row = tx.query_row("SELECT COUNT(*) FROM ticks")?;
-            let tick_count =
-                checked_u64("ticks.count", decode(&tick_count_row, 0, "ticks.count")?)?;
-            let birth_count_row =
-                tx.query_row("SELECT COUNT(*) FROM births WHERE origin = 'born'")?;
+            let run_id = sqlite_run_id(self.run_id);
+            let tick_count_row = tx.query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                std::slice::from_ref(&run_id),
+            )?;
+            let tick_count = checked_u64(
+                "tick_summaries.count",
+                decode(&tick_count_row, 0, "tick_summaries.count")?,
+            )?;
+            let birth_count_row = tx.query_row_with_params(
+                "SELECT COUNT(*) FROM births WHERE run_id = ?1 AND origin = 'born'",
+                std::slice::from_ref(&run_id),
+            )?;
             let birth_records =
                 checked_u64("births.count", decode(&birth_count_row, 0, "births.count")?)?;
-            let death_count_row = tx.query_row("SELECT COUNT(*) FROM deaths")?;
+            let death_count_row = tx.query_row_with_params(
+                "SELECT COUNT(*) FROM deaths WHERE run_id = ?1",
+                std::slice::from_ref(&run_id),
+            )?;
             let death_records =
                 checked_u64("deaths.count", decode(&death_count_row, 0, "deaths.count")?)?;
-            let birth_event_row =
-                tx.query_row("SELECT COALESCE(SUM(count), 0) FROM events WHERE kind = 'births'")?;
+            let birth_event_row = tx.query_row_with_params(
+                "SELECT COALESCE(SUM(count), 0) FROM events
+                 WHERE run_id = ?1 AND kind = 'births'",
+                std::slice::from_ref(&run_id),
+            )?;
             let birth_events = checked_u64(
                 "events.births",
                 decode(&birth_event_row, 0, "events.births")?,
             )?;
-            let death_event_row =
-                tx.query_row("SELECT COALESCE(SUM(count), 0) FROM events WHERE kind = 'deaths'")?;
+            let death_event_row = tx.query_row_with_params(
+                "SELECT COALESCE(SUM(count), 0) FROM events
+                 WHERE run_id = ?1 AND kind = 'deaths'",
+                std::slice::from_ref(&run_id),
+            )?;
             let death_events = checked_u64(
                 "events.deaths",
                 decode(&death_event_row, 0, "events.deaths")?,
             )?;
-            let rows = tx.query(
+            let rows = tx.query_with_params(
                 "SELECT tick, epoch, closed, agent_count, births, deaths,
                         total_energy, average_energy, average_health
-                 FROM ticks
+                 FROM tick_summaries
+                 WHERE run_id = ?1
                  ORDER BY tick DESC
                  LIMIT 1",
+                std::slice::from_ref(&run_id),
             )?;
             let latest_tick = rows
                 .first()
                 .map(|row| -> Result<PersistedTick, StorageError> {
                     Ok(PersistedTick {
-                        tick: checked_u64("ticks.tick", decode(row, 0, "ticks.tick")?)?,
-                        epoch: checked_u64("ticks.epoch", decode(row, 1, "ticks.epoch")?)?,
-                        closed: decode(row, 2, "ticks.closed")?,
-                        agent_count: checked_usize(
-                            "ticks.agent_count",
-                            decode(row, 3, "ticks.agent_count")?,
+                        tick: checked_u64(
+                            "tick_summaries.tick",
+                            decode(row, 0, "tick_summaries.tick")?,
                         )?,
-                        births: checked_usize("ticks.births", decode(row, 4, "ticks.births")?)?,
-                        deaths: checked_usize("ticks.deaths", decode(row, 5, "ticks.deaths")?)?,
-                        total_energy: decode(row, 6, "ticks.total_energy")?,
-                        average_energy: decode(row, 7, "ticks.average_energy")?,
-                        average_health: decode(row, 8, "ticks.average_health")?,
+                        epoch: checked_u64(
+                            "tick_summaries.epoch",
+                            decode(row, 1, "tick_summaries.epoch")?,
+                        )?,
+                        closed: decode(row, 2, "tick_summaries.closed")?,
+                        agent_count: checked_usize(
+                            "tick_summaries.agent_count",
+                            decode(row, 3, "tick_summaries.agent_count")?,
+                        )?,
+                        births: checked_usize(
+                            "tick_summaries.births",
+                            decode(row, 4, "tick_summaries.births")?,
+                        )?,
+                        deaths: checked_usize(
+                            "tick_summaries.deaths",
+                            decode(row, 5, "tick_summaries.deaths")?,
+                        )?,
+                        total_energy: decode(row, 6, "tick_summaries.total_energy")?,
+                        average_energy: decode(row, 7, "tick_summaries.average_energy")?,
+                        average_health: decode(row, 8, "tick_summaries.average_health")?,
                     })
                 })
                 .transpose()?;
@@ -3355,6 +4946,7 @@ fn filesystem_has_stable_file_identity(database_path: &Path) -> bool {
 /// FrankenSQLite-backed persistence sink with buffered writes.
 pub struct Storage {
     path: String,
+    run_id: RunId,
     conn: Option<Connection>,
     _path_lease: Option<StoragePathLease>,
     _writer_lease: Option<StorageWriterLease>,
@@ -3373,9 +4965,12 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Atomically reserve and create a file-backed run database.
-    pub fn create_new_file(path: &str) -> Result<Self, StorageError> {
-        Self::create_new_file_with_thresholds(
+    /// Atomically reserve and create an unattributed file-backed database.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use [`Self::create_new_file_for_run`].
+    pub fn create_unattributed_file(path: &str) -> Result<Self, StorageError> {
+        Self::create_unattributed_file_with_thresholds(
             path,
             DEFAULT_TICK_BUFFER,
             DEFAULT_AGENT_BUFFER,
@@ -3384,21 +4979,16 @@ impl Storage {
         )
     }
 
-    /// Atomically reserve a file-backed run database with explicit flush thresholds.
-    #[allow(dead_code)]
-    pub fn create_new_file_with_thresholds(
+    /// Atomically create a file-backed database and register its complete run manifest before
+    /// any tick can be admitted.
+    pub fn create_new_file_for_run(
         path: &str,
-        tick: usize,
-        agent: usize,
-        event: usize,
-        metric: usize,
+        manifest: RunManifestRecord,
     ) -> Result<Self, StorageError> {
-        Self::with_target(reserve_new_file(path)?, tick, agent, event, metric)
-    }
-
-    /// Open an isolated volatile database with default buffering thresholds.
-    pub fn memory() -> Result<Self, StorageError> {
-        Self::memory_with_thresholds(
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_for_run(
+            reserve_new_file(path)?,
+            run_open,
             DEFAULT_TICK_BUFFER,
             DEFAULT_AGENT_BUFFER,
             DEFAULT_EVENT_BUFFER,
@@ -3406,8 +4996,122 @@ impl Storage {
         )
     }
 
-    /// Open an isolated volatile database with explicit flush thresholds.
-    pub fn memory_with_thresholds(
+    /// Create a file-backed run with explicit buffering thresholds.
+    pub fn create_new_file_for_run_with_thresholds(
+        path: &str,
+        manifest: RunManifestRecord,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+    ) -> Result<Self, StorageError> {
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_for_run(
+            reserve_new_file(path)?,
+            run_open,
+            tick,
+            agent,
+            event,
+            metric,
+        )
+    }
+
+    /// Open a validated database and register a new independent run without rewriting any prior
+    /// run. The caller must have closed the earlier writer first.
+    pub fn append_run(path: &str, manifest: RunManifestRecord) -> Result<Self, StorageError> {
+        validate_durable_storage_path(path)?;
+        let run_open = RunOpen::register(manifest, true)?;
+        Self::with_target_for_run(
+            StorageTarget::RecoverExisting(path.to_owned()),
+            run_open,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+        )
+    }
+
+    /// Recover the durable outbox for one explicitly selected run.
+    pub fn recover_existing_run(path: &str, run_id: RunId) -> Result<Self, StorageError> {
+        validate_durable_storage_path(path)?;
+        Self::with_target_for_run(
+            StorageTarget::RecoverExisting(path.to_owned()),
+            RunOpen::Recover(run_id),
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+        )
+    }
+
+    /// Atomically reserve an unattributed file-backed database with explicit flush thresholds.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use
+    /// [`Self::create_new_file_for_run_with_thresholds`].
+    #[allow(dead_code)]
+    pub fn create_unattributed_file_with_thresholds(
+        path: &str,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+    ) -> Result<Self, StorageError> {
+        let run_open = RunOpen::unattributed()?;
+        Self::with_target_for_run(
+            reserve_new_file(path)?,
+            run_open,
+            tick,
+            agent,
+            event,
+            metric,
+        )
+    }
+
+    /// Open an unattributed volatile database with default buffering thresholds.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use [`Self::memory_for_run`].
+    pub fn unattributed_memory() -> Result<Self, StorageError> {
+        Self::unattributed_memory_with_thresholds(
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+        )
+    }
+
+    /// Open a volatile database and atomically register a complete run manifest.
+    pub fn memory_for_run(manifest: RunManifestRecord) -> Result<Self, StorageError> {
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_for_run(
+            StorageTarget::Memory,
+            run_open,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+        )
+    }
+
+    /// Create a volatile run with explicit buffering thresholds.
+    pub fn memory_for_run_with_thresholds(
+        manifest: RunManifestRecord,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+    ) -> Result<Self, StorageError> {
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_for_run(StorageTarget::Memory, run_open, tick, agent, event, metric)
+    }
+
+    /// Open an unattributed volatile database with explicit flush thresholds.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use
+    /// [`Self::memory_for_run_with_thresholds`].
+    pub fn unattributed_memory_with_thresholds(
         tick: usize,
         agent: usize,
         event: usize,
@@ -3423,7 +5127,31 @@ impl Storage {
         event: usize,
         metric: usize,
     ) -> Result<Self, StorageError> {
-        Self::with_target_before_recovery_writer_open(target, tick, agent, event, metric, |_| {})
+        let run_open = if matches!(target, StorageTarget::RecoverExisting(_)) {
+            RunOpen::RecoverSole
+        } else {
+            RunOpen::unattributed()?
+        };
+        Self::with_target_for_run(target, run_open, tick, agent, event, metric)
+    }
+
+    fn with_target_for_run(
+        target: StorageTarget,
+        run_open: RunOpen,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+    ) -> Result<Self, StorageError> {
+        Self::with_target_before_recovery_writer_open_for_run(
+            target,
+            run_open,
+            tick,
+            agent,
+            event,
+            metric,
+            |_| {},
+        )
     }
 
     fn with_target_before_recovery_writer_open(
@@ -3434,8 +5162,34 @@ impl Storage {
         metric: usize,
         before_recovery_writer_open: impl FnOnce(&str),
     ) -> Result<Self, StorageError> {
+        let run_open = if matches!(target, StorageTarget::RecoverExisting(_)) {
+            RunOpen::RecoverSole
+        } else {
+            RunOpen::unattributed()?
+        };
+        Self::with_target_before_recovery_writer_open_for_run(
+            target,
+            run_open,
+            tick,
+            agent,
+            event,
+            metric,
+            before_recovery_writer_open,
+        )
+    }
+
+    fn with_target_before_recovery_writer_open_for_run(
+        target: StorageTarget,
+        run_open: RunOpen,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+        before_recovery_writer_open: impl FnOnce(&str),
+    ) -> Result<Self, StorageError> {
         target.prepare_for_open()?;
         let path = target.path().to_owned();
+        let mut selected_run_id = run_open.run_id();
         let recover_existing = matches!(target, StorageTarget::RecoverExisting(_));
         let initialize_schema = !recover_existing;
         let mut path_lease = StoragePathLease::acquire(&path)?;
@@ -3458,10 +5212,18 @@ impl Storage {
                 })
                 .and_then(|lease| lease.bind_connection(&validation_connection, &path))
                 .and_then(|()| Self::validate_existing_scriptbots_database(&validation_connection));
+            let run_selection = if validation.is_ok() && matches!(&run_open, RunOpen::RecoverSole) {
+                StorageReader::resolve_run_id(&validation_connection, None).map(Some)
+            } else {
+                Ok(None)
+            };
             let close_result = validation_connection
                 .close_without_checkpoint()
                 .map_err(StorageError::from);
             validation?;
+            if let Some(run_id) = run_selection? {
+                selected_run_id = Some(run_id);
+            }
             close_result?;
             let identity_lease = existing_lease.as_ref().ok_or(StorageError::InvalidData {
                 context: "storage.recovery_identity",
@@ -3505,9 +5267,15 @@ impl Storage {
         if let Some(lease) = &existing_lease {
             lease.verify_path(&path)?;
         }
+        let run_id = selected_run_id.ok_or(StorageError::InvalidData {
+            context: "runs.run_id",
+            reason: "recovery did not resolve a selected run inside the writer lease".to_owned(),
+        })?;
+        conn.execute("PRAGMA foreign_keys = ON;")?;
         conn.execute("PRAGMA synchronous = FULL;")?;
         let mut storage = Self {
             path,
+            run_id,
             conn: Some(conn),
             _path_lease: path_lease,
             _writer_lease: writer_lease,
@@ -3525,6 +5293,34 @@ impl Storage {
             replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
         };
         if initialize_schema && let Err(error) = storage.initialize_schema() {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        if recover_existing
+            && let Err(error) = Self::validate_all_persistence_invariants(
+                storage.connection()?,
+                storage.file_backed(),
+            )
+        {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        if recover_existing
+            && matches!(&run_open, RunOpen::Register { .. })
+            && let Err(error) = Self::require_all_runs_fully_durable(storage.connection()?)
+        {
+            storage.terminally_failed = true;
+            return Err(error);
+        }
+        let run_result = match run_open {
+            RunOpen::Register {
+                manifest,
+                reject_existing,
+            } => storage.register_run(*manifest, reject_existing),
+            RunOpen::Recover(run_id) => storage.require_run(run_id),
+            RunOpen::RecoverSole => storage.require_run(run_id),
+        };
+        if let Err(error) = run_result {
             storage.terminally_failed = true;
             return Err(error);
         }
@@ -3552,25 +5348,21 @@ impl Storage {
         Ok(storage)
     }
 
-    fn validate_existing_scriptbots_database(connection: &Connection) -> Result<(), StorageError> {
+    fn validate_existing_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
         let migrations = connection.query(
             "SELECT version, name FROM _schema_migrations
              ORDER BY version ASC",
         )?;
-        if migrations.len() != 3 {
+        if migrations.len() != 1 {
             return Err(StorageError::InvalidData {
                 context: "storage.recovery_schema",
                 reason: format!(
-                    "expected exactly three ScriptBots migrations, found {}",
+                    "expected exactly one ScriptBots v6 migration, found {}",
                     migrations.len()
                 ),
             });
         }
-        let expected_migrations = [
-            (3_i64, "create_stable_agent_uid_schema"),
-            (4_i64, "create_stable_uid_persistence_outbox"),
-            (5_i64, "record_birth_origin"),
-        ];
+        let expected_migrations = [(SCRIPTBOTS_SCHEMA_VERSION, "create_multi_run_schema")];
         for (row, (version, name)) in migrations.iter().zip(expected_migrations) {
             let actual_version: i64 = decode(row, 0, "_schema_migrations.version")?;
             let actual_name: String = decode(row, 1, "_schema_migrations.name")?;
@@ -3582,6 +5374,17 @@ impl Storage {
                     ),
                 });
             }
+        }
+
+        let user_version = connection.query_row("PRAGMA user_version")?;
+        let user_version: i64 = decode(&user_version, 0, "pragma.user_version")?;
+        if user_version != SCRIPTBOTS_SCHEMA_VERSION {
+            return Err(StorageError::InvalidData {
+                context: "storage.recovery_schema",
+                reason: format!(
+                    "migration ledger is v{SCRIPTBOTS_SCHEMA_VERSION}, but PRAGMA user_version is {user_version}"
+                ),
+            });
         }
 
         let expected_schema = canonical_schema_objects()?;
@@ -3617,16 +5420,30 @@ impl Storage {
             });
         }
 
-        let progress = connection.query_row(
-            "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
-             FROM storage_progress
-             WHERE singleton = 1",
+        Ok(())
+    }
+
+    fn validate_existing_scriptbots_database(connection: &Connection) -> Result<(), StorageError> {
+        Self::validate_existing_scriptbots_schema(connection)?;
+
+        let orphaned = connection.query_row(
+            "SELECT COUNT(*)
+             FROM runs
+             LEFT JOIN storage_progress USING (run_id)
+             WHERE storage_progress.run_id IS NULL OR storage_progress.singleton != 1",
         )?;
-        PersistenceWatermarks::from_raw(
-            decode(&progress, 0, "storage_progress.admitted_batch_id")?,
-            decode(&progress, 1, "storage_progress.applied_batch_id")?,
-            decode(&progress, 2, "storage_progress.durable_batch_id")?,
-        )?;
+        let orphaned: i64 = decode(&orphaned, 0, "storage_progress.orphaned_runs")?;
+        if orphaned != 0 {
+            return Err(StorageError::InvalidData {
+                context: "storage_progress",
+                reason: format!("{orphaned} registered run(s) lack a canonical progress row"),
+            });
+        }
+        let runs = connection.query("SELECT run_id FROM runs ORDER BY run_id ASC")?;
+        for row in runs {
+            let run_id = decode_run_id(&row, 0, "runs.run_id")?;
+            load_run_manifest(connection, run_id)?;
+        }
         Ok(())
     }
 
@@ -3634,18 +5451,229 @@ impl Storage {
         install_scriptbots_schema(self.connection()?)
     }
 
+    fn register_run(
+        &mut self,
+        manifest: ValidatedRunManifest,
+        reject_existing: bool,
+    ) -> Result<(), StorageError> {
+        let ValidatedRunManifest(manifest) = manifest;
+        if manifest.run_id != self.run_id {
+            return Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                reason: format!(
+                    "storage is bound to run {}, manifest names {}",
+                    self.run_id, manifest.run_id
+                ),
+            });
+        }
+        let run_id = sqlite_run_id(self.run_id);
+        let manifest_digest = manifest.manifest_digest()?;
+        let existing = self.connection()?.query_with_params(
+            "SELECT manifest_digest FROM runs WHERE run_id = ?1 LIMIT 1",
+            std::slice::from_ref(&run_id),
+        )?;
+        if let Some(row) = existing.first() {
+            if reject_existing {
+                return Err(StorageError::InvalidData {
+                    context: "runs.run_id",
+                    reason: format!(
+                        "run {} is already registered; append_run requires a new independent RunId",
+                        self.run_id
+                    ),
+                });
+            }
+            let existing_digest: String = decode(row, 0, "runs.manifest_digest")?;
+            let features = self.connection()?.query_with_params(
+                "SELECT feature FROM run_features WHERE run_id = ?1 ORDER BY feature ASC",
+                std::slice::from_ref(&run_id),
+            )?;
+            let existing_features = features
+                .iter()
+                .map(|row| decode(row, 0, "run_features.feature"))
+                .collect::<Result<Vec<String>, StorageError>>()?;
+            if existing_digest == manifest_digest && existing_features == manifest.features {
+                return self.require_run(self.run_id);
+            }
+            return Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                reason: format!(
+                    "run {} is already registered with conflicting provenance",
+                    self.run_id
+                ),
+            });
+        }
+
+        let root_seed_hex = manifest.root_seed_hex();
+        let started_at_hex = manifest.started_at_hex();
+        let tick_budget_hex = manifest.tick_budget_hex();
+        execute_transaction_with_retry(self.connection()?, |transaction| {
+            let inserted = transaction.execute_with_params(
+                "INSERT INTO runs (
+                    run_id, manifest_schema_version, experiment_id, variant_id,
+                    scenario_id, scenario_version, normalized_config_json, config_digest,
+                    root_seed_hex, rng_algorithm, rng_version, brain_roster_json,
+                    source_revision, source_tree_digest, source_tree_dirty,
+                    source_bundle_digest, rust_toolchain, cargo_lock_digest, target_triple,
+                    started_at_unix_ms_hex, requested_tick_budget_hex, live_run_policy,
+                    reproducible, manifest_json, manifest_digest
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+                 )",
+                &[
+                    sqlite_run_id(manifest.run_id),
+                    i64::from(manifest.manifest_schema_version).into(),
+                    sqlite_optional_text(manifest.experiment_id.as_deref()),
+                    sqlite_optional_text(manifest.variant_id.as_deref()),
+                    manifest.scenario_id.as_str().into(),
+                    i64::from(manifest.scenario_version).into(),
+                    manifest.normalized_config_json.as_str().into(),
+                    manifest.config_digest.as_str().into(),
+                    root_seed_hex.as_str().into(),
+                    manifest.rng_algorithm.as_str().into(),
+                    i64::from(manifest.rng_version).into(),
+                    manifest.brain_roster_json.as_str().into(),
+                    sqlite_optional_text(manifest.source_revision.as_deref()),
+                    sqlite_optional_text(manifest.source_tree_digest.as_deref()),
+                    manifest
+                        .source_tree_dirty
+                        .map_or(SqliteValue::Null, sqlite_bool),
+                    sqlite_optional_text(manifest.source_bundle_digest.as_deref()),
+                    manifest.rust_toolchain.as_str().into(),
+                    manifest.cargo_lock_digest.as_str().into(),
+                    manifest.target_triple.as_str().into(),
+                    started_at_hex.as_str().into(),
+                    sqlite_optional_text(tick_budget_hex.as_deref()),
+                    sqlite_optional_text(manifest.live_run_policy.as_deref()),
+                    sqlite_bool(manifest.reproducible),
+                    manifest.manifest_json.as_str().into(),
+                    manifest_digest.as_str().into(),
+                ],
+            )?;
+            if inserted != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "registered {inserted} rows for run {}",
+                    manifest.run_id
+                )));
+            }
+            for feature in &manifest.features {
+                let inserted = transaction.execute_with_params(
+                    "INSERT INTO run_features (run_id, feature) VALUES (?1, ?2)",
+                    &[sqlite_run_id(manifest.run_id), feature.as_str().into()],
+                )?;
+                if inserted != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "registered {inserted} rows for feature {feature:?}"
+                    )));
+                }
+            }
+            let inserted = transaction.execute_with_params(
+                "INSERT INTO storage_progress (
+                    run_id, singleton, admitted_batch_id, applied_batch_id, durable_batch_id
+                 ) VALUES (?1, 1, 0, 0, 0)",
+                &[sqlite_run_id(manifest.run_id)],
+            )?;
+            if inserted != 1 {
+                return Err(FrankenError::Internal(format!(
+                    "registered {inserted} progress rows for run {}",
+                    manifest.run_id
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn require_run(&self, run_id: RunId) -> Result<(), StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT runs.run_id
+             FROM runs
+             JOIN storage_progress USING (run_id)
+             WHERE runs.run_id = ?1 AND storage_progress.singleton = 1
+             LIMIT 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        if rows.len() != 1 {
+            return Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                reason: format!("run {run_id} is not registered with persistence progress"),
+            });
+        }
+        let persisted = decode_run_id(&rows[0], 0, "runs.run_id")?;
+        if persisted != run_id {
+            return Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                reason: format!("selected run {run_id}, query returned {persisted}"),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_persistence_invariants(&self) -> Result<(), StorageError> {
-        Self::validate_persistence_invariants_for_connection(self.connection()?, self.file_backed())
+        Self::validate_persistence_invariants_for_connection(
+            self.connection()?,
+            self.run_id,
+            self.file_backed(),
+        )
+    }
+
+    fn validate_all_persistence_invariants(
+        connection: &Connection,
+        file_backed: bool,
+    ) -> Result<(), StorageError> {
+        let rows = connection.query("SELECT run_id FROM runs ORDER BY run_id ASC")?;
+        for row in rows {
+            Self::validate_persistence_invariants_for_connection(
+                connection,
+                decode_run_id(&row, 0, "runs.run_id")?,
+                file_backed,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn require_all_runs_fully_durable(connection: &Connection) -> Result<(), StorageError> {
+        let progress = connection.query(
+            "SELECT run_id, admitted_batch_id, applied_batch_id, durable_batch_id
+             FROM storage_progress
+             ORDER BY run_id ASC",
+        )?;
+        for row in progress {
+            let run_id = decode_run_id(&row, 0, "storage_progress.run_id")?;
+            let admitted: i64 = decode(&row, 1, "storage_progress.admitted_batch_id")?;
+            let applied: i64 = decode(&row, 2, "storage_progress.applied_batch_id")?;
+            let durable: i64 = decode(&row, 3, "storage_progress.durable_batch_id")?;
+            if admitted != applied || applied != durable {
+                return Err(StorageError::InvalidData {
+                    context: "storage.append_run",
+                    reason: format!(
+                        "run {run_id} is not fully durable (admitted={admitted}, applied={applied}, durable={durable}); recover it before appending another run"
+                    ),
+                });
+            }
+        }
+        let outbox = connection.query_row("SELECT COUNT(*) FROM storage_outbox")?;
+        let outbox: i64 = decode(&outbox, 0, "storage_outbox.count")?;
+        if outbox != 0 {
+            return Err(StorageError::InvalidData {
+                context: "storage.append_run",
+                reason: format!(
+                    "cannot append a run while {outbox} durable outbox payload(s) remain"
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn validate_persistence_invariants_for_connection(
         connection: &Connection,
+        run_id: RunId,
         file_backed: bool,
     ) -> Result<(), StorageError> {
-        let progress = connection.query_row(
+        let progress = connection.query_row_with_params(
             "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
              FROM storage_progress
-             WHERE singleton = 1",
+             WHERE run_id = ?1 AND singleton = 1",
+            &[sqlite_run_id(run_id)],
         )?;
         let watermarks = PersistenceWatermarks::from_raw(
             decode(&progress, 0, "storage_progress.admitted_batch_id")?,
@@ -3655,9 +5683,11 @@ impl Storage {
         let admitted = watermarks.admitted_raw();
         let applied = watermarks.applied_raw();
         let durable = watermarks.durable_raw();
-        let ledger = connection.query_row(
+        let ledger = connection.query_row_with_params(
             "SELECT COUNT(*), MIN(batch_id), MAX(batch_id), COUNT(DISTINCT tick)
-             FROM storage_batch_ledger",
+             FROM storage_batch_ledger
+             WHERE run_id = ?1",
+            &[sqlite_run_id(run_id)],
         )?;
         let ledger_count: i64 = decode(&ledger, 0, "storage_batch_ledger.count")?;
         let ledger_min: Option<i64> = decode(&ledger, 1, "storage_batch_ledger.min_batch_id")?;
@@ -3685,10 +5715,12 @@ impl Storage {
             let mismatches = connection.query_with_params(
                 "SELECT batch_id, state
                  FROM storage_batch_ledger
-                 WHERE batch_id > ?1 AND batch_id <= ?2 AND state != ?3
+                 WHERE run_id = ?1
+                   AND batch_id > ?2 AND batch_id <= ?3 AND state != ?4
                  ORDER BY batch_id ASC
                  LIMIT 1",
                 &[
+                    sqlite_run_id(run_id),
                     lower_exclusive.into(),
                     upper_inclusive.into(),
                     expected_state.into(),
@@ -3707,9 +5739,11 @@ impl Storage {
         }
 
         if file_backed {
-            let outbox = connection.query_row(
+            let outbox = connection.query_row_with_params(
                 "SELECT COUNT(*), MIN(batch_id), MAX(batch_id)
-                 FROM storage_outbox",
+                 FROM storage_outbox
+                 WHERE run_id = ?1",
+                &[sqlite_run_id(run_id)],
             )?;
             let outbox_count: i64 = decode(&outbox, 0, "storage_outbox.count")?;
             let outbox_min: Option<i64> = decode(&outbox, 1, "storage_outbox.min_batch_id")?;
@@ -3740,12 +5774,19 @@ impl Storage {
         self.path != ":memory:"
     }
 
+    /// Durable run identity bound to this writer and its outbox.
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
     /// Return the persisted monotonic admission/application/durability prefixes.
     pub fn persistence_watermarks(&self) -> Result<PersistenceWatermarks, StorageError> {
-        let row = self.connection()?.query_row(
+        let row = self.connection()?.query_row_with_params(
             "SELECT admitted_batch_id, applied_batch_id, durable_batch_id
              FROM storage_progress
-             WHERE singleton = 1",
+             WHERE run_id = ?1 AND singleton = 1",
+            &[sqlite_run_id(self.run_id)],
         )?;
         PersistenceWatermarks::from_raw(
             decode(&row, 0, "storage_progress.admitted_batch_id")?,
@@ -3762,8 +5803,8 @@ impl Storage {
         let rows = self.connection()?.query_with_params(
             "SELECT tick, payload_digest, state
              FROM storage_batch_ledger
-             WHERE batch_id = ?1",
-            &[batch_id.as_i64().into()],
+             WHERE run_id = ?1 AND batch_id = ?2",
+            &[sqlite_run_id(self.run_id), batch_id.as_i64().into()],
         )?;
         rows.first()
             .map(|row| {
@@ -3774,6 +5815,7 @@ impl Storage {
                 let payload_digest = decode(row, 1, "storage_batch_ledger.payload_digest")?;
                 let state_text: String = decode(row, 2, "storage_batch_ledger.state")?;
                 Ok(PersistedBatchStatus {
+                    run_id: self.run_id,
                     batch_id,
                     tick,
                     payload_digest,
@@ -3834,9 +5876,11 @@ impl Storage {
             let existing = self.connection()?.query_with_params(
                 "SELECT agent_uid, spawn_ordinal, birth_ordinal
                  FROM births
-                 WHERE agent_uid = ?1 OR spawn_ordinal = ?2 OR birth_ordinal = ?3
+                 WHERE run_id = ?1
+                   AND (agent_uid = ?2 OR spawn_ordinal = ?3 OR birth_ordinal = ?4)
                  LIMIT 1",
                 &[
+                    sqlite_run_id(self.run_id),
                     row.agent_uid.into(),
                     row.spawn_ordinal.into(),
                     sqlite_optional_i64(row.birth_ordinal),
@@ -3912,8 +5956,11 @@ impl Storage {
                 });
             }
             let existing = self.connection()?.query_with_params(
-                "SELECT agent_uid, tick FROM deaths WHERE agent_uid = ?1 LIMIT 1",
-                &[row.agent_uid.into()],
+                "SELECT agent_uid, tick
+                 FROM deaths
+                 WHERE run_id = ?1 AND agent_uid = ?2
+                 LIMIT 1",
+                &[sqlite_run_id(self.run_id), row.agent_uid.into()],
             )?;
             if let Some(existing) = existing.first() {
                 let existing_uid =
@@ -3994,8 +6041,14 @@ impl Storage {
                 continue;
             };
             let existing = self.connection()?.query_with_params(
-                "SELECT agent_uid, tick FROM births WHERE agent_uid = ?1 LIMIT 1",
-                &[encode_u64("births.agent_uid", agent_uid)?.into()],
+                "SELECT agent_uid, tick
+                 FROM births
+                 WHERE run_id = ?1 AND agent_uid = ?2
+                 LIMIT 1",
+                &[
+                    sqlite_run_id(self.run_id),
+                    encode_u64("births.agent_uid", agent_uid)?.into(),
+                ],
             )?;
             if let Some(row) = existing.first() {
                 let persisted_uid =
@@ -4082,14 +6135,14 @@ impl Storage {
             context: "storage_batch_ledger.tick",
             reason: error.to_string(),
         })?;
-        let (payload, payload_digest) = prepared.encode_outbox(tick)?;
+        let (payload, payload_digest) = prepared.encode_outbox(self.run_id, tick)?;
         let before = self.persistence_watermarks()?;
         let existing = self.connection()?.query_with_params(
             "SELECT batch_id, payload_digest
              FROM storage_batch_ledger
-             WHERE tick = ?1
+             WHERE run_id = ?1 AND tick = ?2
              ORDER BY batch_id ASC",
-            &[tick_i64.into()],
+            &[sqlite_run_id(self.run_id), tick_i64.into()],
         )?;
         if let Some(row) = existing.first() {
             if existing.len() != 1 {
@@ -4114,6 +6167,7 @@ impl Storage {
             }
             return Ok((
                 AdmissionReceipt {
+                    run_id: self.run_id,
                     batch_id,
                     tick,
                     guarantee: if self.file_backed() {
@@ -4144,9 +6198,10 @@ impl Storage {
         execute_transaction_with_retry(self.connection()?, |transaction| {
             let ledger_rows = transaction.execute_with_params(
                 "INSERT INTO storage_batch_ledger (
-                    batch_id, tick, payload_digest, state
-                 ) VALUES (?1, ?2, ?3, 'admitted')",
+                    run_id, batch_id, tick, payload_digest, state
+                 ) VALUES (?1, ?2, ?3, ?4, 'admitted')",
                 &[
+                    sqlite_run_id(self.run_id),
                     batch_id.as_i64().into(),
                     tick_i64.into(),
                     payload_digest.as_str().into(),
@@ -4159,8 +6214,12 @@ impl Storage {
                 )));
             }
             let outbox_rows = transaction.execute_with_params(
-                "INSERT INTO storage_outbox (batch_id, payload) VALUES (?1, ?2)",
-                &[batch_id.as_i64().into(), payload.as_str().into()],
+                "INSERT INTO storage_outbox (run_id, batch_id, payload) VALUES (?1, ?2, ?3)",
+                &[
+                    sqlite_run_id(self.run_id),
+                    batch_id.as_i64().into(),
+                    payload.as_str().into(),
+                ],
             )?;
             if outbox_rows != 1 {
                 return Err(FrankenError::Internal(format!(
@@ -4171,8 +6230,12 @@ impl Storage {
             let progress_rows = transaction.execute_with_params(
                 "UPDATE storage_progress
                  SET admitted_batch_id = ?1
-                 WHERE singleton = 1 AND admitted_batch_id = ?2",
-                &[batch_id.as_i64().into(), expected_previous.into()],
+                 WHERE run_id = ?2 AND singleton = 1 AND admitted_batch_id = ?3",
+                &[
+                    batch_id.as_i64().into(),
+                    sqlite_run_id(self.run_id),
+                    expected_previous.into(),
+                ],
             )?;
             if progress_rows != 1 {
                 return Err(FrankenError::Internal(format!(
@@ -4196,6 +6259,7 @@ impl Storage {
         };
         Ok((
             AdmissionReceipt {
+                run_id: self.run_id,
                 batch_id,
                 tick,
                 guarantee: if self.file_backed() {
@@ -4210,11 +6274,14 @@ impl Storage {
     }
 
     fn load_outbox(&self) -> Result<Vec<RecoveredOutboxBatch>, StorageError> {
-        let rows = self.connection()?.query(
+        let rows = self.connection()?.query_with_params(
             "SELECT outbox.batch_id, ledger.tick, ledger.payload_digest, outbox.payload
              FROM storage_outbox AS outbox
-             JOIN storage_batch_ledger AS ledger ON ledger.batch_id = outbox.batch_id
+             JOIN storage_batch_ledger AS ledger
+               ON ledger.run_id = outbox.run_id AND ledger.batch_id = outbox.batch_id
+             WHERE outbox.run_id = ?1
              ORDER BY outbox.batch_id ASC",
+            &[sqlite_run_id(self.run_id)],
         )?;
         let mut batches = Vec::with_capacity(rows.len());
         for row in rows {
@@ -4228,8 +6295,10 @@ impl Storage {
             )?;
             let payload_digest: String = decode(&row, 2, "storage_batch_ledger.payload_digest")?;
             let payload: String = decode(&row, 3, "storage_outbox.payload")?;
-            let storage = StorageBuffer::decode_outbox(&payload, tick, &payload_digest)?;
+            let storage =
+                StorageBuffer::decode_outbox(&payload, self.run_id, tick, &payload_digest)?;
             batches.push(RecoveredOutboxBatch {
+                run_id: self.run_id,
                 batch_id,
                 tick,
                 payload_digest,
@@ -4249,6 +6318,15 @@ impl Storage {
         let mut highest_outbox = durable;
 
         for (offset, batch) in batches.into_iter().enumerate() {
+            if batch.run_id != self.run_id {
+                return Err(StorageError::InvalidData {
+                    context: "storage_outbox.run_id",
+                    reason: format!(
+                        "storage is bound to run {}, outbox belongs to {}",
+                        self.run_id, batch.run_id
+                    ),
+                });
+            }
             let offset = i64::try_from(offset).map_err(|error| StorageError::InvalidData {
                 context: "storage_outbox.batch_id",
                 reason: error.to_string(),
@@ -4403,18 +6481,23 @@ impl Storage {
         Ok(false)
     }
 
-    fn insert_ticks(tx: &Transaction<'_>, rows: &[TickRow]) -> Result<(), FrankenError> {
+    fn insert_ticks(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[TickRow],
+    ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into ticks (
-                tick, epoch, closed, agent_count, births, deaths,
+        let sql = "insert or replace into tick_summaries (
+                run_id, tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
         for row in rows {
             tx.execute_with_params(
                 sql,
                 &[
+                    sqlite_run_id(run_id),
                     row.tick.into(),
                     row.epoch.into(),
                     sqlite_bool(row.closed),
@@ -4430,35 +6513,59 @@ impl Storage {
         Ok(())
     }
 
-    fn insert_metrics(tx: &Transaction<'_>, rows: &[MetricRow]) -> Result<(), FrankenError> {
+    fn insert_metrics(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[MetricRow],
+    ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into metrics (tick, name, value) values (?1, ?2, ?3)";
+        let sql = "insert or replace into metrics (run_id, tick, name, value)
+                   values (?1, ?2, ?3, ?4)";
         for row in rows {
             tx.execute_with_params(
                 sql,
-                &[row.tick.into(), row.name.as_str().into(), row.value.into()],
+                &[
+                    sqlite_run_id(run_id),
+                    row.tick.into(),
+                    row.name.as_str().into(),
+                    row.value.into(),
+                ],
             )?;
         }
         Ok(())
     }
 
-    fn insert_events(tx: &Transaction<'_>, rows: &[EventRow]) -> Result<(), FrankenError> {
+    fn insert_events(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[EventRow],
+    ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
-        let sql = "insert or replace into events (tick, kind, count) values (?1, ?2, ?3)";
+        let sql = "insert or replace into events (run_id, tick, kind, count)
+                   values (?1, ?2, ?3, ?4)";
         for row in rows {
             tx.execute_with_params(
                 sql,
-                &[row.tick.into(), row.kind.as_str().into(), row.count.into()],
+                &[
+                    sqlite_run_id(run_id),
+                    row.tick.into(),
+                    row.kind.as_str().into(),
+                    row.count.into(),
+                ],
             )?;
         }
         Ok(())
     }
 
-    fn insert_agents(tx: &Transaction<'_>, rows: &[AgentRow]) -> Result<(), FrankenError> {
+    fn insert_agents(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[AgentRow],
+    ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -4466,6 +6573,7 @@ impl Storage {
             tx.execute_with_params(
                 scriptbots_agent_insert_sql(),
                 &[
+                    sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
                     row.generation.into(),
@@ -4511,19 +6619,24 @@ impl Storage {
         Ok(())
     }
 
-    fn insert_births(tx: &Transaction<'_>, rows: &[BirthRow]) -> Result<(), FrankenError> {
+    fn insert_births(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[BirthRow],
+    ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
         let sql = "insert into births (
-                tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
+                run_id, tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
                 brain_kind, brain_key, herbivore_tendency,
                 generation, position_x, position_y, is_hybrid, origin
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
         for row in rows {
             tx.execute_with_params(
                 sql,
                 &[
+                    sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
                     row.spawn_ordinal.into(),
@@ -4544,21 +6657,26 @@ impl Storage {
         Ok(())
     }
 
-    fn insert_deaths(tx: &Transaction<'_>, rows: &[DeathRow]) -> Result<(), FrankenError> {
+    fn insert_deaths(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        rows: &[DeathRow],
+    ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
         let sql = "insert into deaths (
-                tick, agent_uid, age, generation,
+                run_id, tick, agent_uid, age, generation,
                 herbivore_tendency, brain_kind, brain_key,
                 energy, food_balance_total, cause, was_hybrid,
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
                 hit_by_carnivore, hit_by_herbivore
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
         for row in rows {
             tx.execute_with_params(
                 sql,
                 &[
+                    sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
                     row.age.into(),
@@ -4584,18 +6702,20 @@ impl Storage {
 
     fn insert_replay_events(
         tx: &Transaction<'_>,
+        run_id: RunId,
         rows: &[ReplayEventRow],
     ) -> Result<(), FrankenError> {
         if rows.is_empty() {
             return Ok(());
         }
         let sql = "insert or replace into replay_events (
-                tick, seq, agent_uid, scope, event_type, payload
-            ) values (?1, ?2, ?3, ?4, ?5, ?6)";
+                run_id, tick, seq, agent_uid, scope, event_type, payload
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
         for row in rows {
             tx.execute_with_params(
                 sql,
                 &[
+                    sqlite_run_id(run_id),
                     row.tick.into(),
                     row.seq.into(),
                     sqlite_optional_i64(row.agent_uid),
@@ -4610,6 +6730,7 @@ impl Storage {
 
     fn flush_attempt(
         connection: &Connection,
+        run_id: RunId,
         buffer: &StorageBuffer,
         outbox_ids: &[PersistenceBatchId],
     ) -> Result<(), FlushAttemptError> {
@@ -4620,13 +6741,13 @@ impl Storage {
                 commit_state: FailureCommitState::RolledBack,
             })?;
         let transaction_result = (|| -> Result<(), FrankenError> {
-            Self::insert_ticks(&tx, &buffer.ticks)?;
-            Self::insert_metrics(&tx, &buffer.metrics)?;
-            Self::insert_events(&tx, &buffer.events)?;
-            Self::insert_agents(&tx, &buffer.agents)?;
-            Self::insert_births(&tx, &buffer.births)?;
-            Self::insert_deaths(&tx, &buffer.deaths)?;
-            Self::insert_replay_events(&tx, &buffer.replay_events)?;
+            Self::insert_ticks(&tx, run_id, &buffer.ticks)?;
+            Self::insert_metrics(&tx, run_id, &buffer.metrics)?;
+            Self::insert_events(&tx, run_id, &buffer.events)?;
+            Self::insert_agents(&tx, run_id, &buffer.agents)?;
+            Self::insert_births(&tx, run_id, &buffer.births)?;
+            Self::insert_deaths(&tx, run_id, &buffer.deaths)?;
+            Self::insert_replay_events(&tx, run_id, &buffer.replay_events)?;
             if let Some(last) = outbox_ids.last().copied() {
                 let first = outbox_ids[0];
                 for pair in outbox_ids.windows(2) {
@@ -4638,9 +6759,10 @@ impl Storage {
                         )));
                     }
                 }
-                let progress = tx.query_row(
+                let progress = tx.query_row_with_params(
                     "SELECT admitted_batch_id, applied_batch_id FROM storage_progress
-                     WHERE singleton = 1",
+                     WHERE run_id = ?1 AND singleton = 1",
+                    &[sqlite_run_id(run_id)],
                 )?;
                 let admitted = progress
                     .get_typed::<i64>(0)
@@ -4657,8 +6779,9 @@ impl Storage {
                 }
                 for batch_id in outbox_ids {
                     let ledger = tx.query_row_with_params(
-                        "SELECT state FROM storage_batch_ledger WHERE batch_id = ?1",
-                        &[batch_id.as_i64().into()],
+                        "SELECT state FROM storage_batch_ledger
+                         WHERE run_id = ?1 AND batch_id = ?2",
+                        &[sqlite_run_id(run_id), batch_id.as_i64().into()],
                     )?;
                     let state = ledger
                         .get_typed::<String>(0)
@@ -4670,8 +6793,10 @@ impl Storage {
                         )));
                     }
                     let updated = tx.execute_with_params(
-                        "UPDATE storage_batch_ledger SET state = 'applied' WHERE batch_id = ?1",
-                        &[batch_id.as_i64().into()],
+                        "UPDATE storage_batch_ledger
+                         SET state = 'applied'
+                         WHERE run_id = ?1 AND batch_id = ?2",
+                        &[sqlite_run_id(run_id), batch_id.as_i64().into()],
                     )?;
                     if updated != 1 {
                         return Err(FrankenError::Internal(format!(
@@ -4681,8 +6806,10 @@ impl Storage {
                     }
                 }
                 let progress_rows = tx.execute_with_params(
-                    "UPDATE storage_progress SET applied_batch_id = ?1 WHERE singleton = 1",
-                    &[last.as_i64().into()],
+                    "UPDATE storage_progress
+                     SET applied_batch_id = ?1
+                     WHERE run_id = ?2 AND singleton = 1",
+                    &[last.as_i64().into(), sqlite_run_id(run_id)],
                 )?;
                 if progress_rows != 1 {
                     return Err(FrankenError::Internal(format!(
@@ -4725,7 +6852,12 @@ impl Storage {
         let connection = self.connection()?;
         let mut attempt = 1_u8;
         loop {
-            match Self::flush_attempt(connection, &self.buffer, &self.buffered_outbox_ids) {
+            match Self::flush_attempt(
+                connection,
+                self.run_id,
+                &self.buffer,
+                &self.buffered_outbox_ids,
+            ) {
                 Ok(()) => {
                     info!(
                         path = %self.path,
@@ -4777,9 +6909,13 @@ impl Storage {
                 let rows = transaction.query_with_params(
                     "SELECT batch_id, state
                      FROM storage_batch_ledger
-                     WHERE batch_id > ?1 AND batch_id <= ?2
+                     WHERE run_id = ?1 AND batch_id > ?2 AND batch_id <= ?3
                      ORDER BY batch_id ASC",
-                    &[durable_before.into(), target.into()],
+                    &[
+                        sqlite_run_id(self.run_id),
+                        durable_before.into(),
+                        target.into(),
+                    ],
                 )?;
                 if rows.len() != usize::try_from(target - durable_before).unwrap_or(usize::MAX) {
                     return Err(FrankenError::Internal(format!(
@@ -4804,8 +6940,12 @@ impl Storage {
                 let ledger_rows = transaction.execute_with_params(
                     "UPDATE storage_batch_ledger
                      SET state = 'durable'
-                     WHERE batch_id > ?1 AND batch_id <= ?2",
-                    &[durable_before.into(), target.into()],
+                     WHERE run_id = ?1 AND batch_id > ?2 AND batch_id <= ?3",
+                    &[
+                        sqlite_run_id(self.run_id),
+                        durable_before.into(),
+                        target.into(),
+                    ],
                 )?;
                 if ledger_rows != expected {
                     return Err(FrankenError::Internal(format!(
@@ -4813,8 +6953,10 @@ impl Storage {
                     )));
                 }
                 let progress_rows = transaction.execute_with_params(
-                    "UPDATE storage_progress SET durable_batch_id = ?1 WHERE singleton = 1",
-                    &[target.into()],
+                    "UPDATE storage_progress
+                     SET durable_batch_id = ?1
+                     WHERE run_id = ?2 AND singleton = 1",
+                    &[target.into(), sqlite_run_id(self.run_id)],
                 )?;
                 if progress_rows != 1 {
                     return Err(FrankenError::Internal(format!(
@@ -4823,8 +6965,8 @@ impl Storage {
                 }
             }
             transaction.execute_with_params(
-                "DELETE FROM storage_outbox WHERE batch_id <= ?1",
-                &[target.into()],
+                "DELETE FROM storage_outbox WHERE run_id = ?1 AND batch_id <= ?2",
+                &[sqlite_run_id(self.run_id), target.into()],
             )?;
             Ok(())
         })?;
@@ -4856,25 +6998,28 @@ impl Storage {
         }
     }
 
-    /// Return the maximum tick recorded in the `ticks` table, if any.
+    /// Return the maximum tick recorded for this run, if any.
     pub fn max_tick(&mut self) -> Result<Option<u64>, StorageError> {
         self.flush()?;
-        let row = self
-            .connection()?
-            .query_row("SELECT MAX(tick) FROM ticks")?;
-        let value = decode::<Option<i64>>(&row, 0, "ticks.max_tick")?;
+        let row = self.connection()?.query_row_with_params(
+            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let value = decode::<Option<i64>>(&row, 0, "tick_summaries.max_tick")?;
         value
-            .map(|tick| checked_u64("ticks.max_tick", tick))
+            .map(|tick| checked_u64("tick_summaries.max_tick", tick))
             .transpose()
     }
 
     /// Load all replay events ordered by tick/sequence and reconstruct their payloads.
     pub fn load_replay_events(&mut self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
         self.flush()?;
-        let rows = self.connection()?.query(
+        let rows = self.connection()?.query_with_params(
             "SELECT tick, seq, agent_uid, scope, event_type, payload
              from replay_events
+             WHERE run_id = ?1
              ORDER BY tick ASC, seq ASC",
+            &[sqlite_run_id(self.run_id)],
         )?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
@@ -4899,11 +7044,13 @@ impl Storage {
     /// Return counts of replay events grouped by event type.
     pub fn replay_event_counts(&mut self) -> Result<Vec<ReplayEventCount>, StorageError> {
         self.flush()?;
-        let rows = self.connection()?.query(
+        let rows = self.connection()?.query_with_params(
             "SELECT event_type, COUNT(*) AS total
              FROM replay_events
+             WHERE run_id = ?1
              GROUP BY event_type
              ORDER BY event_type",
+            &[sqlite_run_id(self.run_id)],
         )?;
         let mut counts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -4922,17 +7069,18 @@ impl Storage {
             return Ok(Vec::new());
         }
         self.flush()?;
-        let bound = checked_i64("top_predators.limit", limit)?;
+        let bound = checked_query_limit("top_predators.limit", limit)?;
         let rows = self.connection()?.query_with_params(
             "SELECT agent_uid,
                     AVG(energy) AS avg_energy,
                     MAX(spike_length) AS max_spike_length,
                     MAX(tick) AS last_tick
              FROM agents
+             WHERE run_id = ?1
              GROUP BY agent_uid
              ORDER BY avg_energy DESC
-             LIMIT ?1",
-            &[bound.into()],
+             LIMIT ?2",
+            &[sqlite_run_id(self.run_id), bound.into()],
         )?;
         let mut stats = Vec::with_capacity(limit.min(16));
         for row in rows {
@@ -4954,23 +7102,24 @@ impl Storage {
         }
 
         self.flush()?;
-        let row = self
-            .connection()?
-            .query_row("SELECT MAX(tick) FROM metrics")?;
+        let row = self.connection()?.query_row_with_params(
+            "SELECT MAX(tick) FROM metrics WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
         let latest_tick = decode::<Option<i64>>(&row, 0, "metrics.latest_tick")?;
 
         let Some(tick) = latest_tick else {
             return Ok(Vec::new());
         };
 
-        let bound = checked_i64("latest_metrics.limit", limit)?;
+        let bound = checked_query_limit("latest_metrics.limit", limit)?;
         let rows = self.connection()?.query_with_params(
             "SELECT name, value
              FROM metrics
-             WHERE tick = ?1
+             WHERE run_id = ?1 AND tick = ?2
              ORDER BY name ASC
-             LIMIT ?2",
-            &[tick.into(), bound.into()],
+             LIMIT ?3",
+            &[sqlite_run_id(self.run_id), tick.into(), bound.into()],
         )?;
         let mut readings = Vec::with_capacity(rows.len());
         for row in rows {
@@ -4984,22 +7133,39 @@ impl Storage {
     }
 
     fn latest_pending_analytics(&self) -> Result<Option<PendingAnalytics>, StorageError> {
-        let rows = self
-            .connection()?
-            .query("SELECT tick, agent_count FROM ticks ORDER BY tick DESC LIMIT 1")?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick, agent_count
+             FROM tick_summaries
+             WHERE run_id = ?1
+             ORDER BY tick DESC
+             LIMIT 1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let tick = checked_u64("ticks.tick", decode(row, 0, "ticks.tick")?)?;
-        let agent_count = checked_usize("ticks.agent_count", decode(row, 1, "ticks.agent_count")?)?;
+        let tick = checked_u64(
+            "tick_summaries.tick",
+            decode(row, 0, "tick_summaries.tick")?,
+        )?;
+        let agent_count = checked_usize(
+            "tick_summaries.agent_count",
+            decode(row, 1, "tick_summaries.agent_count")?,
+        )?;
         let metric_rows = self.connection()?.query_with_params(
-            "SELECT name, value FROM metrics WHERE tick = ?1 ORDER BY name ASC",
-            &[i64::try_from(tick)
-                .map_err(|error| StorageError::InvalidData {
-                    context: "ticks.tick",
-                    reason: error.to_string(),
-                })?
-                .into()],
+            "SELECT name, value
+             FROM metrics
+             WHERE run_id = ?1 AND tick = ?2
+             ORDER BY name ASC",
+            &[
+                sqlite_run_id(self.run_id),
+                i64::try_from(tick)
+                    .map_err(|error| StorageError::InvalidData {
+                        context: "tick_summaries.tick",
+                        reason: error.to_string(),
+                    })?
+                    .into(),
+            ],
         )?;
         let mut readings = Vec::with_capacity(metric_rows.len());
         for row in metric_rows {
@@ -5214,6 +7380,7 @@ struct AdmissionState {
 /// Cloneable persistence sink that never owns or transports a database connection.
 #[derive(Clone)]
 pub struct StorageSink {
+    run_id: RunId,
     tx: xchan::Sender<StorageCommand>,
     analytics: AnalyticsSnapshotProvider,
     admission: Arc<Mutex<AdmissionState>>,
@@ -5281,6 +7448,12 @@ fn lock_admission_gate_until<'a>(
 }
 
 impl StorageSink {
+    /// Durable run identity bound to every batch admitted through this sink.
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
     /// Admit a persistence batch and wait until its exact payload is in the worker outbox.
     pub fn submit_with_receipt(
         &self,
@@ -5798,9 +7971,12 @@ pub struct StoragePipeline {
 }
 
 impl StoragePipeline {
-    /// Atomically reserve and create a file-backed asynchronous pipeline.
-    pub fn create_new_file(path: &str) -> Result<Self, StorageError> {
-        Self::create_new_file_with_thresholds(
+    /// Atomically reserve and create an unattributed file-backed asynchronous pipeline.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use [`Self::create_new_file_for_run`].
+    pub fn create_unattributed_file(path: &str) -> Result<Self, StorageError> {
+        Self::create_unattributed_file_with_thresholds(
             path,
             DEFAULT_TICK_BUFFER,
             DEFAULT_AGENT_BUFFER,
@@ -5809,7 +7985,64 @@ impl StoragePipeline {
         )
     }
 
-    /// Open a validated existing ScriptBots database, recover its outbox, and own it exclusively.
+    /// Atomically create a file-backed pipeline and register complete provenance before tick zero.
+    pub fn create_new_file_for_run(
+        path: &str,
+        manifest: RunManifestRecord,
+    ) -> Result<Self, StorageError> {
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_and_deadlines_for_run(
+            reserve_new_file(path)?,
+            run_open,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+            StorageDeadlines::default(),
+        )
+    }
+
+    /// Create a file-backed pipeline with complete provenance and explicit thresholds.
+    pub fn create_new_file_for_run_with_thresholds(
+        path: &str,
+        manifest: RunManifestRecord,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+    ) -> Result<Self, StorageError> {
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_and_deadlines_for_run(
+            reserve_new_file(path)?,
+            run_open,
+            tick,
+            agent,
+            event,
+            metric,
+            StorageDeadlines::default(),
+        )
+    }
+
+    /// Append a new independent run to a validated database after its previous writer closes.
+    pub fn append_run(path: &str, manifest: RunManifestRecord) -> Result<Self, StorageError> {
+        validate_durable_storage_path(path)?;
+        let run_open = RunOpen::register(manifest, true)?;
+        Self::with_target_and_deadlines_for_run(
+            StorageTarget::RecoverExisting(path.to_owned()),
+            run_open,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+            StorageDeadlines::default(),
+        )
+    }
+
+    /// Open a validated single-run database, recover its outbox, and own it exclusively.
+    ///
+    /// Multi-run databases require [`Self::recover_existing_run`] so recovery can never select a
+    /// scientific run implicitly. The writer still revalidates the exact database identity,
+    /// schema, selected run, and all persistence invariants after acquiring its OS lease.
     pub fn recover_existing(path: &str) -> Result<Self, StorageError> {
         validate_durable_storage_path(path)?;
         Self::with_target_and_deadlines(
@@ -5822,16 +8055,36 @@ impl StoragePipeline {
         )
     }
 
-    /// Atomically reserve a file-backed pipeline with explicit thresholds.
-    pub fn create_new_file_with_thresholds(
+    /// Recover one explicitly selected run from a multi-run database.
+    pub fn recover_existing_run(path: &str, run_id: RunId) -> Result<Self, StorageError> {
+        validate_durable_storage_path(path)?;
+        Self::with_target_and_deadlines_for_run(
+            StorageTarget::RecoverExisting(path.to_owned()),
+            RunOpen::Recover(run_id),
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+            StorageDeadlines::default(),
+        )
+    }
+
+    /// Atomically reserve an unattributed file-backed pipeline with explicit thresholds.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use
+    /// [`Self::create_new_file_for_run_with_thresholds`].
+    pub fn create_unattributed_file_with_thresholds(
         path: &str,
         tick: usize,
         agent: usize,
         event: usize,
         metric: usize,
     ) -> Result<Self, StorageError> {
-        Self::with_target_and_deadlines(
+        let run_open = RunOpen::unattributed()?;
+        Self::with_target_and_deadlines_for_run(
             reserve_new_file(path)?,
+            run_open,
             tick,
             agent,
             event,
@@ -5840,8 +8093,12 @@ impl StoragePipeline {
         )
     }
 
-    /// Atomically reserve a file-backed pipeline with explicit thresholds and wait deadlines.
-    pub fn create_new_file_with_thresholds_and_deadlines(
+    /// Atomically reserve an unattributed file-backed pipeline with explicit thresholds and wait
+    /// deadlines.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance.
+    pub fn create_unattributed_file_with_thresholds_and_deadlines(
         path: &str,
         tick: usize,
         agent: usize,
@@ -5849,8 +8106,10 @@ impl StoragePipeline {
         metric: usize,
         deadlines: StorageDeadlines,
     ) -> Result<Self, StorageError> {
-        Self::with_target_and_deadlines(
+        let run_open = RunOpen::unattributed()?;
+        Self::with_target_and_deadlines_for_run(
             reserve_new_file(path)?,
+            run_open,
             tick,
             agent,
             event,
@@ -5859,9 +8118,12 @@ impl StoragePipeline {
         )
     }
 
-    /// Create an isolated volatile pipeline with default thresholds.
-    pub fn memory() -> Result<Self, StorageError> {
-        Self::memory_with_thresholds(
+    /// Create an unattributed volatile pipeline with default thresholds.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use [`Self::memory_for_run`].
+    pub fn unattributed_memory() -> Result<Self, StorageError> {
+        Self::unattributed_memory_with_thresholds(
             DEFAULT_TICK_BUFFER,
             DEFAULT_AGENT_BUFFER,
             DEFAULT_EVENT_BUFFER,
@@ -5869,8 +8131,46 @@ impl StoragePipeline {
         )
     }
 
-    /// Create an isolated volatile pipeline with explicit thresholds.
-    pub fn memory_with_thresholds(
+    /// Create a volatile pipeline with complete run provenance registered before tick zero.
+    pub fn memory_for_run(manifest: RunManifestRecord) -> Result<Self, StorageError> {
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_and_deadlines_for_run(
+            StorageTarget::Memory,
+            run_open,
+            DEFAULT_TICK_BUFFER,
+            DEFAULT_AGENT_BUFFER,
+            DEFAULT_EVENT_BUFFER,
+            DEFAULT_METRIC_BUFFER,
+            StorageDeadlines::default(),
+        )
+    }
+
+    /// Create a volatile pipeline with complete provenance and explicit thresholds.
+    pub fn memory_for_run_with_thresholds(
+        manifest: RunManifestRecord,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+    ) -> Result<Self, StorageError> {
+        let run_open = RunOpen::register(manifest, false)?;
+        Self::with_target_and_deadlines_for_run(
+            StorageTarget::Memory,
+            run_open,
+            tick,
+            agent,
+            event,
+            metric,
+            StorageDeadlines::default(),
+        )
+    }
+
+    /// Create an unattributed volatile pipeline with explicit thresholds.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance. Production callers must use
+    /// [`Self::memory_for_run_with_thresholds`].
+    pub fn unattributed_memory_with_thresholds(
         tick: usize,
         agent: usize,
         event: usize,
@@ -5886,8 +8186,11 @@ impl StoragePipeline {
         )
     }
 
-    /// Create an isolated volatile pipeline with explicit thresholds and wait deadlines.
-    pub fn memory_with_thresholds_and_deadlines(
+    /// Create an unattributed volatile pipeline with explicit thresholds and wait deadlines.
+    ///
+    /// This constructor is reserved for non-production fixtures and embedders that explicitly do
+    /// not have run provenance.
+    pub fn unattributed_memory_with_thresholds_and_deadlines(
         tick: usize,
         agent: usize,
         event: usize,
@@ -5912,10 +8215,32 @@ impl StoragePipeline {
         metric: usize,
         deadlines: StorageDeadlines,
     ) -> Result<Self, StorageError> {
+        let run_open = if matches!(target, StorageTarget::RecoverExisting(_)) {
+            RunOpen::RecoverSole
+        } else {
+            RunOpen::unattributed()?
+        };
+        Self::with_target_and_deadlines_for_run(
+            target, run_open, tick, agent, event, metric, deadlines,
+        )
+    }
+
+    fn with_target_and_deadlines_for_run(
+        target: StorageTarget,
+        run_open: RunOpen,
+        tick: usize,
+        agent: usize,
+        event: usize,
+        metric: usize,
+        deadlines: StorageDeadlines,
+    ) -> Result<Self, StorageError> {
         deadlines.validate()?;
         let (tx, rx) = xchan::bounded::<StorageCommand>(DEFAULT_COMMAND_CAPACITY);
-        let (startup_tx, startup_rx) = xchan::bounded::<Result<(), StorageWorkerError>>(1);
-        let analytics = AnalyticsSnapshotProvider::empty();
+        let (startup_tx, startup_rx) = xchan::bounded::<Result<RunId, StorageWorkerError>>(1);
+        let analytics = run_open.run_id().map_or_else(
+            AnalyticsSnapshotProvider::empty,
+            AnalyticsSnapshotProvider::for_run,
+        );
         let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
         let storage_path: Arc<str> = Arc::from(target.path());
         let worker_analytics = analytics.clone();
@@ -5927,7 +8252,16 @@ impl StoragePipeline {
         };
         let handle = thread::Builder::new()
             .name("scriptbots-storage-worker".into())
-            .spawn(move || storage_worker(target, thresholds, rx, startup_tx, worker_analytics))
+            .spawn(move || {
+                storage_worker(
+                    target,
+                    run_open,
+                    thresholds,
+                    rx,
+                    startup_tx,
+                    worker_analytics,
+                )
+            })
             .map_err(|err| {
                 StorageError::Worker(StorageWorkerError::Internal {
                     operation: StorageOperation::Startup,
@@ -5939,8 +8273,9 @@ impl StoragePipeline {
             })?;
 
         match startup_rx.recv_deadline(Instant::now() + deadlines.startup_ack) {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(run_id)) => Ok(Self {
                 sink: StorageSink {
+                    run_id,
                     tx,
                     analytics,
                     admission,
@@ -6006,6 +8341,12 @@ impl StoragePipeline {
     #[must_use]
     pub fn analytics_provider(&self) -> AnalyticsSnapshotProvider {
         self.sink.analytics.clone()
+    }
+
+    /// Durable run identity bound to this pipeline.
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.sink.run_id
     }
 
     /// Return a clonable sink for an external persistence session while retaining host control
@@ -6382,15 +8723,17 @@ impl Drop for StoragePipeline {
 
 fn storage_worker(
     target: StorageTarget,
+    run_open: RunOpen,
     thresholds: StorageThresholds,
     rx: xchan::Receiver<StorageCommand>,
-    startup: xchan::Sender<Result<(), StorageWorkerError>>,
+    startup: xchan::Sender<Result<RunId, StorageWorkerError>>,
     analytics: AnalyticsSnapshotProvider,
 ) -> Option<StorageWorkerError> {
     let path = target.path().to_owned();
     let guarantee = target.guarantee();
-    let mut storage = match Storage::with_target(
+    let mut storage = match Storage::with_target_for_run(
         target,
+        run_open,
         thresholds.tick,
         thresholds.agent,
         thresholds.event,
@@ -6410,6 +8753,8 @@ fn storage_worker(
             return None;
         }
     };
+    let run_id = storage.run_id();
+    analytics.bind_run(run_id);
     let watermarks = match storage.persistence_watermarks() {
         Ok(watermarks) => watermarks,
         Err(error) => {
@@ -6456,7 +8801,7 @@ fn storage_worker(
     }
     #[cfg(test)]
     maybe_pause_storage_startup(&path);
-    if startup.send(Ok(())).is_err() {
+    if startup.send(Ok(run_id)).is_err() {
         let _ = storage.close();
         let error = StorageWorkerError::Channel {
             operation: StorageOperation::Startup,
@@ -7143,6 +9488,12 @@ mod tests {
         path
     }
 
+    fn unattributed_manifest_at(run_id: RunId, started_at_unix_ms: u64) -> RunManifestRecord {
+        let mut manifest = RunManifestRecord::unattributed(run_id);
+        manifest.started_at_unix_ms = started_at_unix_ms;
+        manifest
+    }
+
     fn normalized_scientific_schema(
         connection: &Connection,
     ) -> Result<Vec<(String, String, String, String)>, StorageError> {
@@ -7199,10 +9550,10 @@ mod tests {
     }
 
     #[test]
-    fn exported_schema_v1_executes_with_canonical_workload_table_names()
+    fn exported_schema_v6_executes_with_canonical_workload_table_names()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
-        connection.execute_batch(SCRIPTBOTS_SCHEMA_V1)?;
+        connection.execute_batch(SCRIPTBOTS_SCHEMA_V6)?;
 
         let production_connection = Connection::open(":memory:")?;
         install_scriptbots_schema(&production_connection)?;
@@ -7225,12 +9576,26 @@ mod tests {
             table_names,
             vec![
                 "agents",
+                "artifacts",
                 "births",
+                "checkpoints",
+                "command_status_transitions",
+                "commands",
                 "deaths",
+                "domain_events",
                 "events",
+                "genomes",
+                "interactions",
+                "lineage_edges",
                 "metrics",
                 "replay_events",
-                "ticks",
+                "run_features",
+                "runs",
+                "state_digests",
+                "storage_batch_ledger",
+                "storage_outbox",
+                "storage_progress",
+                "tick_summaries",
             ]
         );
         assert_eq!(
@@ -7242,12 +9607,109 @@ mod tests {
             "canonical agent insert placeholder count drifted from its column list"
         );
         assert!(
-            scriptbots_agent_insert_sql().ends_with("?39)"),
+            scriptbots_agent_insert_sql().ends_with("?40)"),
             "canonical agent insert no longer binds all production columns in order"
         );
 
         production_connection.close()?;
         connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_manifest_is_rejected_before_new_file_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-invalid-manifest-before-reserve");
+        let path_string = path.to_string_lossy().to_string();
+        let mut manifest = unattributed_manifest_at(RunId::new(0x101), 101);
+        manifest.scenario_id = "   ".to_owned();
+
+        let error = match StoragePipeline::create_new_file_for_run(&path_string, manifest) {
+            Err(error) => error,
+            Ok(mut unexpected) => {
+                unexpected.shutdown()?;
+                return Err("invalid manifest unexpectedly reserved a database".into());
+            }
+        };
+        assert!(matches!(
+            error,
+            StorageError::InvalidData {
+                context: "runs.scenario_id",
+                ..
+            }
+        ));
+        assert!(
+            !path.exists(),
+            "manifest validation failure must precede creation of the V6 database file"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_run_rejects_an_existing_run_id_even_when_provenance_matches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-append-requires-new-run-id");
+        let path_string = path.to_string_lossy().to_string();
+        let manifest = unattributed_manifest_at(RunId::new(0x202), 202);
+        let mut first = StoragePipeline::create_new_file_for_run(&path_string, manifest.clone())?;
+        first.shutdown()?;
+
+        let error = match StoragePipeline::append_run(&path_string, manifest) {
+            Err(error) => error,
+            Ok(mut unexpected) => {
+                unexpected.shutdown()?;
+                return Err("append_run accepted an already registered RunId".into());
+            }
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("append_run requires a new independent RunId"),
+            "unexpected duplicate-run error: {error}"
+        );
+        let catalog = StorageReader::catalog_page(&path_string, 0, 8)?;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].run_id, RunId::new(0x202));
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_validates_only_the_requested_bounded_page() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = temp_db_path("storage-bounded-run-catalog");
+        let path_string = path.to_string_lossy().to_string();
+        let older_run = RunId::new(0x301);
+        let newer_run = RunId::new(0x302);
+
+        let mut first = StoragePipeline::create_new_file_for_run(
+            &path_string,
+            unattributed_manifest_at(older_run, 301),
+        )?;
+        first.shutdown()?;
+        let mut second =
+            StoragePipeline::append_run(&path_string, unattributed_manifest_at(newer_run, 302))?;
+        second.shutdown()?;
+
+        let connection = Connection::open(&path_string)?;
+        connection.execute_with_params(
+            "UPDATE runs SET manifest_digest = 'blake3:tampered' WHERE run_id = ?1",
+            &[sqlite_run_id(older_run)],
+        )?;
+        connection.close()?;
+
+        let newest_page = StorageReader::catalog_page(&path_string, 0, 1)?;
+        assert_eq!(newest_page.len(), 1);
+        assert_eq!(newest_page[0].run_id, newer_run);
+
+        let older_error = StorageReader::catalog_page(&path_string, 1, 1)
+            .expect_err("the selected page must still validate its manifest");
+        assert!(matches!(
+            older_error,
+            StorageError::InvalidData {
+                context: "runs.manifest_digest",
+                ..
+            }
+        ));
         Ok(())
     }
 
@@ -7369,7 +9831,7 @@ mod tests {
     }
 
     fn create_file_storage(path: &str) -> Result<Storage, StorageError> {
-        Storage::create_new_file_with_thresholds(path, 64, 4096, 1024, 1024)
+        Storage::create_unattributed_file_with_thresholds(path, 64, 4096, 1024, 1024)
     }
 
     fn recover_file_storage(path: &str) -> Result<Storage, StorageError> {
@@ -7399,7 +9861,7 @@ mod tests {
             startup_ack: Duration::MAX,
             ..StorageDeadlines::default()
         };
-        let error = match StoragePipeline::memory_with_thresholds_and_deadlines(
+        let error = match StoragePipeline::unattributed_memory_with_thresholds_and_deadlines(
             64, 4096, 1024, 1024, deadlines,
         ) {
             Ok(mut pipeline) => {
@@ -7428,20 +9890,21 @@ mod tests {
             startup_ack: Duration::from_millis(100),
             ..short_deadlines()
         };
-        let first_error = match StoragePipeline::create_new_file_with_thresholds_and_deadlines(
-            &path_string,
-            64,
-            4096,
-            1024,
-            1024,
-            deadlines,
-        ) {
-            Ok(mut pipeline) => {
-                pipeline.shutdown()?;
-                return Err("startup pause did not trigger its deadline".into());
-            }
-            Err(error) => error,
-        };
+        let first_error =
+            match StoragePipeline::create_unattributed_file_with_thresholds_and_deadlines(
+                &path_string,
+                64,
+                4096,
+                1024,
+                1024,
+                deadlines,
+            ) {
+                Ok(mut pipeline) => {
+                    pipeline.shutdown()?;
+                    return Err("startup pause did not trigger its deadline".into());
+                }
+                Err(error) => error,
+            };
         assert!(matches!(
             first_error,
             StorageError::Worker(StorageWorkerError::Timeout {
@@ -7507,7 +9970,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-writer-path-lease");
         let path_string = path.to_string_lossy().to_string();
-        let mut first = StoragePipeline::create_new_file(&path_string)?;
+        let mut first = StoragePipeline::create_unattributed_file(&path_string)?;
         let error = match StoragePipeline::recover_existing(&path_string) {
             Ok(mut second) => {
                 second.shutdown()?;
@@ -7715,7 +10178,7 @@ mod tests {
         let path = temp_db_path("storage-os-writer-lease-graceful");
         let path_string = path.to_string_lossy().to_string();
         let lock_path = storage_writer_lock_path(&path_string);
-        let mut fixture = StoragePipeline::create_new_file(&path_string)?;
+        let mut fixture = StoragePipeline::create_unattributed_file(&path_string)?;
         fixture.shutdown()?;
         assert!(lock_path.try_exists()?);
 
@@ -7737,7 +10200,7 @@ mod tests {
         let path = temp_db_path("storage-os-writer-lease-forced");
         let path_string = path.to_string_lossy().to_string();
         let lock_path = storage_writer_lock_path(&path_string);
-        let mut fixture = StoragePipeline::create_new_file(&path_string)?;
+        let mut fixture = StoragePipeline::create_unattributed_file(&path_string)?;
         fixture.shutdown()?;
 
         let ready_path = temp_db_path("storage-os-writer-lease-forced-ready");
@@ -7776,8 +10239,8 @@ mod tests {
     fn memory_storage_does_not_participate_in_file_writer_leases()
     -> Result<(), Box<dyn std::error::Error>> {
         assert!(StorageWriterLease::acquire(":memory:")?.is_none());
-        let mut first = StoragePipeline::memory()?;
-        let mut second = StoragePipeline::memory()?;
+        let mut first = StoragePipeline::unattributed_memory()?;
+        let mut second = StoragePipeline::unattributed_memory()?;
         first.shutdown()?;
         second.shutdown()?;
         Ok(())
@@ -7859,7 +10322,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-finished-reader-live-writer");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline = StoragePipeline::create_new_file(&path_string)?;
+        let mut pipeline = StoragePipeline::create_unattributed_file(&path_string)?;
 
         let live_reader = StorageReader::open(&path_string)?;
         let finished_error = match StorageReader::open_finished(&path_string) {
@@ -7913,7 +10376,7 @@ mod tests {
 
     fn create_valid_database(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let path_string = path.to_string_lossy().to_string();
-        let mut storage = StoragePipeline::create_new_file(&path_string)?;
+        let mut storage = StoragePipeline::create_unattributed_file(&path_string)?;
         storage.shutdown()?;
         Ok(())
     }
@@ -8007,341 +10470,226 @@ mod tests {
     }
 
     #[test]
-    fn birth_origin_migration_backfills_historical_rows_without_a_default()
+    fn fresh_v6_schema_records_exact_ledger_and_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
-        MigrationRunner::new()
-            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
-            .add(
-                4,
-                "create_stable_uid_persistence_outbox",
-                SCRIPTBOTS_SCHEMA_V4,
-            )
-            .run(&connection)?;
-        connection.execute(
-            "INSERT INTO births (
-                tick, agent_uid, spawn_ordinal, birth_ordinal, parent_a, parent_b,
-                brain_kind, brain_key, herbivore_tendency, generation,
-                position_x, position_y, is_hybrid
-             ) VALUES (1, 2, 1, 0, NULL, NULL, NULL, NULL, 0.5, 0, 1.0, 2.0, 0)",
-        )?;
-
         install_scriptbots_schema(&connection)?;
 
-        let origin: String = connection
-            .query_row("SELECT origin FROM births WHERE tick = 1 AND agent_uid = 2")?
+        let first_schema = read_schema_objects(&connection)?;
+        let migrations = connection
+            .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(
+            decode::<i64>(&migrations[0], 0, "_schema_migrations.version")?,
+            SCRIPTBOTS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            decode::<String>(&migrations[0], 1, "_schema_migrations.name")?,
+            "create_multi_run_schema"
+        );
+        let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
+
+        install_scriptbots_schema(&connection)?;
+        assert_eq!(read_schema_objects(&connection)?, first_schema);
+        let migration_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM _schema_migrations")?
             .get_typed(0)?;
-        assert_eq!(origin, "born");
-        let historical_ordinal: Option<i64> = connection
-            .query_row("SELECT birth_ordinal FROM births WHERE tick = 1 AND agent_uid = 2")?
+        assert_eq!(
+            migration_count, 1,
+            "idempotent install duplicated its ledger"
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_v6_migration_rolls_back_objects_ledger_and_user_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FAILING_V6: &str = "
+            CREATE TABLE migration_probe (
+                value INTEGER PRIMARY KEY
+            );
+            PRAGMA user_version = 99;
+            INSERT INTO migration_probe (value) VALUES (1);
+            INSERT INTO migration_probe (value) VALUES (1);
+        ";
+
+        let connection = Connection::open(":memory:")?;
+        MigrationRunner::new()
+            .add(
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "deliberately_failing_v6",
+                FAILING_V6,
+            )
+            .run(&connection)
+            .expect_err("the deliberately failing migration unexpectedly committed");
+
+        let leaked_probe: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'migration_probe'",
+            )?
             .get_typed(0)?;
-        assert_eq!(historical_ordinal, Some(0));
-        let births_schema: String = connection
-            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'")?
+        assert_eq!(leaked_probe, 0, "failed migration leaked its schema object");
+        let leaked_ledger: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations
+                 WHERE version = 6 OR name = 'deliberately_failing_v6'",
+            )?
             .get_typed(0)?;
-        assert!(
-            !births_schema.to_ascii_uppercase().contains("DEFAULT"),
-            "the final origin column must not retain a DEFAULT: {births_schema}"
+        assert_eq!(leaked_ledger, 0, "failed migration leaked its ledger row");
+        let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(
+            user_version, 0,
+            "failed migration leaked PRAGMA user_version"
         );
-        assert!(
-            births_schema.contains("PRIMARY KEY (tick, agent_uid)"),
-            "the table rebuild did not preserve the composite primary key: {births_schema}"
-        );
-        assert!(
-            connection
-                .execute("UPDATE births SET origin = 'unknown' WHERE tick = 1")
-                .is_err(),
-            "the V5 origin domain must remain strict after migrating a historical row"
-        );
-        assert!(
-            connection
-                .execute(
-                    "INSERT INTO births (
-                        tick, agent_uid, spawn_ordinal, birth_ordinal,
-                        herbivore_tendency, generation, position_x, position_y, is_hybrid
-                     ) VALUES (2, 3, 2, NULL, 0.5, 0, 3.0, 4.0, 0)",
-                )
-                .is_err(),
-            "omitting origin must fail instead of silently defaulting to born"
-        );
-        connection.execute(
-            "INSERT INTO births (
-                tick, agent_uid, spawn_ordinal, birth_ordinal,
+
+        install_scriptbots_schema(&connection)?;
+        let installed_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+        assert_eq!(installed_version, SCRIPTBOTS_SCHEMA_VERSION);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v6_birth_constraints_are_strict_with_run_scoped_uniqueness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        install_scriptbots_schema(&connection)?;
+        connection.execute("PRAGMA foreign_keys = ON")?;
+        let born_sql = "INSERT INTO births (
+                run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
                 herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-             ) VALUES (0, 1, 0, NULL, 0.5, 0, 3.0, 4.0, 0, 'seeded')",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 0.5, 0, 1.0, 2.0, 0, 'born')";
+        let run_a = RunId::new(11);
+        let run_b = RunId::new(12);
+        let register_run_sql = "INSERT INTO runs (
+                run_id, manifest_schema_version, experiment_id, variant_id,
+                scenario_id, scenario_version, normalized_config_json, config_digest,
+                root_seed_hex, rng_algorithm, rng_version, brain_roster_json,
+                source_revision, source_tree_digest, source_tree_dirty,
+                source_bundle_digest, rust_toolchain, cargo_lock_digest, target_triple,
+                started_at_unix_ms_hex, requested_tick_budget_hex, live_run_policy,
+                reproducible, manifest_json, manifest_digest
+             ) VALUES (
+                ?1, 0, NULL, NULL, 'test', 0, '{}', 'config-digest',
+                '0000000000000000', 'test-rng', 0, '[]',
+                NULL, NULL, NULL, NULL, 'test-toolchain', 'lock-digest', 'test-target',
+                '0000000000000000', NULL, 'test-live-policy', 0, '{}', 'manifest-digest'
+             )";
+        connection.execute_with_params(register_run_sql, &[sqlite_run_id(run_a)])?;
+        connection.execute_with_params(register_run_sql, &[sqlite_run_id(run_b)])?;
+        connection.execute_with_params(
+            born_sql,
+            &[
+                sqlite_run_id(run_a),
+                1_i64.into(),
+                7_i64.into(),
+                9_i64.into(),
+                13_i64.into(),
+            ],
         )?;
-        let seeded_ordinal: Option<i64> = connection
-            .query_row("SELECT birth_ordinal FROM births WHERE agent_uid = 1")?
-            .get_typed(0)?;
-        assert_eq!(seeded_ordinal, None);
+        connection.execute_with_params(
+            born_sql,
+            &[
+                sqlite_run_id(run_b),
+                1_i64.into(),
+                7_i64.into(),
+                9_i64.into(),
+                13_i64.into(),
+            ],
+        )?;
         assert!(
             connection
-                .execute("UPDATE births SET tick = 2 WHERE agent_uid = 1")
-                .is_err(),
-            "the V5 schema must keep seeded founders at tick zero"
-        );
-        assert!(
-            connection
-                .execute(
-                    "INSERT INTO births (
-                        tick, agent_uid, spawn_ordinal, birth_ordinal,
-                        herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-                     ) VALUES (3, 3, 2, 2, 0.5, 0, 3.0, 4.0, 0, 'injected')",
-                )
-                .is_err(),
-            "non-born origins must not persist a demographic birth ordinal"
-        );
-        connection.close()?;
-        Ok(())
-    }
-
-    #[test]
-    fn birth_origin_migration_rejects_historical_duplicate_uids()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let connection = Connection::open(":memory:")?;
-        MigrationRunner::new()
-            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
-            .add(
-                4,
-                "create_stable_uid_persistence_outbox",
-                SCRIPTBOTS_SCHEMA_V4,
-            )
-            .run(&connection)?;
-        connection.execute(
-            "INSERT INTO births (
-                tick, agent_uid, spawn_ordinal, birth_ordinal,
-                herbivore_tendency, generation, position_x, position_y, is_hybrid
-             ) VALUES (1, 7, 0, 0, 0.5, 0, 1.0, 2.0, 0)",
-        )?;
-        connection.execute(
-            "INSERT INTO births (
-                tick, agent_uid, spawn_ordinal, birth_ordinal,
-                herbivore_tendency, generation, position_x, position_y, is_hybrid
-             ) VALUES (2, 7, 1, 1, 0.5, 0, 3.0, 4.0, 0)",
-        )?;
-
-        install_scriptbots_schema(&connection)
-            .expect_err("V5 must reject historical databases with duplicate origin UIDs");
-        let v5_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM _schema_migrations WHERE version = 5")?
-            .get_typed(0)?;
-        assert_eq!(v5_count, 0, "a failed uniqueness migration was recorded");
-
-        let births_schema: String = connection
-            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'")?
-            .get_typed(0)?;
-        assert!(
-            !births_schema.contains("origin"),
-            "failed V5 leaked its replacement schema instead of rolling back: {births_schema}"
-        );
-        let replacement_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'births_v5'",
-            )?
-            .get_typed(0)?;
-        assert_eq!(
-            replacement_count, 0,
-            "failed V5 left its rebuild table behind"
-        );
-        let historical_rows: i64 = connection
-            .query_row("SELECT COUNT(*) FROM births WHERE agent_uid = 7")?
-            .get_typed(0)?;
-        assert_eq!(
-            historical_rows, 2,
-            "failed V5 did not restore both historical duplicate rows"
-        );
-
-        connection.execute("UPDATE births SET agent_uid = 8 WHERE tick = 2 AND agent_uid = 7")?;
-        install_scriptbots_schema(&connection)?;
-        let migrated_origins: i64 = connection
-            .query_row("SELECT COUNT(*) FROM births WHERE origin = 'born'")?
-            .get_typed(0)?;
-        assert_eq!(migrated_origins, 2, "retry did not backfill every V4 row");
-        let unique_index_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'index' AND name IN (
-                     'births_agent_uid_unique',
-                     'births_spawn_ordinal_unique',
-                     'births_birth_ordinal_unique',
-                     'deaths_agent_uid_unique'
-                 )",
-            )?
-            .get_typed(0)?;
-        assert_eq!(
-            unique_index_count, 4,
-            "retry did not finish every V5 lifecycle uniqueness index"
-        );
-        connection.close()?;
-        Ok(())
-    }
-
-    #[test]
-    fn birth_origin_migration_rejects_duplicate_ordinals_atomically_and_retries()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for (duplicate_kind, rows, repair_sql) in [
-            (
-                "spawn",
-                [(1_i64, 7_i64, 9_i64, 0_i64), (2, 8, 9, 1)],
-                "UPDATE births SET spawn_ordinal = 10 WHERE tick = 2",
-            ),
-            (
-                "birth",
-                [(1_i64, 7_i64, 9_i64, 9_i64), (2, 8, 10, 9)],
-                "UPDATE births SET birth_ordinal = 10 WHERE tick = 2",
-            ),
-        ] {
-            let connection = Connection::open(":memory:")?;
-            MigrationRunner::new()
-                .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
-                .add(
-                    4,
-                    "create_stable_uid_persistence_outbox",
-                    SCRIPTBOTS_SCHEMA_V4,
-                )
-                .run(&connection)?;
-            for (tick, agent_uid, spawn_ordinal, birth_ordinal) in rows {
-                connection.execute_with_params(
-                    "INSERT INTO births (
-                        tick, agent_uid, spawn_ordinal, birth_ordinal,
-                        herbivore_tendency, generation, position_x, position_y, is_hybrid
-                     ) VALUES (?1, ?2, ?3, ?4, 0.5, 0, 1.0, 2.0, 0)",
+                .execute_with_params(
+                    born_sql,
                     &[
-                        tick.into(),
-                        agent_uid.into(),
-                        spawn_ordinal.into(),
-                        birth_ordinal.into(),
+                        sqlite_run_id(run_a),
+                        2_i64.into(),
+                        7_i64.into(),
+                        10_i64.into(),
+                        14_i64.into(),
                     ],
-                )?;
-            }
-
-            let expected_failure = format!(
-                "V5 must reject historical databases with duplicate {duplicate_kind} ordinals"
-            );
-            install_scriptbots_schema(&connection).expect_err(&expected_failure);
-            let v5_count: i64 = connection
-                .query_row("SELECT COUNT(*) FROM _schema_migrations WHERE version = 5")?
-                .get_typed(0)?;
-            assert_eq!(
-                v5_count, 0,
-                "a failed {duplicate_kind}-ordinal migration was recorded"
-            );
-            let births_schema: String = connection
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'",
-                )?
-                .get_typed(0)?;
-            assert!(
-                !births_schema.contains("origin"),
-                "failed {duplicate_kind}-ordinal V5 leaked its replacement schema: {births_schema}"
-            );
-            let replacement_count: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type = 'table' AND name = 'births_v5'",
-                )?
-                .get_typed(0)?;
-            assert_eq!(
-                replacement_count, 0,
-                "failed {duplicate_kind}-ordinal V5 left its rebuild table behind"
-            );
-            let historical_rows: i64 = connection
-                .query_row("SELECT COUNT(*) FROM births")?
-                .get_typed(0)?;
-            assert_eq!(
-                historical_rows, 2,
-                "failed {duplicate_kind}-ordinal V5 did not restore both historical rows"
-            );
-
-            connection.execute(repair_sql)?;
-            install_scriptbots_schema(&connection)?;
-            let index_count: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type = 'index' AND name IN (
-                         'births_agent_uid_unique',
-                         'births_spawn_ordinal_unique',
-                         'births_birth_ordinal_unique'
-                     )",
-                )?
-                .get_typed(0)?;
-            assert_eq!(
-                index_count, 3,
-                "retry after repairing duplicate {duplicate_kind} ordinals missed an index"
-            );
-            connection.execute(
-                "INSERT INTO births (
-                    tick, agent_uid, spawn_ordinal, birth_ordinal,
-                    herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-                 ) VALUES (0, 1, 0, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
-            )?;
-            connection.execute(
-                "INSERT INTO births (
-                    tick, agent_uid, spawn_ordinal, birth_ordinal,
-                    herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-                 ) VALUES (21, 21, 21, NULL, 0.5, 0, 1.0, 2.0, 0, 'injected')",
-            )?;
-            connection.close()?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn birth_origin_migration_rejects_duplicate_death_uids_atomically_and_retries()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let connection = Connection::open(":memory:")?;
-        MigrationRunner::new()
-            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
-            .add(
-                4,
-                "create_stable_uid_persistence_outbox",
-                SCRIPTBOTS_SCHEMA_V4,
-            )
-            .run(&connection)?;
-        for (tick, cause) in [(1_i64, "starvation"), (2_i64, "aging")] {
-            connection.execute_with_params(
-                "INSERT INTO deaths (
-                    tick, agent_uid, age, generation, herbivore_tendency,
-                    energy, food_balance_total, cause, was_hybrid,
-                    spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
-                    hit_by_carnivore, hit_by_herbivore
-                 ) VALUES (?1, 7, 1, 0, 0.5, 0.0, 0.0, ?2, 0, 0, 0, 0, 0, 0, 0)",
-                &[tick.into(), cause.into()],
-            )?;
-        }
-
-        install_scriptbots_schema(&connection)
-            .expect_err("V5 must reject historical databases with duplicate death UIDs");
-        let v5_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM _schema_migrations WHERE version = 5")?
-            .get_typed(0)?;
-        assert_eq!(v5_count, 0, "a failed death-UID migration was recorded");
-        let births_schema: String = connection
-            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'births'")?
-            .get_typed(0)?;
+                )
+                .is_err(),
+            "agent UID uniqueness was not enforced within a run"
+        );
         assert!(
-            !births_schema.contains("origin"),
-            "failed death-UID V5 leaked the birth-table rebuild: {births_schema}"
+            connection
+                .execute_with_params(
+                    born_sql,
+                    &[
+                        sqlite_run_id(run_a),
+                        2_i64.into(),
+                        8_i64.into(),
+                        9_i64.into(),
+                        14_i64.into(),
+                    ],
+                )
+                .is_err(),
+            "spawn ordinal uniqueness was not enforced within a run"
         );
-        let death_rows: i64 = connection
-            .query_row("SELECT COUNT(*) FROM deaths WHERE agent_uid = 7")?
-            .get_typed(0)?;
-        assert_eq!(
-            death_rows, 2,
-            "failed death-UID V5 did not restore both historical rows"
+        assert!(
+            connection
+                .execute_with_params(
+                    born_sql,
+                    &[
+                        sqlite_run_id(run_a),
+                        2_i64.into(),
+                        8_i64.into(),
+                        10_i64.into(),
+                        13_i64.into(),
+                    ],
+                )
+                .is_err(),
+            "birth ordinal uniqueness was not enforced within a run"
         );
 
-        connection.execute("UPDATE deaths SET agent_uid = 8 WHERE tick = 2")?;
-        install_scriptbots_schema(&connection)?;
-        let death_index_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'index' AND name = 'deaths_agent_uid_unique'",
-            )?
-            .get_typed(0)?;
-        assert_eq!(
-            death_index_count, 1,
-            "retry did not finish the death UID uniqueness index"
+        connection.execute_with_params(
+            "INSERT INTO births (
+                run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+                herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
+             ) VALUES (?1, 0, 1, 0, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+            &[sqlite_run_id(run_a)],
+        )?;
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO births (
+                        run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+                        herbivore_tendency, generation, position_x, position_y,
+                        is_hybrid, origin
+                     ) VALUES (?1, 2, 2, 1, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+                    &[sqlite_run_id(run_a)],
+                )
+                .is_err(),
+            "seeded founders were accepted after tick zero"
+        );
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO births (
+                        run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+                        herbivore_tendency, generation, position_x, position_y,
+                        is_hybrid, origin
+                     ) VALUES (?1, 2, 2, 1, 1, 0.5, 0, 1.0, 2.0, 0, 'injected')",
+                    &[sqlite_run_id(run_a)],
+                )
+                .is_err(),
+            "an injected agent retained a demographic birth ordinal"
+        );
+        assert!(
+            connection
+                .execute_with_params(
+                    "INSERT INTO births (
+                        run_id, tick, agent_uid, spawn_ordinal, birth_ordinal,
+                        herbivore_tendency, generation, position_x, position_y, is_hybrid
+                     ) VALUES (?1, 2, 2, 1, NULL, 0.5, 0, 1.0, 2.0, 0)",
+                    &[sqlite_run_id(run_a)],
+                )
+                .is_err(),
+            "origin silently defaulted instead of remaining mandatory"
         );
         connection.close()?;
         Ok(())
@@ -8354,17 +10702,40 @@ mod tests {
         create_valid_database(&future)?;
         add_schema_object(
             &future,
-            "INSERT INTO _schema_migrations (version, name) VALUES (6, 'future_schema')",
+            "INSERT INTO _schema_migrations (version, name) VALUES (7, 'future_schema')",
         )?;
-        assert_recovery_refused_without_database_mutation(&future, "exactly three")?;
+        assert_recovery_refused_without_database_mutation(
+            &future,
+            "expected exactly one ScriptBots v6 migration",
+        )?;
 
-        let incomplete = temp_db_path("storage-recovery-incomplete-migration-set");
-        let incomplete_connection = Connection::open(incomplete.to_string_lossy().as_ref())?;
-        MigrationRunner::new()
-            .add(3, "create_stable_agent_uid_schema", SCRIPTBOTS_SCHEMA_V3)
-            .run(&incomplete_connection)?;
-        incomplete_connection.close()?;
-        assert_recovery_refused_without_database_mutation(&incomplete, "exactly three")?;
+        let legacy = temp_db_path("storage-recovery-legacy-v5-lineage");
+        let legacy_connection = Connection::open(legacy.to_string_lossy().as_ref())?;
+        legacy_connection.execute(
+            "CREATE TABLE _schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+             );
+             INSERT INTO _schema_migrations VALUES
+                (3, 'create_stable_agent_uid_schema', 'legacy'),
+                (4, 'create_stable_uid_persistence_outbox', 'legacy'),
+                (5, 'record_birth_origin', 'legacy');
+             PRAGMA user_version = 5;",
+        )?;
+        legacy_connection.close()?;
+        assert_recovery_refused_without_database_mutation(
+            &legacy,
+            "expected exactly one ScriptBots v6 migration",
+        )?;
+
+        let mismatched_user_version = temp_db_path("storage-recovery-user-version-mismatch");
+        create_valid_database(&mismatched_user_version)?;
+        add_schema_object(&mismatched_user_version, "PRAGMA user_version = 5")?;
+        assert_recovery_refused_without_database_mutation(
+            &mismatched_user_version,
+            "migration ledger is v6, but PRAGMA user_version is 5",
+        )?;
         Ok(())
     }
 
@@ -8380,18 +10751,17 @@ mod tests {
                 applied_at TEXT NOT NULL
              );
              INSERT INTO _schema_migrations (version, name, applied_at)
-             VALUES (3, 'create_stable_agent_uid_schema', 'forged');
-             INSERT INTO _schema_migrations (version, name, applied_at)
-             VALUES (4, 'create_stable_uid_persistence_outbox', 'forged');
-             INSERT INTO _schema_migrations (version, name, applied_at)
-             VALUES (5, 'record_birth_origin', 'forged');
+             VALUES (6, 'create_multi_run_schema', 'forged');
              CREATE TABLE storage_progress (
-                singleton INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                singleton INTEGER NOT NULL,
                 admitted_batch_id INTEGER NOT NULL,
                 applied_batch_id INTEGER NOT NULL,
-                durable_batch_id INTEGER NOT NULL
+                durable_batch_id INTEGER NOT NULL,
+                PRIMARY KEY (run_id, singleton)
              );
-             INSERT INTO storage_progress VALUES (1, 0, 0, 0);",
+             INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
+             PRAGMA user_version = 6;",
         )?;
         connection.close()?;
 
@@ -8403,10 +10773,11 @@ mod tests {
         connection.execute(
             "DROP TABLE metrics;
              CREATE TABLE metrics (
+                run_id TEXT NOT NULL,
                 tick INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 value REAL NOT NULL,
-                PRIMARY KEY (tick, name)
+                PRIMARY KEY (run_id, tick, name)
              )",
         )?;
         connection.close()?;
@@ -8435,7 +10806,7 @@ mod tests {
             ),
             (
                 "extra-trigger",
-                "CREATE TRIGGER unexpected_tick_trigger AFTER INSERT ON ticks
+                "CREATE TRIGGER unexpected_tick_trigger AFTER INSERT ON tick_summaries
                  BEGIN SELECT 1; END",
             ),
         ];
@@ -8473,7 +10844,7 @@ mod tests {
 
         let original = temp_db_path("storage-writer-alias-original");
         let original_string = original.to_string_lossy().to_string();
-        let mut pipeline = StoragePipeline::create_new_file(&original_string)?;
+        let mut pipeline = StoragePipeline::create_unattributed_file(&original_string)?;
         pipeline.shutdown()?;
 
         let symlink_path = temp_db_path("storage-writer-alias-symlink");
@@ -8562,7 +10933,7 @@ mod tests {
         let path = temp_db_path("storage-unstable-inode-open");
         let path_string = path.to_string_lossy().to_string();
 
-        let mut pipeline = StoragePipeline::create_new_file(&path_string)?;
+        let mut pipeline = StoragePipeline::create_unattributed_file(&path_string)?;
         pipeline.shutdown()?;
 
         // And it must REOPEN — the recovery path is where the identity check actually runs.
@@ -8771,7 +11142,10 @@ mod tests {
         );
         let tick_count: i64 = durable
             .connection()?
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(durable.run_id)],
+            )?
             .get_typed(0)?;
         assert_eq!(tick_count, 1);
         assert_integrity(&durable)?;
@@ -8859,7 +11233,10 @@ mod tests {
 
         let inspector = Connection::open(&path_string)?;
         let tick_count: i64 = inspector
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(RunId::new(1))],
+            )?
             .get_typed(0)?;
         assert_eq!(
             tick_count, 0,
@@ -8952,7 +11329,10 @@ mod tests {
 
         let inspector = Connection::open(&path_string)?;
         let tick_count: i64 = inspector
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(RunId::new(1))],
+            )?
             .get_typed(0)?;
         assert_eq!(
             tick_count, 0,
@@ -9074,7 +11454,10 @@ mod tests {
 
             let inspector = Connection::open(&path_string)?;
             let tick_count: i64 = inspector
-                .query_row("SELECT COUNT(*) FROM ticks")?
+                .query_row_with_params(
+                    "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                    &[sqlite_run_id(RunId::new(1))],
+                )?
                 .get_typed(0)?;
             assert_eq!(
                 tick_count, 0,
@@ -9132,7 +11515,8 @@ mod tests {
         ];
         synchronize_lifecycle_counts(&mut batch);
         let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
-        let (payload, payload_digest) = prepared.storage.encode_outbox(prepared.tick)?;
+        let run_id = RunId::new(1);
+        let (payload, payload_digest) = prepared.storage.encode_outbox(run_id, prepared.tick)?;
         let stale_payload = r#"{"version":2,"tick":22,"storage":{"ticks":[],"metrics":[],"events":[],"agents":[],"births":[{"tick":22,"agent_uid":1,"spawn_ordinal":0,"birth_ordinal":0,"parent_a":null,"parent_b":null,"brain_kind":"legacy","brain_key":null,"herbivore_tendency":0.5,"generation":0,"position_x":1.0,"position_y":2.0,"is_hybrid":false}],"deaths":[],"replay_events":[]}}"#;
         assert!(
             !stale_payload.contains("\"origin\""),
@@ -9140,7 +11524,7 @@ mod tests {
         );
         let stale_digest = format!("blake3:{}", blake3::hash(stale_payload.as_bytes()).to_hex());
         let version_error =
-            StorageBuffer::decode_outbox(stale_payload, prepared.tick, &stale_digest)
+            StorageBuffer::decode_outbox(stale_payload, run_id, prepared.tick, &stale_digest)
                 .expect_err("a correctly hashed V2-shaped payload must still be refused");
         assert!(matches!(
             version_error,
@@ -9162,6 +11546,7 @@ mod tests {
         );
         let invariant_error = StorageBuffer::decode_outbox(
             &inconsistent_payload,
+            run_id,
             prepared.tick,
             &inconsistent_digest,
         )
@@ -9187,9 +11572,13 @@ mod tests {
             "blake3:{}",
             blake3::hash(late_seeded_payload.as_bytes()).to_hex()
         );
-        let late_seeded_error =
-            StorageBuffer::decode_outbox(&late_seeded_payload, prepared.tick, &late_seeded_digest)
-                .expect_err("a correctly hashed nonzero seeded arrival must be refused");
+        let late_seeded_error = StorageBuffer::decode_outbox(
+            &late_seeded_payload,
+            run_id,
+            prepared.tick,
+            &late_seeded_digest,
+        )
+        .expect_err("a correctly hashed nonzero seeded arrival must be refused");
         assert!(matches!(
             late_seeded_error,
             StorageError::InvalidData {
@@ -9204,7 +11593,7 @@ mod tests {
             "the test failed to tamper with the current outbox payload"
         );
         let tamper_error =
-            StorageBuffer::decode_outbox(&tampered_payload, prepared.tick, &payload_digest)
+            StorageBuffer::decode_outbox(&tampered_payload, run_id, prepared.tick, &payload_digest)
                 .expect_err("changing the payload without its digest must be refused");
         assert!(matches!(
             tamper_error,
@@ -9245,7 +11634,10 @@ mod tests {
         let durable = recover_file_storage(&path_string)?;
         let tick_count: i64 = durable
             .connection()?
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(durable.run_id)],
+            )?
             .get_typed(0)?;
         let event_count: i64 = durable
             .connection()?
@@ -9324,7 +11716,7 @@ mod tests {
         let reader = StorageReader::open(&path_string)?;
         assert_eq!(
             reader
-                .recent_ticks(None)?
+                .recent_ticks(4096)?
                 .into_iter()
                 .map(|tick| tick.tick)
                 .collect::<Vec<_>>(),
@@ -9376,7 +11768,10 @@ mod tests {
 
         let inspector = Connection::open(&path_string)?;
         let tick_count: i64 = inspector
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(RunId::new(1))],
+            )?
             .get_typed(0)?;
         let progress = inspector.query_row(
             "SELECT applied_batch_id, durable_batch_id FROM storage_progress WHERE singleton = 1",
@@ -9393,7 +11788,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-ledger-state-corruption");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline = StoragePipeline::create_new_file(&path_string)?;
+        let mut pipeline = StoragePipeline::create_unattributed_file(&path_string)?;
         let admission = pipeline.submit_with_receipt(&sample_batch(64, 6.4))?;
         pipeline.shutdown()?;
 
@@ -9447,7 +11842,10 @@ mod tests {
         ));
         let tick_count: i64 = interrupted
             .connection()?
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(interrupted.run_id)],
+            )?
             .get_typed(0)?;
         assert_eq!(tick_count, 0);
         assert_eq!(
@@ -9544,7 +11942,8 @@ mod tests {
     fn persist_batch_writes_all_tables() -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-persist");
         let path_string = path.to_string_lossy().to_string();
-        let mut storage = Storage::create_new_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
 
         let batch = sample_batch(42, 5.5);
         storage.persist(&batch)?;
@@ -9552,7 +11951,10 @@ mod tests {
 
         let tick_count: i64 = storage
             .connection()?
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
             .get_typed(0)?;
         assert_eq!(tick_count, 1);
 
@@ -9589,7 +11991,7 @@ mod tests {
         let path = temp_db_path("storage-replay-rng-agent-ids");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
-            Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
         let outer_agent = AgentUid(0x0000_0001_0000_0001);
         let scope_agent = AgentUid(0x0000_0002_0000_0001);
         let mut batch = sample_batch(5, 1.0);
@@ -9621,7 +12023,7 @@ mod tests {
         let path = temp_db_path("storage-replay-action-spike-target");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
-            Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
         let actor = AgentUid(0x0000_0001_0000_0001);
         let target = AgentUid(0x0000_0002_0000_0001);
         let mut batch = sample_batch(6, 1.0);
@@ -9662,7 +12064,7 @@ mod tests {
         let path = temp_db_path("storage-invalid-replay-atomic");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
-            Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
         let mut invalid = sample_batch(1, 1.0);
         invalid.replay_events.push(ReplayEvent {
             agent_uid: None,
@@ -9685,11 +12087,12 @@ mod tests {
 
         storage.persist(&sample_batch(2, 2.0))?;
         storage.flush()?;
-        let ticks = storage
-            .connection()?
-            .query("SELECT tick FROM ticks ORDER BY tick")?;
+        let ticks = storage.connection()?.query_with_params(
+            "SELECT tick FROM tick_summaries WHERE run_id = ?1 ORDER BY tick",
+            &[sqlite_run_id(storage.run_id)],
+        )?;
         assert_eq!(ticks.len(), 1);
-        assert_eq!(decode::<i64>(&ticks[0], 0, "ticks.tick")?, 2);
+        assert_eq!(decode::<i64>(&ticks[0], 0, "tick_summaries.tick")?, 2);
         storage.close()?;
         let _ = fs::remove_file(path);
         Ok(())
@@ -9701,7 +12104,7 @@ mod tests {
         let path = temp_db_path("storage-late-conversion-atomic");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
-            Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
         storage.persist(&sample_batch(1, 1.0))?;
         let lengths_before = (
             storage.buffer.ticks.len(),
@@ -9746,13 +12149,14 @@ mod tests {
 
         storage.persist(&sample_batch(3, 3.0))?;
         storage.flush()?;
-        let ticks = storage
-            .connection()?
-            .query("SELECT tick FROM ticks ORDER BY tick")?;
+        let ticks = storage.connection()?.query_with_params(
+            "SELECT tick FROM tick_summaries WHERE run_id = ?1 ORDER BY tick",
+            &[sqlite_run_id(storage.run_id)],
+        )?;
         assert_eq!(
             ticks
                 .iter()
-                .map(|row| decode::<i64>(row, 0, "ticks.tick"))
+                .map(|row| decode::<i64>(row, 0, "tick_summaries.tick"))
                 .collect::<Result<Vec<_>, _>>()?,
             vec![1, 3]
         );
@@ -9766,8 +12170,13 @@ mod tests {
     {
         let path = temp_db_path("storage-invalid-replay-admission");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline =
-            StoragePipeline::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
         pipeline.submit(&sample_batch(1, 1.0))?;
         let mut invalid = sample_batch(2, 2.0);
         invalid.replay_events.push(ReplayEvent {
@@ -9806,7 +12215,7 @@ mod tests {
         assert_eq!(receipt.committed_tick, Some(3));
 
         let reader = StorageReader::open(&path_string)?;
-        let ticks = reader.recent_ticks(None)?;
+        let ticks = reader.recent_ticks(4096)?;
         assert_eq!(
             ticks.iter().map(|tick| tick.tick).collect::<Vec<_>>(),
             vec![1, 3]
@@ -9820,7 +12229,8 @@ mod tests {
     fn top_predators_tracks_average_energy() -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-predators");
         let path_string = path.to_string_lossy().to_string();
-        let mut storage = Storage::create_new_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
 
         let batch_one = sample_batch(1, 1.0);
         storage.persist(&batch_one)?;
@@ -9851,19 +12261,19 @@ mod tests {
     #[test]
     fn production_birth_insert_rejects_duplicate_uid_across_ticks()
     -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Storage::memory()?;
+        let storage = Storage::unattributed_memory()?;
         let rows = [
             birth_row_from_record(&sample_birth(0, 7, BirthOrigin::Seeded))?,
             birth_row_from_record(&sample_birth(12, 7, BirthOrigin::Injected))?,
         ];
         {
             let mut first = storage.connection()?.transaction()?;
-            Storage::insert_births(&first, &rows[..1])?;
+            Storage::insert_births(&first, storage.run_id, &rows[..1])?;
             first.commit()?;
         }
         {
             let mut conflicting = storage.connection()?.transaction()?;
-            Storage::insert_births(&conflicting, &rows[1..])
+            Storage::insert_births(&conflicting, storage.run_id, &rows[1..])
                 .expect_err("a second origin row for one uid must not replace the first");
             conflicting.rollback()?;
         }
@@ -9887,14 +12297,18 @@ mod tests {
     #[test]
     fn production_birth_insert_enforces_unique_ordinals_and_nullable_non_birth_ordinals()
     -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Storage::memory()?;
+        let storage = Storage::unattributed_memory()?;
         let mut canonical = sample_birth(11, 7, BirthOrigin::Born);
         canonical.spawn_ordinal = 20;
         canonical.birth_ordinal = Some(30);
         let canonical = birth_row_from_record(&canonical)?;
         {
             let mut transaction = storage.connection()?.transaction()?;
-            Storage::insert_births(&transaction, std::slice::from_ref(&canonical))?;
+            Storage::insert_births(
+                &transaction,
+                storage.run_id,
+                std::slice::from_ref(&canonical),
+            )?;
             transaction.commit()?;
         }
 
@@ -9907,7 +12321,7 @@ mod tests {
         for conflicting in [duplicate_spawn, duplicate_birth] {
             let conflicting = birth_row_from_record(&conflicting)?;
             let mut transaction = storage.connection()?.transaction()?;
-            Storage::insert_births(&transaction, &[conflicting])
+            Storage::insert_births(&transaction, storage.run_id, &[conflicting])
                 .expect_err("a duplicate insertion or birth ordinal must not replace a row");
             transaction.rollback()?;
         }
@@ -9922,7 +12336,7 @@ mod tests {
         ];
         {
             let mut transaction = storage.connection()?.transaction()?;
-            Storage::insert_births(&transaction, &nullable_rows)?;
+            Storage::insert_births(&transaction, storage.run_id, &nullable_rows)?;
             transaction.commit()?;
         }
 
@@ -9931,7 +12345,7 @@ mod tests {
         let late_seeded = birth_row_from_record(&late_seeded)?;
         {
             let mut transaction = storage.connection()?.transaction()?;
-            Storage::insert_births(&transaction, &[late_seeded])
+            Storage::insert_births(&transaction, storage.run_id, &[late_seeded])
                 .expect_err("the schema must reject a seeded founder after tick zero");
             transaction.rollback()?;
         }
@@ -9951,11 +12365,15 @@ mod tests {
     #[test]
     fn production_death_insert_never_replaces_an_existing_uid()
     -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Storage::memory()?;
+        let storage = Storage::unattributed_memory()?;
         let original = death_row_from_record(&sample_death(11, 7, DeathCause::Starvation))?;
         {
             let mut transaction = storage.connection()?.transaction()?;
-            Storage::insert_deaths(&transaction, std::slice::from_ref(&original))?;
+            Storage::insert_deaths(
+                &transaction,
+                storage.run_id,
+                std::slice::from_ref(&original),
+            )?;
             transaction.commit()?;
         }
 
@@ -9965,7 +12383,7 @@ mod tests {
         ] {
             let conflicting = death_row_from_record(&conflicting)?;
             let mut transaction = storage.connection()?.transaction()?;
-            Storage::insert_deaths(&transaction, &[conflicting])
+            Storage::insert_deaths(&transaction, storage.run_id, &[conflicting])
                 .expect_err("a second death for one uid must fail instead of replacing it");
             transaction.rollback()?;
         }
@@ -10058,7 +12476,7 @@ mod tests {
         late_seeded.births = vec![sample_birth(39, 390, BirthOrigin::Seeded)];
         synchronize_lifecycle_counts(&mut late_seeded);
 
-        let mut storage = Storage::memory()?;
+        let mut storage = Storage::unattributed_memory()?;
         for (context, malformed) in [
             ("ticks.births", missing_birth_row),
             ("ticks.deaths", missing_death_row),
@@ -10084,7 +12502,10 @@ mod tests {
         storage.flush()?;
         let tick_count: i64 = storage
             .connection()?
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
             .get_typed(0)?;
         assert_eq!(tick_count, 1, "rejected mismatch poisoned the writer");
         storage.close()?;
@@ -10094,7 +12515,7 @@ mod tests {
     #[test]
     fn lifecycle_records_after_the_summary_tick_are_rejected_before_admission()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut storage = Storage::memory()?;
+        let mut storage = Storage::unattributed_memory()?;
 
         let mut future_birth = sample_batch(40, 4.0);
         future_birth
@@ -10133,7 +12554,10 @@ mod tests {
         storage.flush()?;
         let tick_count: i64 = storage
             .connection()?
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
             .get_typed(0)?;
         assert_eq!(tick_count, 1, "rejected lifecycle rows poisoned the writer");
         storage.close()?;
@@ -10159,17 +12583,19 @@ mod tests {
         let mut future_death = Storage::prepare_batch(&death_batch)?;
         future_death.deaths[0].tick = 51;
 
+        let run_id = RunId::new(1);
         for (context, invalid) in [("births.tick", future_birth), ("deaths.tick", future_death)] {
-            assert_invalid_data_context(invalid.encode_outbox(50), context);
+            assert_invalid_data_context(invalid.encode_outbox(run_id, 50), context);
 
             let payload = serde_json::to_string(&OutboxPayloadRef {
                 version: OUTBOX_PAYLOAD_VERSION,
+                run_id,
                 tick: 50,
                 storage: &invalid,
             })?;
             let digest = format!("blake3:{}", blake3::hash(payload.as_bytes()).to_hex());
             assert_invalid_data_context(
-                StorageBuffer::decode_outbox(&payload, 50, &digest),
+                StorageBuffer::decode_outbox(&payload, run_id, 50, &digest),
                 context,
             );
         }
@@ -10179,7 +12605,7 @@ mod tests {
     #[test]
     fn ancestry_incoherence_is_rejected_before_new_outbox_admission()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut storage = Storage::memory()?;
+        let mut storage = Storage::unattributed_memory()?;
         let no_watermarks = PersistenceWatermarks {
             admitted: None,
             applied: None,
@@ -10263,7 +12689,7 @@ mod tests {
     #[test]
     fn ancestry_checks_cover_staged_and_persisted_arrivals_without_moving_watermarks()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut storage = Storage::memory()?;
+        let mut storage = Storage::unattributed_memory()?;
         let mut root_batch = sample_batch(200, 20.0);
         root_batch.summary.births = 0;
         root_batch.births = vec![sample_birth(200, 80, BirthOrigin::Injected)];
@@ -10311,7 +12737,7 @@ mod tests {
     #[test]
     fn negative_persisted_arrival_tick_is_rejected_before_new_admission()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut storage = Storage::memory()?;
+        let mut storage = Storage::unattributed_memory()?;
         let mut root_batch = sample_batch(300, 30.0);
         root_batch.summary.births = 0;
         root_batch.births = vec![sample_birth(300, 90, BirthOrigin::Injected)];
@@ -10381,7 +12807,7 @@ mod tests {
             );
         }
 
-        let mut storage = Storage::memory()?;
+        let mut storage = Storage::unattributed_memory()?;
         let mut first = sample_batch(70, 7.0);
         first.births = vec![make_birth(70, 7, 20, 30)];
         synchronize_lifecycle_counts(&mut first);
@@ -10429,7 +12855,7 @@ mod tests {
     #[test]
     fn duplicate_death_uids_are_rejected_before_new_outbox_admission()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut storage = Storage::memory()?;
+        let mut storage = Storage::unattributed_memory()?;
         let mut first = sample_batch(60, 6.0);
         first.births.push(sample_birth(59, 7, BirthOrigin::Born));
         first
@@ -10499,7 +12925,8 @@ mod tests {
     fn run_ledger_counts_only_demographic_births() -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-birth-origin-ledger");
         let path_string = path.to_string_lossy().to_string();
-        let mut storage = Storage::create_new_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
         let mut batch = sample_batch(11, 1.0);
         let base = BirthRecord {
             tick: Tick(11),
@@ -10552,24 +12979,26 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-production-schema");
         let path_string = path.to_string_lossy().to_string();
-        let mut storage = Storage::create_new_file(&path_string)?;
+        let mut storage = Storage::create_unattributed_file(&path_string)?;
 
-        let invalid_bool = storage.connection()?.execute(
-            "INSERT INTO ticks (
-                tick, epoch, closed, agent_count, births, deaths,
+        let invalid_bool = storage.connection()?.execute_with_params(
+            "INSERT INTO tick_summaries (
+                run_id, tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health
-             ) VALUES (1, 0, 2, 0, 0, 0, 0.0, 0.0, 0.0)",
+             ) VALUES (?1, 1, 0, 2, 0, 0, 0, 0.0, 0.0, 0.0)",
+            &[sqlite_run_id(storage.run_id)],
         );
         assert!(
             invalid_bool.is_err(),
             "closed CHECK must reject values outside 0/1"
         );
 
-        let invalid_null = storage.connection()?.execute(
-            "INSERT INTO ticks (
-                tick, epoch, closed, agent_count, births, deaths,
+        let invalid_null = storage.connection()?.execute_with_params(
+            "INSERT INTO tick_summaries (
+                run_id, tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health
-             ) VALUES (2, 0, 0, 0, 0, 0, NULL, 0.0, 0.0)",
+             ) VALUES (?1, 2, 0, 0, 0, 0, 0, NULL, 0.0, 0.0)",
+            &[sqlite_run_id(storage.run_id)],
         );
         assert!(invalid_null.is_err(), "NOT NULL columns must reject NULL");
 
@@ -10618,19 +13047,25 @@ mod tests {
         storage.flush()?;
 
         let negative_updates = [
-            ("ticks.tick", "UPDATE ticks SET tick = -1 WHERE tick = 11"),
-            ("ticks.epoch", "UPDATE ticks SET epoch = -1 WHERE tick = 11"),
             (
-                "ticks.agent_count",
-                "UPDATE ticks SET agent_count = -1 WHERE tick = 11",
+                "tick_summaries.tick",
+                "UPDATE tick_summaries SET tick = -1 WHERE tick = 11",
             ),
             (
-                "ticks.births",
-                "UPDATE ticks SET births = -1 WHERE tick = 11",
+                "tick_summaries.epoch",
+                "UPDATE tick_summaries SET epoch = -1 WHERE tick = 11",
             ),
             (
-                "ticks.deaths",
-                "UPDATE ticks SET deaths = -1 WHERE tick = 11",
+                "tick_summaries.agent_count",
+                "UPDATE tick_summaries SET agent_count = -1 WHERE tick = 11",
+            ),
+            (
+                "tick_summaries.births",
+                "UPDATE tick_summaries SET births = -1 WHERE tick = 11",
+            ),
+            (
+                "tick_summaries.deaths",
+                "UPDATE tick_summaries SET deaths = -1 WHERE tick = 11",
             ),
             (
                 "metrics.tick",
@@ -10725,11 +13160,12 @@ mod tests {
             "births.origin CHECK must reject values outside the typed domain"
         );
 
-        storage.connection()?.execute(
-            "INSERT INTO ticks (
-                tick, epoch, closed, agent_count, births, deaths,
+        storage.connection()?.execute_with_params(
+            "INSERT INTO tick_summaries (
+                run_id, tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health
-             ) VALUES (3, 'invalid-epoch', 0, 0, 0, 0, 0.0, 0.0, 0.0)",
+             ) VALUES (?1, 3, 'invalid-epoch', 0, 0, 0, 0, 0.0, 0.0, 0.0)",
+            &[sqlite_run_id(storage.run_id)],
         )?;
         storage
             .connection()?
@@ -10748,12 +13184,12 @@ mod tests {
             }
         ));
         let decode_error = reader
-            .recent_ticks(None)
+            .recent_ticks(4096)
             .expect_err("typed reader must reject a TEXT epoch in an INTEGER domain field");
         assert!(matches!(
             decode_error,
             StorageError::InvalidData {
-                context: "ticks.epoch",
+                context: "tick_summaries.epoch",
                 ..
             }
         ));
@@ -10843,7 +13279,7 @@ mod tests {
         let path = temp_db_path("storage-production-rollback");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
-            Storage::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
         storage.connection()?.execute("DROP TABLE metrics")?;
         storage.persist(&sample_batch(42, 5.5))?;
 
@@ -10861,7 +13297,10 @@ mod tests {
         ));
         let tick_count: i64 = storage
             .connection()?
-            .query_row("SELECT COUNT(*) FROM ticks")?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
             .get_typed(0)?;
         assert_eq!(tick_count, 0, "partial tick insert escaped rollback");
         assert!(matches!(
@@ -10901,7 +13340,7 @@ mod tests {
         storage.abandon_after_error();
 
         let reader = StorageReader::open(&path_string)?;
-        assert!(reader.recent_ticks(None)?.is_empty());
+        assert!(reader.recent_ticks(4096)?.is_empty());
         reader.close()?;
         let _ = fs::remove_file(path);
         Ok(())
@@ -10937,8 +13376,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-file-receipt");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline =
-            StoragePipeline::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
         let sink = pipeline.sink();
         let reader = StorageReader::open(&path_string)?;
 
@@ -10982,6 +13426,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (tx, rx) = xchan::bounded(1);
         let mut sink = StorageSink {
+            run_id: RunId::new(1),
             tx,
             analytics: AnalyticsSnapshotProvider::empty(),
             admission: Arc::new(Mutex::new(AdmissionState { open: true })),
@@ -11019,6 +13464,7 @@ mod tests {
         let (dummy_reply, _dummy_receiver) = xchan::bounded(1);
         tx.send(StorageCommand::Flush { reply: dummy_reply })?;
         let sink = StorageSink {
+            run_id: RunId::new(1),
             tx,
             analytics: AnalyticsSnapshotProvider::empty(),
             admission: Arc::new(Mutex::new(AdmissionState { open: true })),
@@ -11045,6 +13491,7 @@ mod tests {
 
         let (tx, _rx) = xchan::bounded(1);
         let mut sink = StorageSink {
+            run_id: RunId::new(1),
             tx,
             analytics: AnalyticsSnapshotProvider::empty(),
             admission: Arc::new(Mutex::new(AdmissionState { open: true })),
@@ -11071,7 +13518,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-admission-timeout-retry");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline = StoragePipeline::create_new_file_with_thresholds_and_deadlines(
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds_and_deadlines(
             &path_string,
             64,
             4096,
@@ -11119,13 +13566,14 @@ mod tests {
     #[test]
     fn flush_and_shutdown_timeouts_are_bounded_and_retry_the_original_barrier()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut flush_pipeline = StoragePipeline::memory_with_thresholds_and_deadlines(
-            64,
-            4096,
-            1024,
-            1024,
-            short_deadlines(),
-        )?;
+        let mut flush_pipeline =
+            StoragePipeline::unattributed_memory_with_thresholds_and_deadlines(
+                64,
+                4096,
+                1024,
+                1024,
+                short_deadlines(),
+            )?;
         let (entered_tx, entered_rx) = xchan::bounded(1);
         let (release_tx, release_rx) = xchan::bounded(1);
         flush_pipeline
@@ -11152,13 +13600,14 @@ mod tests {
         flush_pipeline.flush_and_wait()?;
         flush_pipeline.shutdown()?;
 
-        let mut shutdown_pipeline = StoragePipeline::memory_with_thresholds_and_deadlines(
-            64,
-            4096,
-            1024,
-            1024,
-            short_deadlines(),
-        )?;
+        let mut shutdown_pipeline =
+            StoragePipeline::unattributed_memory_with_thresholds_and_deadlines(
+                64,
+                4096,
+                1024,
+                1024,
+                short_deadlines(),
+            )?;
         let retained_sink = shutdown_pipeline.sink();
         let (entered_tx, entered_rx) = xchan::bounded(1);
         let (release_tx, release_rx) = xchan::bounded(1);
@@ -11201,7 +13650,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-shutdown-reaper");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline = StoragePipeline::create_new_file_with_thresholds_and_deadlines(
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds_and_deadlines(
             &path_string,
             64,
             4096,
@@ -11245,8 +13694,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-admission-race");
         let path_string = path.to_string_lossy().to_string();
-        let pipeline =
-            StoragePipeline::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
         let retained_sink = pipeline.sink();
 
         let (entered_tx, entered_rx) = xchan::bounded(1);
@@ -11360,7 +13814,7 @@ mod tests {
     #[test]
     fn pipeline_acknowledges_startup_flush_and_shutdown() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut pipeline = StoragePipeline::memory_with_thresholds(1, 1, 1, 1)?;
+        let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(1, 1, 1, 1)?;
         let admission = pipeline.submit_with_receipt(&sample_batch(7, 2.5))?;
         assert_eq!(admission.guarantee, PersistenceGuarantee::CommittedVolatile);
 
@@ -11387,7 +13841,8 @@ mod tests {
     #[test]
     fn empty_metric_batch_still_advances_committed_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut pipeline = StoragePipeline::memory_with_thresholds(64, 4096, 1024, 1024)?;
+        let mut pipeline =
+            StoragePipeline::unattributed_memory_with_thresholds(64, 4096, 1024, 1024)?;
         let mut batch = sample_batch(11, 4.0);
         batch.metrics.clear();
         pipeline.submit(&batch)?;
@@ -11404,7 +13859,7 @@ mod tests {
 
     #[test]
     fn pipeline_reports_worker_initialization_failure() {
-        let error = StoragePipeline::create_new_file("")
+        let error = StoragePipeline::create_unattributed_file("")
             .err()
             .expect("empty storage paths must fail during the startup handshake");
         assert!(matches!(error, StorageError::InvalidTarget { .. }));
@@ -11420,18 +13875,19 @@ mod tests {
             "FiLe:test.sqlite",
         ] {
             assert!(matches!(
-                Storage::create_new_file(invalid),
+                Storage::create_unattributed_file(invalid),
                 Err(StorageError::InvalidTarget { .. })
             ));
             assert!(matches!(
-                StoragePipeline::create_new_file(invalid),
+                StoragePipeline::create_unattributed_file(invalid),
                 Err(StorageError::InvalidTarget { .. })
             ));
         }
 
-        let storage = Storage::memory().expect("explicit same-thread memory target");
+        let storage = Storage::unattributed_memory().expect("explicit same-thread memory target");
         storage.close().expect("close memory storage");
-        let mut pipeline = StoragePipeline::memory().expect("explicit pipeline memory target");
+        let mut pipeline =
+            StoragePipeline::unattributed_memory().expect("explicit pipeline memory target");
         let receipt = pipeline.shutdown().expect("shutdown memory pipeline");
         assert_eq!(receipt.guarantee, PersistenceGuarantee::CommittedVolatile);
     }
@@ -11443,11 +13899,11 @@ mod tests {
         fs::write(&existing, b"sentinel-main")?;
         let existing_string = existing.to_string_lossy().to_string();
         assert!(matches!(
-            Storage::create_new_file(&existing_string),
+            Storage::create_unattributed_file(&existing_string),
             Err(StorageError::InvalidTarget { .. })
         ));
         assert!(matches!(
-            StoragePipeline::create_new_file(&existing_string),
+            StoragePipeline::create_unattributed_file(&existing_string),
             Err(StorageError::InvalidTarget { .. })
         ));
         assert_eq!(fs::read(&existing)?, b"sentinel-main");
@@ -11460,7 +13916,7 @@ mod tests {
             fs::write(&sidecar, b"sentinel-sidecar")?;
             let main_string = main.to_string_lossy().to_string();
             assert!(matches!(
-                StoragePipeline::create_new_file(&main_string),
+                StoragePipeline::create_unattributed_file(&main_string),
                 Err(StorageError::InvalidTarget { .. })
             ));
             assert!(!path_entry_exists(&main)?);
@@ -11485,7 +13941,7 @@ mod tests {
         let missing_target = temp_db_path("storage-missing-sidecar-target");
         symlink(&missing_target, &sidecar)?;
 
-        let error = StoragePipeline::create_new_file(&main.to_string_lossy())
+        let error = StoragePipeline::create_unattributed_file(&main.to_string_lossy())
             .err()
             .expect("dangling sidecar symlink must be treated as an existing entry");
         assert!(matches!(error, StorageError::InvalidTarget { .. }));
@@ -11743,7 +14199,8 @@ mod tests {
     #[test]
     fn out_of_range_batch_fails_admission_without_poisoning_pipeline()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut pipeline = StoragePipeline::memory_with_thresholds(64, 4096, 1024, 1024)?;
+        let mut pipeline =
+            StoragePipeline::unattributed_memory_with_thresholds(64, 4096, 1024, 1024)?;
         let mut bad = sample_batch(7, 1.0);
         bad.agents[0].identity.uid = AgentUid(u64::MAX);
 
@@ -11770,8 +14227,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-flush-terminal-join");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline =
-            StoragePipeline::create_new_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
         pipeline.submit(&sample_batch(11, 1.5))?;
 
         // Apply the sabotage on the connection-owning worker thread. Opening a

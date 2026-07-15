@@ -463,7 +463,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
     config.food_sharing_rate = 0.16;
     config.food_transfer_rate = 0.002;
 
-    let mut pipeline = StoragePipeline::create_new_file_with_thresholds(
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
         storage_path
             .to_str()
             .expect("temporary storage path should be utf-8"),
@@ -737,7 +737,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         "death events should sum to reported total"
     );
 
-    let metrics = reader.recent_metrics(None)?;
+    let metrics = reader.recent_metrics(4_096)?;
     let births_metric: f64 = metrics
         .iter()
         .filter(|reading| reading.name == "births.total.count")

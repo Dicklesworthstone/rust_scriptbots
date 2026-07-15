@@ -39,7 +39,7 @@ const fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
 /// metric `flat` is constant at 7.0. Both have hand-computable summaries.
 fn fixture(dir: &tempfile::TempDir) -> String {
     let path = dir.path().join("run.sqlite").display().to_string();
-    let mut storage = Storage::create_new_file(&path).expect("create fixture run db");
+    let mut storage = Storage::create_unattributed_file(&path).expect("create fixture run db");
     for value in 1_u32..=5 {
         let metrics = vec![
             MetricSample::new("probe", f64::from(value)),

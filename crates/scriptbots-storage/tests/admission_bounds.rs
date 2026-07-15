@@ -82,8 +82,8 @@ fn the_size_estimate_is_deterministic_monotonic_and_allocates_nothing() {
 #[test]
 fn an_oversized_batch_is_refused_before_it_is_ever_allocated() {
     let path = temp_db("oversize");
-    let mut pipeline =
-        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("pipeline");
 
     // A budget small enough that a modest batch is already over it.
     pipeline.set_payload_budget(PayloadBudget {
@@ -119,8 +119,8 @@ fn an_oversized_batch_is_refused_before_it_is_ever_allocated() {
 #[test]
 fn the_boundary_is_exact_at_the_cap_and_one_record_past_it() {
     let path = temp_db("boundary");
-    let mut pipeline =
-        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("pipeline");
 
     // Size the cap to EXACTLY what an 8-record batch estimates.
     let at_cap = batch(1, 8);
@@ -159,8 +159,8 @@ fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() {
     // If the permit leaked on ANY path, the in-flight total would ratchet upward
     // and this loop would start failing partway through. It does not.
     let path = temp_db("permit");
-    let mut pipeline =
-        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("pipeline");
 
     let small = batch(0, 2);
     let (small_bytes, _) = estimate_batch_size(&small);

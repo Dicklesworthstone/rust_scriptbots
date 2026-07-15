@@ -61,7 +61,8 @@ fn many_pipelines_shut_down_cleanly_without_a_thread_explosion() {
     for index in 0..12 {
         let path = temp_db("many", index);
         let mut pipeline =
-            StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
+            StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+                .expect("pipeline");
         pipeline.shutdown().expect("shutdown");
         paths.push(path);
     }
@@ -104,8 +105,10 @@ fn reaping_one_path_does_not_block_another() {
     let path_a = temp_db("cross", 0);
     let path_b = temp_db("cross", 1);
 
-    let mut a = StoragePipeline::create_new_file_with_thresholds(&path_a, 1, 1, 1, 1).expect("a");
-    let mut b = StoragePipeline::create_new_file_with_thresholds(&path_b, 1, 1, 1, 1).expect("b");
+    let mut a =
+        StoragePipeline::create_unattributed_file_with_thresholds(&path_a, 1, 1, 1, 1).expect("a");
+    let mut b =
+        StoragePipeline::create_unattributed_file_with_thresholds(&path_b, 1, 1, 1, 1).expect("b");
 
     // Both shut down; neither may be blocked by the other's reaping.
     a.shutdown().expect("a shuts down");
@@ -125,8 +128,8 @@ fn a_path_can_be_reopened_after_it_has_been_reaped() {
     // "supervised reap" would be a permanent quarantine rather than a cleanup.
     let path = temp_db("reopen", 0);
 
-    let mut first =
-        StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("first");
+    let mut first = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
+        .expect("first");
     first.shutdown().expect("first shutdown");
     // Clear the database AND its sidecars: a stale -wal is refused on open, and
     // leaving one behind would make this test fail for a reason that has nothing
@@ -138,7 +141,7 @@ fn a_path_can_be_reopened_after_it_has_been_reaped() {
     // The path's writer lease must have been released by the reap. If the reaper
     // held it, this second open would fail and a single timeout would have poisoned
     // that database for the life of the process.
-    let mut second = StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1)
+    let mut second = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
         .expect("the path must be usable again after it was reaped");
     second.shutdown().expect("second shutdown");
 

@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 asupersync = { workspace = true }
 axum = { version = "0.8.0", features = ["macros", "json"] }
 async-trait = "0.1"
+blake3 = { workspace = true }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 mcp-protocol-sdk = { version = "0.5.1", default-features = false, features = ["http"] }
 ratatui = { version = "0.30.0-alpha.5" }
@@ -17,6 +18,7 @@ scriptbots-brain-ml = { path = "../scriptbots-brain-ml", optional = true }
 scriptbots-brain-neuro = { path = "../scriptbots-brain-neuro", optional = true }
 scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-render = { path = "../scriptbots-render", optional = true }
+scriptbots-runtime = { path = "../scriptbots-runtime" }
 scriptbots-storage = { path = "../scriptbots-storage" }
 scriptbots-bevy = { path = "../scriptbots-bevy", optional = true }
 serde = { workspace = true }

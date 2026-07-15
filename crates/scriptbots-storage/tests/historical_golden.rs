@@ -170,7 +170,7 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
 {
     let path = temp_db_path("storage-golden");
     let path_str = path.to_string_lossy().to_string();
-    let mut storage = Storage::create_new_file_with_thresholds(&path_str, 1, 1, 1, 1)?;
+    let mut storage = Storage::create_unattributed_file_with_thresholds(&path_str, 1, 1, 1, 1)?;
 
     let batches = vec![
         make_batch(
@@ -228,15 +228,18 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
         storage.persist(batch)?;
     }
     storage.flush()?;
+    let run_id = storage.run_id().to_string();
 
     drop(storage);
 
     let connection = Connection::open(&path_str)?;
 
-    let tick_rows = connection.query(
+    let tick_rows = connection.query_with_params(
         "select tick, agent_count, births, deaths
-         from ticks
+         from tick_summaries
+         where run_id = ?1
          order by tick asc",
+        &[run_id.as_str().into()],
     )?;
     let expected_ticks = vec![(1_i64, 3_i64, 1_i64, 0_i64), (2, 4, 2, 1), (3, 5, 1, 0)];
     let actual_ticks = tick_rows
@@ -252,10 +255,12 @@ fn golden_population_and_kill_queries_match_expectations() -> Result<(), Box<dyn
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(actual_ticks, expected_ticks);
 
-    let event_rows = connection.query(
+    let event_rows = connection.query_with_params(
         "select tick, kind, count
          from events
+         where run_id = ?1
          order by tick asc, kind asc",
+        &[run_id.as_str().into()],
     )?;
     let expected_events = vec![
         (1_i64, "births".to_string(), 1_i64),

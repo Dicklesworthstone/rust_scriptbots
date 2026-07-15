@@ -13,4 +13,5 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
+scriptbots-runtime = { path = "../scriptbots-runtime" }
 crossbeam-channel = "0.5"

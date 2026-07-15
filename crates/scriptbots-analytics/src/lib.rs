@@ -60,6 +60,21 @@ pub mod compare;
 /// envelope goldens assert the value so an accidental schema change is loud.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
+/// Maximum metric rows sampled by `metric-summary` in one bounded SQL page.
+///
+/// Keeping report reads capped prevents a finished multi-run database from being
+/// materialized wholesale merely to compute an interactive summary.
+const METRIC_SUMMARY_ROW_LIMIT: usize = 4_096;
+
+/// Maximum recent tick summaries sampled by `run-summary` in one bounded SQL page.
+const RUN_SUMMARY_TICK_LIMIT: usize = 4_096;
+
+/// Default number of recent replay events rendered by `narrative-timeline`.
+const NARRATIVE_TIMELINE_DEFAULT_LIMIT: usize = 1_024;
+
+/// Hard ceiling for a caller-selected `narrative-timeline` SQL page.
+const NARRATIVE_TIMELINE_MAX_LIMIT: usize = 4_096;
+
 /// Errors surfaced by the analytics layer.
 #[derive(Debug, thiserror::Error)]
 pub enum AnalyticsError {
@@ -277,9 +292,9 @@ fn log_report_stage(stage: &'static str, started: &Instant, rows: usize) {
 /// `metric-summary`: a per-metric distribution summary over a finished run.
 ///
 /// This is the first report to put the native [`stats`] module (bd-2z0.11.6) to work on real
-/// persisted data: for every metric the run recorded, it loads the full value series and reports
-/// n, mean, standard deviation, the 5/50/95 quantiles, min/max, and the coefficient of variation
-/// — the foundation of the `distribution-report` (bd-2z0.11.6 item 2). Distribution FITTING (the
+/// persisted data: for every metric present in the newest bounded SQL page, it reports n, mean,
+/// standard deviation, the 5/50/95 quantiles, min/max, and the coefficient of variation — the
+/// foundation of the `distribution-report` (bd-2z0.11.6 item 2). Distribution FITTING (the
 /// candidate normal/lognormal/gamma fits + KS test) is the piece where `fsci`'s distribution zoo
 /// would earn its keep and is left for the adapter decision (bd-2z0.11.3); the summary itself
 /// needs nothing beyond the native estimators.
@@ -312,12 +327,12 @@ impl Report for MetricSummary {
     }
 
     fn description(&self) -> &'static str {
-        "Per-metric distribution summary (n, mean, sd, quantiles, CV) over a finished run"
+        "Per-metric distribution summary over the newest bounded row page of a finished run"
     }
 
     fn run(&self, cx: &ReaderCtx, _params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
         let read_started = Instant::now();
-        let readings = cx.reader.recent_metrics(None)?;
+        let readings = cx.reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
         log_report_stage("read", &read_started, readings.len());
 
         let render_started = Instant::now();
@@ -428,7 +443,7 @@ fn base_output(
     })
 }
 
-/// `run-summary`: lifecycle totals and population trajectory statistics.
+/// `run-summary`: lifecycle totals and bounded recent population trajectory statistics.
 struct RunSummary;
 
 #[derive(Debug, Serialize)]
@@ -459,14 +474,14 @@ impl Report for RunSummary {
     }
 
     fn description(&self) -> &'static str {
-        "Lifecycle totals, population trajectory stats, and persistence watermarks"
+        "Lifecycle totals, recent bounded population trajectory stats, and persistence watermarks"
     }
 
     fn run(&self, cx: &ReaderCtx, _params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
         let read_started = Instant::now();
         let ledger = cx.reader.run_ledger_summary()?;
-        // StorageReader guarantees chronological order.
-        let ticks = cx.reader.recent_ticks(None)?;
+        // StorageReader returns the newest bounded page in chronological order.
+        let ticks = cx.reader.recent_ticks(RUN_SUMMARY_TICK_LIMIT)?;
         let watermarks = cx.reader.persistence_watermarks()?;
         log_report_stage("read", &read_started, ticks.len());
 
@@ -523,7 +538,7 @@ impl Report for RunSummary {
         );
         let _ = writeln!(
             md,
-            "| population first→last (min/mean/max) | {:?}→{:?} ({:?}/{}/{:?}) |",
+            "| recent-window population first→last (min/mean/max) | {:?}→{:?} ({:?}/{}/{:?}) |",
             machine.population_first,
             machine.population_last,
             machine.population_min,
@@ -550,9 +565,10 @@ impl Report for RunSummary {
     }
 }
 
-/// `narrative-timeline`: chronological event dump for a finished run.
+/// `narrative-timeline`: bounded page of the latest events for a finished run.
 ///
-/// v1 renders the replay-event stream (kind counts + ordered rows). When the
+/// v1 renders aggregate kind counts plus a newest-first SQL page returned in
+/// chronological order. When the
 /// typed narrative tables land (bd-16g.2.2) and FTS search (bd-16g.2.6),
 /// this report upgrades to the `run_events` stream + BM25 search parameters
 /// WITHOUT changing its registry name; the machine schema will bump
@@ -583,16 +599,14 @@ impl Report for NarrativeTimeline {
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
-        let limit = params.get_usize("limit")?;
+        let limit = narrative_timeline_limit(params)?;
         let read_started = Instant::now();
         let counts = cx.reader.replay_event_counts()?;
-        let mut events = cx.reader.load_replay_events()?;
-        events.sort_by_key(|e| (e.tick, e.seq));
-        let total = events.len();
-        if let Some(limit) = limit {
-            events.truncate(limit);
-        }
-        log_report_stage("read", &read_started, total);
+        let events = cx.reader.recent_replay_events(limit)?;
+        let total = counts
+            .iter()
+            .fold(0_u64, |sum, count| sum.saturating_add(count.count));
+        log_report_stage("read", &read_started, events.len());
 
         let render_started = Instant::now();
         let machine = TimelineMachine {
@@ -610,11 +624,14 @@ impl Report for NarrativeTimeline {
                     })
                 })
                 .collect::<Result<Vec<_>, AnalyticsError>>()?,
-            truncated_to: limit.filter(|l| *l < total),
+            truncated_to: (total > u64::try_from(limit).unwrap_or(u64::MAX)).then_some(limit),
         };
 
         let mut md = String::new();
-        let _ = writeln!(md, "# Narrative timeline (replay events, v1)\n");
+        let _ = writeln!(
+            md,
+            "# Narrative timeline (latest bounded replay-event page, v1)\n"
+        );
         if machine.events.is_empty() {
             let _ = writeln!(md, "_No replay events persisted in this run._");
         } else {
@@ -624,7 +641,7 @@ impl Report for NarrativeTimeline {
                 let _ = writeln!(md, "| {} | {} | `{}` |", row.tick, row.seq, row.event);
             }
             if let Some(t) = machine.truncated_to {
-                let _ = writeln!(md, "\n_…truncated to {t} of {total} events (limit param)._");
+                let _ = writeln!(md, "\n_…showing {t} of {total} events (bounded SQL page)._");
             }
         }
 
@@ -638,4 +655,17 @@ impl Report for NarrativeTimeline {
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }
+}
+
+fn narrative_timeline_limit(params: &ReportParams) -> Result<usize, AnalyticsError> {
+    let limit = params
+        .get_usize("limit")?
+        .unwrap_or(NARRATIVE_TIMELINE_DEFAULT_LIMIT);
+    if limit > NARRATIVE_TIMELINE_MAX_LIMIT {
+        return Err(AnalyticsError::BadParam {
+            name: "limit".to_owned(),
+            reason: format!("must be at most {NARRATIVE_TIMELINE_MAX_LIMIT}"),
+        });
+    }
+    Ok(limit)
 }
