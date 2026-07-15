@@ -454,7 +454,7 @@ Dynamic agent data may be rebuilt at UI cadence. Static terrain and configuratio
 
 Scientific events use different semantics: they live in a sequenced journal. UI subscriptions receive bounded notifications/cursors, detect gaps, and catch up from the journal or explicitly report that their display window was truncated. Snapshot loss never implies scientific event loss.
 
-### 5.6 projection model [Currently In Progress — bd-2z0.3.8, TopazCastle; bounded revisioned brain-detail pull]
+### 5.6 projection model [Selected-brain slice completed — bd-2z0.3.8, TopazCastle, 2026-07-15; DSR run-1784156735-28027 green]
 
 Shared pure projection functions or a keyed projection broker perform work that is currently duplicated under world locks:
 
@@ -466,6 +466,16 @@ Shared pure projection functions or a keyed projection broker perform work that 
 - capability-neutral labels and semantic colors.
 
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
+
+The selected-brain detail slice is now an explicit, synchronous, read-only pull
+keyed by stable `AgentUid`, client identity, request revision, and the exact
+completed source tick. Requests accept at most eight unique targets and carry
+hard independent limits for layers, name bytes, values, edges, source scalars,
+and retained payload bytes. Missing, unbound, unsupported, clipped, and refused
+results remain typed. `HostCore` returns the latest published and synchronously
+inspected revision domains together; TUI and GPUI caches are client-local and
+keyed by stable identity plus source tick, so selecting or hovering an agent
+does not install mutable global probe state or authorize background capture.
 
 ### 5.7 Asupersync adoption boundary [Completed — bd-2z0.4.12, TopazCastle, 2026-07-15; DSR run-1784141755-1923 green]
 
@@ -616,7 +626,7 @@ cumulative reports; each completed tick declares an absolute `1e-5` plus relativ
 pools. Ledger state is outside characterization/digest, replay, persistence, RNG,
 and scientific decisions.
 
-### 6.5 brain genome/evaluator-state separation [Currently In Progress — bd-2z0.3.8, TopazCastle; bounded on-demand inspection boundary]
+### 6.5 brain genome/evaluator-state separation [Inspection slice completed — bd-2z0.3.8, TopazCastle, 2026-07-15; DSR run-1784156735-28027 green]
 
 The current `Brain`/`BrainRunner` bridge loses the operations required by evolution. Replace trait-object cloning with versioned heritable data **and** separately versioned dynamic evaluator state. Evaluator state is not universally ephemeral: recurrent MLP/DWRAON node state and Assembly working cells can affect future outputs and must survive checkpoints when the family contract says so.
 
@@ -732,7 +742,15 @@ Each agent stores the exact genome envelope, versioned evaluator state, and a li
 
 This removes the need to clone an opaque runner and makes persistence, replay, lineage, stateful-brain behavior, and external inspection truthful.
 
-### 6.6 brain-family acceptance [Currently In Progress — bd-2z0.3.8, TopazCastle; producer-side inspection bounds and purity proof]
+The inspection half of this boundary is implemented without cloning or
+serializing live evaluator state during ordinary ticks. `BrainRunner::inspect`
+is fallible, stateless, and explicitly requested; producer and core bounds are
+both enforced before publication. Tests checkpoint each stateful family and
+compare the next output before and after inspection, while core, runtime, TUI,
+and GPUI tests prove that enabling, disabling, clipping, caching, or repeating
+inspection leaves `WorldDigest` and future scientific behavior unchanged.
+
+### 6.6 brain-family acceptance [Introspection gate completed — bd-2z0.3.8, TopazCastle, 2026-07-15; DSR run-1784156735-28027 green]
 
 Before a family can enter a scenario it must prove:
 
@@ -749,6 +767,16 @@ Before a family can enter a scenario it must prove:
 - lineage provenance in child genomes.
 
 MLP, DWRAON, and Assembly should be the first honest families. Their recurrent/working state receives family-specific checkpoint and offspring tests. NeuroFlow remains optional until its genome/evaluator-state reconstruction and introspection cost are acceptable. Candle/Tract/Tch adapters remain disabled from default scenarios until they load actual models and define reproduction semantics. `ml.placeholder` is removed from production registration.
+
+MLP and DWRAON now preflight the requested limits before allocating their
+activation layer; Assembly reports introspection as explicitly unsupported;
+and NeuroFlow preflights source-scalar and payload budgets before any JSON
+serialization. No family serializes inspection data from its normal `tick`
+path. The DSR measurement guard used five warmups and fifty samples for 1,000
+and 10,000-agent worlds at zero, one, and eight targets. In the 10,000-agent
+case, p95 request times were 125 ns, 512,916 ns, and 1,477,208 ns respectively;
+retained payload was 0, 41,035, and 328,280 bytes, beneath the hard 65,536-byte
+per-target ceiling. The measurement log is content-addressed in the DSR proof.
 
 ### 6.7 brain-specific parity work
 
