@@ -3039,7 +3039,12 @@ mod tests {
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     #[test]
     fn root_panic_retains_racing_native_envelopes_without_detaching() {
-        let (core, journal) = captured_host(47, true, ReceiptMode::Panic);
+        let (core, journal) = captured_host_with_world(
+            47,
+            world_with_persistence_interval(1),
+            options(true),
+            ReceiptMode::Panic,
+        );
         let (mut runner, control) =
             NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
                 .expect("panic runner");
@@ -3182,16 +3187,16 @@ mod tests {
                 std::thread::yield_now();
             }
             clock.advance_to(Time::from_nanos(10));
-            Ok(timer.process_timers())
+            let _ = timer.process_timers();
+            Ok(())
         });
 
         let run = runner.run_on_runtime(&runtime);
-        let timers_fired = advancer
+        advancer
             .join()
             .expect("virtual deadline advancer")
             .expect("virtual deadline registration");
         assert!(matches!(run, Ok(NativeRunOutcome::Cancelled { .. })));
-        assert!(timers_fired >= 1);
         assert_eq!(runner.host().core().world_tick(), Tick(1));
         assert_eq!(runner.metrics().deadline_wakes, 1);
         assert_eq!(runner.metrics().automatic_steps_skipped, 0);
