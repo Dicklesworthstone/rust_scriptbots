@@ -318,7 +318,7 @@ struct LayerRefreshStats {
 }
 
 impl LayerRefreshStats {
-    fn add_vector<T>(&mut self, capacity: usize) {
+    const fn add_vector<T>(&mut self, capacity: usize) {
         if capacity != 0 {
             self.bulk_allocations = self.bulk_allocations.saturating_add(1);
             self.newly_allocated_capacity_bytes = self
@@ -528,7 +528,7 @@ fn hydrology_layer_matches(
         && same_f32_slice(&snapshot.water_depth, hydrology.water_depth())
 }
 
-fn same_f32(left: f32, right: f32) -> bool {
+const fn same_f32(left: f32, right: f32) -> bool {
     left.to_bits() == right.to_bits()
 }
 
@@ -540,7 +540,7 @@ fn same_f32_slice(left: &[f32], right: &[f32]) -> bool {
             .all(|(left, right)| same_f32(*left, *right))
 }
 
-fn hydrology_capacity_bytes(snapshot: &HydrologyLayerSnapshot) -> usize {
+const fn hydrology_capacity_bytes(snapshot: &HydrologyLayerSnapshot) -> usize {
     snapshot
         .tiles
         .capacity()
@@ -2300,7 +2300,7 @@ mod tests {
     )]
     fn layer_arcs_and_revisions_change_together_on_exact_content_bits() {
         let mut config = ScriptBotsConfig {
-            rng_seed: Some(0x51a7_1c5),
+            rng_seed: Some(0x051a_71c5),
             initial_food: 0.5,
             persistence_interval: 0,
             ..ScriptBotsConfig::default()

@@ -22,7 +22,7 @@ mod serde_arc {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::sync::Arc;
 
-    pub(super) fn serialize<T, S>(value: &Arc<T>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<T, S>(value: &Arc<T>, serializer: S) -> Result<S::Ok, S::Error>
     where
         T: Serialize,
         S: Serializer,
@@ -30,7 +30,7 @@ mod serde_arc {
         value.as_ref().serialize(serializer)
     }
 
-    pub(super) fn deserialize<'de, T, D>(deserializer: D) -> Result<Arc<T>, D::Error>
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Arc<T>, D::Error>
     where
         T: Deserialize<'de>,
         D: Deserializer<'de>,
@@ -43,7 +43,11 @@ mod serde_optional_arc {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::sync::Arc;
 
-    pub(super) fn serialize<T, S>(value: &Option<Arc<T>>, serializer: S) -> Result<S::Ok, S::Error>
+    #[allow(
+        clippy::ref_option,
+        reason = "serde with-modules require a serializer accepting a shared reference to the field type"
+    )]
+    pub fn serialize<T, S>(value: &Option<Arc<T>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         T: Serialize,
         S: Serializer,
@@ -51,7 +55,7 @@ mod serde_optional_arc {
         value.as_deref().serialize(serializer)
     }
 
-    pub(super) fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<Arc<T>>, D::Error>
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<Arc<T>>, D::Error>
     where
         T: Deserialize<'de>,
         D: Deserializer<'de>,
@@ -2187,6 +2191,10 @@ mod tests {
             Ok(())
         }
 
+        #[allow(
+            clippy::too_many_lines,
+            reason = "the fake protocol oracle keeps one complete coherent RenderSnapshot literal visible"
+        )]
         fn publish_snapshot(&mut self) {
             let revision = self.next_snapshot;
             self.next_snapshot = revision
@@ -2270,7 +2278,7 @@ mod tests {
                 health: HostHealth::Healthy,
                 command_queue_depth: self.queue.len(),
                 last_applied_command,
-                completed_summary: (self.tick != Tick::zero()).then(|| TickSummary {
+                completed_summary: (self.tick != Tick::zero()).then_some(TickSummary {
                     tick: self.tick,
                     agent_count: 0,
                     births: 0,
@@ -2654,6 +2662,7 @@ mod tests {
                 .as_mut()
                 .expect("fake initial snapshot");
             Arc::make_mut(snapshot).session_id = HostSessionId::new(9_999);
+            drop(host);
         }
 
         assert_eq!(
