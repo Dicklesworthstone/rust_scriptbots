@@ -581,6 +581,7 @@ const AGENT_COLUMNS: &[&str] = &[
 ];
 
 /// Number of values bound by [`scriptbots_agent_insert_sql`].
+#[cfg(test)]
 const SCRIPTBOTS_AGENT_COLUMN_COUNT: usize = AGENT_COLUMNS.len();
 
 /// Canonical production insert statement for one full scientific agent snapshot.
