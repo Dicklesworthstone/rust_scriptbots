@@ -25,6 +25,9 @@ pub enum CommandRecvError {
 }
 
 /// Payload-redacted command-bus state and cumulative counters.
+///
+/// This diagnostic view is best-effort rather than a linearizable ledger: the
+/// channel state and cumulative atomics are sampled independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandBusTelemetry {
     /// Stable deterministic identifier for this bus class.
@@ -136,7 +139,7 @@ impl CommandSender {
         result
     }
 
-    fn record_validation_rejection(&self) {
+    pub(crate) fn record_validation_rejection(&self) {
         self.counters
             .validation_rejections
             .fetch_add(1, Ordering::Relaxed);

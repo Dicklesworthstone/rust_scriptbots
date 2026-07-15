@@ -536,9 +536,10 @@ impl ControlHandle {
     }
 
     fn enqueue(&self, command: ControlCommand) -> Result<(), ControlError> {
-        command
-            .validate()
-            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        if let Err(error) = command.validate() {
+            self.commands.record_validation_rejection();
+            return Err(ControlError::InvalidPatch(error.to_string()));
+        }
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
             Err(CommandSendError::Full(_command)) => Err(ControlError::CommandQueueFull),
