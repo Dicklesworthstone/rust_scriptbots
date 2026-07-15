@@ -45,6 +45,15 @@ pub mod stats;
 /// from a database is a thin adapter on top.
 pub mod certify;
 
+/// Matched-seed treatment-effect analysis (bd-2z0.11.6 item 3; serves bd-16g.1.4).
+///
+/// Given the same seeds run under a control and a treatment, measures whether the treatment
+/// changed each metric — with a paired design (sign-flip permutation, paired bootstrap CI,
+/// Cohen's `d_z`) that exploits the matched seeds, and Benjamini-Hochberg across metrics so a
+/// study measuring many outcomes cannot report a chance "effect". Pure functions; the DB glue
+/// that pulls per-seed outcomes from two run databases is a thin adapter on top.
+pub mod compare;
+
 /// Schema version stamped into every machine-readable report payload.
 ///
 /// Bump ONLY with a migration note in the owning Bead/release evidence. Full
