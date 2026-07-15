@@ -319,7 +319,10 @@ fn reader_is_verified_read_only_and_never_creates_databases() {
 fn registry_lists_builtin_reports_with_descriptions() {
     let listed = Registry::builtin().list();
     let names: Vec<&str> = listed.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, vec!["run-summary", "narrative-timeline"]);
+    assert_eq!(
+        names,
+        vec!["run-summary", "narrative-timeline", "metric-summary"]
+    );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));
 }
 

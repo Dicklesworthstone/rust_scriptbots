@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use scriptbots_storage::{PersistenceBatchId, StorageError, StorageReader};
+use scriptbots_storage::{PersistedMetric, PersistenceBatchId, StorageError, StorageReader};
 use serde::Serialize;
 
 /// Native, dependency-free statistics for offline detector certification (bd-2z0.11.6).
@@ -207,7 +207,11 @@ impl Registry {
     #[must_use]
     pub fn builtin() -> Self {
         Self {
-            reports: vec![Box::new(RunSummary), Box::new(NarrativeTimeline)],
+            reports: vec![
+                Box::new(RunSummary),
+                Box::new(NarrativeTimeline),
+                Box::new(MetricSummary),
+            ],
         }
     }
 
@@ -268,6 +272,141 @@ fn log_report_stage(stage: &'static str, started: &Instant, rows: usize) {
         rows,
         "report stage completed"
     );
+}
+
+/// `metric-summary`: a per-metric distribution summary over a finished run.
+///
+/// This is the first report to put the native [`stats`] module (bd-2z0.11.6) to work on real
+/// persisted data: for every metric the run recorded, it loads the full value series and reports
+/// n, mean, standard deviation, the 5/50/95 quantiles, min/max, and the coefficient of variation
+/// — the foundation of the `distribution-report` (bd-2z0.11.6 item 2). Distribution FITTING (the
+/// candidate normal/lognormal/gamma fits + KS test) is the piece where `fsci`'s distribution zoo
+/// would earn its keep and is left for the adapter decision (bd-2z0.11.3); the summary itself
+/// needs nothing beyond the native estimators.
+struct MetricSummary;
+
+#[derive(Debug, Serialize)]
+struct MetricSummaryMachine {
+    metrics: Vec<MetricSummaryRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricSummaryRow {
+    name: String,
+    n: usize,
+    mean: f64,
+    std_dev: f64,
+    min: f64,
+    q05: f64,
+    median: f64,
+    q95: f64,
+    max: f64,
+    /// `std_dev / |mean|` — a scale-free measure of spread. `None` when the mean is within
+    /// `f64::EPSILON` of zero, where the ratio is meaningless rather than merely large.
+    coefficient_of_variation: Option<f64>,
+}
+
+impl Report for MetricSummary {
+    fn name(&self) -> &'static str {
+        "metric-summary"
+    }
+
+    fn description(&self) -> &'static str {
+        "Per-metric distribution summary (n, mean, sd, quantiles, CV) over a finished run"
+    }
+
+    fn run(&self, cx: &ReaderCtx, _params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let read_started = Instant::now();
+        let readings = cx.reader.recent_metrics(None)?;
+        log_report_stage("read", &read_started, readings.len());
+
+        let render_started = Instant::now();
+        // Group values by metric name. BTreeMap keeps the output in a stable, name-sorted order so
+        // two runs of the report over the same data render identically — a report whose row order
+        // wobbled could not be diffed across runs.
+        let mut by_metric: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for PersistedMetric { name, value, .. } in readings {
+            by_metric.entry(name).or_default().push(value);
+        }
+
+        let mut rows = Vec::with_capacity(by_metric.len());
+        for (name, values) in by_metric {
+            // A metric with non-finite values is a real problem worth surfacing, but the stats
+            // functions already reject it; map that to a report-level error rather than a panic.
+            let mean = stats::mean(&values).map_err(metric_stats_error)?;
+            let std_dev = stats::std_dev(&values).map_err(metric_stats_error)?;
+            let q05 = stats::quantile(&values, 0.05).map_err(metric_stats_error)?;
+            let median = stats::quantile(&values, 0.50).map_err(metric_stats_error)?;
+            let q95 = stats::quantile(&values, 0.95).map_err(metric_stats_error)?;
+            let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let coefficient_of_variation =
+                (mean.abs() > f64::EPSILON).then(|| std_dev / mean.abs());
+            rows.push(MetricSummaryRow {
+                name,
+                n: values.len(),
+                mean,
+                std_dev,
+                min,
+                q05,
+                median,
+                q95,
+                max,
+                coefficient_of_variation,
+            });
+        }
+
+        let machine = MetricSummaryMachine { metrics: rows };
+
+        let mut md = String::new();
+        let _ = writeln!(md, "# Metric summary\n");
+        if machine.metrics.is_empty() {
+            let _ = writeln!(md, "_No metrics persisted in this run._");
+        } else {
+            let _ = writeln!(
+                md,
+                "| metric | n | mean | sd | min | p05 | median | p95 | max | CV |"
+            );
+            let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|");
+            for row in &machine.metrics {
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {} |",
+                    row.name,
+                    row.n,
+                    row.mean,
+                    row.std_dev,
+                    row.min,
+                    row.q05,
+                    row.median,
+                    row.q95,
+                    row.max,
+                    row.coefficient_of_variation
+                        .map_or_else(|| "-".to_owned(), |cv| format!("{cv:.4}")),
+                );
+            }
+        }
+
+        let output = base_output(
+            self.name(),
+            cx,
+            machine.metrics.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
+    }
+}
+
+/// Map a statistics error to a report error. The stats module only errors on genuinely bad data
+/// (empty or non-finite), which for persisted metrics means the run wrote something impossible —
+/// a report-level failure, not a panic.
+fn metric_stats_error(error: crate::stats::StatsError) -> AnalyticsError {
+    AnalyticsError::Storage(StorageError::InvalidData {
+        context: "analytics.metric_summary",
+        reason: error.to_string(),
+    })
 }
 
 fn base_output(
