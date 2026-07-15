@@ -215,13 +215,12 @@ impl DwraonBrain {
         let activations = if retain_layer {
             let mut values = Vec::with_capacity(source_values);
             values.extend(self.state.iter().map(|node| node.output));
-            let mut layers = Vec::with_capacity(1);
-            layers.push(ActivationLayer {
+            let layers = vec![ActivationLayer {
                 name: ACTIVATION_LAYER_NAME.to_owned(),
                 width: ACTIVATION_LAYER_WIDTH,
                 height: ACTIVATION_LAYER_HEIGHT,
                 values,
-            });
+            }];
             BrainActivations {
                 layers,
                 connections: Vec::new(),

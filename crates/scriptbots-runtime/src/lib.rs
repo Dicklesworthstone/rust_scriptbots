@@ -727,11 +727,14 @@ impl BrainProjectionSource {
     /// Whether this detail can be paired with the supplied immutable snapshot without staleness.
     #[must_use]
     pub fn matches_snapshot(self, snapshot: &RenderSnapshot) -> bool {
+        let published_source = (self.published_snapshot, self.published_host);
+        let snapshot_source = (snapshot.revision, snapshot.revisions);
+        let inspected_source = (self.inspected_host, self.inspected_tick.0);
+        let snapshot_state = (snapshot.revisions, snapshot.world.tick);
+
         self.session_id == snapshot.session_id
-            && self.published_snapshot == snapshot.revision
-            && self.published_host == snapshot.revisions
-            && self.inspected_host == snapshot.revisions
-            && self.inspected_tick.0 == snapshot.world.tick
+            && published_source == snapshot_source
+            && inspected_source == snapshot_state
     }
 }
 

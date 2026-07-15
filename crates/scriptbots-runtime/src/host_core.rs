@@ -3198,53 +3198,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selected_brain_projection_is_client_isolated_revisioned_and_science_neutral() {
-        #[derive(Debug)]
-        struct ProjectionBrain;
+    const PROJECTION_BRAIN_DIGEST: u64 = 0x5255_4e54_494d_4501;
 
-        impl BrainRunner for ProjectionBrain {
-            fn kind(&self) -> &'static str {
-                "runtime.projection"
-            }
+    #[derive(Debug)]
+    struct ProjectionBrain;
 
-            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
-                [0.0; OUTPUT_SIZE]
-            }
-
-            fn inspect(
-                &self,
-                request: BrainInspection,
-            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
-                let BrainInspection::Activations(limits) = request;
-                bound_brain_inspection(
-                    self.kind(),
-                    BrainActivations {
-                        layers: vec![ActivationLayer {
-                            name: "runtime".to_owned(),
-                            width: 2,
-                            height: 1,
-                            values: vec![0.25, 0.75],
-                        }],
-                        connections: Vec::new(),
-                        truncated: false,
-                    },
-                    2,
-                    limits,
-                )
-                .map(Some)
-            }
-
-            fn state_digest(&self) -> Option<u64> {
-                Some(0x5255_4e54_494d_4501)
-            }
+    impl BrainRunner for ProjectionBrain {
+        fn kind(&self) -> &'static str {
+            "runtime.projection"
         }
 
+        fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+            [0.0; OUTPUT_SIZE]
+        }
+
+        fn inspect(
+            &self,
+            request: BrainInspection,
+        ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+            let BrainInspection::Activations(limits) = request;
+            bound_brain_inspection(
+                self.kind(),
+                BrainActivations {
+                    layers: vec![ActivationLayer {
+                        name: "runtime".to_owned(),
+                        width: 2,
+                        height: 1,
+                        values: vec![0.25, 0.75],
+                    }],
+                    connections: Vec::new(),
+                    truncated: false,
+                },
+                2,
+                limits,
+            )
+            .map(Some)
+        }
+
+        fn state_digest(&self) -> Option<u64> {
+            Some(PROJECTION_BRAIN_DIGEST)
+        }
+    }
+
+    fn projection_brain_host() -> HostCore {
         let mut world = snapshot_measurement_world(2);
         let family = world
             .brain_registry_mut()
             .expect("runtime projection registry mutation")
-            .register_with_state_digest("runtime.projection", 0x5255_4e54_494d_4501, |_rng| {
+            .register_with_state_digest("runtime.projection", PROJECTION_BRAIN_DIGEST, |_rng| {
                 Ok(Box::new(ProjectionBrain))
             });
         let agent_ids: Vec<_> = world.agents().iter_handles().collect();
@@ -3253,8 +3254,13 @@ mod tests {
                 .bind_agent_brain(agent_id, family)
                 .expect("bind runtime projection brain");
         }
-        let core = HostCore::new(HostSessionId::new(0x4252_4149_4e), world, options(true))
-            .expect("brain projection host");
+        HostCore::new(HostSessionId::new(0x0042_5241_494e), world, options(true))
+            .expect("brain projection host")
+    }
+
+    #[test]
+    fn selected_brain_projection_is_client_isolated_revisioned_and_science_neutral() {
+        let core = projection_brain_host();
         let source = core.latest_snapshot();
         let first_uid = source.world.agents[0].uid;
         let second_uid = source.world.agents[1].uid;
