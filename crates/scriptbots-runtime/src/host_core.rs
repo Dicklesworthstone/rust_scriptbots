@@ -4,17 +4,17 @@ use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
     CommandId, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt, EventCatchUp,
     EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment,
-    EventHub, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot, EventSequence,
-    EventSequenceRange,
-    FoodLayerSnapshot, HostAccessError, HostBlocker, HostCommand, HostDriveInterest, HostEvent,
-    HostEventKind, HostFault, HostHealth, HostLifecycle, HostPort, HostRevisions, HostSessionId,
-    HydrologyLayerSnapshot, HydrologyTileSnapshot, JournalAdmission, JournalBatch, JournalBatchId,
-    JournalFailure, JournalPort, JournalReceipt, JournalReceiptState, JournalState,
-    JournaledScientificEvent, LayerRevision, ManualHostDriver, ManualInstant, PlaybackSnapshot,
-    ProtocolEventSequence, RejectionReason, RenderSnapshot, ScientificBoundary,
-    ScientificBoundaryFault, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
-    SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions, SnapshotLayers, SnapshotRevision,
-    StatusCombinationError, TerrainLayerSnapshot, TerrainTileSnapshot,
+    EventHub, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot,
+    EventSequence, EventSequenceRange, FoodLayerSnapshot, HostAccessError, HostBlocker,
+    HostCommand, HostDriveInterest, HostEvent, HostEventKind, HostFault, HostHealth, HostLifecycle,
+    HostPort, HostRevisions, HostSessionId, HydrologyLayerSnapshot, HydrologyTileSnapshot,
+    JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
+    JournalReceiptState, JournalState, JournaledScientificEvent, LayerRevision, ManualHostDriver,
+    ManualInstant, PlaybackSnapshot, ProtocolEventSequence, RejectionReason, RenderSnapshot,
+    ScientificBoundary, ScientificBoundaryFault, ScientificEvent, ScientificRevision,
+    ShutdownCommitRequirement, SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions,
+    SnapshotLayers, SnapshotRevision, StatusCombinationError, TerrainLayerSnapshot,
+    TerrainTileSnapshot,
 };
 use arc_swap::ArcSwap;
 use scriptbots_core::{
@@ -150,9 +150,7 @@ impl VolatileJournal {
                 entries: VecDeque::with_capacity(capacity),
                 scientific_entries: VecDeque::with_capacity(capacity),
             },
-            event_view: Arc::new(ArcSwap::from_pointee(
-                VolatileEventArchiveView::default(),
-            )),
+            event_view: Arc::new(ArcSwap::from_pointee(VolatileEventArchiveView::default())),
             receipts: VecDeque::new(),
         }
     }
@@ -229,11 +227,7 @@ impl EventJournalReader for VolatileEventReader {
         .ok()
     }
 
-    fn contains_event_identity(
-        &self,
-        sequence: EventSequence,
-        batch_id: JournalBatchId,
-    ) -> bool {
+    fn contains_event_identity(&self, sequence: EventSequence, batch_id: JournalBatchId) -> bool {
         self.view.load().entries.iter().any(|entry| {
             entry.sequence == sequence
                 && entry.batch_id == batch_id
@@ -385,10 +379,8 @@ impl JournalPort for VolatileJournal {
             }
         }
         if scientific_changed && let Some(highest) = self.highest_accepted {
-            self.event_view.store(Arc::new(volatile_event_view(
-                archive,
-                highest.session_id(),
-            )));
+            self.event_view
+                .store(Arc::new(volatile_event_view(archive, highest.session_id())));
         }
         receipts
     }
@@ -1364,10 +1356,7 @@ impl HostCore {
             message: "journal response echoed a different batch identity".to_owned(),
         };
         if let Some(command_id) = batch.command_id() {
-            self.update_command_journal(
-                command_id,
-                JournalState::Failed(failure.clone()),
-            )?;
+            self.update_command_journal(command_id, JournalState::Failed(failure.clone()))?;
         }
         if let Some(event_sequence) = batch.scientific_event_sequence() {
             self.events.update_commitment(
@@ -2365,10 +2354,9 @@ impl ManualHostDriver for HostCore {
         if should_publish {
             self.publish_snapshot()?;
         }
-        let events_published = usize::try_from(
-            self.events.published_total().saturating_sub(events_before),
-        )
-        .unwrap_or(usize::MAX);
+        let events_published =
+            usize::try_from(self.events.published_total().saturating_sub(events_before))
+                .unwrap_or(usize::MAX);
         self.events.cancel_publish_reservation();
         Ok(DriveReceipt {
             now,
@@ -2506,9 +2494,9 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 mod tests {
     use super::*;
     use crate::{
-        ProjectionBroker, ProjectionCamera, ProjectionClientId, ProjectionDetail,
-        ProjectionLimits, ProjectionRanking, ProjectionRequest, ProjectionSelection,
-        ProjectionViewport, project_snapshot,
+        ProjectionBroker, ProjectionCamera, ProjectionClientId, ProjectionDetail, ProjectionLimits,
+        ProjectionRanking, ProjectionRequest, ProjectionSelection, ProjectionViewport,
+        project_snapshot,
     };
     use scriptbots_core::{
         AgentData, AgentUid, Generation, HydrologyField, HydrologyFlowDirection, HydrologyTile,
@@ -3250,9 +3238,7 @@ mod tests {
         let mut world = WorldState::new(config).expect("projection measurement world");
         populate_snapshot_measurement_agents(&mut world, agent_count);
         for _ in 0..HISTORY_SAMPLES {
-            world
-                .step()
-                .expect("projection measurement history step");
+            world.step().expect("projection measurement history step");
         }
         assert_eq!(world.history().count(), HISTORY_SAMPLES);
         world
@@ -3493,26 +3479,22 @@ mod tests {
 
             for _ in 0..WARMUPS {
                 black_box(
-                    project_snapshot(&source, &request, limits)
-                        .expect("cold projection warmup"),
+                    project_snapshot(&source, &request, limits).expect("cold projection warmup"),
                 );
             }
             let mut cold_samples = Vec::with_capacity(SAMPLES);
             let mut cold_stats = crate::ProjectionBuildStats::default();
             for _ in 0..SAMPLES {
                 let started = Instant::now();
-                let projection = project_snapshot(&source, &request, limits)
-                    .expect("measured cold projection");
-                cold_samples.push(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                let projection =
+                    project_snapshot(&source, &request, limits).expect("measured cold projection");
+                cold_samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
                 cold_stats = projection.build;
                 black_box(projection);
             }
 
-            let mut warm_broker =
-                ProjectionBroker::with_byte_capacity(4, SINGLE_CACHE_BYTES)
-                    .expect("warm projection broker");
+            let mut warm_broker = ProjectionBroker::with_byte_capacity(4, SINGLE_CACHE_BYTES)
+                .expect("warm projection broker");
             for _ in 0..WARMUPS {
                 black_box(
                     warm_broker
@@ -3527,9 +3509,7 @@ mod tests {
                 let projection = warm_broker
                     .project(&source, &request, limits)
                     .expect("measured warm cached projection");
-                warm_samples.push(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                warm_samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
                 warm_stats = projection.build;
                 black_box(projection);
             }
@@ -3539,9 +3519,8 @@ mod tests {
                 u64::try_from(WARMUPS + SAMPLES - 1).expect("bounded warm hit count")
             );
 
-            let mut moving_broker =
-                ProjectionBroker::with_byte_capacity(16, SINGLE_CACHE_BYTES)
-                    .expect("moving projection broker");
+            let mut moving_broker = ProjectionBroker::with_byte_capacity(16, SINGLE_CACHE_BYTES)
+                .expect("moving projection broker");
             for sample in 0..WARMUPS {
                 let moving = moving_projection_request(&request, sample);
                 black_box(
@@ -3558,9 +3537,8 @@ mod tests {
                 let projection = moving_broker
                     .project(&source, &moving, limits)
                     .expect("measured moving-camera projection");
-                moving_samples.push(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                moving_samples
+                    .push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
                 moving_stats = projection.build;
                 black_box(projection);
             }
@@ -3587,16 +3565,15 @@ mod tests {
                     .unwrap_or_else(|error| {
                         panic!("cold fanout projection {client} failed: {error}")
                     });
-                fanout_agents_examined = fanout_agents_examined
-                    .saturating_add(projection.build.agents_examined);
+                fanout_agents_examined =
+                    fanout_agents_examined.saturating_add(projection.build.agents_examined);
                 fanout_visible_agents =
                     fanout_visible_agents.saturating_add(projection.build.visible_agents);
                 fanout_canvas_cells =
                     fanout_canvas_cells.saturating_add(projection.build.canvas_cells);
-                fanout_top_k_peak =
-                    fanout_top_k_peak.saturating_add(projection.build.top_k_peak);
-                fanout_chart_points = fanout_chart_points
-                    .saturating_add(projection.build.chart_points_emitted);
+                fanout_top_k_peak = fanout_top_k_peak.saturating_add(projection.build.top_k_peak);
+                fanout_chart_points =
+                    fanout_chart_points.saturating_add(projection.build.chart_points_emitted);
                 fanout_output_capacity_bytes = fanout_output_capacity_bytes
                     .saturating_add(projection.build.output_capacity_bytes);
                 black_box(projection);
@@ -3630,9 +3607,8 @@ mod tests {
                             .expect("measured warm fanout projection"),
                     );
                 }
-                fanout_warm_samples.push(
-                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                fanout_warm_samples
+                    .push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
             }
 
             assert!(cold_stats.chart_samples_examined > 0);
@@ -3662,7 +3638,13 @@ mod tests {
             ) = if agent_count == 1_000 {
                 (16_000_000, 500_000, 20_000_000, 250_000_000, 20_000_000)
             } else {
-                (80_000_000, 1_000_000, 100_000_000, 3_000_000_000, 25_000_000)
+                (
+                    80_000_000,
+                    1_000_000,
+                    100_000_000,
+                    3_000_000_000,
+                    25_000_000,
+                )
             };
             let digest_after = core
                 .scientific_digest_v1()
@@ -3855,7 +3837,10 @@ mod tests {
         assert_eq!(page.source, EventPageSource::LiveMemory);
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].event.sequence, EventSequence::new(1));
-        assert_eq!(page.events[0].commitment, EventCommitment::CommittedVolatile);
+        assert_eq!(
+            page.events[0].commitment,
+            EventCommitment::CommittedVolatile
+        );
         assert_eq!(slow.last_seen(), EventSequence::new(1));
     }
 
@@ -4128,7 +4113,7 @@ mod tests {
             core.drive(ManualInstant::from_nanos(
                 u64::try_from(id).expect("small event sequence"),
             ))
-                .expect("scientific event drive");
+            .expect("scientific event drive");
         }
 
         let gap = match client
@@ -4158,7 +4143,10 @@ mod tests {
         assert_eq!(page.source, EventPageSource::LiveMemory);
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].event.sequence, EventSequence::new(1));
-        assert_eq!(page.events[0].commitment, EventCommitment::CommittedVolatile);
+        assert_eq!(
+            page.events[0].commitment,
+            EventCommitment::CommittedVolatile
+        );
         assert_eq!(slow.last_seen(), EventSequence::new(1));
 
         let crate::EventPoll::Contiguous(hot) = client
@@ -4258,8 +4246,7 @@ mod tests {
             Box::new(FakeJournal { state }),
         )
         .expect("null-frontend no-reader host");
-        let mut unavailable_frontend =
-            crate::NullFrontend::new(unavailable_core.local_port(), 12);
+        let mut unavailable_frontend = crate::NullFrontend::new(unavailable_core.local_port(), 12);
         unavailable_frontend
             .step()
             .expect("first unavailable frontend step");
@@ -4362,7 +4349,10 @@ mod tests {
                 .expect("repeated blocked digest"),
             blocked_digest
         );
-        assert_eq!(core.latest_snapshot().revisions.scientific, blocked_revision);
+        assert_eq!(
+            core.latest_snapshot().revisions.scientific,
+            blocked_revision
+        );
 
         let batch_ids = state
             .borrow()
@@ -4371,9 +4361,12 @@ mod tests {
             .map(|batch| batch.id())
             .collect::<Vec<_>>();
         assert_eq!(batch_ids.len(), 2);
-        state.borrow_mut().receipts.extend(batch_ids.iter().copied().map(|batch_id| {
-            JournalReceipt::new(batch_id, JournalReceiptState::Durable)
-        }));
+        state.borrow_mut().receipts.extend(
+            batch_ids
+                .iter()
+                .copied()
+                .map(|batch_id| JournalReceipt::new(batch_id, JournalReceiptState::Durable)),
+        );
         let resumed = core
             .drive(ManualInstant::from_nanos(1_001))
             .expect("event-pressure recovery");
@@ -4382,12 +4375,13 @@ mod tests {
         assert_eq!(core.world_tick(), Tick(3));
         assert_eq!(port.queue_depth(), 0);
         assert_eq!(state.borrow().attempts.len(), 3);
-        assert_eq!(status(&mut port, 3).application(), &ApplicationState::Applied(
-            AppliedCommand {
+        assert_eq!(
+            status(&mut port, 3).application(),
+            &ApplicationState::Applied(AppliedCommand {
                 tick: Tick(3),
                 revisions: core.latest_snapshot().revisions,
-            }
-        ));
+            })
+        );
     }
 
     #[test]

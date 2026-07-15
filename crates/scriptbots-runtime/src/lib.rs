@@ -924,7 +924,11 @@ fn ranking_value(agent: &DynamicAgentSnapshot, ranking: ProjectionRanking) -> f6
     }
 }
 
-fn build_chart(snapshot: &RenderSnapshot, window: u32, points: u16) -> (Vec<TickSummary>, bool, usize) {
+fn build_chart(
+    snapshot: &RenderSnapshot,
+    window: u32,
+    points: u16,
+) -> (Vec<TickSummary>, bool, usize) {
     if window == 0 || points == 0 || snapshot.summary_history.is_empty() {
         return (Vec::new(), false, 0);
     }
@@ -985,9 +989,7 @@ fn project_normalized_snapshot(
     let base_scale = (viewport_width / world_width).min(viewport_height / world_height);
     let scale = base_scale * request.camera.zoom;
     let visible_world = [viewport_width / scale, viewport_height / scale];
-    if !scale.is_finite()
-        || scale <= 0.0
-        || !visible_world.iter().all(|extent| extent.is_finite())
+    if !scale.is_finite() || scale <= 0.0 || !visible_world.iter().all(|extent| extent.is_finite())
     {
         return Err(ProjectionError::ScaleOutOfRange);
     }
@@ -997,13 +999,12 @@ fn project_normalized_snapshot(
         viewport: request.viewport,
         scale,
     };
-    let canvas_len = usize::try_from(
-        u64::from(request.viewport.width) * u64::from(request.viewport.height),
-    )
-    .map_err(|_| ProjectionError::CanvasTooLarge {
-        requested: u64::from(request.viewport.width) * u64::from(request.viewport.height),
-        limit: limits.max_canvas_cells,
-    })?;
+    let canvas_len =
+        usize::try_from(u64::from(request.viewport.width) * u64::from(request.viewport.height))
+            .map_err(|_| ProjectionError::CanvasTooLarge {
+                requested: u64::from(request.viewport.width) * u64::from(request.viewport.height),
+                limit: limits.max_canvas_cells,
+            })?;
     let mut cells = vec![ProjectionCell::default(); canvas_len];
     let selected = &request.selection.selected;
     let mut visible_agents = Vec::new();
@@ -1029,20 +1030,12 @@ fn project_normalized_snapshot(
             }
         }
 
-        let (delta_x, wrap_x) = nearest_wrapped_delta(
-            agent.position[0],
-            request.camera.center[0],
-            world_width,
-        );
-        let (delta_y, wrap_y) = nearest_wrapped_delta(
-            agent.position[1],
-            request.camera.center[1],
-            world_height,
-        );
-        let canvas_x = f64::from(viewport_width) * 0.5
-            + f64::from(delta_x) * f64::from(scale);
-        let canvas_y = f64::from(viewport_height) * 0.5
-            + f64::from(delta_y) * f64::from(scale);
+        let (delta_x, wrap_x) =
+            nearest_wrapped_delta(agent.position[0], request.camera.center[0], world_width);
+        let (delta_y, wrap_y) =
+            nearest_wrapped_delta(agent.position[1], request.camera.center[1], world_height);
+        let canvas_x = f64::from(viewport_width) * 0.5 + f64::from(delta_x) * f64::from(scale);
+        let canvas_y = f64::from(viewport_height) * 0.5 + f64::from(delta_y) * f64::from(scale);
         let is_selected = selected.binary_search(&agent.uid).is_ok();
         let is_focused = request.selection.focused == Some(agent.uid);
         let projected = ProjectedAgent {
@@ -1067,8 +1060,7 @@ fn project_normalized_snapshot(
         {
             continue;
         }
-        if visible_agents.len()
-            >= usize::try_from(limits.max_visible_agents).unwrap_or(usize::MAX)
+        if visible_agents.len() >= usize::try_from(limits.max_visible_agents).unwrap_or(usize::MAX)
         {
             return Err(ProjectionError::VisibleAgentsTooLarge {
                 limit: limits.max_visible_agents,
@@ -1078,12 +1070,11 @@ fn project_normalized_snapshot(
         let cell_y = (canvas_y.floor() as u32).min(request.viewport.height - 1);
         let cell_index_u64 =
             u64::from(cell_y) * u64::from(request.viewport.width) + u64::from(cell_x);
-        let cell_index = usize::try_from(cell_index_u64).map_err(|_| {
-            ProjectionError::CanvasTooLarge {
+        let cell_index =
+            usize::try_from(cell_index_u64).map_err(|_| ProjectionError::CanvasTooLarge {
                 requested: cell_index_u64.saturating_add(1),
                 limit: limits.max_canvas_cells,
-            }
-        })?;
+            })?;
         let cell = cells
             .get_mut(cell_index)
             .ok_or(ProjectionError::CanvasTooLarge {
@@ -1234,8 +1225,7 @@ impl ProjectionBroker {
             entry.source == identity.source
                 && entry.limits == identity.limits
                 && entry.projection.request == identity.request
-        })
-            && let Some(entry) = self.entries.remove(index)
+        }) && let Some(entry) = self.entries.remove(index)
         {
             let projection = Arc::clone(&entry.projection);
             self.entries.push_back(entry);
@@ -2274,7 +2264,10 @@ impl ProtocolEventCursor {
     /// Resume after an already-observed notification.
     #[must_use]
     pub const fn after(session_id: HostSessionId, sequence: ProtocolEventSequence) -> Self {
-        Self { session_id, last_seen: sequence }
+        Self {
+            session_id,
+            last_seen: sequence,
+        }
     }
 
     /// Bound host session.
@@ -2351,9 +2344,7 @@ impl EventSequenceRange {
     /// Whether this valid range contains one sequence.
     #[must_use]
     pub const fn contains(self, sequence: EventSequence) -> bool {
-        self.is_valid()
-            && self.first.get() <= sequence.get()
-            && sequence.get() <= self.last.get()
+        self.is_valid() && self.first.get() <= sequence.get() && sequence.get() <= self.last.get()
     }
 
     /// Whether this valid range completely contains another valid range.
@@ -2617,11 +2608,7 @@ pub trait EventJournalReader: Send + Sync {
     ///
     /// This is a nonblocking identity query used for a later commitment receipt after the
     /// corresponding record has left the hot ring. Implementations must not perform file I/O.
-    fn contains_event_identity(
-        &self,
-        sequence: EventSequence,
-        batch_id: JournalBatchId,
-    ) -> bool;
+    fn contains_event_identity(&self, sequence: EventSequence, batch_id: JournalBatchId) -> bool;
 
     /// Resolve a session-bound exact range without advancing client state.
     ///
@@ -2711,7 +2698,9 @@ impl EventHub {
         reader: Option<Arc<dyn EventJournalReader>>,
     ) -> Result<Self, HostAccessError> {
         if capacity == 0 {
-            return Err(protocol_violation("scientific event capacity must be nonzero"));
+            return Err(protocol_violation(
+                "scientific event capacity must be nonzero",
+            ));
         }
         if reader
             .as_ref()
@@ -2813,9 +2802,7 @@ impl EventHub {
                 entry.commitment,
                 EventCommitment::CommittedVolatile | EventCommitment::Durable
             ),
-            EventCatchUpGuarantee::CrashDurable => {
-                entry.commitment == EventCommitment::Durable
-            }
+            EventCatchUpGuarantee::CrashDurable => entry.commitment == EventCommitment::Durable,
         };
         if !commitment_safe {
             return Err(EventHighWaterReason::GuaranteeMismatch);
@@ -2823,8 +2810,7 @@ impl EventHub {
         let Some(retention) = reader.retention_snapshot() else {
             return Err(EventHighWaterReason::RangeUnavailable);
         };
-        if retention.session_id() != self.session_id
-            || retention.guarantee() != reader.guarantee()
+        if retention.session_id() != self.session_id || retention.guarantee() != reader.guarantee()
         {
             return Err(EventHighWaterReason::GuaranteeMismatch);
         }
@@ -2977,9 +2963,10 @@ impl EventHub {
                 return Ok(());
             }
         }
-        if self.reader.as_ref().is_some_and(|reader| {
-            reader.contains_event_identity(event_sequence, batch_id)
-        })
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| reader.contains_event_identity(event_sequence, batch_id))
         {
             Ok(())
         } else {
@@ -3016,7 +3003,9 @@ impl EventHub {
         let state = self.hot.load();
         let latest = EventSequence::new(state.next_sequence.get().saturating_sub(1));
         if cursor.last_seen > latest {
-            return Err(protocol_violation("scientific event cursor is ahead of the host"));
+            return Err(protocol_violation(
+                "scientific event cursor is ahead of the host",
+            ));
         }
         let expected = cursor
             .last_seen
@@ -3052,12 +3041,12 @@ impl EventHub {
                             guarantee: reader.guarantee(),
                         })
                     }
-                    Some(range) if range.contains(missing.last) => EventCatchUpState::Unavailable(
-                        EventCatchUpUnavailableReason::PartialRange,
-                    ),
-                    _ => EventCatchUpState::Unavailable(
-                        EventCatchUpUnavailableReason::RangeExpired,
-                    ),
+                    Some(range) if range.contains(missing.last) => {
+                        EventCatchUpState::Unavailable(EventCatchUpUnavailableReason::PartialRange)
+                    }
+                    _ => {
+                        EventCatchUpState::Unavailable(EventCatchUpUnavailableReason::RangeExpired)
+                    }
                 },
             };
             return Ok(EventPoll::Gap(EventGap {
@@ -3708,8 +3697,14 @@ fn scientific_boundary_matches_event(event: &ScientificEvent) -> bool {
     boundary.events.tick == event.tick
         && boundary.summary.tick == event.tick
         && boundary.config_revision == event.revisions.config.get()
-        && boundary.births.iter().all(|record| record.tick == event.tick)
-        && boundary.deaths.iter().all(|record| record.tick == event.tick)
+        && boundary
+            .births
+            .iter()
+            .all(|record| record.tick == event.tick)
+        && boundary
+            .deaths
+            .iter()
+            .all(|record| record.tick == event.tick)
         && boundary
             .resource_tick
             .as_ref()
@@ -3787,7 +3782,9 @@ fn validate_event_gap(cursor: EventCursor, gap: EventGap) -> Result<(), HostAcce
         || gap.missing.last.checked_next() != Some(gap.hot_available.first)
         || gap.hot_available.last != gap.latest
     {
-        return Err(protocol_violation("scientific event gap metadata is incoherent"));
+        return Err(protocol_violation(
+            "scientific event gap metadata is incoherent",
+        ));
     }
     if let EventCatchUpState::Available(locator) = gap.catch_up
         && (locator.session_id != gap.session_id || locator.range != gap.missing)
@@ -4205,10 +4202,12 @@ mod tests {
         assert!(offscreen_detail.heading.is_some());
         assert!(offscreen_detail.spike_length.is_some());
         assert!(offscreen_detail.boost.is_some());
-        assert!(!a_first
-            .visible_agents
-            .iter()
-            .any(|agent| agent.uid == offscreen_selected.uid));
+        assert!(
+            !a_first
+                .visible_agents
+                .iter()
+                .any(|agent| agent.uid == offscreen_selected.uid)
+        );
         assert_eq!(b.request.selection.selected, [AgentUid(3)]);
         let b_focused = b.focused_agent.as_ref().expect("client B focused agent");
         assert_eq!(b_focused.uid, AgentUid(3));
@@ -4221,8 +4220,14 @@ mod tests {
         assert_eq!(a_first.top_agents[0].uid, AgentUid(1));
         assert_eq!(a_first.top_agents[1].uid, AgentUid(2));
         assert_eq!(b.top_agents[0].uid, AgentUid(3));
-        assert_eq!(a_first.chart.first().expect("first chart point").tick, Tick(1));
-        assert_eq!(a_first.chart.last().expect("last chart point").tick, Tick(10));
+        assert_eq!(
+            a_first.chart.first().expect("first chart point").tick,
+            Tick(1)
+        );
+        assert_eq!(
+            a_first.chart.last().expect("last chart point").tick,
+            Tick(10)
+        );
         assert_eq!(b.chart.first().expect("B first chart point").tick, Tick(8));
         assert_eq!(b.chart.last().expect("B last chart point").tick, Tick(10));
         assert_eq!(
@@ -4347,7 +4352,10 @@ mod tests {
         }
         assert_eq!(broker.len(), 2);
         assert_eq!(broker.evictions(), 1);
-        assert!(weak.upgrade().is_none(), "evicted projection must be reclaimable");
+        assert!(
+            weak.upgrade().is_none(),
+            "evicted projection must be reclaimable"
+        );
         assert!(broker.retained_output_capacity_bytes() > 0);
         assert!(broker.retained_output_capacity_bytes() <= broker.byte_capacity());
 
@@ -4454,9 +4462,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
-                .any(|entry| {
-                    entry.event.sequence == sequence && entry.event.batch_id == batch_id
-                })
+                .any(|entry| entry.event.sequence == sequence && entry.event.batch_id == batch_id)
         }
 
         fn read(
@@ -4474,12 +4480,15 @@ mod tests {
                 .events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(available) = events.first().zip(events.last()).map(|(first, last)| {
-                EventSequenceRange {
-                    first: first.event.sequence,
-                    last: last.event.sequence,
-                }
-            }) else {
+            let Some(available) =
+                events
+                    .first()
+                    .zip(events.last())
+                    .map(|(first, last)| EventSequenceRange {
+                        first: first.event.sequence,
+                        last: last.event.sequence,
+                    })
+            else {
                 return Ok(EventCatchUp::Unavailable {
                     range: locator.range,
                     reason: EventCatchUpUnavailableReason::RangeExpired,
@@ -4762,10 +4771,7 @@ mod tests {
         let mut poll_samples = Vec::with_capacity(SAMPLES);
         for sample in 0..WARMUPS + SAMPLES {
             let started = Instant::now();
-            let page = black_box(
-                hub.poll(tip_cursor, 1)
-                    .expect("measurement hot poll"),
-            );
+            let page = black_box(hub.poll(tip_cursor, 1).expect("measurement hot poll"));
             let elapsed = u64::try_from(started.elapsed().as_nanos())
                 .expect("measurement duration fits u64 nanoseconds");
             if sample >= WARMUPS {
@@ -4855,7 +4861,10 @@ mod tests {
                 )
                 .expect("durable event publish");
             let EventPoll::Contiguous(page) = hub
-                .poll(EventCursor::after(session_id, EventSequence::new(sequence - 1)), 1)
+                .poll(
+                    EventCursor::after(session_id, EventSequence::new(sequence - 1)),
+                    1,
+                )
                 .expect("published event poll")
             else {
                 panic!("new event must be hot");
@@ -4892,9 +4901,8 @@ mod tests {
             panic!("durable gap must expose a reader locator");
         };
         assert_eq!(locator.guarantee(), EventCatchUpGuarantee::CrashDurable);
-        let EventCatchUp::Contiguous(caught_up) = hub
-            .catch_up(locator, usize::MAX)
-            .expect("durable catch-up")
+        let EventCatchUp::Contiguous(caught_up) =
+            hub.catch_up(locator, usize::MAX).expect("durable catch-up")
         else {
             panic!("durable locator must be readable");
         };
@@ -4906,8 +4914,8 @@ mod tests {
         let encoded = reader.encoded();
         let reopened_reader = Arc::new(TestDurableEventReader::reopen(session_id, &encoded));
         let reopened_capability: Arc<dyn EventJournalReader> = reopened_reader;
-        let reopened_hub = EventHub::new(session_id, 2, Some(reopened_capability))
-            .expect("reopened durable hub");
+        let reopened_hub =
+            EventHub::new(session_id, 2, Some(reopened_capability)).expect("reopened durable hub");
         let restart_locator = EventCatchUpLocator {
             session_id,
             range: EventSequenceRange {
@@ -4926,8 +4934,8 @@ mod tests {
         assert_eq!(restarted.events.len(), 3);
         assert_eq!(restarted.latest, EventSequence::new(3));
 
-        let unavailable = EventHub::new(HostSessionId::new(46), 1, None)
-            .expect("unavailable-reader hub");
+        let unavailable =
+            EventHub::new(HostSessionId::new(46), 1, None).expect("unavailable-reader hub");
         for sequence in 1..=2 {
             assert!(
                 unavailable

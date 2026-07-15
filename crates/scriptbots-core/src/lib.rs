@@ -29596,7 +29596,9 @@ mod tests {
         }
 
         let first_uid = world.agent_uid(first_id).expect("first uid before removal");
-        world.remove_agent(first_id).expect("remove first snapshot agent");
+        world
+            .remove_agent(first_id)
+            .expect("remove first snapshot agent");
         let replacement_id = world.spawn_agent(sample_agent(2));
         let replacement_uid = world
             .agent_uid(replacement_id)
@@ -29604,8 +29606,11 @@ mod tests {
         let churned = DynamicWorldSnapshot::from_world(&world);
         assert_ne!(replacement_uid, first_uid);
         assert!(churned.agents.iter().all(|agent| agent.uid != first_uid));
-        assert!(churned.agents.iter().any(|agent| {
-            agent.id == replacement_id.raw() && agent.uid == replacement_uid
-        }));
+        assert!(
+            churned
+                .agents
+                .iter()
+                .any(|agent| { agent.id == replacement_id.raw() && agent.uid == replacement_uid })
+        );
     }
 }
