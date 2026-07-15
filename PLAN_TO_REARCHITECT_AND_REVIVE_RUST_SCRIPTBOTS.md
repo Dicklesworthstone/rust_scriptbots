@@ -2151,7 +2151,7 @@ frontend, server, or storage edge.
 
 **Exit:** dependency graph enforces that renderers cannot call `WorldState::step`.
 
-#### 2.3.1 runtime-neutral host protocol [Currently In Progress — `bd-2z0.4.4`]
+#### 2.3.1 runtime-neutral host protocol [Completed — `bd-2z0.4.4`, 2026-07-15]
 
 - introduce the dependency-approved `scriptbots-runtime` boundary without taking ownership of
   `WorldState` ahead of the pure host-state-machine bead;
@@ -2166,6 +2166,14 @@ frontend, server, or storage edge.
 
 **Exit:** the public protocol is renderer-neutral and executable through the null frontend; actual
 sole ownership and tick-boundary application remain explicitly assigned to `bd-2z0.4.5`.
+
+**Completion evidence:** DSR build `runtime-storage-union6-f44c236` succeeded for exact source
+`f44c236bba52c1d6fe15be0926f3f79483275d94` with one target green and zero failed. Its guarded
+recipe applied and checked formatting, scanned the runtime/storage delta with UBS, ran strict
+all-target Clippy and the complete runtime and storage test suites, passed the WASM graph self-test
+and authoritative snapshot guard, and compiled `scriptbots-runtime` by itself for
+`wasm32-unknown-unknown`. The final WASM proof also verifies that core owns both required
+`getrandom` browser backends, rather than relying on a consumer-only feature accident.
 
 #### 2.4 pure host state machine
 
