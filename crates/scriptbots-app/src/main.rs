@@ -1476,6 +1476,7 @@ enum ConfigFormat {
     Ron,
 }
 
+#[cfg(test)]
 fn apply_config_layers(base: ScriptBotsConfig, layers: &[PathBuf]) -> Result<ScriptBotsConfig> {
     apply_config_layers_internal(base, layers, None)
 }

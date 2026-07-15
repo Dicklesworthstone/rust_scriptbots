@@ -4668,6 +4668,47 @@ mod tests {
         ))
     }
 
+    fn publish_durable_fixture_event(
+        hub: &EventHub,
+        reader: &TestDurableEventReader,
+        sequence: u64,
+    ) {
+        let session_id = reader.session_id;
+        assert!(hub.prepare_publish().expect("durable slot").is_none());
+        let batch_id = JournalBatchId::new(session_id, sequence);
+        let event_sequence = hub
+            .publish_pending(
+                batch_id,
+                AppliedCommand {
+                    tick: Tick(sequence),
+                    revisions: HostRevisions {
+                        control: ControlRevision::new(0),
+                        scientific: ScientificRevision::new(sequence),
+                        config: ConfigRevision::new(0),
+                    },
+                },
+                scientific_boundary(sequence),
+            )
+            .expect("durable event publish");
+        let page = match hub
+            .poll(
+                EventCursor::after(session_id, EventSequence::new(sequence - 1)),
+                1,
+            )
+            .expect("published event poll")
+        {
+            EventPoll::Contiguous(page) => Some(page),
+            EventPoll::Gap(_) => None,
+        }
+        .expect("new event must be hot");
+        let mut durable = page.events[0].clone();
+        assert_eq!(durable.event.sequence, event_sequence);
+        durable.commitment = EventCommitment::Durable;
+        reader.push(durable);
+        hub.update_commitment(batch_id, event_sequence, EventCommitment::Durable)
+            .expect("durable commitment");
+    }
+
     #[test]
     fn eviction_requires_atomic_retention_even_when_a_watermark_claims_coverage() {
         let session_id = HostSessionId::new(47);
@@ -4940,39 +4981,7 @@ mod tests {
         let reader_capability: Arc<dyn EventJournalReader> = reader.clone();
         let hub = EventHub::new(session_id, 2, Some(reader_capability)).expect("durable hub");
         for sequence in 1..=3 {
-            assert!(hub.prepare_publish().expect("durable slot").is_none());
-            let batch_id = JournalBatchId::new(session_id, sequence);
-            let event_sequence = hub
-                .publish_pending(
-                    batch_id,
-                    AppliedCommand {
-                        tick: Tick(sequence),
-                        revisions: HostRevisions {
-                            control: ControlRevision::new(0),
-                            scientific: ScientificRevision::new(sequence),
-                            config: ConfigRevision::new(0),
-                        },
-                    },
-                    scientific_boundary(sequence),
-                )
-                .expect("durable event publish");
-            let page = match hub
-                .poll(
-                    EventCursor::after(session_id, EventSequence::new(sequence - 1)),
-                    1,
-                )
-                .expect("published event poll")
-            {
-                EventPoll::Contiguous(page) => Some(page),
-                EventPoll::Gap(_) => None,
-            }
-            .expect("new event must be hot");
-            let mut durable = page.events[0].clone();
-            assert_eq!(durable.event.sequence, event_sequence);
-            durable.commitment = EventCommitment::Durable;
-            reader.push(durable);
-            hub.update_commitment(batch_id, event_sequence, EventCommitment::Durable)
-                .expect("durable commitment");
+            publish_durable_fixture_event(&hub, &reader, sequence);
         }
         hub.update_commitment(
             JournalBatchId::new(session_id, 1),

@@ -1010,12 +1010,12 @@ fn validate_v2_identity(record: &RunManifestRecord, manifest: &Value) -> Result<
 
 fn validate_v2_thread_policy(manifest: &Value) -> Result<(), StorageError> {
     manifest_required_object(manifest, "/thread_policy")?;
-    if let Some(threads) = manifest_required_nullable_u64(manifest, "/thread_policy/threads")? {
-        if threads == 0 || usize::try_from(threads).is_err() {
-            return Err(manifest_projection_error(
-                "/thread_policy/threads must fit usize and be greater than zero",
-            ));
-        }
+    if let Some(threads) = manifest_required_nullable_u64(manifest, "/thread_policy/threads")?
+        && (threads == 0 || usize::try_from(threads).is_err())
+    {
+        return Err(manifest_projection_error(
+            "/thread_policy/threads must fit usize and be greater than zero",
+        ));
     }
     manifest_required_bounded_string(manifest, "/thread_policy/source", MAX_RUN_LABEL_BYTES)?;
     manifest_required_nullable_string(
@@ -2486,8 +2486,10 @@ impl AnalyticsSnapshotProvider {
     }
 
     fn for_run(run_id: RunId) -> Self {
-        let mut snapshot = AnalyticsSnapshot::default();
-        snapshot.run_id = Some(run_id);
+        let snapshot = AnalyticsSnapshot {
+            run_id: Some(run_id),
+            ..AnalyticsSnapshot::default()
+        };
         Self {
             inner: Arc::new(ArcSwap::from_pointee(snapshot)),
         }
@@ -5156,6 +5158,7 @@ impl Storage {
         )
     }
 
+    #[cfg(all(test, unix))]
     fn with_target_before_recovery_writer_open(
         target: StorageTarget,
         tick: usize,
