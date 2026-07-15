@@ -238,6 +238,11 @@ impl CommandReceiver {
     }
 }
 
+/// Cloneable callback for the one logical simulation consumer.
+///
+/// Calls are mutex-serialized so one preloaded batch cannot split between
+/// callbacks. Application-order FIFO still requires exactly one logical
+/// consumer; concurrent callers must not apply returned batches out of order.
 pub type CommandDrain = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
 pub type CommandSubmit = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
 
@@ -967,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_drain_callbacks_preserve_exactly_once_batch_ownership() {
+    fn concurrent_drain_callbacks_do_not_split_one_preloaded_batch() {
         const SPEEDS: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let (sender, receiver) = create_command_bus(SPEEDS.len());
         for speed_multiplier in SPEEDS {
@@ -1004,7 +1009,7 @@ mod tests {
         assert_eq!(
             batches.iter().filter(|batch| !batch.is_empty()).count(),
             1,
-            "one receiver lock owns the whole bounded batch"
+            "one receiver lock owns the whole preloaded bounded batch"
         );
         let mut observed = batches
             .into_iter()
@@ -1020,6 +1025,55 @@ mod tests {
             .collect::<Vec<_>>();
         observed.sort_by(f32::total_cmp);
         assert_eq!(observed, SPEEDS);
+    }
+
+    #[test]
+    fn seeded_command_schedule_matches_direct_world_digest_each_tick() {
+        const FOOD_MAX_SCHEDULE: &[&[f32]] = &[
+            &[0.61, 0.47],
+            &[],
+            &[0.58],
+            &[],
+            &[0.52, 0.63],
+        ];
+        let config = ScriptBotsConfig::default();
+        let mut direct = WorldState::new(config.clone()).expect("direct seeded world");
+        let mut queued = WorldState::new(config).expect("queued seeded world");
+        let (sender, receiver) = create_command_bus(4);
+
+        for (boundary, food_max_values) in FOOD_MAX_SCHEDULE.iter().enumerate() {
+            for &food_max in *food_max_values {
+                let mut updated = direct.config().clone();
+                updated.food_max = food_max;
+                let command = ControlCommand::UpdateConfig(Box::new(updated));
+                let direct_disposition = apply_control_command(&mut direct, command.clone())
+                    .expect("direct scheduled command applies");
+                assert!(matches!(
+                    direct_disposition,
+                    ControlDisposition::WorldApplied
+                ));
+                sender
+                    .try_send(command)
+                    .expect("scheduled command enters bounded bus");
+            }
+
+            for command in drain_pending_commands(&receiver) {
+                let queued_disposition = apply_control_command(&mut queued, command)
+                    .expect("queued scheduled command applies");
+                assert!(matches!(
+                    queued_disposition,
+                    ControlDisposition::WorldApplied
+                ));
+            }
+
+            direct.step().expect("direct seeded tick");
+            queued.step().expect("queued seeded tick");
+            assert_eq!(
+                queued.world_digest_v1().expect("queued world digest"),
+                direct.world_digest_v1().expect("direct world digest"),
+                "command transport changed scientific state at boundary {boundary}"
+            );
+        }
     }
 
     #[test]
