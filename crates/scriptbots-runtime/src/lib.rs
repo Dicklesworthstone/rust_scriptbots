@@ -479,7 +479,7 @@ impl ScientificBoundaryFault {
 impl ScientificBoundary {
     /// Capture one completed scientific boundary without downstream I/O.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         events: TickEvents,
         summary: TickSummary,
         births: Vec<BirthRecord>,
@@ -559,7 +559,7 @@ impl ScientificBoundary {
 impl JournalBatch {
     /// Construct one exact journal batch at an already-completed boundary.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         id: JournalBatchId,
         command: Option<CommandEnvelope>,
         applied: AppliedCommand,
@@ -589,7 +589,7 @@ impl JournalBatch {
 
     /// Exact command envelope captured at the application boundary.
     #[must_use]
-    pub fn command(&self) -> Option<&CommandEnvelope> {
+    pub const fn command(&self) -> Option<&CommandEnvelope> {
         self.command.as_ref()
     }
 
@@ -601,13 +601,13 @@ impl JournalBatch {
 
     /// Exact scientific boundary, or `None` for command-only work.
     #[must_use]
-    pub fn scientific(&self) -> Option<&Arc<ScientificBoundary>> {
+    pub const fn scientific(&self) -> Option<&Arc<ScientificBoundary>> {
         self.scientific.as_ref()
     }
 
     /// Exact immutable scientific persistence payload, when this boundary produced one.
     #[must_use]
-    pub fn persistence(&self) -> Option<&Arc<PersistenceBatch>> {
+    pub const fn persistence(&self) -> Option<&Arc<PersistenceBatch>> {
         self.persistence.as_ref()
     }
 }
@@ -693,7 +693,7 @@ pub struct JournalReceipt {
 impl JournalReceipt {
     /// Construct an acknowledgement for a stable batch identity.
     #[must_use]
-    pub fn new(batch_id: JournalBatchId, state: JournalReceiptState) -> Self {
+    pub const fn new(batch_id: JournalBatchId, state: JournalReceiptState) -> Self {
         Self { batch_id, state }
     }
 
@@ -705,7 +705,7 @@ impl JournalReceipt {
 
     /// Commit, durability, or terminal-failure knowledge carried by this receipt.
     #[must_use]
-    pub fn state(&self) -> &JournalReceiptState {
+    pub const fn state(&self) -> &JournalReceiptState {
         &self.state
     }
 }
@@ -803,7 +803,7 @@ pub enum HostHealth {
 impl HostHealth {
     /// Recoverable blocker carried by this health value, if any.
     #[must_use]
-    pub fn blocker(&self) -> Option<HostBlocker> {
+    pub const fn blocker(&self) -> Option<HostBlocker> {
         match self {
             Self::Blocked(blocker) => Some(*blocker),
             Self::Healthy | Self::Faulted(_) => None,
@@ -812,7 +812,7 @@ impl HostHealth {
 
     /// Fault carried by this health value, if any.
     #[must_use]
-    pub fn fault(&self) -> Option<&HostFault> {
+    pub const fn fault(&self) -> Option<&HostFault> {
         match self {
             Self::Faulted(fault) => Some(fault),
             Self::Healthy | Self::Blocked(_) => None,

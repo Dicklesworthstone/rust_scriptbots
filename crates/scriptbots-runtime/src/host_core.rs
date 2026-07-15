@@ -246,10 +246,9 @@ impl HostPort for LocalHostPort {
         after: Option<SnapshotRevision>,
     ) -> Result<Option<Arc<HostSnapshot>>, HostAccessError> {
         let snapshot = Arc::clone(&self.shared.borrow().latest_snapshot);
-        Ok(
-            (after.is_none() || after.is_some_and(|revision| snapshot.revision > revision))
-                .then_some(snapshot),
-        )
+        Ok(after
+            .is_none_or(|revision| snapshot.revision > revision)
+            .then_some(snapshot))
     }
 
     fn events_after(
@@ -396,7 +395,7 @@ impl HostCore {
 
     /// Current queryable health.
     #[must_use]
-    pub fn health(&self) -> &HostHealth {
+    pub const fn health(&self) -> &HostHealth {
         &self.health
     }
 
@@ -580,7 +579,7 @@ impl HostCore {
     }
 
     fn update_command_journal(
-        &mut self,
+        &self,
         command_id: CommandId,
         journal: JournalState,
     ) -> Result<bool, HostAccessError> {
@@ -907,7 +906,7 @@ impl HostCore {
         self.complete_applied_with(envelope.command_id, admission, applied, true)?;
         let blocked = self.offer_journal(envelope, applied, Some(scientific), persistence)?;
         if let Some(fault) = completed_fault {
-            self.latch_completed_step_fault(tick, fault)?;
+            self.latch_completed_step_fault(tick, &fault)?;
         }
         Ok(ApplyResult::completed(blocked).with_science())
     }
@@ -952,7 +951,7 @@ impl HostCore {
         Ok(ApplyResult::completed(blocked))
     }
 
-    fn applied_boundary(&self) -> AppliedCommand {
+    const fn applied_boundary(&self) -> AppliedCommand {
         AppliedCommand {
             tick: self.world.tick(),
             revisions: self.revisions,
@@ -1121,7 +1120,7 @@ impl HostCore {
     fn latch_completed_step_fault(
         &mut self,
         tick: Tick,
-        fault: ScientificBoundaryFault,
+        fault: &ScientificBoundaryFault,
     ) -> Result<(), HostAccessError> {
         self.latched_fault = Some(HostFault::Scientific {
             tick,
@@ -1188,7 +1187,7 @@ impl HostCore {
         };
         let blocked = self.offer_automatic_journal(applied, scientific, persistence)?;
         if let Some(fault) = completed_fault {
-            self.latch_completed_step_fault(tick, fault)?;
+            self.latch_completed_step_fault(tick, &fault)?;
         }
         Ok(ApplyResult::science(
             blocked || self.latched_fault.is_some(),
