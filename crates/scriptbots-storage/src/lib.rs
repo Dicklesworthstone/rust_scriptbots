@@ -11523,14 +11523,19 @@ mod tests {
         let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
         let run_id = RunId::new(1);
         let (payload, payload_digest) = prepared.storage.encode_outbox(run_id, prepared.tick)?;
-        let stale_payload = r#"{"version":2,"tick":22,"storage":{"ticks":[],"metrics":[],"events":[],"agents":[],"births":[{"tick":22,"agent_uid":1,"spawn_ordinal":0,"birth_ordinal":0,"parent_a":null,"parent_b":null,"brain_kind":"legacy","brain_key":null,"herbivore_tendency":0.5,"generation":0,"position_x":1.0,"position_y":2.0,"is_hybrid":false}],"deaths":[],"replay_events":[]}}"#;
+        let stale_payload = r#"{"version":2,"run_id":"RUN_ID","tick":22,"storage":{"ticks":[],"metrics":[],"events":[],"agents":[],"births":[{"tick":22,"agent_uid":1,"spawn_ordinal":0,"birth_ordinal":0,"parent_a":null,"parent_b":null,"brain_kind":"legacy","brain_key":null,"herbivore_tendency":0.5,"generation":0,"position_x":1.0,"position_y":2.0,"is_hybrid":false}],"deaths":[],"replay_events":[]}}"#
+            .replacen("RUN_ID", &run_id.to_string(), 1);
         assert!(
             !stale_payload.contains("\"origin\""),
             "the V2 fixture accidentally included the V3-only origin field"
         );
+        assert!(
+            stale_payload.contains(&format!("\"run_id\":\"{run_id}\"")),
+            "the V2 fixture must carry the current envelope's canonical run identity"
+        );
         let stale_digest = format!("blake3:{}", blake3::hash(stale_payload.as_bytes()).to_hex());
         let version_error =
-            StorageBuffer::decode_outbox(stale_payload, run_id, prepared.tick, &stale_digest)
+            StorageBuffer::decode_outbox(&stale_payload, run_id, prepared.tick, &stale_digest)
                 .expect_err("a correctly hashed V2-shaped payload must still be refused");
         assert!(matches!(
             version_error,
@@ -11835,6 +11840,13 @@ mod tests {
                  WHERE type = 'table' AND name = 'metrics'",
             )?
             .get_typed(0)?;
+        let canonical_metrics_index_sql: String = interrupted
+            .connection()?
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'metrics_run_name_tick_index'",
+            )?
+            .get_typed(0)?;
         interrupted.connection()?.execute("DROP TABLE metrics")?;
         let failure = interrupted
             .flush()
@@ -11863,6 +11875,7 @@ mod tests {
 
         let repair = Connection::open(&path_string)?;
         repair.execute(&canonical_metrics_sql)?;
+        repair.execute(&canonical_metrics_index_sql)?;
         repair.close()?;
         let mut recovered = StoragePipeline::recover_existing(&path_string)?;
         let shutdown = recovered.shutdown()?;
