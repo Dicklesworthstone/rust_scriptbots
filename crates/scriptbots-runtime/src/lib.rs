@@ -827,8 +827,8 @@ fn normalize_projection_request(
     if request.viewport.width == 0 || request.viewport.height == 0 {
         return Err(ProjectionError::EmptyViewport);
     }
-    let canvas_cells = u64::from(request.viewport.width)
-        .saturating_mul(u64::from(request.viewport.height));
+    let canvas_cells =
+        u64::from(request.viewport.width).saturating_mul(u64::from(request.viewport.height));
     if canvas_cells > u64::from(limits.max_canvas_cells) {
         return Err(ProjectionError::CanvasTooLarge {
             requested: canvas_cells,
@@ -1033,14 +1033,10 @@ fn project_normalized_snapshot(
             nearest_wrapped_delta(agent.position[0], request.camera.center[0], world_width);
         let (delta_y, wrap_y) =
             nearest_wrapped_delta(agent.position[1], request.camera.center[1], world_height);
-        let canvas_x = f64::from(delta_x).mul_add(
-            f64::from(scale),
-            f64::from(viewport_width) * 0.5,
-        );
-        let canvas_y = f64::from(delta_y).mul_add(
-            f64::from(scale),
-            f64::from(viewport_height) * 0.5,
-        );
+        let canvas_x =
+            f64::from(delta_x).mul_add(f64::from(scale), f64::from(viewport_width) * 0.5);
+        let canvas_y =
+            f64::from(delta_y).mul_add(f64::from(scale), f64::from(viewport_height) * 0.5);
         let is_selected = selected.binary_search(&agent.uid).is_ok();
         let is_focused = request.selection.focused == Some(agent.uid);
         let projected = ProjectedAgent {
