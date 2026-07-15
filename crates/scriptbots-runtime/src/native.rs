@@ -512,9 +512,7 @@ mod asupersync_runner {
                 Err(
                     SendError::Disconnected(NativeMessage::Command(envelope))
                     | SendError::Cancelled(NativeMessage::Command(envelope)),
-                ) => {
-                    Err(NativeIngressError::Closed(envelope))
-                }
+                ) => Err(NativeIngressError::Closed(envelope)),
                 Err(SendError::Full(_) | SendError::Disconnected(_) | SendError::Cancelled(_)) => {
                     unreachable!("try_submit sent only a command message")
                 }
