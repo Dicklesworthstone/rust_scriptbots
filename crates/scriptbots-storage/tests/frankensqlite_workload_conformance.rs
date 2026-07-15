@@ -1,10 +1,14 @@
+//! Raw FrankenSQLite workload probe for the canonical ScriptBots schema.
+//!
+//! This test deliberately bypasses `StoragePipeline` to qualify the database engine itself. Its
+//! insert SQL remains private to this test target and is not a supported application write path.
+
 use fsqlite::{Connection, SqliteValue, compat::RowExt};
-use scriptbots_storage::{
-    SCRIPTBOTS_AGENT_COLUMN_COUNT, SCRIPTBOTS_SCHEMA_V6, scriptbots_agent_insert_sql,
-};
+use scriptbots_storage::SCRIPTBOTS_SCHEMA_V6;
 use std::{
     fs,
     path::PathBuf,
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,8 +16,9 @@ const FIRST_TICK: i64 = 41;
 const SECOND_TICK: i64 = 42;
 const ROLLED_BACK_TICK: i64 = 9_001;
 const RUN_ID: &str = "00000000000000000000000000000001";
+const CONFORMANCE_AGENT_COLUMN_COUNT: usize = 40;
 
-fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; SCRIPTBOTS_AGENT_COLUMN_COUNT] {
+fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; CONFORMANCE_AGENT_COLUMN_COUNT] {
     [
         RUN_ID.into(),
         tick.into(),
@@ -56,6 +61,17 @@ fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; SCRIPTBOTS_AGENT_COL
         1_i64.into(),
         0_i64.into(),
     ]
+}
+
+fn conformance_agent_insert_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| {
+        let placeholders = (1..=CONFORMANCE_AGENT_COLUMN_COUNT)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("INSERT OR REPLACE INTO agents VALUES ({placeholders})")
+    })
 }
 
 fn create_schema(connection: &Connection) {
@@ -146,7 +162,7 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
         .expect("replay insert should preserve nullable ids and JSON encoded as TEXT");
     connection
         .execute_with_params(
-            scriptbots_agent_insert_sql(),
+            conformance_agent_insert_sql(),
             &agent_values(tick, agent_uid),
         )
         .expect("canonical agent insert should bind every production column");

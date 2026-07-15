@@ -69,6 +69,9 @@ pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 6;
 /// and digests use text. Scientific counters retain the existing checked signed-integer boundary.
 /// This is deliberately a clean lineage: existing v3-v5 databases require an explicit
 /// export/import migration rather than an in-place rewrite.
+///
+/// This DDL is exported for read-only schema inspection and FrankenSQLite conformance probes. It
+/// is not a supported file-writer API; production scientific writes must use [`StoragePipeline`].
 pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
     CREATE TABLE runs (
         run_id TEXT PRIMARY KEY CHECK (run_id <> ''),
@@ -578,14 +581,15 @@ const AGENT_COLUMNS: &[&str] = &[
 ];
 
 /// Number of values bound by [`scriptbots_agent_insert_sql`].
-pub const SCRIPTBOTS_AGENT_COLUMN_COUNT: usize = AGENT_COLUMNS.len();
+const SCRIPTBOTS_AGENT_COLUMN_COUNT: usize = AGENT_COLUMNS.len();
 
 /// Canonical production insert statement for one full scientific agent snapshot.
 ///
-/// The statement is generated from the same ordered column list used by [`Storage`], so external
-/// conformance tests cannot silently drift to a different column order or placeholder count.
+/// This stays private so raw SQL cannot become a supported persistence surface outside the
+/// connection-owning worker. The same-thread implementation and its inline tests share the exact
+/// ordered column list without exporting a scientific-row bypass.
 #[must_use]
-pub fn scriptbots_agent_insert_sql() -> &'static str {
+fn scriptbots_agent_insert_sql() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
     SQL.get_or_init(|| {
         let columns = AGENT_COLUMNS.join(", ");
@@ -1950,7 +1954,7 @@ pub enum StorageWaitPhase {
 }
 
 /// Structured error crossing the storage worker boundary.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum StorageWorkerError {
     #[error(
         "storage {operation:?} failed at {path} (tick={tick:?}, attempt={attempt}, transient={transient}, commit_state={commit_state:?}): {source}"
@@ -1963,7 +1967,7 @@ pub enum StorageWorkerError {
         transient: bool,
         commit_state: FailureCommitState,
         #[source]
-        source: Box<FrankenError>,
+        source: Arc<FrankenError>,
     },
     #[error(
         "storage {operation:?} timed out during {phase:?} at {path} after {waited:?} (tick={tick:?}, commit_state={commit_state:?})"
@@ -2147,7 +2151,7 @@ fn worker_error_from_storage(
             attempt: 1,
             transient: source.is_transient(),
             commit_state: default_commit_state,
-            source: Box::new(source),
+            source: Arc::new(source),
         },
         StorageError::Transaction {
             attempts,
@@ -2161,7 +2165,7 @@ fn worker_error_from_storage(
             attempt: attempts,
             transient,
             commit_state,
-            source: Box::new(source),
+            source: Arc::new(source),
         },
         StorageError::WriterLeaseHeld {
             path: lease_path,
@@ -2184,86 +2188,13 @@ fn worker_error_from_storage(
     }
 }
 
-/// Rebuild an equivalent structured worker error so the terminal failure can be
-/// both replied to the requester and returned from the worker thread join.
+/// Duplicate a structured worker error so the terminal failure can be both
+/// replied to the requester and returned from the worker thread join.
 ///
-/// `FrankenError` is not `Clone`, so the `Database` variant carries the source's
-/// rendered message instead of the original source value; every other field is
-/// preserved verbatim.
+/// Database sources are immutable and shared through [`Arc`], preserving the
+/// exact `FrankenError` variant and payload across both observations.
 fn duplicate_worker_error(error: &StorageWorkerError) -> StorageWorkerError {
-    match error {
-        StorageWorkerError::Database {
-            operation,
-            path,
-            tick,
-            attempt,
-            transient,
-            commit_state,
-            source,
-        } => StorageWorkerError::Database {
-            operation: *operation,
-            path: path.clone(),
-            tick: *tick,
-            attempt: *attempt,
-            transient: *transient,
-            commit_state: *commit_state,
-            source: Box::new(FrankenError::Internal(source.to_string())),
-        },
-        StorageWorkerError::Timeout {
-            operation,
-            phase,
-            path,
-            tick,
-            waited,
-            commit_state,
-        } => StorageWorkerError::Timeout {
-            operation: *operation,
-            phase: *phase,
-            path: path.clone(),
-            tick: *tick,
-            waited: *waited,
-            commit_state: *commit_state,
-        },
-        StorageWorkerError::Channel {
-            operation,
-            path,
-            tick,
-            commit_state,
-            detail,
-        } => StorageWorkerError::Channel {
-            operation: *operation,
-            path: path.clone(),
-            tick: *tick,
-            commit_state: *commit_state,
-            detail: detail.clone(),
-        },
-        StorageWorkerError::Internal {
-            operation,
-            path,
-            tick,
-            commit_state,
-            detail,
-        } => StorageWorkerError::Internal {
-            operation: *operation,
-            path: path.clone(),
-            tick: *tick,
-            commit_state: *commit_state,
-            detail: detail.clone(),
-        },
-        StorageWorkerError::WriterLeaseHeld {
-            operation,
-            path,
-            lock_path,
-            tick,
-            commit_state,
-        } => StorageWorkerError::WriterLeaseHeld {
-            operation: *operation,
-            path: path.clone(),
-            lock_path: lock_path.clone(),
-            tick: *tick,
-            commit_state: *commit_state,
-        },
-    }
+    error.clone()
 }
 
 /// Summary row written to the `ticks` table.
@@ -11943,6 +11874,73 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn public_file_persist_preserves_one_identity_and_monotonic_watermarks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-direct-persist-outbox");
+        let path_string = path.to_string_lossy().to_string();
+        let batch = sample_batch(52, 5.2);
+        let mut storage = create_file_storage(&path_string)?;
+
+        storage.persist(&batch)?;
+        let admitted = storage.persistence_watermarks()?;
+        let Some(batch_id) = admitted.admitted else {
+            return Err("direct persist did not assign a stable batch identity".into());
+        };
+        assert_eq!(admitted.applied, None);
+        assert_eq!(admitted.durable, None);
+
+        storage.persist(&batch)?;
+        assert_eq!(storage.persistence_watermarks()?, admitted);
+        let ledger_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
+            .get_typed(0)?;
+        let outbox_count: i64 = storage
+            .connection()?
+            .query_row("SELECT COUNT(*) FROM storage_outbox")?
+            .get_typed(0)?;
+        assert_eq!(ledger_count, 1);
+        assert_eq!(outbox_count, 1);
+
+        storage.flush()?;
+        let applied = storage.persistence_watermarks()?;
+        assert_eq!(applied.admitted, Some(batch_id));
+        assert_eq!(applied.applied, Some(batch_id));
+        assert_eq!(applied.durable, None);
+        storage.close()?;
+
+        let mut reopened = recover_file_storage(&path_string)?;
+        let durable = reopened.persistence_watermarks()?;
+        assert_eq!(durable.admitted, Some(batch_id));
+        assert_eq!(durable.applied, Some(batch_id));
+        assert_eq!(durable.durable, Some(batch_id));
+
+        reopened.persist(&batch)?;
+        assert_eq!(reopened.persistence_watermarks()?, durable);
+        let conflicting = sample_batch(52, 99.0);
+        assert!(matches!(
+            reopened.persist(&conflicting),
+            Err(StorageError::InvalidData {
+                context: "storage_batch_ledger.payload_digest",
+                ..
+            })
+        ));
+        assert_eq!(reopened.persistence_watermarks()?, durable);
+        let tick_count: i64 = reopened
+            .connection()?
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM tick_summaries WHERE run_id = ?1 AND tick = 52",
+                &[sqlite_run_id(reopened.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(tick_count, 1);
+
+        reopened.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
     fn assert_invalid_data_context<T: std::fmt::Debug>(
         result: Result<T, StorageError>,
         expected: &'static str,
@@ -14270,6 +14268,13 @@ mod tests {
         let reply_status = reply_error.status();
         assert_eq!(reply_status.kind, StorageFailureKind::Database);
         assert_eq!(reply_status.operation, StorageOperation::Flush);
+        let StorageWorkerError::Database {
+            source: reply_source,
+            ..
+        } = &reply_error
+        else {
+            return Err("flush reply lost its typed database source".into());
+        };
 
         let shutdown_error = pipeline
             .shutdown()
@@ -14278,13 +14283,53 @@ mod tests {
             return Err("shutdown must surface a structured worker error".into());
         };
         let join_status = join_error.status();
-        assert_eq!(join_status.kind, StorageFailureKind::Database);
-        assert_eq!(join_status.operation, StorageOperation::Flush);
-        assert!(
-            join_status.detail.contains("metrics"),
-            "join error must preserve the flush root cause, got: {}",
-            join_status.detail
-        );
+        assert_eq!(join_status, reply_status);
+        let StorageWorkerError::Database {
+            source: join_source,
+            ..
+        } = &join_error
+        else {
+            return Err("worker join lost its typed database source".into());
+        };
+        assert!(Arc::ptr_eq(reply_source, join_source));
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_admission_failure_status_survives_worker_join()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-admission-terminal-join");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            &path_string,
+            64,
+            4096,
+            1024,
+            1024,
+        )?;
+        pipeline.submit(&sample_batch(12, 1.5))?;
+
+        let receipt_error = pipeline
+            .submit(&sample_batch(12, 9.5))
+            .expect_err("a changed payload for an admitted tick must be refused");
+        let StorageError::Worker(reply_error) = receipt_error else {
+            return Err("admission refusal must surface a structured worker error".into());
+        };
+        let reply_status = reply_error.status();
+        assert_eq!(reply_status.kind, StorageFailureKind::Internal);
+        assert_eq!(reply_status.operation, StorageOperation::Admit);
+        assert_eq!(reply_status.commit_state, FailureCommitState::NotAdmitted);
+        assert!(reply_status.detail.contains("different payload"));
+
+        let shutdown_error = pipeline
+            .shutdown()
+            .expect_err("shutdown must retain the terminal admission refusal");
+        let StorageError::Worker(join_error) = shutdown_error else {
+            return Err("shutdown must surface a structured worker error".into());
+        };
+        assert_eq!(join_error.status(), reply_status);
 
         let _ = fs::remove_file(path);
         Ok(())

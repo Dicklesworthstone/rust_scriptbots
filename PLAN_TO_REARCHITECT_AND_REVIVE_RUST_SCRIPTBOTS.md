@@ -907,7 +907,7 @@ Empty-versus-empty is reported as `NoEvidence`, never “matched.”
 
 ### 7.5 bounded storage worker
 
-**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact descriptor-bound recovery identity and structural-schema proof is completed under `bd-2z0.8.9.4.2`; remaining direct-write/root-cause unification (`bd-2z0.8.9.4.4`), queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open, Codex, 2026-07-12]
+**Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact descriptor-bound recovery identity and structural-schema proof is completed under `bd-2z0.8.9.4.2`; direct-write/root-cause unification is actively claimed under `bd-2z0.8.9.4.4` (TopazCastle, 2026-07-15); queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open]
 
 The current unbounded storage channel carrying cloned full batches can exhaust memory. The new worker uses:
 
