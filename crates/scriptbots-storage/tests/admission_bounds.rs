@@ -149,7 +149,8 @@ fn the_boundary_is_exact_at_the_cap_and_one_record_past_it() {
 }
 
 #[test]
-fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() {
+fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() -> Result<(), String>
+{
     // THE LEAK TEST. "Released exactly once on commit, refusal, timeout handoff,
     // crash, and shutdown" is a requirement that a chain of hand-written
     // decrements WILL eventually violate: one early return that forgets it, and
@@ -174,14 +175,14 @@ fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() {
     });
 
     for tick in 0..200u64 {
-        pipeline.submit(&batch(tick, 2)).unwrap_or_else(|error| {
-            panic!(
+        pipeline.submit(&batch(tick, 2)).map_err(|error| {
+            format!(
                 "submission {tick} was refused: {error}. The in-flight byte permit \
                  has LEAKED — every batch reserved bytes it never gave back, so the \
                  counter ratcheted up until the sink refused everything. In a long \
                  run this is persistence dying silently."
             )
-        });
+        })?;
     }
 
     // Interleave refusals: a refused batch must give its reservation back too,
@@ -195,4 +196,5 @@ fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() {
 
     pipeline.shutdown().expect("shutdown");
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }

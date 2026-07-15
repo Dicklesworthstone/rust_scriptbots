@@ -4871,9 +4871,11 @@ mod tests {
             if sample >= WARMUPS {
                 poll_samples.push(elapsed);
             }
-            let EventPoll::Contiguous(page) = page else {
-                panic!("tip cursor must remain contiguous");
-            };
+            let page = match page {
+                EventPoll::Contiguous(page) => Some(page),
+                EventPoll::Gap(_) => None,
+            }
+            .expect("tip cursor must remain contiguous");
             assert!(page.events.is_empty());
         }
 
@@ -4954,15 +4956,17 @@ mod tests {
                     scientific_boundary(sequence),
                 )
                 .expect("durable event publish");
-            let EventPoll::Contiguous(page) = hub
+            let page = match hub
                 .poll(
                     EventCursor::after(session_id, EventSequence::new(sequence - 1)),
                     1,
                 )
                 .expect("published event poll")
-            else {
-                panic!("new event must be hot");
-            };
+            {
+                EventPoll::Contiguous(page) => Some(page),
+                EventPoll::Gap(_) => None,
+            }
+            .expect("new event must be hot");
             let mut durable = page.events[0].clone();
             assert_eq!(durable.event.sequence, event_sequence);
             durable.commitment = EventCommitment::Durable;
@@ -4985,21 +4989,25 @@ mod tests {
             .is_err(),
             "reader coverage alone must not authorize a different batch identity"
         );
-        let EventPoll::Gap(gap) = hub
+        let gap = match hub
             .poll(EventCursor::beginning(session_id), usize::MAX)
             .expect("durable gap poll")
-        else {
-            panic!("wrapped durable hot ring must report a gap");
-        };
-        let EventCatchUpState::Available(locator) = gap.catch_up else {
-            panic!("durable gap must expose a reader locator");
-        };
+        {
+            EventPoll::Gap(gap) => Some(gap),
+            EventPoll::Contiguous(_) => None,
+        }
+        .expect("wrapped durable hot ring must report a gap");
+        let locator = match gap.catch_up {
+            EventCatchUpState::Available(locator) => Some(locator),
+            EventCatchUpState::Unavailable(_) => None,
+        }
+        .expect("durable gap must expose a reader locator");
         assert_eq!(locator.guarantee(), EventCatchUpGuarantee::CrashDurable);
-        let EventCatchUp::Contiguous(caught_up) =
-            hub.catch_up(locator, usize::MAX).expect("durable catch-up")
-        else {
-            panic!("durable locator must be readable");
-        };
+        let caught_up = match hub.catch_up(locator, usize::MAX).expect("durable catch-up") {
+            EventCatchUp::Contiguous(page) => Some(page),
+            EventCatchUp::Unavailable { .. } => None,
+        }
+        .expect("durable locator must be readable");
         assert_eq!(caught_up.source, EventPageSource::Durable);
         assert_eq!(caught_up.events.len(), 1);
         assert_eq!(caught_up.events[0].event.sequence, EventSequence::new(1));
@@ -5018,12 +5026,14 @@ mod tests {
             },
             guarantee: EventCatchUpGuarantee::CrashDurable,
         };
-        let EventCatchUp::Contiguous(restarted) = reopened_hub
+        let restarted = match reopened_hub
             .catch_up(restart_locator, usize::MAX)
             .expect("serialized durable restart catch-up")
-        else {
-            panic!("reopened durable reader must return a contiguous page");
-        };
+        {
+            EventCatchUp::Contiguous(page) => Some(page),
+            EventCatchUp::Unavailable { .. } => None,
+        }
+        .expect("reopened durable reader must return a contiguous page");
         assert_eq!(restarted.source, EventPageSource::Durable);
         assert_eq!(restarted.events.len(), 3);
         assert_eq!(restarted.latest, EventSequence::new(3));
@@ -5060,12 +5070,14 @@ mod tests {
                 .expect("unavailable event durable state");
         }
         let cursor = EventCursor::beginning(HostSessionId::new(46));
-        let EventPoll::Gap(unavailable_gap) = unavailable
+        let unavailable_gap = match unavailable
             .poll(cursor, usize::MAX)
             .expect("unavailable gap poll")
-        else {
-            panic!("wrapped no-reader hub must report gap");
-        };
+        {
+            EventPoll::Gap(gap) => Some(gap),
+            EventPoll::Contiguous(_) => None,
+        }
+        .expect("wrapped no-reader hub must report gap");
         assert_eq!(
             unavailable_gap.catch_up,
             EventCatchUpState::Unavailable(EventCatchUpUnavailableReason::NoReader)
@@ -5590,10 +5602,10 @@ mod tests {
             .expect("the conformance host should accept this request")
     }
 
-    fn applied(status: &CommandStatus) -> AppliedCommand {
+    fn applied(status: &CommandStatus) -> Result<AppliedCommand, String> {
         match status.application() {
-            ApplicationState::Applied(applied) => *applied,
-            state => panic!("expected applied status, got {state:?}"),
+            ApplicationState::Applied(applied) => Ok(*applied),
+            state => Err(format!("expected applied status, got {state:?}")),
         }
     }
 
@@ -5997,7 +6009,7 @@ mod tests {
             .command_status(pause.command_id())
             .expect("pause lookup")
             .expect("pause status");
-        let pause = applied(&pause);
+        let pause = applied(&pause).expect("pause command must reach the applied state");
         let after_pause = client
             .poll_snapshot(&mut snapshots)
             .expect("pause snapshot poll")
@@ -6015,7 +6027,8 @@ mod tests {
                 .command_status(config.command_id())
                 .expect("config lookup")
                 .expect("config status"),
-        );
+        )
+        .expect("config command must reach the applied state");
         let after_config = client
             .poll_snapshot(&mut snapshots)
             .expect("config snapshot poll")
@@ -6030,7 +6043,8 @@ mod tests {
                 .command_status(step.command_id())
                 .expect("step lookup")
                 .expect("step status"),
-        );
+        )
+        .expect("step command must reach the applied state");
         let after_step = client
             .poll_snapshot(&mut snapshots)
             .expect("step snapshot poll")

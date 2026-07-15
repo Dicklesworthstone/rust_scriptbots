@@ -1033,9 +1033,12 @@ mod tests {
             || Ok(()),
             || Err(io::Error::other("injected terminal setup failure")),
         );
-        let error = match result {
-            Ok(_) => panic!("terminal setup failure unexpectedly succeeded"),
-            Err(error) => error,
+        assert!(
+            result.is_err(),
+            "terminal setup failure unexpectedly succeeded"
+        );
+        let Some(error) = result.err() else {
+            return;
         };
 
         assert_eq!(

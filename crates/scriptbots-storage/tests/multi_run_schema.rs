@@ -167,15 +167,14 @@ fn mutate_manifest(record: &mut RunManifestRecord, mutate: impl FnOnce(&mut serd
 }
 
 fn manifest_validation_error(record: RunManifestRecord) -> String {
-    match StoragePipeline::memory_for_run(record) {
-        Err(error) => error.to_string(),
-        Ok(mut unexpected) => {
+    StoragePipeline::memory_for_run(record)
+        .map(|mut unexpected| {
             unexpected
                 .shutdown()
                 .expect("unexpected accepted fixture still shuts down");
-            panic!("storage unexpectedly accepted an invalid V2 manifest");
-        }
-    }
+        })
+        .expect_err("storage unexpectedly accepted an invalid V2 manifest")
+        .to_string()
 }
 
 fn overlapping_batch(epoch: u64, energy: f32) -> PersistenceBatch {
@@ -265,8 +264,11 @@ fn two_runs_with_overlapping_scientific_and_operational_keys_remain_isolated()
     assert_eq!(shutdown_a.watermarks.durable, Some(admission_a.batch_id));
     assert_eq!(shutdown_b.watermarks.durable, Some(admission_b.batch_id));
 
-    let Err(ambiguous) = StorageReader::open(&path) else {
-        panic!("an unscoped reader must refuse a database containing two runs");
+    let ambiguous = match StorageReader::open(&path) {
+        Err(error) => error,
+        Ok(_unexpected) => {
+            return Err("an unscoped reader must refuse a database containing two runs".into());
+        }
     };
     assert!(
         ambiguous
@@ -278,7 +280,7 @@ fn two_runs_with_overlapping_scientific_and_operational_keys_remain_isolated()
         Err(error) => error,
         Ok(mut unexpected) => {
             unexpected.shutdown()?;
-            panic!("unscoped recovery must refuse a multi-run database");
+            return Err("unscoped recovery must refuse a multi-run database".into());
         }
     };
     assert!(
@@ -466,8 +468,9 @@ fn registration_and_recovery_reject_unverifiable_manifest_provenance()
             Err(error) => error,
             Ok(mut unexpected) => {
                 unexpected.shutdown()?;
-                panic!(
+                return Err(
                     "registration must reject a scalar projection that contradicts manifest JSON"
+                        .into(),
                 );
             }
         };
@@ -493,7 +496,7 @@ fn registration_and_recovery_reject_unverifiable_manifest_provenance()
         Err(error) => error,
         Ok(mut unexpected) => {
             unexpected.shutdown()?;
-            panic!("recovery must recompute every stored manifest digest");
+            return Err("recovery must recompute every stored manifest digest".into());
         }
     };
     assert!(
@@ -704,7 +707,7 @@ fn append_refuses_to_strand_an_earlier_runs_pending_outbox()
         Err(error) => error,
         Ok(mut unexpected) => {
             unexpected.shutdown()?;
-            panic!("append must not strand a prior run's admitted payload");
+            return Err("append must not strand a prior run's admitted payload".into());
         }
     };
     assert!(
@@ -751,7 +754,7 @@ fn legacy_v5_database_is_refused_before_its_primary_file_is_mutated()
         Err(error) => error,
         Ok(mut unexpected) => {
             unexpected.shutdown()?;
-            panic!("a legacy v5 database must not be upgraded implicitly");
+            return Err("a legacy v5 database must not be upgraded implicitly".into());
         }
     };
     assert!(

@@ -10213,8 +10213,12 @@ mod map_sandbox {
 
             let error = TerrainLayer::from_tiles(u32::MAX, u32::MAX, 1, Vec::new())
                 .expect_err("oversized terrain layout must reject before length comparison");
+            assert!(
+                matches!(&error, super::super::WorldStateError::InvalidState(_)),
+                "expected terrain layout state error"
+            );
             let super::super::WorldStateError::InvalidState(error) = error else {
-                panic!("expected terrain layout state error");
+                return;
             };
             assert_eq!(error.path(), "terrain.tiles");
             assert!(matches!(
@@ -10255,8 +10259,12 @@ mod map_sandbox {
                 tiles[1].moisture = value;
                 let error = TerrainLayer::from_tiles(2, 1, 16, tiles)
                     .expect_err("non-finite terrain tile must fail");
+                assert!(
+                    matches!(&error, super::super::WorldStateError::InvalidState(_)),
+                    "expected terrain state error"
+                );
                 let super::super::WorldStateError::InvalidState(error) = error else {
-                    panic!("expected terrain state error");
+                    return;
                 };
                 assert_eq!(error.path(), "terrain.tiles[1].moisture");
 
@@ -10414,8 +10422,12 @@ mod map_sandbox {
                 let error = world
                     .apply_map_artifact(&imported)
                     .expect_err("invalid imported map must fail");
+                assert!(
+                    matches!(&error, super::super::WorldStateError::InvalidState(_)),
+                    "expected imported-map state error"
+                );
                 let super::super::WorldStateError::InvalidState(error) = error else {
-                    panic!("expected imported-map state error");
+                    return;
                 };
                 assert_eq!(error.path(), "map.fertility.values[17]");
                 assert_eq!(
@@ -10458,8 +10470,12 @@ mod map_sandbox {
             let error = generator
                 .generate(u32::MAX, u32::MAX, 1, 7)
                 .expect_err("oversized map must reject before WFC allocation");
+            assert!(
+                matches!(&error, MapGenerationError::InvalidState(_)),
+                "expected typed map layout error"
+            );
             let MapGenerationError::InvalidState(error) = error else {
-                panic!("expected typed map layout error");
+                return;
             };
             assert_eq!(error.path(), "map.tiles");
             assert!(matches!(
@@ -19709,8 +19725,12 @@ mod tests {
                 let error = config
                     .validate()
                     .expect_err("every non-finite public config float must be rejected");
+                assert!(
+                    matches!(&error, WorldStateError::InvalidConfig(_)),
+                    "non-finite config unexpectedly produced state error: {error}"
+                );
                 let WorldStateError::InvalidConfig(message) = error else {
-                    panic!("non-finite config unexpectedly produced state error: {error}");
+                    return;
                 };
                 assert!(
                     message.starts_with(field),
@@ -23121,8 +23141,12 @@ mod tests {
         let rejection = session
             .admit_pending(&mut world)
             .expect_err("injected admission rejection");
+        assert!(
+            matches!(&rejection, PersistenceSessionError::Admission(_)),
+            "expected typed sink rejection"
+        );
         let PersistenceSessionError::Admission(rejection) = rejection else {
-            panic!("expected typed sink rejection");
+            return;
         };
         assert_eq!(rejection.state(), PersistenceAdmissionState::NotAdmitted);
         assert_eq!(
@@ -23314,8 +23338,12 @@ mod tests {
         let rejection = session
             .admit_pending(&mut world)
             .expect_err("injected downstream rejection");
+        assert!(
+            matches!(&rejection, PersistenceSessionError::Admission(_)),
+            "expected typed sink rejection"
+        );
         let PersistenceSessionError::Admission(rejection) = rejection else {
-            panic!("expected typed sink rejection");
+            return;
         };
         assert_eq!(rejection.state(), PersistenceAdmissionState::NotAdmitted);
         assert_eq!(logs.lock().unwrap().len(), 1);
@@ -24823,8 +24851,12 @@ mod tests {
             Some(Tick(1))
         );
         assert_latest_ledger_reconciles(&world);
+        assert!(
+            matches!(fault.as_ref(), Some(CompletedStepFault::BrainSpawn(_))),
+            "expected a completed brain-spawn fault"
+        );
         let Some(CompletedStepFault::BrainSpawn(brain)) = fault.as_ref() else {
-            panic!("expected a completed brain-spawn fault");
+            return;
         };
         assert_eq!(brain.kind(), "test.outcome-fault");
         assert_eq!(
@@ -24883,12 +24915,16 @@ mod tests {
                 },
             )
             .expect_err("legacy adapter must retain both completed faults");
+        assert!(
+            matches!(&error, WorldStepError::ScientificStateAndPersistence { .. }),
+            "expected combined scientific-state and persistence fault"
+        );
         let WorldStepError::ScientificStateAndPersistence {
             scientific_state: returned_scientific_state,
             persistence: returned_persistence,
         } = error
         else {
-            panic!("expected combined scientific-state and persistence fault");
+            return;
         };
         assert_eq!(returned_scientific_state, scientific_state);
         assert_eq!(returned_persistence.tick(), 1);
@@ -29467,15 +29503,24 @@ mod tests {
         let profiled_error = profiled_session
             .step_profiled(&mut profiled, &mut profiler)
             .expect_err("profiled persistence rejection");
-        match (&control_error, &profiled_error) {
-            (
-                WorldStepError::Persistence(control_persistence),
-                WorldStepError::Persistence(profiled_persistence),
-            ) => assert_eq!(control_persistence, profiled_persistence),
-            _ => panic!(
-                "expected matching typed persistence errors, got {control_error:?} and {profiled_error:?}"
+        assert!(
+            matches!(
+                (&control_error, &profiled_error),
+                (
+                    WorldStepError::Persistence(_),
+                    WorldStepError::Persistence(_)
+                )
             ),
-        }
+            "expected matching typed persistence errors, got {control_error:?} and {profiled_error:?}"
+        );
+        let (
+            WorldStepError::Persistence(control_persistence),
+            WorldStepError::Persistence(profiled_persistence),
+        ) = (&control_error, &profiled_error)
+        else {
+            return;
+        };
+        assert_eq!(control_persistence, profiled_persistence);
         assert_eq!(control.tick(), Tick(1));
         assert_eq!(profiled.tick(), Tick(1));
         assert!(matches!(
