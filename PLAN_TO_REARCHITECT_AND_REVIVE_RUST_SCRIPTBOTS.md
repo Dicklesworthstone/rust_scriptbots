@@ -467,7 +467,7 @@ Shared pure projection functions or a keyed projection broker perform work that 
 
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 
-### 5.7 Asupersync adoption boundary [Currently In Progress — bd-2z0.4.12, TopazCastle, 2026-07-15]
+### 5.7 Asupersync adoption boundary [Completed — bd-2z0.4.12, TopazCastle, 2026-07-15; DSR run-1784141755-1923 green]
 
 Asupersync is a strong fit for:
 

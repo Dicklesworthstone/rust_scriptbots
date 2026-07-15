@@ -116,16 +116,16 @@ and review log). Status at last reconcile:
   reconciliation → `ci/check_fsqlite_pin.sh`), bd-2z0.8.16 (wasm graph
   denylist + golden), bd-2z0.11.5 (analytics scaffold), bd-2z0.13.6 (rider
   release packaging), bd-2z0.3.12.1 (frankentorch dependency admission),
-  bd-2z0.8.18 (performance gates; DSR-only acceptance).
+  bd-2z0.8.18 (performance gates; DSR-only acceptance), bd-2z0.4.12
+  (legacy app Crossfire removed; bounded Asupersync command bus DSR-verified).
 - **OPEN, ready**: bd-2z0.3.12.2 (BatchBrain — sequenced after the
-  bd-16g.15.x sense-lane digest move).
-- **IN PROGRESS**: bd-2z0.4.12 (final Crossfire removal from the legacy app
-  command callback; production runtime ingress/snapshot/shutdown already landed).
-- **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.12/.13
-  (async-api / MVCC decision), bd-2z0.4.13/.14 + bd-2z0.8.9.15 +
-  bd-2z0.12.4 (asupersync spine chain), bd-2z0.11.6/.7/.8/.9 (analytics
-  implementations), bd-2z0.3.12.3–.6 (FtBrain chain), bd-2z0.5.9
-  (interaction persistence, rides bd-2z0.5.2).
+  bd-16g.15.x sense-lane digest move), bd-2z0.8.9.12 (fsqlite async-api),
+  bd-2z0.4.14 (`Cx::scoped_cpu` spike), and bd-2z0.12.4 (BrowserRuntime
+  evaluation).
+- **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.13
+  (MVCC decision), bd-2z0.4.13 + bd-2z0.8.9.15 (structured-shutdown chain),
+  bd-2z0.11.6/.7/.8/.9 (analytics implementations), bd-2z0.3.12.3–.6
+  (FtBrain chain), bd-2z0.5.9 (interaction persistence, rides bd-2z0.5.2).
 
 The pinned local DSR verification profile is the only acceptance lane. It runs
 `check_franken_licenses.sh`, `check_asupersync_universe.sh`,
