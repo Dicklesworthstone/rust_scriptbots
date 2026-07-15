@@ -4668,6 +4668,59 @@ pub struct PersistenceBatch {
     pub replay_events: Vec<ReplayEvent>,
 }
 
+/// Result of evaluating persistence policy at a completed simulation boundary.
+///
+/// Preparing a ready batch consumes the exact accumulated rows and counters that
+/// the batch owns. Admission is deliberately a separate operation so a rejected
+/// sink cannot cause those values to be projected a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceProjectionStatus {
+    /// Persistence is disabled and the completed boundary was deliberately discarded.
+    Disabled,
+    /// The configured cadence retained this boundary for a later aggregate batch.
+    Deferred,
+    /// An owned, exact batch is ready for downstream admission.
+    Ready,
+}
+
+#[derive(Debug)]
+#[must_use = "a ready persistence projection owns drained scientific records"]
+struct PersistenceProjection {
+    status: PersistenceProjectionStatus,
+    batch: Option<PersistenceBatch>,
+}
+
+impl PersistenceProjection {
+    const fn disabled() -> Self {
+        Self {
+            status: PersistenceProjectionStatus::Disabled,
+            batch: None,
+        }
+    }
+
+    const fn deferred() -> Self {
+        Self {
+            status: PersistenceProjectionStatus::Deferred,
+            batch: None,
+        }
+    }
+
+    const fn ready(batch: PersistenceBatch) -> Self {
+        Self {
+            status: PersistenceProjectionStatus::Ready,
+            batch: Some(batch),
+        }
+    }
+
+    fn into_ready(self) -> Option<PersistenceBatch> {
+        debug_assert_eq!(
+            self.status == PersistenceProjectionStatus::Ready,
+            self.batch.is_some()
+        );
+        self.batch
+    }
+}
+
 /// Persistence sink invoked after each tick.
 pub trait WorldPersistence: Send {
     /// Admit a completed tick without silently discarding an unacknowledged batch.
@@ -14682,11 +14735,11 @@ impl WorldState {
             value.clamp(min, max)
         }
     }
-    fn stage_persistence(
+    fn prepare_persistence(
         &mut self,
         next_tick: Tick,
         force_partial_batch: bool,
-    ) -> Result<(), PersistenceAdmissionError> {
+    ) -> PersistenceProjection {
         if self.config.persistence_interval == 0 {
             // A completed boundary is itself part of the scientific timeline, even when that
             // particular tick produced no lifecycle or replay rows. Remember the first disabled
@@ -14705,7 +14758,7 @@ impl WorldState {
             self.pending_spike_attempt_events = 0;
             self.pending_spike_hit_events = 0;
             self.pending_persistence_runtime_tail.clear();
-            return Ok(());
+            return PersistenceProjection::disabled();
         }
 
         let analytics = self.config.analytics_stride;
@@ -14718,7 +14771,7 @@ impl WorldState {
                 self.pending_lifecycle_birth_metrics.clear();
                 self.pending_lifecycle_death_metrics.clear();
             }
-            return Ok(());
+            return PersistenceProjection::deferred();
         }
 
         let macro_enabled = analytics.macro_metrics != 0
@@ -15263,9 +15316,22 @@ impl WorldState {
             replay_events: std::mem::take(&mut self.replay_events),
         };
         self.pending_persistence_runtime_tail.clear();
-        let persistence_result = match self.persistence.on_tick(&batch) {
+        self.pending_birth_events = 0;
+        self.pending_death_events = 0;
+        self.pending_spike_attempt_events = 0;
+        self.pending_spike_hit_events = 0;
+        self.carcass_health_distributed = 0.0;
+        self.carcass_reproduction_bonus = 0.0;
+        PersistenceProjection::ready(batch)
+    }
+
+    fn admit_prepared_persistence(
+        &mut self,
+        batch: PersistenceBatch,
+    ) -> Result<(), PersistenceAdmissionError> {
+        match self.persistence.on_tick(&batch) {
             Ok(()) => {
-                self.last_admitted_persistence_tick = Some(next_tick);
+                self.last_admitted_persistence_tick = Some(batch.summary.tick);
                 Ok(())
             }
             Err(error) => {
@@ -15273,14 +15339,22 @@ impl WorldState {
                 self.pending_persistence_batch = Some(batch);
                 Err(error)
             }
-        };
-        self.pending_birth_events = 0;
-        self.pending_death_events = 0;
-        self.pending_spike_attempt_events = 0;
-        self.pending_spike_hit_events = 0;
-        self.carcass_health_distributed = 0.0;
-        self.carcass_reproduction_bonus = 0.0;
-        persistence_result
+        }
+    }
+
+    fn stage_persistence(
+        &mut self,
+        next_tick: Tick,
+        force_partial_batch: bool,
+    ) -> Result<(), PersistenceAdmissionError> {
+        if let Some(batch) = self
+            .prepare_persistence(next_tick, force_partial_batch)
+            .into_ready()
+        {
+            self.admit_prepared_persistence(batch)
+        } else {
+            Ok(())
+        }
     }
 
     /// Execute one simulation tick pipeline returning emitted events.
@@ -22222,6 +22296,152 @@ mod tests {
     }
 
     #[test]
+    fn prepared_persistence_is_inert_until_the_exact_batch_is_admitted() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let persistence = RejectOncePersistence {
+            logs: Arc::clone(&logs),
+            reject_next: true,
+        };
+        let mut world = WorldState::with_persistence(
+            ScriptBotsConfig {
+                persistence_interval: 1,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                closed: true,
+                rng_seed: Some(0xA11D_5EED),
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(persistence),
+        )
+        .expect("world");
+        let live_agent = world
+            .try_spawn_agent(sample_agent(7))
+            .expect("seed live projection agent");
+        let live_uid = world.agent_uid(live_agent).expect("live uid");
+        world.pending_birth_records.clear();
+        world.pending_lifecycle_birth_metrics.clear();
+        let birth = lifecycle_birth(1);
+        let death = lifecycle_death(1);
+        world.pending_birth_records.push(birth.clone());
+        world.pending_death_records.push(death.clone());
+        world.pending_lifecycle_birth_metrics.push(birth);
+        world.pending_lifecycle_death_metrics.push(death);
+        world.last_births = 1;
+        world.last_deaths = 1;
+        world.combat_spike_attempts = 2;
+        world.combat_spike_hits = 1;
+        world.carcass_health_distributed = 3.5;
+        world.carcass_reproduction_bonus = 1.25;
+        world.replay_events.push(replay_marker(0.25));
+        let runtime_tail = PersistenceRuntimeTail::capture(
+            live_uid,
+            world.runtime.get(live_agent).expect("live runtime"),
+        );
+        world
+            .pending_persistence_runtime_tail
+            .insert(live_agent, runtime_tail);
+        world.epoch = 4;
+        world.stage_accumulate_tick_events();
+        world.stage_record_history(Tick(1));
+
+        let projection = world.prepare_persistence(Tick(1), false);
+        assert!(logs.lock().unwrap().is_empty());
+        assert_eq!(projection.status, PersistenceProjectionStatus::Ready);
+        let Some(batch) = projection.into_ready() else {
+            panic!("cadence boundary must prepare an owned batch");
+        };
+        assert_eq!(batch.summary.tick, Tick(1));
+        assert_eq!(batch.summary.births, 1);
+        assert_eq!(batch.summary.deaths, 1);
+        assert_eq!(batch.epoch, 4);
+        assert!(batch.closed);
+        assert_eq!(batch.agents.len(), 1);
+        assert_eq!(batch.births.len(), 1);
+        assert_eq!(batch.deaths.len(), 1);
+        assert_eq!(batch.replay_events.len(), 1);
+        assert!(
+            batch
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "carcass_health_distributed")
+        );
+        assert!(
+            batch
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "carcass_reproduction_bonus")
+        );
+        assert!(world.pending_birth_records.is_empty());
+        assert!(world.pending_death_records.is_empty());
+        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert!(world.pending_lifecycle_death_metrics.is_empty());
+        assert!(world.replay_events.is_empty());
+        assert!(world.pending_persistence_runtime_tail.is_empty());
+        assert_eq!(world.pending_birth_events, 0);
+        assert_eq!(world.pending_death_events, 0);
+        assert_eq!(world.pending_spike_attempt_events, 0);
+        assert_eq!(world.pending_spike_hit_events, 0);
+        assert_eq!(world.carcass_health_distributed, 0.0);
+        assert_eq!(world.carcass_reproduction_bonus, 0.0);
+
+        let expected = batch.clone();
+        let digest_before_admission = world.world_digest_v1().expect("prepared world V1");
+        let rejection = world
+            .admit_prepared_persistence(batch)
+            .expect_err("injected admission rejection");
+        assert_eq!(rejection.state(), PersistenceAdmissionState::NotAdmitted);
+        assert!(matches!(
+            world.world_digest_v1(),
+            Err(CharacterizationError::NonContinuable {
+                blocker: WorldContinuationBlocker::PersistenceFault,
+            })
+        ));
+        assert_eq!(
+            world
+                .world_digest_v1_inner(false)
+                .expect("rejected scientific lanes"),
+            digest_before_admission
+        );
+        assert_eq!(logs.lock().unwrap().len(), 1);
+        let retained = world
+            .pending_persistence_batch
+            .as_ref()
+            .expect("the exact projected batch must be retained");
+        assert_eq!(retained.summary, expected.summary);
+        assert_eq!(retained.epoch, expected.epoch);
+        assert_eq!(retained.closed, expected.closed);
+        assert_eq!(retained.metrics, expected.metrics);
+        assert_eq!(retained.events, expected.events);
+        assert_eq!(retained.births, expected.births);
+        assert_eq!(retained.deaths, expected.deaths);
+        assert_eq!(retained.replay_events, expected.replay_events);
+        assert_eq!(
+            postcard::to_allocvec(&retained.agents).expect("encode retained agents"),
+            postcard::to_allocvec(&expected.agents).expect("encode projected agents")
+        );
+
+        assert!(
+            world
+                .retry_pending_persistence()
+                .expect("exact retained batch retry")
+        );
+        let attempts = logs.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].summary, attempts[1].summary);
+        assert_eq!(attempts[0].epoch, attempts[1].epoch);
+        assert_eq!(attempts[0].closed, attempts[1].closed);
+        assert_eq!(attempts[0].metrics, attempts[1].metrics);
+        assert_eq!(attempts[0].events, attempts[1].events);
+        assert_eq!(attempts[0].births, attempts[1].births);
+        assert_eq!(attempts[0].deaths, attempts[1].deaths);
+        assert_eq!(attempts[0].replay_events, attempts[1].replay_events);
+        assert_eq!(
+            postcard::to_allocvec(&attempts[0].agents).expect("encode first attempt agents"),
+            postcard::to_allocvec(&attempts[1].agents).expect("encode retry agents")
+        );
+    }
+
+    #[test]
     fn tick_zero_seed_finalizes_exactly_once() {
         let config = ScriptBotsConfig {
             persistence_interval: 3,
@@ -22956,9 +23176,10 @@ mod tests {
         origin_world
             .try_spawn_agent(sample_agent(1))
             .expect("seeded origin");
-        origin_world
-            .stage_persistence(Tick(7), false)
-            .expect("disabled persistence stage");
+        assert!(matches!(
+            origin_world.prepare_persistence(Tick(7), false),
+            projection if projection.status == PersistenceProjectionStatus::Disabled
+        ));
         assert_eq!(origin_world.persistence_discarded_records_at, Some(Tick(7)));
         assert!(origin_world.pending_birth_records.is_empty());
 
@@ -23497,9 +23718,10 @@ mod tests {
         world.stage_accumulate_tick_events();
         world.stage_record_history(Tick(1));
 
-        world
-            .stage_persistence(Tick(1), false)
-            .expect("non-boundary persistence stage");
+        assert!(matches!(
+            world.prepare_persistence(Tick(1), false),
+            projection if projection.status == PersistenceProjectionStatus::Deferred
+        ));
 
         assert_eq!(world.pending_birth_events, 2);
         assert_eq!(world.pending_death_events, 1);
