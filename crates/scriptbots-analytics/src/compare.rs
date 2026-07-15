@@ -41,7 +41,7 @@
 use crate::certify::benjamini_hochberg;
 use crate::stats::{ConfidenceInterval, StatsError, mean, quantile, std_dev};
 
-/// A deterministic SplitMix64, local to this module.
+/// A deterministic `SplitMix64`, local to this module.
 ///
 /// `stats` has its own `DeterministicRng` but keeps its draw private, so rather than couple to
 /// another module's internals this module carries its own identical stepper. Same algorithm, same
@@ -56,7 +56,7 @@ impl LocalRng {
         Self { state: seed }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -67,7 +67,8 @@ impl LocalRng {
     /// Uniform index in `0..len` via Lemire multiply-shift (no modulo bias). `len` must be > 0.
     fn index(&mut self, len: usize) -> usize {
         let m = u128::from(self.next_u64()) * (len as u128);
-        (m >> 64) as usize
+        usize::try_from(m >> 64)
+            .expect("multiply-shift quotient is strictly below its usize input bound")
     }
 
     /// A fair coin.
@@ -100,7 +101,7 @@ impl Default for CompareParams {
             n_permutations: 4000,
             confidence: 0.95,
             fdr: 0.05,
-            seed: 0xC0FFEE,
+            seed: 0x00C0_FFEE,
         }
     }
 }
@@ -333,12 +334,15 @@ mod tests {
         fn normal(&mut self, mean: f64, sd: f64) -> f64 {
             let u1 = self.unit();
             let u2 = self.unit();
-            mean + sd * (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+            sd.mul_add(
+                (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos(),
+                mean,
+            )
         }
     }
 
     /// A matched control/treatment pair of `n` seeds: control is N(base, sd), treatment is the
-    /// SAME control value plus a per-seed treatment effect N(effect, effect_sd).
+    /// SAME control value plus a per-seed treatment effect `N(effect, effect_sd)`.
     fn matched(
         n: usize,
         base: f64,
@@ -471,7 +475,7 @@ mod tests {
             .filter(|m| m.comparison.significant_fdr)
             .map(|m| m.metric.as_str())
             .collect();
-        println!("study discoveries after FDR: {:?}", real);
+        println!("study discoveries after FDR: {real:?}");
         assert!(
             real.contains(&"population"),
             "the real population effect was suppressed"

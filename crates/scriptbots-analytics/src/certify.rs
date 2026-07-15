@@ -330,7 +330,7 @@ mod tests {
             let u1 = self.unit();
             let u2 = self.unit();
             let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
-            mean + sd * z
+            sd.mul_add(z, mean)
         }
     }
 
