@@ -1,7 +1,7 @@
 //! Deterministic sole-owner simulation host.
 
 use super::{
-    AdmissionSequence, AppliedCommand, ApplicationFailure, ApplicationState, CommandEnvelope,
+    AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
     CommandId, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt, EventSequence,
     HostAccessError, HostBlocker, HostCommand, HostEvent, HostEventKind, HostFault, HostHealth,
     HostLifecycle, HostPort, HostRevisions, HostSessionId, HostSnapshot, JournalAdmission,
@@ -188,11 +188,9 @@ impl HostPort for LocalHostPort {
             return Ok(status);
         }
         if shared.admission_lifecycle != HostLifecycle::Running {
-            let status = CommandStatus::rejected(
-                envelope.command_id,
-                RejectionReason::HostStopping,
-            )
-            .map_err(status_violation)?;
+            let status =
+                CommandStatus::rejected(envelope.command_id, RejectionReason::HostStopping)
+                    .map_err(status_violation)?;
             shared.store_status(status.clone())?;
             return Ok(status);
         }
@@ -248,8 +246,10 @@ impl HostPort for LocalHostPort {
         after: Option<SnapshotRevision>,
     ) -> Result<Option<Arc<HostSnapshot>>, HostAccessError> {
         let snapshot = Arc::clone(&self.shared.borrow().latest_snapshot);
-        Ok((after.is_none() || after.is_some_and(|revision| snapshot.revision > revision))
-            .then_some(snapshot))
+        Ok(
+            (after.is_none() || after.is_some_and(|revision| snapshot.revision > revision))
+                .then_some(snapshot),
+        )
     }
 
     fn events_after(
@@ -417,9 +417,7 @@ impl HostCore {
     /// A successful retry seals the corresponding core persistence boundary,
     /// but its command's `JournalState` still advances only through a later
     /// receipt polled by [`ManualHostDriver::drive`].
-    pub fn retry_retained_journal(
-        &mut self,
-    ) -> Result<Option<JournalAdmission>, HostAccessError> {
+    pub fn retry_retained_journal(&mut self) -> Result<Option<JournalAdmission>, HostAccessError> {
         let Some(batch) = self.retained_journal.as_ref().map(Arc::clone) else {
             return Ok(None);
         };
@@ -450,14 +448,8 @@ impl HostCore {
                 self.retained_journal = None;
                 self.retained_blocker = None;
             }
-            JournalAdmission::Full {
-                batch_id,
-                capacity,
-            } => {
-                self.retained_blocker = Some(HostBlocker::JournalFull {
-                    batch_id,
-                    capacity,
-                });
+            JournalAdmission::Full { batch_id, capacity } => {
+                self.retained_blocker = Some(HostBlocker::JournalFull { batch_id, capacity });
             }
             JournalAdmission::Closed { batch_id } => {
                 self.retained_blocker = Some(HostBlocker::JournalClosed { batch_id });
@@ -507,7 +499,9 @@ impl HostCore {
         self.persistence
             .admit_pending(&mut self.world)
             .map(|_| ())
-            .map_err(|error| protocol_violation(format!("could not seal core persistence: {error}")))
+            .map_err(|error| {
+                protocol_violation(format!("could not seal core persistence: {error}"))
+            })
     }
 
     fn fail_closed_batch(&mut self, batch: &Arc<JournalBatch>) -> Result<(), HostAccessError> {
@@ -598,7 +592,10 @@ impl HostCore {
             .cloned()
             .ok_or_else(|| protocol_violation("journal receipt command status is missing"))?;
         if current.journal() == &journal
-            || matches!(current.journal(), JournalState::Durable | JournalState::Failed(_))
+            || matches!(
+                current.journal(),
+                JournalState::Durable | JournalState::Failed(_)
+            )
         {
             return Ok(false);
         }
@@ -639,9 +636,7 @@ impl HostCore {
             batch_id.session_id() == shutdown_id.session_id()
                 && batch_id.sequence() <= shutdown_id.sequence()
                 && match requirement {
-                    ShutdownCommitRequirement::CommittedVolatile => {
-                        !inflight.committed_volatile
-                    }
+                    ShutdownCommitRequirement::CommittedVolatile => !inflight.committed_volatile,
                     ShutdownCommitRequirement::Durable => true,
                 }
         });
@@ -807,15 +802,10 @@ impl HostCore {
                 self.complete_applied(retry_envelope.command_id, admission, false)?;
                 Ok(ApplyResult::completed(false))
             }
-            HostCommand::UpdateConfig(config) => self.apply_config_command(
-                admission,
-                retry_envelope,
-                config,
-                next_control,
-            ),
-            HostCommand::Step => {
-                self.apply_step_command(admission, retry_envelope, next_control)
+            HostCommand::UpdateConfig(config) => {
+                self.apply_config_command(admission, retry_envelope, config, next_control)
             }
+            HostCommand::Step => self.apply_step_command(admission, retry_envelope, next_control),
             HostCommand::Shutdown => {
                 self.apply_shutdown_command(admission, retry_envelope, next_control)
             }
@@ -1069,10 +1059,7 @@ impl HostCore {
             }
             JournalAdmission::Full { capacity, .. } => {
                 self.retained_journal = Some(batch);
-                self.retained_blocker = Some(HostBlocker::JournalFull {
-                    batch_id,
-                    capacity,
-                });
+                self.retained_blocker = Some(HostBlocker::JournalFull { batch_id, capacity });
                 self.synchronize_health()?;
                 Ok(true)
             }
@@ -1120,10 +1107,7 @@ impl HostCore {
             }
             JournalAdmission::Full { capacity, .. } => {
                 self.retained_journal = Some(batch);
-                self.retained_blocker = Some(HostBlocker::JournalFull {
-                    batch_id,
-                    capacity,
-                });
+                self.retained_blocker = Some(HostBlocker::JournalFull { batch_id, capacity });
                 self.synchronize_health()?;
                 Ok(true)
             }
@@ -1206,14 +1190,16 @@ impl HostCore {
         if let Some(fault) = completed_fault {
             self.latch_completed_step_fault(tick, fault)?;
         }
-        Ok(ApplyResult::science(blocked || self.latched_fault.is_some()))
+        Ok(ApplyResult::science(
+            blocked || self.latched_fault.is_some(),
+        ))
     }
 
     fn automatic_budget(&mut self, elapsed_nanos: u64, speed_multiplier: f32) -> usize {
         let speed_units = speed_units(speed_multiplier);
         let threshold = u128::from(self.options.tick_period_nanos) * SPEED_SCALE;
-        let maximum_credit = threshold
-            .saturating_mul(u128::from(self.options.max_automatic_steps_per_drive));
+        let maximum_credit =
+            threshold.saturating_mul(u128::from(self.options.max_automatic_steps_per_drive));
         self.cadence_credit = self
             .cadence_credit
             .saturating_add(u128::from(elapsed_nanos).saturating_mul(u128::from(speed_units)))
@@ -1441,7 +1427,8 @@ mod tests {
     }
 
     fn submit(port: &mut LocalHostPort, id: u128, command: HostCommand) -> CommandStatus {
-        port.submit(envelope(id, command)).expect("local submission")
+        port.submit(envelope(id, command))
+            .expect("local submission")
     }
 
     fn status(port: &mut LocalHostPort, id: u128) -> CommandStatus {
@@ -1571,8 +1558,7 @@ mod tests {
         core.drive(ManualInstant::from_nanos(0))
             .expect("establish epoch");
         port.submit(
-            envelope(1, HostCommand::Step)
-                .expecting_control_revision(ControlRevision::new(99)),
+            envelope(1, HostCommand::Step).expecting_control_revision(ControlRevision::new(99)),
         )
         .expect("guarded step admission");
 
@@ -1581,7 +1567,10 @@ mod tests {
             .expect("conflict plus cadence");
         assert_eq!(receipt.scientific_steps, 1);
         assert_eq!(core.world_tick(), Tick(1));
-        assert_eq!(core.latest_snapshot().revisions.control, ControlRevision::new(0));
+        assert_eq!(
+            core.latest_snapshot().revisions.control,
+            ControlRevision::new(0)
+        );
         assert!(matches!(
             status(&mut port, 1).application(),
             ApplicationState::Rejected(RejectionReason::ControlRevisionConflict { .. })
@@ -1643,17 +1632,20 @@ mod tests {
         let duplicate = submit(&mut port, 1, HostCommand::Step);
         assert_eq!(duplicate, original);
 
-        let winner = envelope(2, HostCommand::Resume)
-            .expecting_control_revision(ControlRevision::new(1));
-        let conflict = envelope(3, HostCommand::Step)
-            .expecting_control_revision(ControlRevision::new(1));
+        let winner =
+            envelope(2, HostCommand::Resume).expecting_control_revision(ControlRevision::new(1));
+        let conflict =
+            envelope(3, HostCommand::Step).expecting_control_revision(ControlRevision::new(1));
         port.submit(winner).expect("winner admission");
         port.submit(conflict).expect("conflict admission");
         core.drive(ManualInstant::from_nanos(0))
             .expect("ordered CAS boundary");
 
         assert_eq!(core.world_tick(), Tick(0));
-        assert_eq!(core.latest_snapshot().revisions.control, ControlRevision::new(2));
+        assert_eq!(
+            core.latest_snapshot().revisions.control,
+            ControlRevision::new(2)
+        );
         assert!(matches!(
             status(&mut port, 3).application(),
             ApplicationState::Rejected(RejectionReason::ControlRevisionConflict {
@@ -1792,7 +1784,10 @@ mod tests {
             .drive(ManualInstant::from_nanos(0))
             .expect("completed step with backpressure");
         assert_eq!(blocked.scientific_steps, 1);
-        assert!(matches!(blocked.blocker, Some(HostBlocker::JournalFull { .. })));
+        assert!(matches!(
+            blocked.blocker,
+            Some(HostBlocker::JournalFull { .. })
+        ));
         assert_eq!(core.world_tick(), Tick(1));
         assert_eq!(port.queue_depth(), 1);
         assert_eq!(status(&mut port, 1).journal(), &JournalState::Pending);
@@ -1869,8 +1864,14 @@ mod tests {
             receipt.blocker,
             Some(HostBlocker::JournalClosed { .. })
         ));
-        assert!(matches!(status(&mut port, 1).journal(), JournalState::Failed(_)));
-        assert!(matches!(core.health(), HostHealth::Faulted(HostFault::Journal { .. })));
+        assert!(matches!(
+            status(&mut port, 1).journal(),
+            JournalState::Failed(_)
+        ));
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Journal { .. })
+        ));
         assert!(core.pending_journal_batch().is_some());
     }
 
@@ -1988,17 +1989,22 @@ mod tests {
             .expect("failure, malformed receipt, and shutdown durability");
 
         assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
-        assert!(matches!(status(&mut port, 1).journal(), JournalState::Failed(_)));
+        assert!(matches!(
+            status(&mut port, 1).journal(),
+            JournalState::Failed(_)
+        ));
         assert_eq!(status(&mut port, 2).journal(), &JournalState::Durable);
-        assert!(matches!(core.health(), HostHealth::Faulted(HostFault::Protocol { .. })));
+        assert!(matches!(
+            core.health(),
+            HostHealth::Faulted(HostFault::Protocol { .. })
+        ));
     }
 
     #[test]
     fn stale_shutdown_cas_reopens_ingress_without_advancing_control() {
         let (mut core, mut port) = host(true);
         port.submit(
-            envelope(1, HostCommand::Shutdown)
-                .expecting_control_revision(ControlRevision::new(7)),
+            envelope(1, HostCommand::Shutdown).expecting_control_revision(ControlRevision::new(7)),
         )
         .expect("guarded shutdown admission");
         core.drive(ManualInstant::from_nanos(0))
@@ -2009,7 +2015,10 @@ mod tests {
             ApplicationState::Rejected(RejectionReason::ControlRevisionConflict { .. })
         ));
         assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Running);
-        assert_eq!(core.latest_snapshot().revisions.control, ControlRevision::new(0));
+        assert_eq!(
+            core.latest_snapshot().revisions.control,
+            ControlRevision::new(0)
+        );
         assert!(matches!(
             submit(&mut port, 2, HostCommand::Pause).application(),
             ApplicationState::Admitted
@@ -2046,9 +2055,11 @@ mod tests {
         let retained = core
             .pending_journal_batch()
             .expect("shutdown tail retained");
-        assert!(retained
-            .command()
-            .is_some_and(|command| matches!(&command.command, HostCommand::Shutdown)));
+        assert!(
+            retained
+                .command()
+                .is_some_and(|command| matches!(&command.command, HostCommand::Shutdown))
+        );
         assert_eq!(
             retained
                 .persistence()

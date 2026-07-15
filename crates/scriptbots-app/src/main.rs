@@ -5,8 +5,10 @@ use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     BootstrapEvidenceV0, CharacterizationTraceV0, ControlServerConfig, ControlServerReservation,
     RunManifestV1, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
-    WorldStepDriver, precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
-    renderer::{Renderer, RendererContext}, terminal::TerminalRenderer,
+    WorldStepDriver,
+    precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
+    renderer::{Renderer, RendererContext},
+    terminal::TerminalRenderer,
 };
 #[cfg(feature = "bevy_render")]
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
@@ -14,8 +16,8 @@ use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
     AgentData, BrainRunner, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
     PersistenceSessionError, RenderAutoExposureSettings, RenderSettings, RenderTonemapMode,
-    ReplayEventKind, ScriptBotsConfig, SmallRngStream, TickSummary, WorldDigestV1, WorldPersistence,
-    WorldState,
+    ReplayEventKind, ScriptBotsConfig, SmallRngStream, TickSummary, WorldDigestV1,
+    WorldPersistence, WorldState,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
@@ -950,11 +952,7 @@ fn prepare_run_manifest(
     })
 }
 
-fn emit_run_manifest(
-    world: &WorldState,
-    pending: Option<PendingRunManifest>,
-    completed: u64,
-) {
+fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, completed: u64) {
     let Some(pending) = pending else {
         return;
     };
@@ -3337,7 +3335,11 @@ mod tests {
 
         let manifest = build_run_manifest(&world, 37).expect("manifest");
 
-        assert_eq!(world.tick().0, 0, "manifest emission must not advance science");
+        assert_eq!(
+            world.tick().0,
+            0,
+            "manifest emission must not advance science"
+        );
         assert_eq!(manifest.scenario.bootstrap_ticks, 37);
         assert!(manifest.bootstrap_evidence.is_none());
         assert_eq!(manifest.schema, scriptbots_app::RUN_MANIFEST_V1_SCHEMA);

@@ -1978,7 +1978,10 @@ mod tests {
             .expect("empty drive should succeed");
         assert_eq!(empty_receipt.commands_completed, 0);
         assert_eq!(empty_receipt.scientific_steps, 0);
-        assert_eq!(empty_receipt.scientific_revision, ScientificRevision::new(1));
+        assert_eq!(
+            empty_receipt.scientific_revision,
+            ScientificRevision::new(1)
+        );
         assert_eq!(
             shared.lock().admission_order,
             vec![CommandId::new(1), CommandId::new(2), CommandId::new(3)]
