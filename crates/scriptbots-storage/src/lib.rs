@@ -7133,11 +7133,58 @@ mod tests {
         path
     }
 
+    fn normalized_scientific_schema(
+        connection: &Connection,
+    ) -> Result<Vec<(String, String, String, String)>, StorageError> {
+        const SCIENTIFIC_TABLES: &[&str] = &[
+            "agents",
+            "births",
+            "deaths",
+            "events",
+            "metrics",
+            "replay_events",
+            "ticks",
+        ];
+
+        read_schema_objects(connection).map(|objects| {
+            objects
+                .into_iter()
+                .filter(|object| {
+                    SCIENTIFIC_TABLES.contains(&object.table_name.as_str())
+                        && object.sql.is_some()
+                })
+                .map(|object| {
+                    let normalized_sql = object
+                        .sql
+                        .expect("filtered schema objects have SQL")
+                        .chars()
+                        .filter(|character| !character.is_ascii_whitespace() && *character != '"')
+                        .map(|character| character.to_ascii_lowercase())
+                        .collect();
+                    (
+                        object.object_type,
+                        object.name,
+                        object.table_name,
+                        normalized_sql,
+                    )
+                })
+                .collect()
+        })
+    }
+
     #[test]
     fn exported_schema_v1_executes_with_canonical_workload_table_names()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
         connection.execute_batch(SCRIPTBOTS_SCHEMA_V1)?;
+
+        let production_connection = Connection::open(":memory:")?;
+        install_scriptbots_schema(&production_connection)?;
+        assert_eq!(
+            normalized_scientific_schema(&connection)?,
+            normalized_scientific_schema(&production_connection)?,
+            "exported scientific DDL drifted from the production migration result"
+        );
 
         let table_names = connection
             .query(
@@ -7173,6 +7220,7 @@ mod tests {
             "canonical agent insert no longer binds all production columns in order"
         );
 
+        production_connection.close()?;
         connection.close()?;
         Ok(())
     }
