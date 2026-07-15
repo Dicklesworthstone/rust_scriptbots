@@ -509,8 +509,10 @@ mod asupersync_runner {
                 // Pinned Asupersync 0.3.6 `try_send` has no cancellation
                 // context, but the shared error enum still requires this
                 // exhaustive defensive arm.
-                Err(SendError::Disconnected(NativeMessage::Command(envelope)))
-                | Err(SendError::Cancelled(NativeMessage::Command(envelope))) => {
+                Err(
+                    SendError::Disconnected(NativeMessage::Command(envelope))
+                    | SendError::Cancelled(NativeMessage::Command(envelope)),
+                ) => {
                     Err(NativeIngressError::Closed(envelope))
                 }
                 Err(SendError::Full(_) | SendError::Disconnected(_) | SendError::Cancelled(_)) => {
