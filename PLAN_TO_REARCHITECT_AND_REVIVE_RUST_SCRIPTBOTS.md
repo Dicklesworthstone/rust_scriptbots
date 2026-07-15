@@ -2225,7 +2225,7 @@ guard at `0.3.6`, the 32-package franken license audit, the authoritative 62-cra
 and the standalone default-feature `scriptbots-runtime` `wasm32-unknown-unknown` check on exact
 source `5b1a5a8d6c8d7629c3822712e59361e3fa9014e0`.
 
-#### 2.6 canonical snapshot hub and projections [Currently In Progress — bd-2z0.4.7, TopazCastle, 2026-07-15]
+#### 2.6 canonical snapshot hub and projections [Complete — bd-2z0.4.7, DSR run `run-1784102138-21288`, 2026-07-15]
 
 - current summary;
 - revisioned static layers;
@@ -2236,6 +2236,16 @@ source `5b1a5a8d6c8d7629c3822712e59361e3fa9014e0`.
 - projection perf metrics.
 
 **Exit:** stalled readers remain bounded and snapshot publication does not alter world digest.
+
+**Completion evidence:** Exact-source DSR run `run-1784102138-21288` passed formatting,
+eight scoped UBS scans with zero critical findings, strict default and `native-asupersync`
+all-target Clippy, 498 default union tests plus 68 native-feature runtime tests, and the
+release-only 1k/10k full-publication measurement. Steady/changed-layer p95 was
+0.018/0.017 ms at 1k and 0.074/0.123 ms at 10k against the 4/16 ms budgets. The same run
+passed the Asupersync 0.3.6 single-universe guard, 32-package franken license audit,
+authoritative 62-crate WASM graph guard, and standalone default-feature
+`scriptbots-runtime` `wasm32-unknown-unknown` check on source
+`96e51093e3066f817d60fd45882a2fec6285665e`.
 
 #### 2.7 control/server migration
 
