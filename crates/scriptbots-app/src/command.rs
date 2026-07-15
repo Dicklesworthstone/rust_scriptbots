@@ -159,9 +159,7 @@ impl CommandSender {
     }
 
     #[cfg(test)]
-    fn try_reserve(
-        &self,
-    ) -> Result<mpsc::SendPermit<'_, ControlCommand>, mpsc::SendError<()>> {
+    fn try_reserve(&self) -> Result<mpsc::SendPermit<'_, ControlCommand>, mpsc::SendError<()>> {
         self.inner.try_reserve()
     }
 }
@@ -200,10 +198,7 @@ impl CommandReceiver {
     }
 
     fn drain_bounded(&self) -> Vec<ControlCommand> {
-        let mut receiver = self
-            .inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut receiver = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mut commands = Vec::new();
         for _ in 0..receiver.capacity() {
             match receiver.try_recv() {
@@ -215,12 +210,10 @@ impl CommandReceiver {
                 ) => break,
             }
         }
-        self.counters
-            .drained_commands
-            .fetch_add(
-                u64::try_from(commands.len()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+        self.counters.drained_commands.fetch_add(
+            u64::try_from(commands.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         commands
     }
 
@@ -336,10 +329,7 @@ mod validation_tests {
                 step_once: false,
             }
         )));
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(CommandRecvError::Empty)
-        ));
+        assert!(matches!(receiver.try_recv(), Err(CommandRecvError::Empty)));
         assert_eq!(telemetry.telemetry_snapshot().validation_rejections, 1);
     }
 
@@ -857,10 +847,7 @@ mod tests {
         assert_eq!(aborted.queued_commands, 0);
         assert_eq!(aborted.reserved_commands, 0);
         assert_eq!(aborted.cancellation_count, 1);
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(CommandRecvError::Empty)
-        ));
+        assert!(matches!(receiver.try_recv(), Err(CommandRecvError::Empty)));
         sender
             .try_send(ControlCommand::UpdateSimulation(
                 SimulationCommand::default(),
@@ -883,9 +870,7 @@ mod tests {
             .try_send(command)
             .expect_err("closed receiver must reject reserved commit");
         let recovered = match error {
-            mpsc::SendError::Disconnected(ControlCommand::UpdateSimulation(recovered)) => {
-                recovered
-            }
+            mpsc::SendError::Disconnected(ControlCommand::UpdateSimulation(recovered)) => recovered,
             other => panic!("expected exact disconnected playback command, got {other:?}"),
         };
         assert_eq!(
