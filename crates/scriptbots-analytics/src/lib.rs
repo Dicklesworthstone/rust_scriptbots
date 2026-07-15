@@ -333,11 +333,15 @@ impl Report for MetricSummary {
         for (name, values) in by_metric {
             // A metric with non-finite values is a real problem worth surfacing, but the stats
             // functions already reject it; map that to a report-level error rather than a panic.
-            let mean = stats::mean(&values).map_err(metric_stats_error)?;
-            let std_dev = stats::std_dev(&values).map_err(metric_stats_error)?;
-            let q05 = stats::quantile(&values, 0.05).map_err(metric_stats_error)?;
-            let median = stats::quantile(&values, 0.50).map_err(metric_stats_error)?;
-            let q95 = stats::quantile(&values, 0.95).map_err(metric_stats_error)?;
+            let mean = stats::mean(&values).map_err(|error| metric_stats_error(&error))?;
+            let std_dev =
+                stats::std_dev(&values).map_err(|error| metric_stats_error(&error))?;
+            let q05 =
+                stats::quantile(&values, 0.05).map_err(|error| metric_stats_error(&error))?;
+            let median =
+                stats::quantile(&values, 0.50).map_err(|error| metric_stats_error(&error))?;
+            let q95 =
+                stats::quantile(&values, 0.95).map_err(|error| metric_stats_error(&error))?;
             let min = values.iter().copied().fold(f64::INFINITY, f64::min);
             let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let coefficient_of_variation =
@@ -402,7 +406,7 @@ impl Report for MetricSummary {
 /// Map a statistics error to a report error. The stats module only errors on genuinely bad data
 /// (empty or non-finite), which for persisted metrics means the run wrote something impossible —
 /// a report-level failure, not a panic.
-fn metric_stats_error(error: crate::stats::StatsError) -> AnalyticsError {
+fn metric_stats_error(error: &crate::stats::StatsError) -> AnalyticsError {
     AnalyticsError::Storage(StorageError::InvalidData {
         context: "analytics.metric_summary",
         reason: error.to_string(),

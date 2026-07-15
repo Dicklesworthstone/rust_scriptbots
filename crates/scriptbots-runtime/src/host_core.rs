@@ -577,7 +577,7 @@ const fn hydrology_capacity_bytes(snapshot: &HydrologyLayerSnapshot) -> usize {
         )
 }
 
-fn add_hydrology_allocation_stats(
+const fn add_hydrology_allocation_stats(
     snapshot: &HydrologyLayerSnapshot,
     stats: &mut LayerRefreshStats,
 ) {
