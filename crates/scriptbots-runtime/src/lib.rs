@@ -89,9 +89,13 @@ impl Serialize for CommandId {
 impl<'de> Deserialize<'de> for CommandId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        if encoded.len() != 32 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if encoded.len() != 32
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
             return Err(serde::de::Error::custom(
-                "command id must be exactly 32 hexadecimal characters",
+                "command id must be exactly 32 lowercase hexadecimal characters",
             ));
         }
         u128::from_str_radix(&encoded, 16)
@@ -1430,6 +1434,9 @@ mod tests {
         );
         assert!(serde_json::from_str::<CommandId>("1").is_err());
         assert!(serde_json::from_str::<CommandId>("\"abc\"").is_err());
+        assert!(
+            serde_json::from_str::<CommandId>("\"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\"").is_err()
+        );
     }
 
     #[test]
