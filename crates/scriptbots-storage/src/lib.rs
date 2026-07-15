@@ -7136,31 +7136,48 @@ mod tests {
     fn normalized_scientific_schema(
         connection: &Connection,
     ) -> Result<Vec<(String, String, String, String)>, StorageError> {
-        const SCIENTIFIC_TABLES: &[&str] = &[
-            "agents",
-            "births",
-            "deaths",
-            "events",
-            "metrics",
-            "replay_events",
-            "ticks",
+        const INTERNAL_TABLES: &[&str] = &[
+            "_schema_migrations",
+            "storage_batch_ledger",
+            "storage_outbox",
+            "storage_progress",
         ];
+
+        fn normalize_schema_sql(sql: &str) -> String {
+            let mut normalized = String::with_capacity(sql.len());
+            let mut characters = sql.chars().peekable();
+            let mut in_string_literal = false;
+            while let Some(character) = characters.next() {
+                if in_string_literal {
+                    normalized.push(character);
+                    if character == '\'' {
+                        if characters.peek() == Some(&'\'') {
+                            normalized.push(characters.next().expect("peeked escaped quote"));
+                        } else {
+                            in_string_literal = false;
+                        }
+                    }
+                } else if character == '\'' {
+                    in_string_literal = true;
+                    normalized.push(character);
+                } else if !character.is_ascii_whitespace() && character != '"' {
+                    normalized.push(character.to_ascii_lowercase());
+                }
+            }
+            normalized
+        }
 
         read_schema_objects(connection).map(|objects| {
             objects
                 .into_iter()
                 .filter(|object| {
-                    SCIENTIFIC_TABLES.contains(&object.table_name.as_str())
+                    !INTERNAL_TABLES.contains(&object.table_name.as_str())
                         && object.sql.is_some()
                 })
                 .map(|object| {
-                    let normalized_sql = object
-                        .sql
-                        .expect("filtered schema objects have SQL")
-                        .chars()
-                        .filter(|character| !character.is_ascii_whitespace() && *character != '"')
-                        .map(|character| character.to_ascii_lowercase())
-                        .collect();
+                    let normalized_sql = normalize_schema_sql(
+                        &object.sql.expect("filtered schema objects have SQL"),
+                    );
                     (
                         object.object_type,
                         object.name,
