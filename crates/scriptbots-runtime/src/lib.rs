@@ -8,7 +8,9 @@
 
 #![warn(missing_docs, unsafe_code)]
 
-use scriptbots_core::{DynamicWorldSnapshot, ScriptBotsConfig, SelectionUpdate, Tick};
+use scriptbots_core::{
+    DynamicWorldSnapshot, PersistenceBatch, ScriptBotsConfig, SelectionUpdate, Tick,
+};
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
 use thiserror::Error;
@@ -106,6 +108,41 @@ monotonic_newtype!(
     /// Stable identity shared by one host's ingress port and manual driver.
     HostSessionId
 );
+
+/// Stable identity of one immutable host-journal batch.
+///
+/// The host-local sequence is paired with the host session so retries remain
+/// unambiguous even when several hosts share one journal adapter.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct JournalBatchId {
+    session_id: HostSessionId,
+    sequence: u64,
+}
+
+impl JournalBatchId {
+    /// Construct a host-scoped journal identity.
+    #[must_use]
+    pub const fn new(session_id: HostSessionId, sequence: u64) -> Self {
+        Self {
+            session_id,
+            sequence,
+        }
+    }
+
+    /// Host session that allocated this identity.
+    #[must_use]
+    pub const fn session_id(self) -> HostSessionId {
+        self.session_id
+    }
+
+    /// Monotonic journal sequence within the host session.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
 
 monotonic_newtype!(
     /// Total order assigned to successfully admitted commands.
@@ -206,6 +243,8 @@ pub struct HostSnapshot {
     pub playback: PlaybackSnapshot,
     /// Host lifecycle captured at this boundary.
     pub lifecycle: HostLifecycle,
+    /// Queryable health captured at this boundary.
+    pub health: HostHealth,
     /// Existing renderer-neutral dynamic world projection.
     pub world: DynamicWorldSnapshot,
 }
@@ -365,6 +404,252 @@ pub enum JournalState {
     Durable,
     /// Journal persistence failed independently of application.
     Failed(JournalFailure),
+}
+
+/// Exact immutable work offered to a nonblocking host-journal adapter.
+///
+/// A host constructs this value from the completed transition and command
+/// boundary, wraps it in an [`Arc`], and retains that same allocation until
+/// [`JournalPort::try_admit`] accepts it. In particular, retry code must never
+/// reconstruct `persistence` by rereading mutable world state.
+#[derive(Debug, Clone)]
+pub struct JournalBatch {
+    id: JournalBatchId,
+    command: Option<CommandEnvelope>,
+    applied: AppliedCommand,
+    persistence: Option<Arc<PersistenceBatch>>,
+}
+
+impl JournalBatch {
+    /// Construct one exact journal batch at an already-completed boundary.
+    #[must_use]
+    pub fn new(
+        id: JournalBatchId,
+        command: Option<CommandEnvelope>,
+        applied: AppliedCommand,
+        persistence: Option<Arc<PersistenceBatch>>,
+    ) -> Self {
+        Self {
+            id,
+            command,
+            applied,
+            persistence,
+        }
+    }
+
+    /// Stable identity reused for every admission retry and later receipt.
+    #[must_use]
+    pub const fn id(&self) -> JournalBatchId {
+        self.id
+    }
+
+    /// Command id associated with this batch, or `None` for automatic science.
+    #[must_use]
+    pub fn command_id(&self) -> Option<CommandId> {
+        self.command.as_ref().map(|command| command.command_id)
+    }
+
+    /// Exact command envelope captured at the application boundary.
+    #[must_use]
+    pub fn command(&self) -> Option<&CommandEnvelope> {
+        self.command.as_ref()
+    }
+
+    /// Tick and typed revisions captured when the work finished applying.
+    #[must_use]
+    pub const fn applied(&self) -> AppliedCommand {
+        self.applied
+    }
+
+    /// Exact immutable scientific persistence payload, when this boundary produced one.
+    #[must_use]
+    pub fn persistence(&self) -> Option<&Arc<PersistenceBatch>> {
+        self.persistence.as_ref()
+    }
+}
+
+/// Immediate result of one nonblocking journal admission attempt.
+///
+/// `Accepted` means only that the adapter took responsibility for the exact
+/// batch. Commit and durability advance exclusively through [`JournalReceipt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum JournalAdmission {
+    /// The adapter accepted the batch and owes a later receipt.
+    Accepted {
+        /// Identity accepted by the adapter.
+        batch_id: JournalBatchId,
+    },
+    /// The bounded adapter had no admission capacity.
+    Full {
+        /// Identity that was not accepted.
+        batch_id: JournalBatchId,
+        /// Configured queue capacity at this boundary.
+        capacity: usize,
+    },
+    /// The adapter permanently closed its admission gate.
+    Closed {
+        /// Identity that was not accepted.
+        batch_id: JournalBatchId,
+    },
+}
+
+impl JournalAdmission {
+    /// Batch identity echoed by this admission result.
+    #[must_use]
+    pub const fn batch_id(self) -> JournalBatchId {
+        match self {
+            Self::Accepted { batch_id }
+            | Self::Full { batch_id, .. }
+            | Self::Closed { batch_id } => batch_id,
+        }
+    }
+
+    /// Whether responsibility for the exact batch transferred to the adapter.
+    #[must_use]
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
+}
+
+/// Terminal or progressive journal knowledge returned after admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum JournalReceiptState {
+    /// The batch committed to volatile storage but is not crash durable.
+    CommittedVolatile,
+    /// The batch is durable according to the adapter's configured contract.
+    Durable,
+    /// The adapter can no longer complete this batch.
+    Failed(JournalFailure),
+}
+
+/// Typed acknowledgement for one previously accepted journal batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalReceipt {
+    batch_id: JournalBatchId,
+    state: JournalReceiptState,
+}
+
+impl JournalReceipt {
+    /// Construct an acknowledgement for a stable batch identity.
+    #[must_use]
+    pub fn new(batch_id: JournalBatchId, state: JournalReceiptState) -> Self {
+        Self { batch_id, state }
+    }
+
+    /// Stable batch identity acknowledged by this receipt.
+    #[must_use]
+    pub const fn batch_id(&self) -> JournalBatchId {
+        self.batch_id
+    }
+
+    /// Commit, durability, or terminal-failure knowledge carried by this receipt.
+    #[must_use]
+    pub fn state(&self) -> &JournalReceiptState {
+        &self.state
+    }
+}
+
+/// Runtime-neutral, nonblocking adapter boundary for host journal work.
+///
+/// Implementations may enqueue work for another owner, but these methods must
+/// not wait for database I/O, worker progress, or durability. A rejected batch
+/// remains owned by the caller through the original [`Arc<JournalBatch>`].
+pub trait JournalPort {
+    /// Try to transfer responsibility for one exact immutable batch.
+    fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission;
+
+    /// Poll at most `limit` acknowledgements without blocking.
+    fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt>;
+}
+
+/// Typed reason scientific progress stopped at a manual-drive boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostBlocker {
+    /// Playback is intentionally paused and no explicit step was applied.
+    PlaybackPaused,
+    /// A retained journal batch could not enter the bounded adapter.
+    JournalFull {
+        /// Exact batch retained for retry.
+        batch_id: JournalBatchId,
+        /// Configured adapter capacity at the failed boundary.
+        capacity: usize,
+    },
+    /// A retained journal batch reached a closed adapter.
+    JournalClosed {
+        /// Exact batch retained for retry or orderly failure handling.
+        batch_id: JournalBatchId,
+    },
+    /// The host is draining an ordered shutdown boundary.
+    LifecycleStopping,
+    /// The host has completed shutdown and cannot advance science.
+    LifecycleStopped,
+    /// A latched scientific fault prevents a later transition.
+    ScientificFault,
+}
+
+/// Queryable host fault that is independent of frontend or transport state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostFault {
+    /// Core rejected or faulted a scientific transition.
+    Scientific {
+        /// Tick visible when the fault was observed.
+        tick: Tick,
+        /// Stable machine-readable category.
+        code: String,
+        /// Human-readable diagnostic detail.
+        message: String,
+    },
+    /// An accepted journal batch later failed.
+    Journal {
+        /// Stable failed batch identity.
+        batch_id: JournalBatchId,
+        /// Typed journal failure detail.
+        failure: JournalFailure,
+    },
+    /// The host detected an internal protocol invariant violation.
+    Protocol {
+        /// Stable machine-readable category.
+        code: String,
+        /// Human-readable diagnostic detail.
+        message: String,
+    },
+}
+
+/// Queryable health of the sole-owner host state machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum HostHealth {
+    /// The host has no latched blocker or fault.
+    #[default]
+    Healthy,
+    /// Progress is stopped by a typed, potentially recoverable condition.
+    Blocked(HostBlocker),
+    /// Progress is stopped by a queryable fault.
+    Faulted(HostFault),
+}
+
+impl HostHealth {
+    /// Recoverable blocker carried by this health value, if any.
+    #[must_use]
+    pub fn blocker(&self) -> Option<HostBlocker> {
+        match self {
+            Self::Blocked(blocker) => Some(*blocker),
+            Self::Healthy | Self::Faulted(_) => None,
+        }
+    }
+
+    /// Fault carried by this health value, if any.
+    #[must_use]
+    pub fn fault(&self) -> Option<&HostFault> {
+        match self {
+            Self::Faulted(fault) => Some(fault),
+            Self::Healthy | Self::Blocked(_) => None,
+        }
+    }
 }
 
 /// Two-axis status for one stable command id.
@@ -560,6 +845,8 @@ pub enum HostEventKind {
     SnapshotPublished(SnapshotRevision),
     /// Host lifecycle changed.
     LifecycleChanged(HostLifecycle),
+    /// Queryable host health changed.
+    HealthChanged(HostHealth),
 }
 
 /// Opaque client-side cursor into the host event stream.
@@ -726,10 +1013,16 @@ pub struct DriveReceipt {
     pub now: ManualInstant,
     /// Commands whose application completed during this drive.
     pub commands_completed: usize,
+    /// Scientific transitions completed during this drive.
+    pub scientific_steps: usize,
+    /// Scientific revision visible after this drive.
+    pub scientific_revision: ScientificRevision,
     /// Snapshots published during this drive.
     pub snapshots_published: usize,
     /// Events published during this drive.
     pub events_published: usize,
+    /// Typed reason science could not make further progress, when applicable.
+    pub blocker: Option<HostBlocker>,
 }
 
 /// Typed client that owns, but never exposes, its concrete host port.
@@ -1239,6 +1532,7 @@ mod tests {
             }
             self.now = now;
             let events_before = self.events.len();
+            let scientific_before = self.revisions.scientific;
             let mut commands_completed = 0;
             while let Some(envelope) = self.queue.pop_front() {
                 self.apply(envelope)?;
@@ -1251,8 +1545,17 @@ mod tests {
             Ok(DriveReceipt {
                 now,
                 commands_completed,
+                scientific_steps: usize::try_from(
+                    self.revisions
+                        .scientific
+                        .get()
+                        .saturating_sub(scientific_before.get()),
+                )
+                .expect("test scientific-step count fits usize"),
+                scientific_revision: self.revisions.scientific,
                 snapshots_published,
                 events_published: self.events.len() - events_before,
+                blocker: None,
             })
         }
 
@@ -1342,6 +1645,7 @@ mod tests {
                 revisions: self.revisions,
                 playback: self.playback,
                 lifecycle: self.lifecycle,
+                health: HostHealth::Healthy,
                 world: DynamicWorldSnapshot {
                     tick: self.tick.0,
                     epoch: 0,
@@ -1470,6 +1774,9 @@ mod tests {
             .drive(ManualInstant::from_nanos(1))
             .expect("drive should succeed");
         assert_eq!(receipt.commands_completed, 3);
+        assert_eq!(receipt.scientific_steps, 1);
+        assert_eq!(receipt.scientific_revision, ScientificRevision::new(1));
+        assert_eq!(receipt.blocker, None);
         for command_id in [CommandId::new(1), CommandId::new(2)] {
             assert_eq!(
                 client
@@ -1498,13 +1805,12 @@ mod tests {
             ApplicationState::Applied(_)
         ));
         assert_eq!(retried.admission_sequence(), second.admission_sequence());
-        assert_eq!(
-            driver
-                .drive(ManualInstant::from_nanos(2))
-                .expect("empty drive should succeed")
-                .commands_completed,
-            0
-        );
+        let empty_receipt = driver
+            .drive(ManualInstant::from_nanos(2))
+            .expect("empty drive should succeed");
+        assert_eq!(empty_receipt.commands_completed, 0);
+        assert_eq!(empty_receipt.scientific_steps, 0);
+        assert_eq!(empty_receipt.scientific_revision, ScientificRevision::new(1));
         assert_eq!(
             shared.lock().admission_order,
             vec![CommandId::new(1), CommandId::new(2), CommandId::new(3)]
