@@ -450,6 +450,15 @@ impl HostCore {
         self.shared.borrow().shutdown_command_id
     }
 
+    /// Current two-axis status of the admitted ordered shutdown, when present.
+    #[must_use]
+    pub fn shutdown_command_status(&self) -> Option<CommandStatus> {
+        let shared = self.shared.borrow();
+        shared
+            .shutdown_command_id
+            .and_then(|command_id| shared.statuses.get(&command_id).cloned())
+    }
+
     /// Latest immutable host publication.
     #[must_use]
     pub fn latest_snapshot(&self) -> Arc<HostSnapshot> {

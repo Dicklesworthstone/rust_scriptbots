@@ -4,7 +4,7 @@
 //! runtime neutral. [`HostCore`] implements that protocol as a deterministic
 //! synchronous state machine: it owns one [`scriptbots_core::WorldState`] by
 //! value, advances it only under injected time, and delegates native or browser
-//! scheduling to later adapters.
+//! scheduling to platform adapters.
 
 #![warn(missing_docs, unsafe_code)]
 

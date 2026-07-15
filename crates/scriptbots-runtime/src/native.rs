@@ -282,7 +282,7 @@ mod asupersync_runner {
         CommandEnvelope, FixedDeadlineHost, HostDriveInterest, ManualInstant, NativeDriveReceipt,
         NativeDriveTrigger, NativeScheduleError,
     };
-    use crate::{CommandId, HostFault, HostHealth, JournalBatchId};
+    use crate::{ApplicationState, CommandId, HostFault, HostHealth, JournalBatchId};
     use asupersync::channel::mpsc::{self, Receiver, RecvError, SendError, Sender};
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use asupersync::time::sleep_until;
@@ -290,7 +290,7 @@ mod asupersync_runner {
     use asupersync::Cx;
     use std::any::Any;
     use std::future::{poll_fn, Future};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Poll, Waker};
     use thiserror::Error;
@@ -315,6 +315,7 @@ mod asupersync_runner {
         cancel_requested: AtomicBool,
         wake_enqueued: AtomicBool,
         journal_wake_enqueued: AtomicBool,
+        owner_wait_generation: AtomicU64,
     }
 
     impl NativeControlState {
@@ -327,6 +328,7 @@ mod asupersync_runner {
                 cancel_requested: AtomicBool::new(false),
                 wake_enqueued: AtomicBool::new(false),
                 journal_wake_enqueued: AtomicBool::new(false),
+                owner_wait_generation: AtomicU64::new(0),
             }
         }
 
@@ -350,6 +352,10 @@ mod asupersync_runner {
             {
                 *slot = Some(waker.clone());
             }
+        }
+
+        fn begin_owner_wait(&self) {
+            let _ = self.owner_wait_generation.fetch_add(1, Ordering::AcqRel);
         }
 
         fn wake_runner(&self) {
@@ -604,6 +610,16 @@ mod asupersync_runner {
         pub fn is_owner_waiting(&self) -> bool {
             self.state.runner_waker().is_some()
         }
+
+        /// Monotonic count of distinct owner wait registrations.
+        ///
+        /// This diagnostic counter lets supervisors distinguish a fresh wait
+        /// after a wake from the wait that wake originally interrupted. It is
+        /// not a command admission or scientific revision.
+        #[must_use]
+        pub fn owner_wait_generation(&self) -> u64 {
+            self.state.owner_wait_generation.load(Ordering::Acquire)
+        }
     }
 
     /// Cumulative, bounded-memory native lifecycle telemetry.
@@ -718,6 +734,13 @@ mod asupersync_runner {
         Disconnected,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ControllerState {
+        Connected,
+        DisconnectPending,
+        Disconnected,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TerminalDrainFailure {
         unresolved_envelopes: usize,
@@ -736,9 +759,10 @@ mod asupersync_runner {
         options: NativeRunnerOptions,
         metrics: NativeLifecycleMetrics,
         shutdown_started_at: Option<ManualInstant>,
+        provisional_shutdown_started_at: Option<ManualInstant>,
         shutdown_command_id: Option<CommandId>,
         cancellation_observed: bool,
-        controller_disconnected: bool,
+        controller_state: ControllerState,
         receiver_closed: bool,
         maintenance_deadline: Option<ManualInstant>,
         terminal: Option<NativeRunOutcome>,
@@ -768,9 +792,10 @@ mod asupersync_runner {
                     options,
                     metrics: NativeLifecycleMetrics::default(),
                     shutdown_started_at: None,
+                    provisional_shutdown_started_at: None,
                     shutdown_command_id: None,
                     cancellation_observed: false,
-                    controller_disconnected: false,
+                    controller_state: ControllerState::Connected,
                     receiver_closed: false,
                     maintenance_deadline: None,
                     terminal: None,
@@ -932,7 +957,7 @@ mod asupersync_runner {
                         (NativeDriveTrigger::Cancellation, None)
                     }
                     DriverWake::Disconnected => {
-                        self.controller_disconnected = true;
+                        self.controller_state = ControllerState::DisconnectPending;
                         (NativeDriveTrigger::Cancellation, None)
                     }
                 };
@@ -950,7 +975,7 @@ mod asupersync_runner {
             if self.should_cancel(cx) {
                 self.begin_shutdown(now, true)?;
                 trigger = trigger.combine(NativeDriveTrigger::Cancellation);
-            } else if self.controller_disconnected {
+            } else if self.controller_state == ControllerState::Disconnected {
                 self.begin_shutdown(now, false)?;
                 trigger = trigger.combine(NativeDriveTrigger::Cancellation);
             }
@@ -962,56 +987,177 @@ mod asupersync_runner {
             }
             self.drain_available(now, &mut trigger, remaining_messages)?;
             trigger = self.consume_latched_journal_ready(trigger)?;
+            self.track_provisional_shutdown(now);
 
             if self.should_cancel(cx) {
                 self.begin_shutdown(now, true)?;
                 trigger = trigger.combine(NativeDriveTrigger::Cancellation);
             }
+            if self.controller_state == ControllerState::DisconnectPending
+                && self.host.core().shutdown_command_id().is_none()
+            {
+                self.controller_state = ControllerState::Disconnected;
+                self.begin_shutdown(now, false)?;
+                trigger = trigger.combine(NativeDriveTrigger::Cancellation);
+            }
 
             self.drive(now, trigger)?;
             let cancellation_after_drive = self.should_cancel(cx);
-            if self.host.core().shutdown_command_id().is_some() {
+            self.reconcile_provisional_shutdown();
+            self.reconcile_controller_disconnect();
+            let forced_stop = cancellation_after_drive
+                || self.controller_state != ControllerState::Connected;
+            if self.shutdown_is_applied()
+                || (forced_stop && self.host.core().shutdown_command_id().is_some())
+            {
                 self.begin_shutdown(now, cancellation_after_drive)?;
                 let limit = self.options.ingress_capacity;
                 self.drain_available(now, &mut trigger, limit)?;
                 self.consume_latched_journal_ready(trigger)?;
             }
 
-            let ordered_stop_required = cancellation_after_drive
-                || self.controller_disconnected
-                || self.shutdown_started_at.is_some();
-            if ordered_stop_required && self.host.core().shutdown_command_id().is_none() {
-                // A conditional external Shutdown can close the host gate at
-                // admission and then be rejected at its ordered CAS boundary.
-                // If cancellation/controller loss selected that provisional
-                // identity, replace it with the unconditional host-owned one.
-                self.shutdown_command_id = None;
-                self.begin_shutdown(now, cancellation_after_drive)?;
-                let limit = self.options.ingress_capacity;
-                self.drain_available(now, &mut trigger, limit)?;
-                self.consume_latched_journal_ready(trigger)?;
-                self.drive(now, NativeDriveTrigger::Cancellation)?;
+            self.replace_missing_shutdown_if_required(
+                now,
+                cancellation_after_drive,
+                trigger,
+            )?;
+            self.pump_same_instant_maintenance(now)?;
+            self.reconcile_provisional_shutdown();
+            self.reconcile_controller_disconnect();
+            if self.replace_missing_shutdown_if_required(
+                now,
+                cancellation_after_drive,
+                trigger,
+            )? {
+                self.pump_same_instant_maintenance(now)?;
+                self.reconcile_provisional_shutdown();
+                self.reconcile_controller_disconnect();
             }
+            Ok(())
+        }
 
-            if matches!(self.host.drive_interest(), HostDriveInterest::Draining) {
-                for _ in 0..self.options.max_same_instant_drives {
-                    let maintenance = self.drive(now, NativeDriveTrigger::Maintenance)?;
-                    self.metrics.same_instant_maintenance_drives = self
-                        .metrics
-                        .same_instant_maintenance_drives
-                        .saturating_add(1);
-                    let progressed = maintenance.host.commands_completed > 0
-                        || maintenance.host.scientific_steps > 0
-                        || maintenance.host.snapshots_published > 0
-                        || maintenance.host.events_published > 0;
-                    if !progressed
-                        || !matches!(
-                            self.host.drive_interest(),
-                            HostDriveInterest::ReadyNow | HostDriveInterest::Draining
-                        )
-                    {
-                        break;
+        fn reconcile_controller_disconnect(&mut self) {
+            if self.controller_state != ControllerState::DisconnectPending {
+                return;
+            }
+            match self.host.core().shutdown_command_status() {
+                Some(status) if matches!(status.application(), ApplicationState::Admitted) => {}
+                Some(status) if matches!(status.application(), ApplicationState::Applied(_)) => {
+                    self.controller_state = ControllerState::Connected;
+                }
+                Some(_) | None => {
+                    self.controller_state = ControllerState::Disconnected;
+                }
+            }
+        }
+
+        fn shutdown_is_applied(&self) -> bool {
+            self.host
+                .core()
+                .shutdown_command_status()
+                .is_some_and(|status| {
+                    matches!(status.application(), ApplicationState::Applied(_))
+                })
+        }
+
+        fn track_provisional_shutdown(&mut self, now: ManualInstant) {
+            if self.shutdown_started_at.is_none()
+                && self.provisional_shutdown_started_at.is_none()
+                && self
+                    .host
+                    .core()
+                    .shutdown_command_status()
+                    .is_some_and(|status| {
+                        matches!(status.application(), ApplicationState::Admitted)
+                    })
+            {
+                self.provisional_shutdown_started_at = Some(now);
+            }
+        }
+
+        fn reconcile_provisional_shutdown(&mut self) {
+            if self.provisional_shutdown_started_at.is_none() {
+                return;
+            }
+            match self.host.core().shutdown_command_status() {
+                Some(status)
+                    if matches!(
+                        status.application(),
+                        ApplicationState::Admitted | ApplicationState::Applied(_)
+                    ) => {}
+                Some(_) | None if self.controller_state == ControllerState::Connected => {
+                    self.provisional_shutdown_started_at = None;
+                }
+                Some(_) | None => {}
+            }
+        }
+
+        const fn shutdown_wait_started_at(&self) -> Option<ManualInstant> {
+            match (
+                self.shutdown_started_at,
+                self.provisional_shutdown_started_at,
+            ) {
+                (Some(started), Some(provisional)) => {
+                    if started.as_nanos() <= provisional.as_nanos() {
+                        Some(started)
+                    } else {
+                        Some(provisional)
                     }
+                }
+                (Some(started), None) => Some(started),
+                (None, provisional) => provisional,
+            }
+        }
+
+        fn replace_missing_shutdown_if_required(
+            &mut self,
+            now: ManualInstant,
+            cancellation: bool,
+            mut trigger: NativeDriveTrigger,
+        ) -> Result<bool, NativeRunError> {
+            let ordered_stop_required = cancellation
+                || self.controller_state == ControllerState::Disconnected
+                || self.shutdown_started_at.is_some();
+            if !ordered_stop_required || self.host.core().shutdown_command_id().is_some() {
+                return Ok(false);
+            }
+            // A conditional external Shutdown can close the host gate at
+            // admission and then be rejected at its ordered CAS boundary.
+            // Replace a selected provisional identity with the unconditional
+            // host-owned shutdown while preserving the original stop cause.
+            self.shutdown_command_id = None;
+            self.begin_shutdown(now, cancellation)?;
+            let limit = self.options.ingress_capacity;
+            self.drain_available(now, &mut trigger, limit)?;
+            self.consume_latched_journal_ready(trigger)?;
+            self.drive(now, NativeDriveTrigger::Cancellation)?;
+            Ok(true)
+        }
+
+        fn pump_same_instant_maintenance(
+            &mut self,
+            now: ManualInstant,
+        ) -> Result<(), NativeRunError> {
+            if !matches!(self.host.drive_interest(), HostDriveInterest::Draining) {
+                return Ok(());
+            }
+            for _ in 0..self.options.max_same_instant_drives {
+                let maintenance = self.drive(now, NativeDriveTrigger::Maintenance)?;
+                self.metrics.same_instant_maintenance_drives = self
+                    .metrics
+                    .same_instant_maintenance_drives
+                    .saturating_add(1);
+                let progressed = maintenance.host.commands_completed > 0
+                    || maintenance.host.scientific_steps > 0
+                    || maintenance.host.snapshots_published > 0
+                    || maintenance.host.events_published > 0;
+                if !progressed
+                    || !matches!(
+                        self.host.drive_interest(),
+                        HostDriveInterest::ReadyNow | HostDriveInterest::Draining
+                    )
+                {
+                    break;
                 }
             }
             Ok(())
@@ -1028,9 +1174,11 @@ mod asupersync_runner {
                     Ok(message) => *trigger = self.process_message(message, *trigger)?,
                     Err(RecvError::Empty) => return Ok(()),
                     Err(RecvError::Disconnected) => {
-                        if self.shutdown_started_at.is_none() && !self.receiver_closed {
-                            self.controller_disconnected = true;
-                            self.begin_shutdown(now, false)?;
+                        if !self.receiver_closed
+                            && self.controller_state != ControllerState::Disconnected
+                            && !self.shutdown_is_applied()
+                        {
+                            self.controller_state = ControllerState::DisconnectPending;
                             *trigger = trigger.combine(NativeDriveTrigger::Cancellation);
                         }
                         return Ok(());
@@ -1136,7 +1284,11 @@ mod asupersync_runner {
                 self.shutdown_command_id = Some(status.command_id());
                 self.metrics.shutdown_requests = self.metrics.shutdown_requests.saturating_add(1);
             }
-            self.shutdown_started_at.get_or_insert(now);
+            let started_at = self.provisional_shutdown_started_at.take().unwrap_or(now);
+            self.shutdown_started_at = Some(
+                self.shutdown_started_at
+                    .map_or(started_at, |existing| existing.min(started_at)),
+            );
             self.state
                 .command_ingress_open
                 .store(false, Ordering::Release);
@@ -1236,7 +1388,7 @@ mod asupersync_runner {
                                     .to_owned(),
                             },
                         })?;
-                    let outcome = if self.controller_disconnected {
+                    let outcome = if self.controller_state == ControllerState::Disconnected {
                         NativeRunOutcome::ControllerDisconnected {
                             shutdown_command_id,
                         }
@@ -1268,7 +1420,7 @@ mod asupersync_runner {
                 | HostDriveInterest::Deadline
                 | HostDriveInterest::WakeOnly
                 | HostDriveInterest::Draining => {
-                    if let Some(started) = self.shutdown_started_at {
+                    if let Some(started) = self.shutdown_wait_started_at() {
                         let waited_nanos = now.as_nanos().saturating_sub(started.as_nanos());
                         if waited_nanos >= self.options.shutdown_timeout_nanos {
                             return Err(NativeRunError::ShutdownTimedOut {
@@ -1291,14 +1443,21 @@ mod asupersync_runner {
             match self.host.drive_interest() {
                 HostDriveInterest::ReadyNow => DriverWake::Immediate,
                 HostDriveInterest::Deadline => {
-                    let deadline = self
+                    let cadence = self
                         .host
                         .next_deadline()
                         .expect("startup establishes a fixed deadline");
+                    let deadline = self.shutdown_wait_started_at().map_or(cadence, |started| {
+                        cadence.min(ManualInstant::from_nanos(
+                            started
+                                .as_nanos()
+                                .saturating_add(self.options.shutdown_timeout_nanos),
+                        ))
+                    });
                     self.wait_message_or_deadline(cx, deadline).await
                 }
                 HostDriveInterest::WakeOnly => {
-                    if let Some(started) = self.shutdown_started_at {
+                    if let Some(started) = self.shutdown_wait_started_at() {
                         let timeout = ManualInstant::from_nanos(
                             started
                                 .as_nanos()
@@ -1317,7 +1476,7 @@ mod asupersync_runner {
                         self.options.maintenance_period_nanos,
                     );
                     self.maintenance_deadline = Some(maintenance);
-                    let deadline = self.shutdown_started_at.map_or(maintenance, |started| {
+                    let deadline = self.shutdown_wait_started_at().map_or(maintenance, |started| {
                         let timeout = ManualInstant::from_nanos(
                             started
                                 .as_nanos()
@@ -1334,6 +1493,7 @@ mod asupersync_runner {
         }
 
         async fn wait_message(&mut self, cx: &Cx) -> DriverWake {
+            self.state.begin_owner_wait();
             let state = Arc::clone(&self.state);
             let wake = poll_fn(|task_cx| {
                 state.register_runner_waker(task_cx.waker());
@@ -1370,6 +1530,7 @@ mod asupersync_runner {
             cx: &Cx,
             deadline: ManualInstant,
         ) -> DriverWake {
+            self.state.begin_owner_wait();
             let mut sleep = Box::pin(sleep_until(Time::from_nanos(deadline.as_nanos())));
             let state = Arc::clone(&self.state);
             let wake = poll_fn(|task_cx| {
@@ -1391,6 +1552,9 @@ mod asupersync_runner {
                         return Poll::Ready(DriverWake::Message(message));
                     }
                     Poll::Ready(Err(RecvError::Disconnected)) => {
+                        // A provisional timeout deliberately leaves ingress
+                        // reversible. Producer loss must wake once so observe
+                        // can promote that same deadline into definitive stop.
                         if self.shutdown_started_at.is_none() {
                             return Poll::Ready(DriverWake::Disconnected);
                         }
@@ -1608,7 +1772,7 @@ mod tests {
         world_with_persistence_interval(0)
     }
 
-    fn world_with_persistence_interval(persistence_interval: u64) -> WorldState {
+    fn world_with_persistence_interval(persistence_interval: u32) -> WorldState {
         WorldState::new(ScriptBotsConfig {
             rng_seed: Some(0x4e41_5449_5645),
             persistence_interval,
@@ -1789,6 +1953,10 @@ mod tests {
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end trace keeps the manual and native schedules visibly adjacent"
+    )]
     fn actual_native_runner_matches_manual_full_journal_trace() {
         let (mut manual, manual_journal) = captured_host_with_world(
             52,
@@ -1823,7 +1991,7 @@ mod tests {
             while timer.pending_count() == 0 {
                 if std::time::Instant::now() >= deadline {
                     clock.advance_to(Time::from_nanos(10));
-                    timer.process_timers();
+                    let _ = timer.process_timers();
                     let _ = failsafe.cancel();
                     return Err("native parity deadline was never registered");
                 }
@@ -2372,6 +2540,10 @@ mod tests {
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one virtual-time scenario proves the complete JournalFull wake transition"
+    )]
     fn journal_full_disarms_native_deadlines_until_explicit_ready() {
         let ready = Arc::new(AtomicBool::new(false));
         let blocked = Arc::new(AtomicBool::new(false));
@@ -2412,7 +2584,7 @@ mod tests {
             while timer.pending_count() == 0 {
                 if std::time::Instant::now() >= first_deadline {
                     clock.advance_to(Time::from_nanos(10));
-                    timer.process_timers();
+                    let _ = timer.process_timers();
                     ready.store(true, Ordering::Release);
                     let _ = lifecycle.journal_ready();
                     let _ = lifecycle.cancel();
@@ -2505,6 +2677,395 @@ mod tests {
         ));
         assert_eq!(runner.host().core().latest_snapshot().lifecycle, HostLifecycle::Stopped);
         assert_eq!(runner.metrics().shutdown_requests, 1);
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn disconnect_wins_a_ready_deadline_tie_without_extra_science() {
+        let (core, _) = captured_host(57, false, ReceiptMode::Immediate);
+        let (mut runner, control) = NativeRunner::new(
+            FixedDeadlineHost::new(core),
+            NativeRunnerOptions::default(),
+        )
+        .expect("disconnect deadline-tie runner");
+        let clock = Arc::new(VirtualClock::starting_at(Time::ZERO));
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .with_timer_driver(timer.clone())
+            .enable_platform_reactor(false)
+            .build()
+            .expect("disconnect deadline-tie runtime");
+        let coordinator = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while timer.pending_count() == 0 {
+                if std::time::Instant::now() >= deadline {
+                    drop(control);
+                    clock.advance_to(Time::from_nanos(10));
+                    let _ = timer.process_timers();
+                    return Err("disconnect deadline was never registered");
+                }
+                std::thread::yield_now();
+            }
+            drop(control);
+            clock.advance_to(Time::from_nanos(10));
+            let _ = timer.process_timers();
+            Ok(())
+        });
+
+        let run = runner.run_on_runtime(&runtime);
+        coordinator
+            .join()
+            .expect("disconnect deadline-tie coordinator")
+            .expect("disconnect deadline registration");
+        assert!(matches!(
+            run,
+            Ok(NativeRunOutcome::ControllerDisconnected { .. })
+        ));
+        assert_eq!(runner.host().core().world_tick(), Tick(0));
+        assert_eq!(runner.metrics().automatic_steps_skipped, 0);
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn disconnect_after_valid_explicit_shutdown_preserves_stopped_outcome() {
+        let (core, _) = captured_host(54, true, ReceiptMode::Immediate);
+        let (mut runner, control) = NativeRunner::new(
+            FixedDeadlineHost::new(core),
+            NativeRunnerOptions::default(),
+        )
+        .expect("explicit shutdown disconnect runner");
+        let shutdown = envelope(1, HostCommand::Shutdown);
+        control
+            .try_submit(shutdown.clone())
+            .expect("explicit shutdown enqueue");
+        drop(control);
+
+        assert_eq!(
+            runner
+                .run_until_terminal()
+                .expect("explicit shutdown before disconnect"),
+            NativeRunOutcome::Stopped {
+                shutdown_command_id: shutdown.command_id,
+            }
+        );
+        assert_eq!(runner.host().core().world_tick(), Tick(0));
+        assert_eq!(runner.metrics().shutdown_requests, 1);
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn disconnect_replaces_stale_queued_shutdown_with_fail_safe_identity() {
+        let (core, _) = captured_host(55, true, ReceiptMode::Immediate);
+        let (mut runner, control) = NativeRunner::new(
+            FixedDeadlineHost::new(core),
+            NativeRunnerOptions::default(),
+        )
+        .expect("stale shutdown disconnect runner");
+        let stale = envelope(1, HostCommand::Shutdown)
+            .expecting_control_revision(crate::ControlRevision::new(99));
+        control
+            .try_submit(stale.clone())
+            .expect("stale shutdown enqueue");
+        drop(control);
+
+        let fail_safe_id = match runner
+            .run_until_terminal()
+            .expect("disconnect must replace stale shutdown")
+        {
+            NativeRunOutcome::ControllerDisconnected {
+                shutdown_command_id,
+            } => shutdown_command_id,
+            other => panic!("unexpected stale-disconnect outcome: {other:?}"),
+        };
+        assert_ne!(fail_safe_id, stale.command_id);
+        assert_eq!(
+            runner.host().core().shutdown_command_id(),
+            Some(fail_safe_id)
+        );
+        let mut port = runner.host().local_port();
+        assert!(matches!(
+            port.command_status(stale.command_id)
+                .expect("stale disconnect status query")
+                .expect("stale disconnect status")
+                .application(),
+            crate::ApplicationState::Rejected(
+                crate::RejectionReason::ControlRevisionConflict { .. }
+            )
+        ));
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn disconnect_provenance_survives_journal_full_before_stale_shutdown() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let on_full = Rc::new(RefCell::new(None));
+        let wake_results = Rc::new(RefCell::new(None));
+        let core = HostCore::with_journal(
+            HostSessionId::new(56),
+            world(),
+            options(true),
+            Box::new(ReadinessJournal {
+                ready: Arc::clone(&ready),
+                blocked: Arc::clone(&blocked),
+                on_full: Rc::clone(&on_full),
+                wake_results,
+                receipts: VecDeque::new(),
+            }),
+        )
+        .expect("journal-full stale-shutdown host");
+        let (mut runner, control) = NativeRunner::new(
+            FixedDeadlineHost::new(core),
+            NativeRunnerOptions::default(),
+        )
+        .expect("journal-full stale-shutdown runner");
+        *on_full.borrow_mut() = Some(control.clone());
+        let step = envelope(1, HostCommand::Step);
+        let stale = envelope(2, HostCommand::Shutdown)
+            .expecting_control_revision(crate::ControlRevision::new(99));
+        control
+            .try_submit(step.clone())
+            .expect("journal-full step enqueue");
+        control
+            .try_submit(stale.clone())
+            .expect("journal-full stale shutdown enqueue");
+        drop(control);
+
+        let fail_safe_id = match runner
+            .run_until_terminal()
+            .expect("journal-full disconnect must install fail-safe shutdown")
+        {
+            NativeRunOutcome::ControllerDisconnected {
+                shutdown_command_id,
+            } => shutdown_command_id,
+            other => panic!("unexpected delayed stale-disconnect outcome: {other:?}"),
+        };
+        assert!(blocked.load(Ordering::Acquire));
+        assert!(ready.load(Ordering::Acquire));
+        assert_ne!(fail_safe_id, stale.command_id);
+        assert_eq!(runner.host().core().world_tick(), Tick(1));
+        let mut port = runner.host().local_port();
+        assert!(matches!(
+            port.command_status(step.command_id)
+                .expect("delayed step status query")
+                .expect("delayed step status")
+                .application(),
+            crate::ApplicationState::Applied(applied) if applied.tick == Tick(1)
+        ));
+        assert!(matches!(
+            port.command_status(stale.command_id)
+                .expect("delayed stale status query")
+                .expect("delayed stale status")
+                .application(),
+            crate::ApplicationState::Rejected(
+                crate::RejectionReason::ControlRevisionConflict { .. }
+            )
+        ));
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one coordinated trace proves delayed stale-CAS recovery before valid shutdown"
+    )]
+    fn connected_stale_shutdown_reopens_for_later_valid_shutdown() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let core = HostCore::with_journal(
+            HostSessionId::new(58),
+            world(),
+            options(true),
+            Box::new(ReadinessJournal {
+                ready: Arc::clone(&ready),
+                blocked: Arc::clone(&blocked),
+                on_full: Rc::new(RefCell::new(None)),
+                wake_results: Rc::new(RefCell::new(None)),
+                receipts: VecDeque::new(),
+            }),
+        )
+        .expect("connected stale-shutdown host");
+        let (mut runner, control) = NativeRunner::new(
+            FixedDeadlineHost::new(core),
+            NativeRunnerOptions::default(),
+        )
+        .expect("connected stale-shutdown runner");
+        let step = envelope(1, HostCommand::Step);
+        let stale = envelope(2, HostCommand::Shutdown)
+            .expecting_control_revision(crate::ControlRevision::new(99));
+        let valid = envelope(3, HostCommand::Shutdown);
+        control
+            .try_submit(step.clone())
+            .expect("connected delayed step enqueue");
+        control
+            .try_submit(stale.clone())
+            .expect("connected delayed stale shutdown enqueue");
+        let coordinator = std::thread::spawn(move || {
+            let first_wait_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !(blocked.load(Ordering::Acquire) && control.is_owner_waiting()) {
+                if std::time::Instant::now() >= first_wait_deadline {
+                    ready.store(true, Ordering::Release);
+                    let _ = control.journal_ready();
+                    let _ = control.cancel();
+                    return Err("connected stale shutdown never reached JournalFull wait");
+                }
+                std::thread::yield_now();
+            }
+            let first_wait_generation = control.owner_wait_generation();
+            ready.store(true, Ordering::Release);
+            let _ = control.journal_ready();
+
+            let reopened_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while control.owner_wait_generation() <= first_wait_generation
+                || !control.is_owner_waiting()
+            {
+                if std::time::Instant::now() >= reopened_deadline {
+                    let _ = control.cancel();
+                    return Err("stale shutdown never returned to a connected wake-only wait");
+                }
+                std::thread::yield_now();
+            }
+            let valid_id = valid.command_id;
+            if control.try_submit(valid).is_err() {
+                let _ = control.cancel();
+                return Err("valid shutdown could not enter reopened native ingress");
+            }
+            Ok(valid_id)
+        });
+
+        let run = runner.run_until_terminal();
+        let valid_id = coordinator
+            .join()
+            .expect("connected stale-shutdown coordinator")
+            .expect("connected stale-shutdown recovery");
+        assert_eq!(
+            run.expect("later valid shutdown must stop"),
+            NativeRunOutcome::Stopped {
+                shutdown_command_id: valid_id,
+            }
+        );
+        assert_eq!(runner.host().core().world_tick(), Tick(1));
+        let mut port = runner.host().local_port();
+        assert!(matches!(
+            port.command_status(step.command_id)
+                .expect("connected delayed step status query")
+                .expect("connected delayed step status")
+                .application(),
+            crate::ApplicationState::Applied(applied) if applied.tick == Tick(1)
+        ));
+        assert!(matches!(
+            port.command_status(stale.command_id)
+                .expect("connected delayed stale status query")
+                .expect("connected delayed stale status")
+                .application(),
+            crate::ApplicationState::Rejected(
+                crate::RejectionReason::ControlRevisionConflict { .. }
+            )
+        ));
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one virtual-time trace proves provisional shutdown remains timeout-bounded"
+    )]
+    fn disconnected_provisional_shutdown_times_out_without_journal_ready() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let core = HostCore::with_journal(
+            HostSessionId::new(59),
+            world(),
+            options(true),
+            Box::new(ReadinessJournal {
+                ready: Arc::clone(&ready),
+                blocked: Arc::clone(&blocked),
+                on_full: Rc::new(RefCell::new(None)),
+                wake_results: Rc::new(RefCell::new(None)),
+                receipts: VecDeque::new(),
+            }),
+        )
+        .expect("provisional-timeout host");
+        let (mut runner, control) = NativeRunner::new(
+            FixedDeadlineHost::new(core),
+            NativeRunnerOptions {
+                maintenance_period_nanos: 5,
+                shutdown_timeout_nanos: 20,
+                ..NativeRunnerOptions::default()
+            },
+        )
+        .expect("provisional-timeout runner");
+        let step = envelope(1, HostCommand::Step);
+        let shutdown = envelope(2, HostCommand::Shutdown);
+        control
+            .try_submit(step)
+            .expect("provisional-timeout step enqueue");
+        control
+            .try_submit(shutdown.clone())
+            .expect("provisional-timeout shutdown enqueue");
+
+        let clock = Arc::new(VirtualClock::starting_at(Time::ZERO));
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .with_timer_driver(timer.clone())
+            .enable_platform_reactor(false)
+            .build()
+            .expect("provisional-timeout runtime");
+        let blocked_for_coordinator = Arc::clone(&blocked);
+        let ready_for_coordinator = Arc::clone(&ready);
+        let coordinator = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !(blocked_for_coordinator.load(Ordering::Acquire)
+                && timer.pending_count() > 0)
+            {
+                if std::time::Instant::now() >= deadline {
+                    ready_for_coordinator.store(true, Ordering::Release);
+                    let _ = control.journal_ready();
+                    let _ = control.cancel();
+                    drop(control);
+                    clock.advance_to(Time::from_nanos(20));
+                    let _ = timer.process_timers();
+                    return Err("provisional shutdown timeout was never registered");
+                }
+                std::thread::yield_now();
+            }
+            drop(control);
+            clock.advance_to(Time::from_nanos(20));
+            let _ = timer.process_timers();
+            Ok(())
+        });
+
+        let run = runner.run_on_runtime(&runtime);
+        coordinator
+            .join()
+            .expect("provisional-timeout coordinator")
+            .expect("provisional timeout registration");
+        let pending_batch = match run {
+            Err(NativeRunError::ShutdownTimedOut {
+                waited_nanos,
+                pending_batch,
+                ..
+            }) => {
+                assert_eq!(waited_nanos, 20);
+                pending_batch
+            }
+            other => panic!("unexpected provisional-timeout result: {other:?}"),
+        };
+        assert!(pending_batch.is_some());
+        assert!(blocked.load(Ordering::Acquire));
+        assert_eq!(runner.host().core().world_tick(), Tick(1));
+        assert!(runner.host().core().pending_journal_batch().is_some());
+        let mut port = runner.host().local_port();
+        let shutdown_status = port
+            .command_status(shutdown.command_id)
+            .expect("provisional shutdown status query")
+            .expect("provisional shutdown status");
+        assert!(matches!(
+            shutdown_status.application(),
+            crate::ApplicationState::Admitted
+        ));
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
@@ -2649,7 +3210,7 @@ mod tests {
             while timer.pending_count() == 0 {
                 if std::time::Instant::now() >= deadline {
                     clock.advance_to(Time::from_nanos(10));
-                    timer.process_timers();
+                    let _ = timer.process_timers();
                     let _ = failsafe.cancel();
                     return Err("native deadline sleep was never registered");
                 }
@@ -2697,7 +3258,7 @@ mod tests {
             while !lifecycle.is_owner_waiting() {
                 if std::time::Instant::now() >= deadline {
                     clock.advance_to(Time::from_nanos(1_000_000_000_000));
-                    timer.process_timers();
+                    let _ = timer.process_timers();
                     let _ = lifecycle.cancel();
                     return Err("paused native owner never reached its event wait");
                 }
@@ -2799,7 +3360,7 @@ mod tests {
             while timer.pending_count() == 0 {
                 if std::time::Instant::now() >= deadline {
                     clock.advance_to(Time::from_nanos(2_000_000));
-                    timer.process_timers();
+                    let _ = timer.process_timers();
                     let _ = failsafe.cancel();
                     return Err("shutdown timeout sleep was never registered");
                 }
