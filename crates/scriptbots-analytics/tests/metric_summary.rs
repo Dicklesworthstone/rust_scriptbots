@@ -115,10 +115,7 @@ fn the_report_computes_the_hand_verified_summary_of_a_real_run() {
         "a constant metric has zero spread"
     );
     assert_eq!(
-        flat["coefficient_of_variation"]
-            .as_f64()
-            .unwrap()
-            .to_bits(),
+        flat["coefficient_of_variation"].as_f64().unwrap().to_bits(),
         0.0_f64.to_bits(),
         "a constant non-zero metric has CV 0, not null"
     );
