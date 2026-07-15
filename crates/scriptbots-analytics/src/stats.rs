@@ -55,7 +55,7 @@ impl DeterministicRng {
         Self { state: seed }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         // SplitMix64.
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
@@ -71,31 +71,47 @@ impl DeterministicRng {
     /// skew every confidence interval derived from it.
     fn index(&mut self, len: usize) -> usize {
         debug_assert!(len > 0, "cannot draw an index from an empty range");
-        let m = (self.next_u64() as u128) * (len as u128);
+        let m = u128::from(self.next_u64()) * (len as u128);
         (m >> 64) as usize
     }
 }
 
-/// Errors from a statistics routine. These are PROGRAMMING errors — an empty sample, a nonsense
-/// confidence level — surfaced loudly rather than papered over with a silent `NaN`, because a
-/// certification computed from bad inputs is worse than no certification.
+/// Errors from a statistics routine.
+///
+/// These are PROGRAMMING errors — an empty sample, a nonsense confidence level — surfaced loudly
+/// rather than papered over with a silent `NaN`, because a certification computed from bad inputs
+/// is worse than no certification.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum StatsError {
     /// A sample that a statistic requires to be non-empty was empty.
     #[error("statistic `{what}` requires a non-empty sample")]
-    EmptySample { what: &'static str },
+    EmptySample {
+        /// The statistic that received the empty sample.
+        what: &'static str,
+    },
     /// A confidence level outside the open interval (0, 1).
     #[error("confidence level must be in (0, 1); got {level}")]
-    InvalidConfidence { level: f64 },
+    InvalidConfidence {
+        /// The invalid confidence level.
+        level: f64,
+    },
     /// A resample count of zero, which would produce an empty bootstrap distribution.
     #[error("resample count must be at least 1")]
     ZeroResamples,
     /// A moving-block length that is zero or exceeds the series length.
     #[error("block length {block} is invalid for a series of length {series_len}")]
-    InvalidBlockLength { block: usize, series_len: usize },
+    InvalidBlockLength {
+        /// The invalid requested block length.
+        block: usize,
+        /// The number of values in the source series.
+        series_len: usize,
+    },
     /// An input that must be finite contained NaN or an infinity.
     #[error("statistic `{what}` received a non-finite value")]
-    NonFinite { what: &'static str },
+    NonFinite {
+        /// The statistic that received the non-finite value.
+        what: &'static str,
+    },
 }
 
 /// The arithmetic mean. Errors on an empty sample rather than returning `NaN`.
@@ -125,10 +141,13 @@ pub fn std_dev(sample: &[f64]) -> Result<f64, StatsError> {
 }
 
 /// The `q`-quantile of a sample, `q` in `[0, 1]`, by linear interpolation between order
-/// statistics (the "type 7" definition used by NumPy and R's default).
+/// statistics (the "type 7" definition used by `NumPy` and R's default).
 ///
 /// The sample is sorted internally with `total_cmp`, so NaN cannot silently reorder the data —
 /// the finite guard rejects it first.
+// The validated `q` bounds make both percentile ranks nonnegative and in range; Rust has no
+// checked `f64`-to-`usize` conversion for these two indices.
+#[allow(clippy::cast_sign_loss)]
 pub fn quantile(sample: &[f64], q: f64) -> Result<f64, StatsError> {
     if sample.is_empty() {
         return Err(StatsError::EmptySample { what: "quantile" });
@@ -149,7 +168,7 @@ pub fn quantile(sample: &[f64], q: f64) -> Result<f64, StatsError> {
         return Ok(sorted[low]);
     }
     let weight = rank - low as f64;
-    Ok(sorted[low] * (1.0 - weight) + sorted[high] * weight)
+    Ok(sorted[high].mul_add(weight, sorted[low] * (1.0 - weight)))
 }
 
 /// A two-sided confidence interval.
@@ -157,7 +176,9 @@ pub fn quantile(sample: &[f64], q: f64) -> Result<f64, StatsError> {
 pub struct ConfidenceInterval {
     /// The point estimate the interval is built around.
     pub point: f64,
+    /// The lower endpoint of the interval.
     pub lower: f64,
+    /// The upper endpoint of the interval.
     pub upper: f64,
     /// The nominal coverage, e.g. `0.95`.
     pub confidence: f64,
@@ -286,6 +307,7 @@ pub struct PermutationTest {
     /// observed |statistic|. Computed with the `(count + 1) / (n + 1)` correction so it can never
     /// be exactly zero — a p-value of literally zero is a claim no finite resampling can support.
     pub p_value: f64,
+    /// The number of label permutations used to estimate the p-value.
     pub permutations: usize,
 }
 
@@ -363,7 +385,7 @@ pub fn cohens_d(before: &[f64], after: &[f64]) -> Result<f64, StatsError> {
     finite_guard(after, "cohens_d.after")?;
     let (n1, n2) = (before.len() as f64, after.len() as f64);
     let (s1, s2) = (std_dev(before)?, std_dev(after)?);
-    let pooled_var = ((n1 - 1.0) * s1 * s1 + (n2 - 1.0) * s2 * s2) / (n1 + n2 - 2.0);
+    let pooled_var = ((n2 - 1.0) * s2).mul_add(s2, (n1 - 1.0) * s1 * s1) / (n1 + n2 - 2.0);
     let pooled_sd = pooled_var.sqrt();
     if pooled_sd == 0.0 {
         // Both groups are constant. The effect is either zero (equal constants) or infinite
@@ -484,7 +506,7 @@ mod tests {
             let u1 = self.unit();
             let u2 = self.unit();
             let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
-            mean + sd * z
+            sd.mul_add(z, mean)
         }
         fn series(&mut self, n: usize, mean: f64, sd: f64) -> Vec<f64> {
             (0..n).map(|_| self.normal(mean, sd)).collect()
@@ -509,14 +531,14 @@ mod tests {
         for _ in 0..draws {
             counts[rng.index(7)] += 1;
         }
-        let expected = draws as f64 / 7.0;
+        let expected = f64::from(draws) / 7.0;
         for (bucket, &count) in counts.iter().enumerate() {
-            let deviation = (count as f64 - expected).abs() / expected;
+            let deviation = (f64::from(count) - expected).abs() / expected;
             assert!(
                 deviation < 0.02,
-                "bucket {bucket} deviated {:.4} from uniform ({count} vs {expected:.0}); the index \
-                 draw is biased and every bootstrap built on it inherits that bias",
-                deviation
+                "bucket {bucket} deviated {deviation:.4} from uniform ({count} vs \
+                 {expected:.0}); the index draw is biased and every bootstrap built on it \
+                 inherits that bias"
             );
         }
     }
@@ -584,7 +606,7 @@ mod tests {
                 covered += 1;
             }
         }
-        let coverage = covered as f64 / replications as f64;
+        let coverage = f64::from(covered) / replications as f64;
         // LOG THE COVERAGE NUMBER, as the bead requires.
         println!("bootstrap 95% CI empirical coverage over {replications} reps: {coverage:.3}");
         assert!(
@@ -613,7 +635,7 @@ mod tests {
                 rejections += 1;
             }
         }
-        let false_positive_rate = rejections as f64 / trials as f64;
+        let false_positive_rate = f64::from(rejections) / trials as f64;
         println!(
             "permutation test false-positive rate under the null at alpha={alpha}: \
              {false_positive_rate:.3} ({rejections}/{trials})"
@@ -719,7 +741,7 @@ mod tests {
         // The bead notes our metric series are f32 and widen at the offline boundary. Prove the
         // widening is lossless for representable values and that the statistics agree.
         let f32_series: Vec<f32> = vec![1.5, 2.25, 3.125, 4.0];
-        let widened: Vec<f64> = f32_series.iter().map(|&value| value as f64).collect();
+        let widened: Vec<f64> = f32_series.iter().map(|&value| f64::from(value)).collect();
         assert_eq!(mean(&widened).unwrap(), (1.5 + 2.25 + 3.125 + 4.0) / 4.0);
         // Each widened value equals the exact f32 it came from.
         for (narrow, wide) in f32_series.iter().zip(&widened) {
