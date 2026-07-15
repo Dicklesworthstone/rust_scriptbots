@@ -3873,7 +3873,9 @@ mod tests {
                     }
                 });
             for _ in 0..2 {
-                let agent_id = guard.spawn_agent(AgentData::default());
+                let agent_id = guard
+                    .try_spawn_agent(AgentData::default())
+                    .expect("spawn terminal inspection agent");
                 guard
                     .bind_agent_brain(agent_id, family)
                     .expect("bind terminal inspection brain");

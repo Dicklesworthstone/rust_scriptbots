@@ -8275,10 +8275,10 @@ fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window
 
 fn paint_activation_edges(
     bounds: Bounds<Pixels>,
-    state: (usize, usize, Vec<ActivationEdge>),
+    state: &(usize, usize, Vec<ActivationEdge>),
     window: &mut Window,
 ) {
-    let (cols, rows, edges) = state;
+    let (cols, rows, edges) = (state.0, state.1, state.2.as_slice());
     if cols == 0 || rows == 0 || edges.is_empty() {
         return;
     }
@@ -13834,7 +13834,9 @@ mod command_characterization_tests {
                         }))
                     }
                 });
-            let agent_id = guard.spawn_agent(AgentData::default());
+            let agent_id = guard
+                .try_spawn_agent(AgentData::default())
+                .expect("spawn GPUI inspection agent");
             guard
                 .bind_agent_brain(agent_id, family)
                 .expect("bind GPUI inspection brain");
