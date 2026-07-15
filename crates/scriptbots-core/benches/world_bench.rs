@@ -2225,10 +2225,7 @@ fn synthetic_repetition(
         total_step_elapsed_ns,
         total_tps,
         median_window_tps: window_tps,
-        snapshot_ns: vec![
-            snapshot_p95_ns;
-            PERF_TICKS * PERF_SNAPSHOT_SAMPLES_PER_TICK
-        ],
+        snapshot_ns: vec![snapshot_p95_ns; PERF_TICKS * PERF_SNAPSHOT_SAMPLES_PER_TICK],
         snapshot_p50_ns: snapshot_p95_ns,
         snapshot_p95_ns,
         snapshot_max_ns: snapshot_p95_ns,
@@ -2467,10 +2464,7 @@ fn run_self_test() -> GateResult<()> {
     let snapshot_noise = [920_000, 1_000_000, 1_000_000, 1_000_000, 1_080_000];
     let mut snapshot_noisy_candidate =
         synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
-    replace_synthetic_snapshot_runs(
-        &mut snapshot_noisy_candidate.scenarios[0],
-        snapshot_noise,
-    );
+    replace_synthetic_snapshot_runs(&mut snapshot_noisy_candidate.scenarios[0], snapshot_noise);
     assert_self_test_status(
         "snapshot-only high-CV candidate is advisory",
         &compare_artifacts(&baseline, &snapshot_noisy_candidate),
@@ -2479,8 +2473,7 @@ fn run_self_test() -> GateResult<()> {
 
     let mut snapshot_noisy_baseline = baseline.clone();
     replace_synthetic_snapshot_runs(&mut snapshot_noisy_baseline.scenarios[0], snapshot_noise);
-    let stable_candidate =
-        synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
+    let stable_candidate = synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
     assert_self_test_status(
         "snapshot-only high-CV baseline is refused",
         &compare_artifacts(&snapshot_noisy_baseline, &stable_candidate),
