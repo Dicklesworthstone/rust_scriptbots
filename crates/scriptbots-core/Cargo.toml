@@ -25,6 +25,9 @@ serde_json = { workspace = true }
 postcard = { workspace = true }
 wide = { version = "1.5.0", default-features = false, optional = true }
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom02 = { workspace = true, features = ["js"] }
+
 [dev-dependencies]
 criterion = { version = "0.7.0", default-features = false, features = ["html_reports"] }
 scriptbots-brain = { path = "../scriptbots-brain", default-features = false, features = ["mlp"] }
