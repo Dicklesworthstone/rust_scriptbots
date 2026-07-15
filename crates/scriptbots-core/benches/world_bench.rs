@@ -1349,7 +1349,7 @@ struct PerfVerdict {
 
 fn scenario_id(agents: usize, brain_family: GateBrainFamily, ticks: usize) -> String {
     format!(
-        "agents-{agents}__brain-{}__ticks-{ticks}__snapshot-dynamic-v1",
+        "agents-{agents}__brain-{}__ticks-{ticks}__snapshot-dynamic-v2",
         brain_family.scenario_slug()
     )
 }

@@ -2225,15 +2225,12 @@ guard at `0.3.6`, the 32-package franken license audit, the authoritative 62-cra
 and the standalone default-feature `scriptbots-runtime` `wasm32-unknown-unknown` check on exact
 source `5b1a5a8d6c8d7629c3822712e59361e3fa9014e0`.
 
-#### 2.6 canonical snapshot hub and projections [Complete — bd-2z0.4.7, DSR run `run-1784102138-21288`, 2026-07-15]
+#### 2.6 canonical snapshot hub [Complete — bd-2z0.4.7, DSR run `run-1784102138-21288`, 2026-07-15]
 
 - current summary;
 - revisioned static layers;
 - compact dynamic agents;
 - multi-subscriber latest-value `Arc`/watch semantics with independent cursors;
-- selected detail and viewport projection as per-client pure requests or keyed broker state, never one global camera/selection;
-- sequenced scientific-event journal with explicit UI lag/catch-up behavior;
-- projection perf metrics.
 
 **Exit:** stalled readers remain bounded and snapshot publication does not alter world digest.
 
@@ -2246,6 +2243,28 @@ passed the Asupersync 0.3.6 single-universe guard, 32-package franken license au
 authoritative 62-crate WASM graph guard, and standalone default-feature
 `scriptbots-runtime` `wasm32-unknown-unknown` check on source
 `96e51093e3066f817d60fd45882a2fec6285665e`.
+
+#### 2.6a per-client projections and sequenced event journal [Currently In Progress — bd-2z0.4.8, TopazCastle, 2026-07-15]
+
+- selected detail and viewport projection as per-client pure requests or keyed broker state, never one global camera/selection;
+- sequenced scientific-event journal with explicit UI lag/catch-up behavior;
+- bounded keyed-cache, canvas, top-K, chart, fanout, and event-ring metrics;
+- this milestone provides the renderer-neutral vitals/kinematics detail substrate; selected senses,
+  outputs, activation layers, and ancestry remain demand-driven work in `bd-2z0.3.8`;
+- this milestone freezes and tests the event-reader contract plus live-memory implementation;
+  production FrankenSQLite file admission, restart recovery, and crash-durability proof remain in
+  the explicitly dependent `bd-2z0.4.10`;
+- existing renderer-specific selection paths migrate onto this contract in frontend beads
+  `bd-2z0.6.4` and `bd-2z0.7.5`.
+
+**Exit:** distinct clients produce deterministic isolated projections without changing host/world
+revisions or digests; event cursors return contiguous bounded pages or exact gaps; pending records
+pin the hot ring before loss; live-memory catch-up, unavailable truncation, reconnect, shutdown,
+and detached readers are covered; slow readers retain no per-client queue; 1k/10k projection and
+event-ring scaling are measured under explicit DSR budgets.
+
+**Completion evidence:** pending the exact-source DSR batch-verification and reference-hardware
+projection/event measurement run for `bd-2z0.4.8`.
 
 #### 2.7 control/server migration
 

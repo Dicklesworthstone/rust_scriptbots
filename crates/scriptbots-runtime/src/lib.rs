@@ -10,12 +10,19 @@
 
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    BirthRecord, DeathRecord, DynamicWorldSnapshot, HydrologyFlowDirection, PersistenceBatch,
-    ResourceLedgerTick, ScriptBotsConfig, SelectionUpdate, TerrainKind, Tick, TickCombatSummary,
-    TickEvents, TickSummary,
+    AgentUid, BirthRecord, DeathRecord, DynamicAgentSnapshot, DynamicWorldSnapshot, Generation,
+    HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScriptBotsConfig, TerrainKind,
+    Tick, TickCombatSummary, TickEvents, TickSummary,
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt, sync::Arc};
+use std::{
+    any::Any,
+    cmp::Ordering,
+    collections::{BinaryHeap, VecDeque},
+    fmt,
+    mem::size_of,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 
 mod serde_arc {
@@ -66,6 +73,9 @@ mod serde_optional_arc {
 
 mod host_core;
 mod native;
+
+const MAX_EVENT_PAGE_SIZE: usize = 4_096;
+const DEFAULT_PROJECTION_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 pub use host_core::{
     HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, VolatileJournal,
@@ -232,8 +242,16 @@ monotonic_newtype!(
     LayerRevision
 );
 monotonic_newtype!(
-    /// Sequence number in the ordered host event stream.
+    /// Sequence number in the lossless scientific-event stream.
     EventSequence
+);
+monotonic_newtype!(
+    /// Sequence number in the bounded ephemeral host-notification stream.
+    ProtocolEventSequence
+);
+monotonic_newtype!(
+    /// Stable frontend identity used only to isolate presentation projections.
+    ProjectionClientId
 );
 
 /// Monotonic time supplied by a deterministic or browser-owned driver.
@@ -419,6 +437,8 @@ pub struct SnapshotLayers {
 pub struct SnapshotBuildStats {
     /// Dynamic agents copied into this publication.
     pub dynamic_agent_count: usize,
+    /// Bounded tick summaries copied into the projection history.
+    pub summary_history_count: usize,
     /// Bulk vector allocations created by this build.
     pub bulk_allocations: usize,
     /// Capacity bytes newly allocated for dynamic agents and changed layers.
@@ -450,12 +470,862 @@ pub struct RenderSnapshot {
     pub last_applied_command: Option<CommandId>,
     /// Exact latest completed `StepOutcome` summary; absent before the first completed tick.
     pub completed_summary: Option<TickSummary>,
+    /// Bounded scientific summary history used by pure per-client chart projections.
+    #[serde(with = "serde_arc")]
+    pub summary_history: Arc<Vec<TickSummary>>,
     /// Content-revisioned Arc-shared terrain, food, and hydrology payloads.
     pub layers: SnapshotLayers,
     /// Deterministic payload allocation and byte accounting.
     pub build: SnapshotBuildStats,
     /// Compact renderer-neutral dynamic world projection.
     pub world: DynamicWorldSnapshot,
+}
+
+/// Hard bounds applied before a renderer-neutral projection allocates output buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionLimits {
+    /// Maximum logical canvas cells in one request.
+    pub max_canvas_cells: u32,
+    /// Maximum stable agent identities carried by one client selection.
+    pub max_selected_agents: u16,
+    /// Maximum points emitted by one chart window.
+    pub max_chart_points: u16,
+    /// Maximum agents retained by one top-K panel.
+    pub max_top_k: u16,
+    /// Maximum visible-agent records emitted by one viewport.
+    pub max_visible_agents: u32,
+}
+
+impl Default for ProjectionLimits {
+    fn default() -> Self {
+        Self {
+            max_canvas_cells: 1_048_576,
+            max_selected_agents: 256,
+            max_chart_points: 4_096,
+            max_top_k: 1_024,
+            max_visible_agents: 100_000,
+        }
+    }
+}
+
+/// Logical viewport dimensions independent of a concrete graphics toolkit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionViewport {
+    /// Logical output width in cells or pixels.
+    pub width: u32,
+    /// Logical output height in cells or pixels.
+    pub height: u32,
+}
+
+/// World-space camera used by the pure projection transform.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionCamera {
+    /// Camera center in world coordinates.
+    pub center: [f32; 2],
+    /// Positive finite magnification; `1.0` fits the whole world.
+    pub zoom: f32,
+}
+
+/// Client-owned selection that never mutates scientific or global host state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionSelection {
+    /// Primary agent shown by an inspector, when present in the source snapshot.
+    pub focused: Option<AgentUid>,
+    /// Client-local selected identities.
+    pub selected: Vec<AgentUid>,
+}
+
+/// Amount of compact per-agent detail requested for visible and selected agents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionDetail {
+    /// Position and display identity only.
+    #[default]
+    Minimal,
+    /// Include health, energy, age, generation, diet tendency, and brain key.
+    Vitals,
+    /// Include vitals plus velocity, heading, spike extension, and boost state.
+    Kinematics,
+}
+
+/// Scalar used by one bounded top-K projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionRanking {
+    /// Rank by current runtime energy.
+    #[default]
+    Energy,
+    /// Rank by current health.
+    Health,
+    /// Rank by completed scientific age.
+    Age,
+    /// Rank by lineage generation.
+    Generation,
+}
+
+/// Complete normalized presentation request for one client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionRequest {
+    /// Stable identity used for cache isolation and accounting only.
+    pub client_id: ProjectionClientId,
+    /// Logical output dimensions.
+    pub viewport: ProjectionViewport,
+    /// World-space camera.
+    pub camera: ProjectionCamera,
+    /// Client-local focus and selection.
+    pub selection: ProjectionSelection,
+    /// Requested compact detail level.
+    pub detail: ProjectionDetail,
+    /// Number of most-recent summaries eligible for the chart.
+    pub chart_window: u32,
+    /// Maximum downsampled points emitted for the chart.
+    pub chart_points: u16,
+    /// Maximum agents emitted by the ranking panel.
+    pub top_k: u16,
+    /// Ranking used by the top-K panel.
+    pub ranking: ProjectionRanking,
+}
+
+/// Source identity included in every projection and cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionSourceKey {
+    /// Host session that owns the source snapshot.
+    pub session_id: HostSessionId,
+    /// Immutable snapshot publication revision.
+    pub snapshot: SnapshotRevision,
+    /// Independent host revision domains.
+    pub host: HostRevisions,
+    /// Independent static-layer content revisions.
+    pub layers: SnapshotLayerRevisions,
+}
+
+/// Pure world-to-canvas transform returned for frontend reuse and picking.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionTransform {
+    /// Camera center used after finite-zero canonicalization.
+    pub center: [f32; 2],
+    /// World units visible across the logical canvas.
+    pub visible_world: [f32; 2],
+    /// Logical output dimensions.
+    pub viewport: ProjectionViewport,
+    /// Logical cells per world unit.
+    pub scale: f32,
+}
+
+/// Optional compact vitals and kinematics for one projected agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedAgentDetail {
+    /// Current health.
+    pub health: f32,
+    /// Current runtime energy.
+    pub energy: f32,
+    /// Completed scientific age.
+    pub age: u32,
+    /// Heritable lineage generation.
+    pub generation: Generation,
+    /// Continuous diet tendency.
+    pub herbivore_tendency: f32,
+    /// Stable brain-registry key when present.
+    pub brain_key: Option<u64>,
+    /// Velocity when kinematics were requested.
+    pub velocity: Option<[f32; 2]>,
+    /// Heading when kinematics were requested.
+    pub heading: Option<f32>,
+    /// Spike extension when kinematics were requested.
+    pub spike_length: Option<f32>,
+    /// Movement boost state when kinematics were requested.
+    pub boost: Option<bool>,
+}
+
+/// One compact visible agent projected into logical canvas coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedAgent {
+    /// Stable logical identity used by client-local selection.
+    pub uid: AgentUid,
+    /// Transient generational handle retained for live control adapters.
+    pub handle: u64,
+    /// World-space position from the immutable source.
+    pub world_position: [f32; 2],
+    /// Logical canvas position.
+    pub canvas_position: [f64; 2],
+    /// Toroidal image offset chosen relative to the camera.
+    pub wrap_offset: [f64; 2],
+    /// Renderer-neutral linear RGB color.
+    pub color: [f32; 3],
+    /// Whether this client selected the agent.
+    pub selected: bool,
+    /// Whether this is the client's primary focused agent.
+    pub focused: bool,
+    /// Optional requested detail.
+    pub detail: Option<ProjectedAgentDetail>,
+}
+
+/// Aggregate for one logical canvas cell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionCell {
+    /// Agents projected into this cell.
+    pub agent_count: u32,
+    /// Sum of current energy in this cell.
+    pub total_energy: f32,
+    /// Sum of current health in this cell.
+    pub total_health: f32,
+}
+
+/// One entry in a deterministic bounded ranking panel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedRankingEntry {
+    /// Stable logical identity.
+    pub uid: AgentUid,
+    /// Ranked scalar value.
+    pub value: f64,
+}
+
+#[derive(Debug)]
+struct RankingHeapEntry(ProjectedRankingEntry);
+
+impl PartialEq for RankingHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.uid == other.0.uid && self.0.value.total_cmp(&other.0.value).is_eq()
+    }
+}
+
+impl Eq for RankingHeapEntry {}
+
+impl PartialOrd for RankingHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankingHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .value
+            .total_cmp(&other.0.value)
+            .reverse()
+            .then_with(|| self.0.uid.cmp(&other.0.uid))
+    }
+}
+
+/// Structural allocation and scaling evidence for one pure projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionBuildStats {
+    /// Source agents examined exactly once.
+    pub agents_examined: usize,
+    /// Visible agents emitted.
+    pub visible_agents: usize,
+    /// Client-selected agents emitted, including offscreen selections.
+    pub selected_agents: usize,
+    /// Logical canvas cells allocated.
+    pub canvas_cells: usize,
+    /// Maximum elements held by the bounded top-K scratch/output.
+    pub top_k_peak: usize,
+    /// Source history samples examined for the requested window.
+    pub chart_samples_examined: usize,
+    /// Downsampled chart points emitted.
+    pub chart_points_emitted: usize,
+    /// Capacity bytes owned by bulk projection vectors.
+    pub output_capacity_bytes: usize,
+}
+
+/// Complete deterministic renderer-neutral projection for one client request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientProjection {
+    /// Exact immutable source identity.
+    pub source: ProjectionSourceKey,
+    /// Canonical validated request used to build this result.
+    pub request: ProjectionRequest,
+    /// World-to-canvas transform.
+    pub transform: ProjectionTransform,
+    /// Visible agents in deterministic source order.
+    pub visible_agents: Vec<ProjectedAgent>,
+    /// Client-selected agents in deterministic source order, including offscreen selections.
+    pub selected_agents: Vec<ProjectedAgent>,
+    /// Dense row-major logical canvas aggregates.
+    pub cells: Vec<ProjectionCell>,
+    /// Requested focused-agent detail, or `None` when absent/unrequested.
+    pub focused_agent: Option<ProjectedAgent>,
+    /// Deterministic bounded ranking.
+    pub top_agents: Vec<ProjectedRankingEntry>,
+    /// Deterministically downsampled recent scientific summaries.
+    pub chart: Vec<TickSummary>,
+    /// Whether the requested chart window began before retained source history.
+    pub chart_truncated: bool,
+    /// Structural resource evidence.
+    pub build: ProjectionBuildStats,
+}
+
+/// Validation or bounded-allocation failure for a projection request.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProjectionError {
+    /// One camera field was non-finite or zoom was not positive.
+    #[error("projection camera must have finite coordinates and positive finite zoom")]
+    InvalidCamera,
+    /// A zero-sized viewport was requested.
+    #[error("projection viewport dimensions must both be nonzero")]
+    EmptyViewport,
+    /// The immutable source declared a zero-sized world.
+    #[error("projection source world dimensions must both be nonzero")]
+    InvalidSourceDimensions,
+    /// Finite inputs produced an unrepresentable world-to-canvas scale.
+    #[error("projection camera and viewport must produce a finite positive scale")]
+    ScaleOutOfRange,
+    /// Canvas area exceeded its declared bound or integer domain.
+    #[error("projection canvas requires {requested} cells, exceeding limit {limit}")]
+    CanvasTooLarge {
+        /// Requested logical cells.
+        requested: u64,
+        /// Configured maximum logical cells.
+        limit: u32,
+    },
+    /// Client selection exceeded its declared bound.
+    #[error("projection selection contains {requested} identities, exceeding limit {limit}")]
+    SelectionTooLarge {
+        /// Requested identities before canonical deduplication.
+        requested: usize,
+        /// Configured maximum identities.
+        limit: u16,
+    },
+    /// Chart output exceeded its declared bound.
+    #[error("projection chart requests {requested} points, exceeding limit {limit}")]
+    ChartTooLarge {
+        /// Requested output points.
+        requested: u16,
+        /// Configured maximum output points.
+        limit: u16,
+    },
+    /// Ranking output exceeded its declared bound.
+    #[error("projection top-K requests {requested} agents, exceeding limit {limit}")]
+    TopKTooLarge {
+        /// Requested retained agents.
+        requested: u16,
+        /// Configured maximum retained agents.
+        limit: u16,
+    },
+    /// Visible output exceeded its declared bound.
+    #[error("projection emitted more than {limit} visible agents")]
+    VisibleAgentsTooLarge {
+        /// Configured maximum visible records.
+        limit: u32,
+    },
+    /// A bounded keyed cache was constructed with zero capacity.
+    #[error("projection cache capacity must be nonzero")]
+    EmptyCache,
+    /// A bounded keyed cache was constructed without any retained-payload budget.
+    #[error("projection cache byte capacity must be nonzero")]
+    EmptyCacheByteCapacity,
+}
+
+const fn canonical_f32(value: f32) -> f32 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
+fn normalize_projection_request(
+    request: &ProjectionRequest,
+    limits: ProjectionLimits,
+) -> Result<ProjectionRequest, ProjectionError> {
+    if request.viewport.width == 0 || request.viewport.height == 0 {
+        return Err(ProjectionError::EmptyViewport);
+    }
+    let canvas_cells = u64::from(request.viewport.width)
+        .checked_mul(u64::from(request.viewport.height))
+        .unwrap_or(u64::MAX);
+    if canvas_cells > u64::from(limits.max_canvas_cells) {
+        return Err(ProjectionError::CanvasTooLarge {
+            requested: canvas_cells,
+            limit: limits.max_canvas_cells,
+        });
+    }
+    if !request.camera.center.iter().all(|value| value.is_finite())
+        || !request.camera.zoom.is_finite()
+        || request.camera.zoom <= 0.0
+    {
+        return Err(ProjectionError::InvalidCamera);
+    }
+    if request.chart_points > limits.max_chart_points {
+        return Err(ProjectionError::ChartTooLarge {
+            requested: request.chart_points,
+            limit: limits.max_chart_points,
+        });
+    }
+    if request.top_k > limits.max_top_k {
+        return Err(ProjectionError::TopKTooLarge {
+            requested: request.top_k,
+            limit: limits.max_top_k,
+        });
+    }
+    if request.selection.selected.len() > usize::from(limits.max_selected_agents) {
+        return Err(ProjectionError::SelectionTooLarge {
+            requested: request.selection.selected.len(),
+            limit: limits.max_selected_agents,
+        });
+    }
+    let mut normalized = request.clone();
+    normalized.camera.center = normalized.camera.center.map(canonical_f32);
+    normalized.camera.zoom = canonical_f32(normalized.camera.zoom);
+    normalized.selection.selected.sort_unstable();
+    normalized.selection.selected.dedup();
+    Ok(normalized)
+}
+
+fn projection_source_key(snapshot: &RenderSnapshot) -> ProjectionSourceKey {
+    ProjectionSourceKey {
+        session_id: snapshot.session_id,
+        snapshot: snapshot.revision,
+        host: snapshot.revisions,
+        layers: snapshot.layers.revisions,
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the wrapped delta is bounded to one f32 world extent before conversion"
+)]
+fn nearest_wrapped_delta(position: f32, center: f32, extent: f32) -> (f32, f64) {
+    let raw = f64::from(position) - f64::from(center);
+    let extent = f64::from(extent);
+    let half = extent * 0.5;
+    let wrapped = (raw + half).rem_euclid(extent) - half;
+    (wrapped as f32, canonical_f64(wrapped - raw))
+}
+
+const fn canonical_f64(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
+fn projected_detail(
+    agent: &DynamicAgentSnapshot,
+    detail: ProjectionDetail,
+) -> Option<ProjectedAgentDetail> {
+    if detail == ProjectionDetail::Minimal {
+        return None;
+    }
+    let kinematics = detail == ProjectionDetail::Kinematics;
+    Some(ProjectedAgentDetail {
+        health: agent.health,
+        energy: agent.energy,
+        age: agent.age,
+        generation: agent.generation,
+        herbivore_tendency: agent.herbivore_tendency,
+        brain_key: agent.brain_key,
+        velocity: kinematics.then_some(agent.velocity),
+        heading: kinematics.then_some(agent.heading),
+        spike_length: kinematics.then_some(agent.spike_length),
+        boost: kinematics.then_some(agent.boost),
+    })
+}
+
+fn ranking_value(agent: &DynamicAgentSnapshot, ranking: ProjectionRanking) -> f64 {
+    match ranking {
+        ProjectionRanking::Energy => f64::from(agent.energy),
+        ProjectionRanking::Health => f64::from(agent.health),
+        ProjectionRanking::Age => f64::from(agent.age),
+        ProjectionRanking::Generation => f64::from(agent.generation.0),
+    }
+}
+
+fn build_chart(snapshot: &RenderSnapshot, window: u32, points: u16) -> (Vec<TickSummary>, bool, usize) {
+    if window == 0 || points == 0 || snapshot.summary_history.is_empty() {
+        return (Vec::new(), false, 0);
+    }
+    let requested_window = usize::try_from(window).unwrap_or(usize::MAX);
+    let retained = snapshot.summary_history.len();
+    let examined = retained.min(requested_window);
+    let start = retained.saturating_sub(examined);
+    let source = &snapshot.summary_history[start..];
+    let point_limit = usize::from(points).min(source.len());
+    let mut chart = Vec::with_capacity(point_limit);
+    match point_limit {
+        0 => {}
+        1 => chart.push(source[source.len() - 1].clone()),
+        count if count == source.len() => chart.extend_from_slice(source),
+        count => {
+            for output_index in 0..count {
+                let source_index = output_index * (source.len() - 1) / (count - 1);
+                chart.push(source[source_index].clone());
+            }
+        }
+    }
+    (chart, requested_window > retained, examined)
+}
+
+/// Build one deterministic projection from an immutable source and client-owned request.
+///
+/// # Errors
+///
+/// Returns [`ProjectionError`] before oversized or invalid output is allocated.
+pub fn project_snapshot(
+    snapshot: &RenderSnapshot,
+    request: &ProjectionRequest,
+    limits: ProjectionLimits,
+) -> Result<ClientProjection, ProjectionError> {
+    let request = normalize_projection_request(request, limits)?;
+    project_normalized_snapshot(snapshot, request, limits)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    reason = "renderer dimensions intentionally narrow into validated presentation coordinates while one pass keeps projection bounds auditable"
+)]
+fn project_normalized_snapshot(
+    snapshot: &RenderSnapshot,
+    request: ProjectionRequest,
+    limits: ProjectionLimits,
+) -> Result<ClientProjection, ProjectionError> {
+    if snapshot.world.world.width == 0 || snapshot.world.world.height == 0 {
+        return Err(ProjectionError::InvalidSourceDimensions);
+    }
+    let world_width = snapshot.world.world.width as f32;
+    let world_height = snapshot.world.world.height as f32;
+    let viewport_width = request.viewport.width as f32;
+    let viewport_height = request.viewport.height as f32;
+    let base_scale = (viewport_width / world_width).min(viewport_height / world_height);
+    let scale = base_scale * request.camera.zoom;
+    let visible_world = [viewport_width / scale, viewport_height / scale];
+    if !scale.is_finite()
+        || scale <= 0.0
+        || !visible_world.iter().all(|extent| extent.is_finite())
+    {
+        return Err(ProjectionError::ScaleOutOfRange);
+    }
+    let transform = ProjectionTransform {
+        center: request.camera.center,
+        visible_world,
+        viewport: request.viewport,
+        scale,
+    };
+    let canvas_len = usize::try_from(
+        u64::from(request.viewport.width) * u64::from(request.viewport.height),
+    )
+    .map_err(|_| ProjectionError::CanvasTooLarge {
+        requested: u64::from(request.viewport.width) * u64::from(request.viewport.height),
+        limit: limits.max_canvas_cells,
+    })?;
+    let mut cells = vec![ProjectionCell::default(); canvas_len];
+    let selected = &request.selection.selected;
+    let mut visible_agents = Vec::new();
+    let mut selected_agents = Vec::with_capacity(selected.len());
+    let mut focused_agent = None;
+    let top_k = usize::from(request.top_k);
+    let mut top_heap = BinaryHeap::with_capacity(top_k);
+
+    for agent in &snapshot.world.agents {
+        let candidate = RankingHeapEntry(ProjectedRankingEntry {
+            uid: agent.uid,
+            value: ranking_value(agent, request.ranking),
+        });
+        if top_k != 0 {
+            if top_heap.len() < top_k {
+                top_heap.push(candidate);
+            } else if top_heap
+                .peek()
+                .is_some_and(|worst| candidate.cmp(worst).is_lt())
+            {
+                top_heap.pop();
+                top_heap.push(candidate);
+            }
+        }
+
+        let (delta_x, wrap_x) = nearest_wrapped_delta(
+            agent.position[0],
+            request.camera.center[0],
+            world_width,
+        );
+        let (delta_y, wrap_y) = nearest_wrapped_delta(
+            agent.position[1],
+            request.camera.center[1],
+            world_height,
+        );
+        let canvas_x = f64::from(viewport_width) * 0.5
+            + f64::from(delta_x) * f64::from(scale);
+        let canvas_y = f64::from(viewport_height) * 0.5
+            + f64::from(delta_y) * f64::from(scale);
+        let is_selected = selected.binary_search(&agent.uid).is_ok();
+        let is_focused = request.selection.focused == Some(agent.uid);
+        let projected = ProjectedAgent {
+            uid: agent.uid,
+            handle: agent.id,
+            world_position: agent.position,
+            canvas_position: [canvas_x, canvas_y],
+            wrap_offset: [wrap_x, wrap_y],
+            color: agent.color,
+            selected: is_selected,
+            focused: is_focused,
+            detail: projected_detail(agent, request.detail),
+        };
+        if is_focused {
+            focused_agent = Some(projected.clone());
+        }
+        if is_selected {
+            selected_agents.push(projected.clone());
+        }
+        if !(0.0..f64::from(viewport_width)).contains(&canvas_x)
+            || !(0.0..f64::from(viewport_height)).contains(&canvas_y)
+        {
+            continue;
+        }
+        if visible_agents.len()
+            >= usize::try_from(limits.max_visible_agents).unwrap_or(usize::MAX)
+        {
+            return Err(ProjectionError::VisibleAgentsTooLarge {
+                limit: limits.max_visible_agents,
+            });
+        }
+        let cell_x = (canvas_x.floor() as u32).min(request.viewport.width - 1);
+        let cell_y = (canvas_y.floor() as u32).min(request.viewport.height - 1);
+        let cell_index_u64 =
+            u64::from(cell_y) * u64::from(request.viewport.width) + u64::from(cell_x);
+        let cell_index = usize::try_from(cell_index_u64).map_err(|_| {
+            ProjectionError::CanvasTooLarge {
+                requested: cell_index_u64.saturating_add(1),
+                limit: limits.max_canvas_cells,
+            }
+        })?;
+        let cell = cells
+            .get_mut(cell_index)
+            .ok_or(ProjectionError::CanvasTooLarge {
+                requested: cell_index_u64.saturating_add(1),
+                limit: limits.max_canvas_cells,
+            })?;
+        cell.agent_count = cell.agent_count.saturating_add(1);
+        cell.total_energy += agent.energy;
+        cell.total_health += agent.health;
+        visible_agents.push(projected);
+    }
+
+    let mut top_heap = top_heap.into_vec();
+    top_heap.sort_unstable();
+    let top_agents = top_heap
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect::<Vec<_>>();
+    let (chart, chart_truncated, chart_samples_examined) =
+        build_chart(snapshot, request.chart_window, request.chart_points);
+    let output_capacity_bytes = visible_agents
+        .capacity()
+        .saturating_mul(size_of::<ProjectedAgent>())
+        .saturating_add(
+            selected_agents
+                .capacity()
+                .saturating_mul(size_of::<ProjectedAgent>()),
+        )
+        .saturating_add(cells.capacity().saturating_mul(size_of::<ProjectionCell>()))
+        .saturating_add(
+            top_agents
+                .capacity()
+                .saturating_mul(size_of::<ProjectedRankingEntry>()),
+        )
+        .saturating_add(chart.capacity().saturating_mul(size_of::<TickSummary>()))
+        .saturating_add(
+            request
+                .selection
+                .selected
+                .capacity()
+                .saturating_mul(size_of::<AgentUid>()),
+        );
+    Ok(ClientProjection {
+        source: projection_source_key(snapshot),
+        request,
+        transform,
+        build: ProjectionBuildStats {
+            agents_examined: snapshot.world.agents.len(),
+            visible_agents: visible_agents.len(),
+            selected_agents: selected_agents.len(),
+            canvas_cells: cells.len(),
+            top_k_peak: top_agents.len(),
+            chart_samples_examined,
+            chart_points_emitted: chart.len(),
+            output_capacity_bytes,
+        },
+        visible_agents,
+        selected_agents,
+        cells,
+        focused_agent,
+        top_agents,
+        chart,
+        chart_truncated,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ProjectionCacheIdentity {
+    source: ProjectionSourceKey,
+    request: ProjectionRequest,
+    limits: ProjectionLimits,
+}
+
+#[derive(Debug)]
+struct ProjectionCacheEntry {
+    source: ProjectionSourceKey,
+    limits: ProjectionLimits,
+    projection: Arc<ClientProjection>,
+}
+
+/// Bounded keyed cache over the pure [`project_snapshot`] function.
+pub struct ProjectionBroker {
+    capacity: usize,
+    byte_capacity: usize,
+    retained_output_capacity_bytes: usize,
+    entries: VecDeque<ProjectionCacheEntry>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    uncached_oversize: u64,
+}
+
+impl ProjectionBroker {
+    /// Construct a cache retaining at most `capacity` complete projections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::EmptyCache`] when `capacity` is zero.
+    pub fn new(capacity: usize) -> Result<Self, ProjectionError> {
+        Self::with_byte_capacity(capacity, DEFAULT_PROJECTION_CACHE_BYTES)
+    }
+
+    /// Construct an entry- and bulk-payload-byte-bounded projection cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed construction error when either bound is zero.
+    pub fn with_byte_capacity(
+        capacity: usize,
+        byte_capacity: usize,
+    ) -> Result<Self, ProjectionError> {
+        if capacity == 0 {
+            return Err(ProjectionError::EmptyCache);
+        }
+        if byte_capacity == 0 {
+            return Err(ProjectionError::EmptyCacheByteCapacity);
+        }
+        Ok(Self {
+            capacity,
+            byte_capacity,
+            retained_output_capacity_bytes: 0,
+            entries: VecDeque::with_capacity(capacity),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            uncached_oversize: 0,
+        })
+    }
+
+    /// Return a pointer-reused exact hit or build and insert one pure projection.
+    ///
+    /// # Errors
+    ///
+    /// Propagates request validation and bounded-allocation errors.
+    pub fn project(
+        &mut self,
+        snapshot: &RenderSnapshot,
+        request: &ProjectionRequest,
+        limits: ProjectionLimits,
+    ) -> Result<Arc<ClientProjection>, ProjectionError> {
+        let normalized = normalize_projection_request(request, limits)?;
+        let identity = ProjectionCacheIdentity {
+            source: projection_source_key(snapshot),
+            request: normalized,
+            limits,
+        };
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry.source == identity.source
+                && entry.limits == identity.limits
+                && entry.projection.request == identity.request
+        })
+            && let Some(entry) = self.entries.remove(index)
+        {
+            let projection = Arc::clone(&entry.projection);
+            self.entries.push_back(entry);
+            self.hits = self.hits.saturating_add(1);
+            return Ok(projection);
+        }
+        let projection = Arc::new(project_normalized_snapshot(
+            snapshot,
+            identity.request.clone(),
+            identity.limits,
+        )?);
+        let projection_bytes = projection.build.output_capacity_bytes;
+        self.misses = self.misses.saturating_add(1);
+        if projection_bytes > self.byte_capacity {
+            self.uncached_oversize = self.uncached_oversize.saturating_add(1);
+            return Ok(projection);
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= self.capacity
+                || self
+                    .retained_output_capacity_bytes
+                    .saturating_add(projection_bytes)
+                    > self.byte_capacity)
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.retained_output_capacity_bytes = self
+                .retained_output_capacity_bytes
+                .saturating_sub(evicted.projection.build.output_capacity_bytes);
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        self.retained_output_capacity_bytes = self
+            .retained_output_capacity_bytes
+            .saturating_add(projection_bytes);
+        self.entries.push_back(ProjectionCacheEntry {
+            source: identity.source,
+            limits: identity.limits,
+            projection: Arc::clone(&projection),
+        });
+        Ok(projection)
+    }
+
+    /// Current retained cache entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this broker retains no projection.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Exact cache-hit count.
+    #[must_use]
+    pub const fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Exact cache-miss count.
+    #[must_use]
+    pub const fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Exact bounded-entry eviction count.
+    #[must_use]
+    pub const fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Cache misses returned without retention because one result exceeded the byte budget.
+    #[must_use]
+    pub const fn uncached_oversize(&self) -> u64 {
+        self.uncached_oversize
+    }
+
+    /// Configured upper bound for retained bulk projection payloads.
+    #[must_use]
+    pub const fn byte_capacity(&self) -> usize {
+        self.byte_capacity
+    }
+
+    /// Sum of structural bulk-vector capacities retained by cached results.
+    #[must_use]
+    pub const fn retained_output_capacity_bytes(&self) -> usize {
+        self.retained_output_capacity_bytes
+    }
 }
 
 /// Cloneable, thread-safe latest-value read handle for render snapshots.
@@ -562,8 +1432,6 @@ pub enum HostCommand {
     Step,
     /// Atomically replace the active simulation configuration.
     UpdateConfig(Box<ScriptBotsConfig>),
-    /// Update the selected-agent set at the next ordered command boundary.
-    UpdateSelection(SelectionUpdate),
     /// Begin orderly host shutdown.
     Shutdown,
 }
@@ -714,6 +1582,7 @@ pub enum JournalState {
 #[derive(Debug, Clone)]
 pub struct JournalBatch {
     id: JournalBatchId,
+    scientific_event_sequence: Option<EventSequence>,
     command: Option<CommandEnvelope>,
     applied: AppliedCommand,
     scientific: Option<Arc<ScientificBoundary>>,
@@ -726,7 +1595,7 @@ pub struct JournalBatch {
 /// runtime journal prevents disabled or deferred persistence cadence from
 /// silently erasing births, deaths, combat, resource, summary, or tick-event
 /// evidence.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScientificBoundary {
     events: TickEvents,
     summary: TickSummary,
@@ -739,7 +1608,7 @@ pub struct ScientificBoundary {
 }
 
 /// Durable runtime-neutral record of a fault discovered after science completed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScientificBoundaryFault {
     code: String,
     message: String,
@@ -851,8 +1720,9 @@ impl ScientificBoundary {
 impl JournalBatch {
     /// Construct one exact journal batch at an already-completed boundary.
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         id: JournalBatchId,
+        scientific_event_sequence: Option<EventSequence>,
         command: Option<CommandEnvelope>,
         applied: AppliedCommand,
         scientific: Option<Arc<ScientificBoundary>>,
@@ -860,6 +1730,7 @@ impl JournalBatch {
     ) -> Self {
         Self {
             id,
+            scientific_event_sequence,
             command,
             applied,
             scientific,
@@ -871,6 +1742,12 @@ impl JournalBatch {
     #[must_use]
     pub const fn id(&self) -> JournalBatchId {
         self.id
+    }
+
+    /// Canonical scientific-event sequence, present exactly for scientific boundaries.
+    #[must_use]
+    pub const fn scientific_event_sequence(&self) -> Option<EventSequence> {
+        self.scientific_event_sequence
     }
 
     /// Command id associated with this batch, or `None` for automatic science.
@@ -1014,6 +1891,15 @@ pub trait JournalPort {
     /// Poll at most `limit` acknowledgements without blocking.
     fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt>;
 
+    /// Optional detached capability for reconstructing evicted scientific-event records.
+    ///
+    /// A live-memory reader must never advertise crash durability. File-backed adapters added by
+    /// the storage integration return a crash-durable reader only after their durable watermark
+    /// covers the requested records.
+    fn event_reader(&self, _session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
+        None
+    }
+
     /// Commitment threshold that gates ordered host shutdown.
     ///
     /// This value must remain stable for the lifetime of a host. The durable
@@ -1048,12 +1934,43 @@ pub enum HostBlocker {
         /// Exact batch retained for retry or orderly failure handling.
         batch_id: JournalBatchId,
     },
+    /// Canonical scientific-event hot ring is pinned before a lossless eviction.
+    EventJournalHighWater {
+        /// Configured hot-ring capacity.
+        capacity: usize,
+        /// Currently pinned pending records.
+        pending: usize,
+        /// Oldest pending batch, when any pending record remains in the ring.
+        oldest_pending: Option<JournalBatchId>,
+        /// Exact batch at the pinned front, even when it is no longer pending.
+        pinned_batch: JournalBatchId,
+        /// Canonical sequence at the pinned front.
+        pinned_sequence: EventSequence,
+        /// Why the front cannot currently leave the hot ring.
+        reason: EventHighWaterReason,
+    },
     /// The host is draining an ordered shutdown boundary.
     LifecycleStopping,
     /// The host has completed shutdown and cannot advance science.
     LifecycleStopped,
     /// A latched scientific fault prevents a later transition.
     ScientificFault,
+}
+
+/// Exact reason a full scientific-event hot ring cannot evict its front record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventHighWaterReason {
+    /// The exact journal batch has not committed yet.
+    Pending,
+    /// The journal permanently failed the exact batch.
+    Failed,
+    /// No reader can reconstruct this non-durable record after eviction.
+    NoReader,
+    /// The observed commitment cannot satisfy the reader's advertised guarantee.
+    GuaranteeMismatch,
+    /// The reader's atomic retention snapshot does not contain the exact front sequence.
+    RangeUnavailable,
 }
 
 /// Scheduling interest derived from the sole-owner host state.
@@ -1312,11 +2229,13 @@ pub enum CommandValidationError {
     },
 }
 
-/// Ordered event emitted by the host protocol.
+/// Ordered ephemeral notification emitted by the host protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostEvent {
-    /// Total event order.
-    pub sequence: EventSequence,
+    /// Host session that emitted this notification.
+    pub session_id: HostSessionId,
+    /// Total notification order within one host session.
+    pub sequence: ProtocolEventSequence,
     /// Scientific tick visible when the event was emitted.
     pub tick: Tick,
     /// Event payload.
@@ -1335,30 +2254,903 @@ pub enum HostEventKind {
     HealthChanged(HostHealth),
 }
 
-/// Opaque client-side cursor into the host event stream.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Opaque cursor over bounded, reconstructibly lossy host notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolEventCursor {
+    session_id: HostSessionId,
+    last_seen: ProtocolEventSequence,
+}
+
+impl ProtocolEventCursor {
+    /// Start before the first notification in one host session.
+    #[must_use]
+    pub const fn beginning(session_id: HostSessionId) -> Self {
+        Self {
+            session_id,
+            last_seen: ProtocolEventSequence::new(0),
+        }
+    }
+
+    /// Resume after an already-observed notification.
+    #[must_use]
+    pub const fn after(session_id: HostSessionId, sequence: ProtocolEventSequence) -> Self {
+        Self { session_id, last_seen: sequence }
+    }
+
+    /// Bound host session.
+    #[must_use]
+    pub const fn session_id(self) -> HostSessionId {
+        self.session_id
+    }
+
+    /// Last notification observed through this cursor.
+    #[must_use]
+    pub const fn last_seen(self) -> ProtocolEventSequence {
+        self.last_seen
+    }
+}
+
+/// Commitment state paired with one immutable scientific-event record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum EventCommitment {
+    /// The exact journal batch has not reached a queryable commitment.
+    Pending,
+    /// The event is queryable only while its live in-memory journal survives.
+    CommittedVolatile,
+    /// The event is crash durable according to the configured journal contract.
+    Durable,
+    /// The journal can no longer commit this exact record.
+    Failed(JournalFailure),
+}
+
+/// Immutable canonical record for one completed scientific boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScientificEvent {
+    /// Host session that allocated this event.
+    pub session_id: HostSessionId,
+    /// Contiguous order among scientific boundaries only.
+    pub sequence: EventSequence,
+    /// Stable runtime-journal batch carrying the exact boundary.
+    pub batch_id: JournalBatchId,
+    /// Completed scientific tick.
+    pub tick: Tick,
+    /// Revisions captured at the boundary.
+    pub revisions: HostRevisions,
+    /// Exact complete engine-neutral scientific payload.
+    #[serde(with = "serde_arc")]
+    pub boundary: Arc<ScientificBoundary>,
+}
+
+/// One immutable event paired with current journal commitment knowledge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JournaledScientificEvent {
+    /// Exact immutable event allocation.
+    #[serde(with = "serde_arc")]
+    pub event: Arc<ScientificEvent>,
+    /// Current journal commitment observed by this page.
+    pub commitment: EventCommitment,
+}
+
+/// Inclusive contiguous scientific-event range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSequenceRange {
+    /// First available sequence.
+    pub first: EventSequence,
+    /// Last available sequence.
+    pub last: EventSequence,
+}
+
+impl EventSequenceRange {
+    /// Whether this inclusive range has at least one sequence.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.first.get() <= self.last.get()
+    }
+
+    /// Whether this valid range contains one sequence.
+    #[must_use]
+    pub const fn contains(self, sequence: EventSequence) -> bool {
+        self.is_valid()
+            && self.first.get() <= sequence.get()
+            && sequence.get() <= self.last.get()
+    }
+
+    /// Whether this valid range completely contains another valid range.
+    #[must_use]
+    pub const fn contains_range(self, other: Self) -> bool {
+        other.is_valid() && self.contains(other.first) && self.contains(other.last)
+    }
+}
+
+/// Strength of an adapter-neutral scientific-event catch-up source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventCatchUpGuarantee {
+    /// Queryability lasts only while the current in-memory journal survives.
+    LiveMemory,
+    /// Records are queryable after a writer/process restart.
+    CrashDurable,
+}
+
+/// Atomic journal-retention evidence used while the hot ring evicts one record.
+///
+/// The opaque retained allocation is deliberately not exposed. Holding this value proves that
+/// every sequence in [`Self::range`] remains physically retained for the snapshot lifetime, even
+/// if the journal writer publishes or compacts concurrently.
+#[derive(Clone)]
+pub struct EventRetentionSnapshot {
+    session_id: HostSessionId,
+    guarantee: EventCatchUpGuarantee,
+    range: EventSequenceRange,
+    _retained: Arc<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for EventRetentionSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventRetentionSnapshot")
+            .field("session_id", &self.session_id)
+            .field("guarantee", &self.guarantee)
+            .field("range", &self.range)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventRetentionSnapshot {
+    /// Construct atomic retention evidence over one immutable reader allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error when `range` is inverted.
+    pub fn try_new<T>(
+        session_id: HostSessionId,
+        guarantee: EventCatchUpGuarantee,
+        range: EventSequenceRange,
+        retained: Arc<T>,
+    ) -> Result<Self, HostAccessError>
+    where
+        T: Any + Send + Sync,
+    {
+        if !range.is_valid() {
+            return Err(protocol_violation(
+                "event retention snapshot range must be nonempty and ordered",
+            ));
+        }
+        Ok(Self {
+            session_id,
+            guarantee,
+            range,
+            _retained: retained,
+        })
+    }
+
+    /// Stable host session covered by this snapshot.
+    #[must_use]
+    pub const fn session_id(&self) -> HostSessionId {
+        self.session_id
+    }
+
+    /// Queryability guarantee covered by this snapshot.
+    #[must_use]
+    pub const fn guarantee(&self) -> EventCatchUpGuarantee {
+        self.guarantee
+    }
+
+    /// Exact inclusive range retained by the opaque allocation.
+    #[must_use]
+    pub const fn range(&self) -> EventSequenceRange {
+        self.range
+    }
+}
+
+/// Source that produced one validated event page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventPageSource {
+    /// Bounded latest hot ring.
+    Hot,
+    /// Live in-memory journal catch-up.
+    LiveMemory,
+    /// Crash-durable journal catch-up.
+    Durable,
+}
+
+/// Opaque session-bound locator for a precise missing scientific-event range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCatchUpLocator {
+    session_id: HostSessionId,
+    range: EventSequenceRange,
+    guarantee: EventCatchUpGuarantee,
+}
+
+impl EventCatchUpLocator {
+    /// Host session whose journal may satisfy this locator.
+    #[must_use]
+    pub const fn session_id(self) -> HostSessionId {
+        self.session_id
+    }
+
+    /// Exact contiguous range required before hot-ring reads can resume.
+    #[must_use]
+    pub const fn range(self) -> EventSequenceRange {
+        self.range
+    }
+
+    /// Queryability guarantee advertised by the source.
+    #[must_use]
+    pub const fn guarantee(self) -> EventCatchUpGuarantee {
+        self.guarantee
+    }
+
+    /// Return a locator for the exact unread suffix after one observed sequence.
+    ///
+    /// `None` means the sequence completed this locator or did not belong to it.
+    #[must_use]
+    pub fn remaining_after(self, sequence: EventSequence) -> Option<Self> {
+        let first = sequence.checked_next()?;
+        if !self.range.contains(sequence) || !self.range.contains(first) {
+            return None;
+        }
+        Some(Self {
+            session_id: self.session_id,
+            range: EventSequenceRange {
+                first,
+                last: self.range.last,
+            },
+            guarantee: self.guarantee,
+        })
+    }
+}
+
+/// Why a gap cannot currently be repaired from a journal reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventCatchUpUnavailableReason {
+    /// The host port exposes no compatible reader capability.
+    NoReader,
+    /// The requested prefix has expired from the available reader range.
+    RangeExpired,
+    /// Only a suffix of the exact missing range is available.
+    PartialRange,
+    /// The locator belongs to a different host session.
+    SessionMismatch,
+}
+
+/// Catch-up state carried by an explicit hot-ring gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum EventCatchUpState {
+    /// An exact adapter-neutral locator is available.
+    Available(EventCatchUpLocator),
+    /// The missing prefix cannot currently be reconstructed.
+    Unavailable(EventCatchUpUnavailableReason),
+}
+
+/// Exact metadata returned when a scientific-event cursor fell behind the hot ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventGap {
+    /// Host session whose event stream was read.
+    pub session_id: HostSessionId,
+    /// Next sequence required by the unchanged cursor.
+    pub expected: EventSequence,
+    /// Exact missing prefix before the current hot range.
+    pub missing: EventSequenceRange,
+    /// Current inclusive hot range.
+    pub hot_available: EventSequenceRange,
+    /// Newest sequence published by the host.
+    pub latest: EventSequence,
+    /// Catch-up capability for the exact missing range.
+    pub catch_up: EventCatchUpState,
+}
+
+impl EventGap {
+    /// Sequence to install only when a client explicitly accepts display truncation.
+    #[must_use]
+    pub const fn resume_after(self) -> EventSequence {
+        EventSequence::new(self.hot_available.first.get().saturating_sub(1))
+    }
+}
+
+/// One contiguous, bounded page of scientific events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventPage {
+    /// Host session that owns every event in the page.
+    pub session_id: HostSessionId,
+    /// Read source and its durability meaning.
+    pub source: EventPageSource,
+    /// Contiguous events strictly after the requested cursor.
+    pub events: Vec<JournaledScientificEvent>,
+    /// Newest sequence known to the source at read time.
+    pub latest: EventSequence,
+}
+
+/// Result of polling the bounded scientific-event hot ring.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum EventPoll {
+    /// The returned page begins exactly at the cursor's next sequence, or is empty at the tip.
+    Contiguous(EventPage),
+    /// The cursor is behind the retained hot range and remains unchanged.
+    Gap(EventGap),
+}
+
+/// Result of resolving an explicit catch-up locator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum EventCatchUp {
+    /// A contiguous catch-up page beginning at the locator's first sequence.
+    Contiguous(EventPage),
+    /// The exact locator cannot be satisfied; the client cursor remains unchanged.
+    Unavailable {
+        /// Exact unavailable range.
+        range: EventSequenceRange,
+        /// Stable reason the reader cannot serve it.
+        reason: EventCatchUpUnavailableReason,
+    },
+}
+
+/// Cloneable adapter-neutral reader for older canonical scientific events.
+pub trait EventJournalReader: Send + Sync {
+    /// Host session served by this reader, stable for the reader lifetime.
+    fn session_id(&self) -> HostSessionId;
+
+    /// Queryability guarantee of returned records, stable for the reader lifetime.
+    fn guarantee(&self) -> EventCatchUpGuarantee;
+
+    /// Current inclusive readable range, or `None` when empty.
+    ///
+    /// This is a cached nonblocking watermark query. Implementations must not perform file I/O,
+    /// wait on a worker, or scan an unbounded journal; slow record reads belong in [`Self::read`].
+    fn available_range(&self) -> Option<EventSequenceRange>;
+
+    /// Atomically capture the readable range and an opaque allocation retaining every record in
+    /// that range.
+    ///
+    /// A successful snapshot must close the range/compaction race: while the returned value is
+    /// alive, a concurrent writer cannot destroy any covered record. This method is cached,
+    /// nonblocking, and performs no file I/O. The hot ring holds the snapshot only across its exact
+    /// eviction reservation and publication boundary.
+    fn retention_snapshot(&self) -> Option<EventRetentionSnapshot>;
+
+    /// Whether the cached reader index binds one exact sequence to one exact journal batch.
+    ///
+    /// This is a nonblocking identity query used for a later commitment receipt after the
+    /// corresponding record has left the hot ring. Implementations must not perform file I/O.
+    fn contains_event_identity(
+        &self,
+        sequence: EventSequence,
+        batch_id: JournalBatchId,
+    ) -> bool;
+
+    /// Resolve a session-bound exact range without advancing client state.
+    ///
+    /// `limit` is a hard result and allocation bound. Implementations return at most `limit`
+    /// records and must not allocate work proportional to an unbounded journal.
+    fn read(
+        &self,
+        locator: EventCatchUpLocator,
+        limit: usize,
+    ) -> Result<EventCatchUp, HostAccessError>;
+}
+
+#[derive(Debug)]
+struct EventHubState {
+    capacity: usize,
+    next_sequence: EventSequence,
+    published_total: u64,
+    reserved_front: Option<EventPublishReservation>,
+    entries: VecDeque<JournaledScientificEvent>,
+}
+
+#[derive(Debug)]
+struct EventPublishReservation {
+    sequence: EventSequence,
+    retention: Option<EventRetentionSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EventHighWater {
+    pub(crate) batch_id: JournalBatchId,
+    pub(crate) sequence: EventSequence,
+    pub(crate) reason: EventHighWaterReason,
+}
+
+#[derive(Debug, Clone)]
+struct EventHotView {
+    capacity: usize,
+    next_sequence: EventSequence,
+    published_total: u64,
+    entries: VecDeque<JournaledScientificEvent>,
+}
+
+impl From<&EventHubState> for EventHotView {
+    fn from(state: &EventHubState) -> Self {
+        Self {
+            capacity: state.capacity,
+            next_sequence: state.next_sequence,
+            published_total: state.published_total,
+            entries: state.entries.clone(),
+        }
+    }
+}
+
+/// Cloneable detached bounded scientific-event hot ring and catch-up capability.
+///
+/// The hub owns no command sender, mutable world, database connection, or per-subscriber queue.
+#[derive(Clone)]
+pub struct EventHub {
+    session_id: HostSessionId,
+    reader: Option<Arc<dyn EventJournalReader>>,
+    state: Arc<Mutex<EventHubState>>,
+    hot: Arc<ArcSwap<EventHotView>>,
+}
+
+impl fmt::Debug for EventHub {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.hot.load();
+        formatter
+            .debug_struct("EventHub")
+            .field("session_id", &self.session_id)
+            .field("capacity", &state.capacity)
+            .field("len", &state.entries.len())
+            .field("published_total", &state.published_total)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventHub {
+    /// Construct one bounded scientific-event hub.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error when capacity is zero or the reader serves another session.
+    pub fn new(
+        session_id: HostSessionId,
+        capacity: usize,
+        reader: Option<Arc<dyn EventJournalReader>>,
+    ) -> Result<Self, HostAccessError> {
+        if capacity == 0 {
+            return Err(protocol_violation("scientific event capacity must be nonzero"));
+        }
+        if reader
+            .as_ref()
+            .is_some_and(|reader| reader.session_id() != session_id)
+        {
+            return Err(protocol_violation(
+                "scientific event reader belongs to another host session",
+            ));
+        }
+        let state = EventHubState {
+            capacity,
+            next_sequence: EventSequence::new(1),
+            published_total: 0,
+            reserved_front: None,
+            entries: VecDeque::with_capacity(capacity),
+        };
+        let hot = Arc::new(ArcSwap::from_pointee(EventHotView::from(&state)));
+        Ok(Self {
+            session_id,
+            reader,
+            state: Arc::new(Mutex::new(state)),
+            hot,
+        })
+    }
+
+    /// Stable host session published by this hub.
+    #[must_use]
+    pub const fn session_id(&self) -> HostSessionId {
+        self.session_id
+    }
+
+    /// Configured hot-ring capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.hot.load().capacity
+    }
+
+    /// Current retained hot-ring records.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hot.load().entries.len()
+    }
+
+    /// Whether no scientific record is currently retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Total canonical records ever published, independent of ring wrap.
+    #[must_use]
+    pub fn published_total(&self) -> u64 {
+        self.hot.load().published_total
+    }
+
+    /// Pending records that may not be evicted.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.hot
+            .load()
+            .entries
+            .iter()
+            .filter(|entry| entry.commitment == EventCommitment::Pending)
+            .count()
+    }
+
+    /// Oldest pending batch, when pressure pins the hot prefix.
+    #[must_use]
+    pub fn oldest_pending_batch(&self) -> Option<JournalBatchId> {
+        self.hot
+            .load()
+            .entries
+            .iter()
+            .find(|entry| entry.commitment == EventCommitment::Pending)
+            .map(|entry| entry.event.batch_id)
+    }
+
+    fn eviction_reservation(
+        &self,
+        entry: &JournaledScientificEvent,
+    ) -> Result<EventPublishReservation, EventHighWaterReason> {
+        match &entry.commitment {
+            EventCommitment::Pending => return Err(EventHighWaterReason::Pending),
+            EventCommitment::Failed(_) => return Err(EventHighWaterReason::Failed),
+            EventCommitment::CommittedVolatile | EventCommitment::Durable => {}
+        }
+        let Some(reader) = &self.reader else {
+            return if entry.commitment == EventCommitment::Durable {
+                Ok(EventPublishReservation {
+                    sequence: entry.event.sequence,
+                    retention: None,
+                })
+            } else {
+                Err(EventHighWaterReason::NoReader)
+            };
+        };
+        let commitment_safe = match reader.guarantee() {
+            EventCatchUpGuarantee::LiveMemory => matches!(
+                entry.commitment,
+                EventCommitment::CommittedVolatile | EventCommitment::Durable
+            ),
+            EventCatchUpGuarantee::CrashDurable => {
+                entry.commitment == EventCommitment::Durable
+            }
+        };
+        if !commitment_safe {
+            return Err(EventHighWaterReason::GuaranteeMismatch);
+        }
+        let Some(retention) = reader.retention_snapshot() else {
+            return Err(EventHighWaterReason::RangeUnavailable);
+        };
+        if retention.session_id() != self.session_id
+            || retention.guarantee() != reader.guarantee()
+        {
+            return Err(EventHighWaterReason::GuaranteeMismatch);
+        }
+        if !retention.range().contains(entry.event.sequence) {
+            return Err(EventHighWaterReason::RangeUnavailable);
+        }
+        Ok(EventPublishReservation {
+            sequence: entry.event.sequence,
+            retention: Some(retention),
+        })
+    }
+
+    pub(crate) fn prepare_publish(&self) -> Result<Option<EventHighWater>, HostAccessError> {
+        let candidate = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.next_sequence.checked_next().is_none() {
+                return Err(protocol_violation("scientific event sequence exhausted"));
+            }
+            if state.entries.len() < state.capacity || state.reserved_front.is_some() {
+                return Ok(None);
+            }
+            state.entries.front().cloned()
+        };
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let reservation = match self.eviction_reservation(&candidate) {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                return Ok(Some(EventHighWater {
+                    batch_id: candidate.event.batch_id,
+                    sequence: candidate.event.sequence,
+                    reason,
+                }));
+            }
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.entries.len() < state.capacity || state.reserved_front.is_some() {
+            return Ok(None);
+        }
+        if state
+            .entries
+            .front()
+            .is_some_and(|front| front.event.sequence == candidate.event.sequence)
+        {
+            state.reserved_front = Some(reservation);
+            return Ok(None);
+        }
+        Err(protocol_violation(
+            "scientific event hot ring changed while reserving its front slot",
+        ))
+    }
+
+    pub(crate) fn publish_pending(
+        &self,
+        batch_id: JournalBatchId,
+        applied: AppliedCommand,
+        boundary: Arc<ScientificBoundary>,
+    ) -> Result<EventSequence, HostAccessError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.entries.len() >= state.capacity {
+            let Some(reservation) = state.reserved_front.take() else {
+                return Err(protocol_violation(
+                    "scientific event published without a reserved hot-ring slot",
+                ));
+            };
+            if state
+                .entries
+                .front()
+                .is_none_or(|front| front.event.sequence != reservation.sequence)
+            {
+                return Err(protocol_violation(
+                    "scientific event hot-ring reservation no longer names its front record",
+                ));
+            }
+            let _retention = reservation.retention;
+            state.entries.pop_front();
+        }
+        let sequence = state.next_sequence;
+        state.next_sequence = sequence
+            .checked_next()
+            .ok_or_else(|| protocol_violation("scientific event sequence exhausted"))?;
+        state.entries.push_back(JournaledScientificEvent {
+            event: Arc::new(ScientificEvent {
+                session_id: self.session_id,
+                sequence,
+                batch_id,
+                tick: applied.tick,
+                revisions: applied.revisions,
+                boundary,
+            }),
+            commitment: EventCommitment::Pending,
+        });
+        state.published_total = state.published_total.saturating_add(1);
+        self.hot.store(Arc::new(EventHotView::from(&*state)));
+        Ok(sequence)
+    }
+
+    pub(crate) fn cancel_publish_reservation(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserved_front = None;
+    }
+
+    pub(crate) fn update_commitment(
+        &self,
+        batch_id: JournalBatchId,
+        event_sequence: EventSequence,
+        commitment: EventCommitment,
+    ) -> Result<(), HostAccessError> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = state
+                .entries
+                .iter_mut()
+                .find(|entry| entry.event.batch_id == batch_id)
+            {
+                if entry.event.sequence != event_sequence {
+                    return Err(protocol_violation(
+                        "journal receipt event sequence does not match its retained batch",
+                    ));
+                }
+                if entry.commitment == commitment
+                    || matches!(
+                        &entry.commitment,
+                        EventCommitment::Durable | EventCommitment::Failed(_)
+                    )
+                    || matches!(
+                        (&entry.commitment, &commitment),
+                        (EventCommitment::CommittedVolatile, EventCommitment::Pending)
+                    )
+                {
+                    return Ok(());
+                }
+                entry.commitment = commitment;
+                self.hot.store(Arc::new(EventHotView::from(&*state)));
+                return Ok(());
+            }
+        }
+        if self.reader.as_ref().is_some_and(|reader| {
+            reader.contains_event_identity(event_sequence, batch_id)
+        })
+        {
+            Ok(())
+        } else {
+            Err(protocol_violation(
+                "journal receipt referenced an unknown scientific event",
+            ))
+        }
+    }
+
+    /// Create an independent session-bound cursor before the first scientific event.
+    #[must_use]
+    pub const fn subscribe(&self) -> EventCursor {
+        EventCursor::beginning(self.session_id)
+    }
+
+    /// Resume after one already-observed sequence in this exact host session.
+    #[must_use]
+    pub const fn resume_after(&self, sequence: EventSequence) -> EventCursor {
+        EventCursor::after(self.session_id, sequence)
+    }
+
+    /// Poll the bounded hot ring without allocating per-subscriber state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed access error for a cross-session or ahead-of-stream cursor.
+    pub fn poll(&self, cursor: EventCursor, limit: usize) -> Result<EventPoll, HostAccessError> {
+        if cursor.session_id != self.session_id {
+            return Err(HostAccessError::EventSessionMismatch {
+                expected: cursor.session_id,
+                actual: self.session_id,
+            });
+        }
+        let state = self.hot.load();
+        let latest = EventSequence::new(state.next_sequence.get().saturating_sub(1));
+        if cursor.last_seen > latest {
+            return Err(protocol_violation("scientific event cursor is ahead of the host"));
+        }
+        let expected = cursor
+            .last_seen
+            .checked_next()
+            .ok_or_else(|| protocol_violation("scientific event cursor sequence exhausted"))?;
+        let Some(front) = state.entries.front() else {
+            return Ok(EventPoll::Contiguous(EventPage {
+                session_id: self.session_id,
+                source: EventPageSource::Hot,
+                events: Vec::new(),
+                latest,
+            }));
+        };
+        if expected < front.event.sequence {
+            let missing = EventSequenceRange {
+                first: expected,
+                last: EventSequence::new(front.event.sequence.get() - 1),
+            };
+            let hot_available = EventSequenceRange {
+                first: front.event.sequence,
+                last: state
+                    .entries
+                    .back()
+                    .map_or(front.event.sequence, |back| back.event.sequence),
+            };
+            let catch_up = match &self.reader {
+                None => EventCatchUpState::Unavailable(EventCatchUpUnavailableReason::NoReader),
+                Some(reader) => match reader.available_range() {
+                    Some(range) if range.contains_range(missing) => {
+                        EventCatchUpState::Available(EventCatchUpLocator {
+                            session_id: self.session_id,
+                            range: missing,
+                            guarantee: reader.guarantee(),
+                        })
+                    }
+                    Some(range) if range.contains(missing.last) => EventCatchUpState::Unavailable(
+                        EventCatchUpUnavailableReason::PartialRange,
+                    ),
+                    _ => EventCatchUpState::Unavailable(
+                        EventCatchUpUnavailableReason::RangeExpired,
+                    ),
+                },
+            };
+            return Ok(EventPoll::Gap(EventGap {
+                session_id: self.session_id,
+                expected,
+                missing,
+                hot_available,
+                latest,
+                catch_up,
+            }));
+        }
+        let limit = limit.min(MAX_EVENT_PAGE_SIZE);
+        let events = state
+            .entries
+            .iter()
+            .filter(|entry| entry.event.sequence > cursor.last_seen)
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(EventPoll::Contiguous(EventPage {
+            session_id: self.session_id,
+            source: EventPageSource::Hot,
+            events,
+            latest,
+        }))
+    }
+
+    /// Resolve one exact gap locator through the injected journal reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed access error when a reader violates the session or page contract.
+    pub fn catch_up(
+        &self,
+        locator: EventCatchUpLocator,
+        limit: usize,
+    ) -> Result<EventCatchUp, HostAccessError> {
+        if locator.session_id != self.session_id {
+            return Ok(EventCatchUp::Unavailable {
+                range: locator.range,
+                reason: EventCatchUpUnavailableReason::SessionMismatch,
+            });
+        }
+        let Some(reader) = &self.reader else {
+            return Ok(EventCatchUp::Unavailable {
+                range: locator.range,
+                reason: EventCatchUpUnavailableReason::NoReader,
+            });
+        };
+        let bounded_limit = limit.min(MAX_EVENT_PAGE_SIZE);
+        let result = reader.read(locator, bounded_limit)?;
+        let cursor = EventCursor::after(
+            self.session_id,
+            EventSequence::new(locator.range.first.get().saturating_sub(1)),
+        );
+        validate_event_catch_up(cursor, locator, &result, bounded_limit)?;
+        Ok(result)
+    }
+}
+
+/// Opaque host-session-bound cursor over canonical scientific events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventCursor {
+    session_id: HostSessionId,
     last_seen: EventSequence,
 }
 
 impl EventCursor {
-    /// Start before the first event.
+    /// Start before the first scientific event in one host session.
     #[must_use]
-    pub const fn beginning() -> Self {
+    pub const fn beginning(session_id: HostSessionId) -> Self {
         Self {
+            session_id,
             last_seen: EventSequence::new(0),
         }
     }
 
-    /// Resume after an already-observed event.
+    /// Resume after an already-observed event from one exact host session.
     #[must_use]
-    pub const fn after(sequence: EventSequence) -> Self {
+    pub const fn after(session_id: HostSessionId, sequence: EventSequence) -> Self {
         Self {
+            session_id,
             last_seen: sequence,
         }
     }
 
-    /// Last event observed through this cursor.
+    /// Bound host session.
+    #[must_use]
+    pub const fn session_id(self) -> HostSessionId {
+        self.session_id
+    }
+
+    /// Last canonical event observed through this cursor.
     #[must_use]
     pub const fn last_seen(self) -> EventSequence {
         self.last_seen
@@ -1461,6 +3253,14 @@ pub enum HostAccessError {
         /// Session reported by the snapshot source.
         actual: HostSessionId,
     },
+    /// A scientific-event cursor or locator was reused against another host session.
+    #[error("event session {actual:?} does not match cursor session {expected:?}")]
+    EventSessionMismatch {
+        /// Session bound to the event cursor.
+        expected: HostSessionId,
+        /// Session reported by the event source.
+        actual: HostSessionId,
+    },
     /// A manual driver belongs to a different host than the frontend's ingress port.
     #[error("manual driver session {actual:?} does not match client session {expected:?}")]
     DriverSessionMismatch {
@@ -1534,9 +3334,23 @@ pub trait HostPort {
     /// Return at most `limit` events whose sequence is strictly greater than the cursor.
     fn events_after(
         &mut self,
-        cursor: EventSequence,
+        cursor: ProtocolEventSequence,
         limit: usize,
     ) -> Result<Vec<HostEvent>, HostAccessError>;
+
+    /// Poll the bounded canonical scientific-event hot ring.
+    fn poll_events(
+        &mut self,
+        cursor: EventCursor,
+        limit: usize,
+    ) -> Result<EventPoll, HostAccessError>;
+
+    /// Resolve one exact scientific-event catch-up locator.
+    fn catch_up_events(
+        &mut self,
+        locator: EventCatchUpLocator,
+        limit: usize,
+    ) -> Result<EventCatchUp, HostAccessError>;
 }
 
 /// Optional extension for deterministic same-thread and browser-owned hosts.
@@ -1568,7 +3382,7 @@ pub struct DriveReceipt {
     pub scientific_revision: ScientificRevision,
     /// Snapshots published during this drive.
     pub snapshots_published: usize,
-    /// Events published during this drive.
+    /// Canonical scientific events published during this drive.
     pub events_published: usize,
     /// Typed reason science could not make further progress, when applicable.
     pub blocker: Option<HostBlocker>,
@@ -1659,18 +3473,25 @@ impl<P: HostPort> HostClient<P> {
         }
     }
 
-    /// Create an event cursor positioned before the first event.
+    /// Create a cursor over bounded ephemeral command/lifecycle/health notifications.
     #[must_use]
-    pub const fn event_cursor(&self) -> EventCursor {
-        EventCursor::beginning()
+    pub fn protocol_event_cursor(&self) -> ProtocolEventCursor {
+        ProtocolEventCursor::beginning(self.port.session_id())
     }
 
-    /// Read ordered events and advance the cursor after the last valid event.
-    pub fn read_events(
+    /// Read contiguous ephemeral notifications and advance only after full validation.
+    pub fn read_protocol_events(
         &mut self,
-        cursor: &mut EventCursor,
+        cursor: &mut ProtocolEventCursor,
         limit: usize,
     ) -> Result<Vec<HostEvent>, HostAccessError> {
+        let session_id = self.port.session_id();
+        if cursor.session_id != session_id {
+            return Err(HostAccessError::EventSessionMismatch {
+                expected: cursor.session_id,
+                actual: session_id,
+            });
+        }
         let events = self.port.events_after(cursor.last_seen, limit)?;
         if events.len() > limit {
             return Err(protocol_violation(
@@ -1685,6 +3506,12 @@ impl<P: HostPort> HostClient<P> {
             if event.sequence != expected {
                 return Err(protocol_violation("event sequence was not contiguous"));
             }
+            if event.session_id != session_id {
+                return Err(HostAccessError::EventSessionMismatch {
+                    expected: session_id,
+                    actual: event.session_id,
+                });
+            }
             if let HostEventKind::CommandStatusChanged(status) = &event.kind {
                 status
                     .validate()
@@ -1695,6 +3522,281 @@ impl<P: HostPort> HostClient<P> {
         cursor.last_seen = previous;
         Ok(events)
     }
+
+    /// Create a session-bound cursor over canonical scientific events.
+    #[must_use]
+    pub fn event_cursor(&self) -> EventCursor {
+        EventCursor::beginning(self.port.session_id())
+    }
+
+    /// Poll canonical scientific events, advancing only after a valid contiguous page.
+    pub fn read_events(
+        &mut self,
+        cursor: &mut EventCursor,
+        limit: usize,
+    ) -> Result<EventPoll, HostAccessError> {
+        let session_id = self.port.session_id();
+        if cursor.session_id != session_id {
+            return Err(HostAccessError::EventSessionMismatch {
+                expected: cursor.session_id,
+                actual: session_id,
+            });
+        }
+        let poll = self.port.poll_events(*cursor, limit)?;
+        match &poll {
+            EventPoll::Contiguous(page) => {
+                if page.source != EventPageSource::Hot {
+                    return Err(protocol_violation(
+                        "hot-ring poll returned a non-hot scientific event page",
+                    ));
+                }
+                if limit.min(MAX_EVENT_PAGE_SIZE) != 0
+                    && page.events.is_empty()
+                    && page.latest > cursor.last_seen
+                {
+                    return Err(protocol_violation(
+                        "hot-ring poll reported newer events without making bounded progress",
+                    ));
+                }
+                cursor.last_seen = validate_event_page(*cursor, page, limit)?;
+            }
+            EventPoll::Gap(gap) => validate_event_gap(*cursor, *gap)?,
+        }
+        Ok(poll)
+    }
+
+    /// Resolve an exact gap locator and advance only through a valid contiguous catch-up page.
+    pub fn catch_up_events(
+        &mut self,
+        cursor: &mut EventCursor,
+        locator: EventCatchUpLocator,
+        limit: usize,
+    ) -> Result<EventCatchUp, HostAccessError> {
+        let session_id = self.port.session_id();
+        if cursor.session_id != session_id {
+            return Err(HostAccessError::EventSessionMismatch {
+                expected: cursor.session_id,
+                actual: session_id,
+            });
+        }
+        if locator.session_id != session_id {
+            return Err(HostAccessError::EventSessionMismatch {
+                expected: session_id,
+                actual: locator.session_id,
+            });
+        }
+        let expected = cursor
+            .last_seen
+            .checked_next()
+            .ok_or_else(|| protocol_violation("scientific event cursor sequence exhausted"))?;
+        if !locator.range.contains(expected) {
+            return Err(protocol_violation(
+                "catch-up locator does not begin at the cursor's required sequence",
+            ));
+        }
+        let effective = EventCatchUpLocator {
+            session_id,
+            range: EventSequenceRange {
+                first: expected,
+                last: locator.range.last,
+            },
+            guarantee: locator.guarantee,
+        };
+        let result = self.port.catch_up_events(effective, limit)?;
+        let next = validate_event_catch_up(*cursor, effective, &result, limit)?;
+        if matches!(&result, EventCatchUp::Contiguous(_)) {
+            cursor.last_seen = next;
+        }
+        Ok(result)
+    }
+
+    /// Explicitly accept display truncation and position the cursor before the hot range.
+    ///
+    /// Merely observing a gap never calls this method or advances the cursor.
+    pub fn accept_event_gap(
+        &self,
+        cursor: &mut EventCursor,
+        gap: EventGap,
+    ) -> Result<(), HostAccessError> {
+        let session_id = self.port.session_id();
+        if cursor.session_id != session_id {
+            return Err(HostAccessError::EventSessionMismatch {
+                expected: cursor.session_id,
+                actual: session_id,
+            });
+        }
+        validate_event_gap(*cursor, gap)?;
+        cursor.last_seen = gap.resume_after();
+        Ok(())
+    }
+}
+
+fn validate_event_page(
+    cursor: EventCursor,
+    page: &EventPage,
+    limit: usize,
+) -> Result<EventSequence, HostAccessError> {
+    if page.session_id != cursor.session_id {
+        return Err(HostAccessError::EventSessionMismatch {
+            expected: cursor.session_id,
+            actual: page.session_id,
+        });
+    }
+    if page.events.len() > limit.min(MAX_EVENT_PAGE_SIZE) {
+        return Err(protocol_violation(
+            "scientific event port exceeded the bounded page limit",
+        ));
+    }
+    let mut previous = cursor.last_seen;
+    let mut previous_batch_sequence = None;
+    for entry in &page.events {
+        let expected = previous
+            .checked_next()
+            .ok_or_else(|| protocol_violation("scientific event cursor sequence exhausted"))?;
+        if entry.event.sequence != expected {
+            return Err(protocol_violation(
+                "scientific event page was not contiguous",
+            ));
+        }
+        if entry.event.session_id != cursor.session_id
+            || entry.event.batch_id.session_id() != cursor.session_id
+            || !scientific_boundary_matches_event(&entry.event)
+        {
+            return Err(protocol_violation(
+                "scientific event page contains incoherent source identity",
+            ));
+        }
+        if previous_batch_sequence
+            .is_some_and(|sequence| sequence >= entry.event.batch_id.sequence())
+        {
+            return Err(protocol_violation(
+                "scientific event page journal batches did not advance",
+            ));
+        }
+        match page.source {
+            EventPageSource::Hot => {}
+            EventPageSource::LiveMemory
+                if !matches!(
+                    entry.commitment,
+                    EventCommitment::CommittedVolatile | EventCommitment::Durable
+                ) =>
+            {
+                return Err(protocol_violation(
+                    "live-memory catch-up returned an uncommitted event",
+                ));
+            }
+            EventPageSource::Durable if entry.commitment != EventCommitment::Durable => {
+                return Err(protocol_violation(
+                    "durable catch-up returned a non-durable event",
+                ));
+            }
+            EventPageSource::LiveMemory | EventPageSource::Durable => {}
+        }
+        previous_batch_sequence = Some(entry.event.batch_id.sequence());
+        previous = entry.event.sequence;
+    }
+    if previous > page.latest {
+        return Err(protocol_violation(
+            "scientific event page advanced beyond its latest watermark",
+        ));
+    }
+    Ok(previous)
+}
+
+fn scientific_boundary_matches_event(event: &ScientificEvent) -> bool {
+    let boundary = event.boundary.as_ref();
+    boundary.events.tick == event.tick
+        && boundary.summary.tick == event.tick
+        && boundary.config_revision == event.revisions.config.get()
+        && boundary.births.iter().all(|record| record.tick == event.tick)
+        && boundary.deaths.iter().all(|record| record.tick == event.tick)
+        && boundary
+            .resource_tick
+            .as_ref()
+            .is_none_or(|record| record.tick == event.tick)
+}
+
+fn validate_event_catch_up(
+    cursor: EventCursor,
+    locator: EventCatchUpLocator,
+    result: &EventCatchUp,
+    limit: usize,
+) -> Result<EventSequence, HostAccessError> {
+    let expected = cursor
+        .last_seen
+        .checked_next()
+        .ok_or_else(|| protocol_violation("scientific event cursor sequence exhausted"))?;
+    if locator.session_id != cursor.session_id
+        || !locator.range.is_valid()
+        || locator.range.first != expected
+    {
+        return Err(protocol_violation(
+            "catch-up locator is incoherent with the scientific event cursor",
+        ));
+    }
+    match result {
+        EventCatchUp::Contiguous(page) => {
+            let expected_source = match locator.guarantee {
+                EventCatchUpGuarantee::LiveMemory => EventPageSource::LiveMemory,
+                EventCatchUpGuarantee::CrashDurable => EventPageSource::Durable,
+            };
+            if page.source != expected_source {
+                return Err(protocol_violation(
+                    "catch-up page source does not match its locator guarantee",
+                ));
+            }
+            if limit.min(MAX_EVENT_PAGE_SIZE) != 0 && page.events.is_empty() {
+                return Err(protocol_violation(
+                    "catch-up reader returned no progress for a nonempty bounded request",
+                ));
+            }
+            let next = validate_event_page(cursor, page, limit)?;
+            if next > locator.range.last {
+                return Err(protocol_violation(
+                    "catch-up page advanced beyond its exact locator range",
+                ));
+            }
+            Ok(next)
+        }
+        EventCatchUp::Unavailable { range, .. } => {
+            if *range != locator.range {
+                return Err(protocol_violation(
+                    "catch-up reader reported an unrelated unavailable range",
+                ));
+            }
+            Ok(cursor.last_seen)
+        }
+    }
+}
+
+fn validate_event_gap(cursor: EventCursor, gap: EventGap) -> Result<(), HostAccessError> {
+    if gap.session_id != cursor.session_id {
+        return Err(HostAccessError::EventSessionMismatch {
+            expected: cursor.session_id,
+            actual: gap.session_id,
+        });
+    }
+    let expected = cursor
+        .last_seen
+        .checked_next()
+        .ok_or_else(|| protocol_violation("scientific event cursor sequence exhausted"))?;
+    if !gap.missing.is_valid()
+        || !gap.hot_available.is_valid()
+        || gap.expected != expected
+        || gap.missing.first != expected
+        || gap.missing.last.checked_next() != Some(gap.hot_available.first)
+        || gap.hot_available.last != gap.latest
+    {
+        return Err(protocol_violation("scientific event gap metadata is incoherent"));
+    }
+    if let EventCatchUpState::Available(locator) = gap.catch_up
+        && (locator.session_id != gap.session_id || locator.range != gap.missing)
+    {
+        return Err(protocol_violation(
+            "scientific event gap locator does not cover its missing range",
+        ));
+    }
+    Ok(())
 }
 
 /// Headless reference frontend used by conformance tests and embedders.
@@ -1707,6 +3809,7 @@ pub struct NullFrontend<P> {
     client_namespace: u64,
     next_sequence: Option<u64>,
     snapshots: SnapshotSubscription,
+    protocol_events: ProtocolEventCursor,
     events: EventCursor,
     last_drive: Option<ManualInstant>,
 }
@@ -1722,7 +3825,8 @@ impl<P: HostPort> NullFrontend<P> {
             client_namespace,
             next_sequence: Some(1),
             snapshots: SnapshotSubscription::current(host_session_id),
-            events: EventCursor::beginning(),
+            protocol_events: ProtocolEventCursor::beginning(host_session_id),
+            events: EventCursor::beginning(host_session_id),
             last_drive: None,
         }
     }
@@ -1805,9 +3909,33 @@ impl<P: HostPort> NullFrontend<P> {
         self.client.poll_snapshot(&mut self.snapshots)
     }
 
-    /// Read ordered host events and advance this frontend's cursor.
-    pub fn read_events(&mut self, limit: usize) -> Result<Vec<HostEvent>, HostAccessError> {
+    /// Read bounded ephemeral host notifications and advance this frontend's cursor.
+    pub fn read_protocol_events(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<HostEvent>, HostAccessError> {
+        self.client
+            .read_protocol_events(&mut self.protocol_events, limit)
+    }
+
+    /// Poll canonical scientific events and advance only through contiguous pages.
+    pub fn read_events(&mut self, limit: usize) -> Result<EventPoll, HostAccessError> {
         self.client.read_events(&mut self.events, limit)
+    }
+
+    /// Resolve one exact scientific-event gap and advance through a valid catch-up page.
+    pub fn catch_up_events(
+        &mut self,
+        locator: EventCatchUpLocator,
+        limit: usize,
+    ) -> Result<EventCatchUp, HostAccessError> {
+        self.client
+            .catch_up_events(&mut self.events, locator, limit)
+    }
+
+    /// Explicitly accept an unavailable display prefix and resume at the hot window.
+    pub fn accept_event_gap(&mut self, gap: EventGap) -> Result<(), HostAccessError> {
+        self.client.accept_event_gap(&mut self.events, gap)
     }
 
     /// Drive a separately owned synchronous host to a caller-owned time boundary.
@@ -1848,16 +3976,998 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{
-        DynamicSnapshotSummary, DynamicSnapshotWorld, SelectionMode, SelectionState,
-    };
+    use scriptbots_core::{DynamicSnapshotSummary, DynamicSnapshotWorld};
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::hint::black_box;
+    use std::mem::size_of;
     use std::sync::{
         Barrier, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     };
+    use std::time::Instant;
 
     static NEXT_FAKE_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn projection_agent(
+        uid: u16,
+        position: [f32; 2],
+        energy: f32,
+        health: f32,
+        age: u32,
+    ) -> DynamicAgentSnapshot {
+        let uid_u64 = u64::from(uid);
+        let uid_scalar = f32::from(uid);
+        DynamicAgentSnapshot {
+            id: uid_u64.saturating_add(10_000),
+            uid: AgentUid(uid_u64),
+            position,
+            velocity: [uid_scalar, -uid_scalar],
+            heading: uid_scalar * 0.1,
+            health,
+            energy,
+            color: [0.2, 0.4, 0.6],
+            spike_length: 0.25,
+            boost: uid.is_multiple_of(2),
+            age,
+            generation: Generation(u32::from(uid)),
+            herbivore_tendency: 0.25,
+            brain_key: Some(uid_u64.saturating_add(100)),
+        }
+    }
+
+    fn projection_summary(tick: u64) -> TickSummary {
+        let fixture_tick =
+            u16::try_from(tick).expect("projection fixture tick fits exact f32 integer range");
+        let tick_scalar = f32::from(fixture_tick);
+        TickSummary {
+            tick: Tick(tick),
+            agent_count: 3,
+            births: usize::from(tick.is_multiple_of(2)),
+            deaths: usize::from(tick.is_multiple_of(3)),
+            total_energy: tick_scalar,
+            average_energy: tick_scalar / 3.0,
+            average_health: 0.75,
+            max_age: u32::from(fixture_tick),
+            spike_hits: u32::from(tick.is_multiple_of(4)),
+        }
+    }
+
+    fn projection_snapshot() -> RenderSnapshot {
+        let summary_history = Arc::new((1..=10).map(projection_summary).collect::<Vec<_>>());
+        RenderSnapshot {
+            session_id: HostSessionId::new(44),
+            revision: SnapshotRevision::new(7),
+            revisions: HostRevisions {
+                control: ControlRevision::new(3),
+                scientific: ScientificRevision::new(10),
+                config: ConfigRevision::new(2),
+            },
+            playback: PlaybackSnapshot::default(),
+            lifecycle: HostLifecycle::Running,
+            health: HostHealth::Healthy,
+            command_queue_depth: 0,
+            last_applied_command: None,
+            completed_summary: summary_history.last().cloned(),
+            summary_history,
+            layers: SnapshotLayers {
+                revisions: SnapshotLayerRevisions {
+                    terrain: LayerRevision::new(2),
+                    food: LayerRevision::new(3),
+                    hydrology: LayerRevision::new(0),
+                },
+                terrain: Arc::new(TerrainLayerSnapshot {
+                    width: 1,
+                    height: 1,
+                    cell_size: 100,
+                    tiles: vec![TerrainTileSnapshot {
+                        kind: TerrainKind::Grass,
+                        elevation: 0.5,
+                        moisture: 0.5,
+                        accent: 0.0,
+                        fertility_bias: 0.5,
+                        temperature_bias: 0.5,
+                        palette_index: 3,
+                    }],
+                }),
+                food: Arc::new(FoodLayerSnapshot {
+                    width: 1,
+                    height: 1,
+                    cells: vec![1.0],
+                }),
+                hydrology: None,
+            },
+            build: SnapshotBuildStats::default(),
+            world: DynamicWorldSnapshot {
+                tick: 10,
+                epoch: 1,
+                world: DynamicSnapshotWorld {
+                    width: 100,
+                    height: 100,
+                    closed: true,
+                },
+                summary: DynamicSnapshotSummary {
+                    agent_count: 3,
+                    births: 1,
+                    deaths: 0,
+                    total_energy: 25.0,
+                    average_energy: 25.0 / 3.0,
+                    average_health: 0.75,
+                },
+                agents: vec![
+                    projection_agent(1, [99.0, 50.0], 10.0, 0.5, 5),
+                    projection_agent(2, [2.0, 50.0], 10.0, 1.0, 7),
+                    projection_agent(3, [50.0, 50.0], 5.0, 0.75, 20),
+                ],
+            },
+        }
+    }
+
+    fn projection_request(client_id: u64) -> ProjectionRequest {
+        ProjectionRequest {
+            client_id: ProjectionClientId::new(client_id),
+            viewport: ProjectionViewport {
+                width: 20,
+                height: 10,
+            },
+            camera: ProjectionCamera {
+                center: [0.0, 50.0],
+                zoom: 4.0,
+            },
+            selection: ProjectionSelection {
+                focused: Some(AgentUid(1)),
+                selected: vec![AgentUid(3), AgentUid(2), AgentUid(1), AgentUid(1)],
+            },
+            detail: ProjectionDetail::Kinematics,
+            chart_window: 10,
+            chart_points: 4,
+            top_k: 2,
+            ranking: ProjectionRanking::Energy,
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one coherent two-client oracle keeps request isolation, source immutability, wrap, detail, chart, and cache evidence together"
+    )]
+    fn pure_projections_isolate_clients_cover_wrap_and_preserve_source() {
+        let snapshot = projection_snapshot();
+        let source_before = snapshot.clone();
+        let expected_source = projection_source_key(&snapshot);
+        let request_a = projection_request(1);
+        let mut request_b = projection_request(2);
+        request_b.viewport = ProjectionViewport {
+            width: 12,
+            height: 8,
+        };
+        request_b.camera.center = [50.0, 50.0];
+        request_b.camera.zoom = 2.0;
+        request_b.selection = ProjectionSelection {
+            focused: Some(AgentUid(3)),
+            selected: vec![AgentUid(3)],
+        };
+        request_b.chart_window = 3;
+        request_b.chart_points = 2;
+        request_b.detail = ProjectionDetail::Vitals;
+        request_b.ranking = ProjectionRanking::Age;
+
+        assert_ne!(request_a.client_id, request_b.client_id);
+        assert_ne!(request_a.viewport, request_b.viewport);
+        assert_ne!(request_a.camera, request_b.camera);
+        assert_ne!(request_a.selection, request_b.selection);
+        assert_ne!(request_a.detail, request_b.detail);
+        assert_ne!(request_a.chart_window, request_b.chart_window);
+        assert_ne!(request_a.chart_points, request_b.chart_points);
+
+        let mut broker = ProjectionBroker::new(2).expect("bounded broker");
+        let a_first = broker
+            .project(&snapshot, &request_a, ProjectionLimits::default())
+            .expect("client A projection");
+        let b = broker
+            .project(&snapshot, &request_b, ProjectionLimits::default())
+            .expect("client B projection");
+        let a_second = broker
+            .project(&snapshot, &request_a, ProjectionLimits::default())
+            .expect("client A exact cache hit");
+
+        assert!(Arc::ptr_eq(&a_first, &a_second));
+        assert_ne!(a_first.as_ref(), b.as_ref());
+        assert_eq!(a_first.source, expected_source);
+        assert_eq!(b.source, expected_source);
+        assert_eq!(a_first.request.client_id, request_a.client_id);
+        assert_eq!(b.request.client_id, request_b.client_id);
+        assert_eq!(a_first.transform.viewport, request_a.viewport);
+        assert_eq!(b.transform.viewport, request_b.viewport);
+        assert_eq!(a_first.transform.center, request_a.camera.center);
+        assert_eq!(b.transform.center, request_b.camera.center);
+        assert_eq!(a_first.request.detail, ProjectionDetail::Kinematics);
+        assert_eq!(b.request.detail, ProjectionDetail::Vitals);
+        assert_eq!(
+            a_first.request.selection.selected,
+            [AgentUid(1), AgentUid(2), AgentUid(3)]
+        );
+        assert_eq!(a_first.selected_agents.len(), 3);
+        let offscreen_selected = a_first
+            .selected_agents
+            .iter()
+            .find(|agent| agent.uid == AgentUid(3))
+            .expect("client A selected offscreen agent");
+        assert!(
+            !(0.0..f64::from(request_a.viewport.width))
+                .contains(&offscreen_selected.canvas_position[0])
+        );
+        let offscreen_detail = offscreen_selected
+            .detail
+            .as_ref()
+            .expect("client A requested offscreen kinematics");
+        assert_eq!(offscreen_detail.age, 20);
+        assert!(offscreen_detail.velocity.is_some());
+        assert!(offscreen_detail.heading.is_some());
+        assert!(offscreen_detail.spike_length.is_some());
+        assert!(offscreen_detail.boost.is_some());
+        assert!(!a_first
+            .visible_agents
+            .iter()
+            .any(|agent| agent.uid == offscreen_selected.uid));
+        assert_eq!(b.request.selection.selected, [AgentUid(3)]);
+        let b_focused = b.focused_agent.as_ref().expect("client B focused agent");
+        assert_eq!(b_focused.uid, AgentUid(3));
+        assert!(b_focused.detail.as_ref().is_some_and(|detail| {
+            detail.velocity.is_none()
+                && detail.heading.is_none()
+                && detail.spike_length.is_none()
+                && detail.boost.is_none()
+        }));
+        assert_eq!(a_first.top_agents[0].uid, AgentUid(1));
+        assert_eq!(a_first.top_agents[1].uid, AgentUid(2));
+        assert_eq!(b.top_agents[0].uid, AgentUid(3));
+        assert_eq!(a_first.chart.first().expect("first chart point").tick, Tick(1));
+        assert_eq!(a_first.chart.last().expect("last chart point").tick, Tick(10));
+        assert_eq!(b.chart.first().expect("B first chart point").tick, Tick(8));
+        assert_eq!(b.chart.last().expect("B last chart point").tick, Tick(10));
+        assert_eq!(
+            a_first
+                .focused_agent
+                .as_ref()
+                .expect("focused seam agent")
+                .wrap_offset,
+            [-100.0, 0.0]
+        );
+        assert!(a_first.build.top_k_peak <= usize::from(request_a.top_k));
+        assert_eq!(a_first.build.agents_examined, snapshot.world.agents.len());
+        assert_eq!(snapshot, source_before);
+        assert_eq!(broker.hits(), 1);
+        assert_eq!(broker.misses(), 2);
+        assert_eq!(broker.len(), 2);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one projection boundary oracle covers every validation class plus entry and byte cache bounds"
+    )]
+    fn projection_validation_cache_eviction_and_chart_truncation_are_explicit() {
+        let snapshot = projection_snapshot();
+        let limits = ProjectionLimits::default();
+        let mut invalid = projection_request(1);
+        invalid.camera.zoom = f32::NAN;
+        assert_eq!(
+            project_snapshot(&snapshot, &invalid, limits),
+            Err(ProjectionError::InvalidCamera)
+        );
+        invalid = projection_request(1);
+        invalid.viewport.width = 0;
+        assert_eq!(
+            project_snapshot(&snapshot, &invalid, limits),
+            Err(ProjectionError::EmptyViewport)
+        );
+        invalid = projection_request(1);
+        invalid.top_k = limits.max_top_k.saturating_add(1);
+        assert!(matches!(
+            project_snapshot(&snapshot, &invalid, limits),
+            Err(ProjectionError::TopKTooLarge { .. })
+        ));
+        invalid = projection_request(1);
+        invalid.camera.zoom = f32::MIN_POSITIVE;
+        assert_eq!(
+            project_snapshot(&snapshot, &invalid, limits),
+            Err(ProjectionError::ScaleOutOfRange)
+        );
+        invalid = projection_request(1);
+        invalid.viewport = ProjectionViewport {
+            width: 1_000,
+            height: 1_000,
+        };
+        invalid.camera.zoom = f32::MAX;
+        assert_eq!(
+            project_snapshot(&snapshot, &invalid, limits),
+            Err(ProjectionError::ScaleOutOfRange)
+        );
+
+        let mut multi_wrap = projection_request(1);
+        multi_wrap.camera.center[0] = 1_000.0;
+        let multi_wrap_result =
+            project_snapshot(&snapshot, &multi_wrap, limits).expect("multi-wrap camera");
+        assert_eq!(
+            multi_wrap_result
+                .focused_agent
+                .expect("focused multi-wrap agent")
+                .wrap_offset,
+            [900.0, 0.0]
+        );
+
+        let mut exact_rank_snapshot = snapshot.clone();
+        exact_rank_snapshot.world.agents[0].age = 16_777_216;
+        exact_rank_snapshot.world.agents[1].age = 16_777_217;
+        let mut exact_rank = projection_request(1);
+        exact_rank.ranking = ProjectionRanking::Age;
+        exact_rank.top_k = 1;
+        assert_eq!(
+            project_snapshot(&exact_rank_snapshot, &exact_rank, limits)
+                .expect("exact integer ranking")
+                .top_agents[0]
+                .uid,
+            AgentUid(2)
+        );
+
+        let mut broker = ProjectionBroker::new(2).expect("bounded broker");
+        let mut plus_zero = projection_request(1);
+        plus_zero.camera.center[0] = 0.0;
+        let first = broker
+            .project(&snapshot, &plus_zero, limits)
+            .expect("positive-zero request");
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        let mut minus_zero = plus_zero.clone();
+        minus_zero.camera.center[0] = -0.0;
+        let canonical_hit = broker
+            .project(&snapshot, &minus_zero, limits)
+            .expect("negative-zero canonical hit");
+        assert_eq!(broker.hits(), 1);
+        drop(canonical_hit);
+
+        let stricter_limits = ProjectionLimits {
+            max_visible_agents: 1,
+            ..limits
+        };
+        assert!(matches!(
+            broker.project(&snapshot, &plus_zero, stricter_limits),
+            Err(ProjectionError::VisibleAgentsTooLarge { limit: 1 })
+        ));
+        assert_eq!(
+            broker.hits(),
+            1,
+            "a cached result built under looser bounds must not bypass stricter bounds"
+        );
+
+        for client in 2..=3 {
+            broker
+                .project(&snapshot, &projection_request(client), limits)
+                .expect("bounded client projection");
+        }
+        assert_eq!(broker.len(), 2);
+        assert_eq!(broker.evictions(), 1);
+        assert!(weak.upgrade().is_none(), "evicted projection must be reclaimable");
+        assert!(broker.retained_output_capacity_bytes() > 0);
+        assert!(broker.retained_output_capacity_bytes() <= broker.byte_capacity());
+
+        let mut byte_bounded =
+            ProjectionBroker::with_byte_capacity(2, 1).expect("one-byte cache budget");
+        let uncached = byte_bounded
+            .project(&snapshot, &projection_request(77), limits)
+            .expect("oversized result remains usable without cache retention");
+        assert!(uncached.build.output_capacity_bytes > byte_bounded.byte_capacity());
+        assert!(byte_bounded.is_empty());
+        assert_eq!(byte_bounded.uncached_oversize(), 1);
+        assert_eq!(byte_bounded.retained_output_capacity_bytes(), 0);
+
+        let mut truncated = projection_request(9);
+        truncated.chart_window = 100;
+        truncated.chart_points = 3;
+        let result = project_snapshot(&snapshot, &truncated, limits).expect("truncated chart");
+        assert!(result.chart_truncated);
+        assert_eq!(result.chart.len(), 3);
+        assert_eq!(result.chart.first().expect("chart first").tick, Tick(1));
+        assert_eq!(result.chart.last().expect("chart last").tick, Tick(10));
+    }
+
+    #[derive(Debug)]
+    struct TestDurableEventReader {
+        session_id: HostSessionId,
+        events: Mutex<Vec<JournaledScientificEvent>>,
+    }
+
+    impl TestDurableEventReader {
+        fn push(&self, event: JournaledScientificEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }
+
+        fn encoded(&self) -> Vec<u8> {
+            serde_json::to_vec(
+                &*self
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .expect("serialize durable event fixture")
+        }
+
+        fn reopen(session_id: HostSessionId, encoded: &[u8]) -> Self {
+            Self {
+                session_id,
+                events: Mutex::new(
+                    serde_json::from_slice(encoded).expect("reopen durable event fixture"),
+                ),
+            }
+        }
+    }
+
+    impl EventJournalReader for TestDurableEventReader {
+        fn session_id(&self) -> HostSessionId {
+            self.session_id
+        }
+
+        fn guarantee(&self) -> EventCatchUpGuarantee {
+            EventCatchUpGuarantee::CrashDurable
+        }
+
+        fn available_range(&self) -> Option<EventSequenceRange> {
+            let events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Some(EventSequenceRange {
+                first: events.first()?.event.sequence,
+                last: events.last()?.event.sequence,
+            })
+        }
+
+        fn retention_snapshot(&self) -> Option<EventRetentionSnapshot> {
+            let events = Arc::new(
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            );
+            let range = EventSequenceRange {
+                first: events.first()?.event.sequence,
+                last: events.last()?.event.sequence,
+            };
+            EventRetentionSnapshot::try_new(
+                self.session_id,
+                EventCatchUpGuarantee::CrashDurable,
+                range,
+                events,
+            )
+            .ok()
+        }
+
+        fn contains_event_identity(
+            &self,
+            sequence: EventSequence,
+            batch_id: JournalBatchId,
+        ) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|entry| {
+                    entry.event.sequence == sequence && entry.event.batch_id == batch_id
+                })
+        }
+
+        fn read(
+            &self,
+            locator: EventCatchUpLocator,
+            limit: usize,
+        ) -> Result<EventCatchUp, HostAccessError> {
+            if locator.session_id != self.session_id {
+                return Ok(EventCatchUp::Unavailable {
+                    range: locator.range,
+                    reason: EventCatchUpUnavailableReason::SessionMismatch,
+                });
+            }
+            let events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(available) = events.first().zip(events.last()).map(|(first, last)| {
+                EventSequenceRange {
+                    first: first.event.sequence,
+                    last: last.event.sequence,
+                }
+            }) else {
+                return Ok(EventCatchUp::Unavailable {
+                    range: locator.range,
+                    reason: EventCatchUpUnavailableReason::RangeExpired,
+                });
+            };
+            if !available.contains_range(locator.range) {
+                return Ok(EventCatchUp::Unavailable {
+                    range: locator.range,
+                    reason: EventCatchUpUnavailableReason::RangeExpired,
+                });
+            }
+            Ok(EventCatchUp::Contiguous(EventPage {
+                session_id: self.session_id,
+                source: EventPageSource::Durable,
+                events: events
+                    .iter()
+                    .filter(|entry| locator.range.contains(entry.event.sequence))
+                    .take(limit)
+                    .cloned()
+                    .collect(),
+                latest: available.last,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnretainedEventReader {
+        session_id: HostSessionId,
+        range: EventSequenceRange,
+    }
+
+    impl EventJournalReader for UnretainedEventReader {
+        fn session_id(&self) -> HostSessionId {
+            self.session_id
+        }
+
+        fn guarantee(&self) -> EventCatchUpGuarantee {
+            EventCatchUpGuarantee::LiveMemory
+        }
+
+        fn available_range(&self) -> Option<EventSequenceRange> {
+            Some(self.range)
+        }
+
+        fn retention_snapshot(&self) -> Option<EventRetentionSnapshot> {
+            None
+        }
+
+        fn contains_event_identity(
+            &self,
+            _sequence: EventSequence,
+            _batch_id: JournalBatchId,
+        ) -> bool {
+            false
+        }
+
+        fn read(
+            &self,
+            locator: EventCatchUpLocator,
+            _limit: usize,
+        ) -> Result<EventCatchUp, HostAccessError> {
+            Ok(EventCatchUp::Unavailable {
+                range: locator.range,
+                reason: EventCatchUpUnavailableReason::RangeExpired,
+            })
+        }
+    }
+
+    fn scientific_boundary(tick: u64) -> Arc<ScientificBoundary> {
+        Arc::new(ScientificBoundary::new(
+            TickEvents {
+                tick: Tick(tick),
+                charts_flushed: false,
+                epoch_rolled: false,
+                food_respawned: None,
+            },
+            projection_summary(tick),
+            Vec::new(),
+            Vec::new(),
+            TickCombatSummary::default(),
+            0,
+            None,
+        ))
+    }
+
+    #[test]
+    fn eviction_requires_atomic_retention_even_when_a_watermark_claims_coverage() {
+        let session_id = HostSessionId::new(47);
+        let reader: Arc<dyn EventJournalReader> = Arc::new(UnretainedEventReader {
+            session_id,
+            range: EventSequenceRange {
+                first: EventSequence::new(1),
+                last: EventSequence::new(1),
+            },
+        });
+        let hub = EventHub::new(session_id, 1, Some(reader)).expect("retention-test hub");
+        assert!(hub.prepare_publish().expect("initial slot").is_none());
+        let batch_id = JournalBatchId::new(session_id, 1);
+        let sequence = hub
+            .publish_pending(
+                batch_id,
+                AppliedCommand {
+                    tick: Tick(1),
+                    revisions: HostRevisions {
+                        scientific: ScientificRevision::new(1),
+                        ..HostRevisions::default()
+                    },
+                },
+                scientific_boundary(1),
+            )
+            .expect("retention-test event");
+        hub.update_commitment(batch_id, sequence, EventCommitment::CommittedVolatile)
+            .expect("volatile commitment");
+
+        let pressure = hub
+            .prepare_publish()
+            .expect("retention refusal is typed")
+            .expect("missing atomic retention must pin the front");
+        assert_eq!(pressure.batch_id, batch_id);
+        assert_eq!(pressure.sequence, sequence);
+        assert_eq!(pressure.reason, EventHighWaterReason::RangeUnavailable);
+        assert_eq!(hub.len(), 1);
+        assert_eq!(hub.published_total(), 1);
+    }
+
+    #[test]
+    fn catch_up_validation_rejects_wrong_source_boundary_and_bounds() {
+        let session_id = HostSessionId::new(48);
+        let cursor = EventCursor::beginning(session_id);
+        let locator = EventCatchUpLocator {
+            session_id,
+            range: EventSequenceRange {
+                first: EventSequence::new(1),
+                last: EventSequence::new(1),
+            },
+            guarantee: EventCatchUpGuarantee::CrashDurable,
+        };
+        let valid_entry = JournaledScientificEvent {
+            event: Arc::new(ScientificEvent {
+                session_id,
+                sequence: EventSequence::new(1),
+                batch_id: JournalBatchId::new(session_id, 1),
+                tick: Tick(1),
+                revisions: HostRevisions {
+                    scientific: ScientificRevision::new(1),
+                    ..HostRevisions::default()
+                },
+                boundary: scientific_boundary(1),
+            }),
+            commitment: EventCommitment::Durable,
+        };
+        let valid = EventCatchUp::Contiguous(EventPage {
+            session_id,
+            source: EventPageSource::Durable,
+            events: vec![valid_entry.clone()],
+            latest: EventSequence::new(1),
+        });
+        assert_eq!(
+            validate_event_catch_up(cursor, locator, &valid, 1).expect("valid durable page"),
+            EventSequence::new(1)
+        );
+
+        let mut wrong_source = valid.clone();
+        let EventCatchUp::Contiguous(page) = &mut wrong_source else {
+            unreachable!("fixture is contiguous");
+        };
+        page.source = EventPageSource::LiveMemory;
+        assert!(validate_event_catch_up(cursor, locator, &wrong_source, 1).is_err());
+
+        let mut wrong_boundary = valid;
+        let EventCatchUp::Contiguous(page) = &mut wrong_boundary else {
+            unreachable!("fixture is contiguous");
+        };
+        page.events[0] = JournaledScientificEvent {
+            event: Arc::new(ScientificEvent {
+                boundary: scientific_boundary(2),
+                ..valid_entry.event.as_ref().clone()
+            }),
+            commitment: EventCommitment::Durable,
+        };
+        assert!(validate_event_catch_up(cursor, locator, &wrong_boundary, 1).is_err());
+        assert!(validate_event_catch_up(cursor, locator, &wrong_boundary, 0).is_err());
+        assert_eq!(cursor.last_seen(), EventSequence::new(0));
+    }
+
+    #[test]
+    #[ignore = "DSR-only reference-hardware scientific-event measurement"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ignored evidence oracle emits raw latency and structural-memory samples together"
+    )]
+    fn dsr_measure_scientific_event_ring_latency_memory_and_consumer_scaling() {
+        const WARMUPS: usize = 20;
+        const SAMPLES: usize = 200;
+        const CAPACITY: usize = 128;
+        const CONSUMERS: usize = 10_000;
+        const PUBLISH_P95_BUDGET_NS: u64 = 5_000_000;
+        const POLL_P95_BUDGET_NS: u64 = 500_000;
+        const FANOUT_BUDGET_NS: u64 = 500_000_000;
+
+        let session_id = HostSessionId::new(49);
+        let hub = EventHub::new(session_id, CAPACITY, None).expect("measurement event hub");
+        let mut publish_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARMUPS + SAMPLES {
+            let sequence = u64::try_from(sample).expect("measurement sample fits u64") + 1;
+            assert!(
+                hub.prepare_publish()
+                    .expect("measurement event slot")
+                    .is_none()
+            );
+            let batch_id = JournalBatchId::new(session_id, sequence);
+            let started = Instant::now();
+            let event_sequence = hub
+                .publish_pending(
+                    batch_id,
+                    AppliedCommand {
+                        tick: Tick(sequence),
+                        revisions: HostRevisions {
+                            scientific: ScientificRevision::new(sequence),
+                            ..HostRevisions::default()
+                        },
+                    },
+                    scientific_boundary(sequence),
+                )
+                .expect("measurement event publish");
+            hub.update_commitment(batch_id, event_sequence, EventCommitment::Durable)
+                .expect("measurement durable commitment");
+            let elapsed = u64::try_from(started.elapsed().as_nanos())
+                .expect("measurement duration fits u64 nanoseconds");
+            if sample >= WARMUPS {
+                publish_samples.push(elapsed);
+            }
+        }
+        assert_eq!(hub.len(), CAPACITY);
+        assert_eq!(hub.pending_count(), 0);
+
+        let held_old_view = hub.hot.load_full();
+        let held_total = held_old_view.published_total;
+        let held_first = held_old_view
+            .entries
+            .front()
+            .expect("full held event view")
+            .event
+            .sequence;
+        let next = u64::try_from(WARMUPS + SAMPLES).expect("sample total fits u64") + 1;
+        assert!(
+            hub.prepare_publish()
+                .expect("post-hold event slot")
+                .is_none()
+        );
+        let next_batch = JournalBatchId::new(session_id, next);
+        let next_sequence = hub
+            .publish_pending(
+                next_batch,
+                AppliedCommand {
+                    tick: Tick(next),
+                    revisions: HostRevisions {
+                        scientific: ScientificRevision::new(next),
+                        ..HostRevisions::default()
+                    },
+                },
+                scientific_boundary(next),
+            )
+            .expect("post-hold event publish");
+        hub.update_commitment(next_batch, next_sequence, EventCommitment::Durable)
+            .expect("post-hold durable commitment");
+        assert_eq!(held_old_view.published_total, held_total);
+        assert_eq!(
+            held_old_view
+                .entries
+                .front()
+                .expect("held view remains populated")
+                .event
+                .sequence,
+            held_first
+        );
+        assert_eq!(hub.published_total(), held_total + 1);
+
+        let tip_cursor = EventCursor::after(session_id, next_sequence);
+        let mut poll_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARMUPS + SAMPLES {
+            let started = Instant::now();
+            let page = black_box(
+                hub.poll(tip_cursor, 1)
+                    .expect("measurement hot poll"),
+            );
+            let elapsed = u64::try_from(started.elapsed().as_nanos())
+                .expect("measurement duration fits u64 nanoseconds");
+            if sample >= WARMUPS {
+                poll_samples.push(elapsed);
+            }
+            let EventPoll::Contiguous(page) = page else {
+                panic!("tip cursor must remain contiguous");
+            };
+            assert!(page.events.is_empty());
+        }
+
+        let cursors = vec![tip_cursor; CONSUMERS];
+        let fanout_started = Instant::now();
+        for cursor in &cursors {
+            black_box(hub.poll(*cursor, 1).expect("independent consumer poll"));
+        }
+        let fanout_ns = u64::try_from(fanout_started.elapsed().as_nanos())
+            .expect("fanout duration fits u64 nanoseconds");
+        let cursor_capacity_bytes = cursors.capacity().saturating_mul(size_of::<EventCursor>());
+        let hot = hub.hot.load();
+        let hot_entry_capacity_bytes = hot
+            .entries
+            .capacity()
+            .saturating_mul(size_of::<JournaledScientificEvent>());
+        assert!(hub.len() <= CAPACITY);
+        assert!(hot.entries.capacity() <= CAPACITY);
+        assert_eq!(cursor_capacity_bytes, CONSUMERS * size_of::<EventCursor>());
+
+        let percentile_95 = |samples: &[u64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[(sorted.len() * 95).div_ceil(100).saturating_sub(1)]
+        };
+        let publish_p95_ns = percentile_95(&publish_samples);
+        let poll_p95_ns = percentile_95(&poll_samples);
+        let evidence = serde_json::json!({
+            "schema": "scriptbots.scientific-event.measurement.v1",
+            "hot_capacity": CAPACITY,
+            "warmups_per_case": WARMUPS,
+            "samples_per_case": SAMPLES,
+            "consumer_count": CONSUMERS,
+            "publish_raw_ns": publish_samples,
+            "publish_p95_ns": publish_p95_ns,
+            "publish_p95_budget_ns": PUBLISH_P95_BUDGET_NS,
+            "tip_poll_raw_ns": poll_samples,
+            "tip_poll_p95_ns": poll_p95_ns,
+            "tip_poll_p95_budget_ns": POLL_P95_BUDGET_NS,
+            "fanout_ns": fanout_ns,
+            "fanout_budget_ns": FANOUT_BUDGET_NS,
+            "hot_entry_capacity_bytes": hot_entry_capacity_bytes,
+            "cursor_capacity_bytes": cursor_capacity_bytes,
+            "published_total": hub.published_total(),
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&evidence).expect("serialize event measurement evidence")
+        );
+        assert!(publish_p95_ns < PUBLISH_P95_BUDGET_NS);
+        assert!(poll_p95_ns < POLL_P95_BUDGET_NS);
+        assert!(fanout_ns < FANOUT_BUDGET_NS);
+    }
+
+    #[test]
+    fn durable_reader_repairs_hot_gap_and_unavailable_gap_requires_explicit_skip() {
+        let session_id = HostSessionId::new(45);
+        let reader = Arc::new(TestDurableEventReader {
+            session_id,
+            events: Mutex::new(Vec::new()),
+        });
+        let reader_capability: Arc<dyn EventJournalReader> = reader.clone();
+        let hub = EventHub::new(session_id, 2, Some(reader_capability)).expect("durable hub");
+        for sequence in 1..=3 {
+            assert!(hub.prepare_publish().expect("durable slot").is_none());
+            let batch_id = JournalBatchId::new(session_id, sequence);
+            let event_sequence = hub
+                .publish_pending(
+                    batch_id,
+                    AppliedCommand {
+                        tick: Tick(sequence),
+                        revisions: HostRevisions {
+                            control: ControlRevision::new(0),
+                            scientific: ScientificRevision::new(sequence),
+                            config: ConfigRevision::new(0),
+                        },
+                    },
+                    scientific_boundary(sequence),
+                )
+                .expect("durable event publish");
+            let EventPoll::Contiguous(page) = hub
+                .poll(EventCursor::after(session_id, EventSequence::new(sequence - 1)), 1)
+                .expect("published event poll")
+            else {
+                panic!("new event must be hot");
+            };
+            let mut durable = page.events[0].clone();
+            assert_eq!(durable.event.sequence, event_sequence);
+            durable.commitment = EventCommitment::Durable;
+            reader.push(durable);
+            hub.update_commitment(batch_id, event_sequence, EventCommitment::Durable)
+                .expect("durable commitment");
+        }
+        hub.update_commitment(
+            JournalBatchId::new(session_id, 1),
+            EventSequence::new(1),
+            EventCommitment::Durable,
+        )
+        .expect("evicted exact batch identity remains idempotent");
+        assert!(
+            hub.update_commitment(
+                JournalBatchId::new(session_id, 99),
+                EventSequence::new(1),
+                EventCommitment::Durable,
+            )
+            .is_err(),
+            "reader coverage alone must not authorize a different batch identity"
+        );
+        let EventPoll::Gap(gap) = hub
+            .poll(EventCursor::beginning(session_id), usize::MAX)
+            .expect("durable gap poll")
+        else {
+            panic!("wrapped durable hot ring must report a gap");
+        };
+        let EventCatchUpState::Available(locator) = gap.catch_up else {
+            panic!("durable gap must expose a reader locator");
+        };
+        assert_eq!(locator.guarantee(), EventCatchUpGuarantee::CrashDurable);
+        let EventCatchUp::Contiguous(caught_up) = hub
+            .catch_up(locator, usize::MAX)
+            .expect("durable catch-up")
+        else {
+            panic!("durable locator must be readable");
+        };
+        assert_eq!(caught_up.source, EventPageSource::Durable);
+        assert_eq!(caught_up.events.len(), 1);
+        assert_eq!(caught_up.events[0].event.sequence, EventSequence::new(1));
+        assert_eq!(caught_up.events[0].commitment, EventCommitment::Durable);
+
+        let encoded = reader.encoded();
+        let reopened_reader = Arc::new(TestDurableEventReader::reopen(session_id, &encoded));
+        let reopened_capability: Arc<dyn EventJournalReader> = reopened_reader;
+        let reopened_hub = EventHub::new(session_id, 2, Some(reopened_capability))
+            .expect("reopened durable hub");
+        let restart_locator = EventCatchUpLocator {
+            session_id,
+            range: EventSequenceRange {
+                first: EventSequence::new(1),
+                last: EventSequence::new(3),
+            },
+            guarantee: EventCatchUpGuarantee::CrashDurable,
+        };
+        let EventCatchUp::Contiguous(restarted) = reopened_hub
+            .catch_up(restart_locator, usize::MAX)
+            .expect("serialized durable restart catch-up")
+        else {
+            panic!("reopened durable reader must return a contiguous page");
+        };
+        assert_eq!(restarted.source, EventPageSource::Durable);
+        assert_eq!(restarted.events.len(), 3);
+        assert_eq!(restarted.latest, EventSequence::new(3));
+
+        let unavailable = EventHub::new(HostSessionId::new(46), 1, None)
+            .expect("unavailable-reader hub");
+        for sequence in 1..=2 {
+            assert!(
+                unavailable
+                    .prepare_publish()
+                    .expect("durable slot without reader")
+                    .is_none()
+            );
+            let batch_id = JournalBatchId::new(HostSessionId::new(46), sequence);
+            unavailable
+                .publish_pending(
+                    batch_id,
+                    AppliedCommand {
+                        tick: Tick(sequence),
+                        revisions: HostRevisions::default(),
+                    },
+                    scientific_boundary(sequence),
+                )
+                .expect("unavailable event publish");
+            unavailable
+                .update_commitment(
+                    batch_id,
+                    EventSequence::new(sequence),
+                    EventCommitment::Durable,
+                )
+                .expect("unavailable event durable state");
+        }
+        let cursor = EventCursor::beginning(HostSessionId::new(46));
+        let EventPoll::Gap(unavailable_gap) = unavailable
+            .poll(cursor, usize::MAX)
+            .expect("unavailable gap poll")
+        else {
+            panic!("wrapped no-reader hub must report gap");
+        };
+        assert_eq!(
+            unavailable_gap.catch_up,
+            EventCatchUpState::Unavailable(EventCatchUpUnavailableReason::NoReader)
+        );
+        assert_eq!(cursor.last_seen(), EventSequence::new(0));
+        assert_eq!(unavailable_gap.resume_after(), EventSequence::new(1));
+    }
 
     #[derive(Clone)]
     struct SharedFakeHost {
@@ -1939,7 +5049,7 @@ mod tests {
 
         fn events_after(
             &mut self,
-            cursor: EventSequence,
+            cursor: ProtocolEventSequence,
             limit: usize,
         ) -> Result<Vec<HostEvent>, HostAccessError> {
             Ok(self
@@ -1950,6 +5060,37 @@ mod tests {
                 .take(limit)
                 .cloned()
                 .collect())
+        }
+
+        fn poll_events(
+            &mut self,
+            cursor: EventCursor,
+            _limit: usize,
+        ) -> Result<EventPoll, HostAccessError> {
+            let session_id = self.lock().session_id;
+            if cursor.session_id != session_id {
+                return Err(HostAccessError::EventSessionMismatch {
+                    expected: cursor.session_id,
+                    actual: session_id,
+                });
+            }
+            Ok(EventPoll::Contiguous(EventPage {
+                session_id,
+                source: EventPageSource::Hot,
+                events: Vec::new(),
+                latest: EventSequence::new(0),
+            }))
+        }
+
+        fn catch_up_events(
+            &mut self,
+            locator: EventCatchUpLocator,
+            _limit: usize,
+        ) -> Result<EventCatchUp, HostAccessError> {
+            Ok(EventCatchUp::Unavailable {
+                range: locator.range,
+                reason: EventCatchUpUnavailableReason::NoReader,
+            })
         }
     }
 
@@ -1990,7 +5131,7 @@ mod tests {
         session_id: HostSessionId,
         now: ManualInstant,
         next_admission: AdmissionSequence,
-        next_event: EventSequence,
+        next_event: ProtocolEventSequence,
         next_snapshot: SnapshotRevision,
         revisions: HostRevisions,
         tick: Tick,
@@ -2013,7 +5154,7 @@ mod tests {
                 session_id,
                 now: ManualInstant::default(),
                 next_admission: AdmissionSequence::new(1),
-                next_event: EventSequence::new(1),
+                next_event: ProtocolEventSequence::new(1),
                 next_snapshot: SnapshotRevision::new(1),
                 revisions: HostRevisions::default(),
                 tick: Tick(0),
@@ -2030,7 +5171,7 @@ mod tests {
             };
             host.publish_snapshot();
             host.events.clear();
-            host.next_event = EventSequence::new(1);
+            host.next_event = ProtocolEventSequence::new(1);
             host
         }
 
@@ -2165,7 +5306,6 @@ mod tests {
                             .checked_next()
                             .ok_or_else(|| protocol_violation("config revision exhausted"))?;
                     }
-                    HostCommand::UpdateSelection(_) => {}
                     HostCommand::Shutdown => self.lifecycle = HostLifecycle::Stopped,
                 }
                 ApplicationState::Applied(AppliedCommand {
@@ -2269,6 +5409,17 @@ mod tests {
                     })
                 })
                 .copied();
+            let completed_summary = (self.tick != Tick::zero()).then_some(TickSummary {
+                tick: self.tick,
+                agent_count: 0,
+                births: 0,
+                deaths: 0,
+                total_energy: 0.0,
+                average_energy: 0.0,
+                average_health: 0.0,
+                max_age: 0,
+                spike_hits: 0,
+            });
             self.latest_snapshot = Some(Arc::new(RenderSnapshot {
                 session_id: self.session_id,
                 revision,
@@ -2278,17 +5429,8 @@ mod tests {
                 health: HostHealth::Healthy,
                 command_queue_depth: self.queue.len(),
                 last_applied_command,
-                completed_summary: (self.tick != Tick::zero()).then_some(TickSummary {
-                    tick: self.tick,
-                    agent_count: 0,
-                    births: 0,
-                    deaths: 0,
-                    total_energy: 0.0,
-                    average_energy: 0.0,
-                    average_health: 0.0,
-                    max_age: 0,
-                    spike_hits: 0,
-                }),
+                completed_summary: completed_summary.clone(),
+                summary_history: Arc::new(completed_summary.into_iter().collect()),
                 layers,
                 build: SnapshotBuildStats::default(),
                 world: DynamicWorldSnapshot {
@@ -2322,6 +5464,7 @@ mod tests {
                 .checked_next()
                 .expect("test event sequence must have headroom");
             self.events.push(HostEvent {
+                session_id: self.session_id,
                 sequence,
                 tick: self.tick,
                 kind,
@@ -2374,16 +5517,10 @@ mod tests {
 
     #[test]
     fn journal_requirement_matches_the_frozen_command_classes() {
-        let selection = HostCommand::UpdateSelection(SelectionUpdate {
-            mode: SelectionMode::Clear,
-            agent_ids: Vec::new(),
-            state: SelectionState::Selected,
-        });
         for command in [
             HostCommand::Pause,
             HostCommand::Resume,
             HostCommand::SetSpeed(1.0),
-            selection,
         ] {
             assert!(!command.requires_journal());
         }
@@ -2761,9 +5898,9 @@ mod tests {
         assert_eq!(step.revisions.scientific, ScientificRevision::new(1));
         assert_eq!(step.tick, Tick(1));
 
-        let mut cursor = client.event_cursor();
+        let mut cursor = client.protocol_event_cursor();
         let events = client
-            .read_events(&mut cursor, usize::MAX)
+            .read_protocol_events(&mut cursor, usize::MAX)
             .expect("ordered event read");
         assert_eq!(events.len(), 6);
         assert!(
@@ -2953,7 +6090,7 @@ mod tests {
         }
         assert!(
             !frontend
-                .read_events(128)
+                .read_protocol_events(128)
                 .expect("event observation")
                 .is_empty()
         );

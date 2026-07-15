@@ -138,6 +138,14 @@ impl FixedDeadlineHost {
         self.core.snapshot_hub()
     }
 
+    /// Clone the detached bounded scientific-event reader.
+    ///
+    /// This handle contains no native command sender and cannot keep ingress connected.
+    #[must_use]
+    pub fn event_hub(&self) -> crate::EventHub {
+        self.core.event_hub()
+    }
+
     /// Read the exact sole-owner host for diagnostics and immutable projections.
     #[must_use]
     pub const fn core(&self) -> &HostCore {
@@ -494,6 +502,7 @@ mod asupersync_runner {
         sender: Sender<NativeMessage>,
         state: Arc<NativeControlState>,
         snapshots: SnapshotHub,
+        events: crate::EventHub,
     }
 
     impl NativeControl {
@@ -504,6 +513,14 @@ mod asupersync_runner {
         #[must_use]
         pub fn snapshot_hub(&self) -> SnapshotHub {
             self.snapshots.clone()
+        }
+
+        /// Clone the detached bounded scientific-event reader.
+        ///
+        /// The returned hub does not clone command ingress.
+        #[must_use]
+        pub fn event_hub(&self) -> crate::EventHub {
+            self.events.clone()
         }
 
         /// Try to enqueue one exact command without waiting.
@@ -794,10 +811,12 @@ mod asupersync_runner {
             let (sender, receiver) = mpsc::channel(options.ingress_capacity);
             let state = Arc::new(NativeControlState::new());
             let snapshots = host.snapshot_hub();
+            let events = host.event_hub();
             let control = NativeControl {
                 sender,
                 state: Arc::clone(&state),
                 snapshots,
+                events,
             };
             Ok((
                 Self {
@@ -1621,9 +1640,10 @@ pub use asupersync_runner::{
 mod tests {
     use super::*;
     use crate::{
-        AppliedCommand, CommandId, EventSequence, HostCommand, HostCoreOptions, HostEvent,
-        HostSessionId, JournalBatch, JournalBatchId, JournalPort, JournalReceipt,
-        JournalReceiptState, PlaybackSnapshot, ScientificBoundary, ShutdownCommitRequirement,
+        AppliedCommand, CommandId, EventCommitment, EventPoll, HostCommand, HostCoreOptions,
+        HostEvent, HostSessionId, JournalBatch, JournalBatchId, JournalPort, JournalReceipt,
+        JournalReceiptState, PlaybackSnapshot, ProtocolEventSequence, ScientificBoundary,
+        ShutdownCommitRequirement,
     };
     use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
     use std::cell::RefCell;
@@ -1799,6 +1819,9 @@ mod tests {
             tick_period_nanos: 10,
             max_automatic_steps_per_drive: 4,
             snapshot_interval_ticks: 1,
+            protocol_event_capacity: 256,
+            scientific_event_capacity: 64,
+            volatile_event_history_capacity: 512,
         }
     }
 
@@ -1845,7 +1868,7 @@ mod tests {
     }
 
     fn events(port: &mut LocalHostPort) -> Vec<HostEvent> {
-        port.events_after(EventSequence::new(0), usize::MAX)
+        port.events_after(ProtocolEventSequence::new(0), usize::MAX)
             .expect("host events")
     }
 
@@ -1953,6 +1976,73 @@ mod tests {
             journal_trace(&manual_journal)
         );
         assert_eq!(native.core().world_tick(), Tick(2));
+    }
+
+    #[test]
+    fn fixed_deadline_event_hub_survives_ordered_shutdown_and_owner_drop() {
+        let (core, _) = captured_host(58, true, ReceiptMode::Immediate);
+        let mut owner = FixedDeadlineHost::new(core);
+        let events = owner.event_hub();
+        let first_cursor = events.subscribe();
+        let second_cursor = events.subscribe();
+
+        owner
+            .submit(envelope(1, HostCommand::Step))
+            .expect("detached-event step admission");
+        owner
+            .drive_at(ManualInstant::from_nanos(0), NativeDriveTrigger::Command)
+            .expect("detached-event scientific boundary");
+        owner
+            .drive_at(
+                ManualInstant::from_nanos(0),
+                NativeDriveTrigger::Maintenance,
+            )
+            .expect("detached-event receipt boundary");
+        assert_eq!(owner.core().world_tick(), Tick(1));
+
+        let _shutdown = owner
+            .request_shutdown()
+            .expect("detached-event ordered shutdown admission");
+        for _ in 0..4 {
+            if matches!(owner.drive_interest(), HostDriveInterest::Terminated) {
+                break;
+            }
+            owner
+                .drive_at(
+                    ManualInstant::from_nanos(0),
+                    NativeDriveTrigger::Maintenance,
+                )
+                .expect("detached-event ordered shutdown drain");
+        }
+        assert!(matches!(
+            owner.drive_interest(),
+            HostDriveInterest::Terminated
+        ));
+        drop(owner);
+
+        assert_eq!(events.published_total(), 1);
+        let first_page = match events
+            .poll(first_cursor, 1)
+            .expect("first detached scientific-event poll")
+        {
+            EventPoll::Contiguous(page) => page,
+            EventPoll::Gap(gap) => panic!("unexpected first detached event gap: {gap:?}"),
+        };
+        let second_page = match events
+            .poll(second_cursor, 1)
+            .expect("second detached scientific-event poll")
+        {
+            EventPoll::Contiguous(page) => page,
+            EventPoll::Gap(gap) => panic!("unexpected second detached event gap: {gap:?}"),
+        };
+        assert_eq!(second_page, first_page);
+        assert_eq!(first_page.events.len(), 1);
+        assert_eq!(first_page.events[0].event.tick, Tick(1));
+        assert_eq!(
+            first_page.events[0].commitment,
+            EventCommitment::CommittedVolatile
+        );
+        assert_eq!(first_page.events[0].event.sequence, first_page.latest);
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
@@ -2664,33 +2754,65 @@ mod tests {
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     #[test]
-    fn controller_disconnect_uses_the_same_ordered_shutdown_barrier() {
+    fn detached_hubs_do_not_keep_native_ingress_connected_and_survive_owner_drop() {
         let (core, _) = captured_host(46, true, ReceiptMode::Immediate);
         let (mut runner, control) =
             NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
                 .expect("disconnect runner");
         let snapshots = control.snapshot_hub();
+        let events = control.event_hub();
         let mut subscription = snapshots.subscribe();
+        let first_cursor = events.subscribe();
+        let second_cursor = events.subscribe();
         assert!(
             snapshots
                 .poll_latest(&mut subscription)
                 .expect("initial detached snapshot poll")
                 .is_some()
         );
+        control
+            .try_submit(envelope(1, HostCommand::Step))
+            .expect("disconnect scientific step enqueue");
         drop(control);
 
         assert!(matches!(
             runner.run_until_terminal().expect("disconnect shutdown"),
             NativeRunOutcome::ControllerDisconnected { .. }
         ));
+        assert_eq!(runner.host().core().world_tick(), Tick(1));
+        let runner_terminal = runner.host().core().latest_snapshot();
+        let metrics = runner.metrics();
+        drop(runner);
+
         let detached_terminal = snapshots
             .poll_latest(&mut subscription)
             .expect("detached terminal snapshot poll")
             .expect("detached hub publishes terminal state");
-        let runner_terminal = runner.host().core().latest_snapshot();
         assert_eq!(detached_terminal.lifecycle, HostLifecycle::Stopped);
         assert!(Arc::ptr_eq(&detached_terminal, &runner_terminal));
-        assert_eq!(runner.metrics().shutdown_requests, 1);
+        assert_eq!(metrics.shutdown_requests, 1);
+
+        let first_page = match events
+            .poll(first_cursor, 1)
+            .expect("first post-owner scientific-event poll")
+        {
+            EventPoll::Contiguous(page) => page,
+            EventPoll::Gap(gap) => panic!("unexpected first post-owner event gap: {gap:?}"),
+        };
+        let second_page = match events
+            .poll(second_cursor, 1)
+            .expect("second post-owner scientific-event poll")
+        {
+            EventPoll::Contiguous(page) => page,
+            EventPoll::Gap(gap) => panic!("unexpected second post-owner event gap: {gap:?}"),
+        };
+        assert_eq!(second_page, first_page);
+        assert_eq!(first_page.events.len(), 1);
+        assert_eq!(first_page.events[0].event.tick, Tick(1));
+        assert_eq!(
+            first_page.events[0].commitment,
+            EventCommitment::CommittedVolatile
+        );
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]

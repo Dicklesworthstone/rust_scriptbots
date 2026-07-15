@@ -1691,7 +1691,7 @@ pub struct AgentState {
 
 /// Schema identifier for the renderer-neutral dynamic snapshot currently consumed by the web
 /// frontend and exercised by the performance gate.
-pub const DYNAMIC_WORLD_SNAPSHOT_SCHEMA: &str = "scriptbots.dynamic-world-snapshot.v1";
+pub const DYNAMIC_WORLD_SNAPSHOT_SCHEMA: &str = "scriptbots.dynamic-world-snapshot.v2";
 
 /// Compact dynamic state for one agent in [`DynamicWorldSnapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1699,6 +1699,8 @@ pub const DYNAMIC_WORLD_SNAPSHOT_SCHEMA: &str = "scriptbots.dynamic-world-snapsh
 pub struct DynamicAgentSnapshot {
     /// Stable generational handle encoded for external consumers.
     pub id: u64,
+    /// Stable logical identity that is never reused within one run.
+    pub uid: AgentUid,
     /// World-space position `[x, y]`.
     pub position: [f32; 2],
     /// World-space velocity `[vx, vy]`.
@@ -1715,6 +1717,14 @@ pub struct DynamicAgentSnapshot {
     pub spike_length: f32,
     /// Whether movement boost is active.
     pub boost: bool,
+    /// Completed scientific ticks lived by this agent.
+    pub age: u32,
+    /// Heritable lineage generation.
+    pub generation: Generation,
+    /// Continuous diet tendency used for renderer-neutral ranking and labels.
+    pub herbivore_tendency: f32,
+    /// Stable brain-registry key when this agent owns a registered evaluator.
+    pub brain_key: Option<u64>,
 }
 
 /// Dynamic world bounds and policy included with a snapshot.
@@ -1768,6 +1778,11 @@ pub struct DynamicWorldSnapshot {
 
 impl DynamicWorldSnapshot {
     /// Capture current dynamic world state without terrain or other static layers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal live-agent identity/runtime maps have diverged from the arena. Such a
+    /// divergence is a core invariant violation, not a recoverable renderer condition.
     #[must_use]
     pub fn from_world(world: &WorldState) -> Self {
         let arena = world.agents();
@@ -1778,13 +1793,17 @@ impl DynamicWorldSnapshot {
 
         for (dense_index, id) in arena.iter_handles().enumerate() {
             let data = columns.snapshot(dense_index);
-            let energy = world
+            let runtime = world
                 .agent_runtime(id)
-                .map_or(0.0, |runtime| runtime.energy);
+                .expect("every live agent has runtime projection state");
+            let energy = runtime.energy;
             total_energy += energy;
             total_health += data.health;
             agents.push(DynamicAgentSnapshot {
                 id: id.raw(),
+                uid: world
+                    .agent_uid(id)
+                    .expect("every live agent has a stable logical identity"),
                 position: [data.position.x, data.position.y],
                 velocity: [data.velocity.vx, data.velocity.vy],
                 heading: data.heading,
@@ -1793,6 +1812,10 @@ impl DynamicWorldSnapshot {
                 color: data.color,
                 spike_length: data.spike_length,
                 boost: data.boost,
+                age: data.age,
+                generation: data.generation,
+                herbivore_tendency: runtime.herbivore_tendency,
+                brain_key: runtime.brain.registry_key(),
             });
         }
 
@@ -29528,9 +29551,9 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
         let mut world = WorldState::new(config).expect("snapshot world");
-        world.spawn_agent(sample_agent(0));
+        let first_id = world.spawn_agent(sample_agent(0));
         world.step().expect("completed tick");
-        world.spawn_agent(sample_agent(1));
+        let second_id = world.spawn_agent(sample_agent(1));
 
         let snapshot = DynamicWorldSnapshot::from_world(&world);
         let total_energy = snapshot
@@ -29555,5 +29578,34 @@ mod tests {
             snapshot.summary.average_health,
             total_health / snapshot.agents.len() as f32
         );
+
+        for id in [first_id, second_id] {
+            let dense_index = world.agents().index_of(id).expect("live dense index");
+            let scalar = world.agents().columns().snapshot(dense_index);
+            let runtime = world.agent_runtime(id).expect("live runtime");
+            let projected = snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.id == id.raw())
+                .expect("projected live agent");
+            assert_eq!(projected.uid, world.agent_uid(id).expect("live uid"));
+            assert_eq!(projected.age, scalar.age);
+            assert_eq!(projected.generation, scalar.generation);
+            assert_eq!(projected.herbivore_tendency, runtime.herbivore_tendency);
+            assert_eq!(projected.brain_key, runtime.brain.registry_key());
+        }
+
+        let first_uid = world.agent_uid(first_id).expect("first uid before removal");
+        world.remove_agent(first_id).expect("remove first snapshot agent");
+        let replacement_id = world.spawn_agent(sample_agent(2));
+        let replacement_uid = world
+            .agent_uid(replacement_id)
+            .expect("replacement stable uid");
+        let churned = DynamicWorldSnapshot::from_world(&world);
+        assert_ne!(replacement_uid, first_uid);
+        assert!(churned.agents.iter().all(|agent| agent.uid != first_uid));
+        assert!(churned.agents.iter().any(|agent| {
+            agent.id == replacement_id.raw() && agent.uid == replacement_uid
+        }));
     }
 }

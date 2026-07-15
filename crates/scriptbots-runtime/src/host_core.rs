@@ -2,16 +2,21 @@
 
 use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
-    CommandId, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt, EventSequence,
+    CommandId, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt, EventCatchUp,
+    EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment,
+    EventHub, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot, EventSequence,
+    EventSequenceRange,
     FoodLayerSnapshot, HostAccessError, HostBlocker, HostCommand, HostDriveInterest, HostEvent,
     HostEventKind, HostFault, HostHealth, HostLifecycle, HostPort, HostRevisions, HostSessionId,
     HydrologyLayerSnapshot, HydrologyTileSnapshot, JournalAdmission, JournalBatch, JournalBatchId,
-    JournalFailure, JournalPort, JournalReceipt, JournalReceiptState, JournalState, LayerRevision,
-    ManualHostDriver, ManualInstant, PlaybackSnapshot, RejectionReason, RenderSnapshot,
-    ScientificBoundary, ScientificBoundaryFault, ScientificRevision, ShutdownCommitRequirement,
+    JournalFailure, JournalPort, JournalReceipt, JournalReceiptState, JournalState,
+    JournaledScientificEvent, LayerRevision, ManualHostDriver, ManualInstant, PlaybackSnapshot,
+    ProtocolEventSequence, RejectionReason, RenderSnapshot, ScientificBoundary,
+    ScientificBoundaryFault, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
     SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions, SnapshotLayers, SnapshotRevision,
     StatusCombinationError, TerrainLayerSnapshot, TerrainTileSnapshot,
 };
+use arc_swap::ArcSwap;
 use scriptbots_core::{
     CharacterizationError, CompletedStepFault, DynamicAgentSnapshot, DynamicWorldSnapshot,
     NullPersistence, PersistenceAdmissionSession, PersistenceSessionError, ScriptBotsConfig, Tick,
@@ -31,6 +36,9 @@ const DEFAULT_TICK_PERIOD_NANOS: u64 = 16_666_667;
 const DEFAULT_COMMAND_CAPACITY: usize = 32;
 const DEFAULT_MAX_AUTOMATIC_STEPS: usize = 8;
 const DEFAULT_SNAPSHOT_INTERVAL_TICKS: u64 = 1;
+const DEFAULT_PROTOCOL_EVENT_CAPACITY: usize = 256;
+const DEFAULT_SCIENTIFIC_EVENT_CAPACITY: usize = 64;
+const DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY: usize = 512;
 const RECEIPT_POLL_LIMIT: usize = 4_096;
 const LIFECYCLE_COMMAND_NAMESPACE: u64 = u64::MAX;
 
@@ -50,6 +58,12 @@ pub struct HostCoreOptions {
     /// Control, lifecycle, health, configuration, and explicit-step changes still publish
     /// immediately. This deterministic stride changes presentation work only.
     pub snapshot_interval_ticks: u64,
+    /// Ephemeral command/lifecycle/health notifications retained for diagnostics.
+    pub protocol_event_capacity: usize,
+    /// Canonical scientific records retained by the detached latest hot ring.
+    pub scientific_event_capacity: usize,
+    /// Exact committed batches retained by the default live-memory catch-up journal.
+    pub volatile_event_history_capacity: usize,
 }
 
 impl Default for HostCoreOptions {
@@ -60,6 +74,9 @@ impl Default for HostCoreOptions {
             tick_period_nanos: DEFAULT_TICK_PERIOD_NANOS,
             max_automatic_steps_per_drive: DEFAULT_MAX_AUTOMATIC_STEPS,
             snapshot_interval_ticks: DEFAULT_SNAPSHOT_INTERVAL_TICKS,
+            protocol_event_capacity: DEFAULT_PROTOCOL_EVENT_CAPACITY,
+            scientific_event_capacity: DEFAULT_SCIENTIFIC_EVENT_CAPACITY,
+            volatile_event_history_capacity: DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY,
         }
     }
 }
@@ -83,37 +100,304 @@ pub enum HostCoreBuildError {
 /// Admission is immediate and nonblocking. A volatile receipt is queued for the
 /// next drive boundary so application and journal state still advance on their
 /// independent protocol axes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VolatileJournal {
-    accepted: HashSet<JournalBatchId>,
-    batches: Vec<Arc<JournalBatch>>,
+    highest_accepted: Option<JournalBatchId>,
+    archive: VolatileJournalArchive,
+    event_view: Arc<ArcSwap<VolatileEventArchiveView>>,
     receipts: VecDeque<JournalReceipt>,
 }
 
+#[derive(Debug)]
+struct VolatileJournalEntry {
+    batch: Arc<JournalBatch>,
+}
+
+#[derive(Debug, Clone)]
+struct VolatileScientificEntry {
+    batch_id: JournalBatchId,
+    sequence: EventSequence,
+    applied: AppliedCommand,
+    boundary: Arc<ScientificBoundary>,
+    committed: bool,
+}
+
+#[derive(Debug)]
+struct VolatileJournalArchive {
+    capacity: usize,
+    entries: VecDeque<VolatileJournalEntry>,
+    scientific_entries: VecDeque<VolatileScientificEntry>,
+}
+
+#[derive(Debug, Default)]
+struct VolatileEventArchiveView {
+    entries: Vec<VolatileScientificEntry>,
+    available_range: Option<EventSequenceRange>,
+}
+
+impl Default for VolatileJournal {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY)
+    }
+}
+
 impl VolatileJournal {
-    /// Accepted immutable batches in journal order.
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            highest_accepted: None,
+            archive: VolatileJournalArchive {
+                capacity,
+                entries: VecDeque::with_capacity(capacity),
+                scientific_entries: VecDeque::with_capacity(capacity),
+            },
+            event_view: Arc::new(ArcSwap::from_pointee(
+                VolatileEventArchiveView::default(),
+            )),
+            receipts: VecDeque::new(),
+        }
+    }
+
+    /// Exact admitted batches whose volatile commitment receipt is still pending.
+    ///
+    /// Committed scientific history is retained separately as a lightweight immutable
+    /// boundary record so catch-up readers do not pin complete persistence payloads.
     #[must_use]
-    pub fn batches(&self) -> &[Arc<JournalBatch>] {
-        &self.batches
+    pub fn batches(&self) -> Vec<Arc<JournalBatch>> {
+        self.archive
+            .entries
+            .iter()
+            .map(|entry| Arc::clone(&entry.batch))
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct VolatileEventReader {
+    session_id: HostSessionId,
+    view: Arc<ArcSwap<VolatileEventArchiveView>>,
+}
+
+fn volatile_available_range(
+    archive: &VolatileJournalArchive,
+    session_id: HostSessionId,
+) -> Option<EventSequenceRange> {
+    let mut sequences = archive.scientific_entries.iter().filter_map(|entry| {
+        (entry.committed && entry.batch_id.session_id() == session_id).then_some(entry.sequence)
+    });
+    let first = sequences.next()?;
+    let last = sequences.next_back().unwrap_or(first);
+    Some(EventSequenceRange { first, last })
+}
+
+fn volatile_event_view(
+    archive: &VolatileJournalArchive,
+    session_id: HostSessionId,
+) -> VolatileEventArchiveView {
+    VolatileEventArchiveView {
+        entries: archive
+            .scientific_entries
+            .iter()
+            .filter(|entry| entry.committed && entry.batch_id.session_id() == session_id)
+            .cloned()
+            .collect(),
+        available_range: volatile_available_range(archive, session_id),
+    }
+}
+
+impl EventJournalReader for VolatileEventReader {
+    fn session_id(&self) -> HostSessionId {
+        self.session_id
+    }
+
+    fn guarantee(&self) -> EventCatchUpGuarantee {
+        EventCatchUpGuarantee::LiveMemory
+    }
+
+    fn available_range(&self) -> Option<EventSequenceRange> {
+        self.view.load().available_range
+    }
+
+    fn retention_snapshot(&self) -> Option<EventRetentionSnapshot> {
+        let view = self.view.load_full();
+        let range = view.available_range?;
+        EventRetentionSnapshot::try_new(
+            self.session_id,
+            EventCatchUpGuarantee::LiveMemory,
+            range,
+            view,
+        )
+        .ok()
+    }
+
+    fn contains_event_identity(
+        &self,
+        sequence: EventSequence,
+        batch_id: JournalBatchId,
+    ) -> bool {
+        self.view.load().entries.iter().any(|entry| {
+            entry.sequence == sequence
+                && entry.batch_id == batch_id
+                && entry.batch_id.session_id() == self.session_id
+        })
+    }
+
+    fn read(
+        &self,
+        locator: EventCatchUpLocator,
+        limit: usize,
+    ) -> Result<EventCatchUp, HostAccessError> {
+        if locator.session_id() != self.session_id {
+            return Ok(EventCatchUp::Unavailable {
+                range: locator.range(),
+                reason: EventCatchUpUnavailableReason::SessionMismatch,
+            });
+        }
+        let view = self.view.load();
+        let Some(available) = view.available_range else {
+            return Ok(EventCatchUp::Unavailable {
+                range: locator.range(),
+                reason: EventCatchUpUnavailableReason::RangeExpired,
+            });
+        };
+        if !available.contains_range(locator.range()) {
+            let reason = if available.contains(locator.range().last) {
+                EventCatchUpUnavailableReason::PartialRange
+            } else {
+                EventCatchUpUnavailableReason::RangeExpired
+            };
+            return Ok(EventCatchUp::Unavailable {
+                range: locator.range(),
+                reason,
+            });
+        }
+        let events = view
+            .entries
+            .iter()
+            .filter(|entry| locator.range().contains(entry.sequence))
+            .map(|entry| JournaledScientificEvent {
+                event: Arc::new(ScientificEvent {
+                    session_id: self.session_id,
+                    sequence: entry.sequence,
+                    batch_id: entry.batch_id,
+                    tick: entry.applied.tick,
+                    revisions: entry.applied.revisions,
+                    boundary: Arc::clone(&entry.boundary),
+                }),
+                commitment: EventCommitment::CommittedVolatile,
+            })
+            .take(limit)
+            .collect();
+        Ok(EventCatchUp::Contiguous(EventPage {
+            session_id: self.session_id,
+            source: EventPageSource::LiveMemory,
+            events,
+            latest: available.last,
+        }))
     }
 }
 
 impl JournalPort for VolatileJournal {
     fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
         let batch_id = batch.id();
-        if self.accepted.insert(batch_id) {
-            self.batches.push(Arc::clone(batch));
-            self.receipts.push_back(JournalReceipt::new(
-                batch_id,
-                JournalReceiptState::CommittedVolatile,
-            ));
+        if self.highest_accepted.is_some_and(|highest| {
+            highest.session_id() == batch_id.session_id()
+                && highest.sequence() >= batch_id.sequence()
+        }) {
+            return JournalAdmission::Accepted { batch_id };
         }
+        if self
+            .highest_accepted
+            .is_some_and(|highest| highest.session_id() != batch_id.session_id())
+        {
+            return JournalAdmission::Closed { batch_id };
+        }
+        let scientific_entry = match batch.scientific_event_sequence() {
+            None => None,
+            Some(sequence) => {
+                let Some(boundary) = batch.scientific() else {
+                    return JournalAdmission::Closed { batch_id };
+                };
+                Some(VolatileScientificEntry {
+                    batch_id,
+                    sequence,
+                    applied: batch.applied(),
+                    boundary: Arc::clone(boundary),
+                    committed: false,
+                })
+            }
+        };
+        let archive = &mut self.archive;
+        let scientific = scientific_entry.is_some();
+        let general_has_room = archive.entries.len() < archive.capacity;
+        let scientific_has_room = !scientific
+            || archive.scientific_entries.len() < archive.capacity
+            || archive
+                .scientific_entries
+                .front()
+                .is_some_and(|entry| entry.committed);
+        if !general_has_room || !scientific_has_room {
+            return JournalAdmission::Full {
+                batch_id,
+                capacity: archive.capacity,
+            };
+        }
+        if scientific && archive.scientific_entries.len() >= archive.capacity {
+            archive.scientific_entries.pop_front();
+        }
+        archive.entries.push_back(VolatileJournalEntry {
+            batch: Arc::clone(batch),
+        });
+        if let Some(scientific_entry) = scientific_entry {
+            archive.scientific_entries.push_back(scientific_entry);
+        }
+        if scientific {
+            let event_view = volatile_event_view(archive, batch_id.session_id());
+            self.event_view.store(Arc::new(event_view));
+        }
+        self.highest_accepted = Some(batch_id);
+        self.receipts.push_back(JournalReceipt::new(
+            batch_id,
+            JournalReceiptState::CommittedVolatile,
+        ));
         JournalAdmission::Accepted { batch_id }
     }
 
     fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
         let count = limit.min(self.receipts.len());
-        self.receipts.drain(..count).collect()
+        let receipts: Vec<_> = self.receipts.drain(..count).collect();
+        let archive = &mut self.archive;
+        let mut scientific_changed = false;
+        for receipt in &receipts {
+            if let Some(index) = archive
+                .entries
+                .iter()
+                .position(|entry| entry.batch.id() == receipt.batch_id())
+            {
+                archive.entries.remove(index);
+            }
+            if let Some(entry) = archive
+                .scientific_entries
+                .iter_mut()
+                .find(|entry| entry.batch_id == receipt.batch_id())
+            {
+                entry.committed = true;
+                scientific_changed = true;
+            }
+        }
+        if scientific_changed && let Some(highest) = self.highest_accepted {
+            self.event_view.store(Arc::new(volatile_event_view(
+                archive,
+                highest.session_id(),
+            )));
+        }
+        receipts
+    }
+
+    fn event_reader(&self, session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
+        Some(Arc::new(VolatileEventReader {
+            session_id,
+            view: Arc::clone(&self.event_view),
+        }))
     }
 
     fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
@@ -131,13 +415,14 @@ struct SharedHostState {
     session_id: HostSessionId,
     command_capacity: usize,
     next_admission: AdmissionSequence,
-    next_event: EventSequence,
+    next_event: ProtocolEventSequence,
+    protocol_event_capacity: usize,
     admission_lifecycle: HostLifecycle,
     shutdown_command_id: Option<CommandId>,
     queue: VecDeque<AdmittedEnvelope>,
     statuses: HashMap<CommandId, CommandStatus>,
     last_applied: Option<(AdmissionSequence, CommandId)>,
-    events: Vec<HostEvent>,
+    events: VecDeque<HostEvent>,
     visible_tick: Tick,
 }
 
@@ -147,7 +432,11 @@ impl SharedHostState {
         self.next_event = sequence
             .checked_next()
             .ok_or_else(|| protocol_violation("event sequence exhausted"))?;
-        self.events.push(HostEvent {
+        if self.events.len() == self.protocol_event_capacity {
+            self.events.pop_front();
+        }
+        self.events.push_back(HostEvent {
+            session_id: self.session_id,
             sequence,
             tick: self.visible_tick,
             kind,
@@ -246,6 +535,7 @@ impl SharedHostState {
 pub struct LocalHostPort {
     shared: Rc<RefCell<SharedHostState>>,
     snapshots: SnapshotHub,
+    events: EventHub,
 }
 
 impl LocalHostPort {
@@ -281,7 +571,7 @@ impl HostPort for LocalHostPort {
 
     fn events_after(
         &mut self,
-        cursor: EventSequence,
+        cursor: ProtocolEventSequence,
         limit: usize,
     ) -> Result<Vec<HostEvent>, HostAccessError> {
         Ok(self
@@ -294,11 +584,28 @@ impl HostPort for LocalHostPort {
             .cloned()
             .collect())
     }
+
+    fn poll_events(
+        &mut self,
+        cursor: super::EventCursor,
+        limit: usize,
+    ) -> Result<super::EventPoll, HostAccessError> {
+        self.events.poll(cursor, limit)
+    }
+
+    fn catch_up_events(
+        &mut self,
+        locator: EventCatchUpLocator,
+        limit: usize,
+    ) -> Result<EventCatchUp, HostAccessError> {
+        self.events.catch_up(locator, limit)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct InflightJournal {
     command_id: Option<CommandId>,
+    scientific_event: Option<EventSequence>,
     shutdown_requirement: Option<ShutdownCommitRequirement>,
     committed_volatile: bool,
 }
@@ -592,6 +899,9 @@ const fn add_hydrology_allocation_stats(
 
 fn snapshot_build_stats(
     world: &DynamicWorldSnapshot,
+    summary_history: &[TickSummary],
+    summary_history_capacity: usize,
+    summary_history_allocated: bool,
     layers: &SnapshotLayerCache,
     refresh: LayerRefreshStats,
 ) -> SnapshotBuildStats {
@@ -600,17 +910,29 @@ fn snapshot_build_stats(
         .capacity()
         .saturating_mul(size_of::<DynamicAgentSnapshot>());
     let layer_bytes = layers.total_capacity_bytes();
+    let summary_history_bytes = summary_history_capacity.saturating_mul(size_of::<TickSummary>());
     SnapshotBuildStats {
         dynamic_agent_count: world.agents.len(),
+        summary_history_count: summary_history.len(),
         bulk_allocations: refresh
             .bulk_allocations
-            .saturating_add(usize::from(world.agents.capacity() != 0)),
+            .saturating_add(usize::from(world.agents.capacity() != 0))
+            .saturating_add(usize::from(
+                summary_history_allocated && !summary_history.is_empty(),
+            )),
         newly_allocated_capacity_bytes: refresh
             .newly_allocated_capacity_bytes
-            .saturating_add(dynamic_agent_bytes),
+            .saturating_add(dynamic_agent_bytes)
+            .saturating_add(if summary_history_allocated {
+                summary_history_bytes
+            } else {
+                0
+            }),
         reused_layer_capacity_bytes: layer_bytes
             .saturating_sub(refresh.newly_allocated_capacity_bytes),
-        total_payload_capacity_bytes: dynamic_agent_bytes.saturating_add(layer_bytes),
+        total_payload_capacity_bytes: dynamic_agent_bytes
+            .saturating_add(summary_history_bytes)
+            .saturating_add(layer_bytes),
     }
 }
 
@@ -626,6 +948,8 @@ pub struct HostCore {
     journal: Box<dyn JournalPort>,
     shared: Rc<RefCell<SharedHostState>>,
     snapshots: SnapshotHub,
+    events: EventHub,
+    summary_history: Arc<Vec<TickSummary>>,
     snapshot_layers: SnapshotLayerCache,
     options: HostCoreOptions,
     playback: PlaybackSnapshot,
@@ -644,6 +968,7 @@ pub struct HostCore {
     indeterminate_journal_batch: Option<Arc<JournalBatch>>,
     retained_journal: Option<Arc<JournalBatch>>,
     retained_blocker: Option<HostBlocker>,
+    event_pressure: Option<HostBlocker>,
     inflight_journal: HashMap<JournalBatchId, InflightJournal>,
     shutdown_receipt: Option<(JournalBatchId, ShutdownCommitRequirement)>,
     failed_journal_batches: HashSet<JournalBatchId>,
@@ -657,11 +982,21 @@ impl HostCore {
         world: WorldState,
         options: HostCoreOptions,
     ) -> Result<Self, HostCoreBuildError> {
+        if options.volatile_event_history_capacity == 0
+            || options.volatile_event_history_capacity <= options.scientific_event_capacity
+        {
+            return Err(HostCoreBuildError::InvalidOptions {
+                message: "volatile_event_history_capacity must exceed scientific_event_capacity"
+                    .to_owned(),
+            });
+        }
         Self::with_journal(
             session_id,
             world,
             options,
-            Box::<VolatileJournal>::default(),
+            Box::new(VolatileJournal::with_capacity(
+                options.volatile_event_history_capacity,
+            )),
         )
     }
 
@@ -673,6 +1008,14 @@ impl HostCore {
         journal: Box<dyn JournalPort>,
     ) -> Result<Self, HostCoreBuildError> {
         validate_options(options)?;
+        let events = EventHub::new(
+            session_id,
+            options.scientific_event_capacity,
+            journal.event_reader(session_id),
+        )
+        .map_err(|error| HostCoreBuildError::InvalidOptions {
+            message: error.to_string(),
+        })?;
         let persistence = world.bind_persistence(Box::new(NullPersistence))?;
         let revisions = HostRevisions {
             control: ControlRevision::new(0),
@@ -684,7 +1027,15 @@ impl HostCore {
         let health = HostHealth::Healthy;
         let (snapshot_layers, layer_refresh) = SnapshotLayerCache::new(&world);
         let dynamic_world = DynamicWorldSnapshot::from_world(&world);
-        let build = snapshot_build_stats(&dynamic_world, &snapshot_layers, layer_refresh);
+        let summary_history = Arc::new(world.history().cloned().collect::<Vec<_>>());
+        let build = snapshot_build_stats(
+            &dynamic_world,
+            &summary_history,
+            summary_history.capacity(),
+            true,
+            &snapshot_layers,
+            layer_refresh,
+        );
         let latest_completed_summary = world
             .history()
             .next_back()
@@ -700,6 +1051,7 @@ impl HostCore {
             command_queue_depth: 0,
             last_applied_command: None,
             completed_summary: latest_completed_summary.clone(),
+            summary_history: Arc::clone(&summary_history),
             layers: snapshot_layers.snapshot(),
             build,
             world: dynamic_world,
@@ -709,13 +1061,14 @@ impl HostCore {
             session_id,
             command_capacity: options.command_capacity,
             next_admission: AdmissionSequence::new(1),
-            next_event: EventSequence::new(1),
+            next_event: ProtocolEventSequence::new(1),
+            protocol_event_capacity: options.protocol_event_capacity,
             admission_lifecycle: HostLifecycle::Running,
             shutdown_command_id: None,
             queue: VecDeque::with_capacity(options.command_capacity),
             statuses: HashMap::new(),
             last_applied: None,
-            events: Vec::new(),
+            events: VecDeque::with_capacity(options.protocol_event_capacity),
             visible_tick: world.tick(),
         }));
         Ok(Self {
@@ -725,6 +1078,8 @@ impl HostCore {
             journal,
             shared,
             snapshots,
+            events,
+            summary_history: Arc::clone(&summary_history),
             snapshot_layers,
             options,
             playback,
@@ -743,6 +1098,7 @@ impl HostCore {
             indeterminate_journal_batch: None,
             retained_journal: None,
             retained_blocker: None,
+            event_pressure: None,
             inflight_journal: HashMap::new(),
             shutdown_receipt: None,
             failed_journal_batches: HashSet::new(),
@@ -756,6 +1112,7 @@ impl HostCore {
         LocalHostPort {
             shared: Rc::clone(&self.shared),
             snapshots: self.snapshots.clone(),
+            events: self.events.clone(),
         }
     }
 
@@ -765,6 +1122,14 @@ impl HostCore {
     #[must_use]
     pub fn snapshot_hub(&self) -> SnapshotHub {
         self.snapshots.clone()
+    }
+
+    /// Clone the detached bounded scientific-event reader.
+    ///
+    /// The returned handle owns no command ingress and cannot keep a native controller alive.
+    #[must_use]
+    pub fn event_hub(&self) -> EventHub {
+        self.events.clone()
     }
 
     /// Admit or reuse the host-owned ordered shutdown command.
@@ -862,6 +1227,9 @@ impl HostCore {
         if self.retained_journal.is_some() {
             return HostDriveInterest::WakeOnly;
         }
+        if self.event_pressure.is_some() {
+            return HostDriveInterest::Draining;
+        }
         if !self.shared.borrow().queue.is_empty() {
             return HostDriveInterest::ReadyNow;
         }
@@ -924,6 +1292,7 @@ impl HostCore {
         &mut self,
         message: &str,
     ) -> Result<(), HostAccessError> {
+        self.events.cancel_publish_reservation();
         if self.indeterminate_journal_batch.is_none()
             && let Some(batch) = self.active_journal_batch.take()
         {
@@ -990,13 +1359,21 @@ impl HostCore {
         }
         self.retained_journal = Some(Arc::clone(batch));
         self.retained_blocker = None;
+        let failure = JournalFailure {
+            code: "journal_identity_mismatch".to_owned(),
+            message: "journal response echoed a different batch identity".to_owned(),
+        };
         if let Some(command_id) = batch.command_id() {
             self.update_command_journal(
                 command_id,
-                JournalState::Failed(JournalFailure {
-                    code: "journal_identity_mismatch".to_owned(),
-                    message: "journal response echoed a different batch identity".to_owned(),
-                }),
+                JournalState::Failed(failure.clone()),
+            )?;
+        }
+        if let Some(event_sequence) = batch.scientific_event_sequence() {
+            self.events.update_commitment(
+                batch.id(),
+                event_sequence,
+                EventCommitment::Failed(failure),
             )?;
         }
         self.failed_journal_batches.insert(batch.id());
@@ -1033,6 +1410,13 @@ impl HostCore {
         if let Some(command_id) = batch.command_id() {
             self.update_command_journal(command_id, JournalState::Failed(failure.clone()))?;
         }
+        if let Some(event_sequence) = batch.scientific_event_sequence() {
+            self.events.update_commitment(
+                batch.id(),
+                event_sequence,
+                EventCommitment::Failed(failure.clone()),
+            )?;
+        }
         self.failed_journal_batches.insert(batch.id());
         self.latched_fault = Some(HostFault::Journal {
             batch_id: batch.id(),
@@ -1060,12 +1444,28 @@ impl HostCore {
                 JournalReceiptState::Failed(failure) => JournalState::Failed(failure.clone()),
             };
             if let Some(command_id) = inflight.command_id {
-                changed |= self.update_command_journal(command_id, journal_state)?;
+                changed |= self.update_command_journal(command_id, journal_state.clone())?;
+            }
+            if let Some(event_sequence) = inflight.scientific_event {
+                let commitment = match receipt.state() {
+                    JournalReceiptState::CommittedVolatile => EventCommitment::CommittedVolatile,
+                    JournalReceiptState::Durable => EventCommitment::Durable,
+                    JournalReceiptState::Failed(failure) => {
+                        EventCommitment::Failed(failure.clone())
+                    }
+                };
+                self.events
+                    .update_commitment(batch_id, event_sequence, commitment)?;
+                changed = true;
             }
 
             match receipt.state() {
                 JournalReceiptState::CommittedVolatile => {
-                    if let Some(entry) = self.inflight_journal.get_mut(&batch_id) {
+                    let terminal = self.journal.shutdown_commit_requirement()
+                        == ShutdownCommitRequirement::CommittedVolatile;
+                    if terminal {
+                        self.inflight_journal.remove(&batch_id);
+                    } else if let Some(entry) = self.inflight_journal.get_mut(&batch_id) {
                         entry.committed_volatile = true;
                     }
                     if let Some(requirement @ ShutdownCommitRequirement::CommittedVolatile) =
@@ -1181,6 +1581,8 @@ impl HostCore {
             HostHealth::Faulted(fault.clone())
         } else if let Some(blocker) = self.retained_blocker {
             HostHealth::Blocked(blocker)
+        } else if let Some(blocker) = self.event_pressure {
+            HostHealth::Blocked(blocker)
         } else {
             match self.lifecycle {
                 HostLifecycle::Running => HostHealth::Healthy,
@@ -1202,6 +1604,9 @@ impl HostCore {
         if let Some(blocker) = self.retained_blocker {
             return Some(blocker);
         }
+        if let Some(blocker) = self.event_pressure {
+            return Some(blocker);
+        }
         if let Some(blocker) = self.health.blocker() {
             return Some(blocker);
         }
@@ -1216,6 +1621,24 @@ impl HostCore {
         }
     }
 
+    fn prepare_scientific_event_slot(&mut self) -> Result<bool, HostAccessError> {
+        let pressure = self.events.prepare_publish()?;
+        let ready = pressure.is_none();
+        if !ready {
+            self.cadence_credit = 0;
+        }
+        self.event_pressure = pressure.map(|pressure| HostBlocker::EventJournalHighWater {
+            capacity: self.events.capacity(),
+            pending: self.events.pending_count(),
+            oldest_pending: self.events.oldest_pending_batch(),
+            pinned_batch: pressure.batch_id,
+            pinned_sequence: pressure.sequence,
+            reason: pressure.reason,
+        });
+        self.synchronize_health()?;
+        Ok(ready)
+    }
+
     fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
         let revision = self.next_snapshot;
         let following_revision = revision
@@ -1224,7 +1647,20 @@ impl HostCore {
         let mut layers = self.snapshot_layers.clone();
         let refresh = layers.refresh(&self.world)?;
         let dynamic_world = DynamicWorldSnapshot::from_world(&self.world);
-        let build = snapshot_build_stats(&dynamic_world, &layers, refresh);
+        let summary_history_allocated = self.revisions.scientific != self.last_published_scientific;
+        let summary_history = if summary_history_allocated {
+            Arc::new(self.world.history().cloned().collect::<Vec<_>>())
+        } else {
+            Arc::clone(&self.summary_history)
+        };
+        let build = snapshot_build_stats(
+            &dynamic_world,
+            &summary_history,
+            summary_history.capacity(),
+            summary_history_allocated,
+            &layers,
+            refresh,
+        );
         let (command_queue_depth, last_applied_command) = {
             let shared = self.shared.borrow();
             (
@@ -1242,12 +1678,14 @@ impl HostCore {
             command_queue_depth,
             last_applied_command,
             completed_summary: self.latest_completed_summary.clone(),
+            summary_history: Arc::clone(&summary_history),
             layers: layers.snapshot(),
             build,
             world: dynamic_world,
         });
         self.snapshots.publish(snapshot)?;
         self.snapshot_layers = layers;
+        self.summary_history = summary_history;
         self.next_snapshot = following_revision;
         self.last_published_scientific = self.revisions.scientific;
         self.shared.borrow_mut().visible_tick = self.world.tick();
@@ -1256,6 +1694,21 @@ impl HostCore {
 
     fn pop_command(&self) -> Option<AdmittedEnvelope> {
         self.shared.borrow_mut().queue.pop_front()
+    }
+
+    fn next_command_requires_scientific_event(&self) -> bool {
+        self.shared
+            .borrow()
+            .queue
+            .front()
+            .is_some_and(|admitted| matches!(&admitted.envelope.command, HostCommand::Step))
+    }
+
+    fn ensure_journal_sequence_available(&self) -> Result<(), HostAccessError> {
+        self.next_journal_sequence
+            .checked_add(1)
+            .map(|_| ())
+            .ok_or_else(|| protocol_violation("journal batch sequence exhausted"))
     }
 
     fn complete_status(&self, status: CommandStatus) -> Result<(), HostAccessError> {
@@ -1309,6 +1762,13 @@ impl HostCore {
             return Ok(ApplyResult::completed(false));
         }
 
+        if matches!(
+            &envelope.command,
+            HostCommand::UpdateConfig(_) | HostCommand::Step | HostCommand::Shutdown
+        ) {
+            self.ensure_journal_sequence_available()?;
+        }
+
         let next_control = self
             .revisions
             .control
@@ -1330,12 +1790,6 @@ impl HostCore {
             }
             HostCommand::SetSpeed(speed) => {
                 self.playback.speed_multiplier = speed;
-                self.revisions.control = next_control;
-                self.complete_applied(retry_envelope.command_id, admission, false)?;
-                Ok(ApplyResult::completed(false))
-            }
-            HostCommand::UpdateSelection(update) => {
-                self.world.apply_selection_update(update);
                 self.revisions.control = next_control;
                 self.complete_applied(retry_envelope.command_id, admission, false)?;
                 Ok(ApplyResult::completed(false))
@@ -1567,8 +2021,16 @@ impl HostCore {
             .checked_add(1)
             .ok_or_else(|| protocol_violation("journal batch sequence exhausted"))?;
         let shutdown = matches!(&envelope.command, HostCommand::Shutdown);
+        let scientific_event_sequence = scientific
+            .as_ref()
+            .map(|boundary| {
+                self.events
+                    .publish_pending(batch_id, applied, Arc::clone(boundary))
+            })
+            .transpose()?;
         let batch = Arc::new(JournalBatch::new(
             batch_id,
+            scientific_event_sequence,
             Some(envelope),
             applied,
             scientific,
@@ -1594,8 +2056,12 @@ impl HostCore {
             .next_journal_sequence
             .checked_add(1)
             .ok_or_else(|| protocol_violation("journal batch sequence exhausted"))?;
+        let scientific_event_sequence =
+            self.events
+                .publish_pending(batch_id, applied, Arc::clone(&scientific))?;
         let batch = Arc::new(JournalBatch::new(
             batch_id,
+            Some(scientific_event_sequence),
             None,
             applied,
             Some(scientific),
@@ -1632,6 +2098,7 @@ impl HostCore {
                     batch.id(),
                     InflightJournal {
                         command_id: batch.command_id(),
+                        scientific_event: batch.scientific_event_sequence(),
                         shutdown_requirement,
                         committed_volatile: false,
                     },
@@ -1672,6 +2139,7 @@ impl HostCore {
     }
 
     fn automatic_step(&mut self) -> Result<ApplyResult, HostAccessError> {
+        self.ensure_journal_sequence_available()?;
         let next_scientific = self
             .revisions
             .scientific
@@ -1786,8 +2254,13 @@ impl ManualHostDriver for HostCore {
         let prior_speed = self.playback.speed_multiplier;
         self.last_now = Some(now);
 
-        let events_before = self.shared.borrow().events.len();
+        self.events.cancel_publish_reservation();
+        let events_before = self.events.published_total();
+        let event_was_pressured = self.event_pressure.is_some();
         self.poll_journal_receipts()?;
+        if self.event_pressure.is_some() {
+            self.prepare_scientific_event_slot()?;
+        }
         let mut commands_completed = 0;
         let mut scientific_steps = 0;
         let mut automatic_steps_due = 0;
@@ -1795,9 +2268,24 @@ impl ManualHostDriver for HostCore {
         let mut explicit_step_applied = false;
 
         if self.retained_journal.is_none() {
-            while let Some(admitted) = self.pop_command() {
+            loop {
+                if self.next_command_requires_scientific_event()
+                    && !self.prepare_scientific_event_slot()?
+                {
+                    break;
+                }
+                let Some(admitted) = self.pop_command() else {
+                    break;
+                };
                 self.active_command = Some(admitted.clone());
                 let result = self.apply_command(admitted);
+                let reservation_unused = match &result {
+                    Ok(result) => !result.science_completed,
+                    Err(_) => true,
+                };
+                if reservation_unused {
+                    self.events.cancel_publish_reservation();
+                }
                 if result.is_ok() {
                     self.active_command = None;
                 }
@@ -1818,12 +2306,25 @@ impl ManualHostDriver for HostCore {
             && !self.playback.paused
             && self.retained_journal.is_none()
             && self.latched_fault.is_none()
+            && self.event_pressure.is_none()
+            && !event_was_pressured
         {
             let budget = self.automatic_budget(elapsed_nanos, prior_speed);
             automatic_steps_due = budget.due;
             automatic_steps_skipped = budget.skipped;
             for _ in 0..budget.steps {
-                let result = self.automatic_step()?;
+                if !self.prepare_scientific_event_slot()? {
+                    break;
+                }
+                let result = self.automatic_step();
+                let reservation_unused = match &result {
+                    Ok(result) => !result.science_completed,
+                    Err(_) => true,
+                };
+                if reservation_unused {
+                    self.events.cancel_publish_reservation();
+                }
+                let result = result?;
                 if result.science_completed {
                     self.consume_automatic_credit();
                     scientific_steps += 1;
@@ -1864,7 +2365,11 @@ impl ManualHostDriver for HostCore {
         if should_publish {
             self.publish_snapshot()?;
         }
-        let events_published = self.shared.borrow().events.len() - events_before;
+        let events_published = usize::try_from(
+            self.events.published_total().saturating_sub(events_before),
+        )
+        .unwrap_or(usize::MAX);
+        self.events.cancel_publish_reservation();
         Ok(DriveReceipt {
             now,
             commands_completed,
@@ -1945,6 +2450,16 @@ fn validate_options(options: HostCoreOptions) -> Result<(), HostCoreBuildError> 
             message: "snapshot_interval_ticks must be nonzero".to_owned(),
         });
     }
+    if options.scientific_event_capacity == 0 {
+        return Err(HostCoreBuildError::InvalidOptions {
+            message: "scientific_event_capacity must be nonzero".to_owned(),
+        });
+    }
+    if options.protocol_event_capacity == 0 {
+        return Err(HostCoreBuildError::InvalidOptions {
+            message: "protocol_event_capacity must be nonzero".to_owned(),
+        });
+    }
     if !options.initial_playback.speed_multiplier.is_finite()
         || options.initial_playback.speed_multiplier < 0.0
     {
@@ -1990,8 +2505,13 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        ProjectionBroker, ProjectionCamera, ProjectionClientId, ProjectionDetail,
+        ProjectionLimits, ProjectionRanking, ProjectionRequest, ProjectionSelection,
+        ProjectionViewport, project_snapshot,
+    };
     use scriptbots_core::{
-        AgentData, Generation, HydrologyField, HydrologyFlowDirection, HydrologyTile,
+        AgentData, AgentUid, Generation, HydrologyField, HydrologyFlowDirection, HydrologyTile,
         HydrologyTileLayer, MapArtifact, MapArtifactMetadata, MapGeneratorKind, Position,
         ScriptBotsConfig, TerrainLayer, Velocity,
     };
@@ -2117,6 +2637,9 @@ mod tests {
             tick_period_nanos: 10,
             max_automatic_steps_per_drive: 4,
             snapshot_interval_ticks: 1,
+            protocol_event_capacity: 256,
+            scientific_event_capacity: 64,
+            volatile_event_history_capacity: 512,
         }
     }
 
@@ -2560,6 +3083,101 @@ mod tests {
         assert_eq!(sparse_publications, 2);
     }
 
+    fn projection_matrix_request(client: u16) -> ProjectionRequest {
+        let uid = u64::from(client) + 1;
+        let next_uid = u64::from((client + 1) % 128) + 1;
+        ProjectionRequest {
+            client_id: ProjectionClientId::new(u64::from(client) + 1),
+            viewport: ProjectionViewport {
+                width: 80,
+                height: 45,
+            },
+            camera: ProjectionCamera {
+                center: [
+                    f32::from(client % 32) * 25.0,
+                    f32::from(client / 32) * 200.0,
+                ],
+                zoom: 1.0 + f32::from(client % 4) * 0.5,
+            },
+            selection: ProjectionSelection {
+                focused: Some(AgentUid(uid)),
+                selected: vec![AgentUid(next_uid), AgentUid(uid)],
+            },
+            detail: match client % 3 {
+                0 => ProjectionDetail::Minimal,
+                1 => ProjectionDetail::Vitals,
+                _ => ProjectionDetail::Kinematics,
+            },
+            chart_window: u32::from(client % 64) + 1,
+            chart_points: client % 16 + 1,
+            top_k: client % 32 + 1,
+            ranking: match client % 4 {
+                0 => ProjectionRanking::Energy,
+                1 => ProjectionRanking::Health,
+                2 => ProjectionRanking::Age,
+                _ => ProjectionRanking::Generation,
+            },
+        }
+    }
+
+    #[test]
+    fn one_hundred_twenty_eight_projection_clients_are_isolated_and_science_invariant() {
+        let core = HostCore::new(
+            HostSessionId::new(76),
+            snapshot_measurement_world(128),
+            options(true),
+        )
+        .expect("projection matrix host");
+        let source = core.latest_snapshot();
+        let source_before = source.as_ref().clone();
+        let digest_before = core
+            .scientific_digest_v1()
+            .expect("projection matrix digest");
+        let revisions_before = source.revisions;
+        let mut broker = ProjectionBroker::with_byte_capacity(16, 8 * 1024 * 1024)
+            .expect("bounded projection matrix broker");
+        let mut first = None;
+        let mut second = None;
+
+        for client in 0_u16..128 {
+            let projection = broker
+                .project(
+                    &source,
+                    &projection_matrix_request(client),
+                    ProjectionLimits::default(),
+                )
+                .unwrap_or_else(|error| panic!("projection client {client} failed: {error}"));
+            assert_eq!(projection.source.snapshot, source.revision);
+            assert_eq!(projection.source.host, revisions_before);
+            if client == 0 {
+                first = Some(projection.as_ref().clone());
+            } else if client == 1 {
+                second = Some(projection.as_ref().clone());
+            }
+        }
+
+        let first = first.expect("first client projection");
+        assert_ne!(first, second.expect("second client projection"));
+        let rebuilt_first = broker
+            .project(
+                &source,
+                &projection_matrix_request(0),
+                ProjectionLimits::default(),
+            )
+            .expect("deterministic first-client rebuild");
+        assert_eq!(rebuilt_first.as_ref(), &first);
+        assert!(broker.len() <= 16);
+        assert!(broker.retained_output_capacity_bytes() <= broker.byte_capacity());
+        assert!(broker.evictions() > 0);
+        assert_eq!(source.as_ref(), &source_before);
+        assert_eq!(core.latest_snapshot().revisions, revisions_before);
+        assert_eq!(
+            core.scientific_digest_v1()
+                .expect("post-projection matrix digest"),
+            digest_before
+        );
+    }
+
     fn snapshot_measurement_config() -> ScriptBotsConfig {
         ScriptBotsConfig {
             world_width: 800,
@@ -2594,10 +3212,11 @@ mod tests {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    fn snapshot_measurement_world(agent_count: usize) -> WorldState {
-        let mut world =
-            WorldState::new(snapshot_measurement_config()).expect("snapshot measurement world");
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "bounded synthetic world coordinates intentionally narrow into the f32 simulation domain"
+    )]
+    fn populate_snapshot_measurement_agents(world: &mut WorldState, agent_count: usize) {
         for ordinal in 0..agent_count {
             let x = (ordinal % 800) as f32;
             let y = ((ordinal * 37) % 800) as f32;
@@ -2615,6 +3234,27 @@ mod tests {
                 ))
                 .unwrap_or_else(|error| panic!("snapshot agent {ordinal} failed: {error}"));
         }
+    }
+
+    fn snapshot_measurement_world(agent_count: usize) -> WorldState {
+        let mut world =
+            WorldState::new(snapshot_measurement_config()).expect("snapshot measurement world");
+        populate_snapshot_measurement_agents(&mut world, agent_count);
+        world
+    }
+
+    fn projection_measurement_world(agent_count: usize) -> WorldState {
+        const HISTORY_SAMPLES: usize = 64;
+        let mut config = snapshot_measurement_config();
+        config.history_capacity = HISTORY_SAMPLES;
+        let mut world = WorldState::new(config).expect("projection measurement world");
+        populate_snapshot_measurement_agents(&mut world, agent_count);
+        for _ in 0..HISTORY_SAMPLES {
+            world
+                .step()
+                .expect("projection measurement history step");
+        }
+        assert_eq!(world.history().count(), HISTORY_SAMPLES);
         world
     }
 
@@ -2638,6 +3278,50 @@ mod tests {
             .saturating_sub(1)
             .min(ordered.len().saturating_sub(1));
         ordered[rank]
+    }
+
+    fn projection_measurement_request(snapshot: &RenderSnapshot) -> ProjectionRequest {
+        let focused = snapshot
+            .world
+            .agents
+            .first()
+            .map(|agent| agent.uid)
+            .expect("projection measurement source has agents");
+        let selected = snapshot
+            .world
+            .agents
+            .get(1)
+            .map_or_else(|| vec![focused], |agent| vec![focused, agent.uid]);
+        ProjectionRequest {
+            client_id: ProjectionClientId::new(0x4d45_4153_5552_45),
+            viewport: ProjectionViewport {
+                width: 160,
+                height: 90,
+            },
+            camera: ProjectionCamera {
+                center: [400.0, 400.0],
+                zoom: 1.25,
+            },
+            selection: ProjectionSelection {
+                focused: Some(focused),
+                selected,
+            },
+            detail: ProjectionDetail::Kinematics,
+            chart_window: 64,
+            chart_points: 32,
+            top_k: 32,
+            ranking: ProjectionRanking::Energy,
+        }
+    }
+
+    fn moving_projection_request(base: &ProjectionRequest, ordinal: usize) -> ProjectionRequest {
+        let ordinal = u16::try_from(ordinal).expect("bounded projection sample ordinal");
+        let mut request = base.clone();
+        request.camera.center = [
+            (f32::from(ordinal) * 17.0).rem_euclid(800.0),
+            (f32::from(ordinal) * 31.0).rem_euclid(800.0),
+        ];
+        request
     }
 
     #[test]
@@ -2777,10 +3461,316 @@ mod tests {
     }
 
     #[test]
-    fn volatile_journal_retains_the_exact_accepted_allocation_after_receipt_polling() {
+    #[ignore = "DSR-only reference-hardware per-client projection measurement"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one emitted DSR evidence record keeps raw cold, cached, moving-camera, and 128-client fanout samples with their exact structural accounting"
+    )]
+    fn measure_projections_at_1k_and_10k_agents() {
+        const WARMUPS: usize = 20;
+        const SAMPLES: usize = 200;
+        const FANOUT_CLIENTS: u16 = 128;
+        const SINGLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+        const FANOUT_CACHE_BYTES: usize = 512 * 1024 * 1024;
+        let limits = ProjectionLimits::default();
+
+        for agent_count in [1_000, 10_000] {
+            let core = HostCore::new(
+                HostSessionId::new(
+                    u64::try_from(agent_count).expect("projection agent count fits session id"),
+                ),
+                projection_measurement_world(agent_count),
+                options(true),
+            )
+            .expect("projection measurement host");
+            let source = core.latest_snapshot();
+            assert_eq!(source.world.agents.len(), agent_count);
+            assert_eq!(source.summary_history.len(), 64);
+            let digest_before = core
+                .scientific_digest_v1()
+                .expect("pre-projection measurement digest");
+            let request = projection_measurement_request(&source);
+
+            for _ in 0..WARMUPS {
+                black_box(
+                    project_snapshot(&source, &request, limits)
+                        .expect("cold projection warmup"),
+                );
+            }
+            let mut cold_samples = Vec::with_capacity(SAMPLES);
+            let mut cold_stats = crate::ProjectionBuildStats::default();
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                let projection = project_snapshot(&source, &request, limits)
+                    .expect("measured cold projection");
+                cold_samples.push(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                cold_stats = projection.build;
+                black_box(projection);
+            }
+
+            let mut warm_broker =
+                ProjectionBroker::with_byte_capacity(4, SINGLE_CACHE_BYTES)
+                    .expect("warm projection broker");
+            for _ in 0..WARMUPS {
+                black_box(
+                    warm_broker
+                        .project(&source, &request, limits)
+                        .expect("warm cached projection warmup"),
+                );
+            }
+            let mut warm_samples = Vec::with_capacity(SAMPLES);
+            let mut warm_stats = crate::ProjectionBuildStats::default();
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                let projection = warm_broker
+                    .project(&source, &request, limits)
+                    .expect("measured warm cached projection");
+                warm_samples.push(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                warm_stats = projection.build;
+                black_box(projection);
+            }
+            assert_eq!(warm_broker.misses(), 1);
+            assert_eq!(
+                warm_broker.hits(),
+                u64::try_from(WARMUPS + SAMPLES - 1).expect("bounded warm hit count")
+            );
+
+            let mut moving_broker =
+                ProjectionBroker::with_byte_capacity(16, SINGLE_CACHE_BYTES)
+                    .expect("moving projection broker");
+            for sample in 0..WARMUPS {
+                let moving = moving_projection_request(&request, sample);
+                black_box(
+                    moving_broker
+                        .project(&source, &moving, limits)
+                        .expect("moving-camera projection warmup"),
+                );
+            }
+            let mut moving_samples = Vec::with_capacity(SAMPLES);
+            let mut moving_stats = crate::ProjectionBuildStats::default();
+            for sample in 0..SAMPLES {
+                let moving = moving_projection_request(&request, WARMUPS + sample);
+                let started = Instant::now();
+                let projection = moving_broker
+                    .project(&source, &moving, limits)
+                    .expect("measured moving-camera projection");
+                moving_samples.push(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                moving_stats = projection.build;
+                black_box(projection);
+            }
+            assert_eq!(
+                moving_broker.misses(),
+                u64::try_from(WARMUPS + SAMPLES).expect("bounded moving miss count")
+            );
+
+            let mut fanout_broker = ProjectionBroker::with_byte_capacity(
+                usize::from(FANOUT_CLIENTS),
+                FANOUT_CACHE_BYTES,
+            )
+            .expect("128-client projection broker");
+            let fanout_started = Instant::now();
+            let mut fanout_agents_examined = 0usize;
+            let mut fanout_visible_agents = 0usize;
+            let mut fanout_canvas_cells = 0usize;
+            let mut fanout_top_k_peak = 0usize;
+            let mut fanout_chart_points = 0usize;
+            let mut fanout_output_capacity_bytes = 0usize;
+            for client in 0..FANOUT_CLIENTS {
+                let projection = fanout_broker
+                    .project(&source, &projection_matrix_request(client), limits)
+                    .unwrap_or_else(|error| {
+                        panic!("cold fanout projection {client} failed: {error}")
+                    });
+                fanout_agents_examined = fanout_agents_examined
+                    .saturating_add(projection.build.agents_examined);
+                fanout_visible_agents =
+                    fanout_visible_agents.saturating_add(projection.build.visible_agents);
+                fanout_canvas_cells =
+                    fanout_canvas_cells.saturating_add(projection.build.canvas_cells);
+                fanout_top_k_peak =
+                    fanout_top_k_peak.saturating_add(projection.build.top_k_peak);
+                fanout_chart_points = fanout_chart_points
+                    .saturating_add(projection.build.chart_points_emitted);
+                fanout_output_capacity_bytes = fanout_output_capacity_bytes
+                    .saturating_add(projection.build.output_capacity_bytes);
+                black_box(projection);
+            }
+            let fanout_cold_ns =
+                u64::try_from(fanout_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            assert_eq!(fanout_broker.len(), usize::from(FANOUT_CLIENTS));
+            assert_eq!(fanout_broker.misses(), u64::from(FANOUT_CLIENTS));
+            assert_eq!(
+                fanout_broker.retained_output_capacity_bytes(),
+                fanout_output_capacity_bytes
+            );
+            assert!(fanout_broker.retained_output_capacity_bytes() <= FANOUT_CACHE_BYTES);
+
+            for _ in 0..WARMUPS {
+                for client in 0..FANOUT_CLIENTS {
+                    black_box(
+                        fanout_broker
+                            .project(&source, &projection_matrix_request(client), limits)
+                            .expect("warm fanout projection"),
+                    );
+                }
+            }
+            let mut fanout_warm_samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                for client in 0..FANOUT_CLIENTS {
+                    black_box(
+                        fanout_broker
+                            .project(&source, &projection_matrix_request(client), limits)
+                            .expect("measured warm fanout projection"),
+                    );
+                }
+                fanout_warm_samples.push(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
+
+            assert!(cold_stats.chart_samples_examined > 0);
+            assert!(cold_stats.chart_points_emitted > 0);
+            assert_eq!(cold_stats.top_k_peak, usize::from(request.top_k));
+            assert_eq!(cold_stats.canvas_cells, 160 * 90);
+            assert_eq!(warm_stats, cold_stats);
+            assert_eq!(moving_stats.agents_examined, agent_count);
+            assert_eq!(moving_stats.top_k_peak, usize::from(request.top_k));
+            assert_eq!(moving_stats.canvas_cells, cold_stats.canvas_cells);
+            assert!(cold_stats.output_capacity_bytes > 0);
+
+            let cold_p50_ns = nearest_rank(&cold_samples, 50);
+            let cold_p95_ns = nearest_rank(&cold_samples, 95);
+            let warm_p50_ns = nearest_rank(&warm_samples, 50);
+            let warm_p95_ns = nearest_rank(&warm_samples, 95);
+            let moving_p50_ns = nearest_rank(&moving_samples, 50);
+            let moving_p95_ns = nearest_rank(&moving_samples, 95);
+            let fanout_warm_p50_ns = nearest_rank(&fanout_warm_samples, 50);
+            let fanout_warm_p95_ns = nearest_rank(&fanout_warm_samples, 95);
+            let (
+                cold_budget_p95_ns,
+                warm_budget_p95_ns,
+                moving_budget_p95_ns,
+                fanout_cold_budget_ns,
+                fanout_warm_budget_p95_ns,
+            ) = if agent_count == 1_000 {
+                (16_000_000, 500_000, 20_000_000, 250_000_000, 20_000_000)
+            } else {
+                (80_000_000, 1_000_000, 100_000_000, 3_000_000_000, 25_000_000)
+            };
+            let digest_after = core
+                .scientific_digest_v1()
+                .expect("post-projection measurement digest");
+            assert_eq!(digest_after, digest_before);
+
+            let evidence = serde_json::json!({
+                "schema": "scriptbots.client_projection.measurement.v1",
+                "scenario_contract": "standard-800x800-food20-seed-0x5eedba5e-history64",
+                "agent_count": agent_count,
+                "warmups_per_case": WARMUPS,
+                "samples_per_case": SAMPLES,
+                "fanout_clients": FANOUT_CLIENTS,
+                "source": {
+                    "snapshot_revision": source.revision,
+                    "host_revisions": source.revisions,
+                    "history_samples": source.summary_history.len(),
+                    "scientific_digest": digest_before.overall,
+                },
+                "request": request,
+                "limits": limits,
+                "budgets_ns": {
+                    "cold_p95": cold_budget_p95_ns,
+                    "warm_p95": warm_budget_p95_ns,
+                    "moving_camera_p95": moving_budget_p95_ns,
+                    "fanout_cold": fanout_cold_budget_ns,
+                    "fanout_warm_p95": fanout_warm_budget_p95_ns,
+                },
+                "cold": {
+                    "raw_ns": cold_samples,
+                    "p50_ns": cold_p50_ns,
+                    "p95_ns": cold_p95_ns,
+                    "build": cold_stats,
+                },
+                "warm_cache": {
+                    "raw_ns": warm_samples,
+                    "p50_ns": warm_p50_ns,
+                    "p95_ns": warm_p95_ns,
+                    "build": warm_stats,
+                    "hits": warm_broker.hits(),
+                    "misses": warm_broker.misses(),
+                    "retained_output_capacity_bytes": warm_broker.retained_output_capacity_bytes(),
+                    "cache_byte_capacity": warm_broker.byte_capacity(),
+                },
+                "moving_camera": {
+                    "raw_ns": moving_samples,
+                    "p50_ns": moving_p50_ns,
+                    "p95_ns": moving_p95_ns,
+                    "build": moving_stats,
+                    "hits": moving_broker.hits(),
+                    "misses": moving_broker.misses(),
+                    "evictions": moving_broker.evictions(),
+                    "retained_output_capacity_bytes": moving_broker.retained_output_capacity_bytes(),
+                    "cache_byte_capacity": moving_broker.byte_capacity(),
+                },
+                "fanout_128": {
+                    "cold_ns": fanout_cold_ns,
+                    "warm_raw_ns": fanout_warm_samples,
+                    "warm_p50_ns": fanout_warm_p50_ns,
+                    "warm_p95_ns": fanout_warm_p95_ns,
+                    "agents_examined": fanout_agents_examined,
+                    "visible_agents": fanout_visible_agents,
+                    "canvas_cells": fanout_canvas_cells,
+                    "top_k_peak_total": fanout_top_k_peak,
+                    "chart_points": fanout_chart_points,
+                    "output_capacity_bytes": fanout_output_capacity_bytes,
+                    "retained_output_capacity_bytes": fanout_broker.retained_output_capacity_bytes(),
+                    "cache_byte_capacity": fanout_broker.byte_capacity(),
+                    "hits": fanout_broker.hits(),
+                    "misses": fanout_broker.misses(),
+                    "evictions": fanout_broker.evictions(),
+                },
+            });
+            eprintln!(
+                "{}",
+                serde_json::to_string(&evidence)
+                    .expect("serialize client projection measurement evidence")
+            );
+
+            assert!(
+                cold_p95_ns < cold_budget_p95_ns,
+                "cold projection p95 {cold_p95_ns}ns exceeded {cold_budget_p95_ns}ns"
+            );
+            assert!(
+                warm_p95_ns < warm_budget_p95_ns,
+                "warm projection p95 {warm_p95_ns}ns exceeded {warm_budget_p95_ns}ns"
+            );
+            assert!(
+                moving_p95_ns < moving_budget_p95_ns,
+                "moving projection p95 {moving_p95_ns}ns exceeded {moving_budget_p95_ns}ns"
+            );
+            assert!(
+                fanout_cold_ns < fanout_cold_budget_ns,
+                "cold 128-client fanout {fanout_cold_ns}ns exceeded {fanout_cold_budget_ns}ns"
+            );
+            assert!(
+                fanout_warm_p95_ns < fanout_warm_budget_p95_ns,
+                "warm 128-client fanout p95 {fanout_warm_p95_ns}ns exceeded {fanout_warm_budget_p95_ns}ns"
+            );
+        }
+    }
+
+    #[test]
+    fn volatile_journal_releases_the_exact_accepted_allocation_after_receipt_polling() {
         let mut journal = VolatileJournal::default();
         let batch = Arc::new(JournalBatch::new(
             JournalBatchId::new(HostSessionId::new(1), 1),
+            None,
             None,
             AppliedCommand {
                 tick: Tick(0),
@@ -2789,11 +3779,84 @@ mod tests {
             None,
             None,
         ));
+        let released = Arc::downgrade(&batch);
 
         assert!(journal.try_admit(&batch).is_accepted());
+        let pending = journal.batches();
+        assert_eq!(pending.len(), 1);
+        assert!(Arc::ptr_eq(&pending[0], &batch));
+        drop(pending);
+        assert_eq!(Arc::strong_count(&batch), 2);
         assert_eq!(journal.poll_receipts(1).len(), 1);
-        assert_eq!(journal.batches().len(), 1);
-        assert!(Arc::ptr_eq(&journal.batches()[0], &batch));
+        assert!(journal.batches().is_empty());
+        assert_eq!(Arc::strong_count(&batch), 1);
+        drop(batch);
+        assert!(released.upgrade().is_none());
+    }
+
+    #[test]
+    fn non_scientific_churn_cannot_evict_lightweight_scientific_catch_up() {
+        let mut event_options = options(true);
+        event_options.scientific_event_capacity = 1;
+        event_options.volatile_event_history_capacity = 3;
+        let mut core = HostCore::new(HostSessionId::new(78), world(0), event_options)
+            .expect("churn-isolation host");
+        let mut port = core.local_port();
+        let mut client = crate::HostClient::new(port.clone());
+        let mut slow = client.event_cursor();
+
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("first scientific boundary");
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("first volatile commitment");
+        submit(&mut port, 2, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("second scientific boundary");
+        core.drive(ManualInstant::from_nanos(3))
+            .expect("second volatile commitment");
+
+        let gap = match client
+            .read_events(&mut slow, usize::MAX)
+            .expect("slow event read")
+        {
+            crate::EventPoll::Gap(gap) => gap,
+            other => panic!("wrapped hot ring must report a gap, got {other:?}"),
+        };
+        let locator = match gap.catch_up {
+            crate::EventCatchUpState::Available(locator) => locator,
+            other => panic!("lightweight live catch-up must be available, got {other:?}"),
+        };
+        assert_eq!(locator.range().first, EventSequence::new(1));
+        assert_eq!(locator.range().last, EventSequence::new(1));
+
+        for ordinal in 0_u16..32 {
+            let mut config = core.world.config().clone();
+            config.food_growth_rate = (f32::from(ordinal) + 1.0) / 1_000.0;
+            let command_id = u128::from(ordinal) + 100;
+            submit(
+                &mut port,
+                command_id,
+                HostCommand::UpdateConfig(Box::new(config)),
+            );
+            let boundary = u64::from(ordinal) * 2 + 10;
+            core.drive(ManualInstant::from_nanos(boundary))
+                .expect("non-scientific config journal boundary");
+            core.drive(ManualInstant::from_nanos(boundary + 1))
+                .expect("non-scientific config receipt boundary");
+        }
+
+        let caught_up = client
+            .catch_up_events(&mut slow, locator, 1)
+            .expect("catch up after config churn");
+        let EventCatchUp::Contiguous(page) = caught_up else {
+            panic!("committed scientific record must survive config churn");
+        };
+        assert_eq!(page.source, EventPageSource::LiveMemory);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.sequence, EventSequence::new(1));
+        assert_eq!(page.events[0].commitment, EventCommitment::CommittedVolatile);
+        assert_eq!(slow.last_seen(), EventSequence::new(1));
     }
 
     #[test]
@@ -3047,6 +4110,440 @@ mod tests {
             let count = limit.min(state.receipts.len());
             state.receipts.drain(..count).collect()
         }
+    }
+
+    #[test]
+    fn scientific_event_ring_wraps_with_exact_live_memory_catch_up() {
+        let mut event_options = options(true);
+        event_options.scientific_event_capacity = 2;
+        event_options.volatile_event_history_capacity = 8;
+        let mut core = HostCore::new(HostSessionId::new(70), world(0), event_options)
+            .expect("event catch-up host");
+        let mut port = core.local_port();
+        let mut client = crate::HostClient::new(port.clone());
+        let mut slow = client.event_cursor();
+
+        for id in 1..=3 {
+            submit(&mut port, id, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(
+                u64::try_from(id).expect("small event sequence"),
+            ))
+                .expect("scientific event drive");
+        }
+
+        let gap = match client
+            .read_events(&mut slow, usize::MAX)
+            .expect("slow event poll")
+        {
+            crate::EventPoll::Gap(gap) => gap,
+            other => panic!("slow cursor must receive a gap, got {other:?}"),
+        };
+        assert_eq!(gap.expected, EventSequence::new(1));
+        assert_eq!(gap.missing.first, EventSequence::new(1));
+        assert_eq!(gap.missing.last, EventSequence::new(1));
+        assert_eq!(gap.hot_available.first, EventSequence::new(2));
+        assert_eq!(gap.hot_available.last, EventSequence::new(3));
+        assert_eq!(slow.last_seen(), EventSequence::new(0));
+        let locator = match gap.catch_up {
+            crate::EventCatchUpState::Available(locator) => locator,
+            other => panic!("live memory locator expected, got {other:?}"),
+        };
+        assert_eq!(locator.guarantee(), EventCatchUpGuarantee::LiveMemory);
+        let caught_up = client
+            .catch_up_events(&mut slow, locator, 1)
+            .expect("live memory catch-up");
+        let crate::EventCatchUp::Contiguous(page) = caught_up else {
+            panic!("live memory catch-up must be contiguous");
+        };
+        assert_eq!(page.source, EventPageSource::LiveMemory);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.sequence, EventSequence::new(1));
+        assert_eq!(page.events[0].commitment, EventCommitment::CommittedVolatile);
+        assert_eq!(slow.last_seen(), EventSequence::new(1));
+
+        let crate::EventPoll::Contiguous(hot) = client
+            .read_events(&mut slow, usize::MAX)
+            .expect("hot suffix")
+        else {
+            panic!("caught-up cursor must rejoin hot ring");
+        };
+        assert_eq!(
+            hot.events
+                .iter()
+                .map(|entry| entry.event.sequence)
+                .collect::<Vec<_>>(),
+            [EventSequence::new(2), EventSequence::new(3)]
+        );
+        assert_eq!(slow.last_seen(), EventSequence::new(3));
+        let crate::EventPoll::Contiguous(duplicate) = client
+            .read_events(&mut slow, usize::MAX)
+            .expect("duplicate tip poll")
+        else {
+            panic!("tip poll must remain contiguous");
+        };
+        assert!(duplicate.events.is_empty());
+        assert_eq!(slow.last_seen(), EventSequence::new(3));
+
+        let mut wrong_session = crate::EventCursor::beginning(HostSessionId::new(71));
+        let before = wrong_session;
+        assert!(client.read_events(&mut wrong_session, 1).is_err());
+        assert_eq!(wrong_session, before);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one public-boundary test contrasts recoverable and explicitly accepted event gaps through the same frontend API"
+    )]
+    fn null_frontend_exercises_live_catch_up_and_explicit_unavailable_gap_acceptance() {
+        let mut live_options = options(true);
+        live_options.scientific_event_capacity = 1;
+        live_options.volatile_event_history_capacity = 4;
+        let mut live_core = HostCore::new(HostSessionId::new(81), world(0), live_options)
+            .expect("null-frontend live-memory host");
+        let mut live_frontend = crate::NullFrontend::new(live_core.local_port(), 11);
+
+        live_frontend.step().expect("first live frontend step");
+        live_frontend
+            .drive_at(&mut live_core, ManualInstant::from_nanos(0))
+            .expect("first live frontend drive");
+        live_frontend
+            .drive_at(&mut live_core, ManualInstant::from_nanos(1))
+            .expect("first live frontend commitment");
+        live_frontend.step().expect("second live frontend step");
+        live_frontend
+            .drive_at(&mut live_core, ManualInstant::from_nanos(2))
+            .expect("second live frontend drive");
+        live_frontend
+            .drive_at(&mut live_core, ManualInstant::from_nanos(3))
+            .expect("second live frontend commitment");
+
+        let live_gap = match live_frontend
+            .read_events(usize::MAX)
+            .expect("public live frontend event read")
+        {
+            crate::EventPoll::Gap(gap) => gap,
+            other => panic!("wrapped live frontend must observe a gap, got {other:?}"),
+        };
+        let live_locator = match live_gap.catch_up {
+            crate::EventCatchUpState::Available(locator) => locator,
+            other => panic!("live frontend must receive a catch-up locator, got {other:?}"),
+        };
+        let EventCatchUp::Contiguous(caught_up) = live_frontend
+            .catch_up_events(live_locator, 1)
+            .expect("public live frontend catch-up")
+        else {
+            panic!("live frontend catch-up must be contiguous");
+        };
+        assert_eq!(caught_up.source, EventPageSource::LiveMemory);
+        assert_eq!(caught_up.events.len(), 1);
+        assert_eq!(caught_up.events[0].event.sequence, EventSequence::new(1));
+        let crate::EventPoll::Contiguous(live_hot) = live_frontend
+            .read_events(1)
+            .expect("public live frontend hot suffix")
+        else {
+            panic!("live frontend must rejoin the hot ring");
+        };
+        assert_eq!(live_hot.events.len(), 1);
+        assert_eq!(live_hot.events[0].event.sequence, EventSequence::new(2));
+
+        let state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut unavailable_options = options(true);
+        unavailable_options.scientific_event_capacity = 1;
+        unavailable_options.volatile_event_history_capacity = 4;
+        let mut unavailable_core = HostCore::with_journal(
+            HostSessionId::new(82),
+            world(0),
+            unavailable_options,
+            Box::new(FakeJournal { state }),
+        )
+        .expect("null-frontend no-reader host");
+        let mut unavailable_frontend =
+            crate::NullFrontend::new(unavailable_core.local_port(), 12);
+        unavailable_frontend
+            .step()
+            .expect("first unavailable frontend step");
+        unavailable_frontend
+            .drive_at(&mut unavailable_core, ManualInstant::from_nanos(0))
+            .expect("first unavailable frontend drive");
+        unavailable_frontend
+            .drive_at(&mut unavailable_core, ManualInstant::from_nanos(1))
+            .expect("first unavailable frontend commitment");
+        unavailable_frontend
+            .step()
+            .expect("second unavailable frontend step");
+        unavailable_frontend
+            .drive_at(&mut unavailable_core, ManualInstant::from_nanos(2))
+            .expect("second unavailable frontend drive");
+        unavailable_frontend
+            .drive_at(&mut unavailable_core, ManualInstant::from_nanos(3))
+            .expect("second unavailable frontend commitment");
+
+        let unavailable_gap = match unavailable_frontend
+            .read_events(1)
+            .expect("public unavailable frontend event read")
+        {
+            crate::EventPoll::Gap(gap) => gap,
+            other => panic!("no-reader frontend must observe a gap, got {other:?}"),
+        };
+        assert_eq!(
+            unavailable_gap.catch_up,
+            crate::EventCatchUpState::Unavailable(EventCatchUpUnavailableReason::NoReader)
+        );
+        unavailable_frontend
+            .accept_event_gap(unavailable_gap)
+            .expect("explicitly accept unavailable prefix");
+        let crate::EventPoll::Contiguous(unavailable_hot) = unavailable_frontend
+            .read_events(1)
+            .expect("public hot read after accepting gap")
+        else {
+            panic!("accepted no-reader gap must resume at the hot ring");
+        };
+        assert_eq!(unavailable_hot.events.len(), 1);
+        assert_eq!(
+            unavailable_hot.events[0].event.sequence,
+            EventSequence::new(2)
+        );
+    }
+
+    #[test]
+    fn pending_event_high_water_stops_before_loss_and_resumes_exact_step() {
+        let state = Rc::new(RefCell::new(FakeJournalState {
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let mut event_options = options(true);
+        event_options.scientific_event_capacity = 2;
+        event_options.volatile_event_history_capacity = 8;
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(72),
+            world(0),
+            event_options,
+            Box::new(FakeJournal {
+                state: Rc::clone(&state),
+            }),
+        )
+        .expect("high-water host");
+        let mut port = core.local_port();
+        for id in 1..=3 {
+            let status = submit(&mut port, id, HostCommand::Step);
+            assert!(matches!(status.application(), ApplicationState::Admitted));
+        }
+
+        let first = core
+            .drive(ManualInstant::from_nanos(0))
+            .expect("high-water drive");
+        assert_eq!(first.commands_completed, 2);
+        assert_eq!(first.scientific_steps, 2);
+        assert_eq!(core.world_tick(), Tick(2));
+        assert_eq!(port.queue_depth(), 1);
+        assert_eq!(core.event_hub().len(), 2);
+        assert_eq!(core.event_hub().pending_count(), 2);
+        assert!(matches!(
+            first.blocker,
+            Some(HostBlocker::EventJournalHighWater {
+                capacity: 2,
+                pending: 2,
+                oldest_pending: Some(_),
+                ..
+            })
+        ));
+        let blocked_digest = core
+            .scientific_digest_v1()
+            .expect("blocked scientific digest");
+        let blocked_revision = core.latest_snapshot().revisions.scientific;
+        let second = core
+            .drive(ManualInstant::from_nanos(1_000))
+            .expect("repeated high-water drive");
+        assert_eq!(second.scientific_steps, 0);
+        assert_eq!(port.queue_depth(), 1);
+        assert_eq!(
+            core.scientific_digest_v1()
+                .expect("repeated blocked digest"),
+            blocked_digest
+        );
+        assert_eq!(core.latest_snapshot().revisions.scientific, blocked_revision);
+
+        let batch_ids = state
+            .borrow()
+            .attempts
+            .iter()
+            .map(|batch| batch.id())
+            .collect::<Vec<_>>();
+        assert_eq!(batch_ids.len(), 2);
+        state.borrow_mut().receipts.extend(batch_ids.iter().copied().map(|batch_id| {
+            JournalReceipt::new(batch_id, JournalReceiptState::Durable)
+        }));
+        let resumed = core
+            .drive(ManualInstant::from_nanos(1_001))
+            .expect("event-pressure recovery");
+        assert_eq!(resumed.commands_completed, 1);
+        assert_eq!(resumed.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(3));
+        assert_eq!(port.queue_depth(), 0);
+        assert_eq!(state.borrow().attempts.len(), 3);
+        assert_eq!(status(&mut port, 3).application(), &ApplicationState::Applied(
+            AppliedCommand {
+                tick: Tick(3),
+                revisions: core.latest_snapshot().revisions,
+            }
+        ));
+    }
+
+    #[test]
+    fn running_automatic_high_water_discards_blocked_time_and_resumes_one_step() {
+        let state = Rc::new(RefCell::new(FakeJournalState {
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let mut event_options = options(false);
+        event_options.scientific_event_capacity = 2;
+        event_options.volatile_event_history_capacity = 8;
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(79),
+            world(0),
+            event_options,
+            Box::new(FakeJournal {
+                state: Rc::clone(&state),
+            }),
+        )
+        .expect("automatic high-water host");
+
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("automatic epoch");
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(10))
+                .expect("first automatic boundary")
+                .scientific_steps,
+            1
+        );
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(20))
+                .expect("second automatic boundary")
+                .scientific_steps,
+            1
+        );
+        assert_eq!(core.world_tick(), Tick(2));
+
+        let pressure = core
+            .drive(ManualInstant::from_nanos(1_000))
+            .expect("automatic high-water boundary");
+        assert_eq!(pressure.scientific_steps, 0);
+        assert_eq!(pressure.automatic_steps_due, 98);
+        assert_eq!(pressure.automatic_steps_skipped, 94);
+        assert!(matches!(
+            pressure.blocker,
+            Some(HostBlocker::EventJournalHighWater {
+                capacity: 2,
+                pending: 2,
+                reason: crate::EventHighWaterReason::Pending,
+                ..
+            })
+        ));
+        assert_eq!(core.world_tick(), Tick(2));
+
+        let still_blocked = core
+            .drive(ManualInstant::from_nanos(2_000))
+            .expect("blocked time does not accumulate");
+        assert_eq!(still_blocked.scientific_steps, 0);
+        assert_eq!(still_blocked.automatic_steps_due, 0);
+        assert_eq!(still_blocked.automatic_steps_skipped, 0);
+
+        let batch_ids = state
+            .borrow()
+            .attempts
+            .iter()
+            .map(|batch| batch.id())
+            .collect::<Vec<_>>();
+        assert_eq!(batch_ids.len(), 2);
+        state.borrow_mut().receipts.extend(
+            batch_ids
+                .iter()
+                .copied()
+                .map(|batch_id| JournalReceipt::new(batch_id, JournalReceiptState::Durable)),
+        );
+        let recovery = core
+            .drive(ManualInstant::from_nanos(3_000))
+            .expect("clear automatic event pressure");
+        assert_eq!(recovery.scientific_steps, 0);
+        assert_eq!(recovery.automatic_steps_due, 0);
+        assert_eq!(core.world_tick(), Tick(2));
+
+        let resumed = core
+            .drive(ManualInstant::from_nanos(3_010))
+            .expect("resume automatic cadence");
+        assert_eq!(resumed.automatic_steps_due, 1);
+        assert_eq!(resumed.automatic_steps_skipped, 0);
+        assert_eq!(resumed.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(3));
+        assert_eq!(state.borrow().attempts.len(), 3);
+    }
+
+    #[test]
+    fn maintenance_drive_cancels_an_unused_full_ring_reservation() {
+        let state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut event_options = options(true);
+        event_options.scientific_event_capacity = 2;
+        event_options.volatile_event_history_capacity = 8;
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(80),
+            world(0),
+            event_options,
+            Box::new(FakeJournal {
+                state: Rc::clone(&state),
+            }),
+        )
+        .expect("reservation-cancellation host");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        submit(&mut port, 2, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("fill event ring");
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("make full ring durable");
+        assert_eq!(core.events.len(), 2);
+        assert_eq!(core.events.pending_count(), 0);
+
+        let retained_batch = Arc::clone(
+            state
+                .borrow()
+                .attempts
+                .first()
+                .expect("first scientific journal batch"),
+        );
+        let boundary = Arc::clone(
+            retained_batch
+                .scientific()
+                .expect("first batch scientific boundary"),
+        );
+        assert!(
+            core.events
+                .prepare_publish()
+                .expect("reserve durable full-ring front")
+                .is_none()
+        );
+        let published_before = core.events.published_total();
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("maintenance-only drive cancels reservation");
+
+        assert!(matches!(
+            core.events.publish_pending(
+                JournalBatchId::new(core.session_id, 99),
+                retained_batch.applied(),
+                boundary,
+            ),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert_eq!(core.events.published_total(), published_before);
+        assert_eq!(core.events.len(), 2);
+
+        submit(&mut port, 3, HostCommand::Step);
+        let legitimate = core
+            .drive(ManualInstant::from_nanos(3))
+            .expect("host obtains a fresh reservation");
+        assert_eq!(legitimate.scientific_steps, 1);
+        assert_eq!(core.events.published_total(), published_before + 1);
+        assert_eq!(core.events.len(), 2);
     }
 
     #[test]
@@ -3443,6 +4940,59 @@ mod tests {
             Err(HostAccessError::ProtocolViolation { .. })
         ));
         assert_eq!(core.latest_snapshot(), before);
+    }
+
+    #[test]
+    fn exhausted_journal_sequence_fails_before_config_or_science_mutation() {
+        let (mut config_core, mut config_port) = host(true);
+        let config_before = config_core.world.config().clone();
+        let snapshot_before = config_core.latest_snapshot();
+        let digest_before = config_core
+            .scientific_digest_v1()
+            .expect("pre-exhaustion config digest");
+        let mut changed_config = config_before.clone();
+        changed_config.food_growth_rate = 0.03125;
+        config_core.next_journal_sequence = u64::MAX;
+        submit(
+            &mut config_port,
+            1,
+            HostCommand::UpdateConfig(Box::new(changed_config)),
+        );
+        assert!(matches!(
+            config_core.drive(ManualInstant::from_nanos(0)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert_eq!(config_core.world.config(), &config_before);
+        assert_eq!(config_core.world_tick(), Tick(0));
+        assert_eq!(config_core.latest_snapshot(), snapshot_before);
+        assert_eq!(
+            config_core
+                .scientific_digest_v1()
+                .expect("post-exhaustion config digest"),
+            digest_before
+        );
+        assert_eq!(config_core.events.published_total(), 0);
+
+        let (mut step_core, mut step_port) = host(true);
+        let step_snapshot_before = step_core.latest_snapshot();
+        let step_digest_before = step_core
+            .scientific_digest_v1()
+            .expect("pre-exhaustion step digest");
+        step_core.next_journal_sequence = u64::MAX;
+        submit(&mut step_port, 1, HostCommand::Step);
+        assert!(matches!(
+            step_core.drive(ManualInstant::from_nanos(0)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert_eq!(step_core.world_tick(), Tick(0));
+        assert_eq!(step_core.latest_snapshot(), step_snapshot_before);
+        assert_eq!(
+            step_core
+                .scientific_digest_v1()
+                .expect("post-exhaustion step digest"),
+            step_digest_before
+        );
+        assert_eq!(step_core.events.published_total(), 0);
     }
 
     #[test]
