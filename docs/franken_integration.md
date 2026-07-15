@@ -112,6 +112,13 @@ release-packaging obligation: bd-2z0.13.6).
    validated, recovery revalidates canonical V2/V2.1 manifest projections and
    digests under the writer lease, and V3-V5 files are refused without rewrite
    (`bd-2z0.5.1`).
+10. **Every supported scientific write uses one outbox protocol**: both
+    `StoragePipeline` and same-thread `Storage::persist` assign a stable BLAKE3
+    batch identity before applying rows, advance explicit admitted/applied/durable
+    watermarks, reuse exact retries, and reject changed payloads. Raw agent insert
+    SQL is private; the isolated FrankenSQLite conformance target owns its own
+    explicitly non-production SQL. Receipt and shutdown/join observations share
+    the exact typed terminal database cause (`bd-2z0.8.9.4.4`).
 
 ## 5. Program bead index + status
 
@@ -127,7 +134,9 @@ and review log). Status at last reconcile:
   (legacy app Crossfire removed; bounded Asupersync command bus DSR-verified),
   bd-2z0.5.1 (V6 multi-run schema, pre-tick-zero canonical provenance,
   run-bound recovery/readers, and bounded catalog; DSR workspace-verified at
-  `8861e55f`).
+  `8861e55f`), bd-2z0.8.9.4.4 (all supported writes use the durable outbox;
+  exact typed terminal causes survive receipt plus shutdown/join; DSR
+  workspace-verified at `60e06b3`).
 - **OPEN, ready**: bd-2z0.3.12.2 (BatchBrain — sequenced after the
   bd-16g.15.x sense-lane digest move), bd-2z0.8.9.12 (fsqlite async-api),
   bd-2z0.4.14 (`Cx::scoped_cpu` spike), and bd-2z0.12.4 (BrowserRuntime
@@ -147,3 +156,9 @@ The `bd-2z0.5.1` close proof is DSR run
 `bd-2z0-5-1-v6-20260715-8` on `darwin/arm64`: formatting, touched-file UBS,
 workspace all-target check, strict workspace Clippy, and the complete workspace
 test suite passed at commit `8861e55f`.
+
+The `bd-2z0.8.9.4.4` close proof is DSR run
+`bd-2z0-8-9-4-4-20260715-2` on `darwin/arm64`: formatting, touched-file UBS,
+three focused identity/watermark and terminal-root-cause tests, workspace
+all-target check, strict workspace Clippy, and the complete workspace test suite
+passed at commit `60e06b3`.
