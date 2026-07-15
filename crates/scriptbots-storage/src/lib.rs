@@ -3448,10 +3448,12 @@ fn sqlite_run_id(run_id: RunId) -> SqliteValue {
 
 fn decode_run_id(row: &Row, index: usize, context: &'static str) -> Result<RunId, StorageError> {
     let encoded: String = decode(row, index, context)?;
-    encoded.parse().map_err(|error| StorageError::InvalidData {
-        context,
-        reason: error.to_string(),
-    })
+    encoded
+        .parse::<RunId>()
+        .map_err(|error| StorageError::InvalidData {
+            context,
+            reason: error.to_string(),
+        })
 }
 
 fn decode_hex_u64(context: &'static str, encoded: &str) -> Result<u64, StorageError> {
@@ -5580,7 +5582,8 @@ impl Storage {
                 )));
             }
             Ok(())
-        })
+        })?;
+        Ok(())
     }
 
     fn require_run(&self, run_id: RunId) -> Result<(), StorageError> {
