@@ -22,9 +22,7 @@ mod native;
 pub use host_core::{
     HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, VolatileJournal,
 };
-pub use native::{
-    FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError,
-};
+pub use native::{FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError};
 
 #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
 pub use native::{

@@ -179,9 +179,7 @@ impl SharedHostState {
         }
 
         let closes_gate = matches!(&envelope.command, HostCommand::Shutdown);
-        if self.queue.len() >= self.command_capacity
-            && !(reserve_lifecycle_slot && closes_gate)
-        {
+        if self.queue.len() >= self.command_capacity && !(reserve_lifecycle_slot && closes_gate) {
             let status = CommandStatus::rejected(
                 envelope.command_id,
                 RejectionReason::Overloaded {
@@ -432,8 +430,7 @@ impl HostCore {
             self.next_lifecycle_command_sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
-            let candidate =
-                CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
+            let candidate = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
             if !self.shared.borrow().statuses.contains_key(&candidate) {
                 break candidate;
             }
@@ -511,8 +508,7 @@ impl HostCore {
         }
         if self.lifecycle == HostLifecycle::Stopping
             || (!self.inflight_journal.is_empty()
-                && (self.playback.paused
-                    || speed_units(self.playback.speed_multiplier) == 0))
+                && (self.playback.paused || speed_units(self.playback.speed_multiplier) == 0))
         {
             return HostDriveInterest::Draining;
         }
@@ -1346,11 +1342,7 @@ impl HostCore {
         ))
     }
 
-    fn automatic_budget(
-        &mut self,
-        elapsed_nanos: u64,
-        speed_multiplier: f32,
-    ) -> AutomaticBudget {
+    fn automatic_budget(&mut self, elapsed_nanos: u64, speed_multiplier: f32) -> AutomaticBudget {
         let speed_units = speed_units(speed_multiplier);
         let threshold = u128::from(self.options.tick_period_nanos) * SPEED_SCALE;
         let maximum_steps =
@@ -1364,8 +1356,8 @@ impl HostCore {
             .unwrap_or(self.options.max_automatic_steps_per_drive)
             .min(self.options.max_automatic_steps_per_drive);
         let skipped = due.saturating_sub(admitted);
-        self.cadence_credit = (total_credit % threshold)
-            .saturating_add(admitted.saturating_mul(threshold));
+        self.cadence_credit =
+            (total_credit % threshold).saturating_add(admitted.saturating_mul(threshold));
         AutomaticBudget {
             steps,
             due: u64::try_from(due).unwrap_or(u64::MAX),
@@ -2277,8 +2269,8 @@ mod tests {
     fn lifecycle_shutdown_uses_one_reserved_ordered_slot_and_is_idempotent() {
         let mut constrained = options(true);
         constrained.command_capacity = 1;
-        let mut core = HostCore::new(HostSessionId::new(21), world(0), constrained)
-            .expect("constrained host");
+        let mut core =
+            HostCore::new(HostSessionId::new(21), world(0), constrained).expect("constrained host");
         let mut port = core.local_port();
         let first = submit(&mut port, 1, HostCommand::Pause);
         assert_eq!(first.admission_sequence(), Some(AdmissionSequence::new(1)));

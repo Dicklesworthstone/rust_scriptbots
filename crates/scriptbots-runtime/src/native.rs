@@ -166,10 +166,7 @@ impl FixedDeadlineHost {
     }
 
     /// Submit one envelope through the exact same ordered local host port.
-    pub fn submit(
-        &mut self,
-        envelope: CommandEnvelope,
-    ) -> Result<CommandStatus, HostAccessError> {
+    pub fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
         self.port.submit(envelope)
     }
 
@@ -179,9 +176,7 @@ impl FixedDeadlineHost {
     }
 
     /// Retry the exact retained journal allocation after an explicit ready wake.
-    pub fn retry_retained_journal(
-        &mut self,
-    ) -> Result<Option<JournalAdmission>, HostAccessError> {
+    pub fn retry_retained_journal(&mut self) -> Result<Option<JournalAdmission>, HostAccessError> {
         self.core.retry_retained_journal()
     }
 
@@ -283,13 +278,13 @@ mod asupersync_runner {
         NativeDriveTrigger, NativeScheduleError,
     };
     use crate::{ApplicationState, CommandId, HostFault, HostHealth, JournalBatchId};
+    use asupersync::Cx;
     use asupersync::channel::mpsc::{self, Receiver, RecvError, SendError, Sender};
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use asupersync::time::sleep_until;
     use asupersync::types::{CancelKind, Time};
-    use asupersync::Cx;
     use std::any::Any;
-    use std::future::{poll_fn, Future};
+    use std::future::{Future, poll_fn};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Poll, Waker};
@@ -896,9 +891,7 @@ mod asupersync_runner {
             }
         }
 
-        fn cached_terminal_result(
-            &self,
-        ) -> Option<Result<NativeRunOutcome, NativeRunError>> {
+        fn cached_terminal_result(&self) -> Option<Result<NativeRunOutcome, NativeRunError>> {
             if let Some(outcome) = self.terminal {
                 return Some(Ok(outcome));
             }
@@ -947,8 +940,7 @@ mod asupersync_runner {
                     }
                     DriverWake::Immediate => (NativeDriveTrigger::Maintenance, None),
                     DriverWake::Deadline => {
-                        self.metrics.deadline_wakes =
-                            self.metrics.deadline_wakes.saturating_add(1);
+                        self.metrics.deadline_wakes = self.metrics.deadline_wakes.saturating_add(1);
                         (NativeDriveTrigger::Deadline, None)
                     }
                     DriverWake::Cancellation => {
@@ -1005,8 +997,8 @@ mod asupersync_runner {
             let cancellation_after_drive = self.should_cancel(cx);
             self.reconcile_provisional_shutdown();
             self.reconcile_controller_disconnect();
-            let forced_stop = cancellation_after_drive
-                || self.controller_state != ControllerState::Connected;
+            let forced_stop =
+                cancellation_after_drive || self.controller_state != ControllerState::Connected;
             if self.shutdown_is_applied()
                 || (forced_stop && self.host.core().shutdown_command_id().is_some())
             {
@@ -1016,19 +1008,11 @@ mod asupersync_runner {
                 self.consume_latched_journal_ready(trigger)?;
             }
 
-            self.replace_missing_shutdown_if_required(
-                now,
-                cancellation_after_drive,
-                trigger,
-            )?;
+            self.replace_missing_shutdown_if_required(now, cancellation_after_drive, trigger)?;
             self.pump_same_instant_maintenance(now)?;
             self.reconcile_provisional_shutdown();
             self.reconcile_controller_disconnect();
-            if self.replace_missing_shutdown_if_required(
-                now,
-                cancellation_after_drive,
-                trigger,
-            )? {
+            if self.replace_missing_shutdown_if_required(now, cancellation_after_drive, trigger)? {
                 self.pump_same_instant_maintenance(now)?;
                 self.reconcile_provisional_shutdown();
                 self.reconcile_controller_disconnect();
@@ -1055,9 +1039,7 @@ mod asupersync_runner {
             self.host
                 .core()
                 .shutdown_command_status()
-                .is_some_and(|status| {
-                    matches!(status.application(), ApplicationState::Applied(_))
-                })
+                .is_some_and(|status| matches!(status.application(), ApplicationState::Applied(_)))
         }
 
         fn track_provisional_shutdown(&mut self, now: ManualInstant) {
@@ -1476,19 +1458,19 @@ mod asupersync_runner {
                         self.options.maintenance_period_nanos,
                     );
                     self.maintenance_deadline = Some(maintenance);
-                    let deadline = self.shutdown_wait_started_at().map_or(maintenance, |started| {
-                        let timeout = ManualInstant::from_nanos(
-                            started
-                                .as_nanos()
-                                .saturating_add(self.options.shutdown_timeout_nanos),
-                        );
-                        maintenance.min(timeout)
-                    });
+                    let deadline = self
+                        .shutdown_wait_started_at()
+                        .map_or(maintenance, |started| {
+                            let timeout = ManualInstant::from_nanos(
+                                started
+                                    .as_nanos()
+                                    .saturating_add(self.options.shutdown_timeout_nanos),
+                            );
+                            maintenance.min(timeout)
+                        });
                     self.wait_message_or_deadline(cx, deadline).await
                 }
-                HostDriveInterest::Terminated | HostDriveInterest::Faulted => {
-                    DriverWake::Deadline
-                }
+                HostDriveInterest::Terminated | HostDriveInterest::Faulted => DriverWake::Deadline,
             }
         }
 
@@ -1514,9 +1496,7 @@ mod asupersync_runner {
                     Poll::Ready(Err(RecvError::Disconnected)) => {
                         Poll::Ready(DriverWake::Disconnected)
                     }
-                    Poll::Ready(Err(RecvError::Cancelled)) => {
-                        Poll::Ready(DriverWake::Cancellation)
-                    }
+                    Poll::Ready(Err(RecvError::Cancelled)) => Poll::Ready(DriverWake::Cancellation),
                     Poll::Ready(Err(RecvError::Empty)) | Poll::Pending => Poll::Pending,
                 }
             })
@@ -1620,9 +1600,8 @@ mod tests {
     use super::*;
     use crate::{
         AppliedCommand, CommandId, EventSequence, HostCommand, HostCoreOptions, HostEvent,
-        HostSessionId, JournalBatch, JournalBatchId, JournalFailure, JournalPort,
-        JournalReceipt, JournalReceiptState, PlaybackSnapshot, ScientificBoundary,
-        ShutdownCommitRequirement,
+        HostSessionId, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
+        JournalReceiptState, PlaybackSnapshot, ScientificBoundary, ShutdownCommitRequirement,
     };
     use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
     use std::cell::RefCell;
@@ -1674,7 +1653,10 @@ mod tests {
             if batch.scientific().is_some()
                 && let Some(control) = self.state.borrow_mut().cancel_on_science.take()
             {
-                assert!(control.cancel(), "science hook must request first cancellation");
+                assert!(
+                    control.cancel(),
+                    "science hook must request first cancellation"
+                );
             }
             let mode = self.state.borrow().mode;
             match mode {
@@ -2035,13 +2017,19 @@ mod tests {
         assert_eq!(manual_shutdown.command_id(), native_shutdown_id);
 
         let mut native_port = native.host().local_port();
-        assert_eq!(native.host().core().latest_snapshot(), manual.latest_snapshot());
+        assert_eq!(
+            native.host().core().latest_snapshot(),
+            manual.latest_snapshot()
+        );
         assert_eq!(
             native.host().core().scientific_digest_v1(),
             manual.scientific_digest_v1()
         );
         assert_eq!(events(&mut native_port), events(&mut manual_port));
-        assert_eq!(journal_trace(&native_journal), journal_trace(&manual_journal));
+        assert_eq!(
+            journal_trace(&native_journal),
+            journal_trace(&manual_journal)
+        );
         assert!(native_journal.borrow().batches[0].persistence().is_some());
         assert_eq!(
             native_port
@@ -2058,10 +2046,7 @@ mod tests {
         let (core, _) = captured_host(32, false, ReceiptMode::Immediate);
         let mut native = FixedDeadlineHost::new(core);
         let startup = native
-            .drive_at(
-                ManualInstant::from_nanos(100),
-                NativeDriveTrigger::Startup,
-            )
+            .drive_at(ManualInstant::from_nanos(100), NativeDriveTrigger::Startup)
             .expect("startup");
         assert_eq!(startup.next_deadline, ManualInstant::from_nanos(110));
 
@@ -2096,10 +2081,7 @@ mod tests {
             .drive_at(ManualInstant::from_nanos(0), NativeDriveTrigger::Startup)
             .expect("startup");
         let late = native
-            .drive_at(
-                ManualInstant::from_nanos(105),
-                NativeDriveTrigger::Deadline,
-            )
+            .drive_at(ManualInstant::from_nanos(105), NativeDriveTrigger::Deadline)
             .expect("late deadline");
         assert_eq!(late.scheduled_deadlines_elapsed, 10);
         assert_eq!(late.scheduled_deadlines_skipped, 6);
@@ -2109,10 +2091,7 @@ mod tests {
         assert_eq!(late.next_deadline, ManualInstant::from_nanos(110));
 
         let fractional = native
-            .drive_at(
-                ManualInstant::from_nanos(110),
-                NativeDriveTrigger::Deadline,
-            )
+            .drive_at(ManualInstant::from_nanos(110), NativeDriveTrigger::Deadline)
             .expect("fractional deadline");
         assert_eq!(fractional.host.scientific_steps, 1);
         assert_eq!(native.core().world_tick(), Tick(5));
@@ -2162,21 +2141,25 @@ mod tests {
     #[test]
     fn asupersync_cancel_before_start_drains_once_without_detached_tasks() {
         let (core, _) = captured_host(35, true, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("native runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("native runner");
         assert!(control.cancel());
         assert!(!control.cancel());
 
         let outcome = runner.run_until_terminal().expect("cancel-clean runner");
         assert!(matches!(outcome, NativeRunOutcome::Cancelled { .. }));
-        assert_eq!(runner.host().core().latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert_eq!(
+            runner.host().core().latest_snapshot().lifecycle,
+            HostLifecycle::Stopped
+        );
         assert_eq!(runner.metrics().shutdown_requests, 1);
         assert_eq!(runner.metrics().owned_tasks_started, 0);
         assert_eq!(runner.metrics().owned_tasks_joined, 0);
-        assert_eq!(runner.run_until_terminal().expect("idempotent join"), outcome);
+        assert_eq!(
+            runner.run_until_terminal().expect("idempotent join"),
+            outcome
+        );
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
@@ -2195,7 +2178,9 @@ mod tests {
             .expect("during-step enqueue");
 
         assert!(matches!(
-            during.run_until_terminal().expect("during-step cancellation"),
+            during
+                .run_until_terminal()
+                .expect("during-step cancellation"),
             NativeRunOutcome::Cancelled { .. }
         ));
         assert_eq!(during.host().core().world_tick(), Tick(1));
@@ -2270,8 +2255,7 @@ mod tests {
     fn full_host_queue_stops_after_its_ordered_scientific_boundary() {
         let mut constrained = options(true);
         constrained.command_capacity = 1;
-        let (core, journal) =
-            captured_host_with_options(41, constrained, ReceiptMode::Immediate);
+        let (core, journal) = captured_host_with_options(41, constrained, ReceiptMode::Immediate);
         let mut host = FixedDeadlineHost::new(core);
         let step = envelope(1, HostCommand::Step);
         assert!(matches!(
@@ -2280,8 +2264,8 @@ mod tests {
                 .application(),
             crate::ApplicationState::Admitted
         ));
-        let (mut runner, control) = NativeRunner::new(host, NativeRunnerOptions::default())
-            .expect("queue-full runner");
+        let (mut runner, control) =
+            NativeRunner::new(host, NativeRunnerOptions::default()).expect("queue-full runner");
         assert!(control.cancel());
 
         assert!(matches!(
@@ -2375,9 +2359,11 @@ mod tests {
             crate::ApplicationState::Rejected(crate::RejectionReason::HostStopping)
         ));
         let ordered_events = events(&mut port);
-        assert!(ordered_events
-            .windows(2)
-            .all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(
+            ordered_events
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
     }
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
@@ -2388,9 +2374,8 @@ mod tests {
             ingress_capacity: 1,
             ..NativeRunnerOptions::default()
         };
-        let (mut runner, control) =
-            NativeRunner::new(FixedDeadlineHost::new(core), runner_options)
-                .expect("stale shutdown runner");
+        let (mut runner, control) = NativeRunner::new(FixedDeadlineHost::new(core), runner_options)
+            .expect("stale shutdown runner");
         let stale = envelope(1, HostCommand::Shutdown)
             .expecting_control_revision(crate::ControlRevision::new(99));
         control
@@ -2453,11 +2438,9 @@ mod tests {
         let mut port = core.local_port();
         port.submit(stale.clone())
             .expect("pre-admit stale shutdown");
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("stale cancellation runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("stale cancellation runner");
         assert!(control.cancel());
 
         let outcome = runner
@@ -2534,7 +2517,10 @@ mod tests {
             Some((NativeWakeResult::Enqueued, NativeWakeResult::Coalesced))
         );
         assert!(runner.host().core().pending_journal_batch().is_none());
-        assert_eq!(runner.host().core().latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert_eq!(
+            runner.host().core().latest_snapshot().lifecycle,
+            HostLifecycle::Stopped
+        );
         assert!(runner.metrics().journal_wakes >= 1);
     }
 
@@ -2560,11 +2546,9 @@ mod tests {
             }),
         )
         .expect("automatic journal-full host");
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("automatic journal-full runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("automatic journal-full runner");
         let pause = envelope(20, HostCommand::Pause);
         let shutdown = envelope(21, HostCommand::Shutdown);
 
@@ -2579,8 +2563,7 @@ mod tests {
         let expected_pause = pause.clone();
         let expected_shutdown = shutdown.clone();
         let coordinator = std::thread::spawn(move || {
-            let first_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let first_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while timer.pending_count() == 0 {
                 if std::time::Instant::now() >= first_deadline {
                     clock.advance_to(Time::from_nanos(10));
@@ -2595,8 +2578,7 @@ mod tests {
             clock.advance_to(Time::from_nanos(10));
             let first_fired = timer.process_timers();
 
-            let blocked_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let blocked_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while !(blocked.load(Ordering::Acquire) && lifecycle.is_owner_waiting()) {
                 if std::time::Instant::now() >= blocked_deadline {
                     ready.store(true, Ordering::Release);
@@ -2614,9 +2596,7 @@ mod tests {
             }
             clock.advance_to(Time::from_nanos(1_000));
             let paused_fired = timer.process_timers();
-            if lifecycle.try_submit(pause).is_err()
-                || lifecycle.try_submit(shutdown).is_err()
-            {
+            if lifecycle.try_submit(pause).is_err() || lifecycle.try_submit(shutdown).is_err() {
                 ready.store(true, Ordering::Release);
                 let _ = lifecycle.journal_ready();
                 let _ = lifecycle.cancel();
@@ -2664,18 +2644,19 @@ mod tests {
     #[test]
     fn controller_disconnect_uses_the_same_ordered_shutdown_barrier() {
         let (core, _) = captured_host(46, true, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("disconnect runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("disconnect runner");
         drop(control);
 
         assert!(matches!(
             runner.run_until_terminal().expect("disconnect shutdown"),
             NativeRunOutcome::ControllerDisconnected { .. }
         ));
-        assert_eq!(runner.host().core().latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert_eq!(
+            runner.host().core().latest_snapshot().lifecycle,
+            HostLifecycle::Stopped
+        );
         assert_eq!(runner.metrics().shutdown_requests, 1);
     }
 
@@ -2683,11 +2664,9 @@ mod tests {
     #[test]
     fn disconnect_wins_a_ready_deadline_tie_without_extra_science() {
         let (core, _) = captured_host(57, false, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("disconnect deadline-tie runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("disconnect deadline-tie runner");
         let clock = Arc::new(VirtualClock::starting_at(Time::ZERO));
         let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
         let runtime = RuntimeBuilder::current_thread()
@@ -2729,11 +2708,9 @@ mod tests {
     #[test]
     fn disconnect_after_valid_explicit_shutdown_preserves_stopped_outcome() {
         let (core, _) = captured_host(54, true, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("explicit shutdown disconnect runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("explicit shutdown disconnect runner");
         let shutdown = envelope(1, HostCommand::Shutdown);
         control
             .try_submit(shutdown.clone())
@@ -2756,11 +2733,9 @@ mod tests {
     #[test]
     fn disconnect_replaces_stale_queued_shutdown_with_fail_safe_identity() {
         let (core, _) = captured_host(55, true, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("stale shutdown disconnect runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("stale shutdown disconnect runner");
         let stale = envelope(1, HostCommand::Shutdown)
             .expecting_control_revision(crate::ControlRevision::new(99));
         control
@@ -2814,11 +2789,9 @@ mod tests {
             }),
         )
         .expect("journal-full stale-shutdown host");
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("journal-full stale-shutdown runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("journal-full stale-shutdown runner");
         *on_full.borrow_mut() = Some(control.clone());
         let step = envelope(1, HostCommand::Step);
         let stale = envelope(2, HostCommand::Shutdown)
@@ -2885,11 +2858,9 @@ mod tests {
             }),
         )
         .expect("connected stale-shutdown host");
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("connected stale-shutdown runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("connected stale-shutdown runner");
         let step = envelope(1, HostCommand::Step);
         let stale = envelope(2, HostCommand::Shutdown)
             .expecting_control_revision(crate::ControlRevision::new(99));
@@ -2901,8 +2872,7 @@ mod tests {
             .try_submit(stale.clone())
             .expect("connected delayed stale shutdown enqueue");
         let coordinator = std::thread::spawn(move || {
-            let first_wait_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let first_wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while !(blocked.load(Ordering::Acquire) && control.is_owner_waiting()) {
                 if std::time::Instant::now() >= first_wait_deadline {
                     ready.store(true, Ordering::Release);
@@ -2916,8 +2886,7 @@ mod tests {
             ready.store(true, Ordering::Release);
             let _ = control.journal_ready();
 
-            let reopened_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let reopened_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while control.owner_wait_generation() <= first_wait_generation
                 || !control.is_owner_waiting()
             {
@@ -3017,9 +2986,7 @@ mod tests {
         let ready_for_coordinator = Arc::clone(&ready);
         let coordinator = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while !(blocked_for_coordinator.load(Ordering::Acquire)
-                && timer.pending_count() > 0)
-            {
+            while !(blocked_for_coordinator.load(Ordering::Acquire) && timer.pending_count() > 0) {
                 if std::time::Instant::now() >= deadline {
                     ready_for_coordinator.store(true, Ordering::Release);
                     let _ = control.journal_ready();
@@ -3072,11 +3039,9 @@ mod tests {
     #[test]
     fn root_panic_retains_racing_native_envelopes_without_detaching() {
         let (core, journal) = captured_host(47, true, ReceiptMode::Panic);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("panic runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("panic runner");
         let step = envelope(1, HostCommand::Step);
         let racing = envelope(2, HostCommand::Pause);
         journal.borrow_mut().enqueue_before_panic = Some((control.clone(), racing.clone()));
@@ -3089,7 +3054,10 @@ mod tests {
             Err(NativeRunError::Panicked { .. })
         ));
         assert_eq!(runner.unresolved_envelopes().len(), 1);
-        assert_eq!(runner.unresolved_envelopes()[0].command_id, racing.command_id);
+        assert_eq!(
+            runner.unresolved_envelopes()[0].command_id,
+            racing.command_id
+        );
         let indeterminate = runner
             .host()
             .core()
@@ -3154,11 +3122,9 @@ mod tests {
     #[test]
     fn terminal_drain_failure_is_sticky_before_any_runtime_retry() {
         let (core, _) = captured_host(51, true, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("terminal-drain sticky runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("terminal-drain sticky runner");
         let unresolved = envelope(1, HostCommand::Pause);
         runner.inject_terminal_drain_failure_for_test(
             unresolved.clone(),
@@ -3191,11 +3157,9 @@ mod tests {
     #[test]
     fn virtual_deadline_drives_one_exact_step_then_cancel_cleanly() {
         let (core, journal) = captured_host(48, false, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("virtual deadline runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("virtual deadline runner");
         journal.borrow_mut().cancel_on_science = Some(control.clone());
         let clock = Arc::new(VirtualClock::starting_at(Time::ZERO));
         let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
@@ -3236,11 +3200,9 @@ mod tests {
     #[test]
     fn long_virtual_pause_has_no_periodic_drive_or_science() {
         let (core, _) = captured_host(49, true, ReceiptMode::Immediate);
-        let (mut runner, control) = NativeRunner::new(
-            FixedDeadlineHost::new(core),
-            NativeRunnerOptions::default(),
-        )
-        .expect("paused virtual runner");
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("paused virtual runner");
         assert_eq!(control.wake(), NativeWakeResult::Enqueued);
         for _ in 0..999 {
             assert_eq!(control.wake(), NativeWakeResult::Coalesced);
@@ -3298,7 +3260,9 @@ mod tests {
             NativeRunner::new(FixedDeadlineHost::new(core), options).expect("bounded runner");
         let first = envelope(1, HostCommand::Step);
         let overflow = envelope(2, HostCommand::Step);
-        control.try_submit(first.clone()).expect("first native enqueue");
+        control
+            .try_submit(first.clone())
+            .expect("first native enqueue");
         let returned = control
             .try_submit(overflow)
             .expect_err("second envelope must be retained")
