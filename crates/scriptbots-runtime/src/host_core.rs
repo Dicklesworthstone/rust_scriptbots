@@ -506,8 +506,15 @@ impl HostCore {
         if !self.shared.borrow().queue.is_empty() {
             return HostDriveInterest::ReadyNow;
         }
+        let journal_drain_required = self.inflight_journal.values().any(|entry| {
+            !entry.committed_volatile
+                || matches!(
+                    entry.shutdown_requirement,
+                    Some(ShutdownCommitRequirement::Durable)
+                )
+        });
         if self.lifecycle == HostLifecycle::Stopping
-            || (!self.inflight_journal.is_empty()
+            || (journal_drain_required
                 && (self.playback.paused || speed_units(self.playback.speed_multiplier) == 0))
         {
             return HostDriveInterest::Draining;
