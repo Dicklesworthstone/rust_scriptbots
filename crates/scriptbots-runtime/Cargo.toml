@@ -1,0 +1,17 @@
+[package]
+name = "scriptbots-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Renderer-neutral ScriptBots host, command, snapshot, and event protocol."
+repository.workspace = true
+
+[dependencies]
+scriptbots-core = { path = "../scriptbots-core", default-features = false }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

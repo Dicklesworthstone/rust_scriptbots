@@ -10234,6 +10234,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scriptbots-runtime"
+version = "0.1.0"
+dependencies = [
+ "scriptbots-core",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "scriptbots-storage"
 version = "0.1.0"
 dependencies = [
