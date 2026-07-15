@@ -547,7 +547,13 @@ impl HostCore {
     }
 
     /// Seal admissions and publish exact fault evidence after a driver unwind.
-    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[cfg_attr(
+        not(all(feature = "native-asupersync", not(target_arch = "wasm32"))),
+        allow(
+            dead_code,
+            reason = "the default/browser host retains panic evidence for its native adapter"
+        )
+    )]
     pub(crate) fn record_panicked_boundary(
         &mut self,
         message: &str,
