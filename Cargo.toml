@@ -28,6 +28,7 @@ repository = "https://github.com/Dicklesworthstone/rust_scriptbots"
 [workspace.dependencies]
 anyhow = "1.0.103"
 arc-swap = "1.9.2"
+asupersync = { version = "=0.3.6", default-features = false }
 blake3 = "1.8.5"
 libc = "0.2.186"
 libm = "0.2.16"

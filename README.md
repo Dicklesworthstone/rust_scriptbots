@@ -35,7 +35,7 @@ rust_scriptbots/
 ├── rust-toolchain.toml       # Pinned nightly-2026-07-09 toolchain (MSRV 1.89)
 ├── crates/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
-│   ├── scriptbots-runtime    # Host/client protocol + null frontend; sole-owner HostCore pending
+│   ├── scriptbots-runtime    # Sole-owner HostCore, protocol, fixed-deadline lifecycle, null frontend
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
 │   ├── scriptbots-brain-ml   # Compile probes for Candle/Tract/tch/Frankentorch; no inference yet
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
@@ -110,13 +110,13 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - Startup is fail-closed and transactional. Renderer selection and control-environment validation happen first, then every enabled REST/MCP socket is prebound and held before configuration output, auto-tuning, process-priority changes, world construction, or storage reservation. Launch consumes those exact listeners, so a bind failure cannot leave config, tuning, or run-database artifacts behind and cannot race a later rebind.
 - REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
 - That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
-- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The presentation boundary is not yet complete, however: GPUI contains its characterized double-drive by making the HUD the sole interim simulation driver and the world window read-only, and it now services explicit playback before paused/accumulator early returns. Scientific time still belongs to a renderer, TUI/Bevy retain interim playback policies, and Bevy still owns a simulation worker. Moving all scientific time, exact command sequencing, and status authority into `HostCore` remains explicit roadmap work.
-- `scriptbots-runtime` now defines the renderer-neutral command, status, snapshot, event-cursor, and manual-drive contracts exercised by its null frontend. The diagram still shows the live application-owned drivers: this first runtime slice does not own `WorldState`, apply commands, or drive scientific ticks. The sole-owner `HostCore` begins in `bd-2z0.4.5`.
+- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The presentation boundary is not yet complete, however: GPUI contains its characterized double-drive by making the HUD the sole interim simulation driver and the world window read-only, and it now services explicit playback before paused/accumulator early returns. `HostCore` and its native lifecycle are implemented, but TUI/GPUI/Bevy and the live server transports remain on their interim adapters until the dedicated migration beads replace them.
+- `scriptbots-runtime` owns the renderer-neutral command, two-axis status, snapshot, event-cursor, and manual-drive contracts plus the exact sole-owner `HostCore`. Its optional `native-asupersync` feature drives that same `!Send` host as one current-thread root future at absolute deadlines. Commands and journal-ready signals wake the owner, catch-up is bounded and reported, paused worlds have no periodic timer, and ordered shutdown retains its exact host and journal obligations without spawning or detaching a simulation task.
 - Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
 
 ### Crate roles
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
-- **`scriptbots-runtime`**: Renderer-neutral command, two-axis status, snapshot, and event-cursor contracts with typed revision domains and a synchronous null frontend. It depends on core but not storage, servers, renderers, or an async runtime. Sole `WorldState` ownership remains assigned to `bd-2z0.4.5`.
+- **`scriptbots-runtime`**: Renderer-neutral command, two-axis status, snapshot, and event-cursor contracts with typed revision domains; the sole-owner `HostCore`; a pure injected-time fixed-deadline adapter; and an optional Asupersync `=0.3.6` native lifecycle. It depends on core but not storage, servers, or renderers. The default and WASM-facing surface remains runtime-neutral; Asupersync is activated only by `native-asupersync` on native targets.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
 - **`scriptbots-brain-ml`**: Feature selection and a sensor-copy placeholder for future Candle, Tract, tch, and Frankentorch inference. It does not load or execute models yet; `brain-ft` currently admits and compiles the pinned Frankentorch dependency family only.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
@@ -129,7 +129,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 ## Current status
 - Workspace scaffolding, shared lints, and profiles are in place.
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
-- `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, opaque client ports, cursors, manual-drive contract, and null frontend are implemented. Production `HostCore` ownership and legacy frontend migration remain pending.
+- `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. Legacy frontend and transport migration remains pending.
 - `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
 - `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
@@ -911,7 +911,7 @@ Runtime constraints:
 ### Control bus architecture
 - The live app still owns a bounded MPMC `CommandBus`; REST, MCP, CLI, and interim frontend drivers enqueue legacy `ControlCommand`s and drain them at simulation boundaries.
 - The new `scriptbots-runtime` crate defines the replacement protocol surface: stable command identity, one admission order, a single `ControlRevision` CAS token, independent application/journal status axes, immutable snapshots, and independent event cursors.
-- This protocol slice deliberately does not claim production command application. `bd-2z0.4.5` installs the sole-owner `HostCore`; later adapter beads migrate REST/MCP, GPUI, Bevy, TUI, headless, and WASM callers away from the legacy bus.
+- `HostCore` is now the implemented command/science authority, and the optional native runner supplies fixed-deadline wake, cancellation, bounded catch-up, and durability-gated shutdown around that exact same host. This does not claim the live app has migrated: later adapter beads move REST/MCP, GPUI, Bevy, TUI, headless, and WASM callers away from the legacy bus.
 
 ## Contributing
 - Keep changes scoped to the relevant crate; prefer improving existing files over adding new ones unless functionality is genuinely new.
@@ -972,7 +972,7 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 2. World mechanics and determinism under parallelism; spatial index tuning.
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
 4. Storage: harden the integrated durable-outbox and bounded-controller-wait protocol with exact identity/schema recovery and complete direct-write/root-cause unification, then add strict-run pause/fail-closed host policy, the multi-run schema, and complete command/replay journals.
-5. Runtime: renderer-neutral protocol landed; implement the sole-owner `HostCore`, then migrate every frontend and transport adapter off the legacy app-owned drivers.
+5. Runtime: renderer-neutral protocol, sole-owner `HostCore`, and fixed-deadline native lifecycle landed; next publish canonical multi-subscriber projections and migrate every frontend and transport adapter off the legacy app-owned drivers.
 6. Rendering: HUD/overlays/inspector polish; performance diagnostics.
 7. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.
 

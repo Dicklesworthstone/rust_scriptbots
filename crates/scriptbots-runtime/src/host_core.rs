@@ -3,16 +3,17 @@
 use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
     CommandId, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt, EventSequence,
-    HostAccessError, HostBlocker, HostCommand, HostEvent, HostEventKind, HostFault, HostHealth,
-    HostLifecycle, HostPort, HostRevisions, HostSessionId, HostSnapshot, JournalAdmission,
-    JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt, JournalReceiptState,
-    JournalState, ManualHostDriver, ManualInstant, PlaybackSnapshot, RejectionReason,
-    ScientificBoundary, ScientificBoundaryFault, ScientificRevision, ShutdownCommitRequirement,
-    SnapshotRevision, StatusCombinationError,
+    HostAccessError, HostBlocker, HostCommand, HostDriveInterest, HostEvent, HostEventKind,
+    HostFault, HostHealth, HostLifecycle, HostPort, HostRevisions, HostSessionId, HostSnapshot,
+    JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
+    JournalReceiptState, JournalState, ManualHostDriver, ManualInstant, PlaybackSnapshot,
+    RejectionReason, ScientificBoundary, ScientificBoundaryFault, ScientificRevision,
+    ShutdownCommitRequirement, SnapshotRevision, StatusCombinationError,
 };
 use scriptbots_core::{
-    CompletedStepFault, DynamicWorldSnapshot, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, ScriptBotsConfig, Tick, WorldState,
+    CharacterizationError, CompletedStepFault, DynamicWorldSnapshot, NullPersistence,
+    PersistenceAdmissionSession, PersistenceSessionError, ScriptBotsConfig, Tick, WorldDigestV1,
+    WorldState,
 };
 use std::{
     cell::RefCell,
@@ -27,6 +28,7 @@ const DEFAULT_TICK_PERIOD_NANOS: u64 = 16_666_667;
 const DEFAULT_COMMAND_CAPACITY: usize = 32;
 const DEFAULT_MAX_AUTOMATIC_STEPS: usize = 8;
 const RECEIPT_POLL_LIMIT: usize = 4_096;
+const LIFECYCLE_COMMAND_NAMESPACE: u64 = u64::MAX;
 
 /// Construction options for a synchronous [`HostCore`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,7 +111,7 @@ impl JournalPort for VolatileJournal {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AdmittedEnvelope {
     admission: AdmissionSequence,
     envelope: CommandEnvelope,
@@ -121,6 +123,7 @@ struct SharedHostState {
     next_admission: AdmissionSequence,
     next_event: EventSequence,
     admission_lifecycle: HostLifecycle,
+    shutdown_command_id: Option<CommandId>,
     queue: VecDeque<AdmittedEnvelope>,
     statuses: HashMap<CommandId, CommandStatus>,
     latest_snapshot: Arc<HostSnapshot>,
@@ -145,6 +148,77 @@ impl SharedHostState {
     fn store_status(&mut self, status: CommandStatus) -> Result<(), HostAccessError> {
         self.statuses.insert(status.command_id(), status.clone());
         self.emit(HostEventKind::CommandStatusChanged(status))
+    }
+
+    fn submit(
+        &mut self,
+        envelope: CommandEnvelope,
+        reserve_lifecycle_slot: bool,
+    ) -> Result<CommandStatus, HostAccessError> {
+        if let Some(status) = self.statuses.get(&envelope.command_id) {
+            return Ok(status.clone());
+        }
+
+        if let Err(error) = envelope.command.validate() {
+            let status = CommandStatus::rejected(
+                envelope.command_id,
+                RejectionReason::Validation {
+                    message: error.to_string(),
+                },
+            )
+            .map_err(status_violation)?;
+            self.store_status(status.clone())?;
+            return Ok(status);
+        }
+        if self.admission_lifecycle != HostLifecycle::Running {
+            let status =
+                CommandStatus::rejected(envelope.command_id, RejectionReason::HostStopping)
+                    .map_err(status_violation)?;
+            self.store_status(status.clone())?;
+            return Ok(status);
+        }
+
+        let closes_gate = matches!(&envelope.command, HostCommand::Shutdown);
+        if self.queue.len() >= self.command_capacity
+            && !(reserve_lifecycle_slot && closes_gate)
+        {
+            let status = CommandStatus::rejected(
+                envelope.command_id,
+                RejectionReason::Overloaded {
+                    capacity: self.command_capacity,
+                },
+            )
+            .map_err(status_violation)?;
+            self.store_status(status.clone())?;
+            return Ok(status);
+        }
+
+        let admission = self.next_admission;
+        self.next_admission = admission
+            .checked_next()
+            .ok_or_else(|| protocol_violation("admission sequence exhausted"))?;
+        let journal = if envelope.command.requires_journal() {
+            JournalState::Pending
+        } else {
+            JournalState::NotRequired
+        };
+        let status = CommandStatus::try_new(
+            envelope.command_id,
+            Some(admission),
+            ApplicationState::Admitted,
+            journal,
+        )
+        .map_err(status_violation)?;
+        if closes_gate {
+            self.admission_lifecycle = HostLifecycle::Stopping;
+            self.shutdown_command_id = Some(envelope.command_id);
+        }
+        self.queue.push_back(AdmittedEnvelope {
+            admission,
+            envelope,
+        });
+        self.store_status(status.clone())?;
+        Ok(status)
     }
 }
 
@@ -171,67 +245,7 @@ impl HostPort for LocalHostPort {
     }
 
     fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
-        let mut shared = self.shared.borrow_mut();
-        if let Some(status) = shared.statuses.get(&envelope.command_id) {
-            return Ok(status.clone());
-        }
-
-        if let Err(error) = envelope.command.validate() {
-            let status = CommandStatus::rejected(
-                envelope.command_id,
-                RejectionReason::Validation {
-                    message: error.to_string(),
-                },
-            )
-            .map_err(status_violation)?;
-            shared.store_status(status.clone())?;
-            return Ok(status);
-        }
-        if shared.admission_lifecycle != HostLifecycle::Running {
-            let status =
-                CommandStatus::rejected(envelope.command_id, RejectionReason::HostStopping)
-                    .map_err(status_violation)?;
-            shared.store_status(status.clone())?;
-            return Ok(status);
-        }
-        if shared.queue.len() >= shared.command_capacity {
-            let status = CommandStatus::rejected(
-                envelope.command_id,
-                RejectionReason::Overloaded {
-                    capacity: shared.command_capacity,
-                },
-            )
-            .map_err(status_violation)?;
-            shared.store_status(status.clone())?;
-            return Ok(status);
-        }
-
-        let admission = shared.next_admission;
-        shared.next_admission = admission
-            .checked_next()
-            .ok_or_else(|| protocol_violation("admission sequence exhausted"))?;
-        let journal = if envelope.command.requires_journal() {
-            JournalState::Pending
-        } else {
-            JournalState::NotRequired
-        };
-        let status = CommandStatus::try_new(
-            envelope.command_id,
-            Some(admission),
-            ApplicationState::Admitted,
-            journal,
-        )
-        .map_err(status_violation)?;
-        let closes_gate = matches!(&envelope.command, HostCommand::Shutdown);
-        shared.queue.push_back(AdmittedEnvelope {
-            admission,
-            envelope,
-        });
-        if closes_gate {
-            shared.admission_lifecycle = HostLifecycle::Stopping;
-        }
-        shared.store_status(status.clone())?;
-        Ok(status)
+        self.shared.borrow_mut().submit(envelope, false)
     }
 
     fn command_status(
@@ -295,6 +309,10 @@ pub struct HostCore {
     cadence_credit: u128,
     next_snapshot: SnapshotRevision,
     next_journal_sequence: u64,
+    next_lifecycle_command_sequence: u64,
+    active_command: Option<AdmittedEnvelope>,
+    active_journal_batch: Option<Arc<JournalBatch>>,
+    indeterminate_journal_batch: Option<Arc<JournalBatch>>,
     retained_journal: Option<Arc<JournalBatch>>,
     retained_blocker: Option<HostBlocker>,
     inflight_journal: HashMap<JournalBatchId, InflightJournal>,
@@ -349,6 +367,7 @@ impl HostCore {
             next_admission: AdmissionSequence::new(1),
             next_event: EventSequence::new(1),
             admission_lifecycle: HostLifecycle::Running,
+            shutdown_command_id: None,
             queue: VecDeque::with_capacity(options.command_capacity),
             statuses: HashMap::new(),
             latest_snapshot: initial_snapshot,
@@ -370,6 +389,10 @@ impl HostCore {
             cadence_credit: 0,
             next_snapshot: SnapshotRevision::new(2),
             next_journal_sequence: 1,
+            next_lifecycle_command_sequence: session_id.get(),
+            active_command: None,
+            active_journal_batch: None,
+            indeterminate_journal_batch: None,
             retained_journal: None,
             retained_blocker: None,
             inflight_journal: HashMap::new(),
@@ -385,6 +408,46 @@ impl HostCore {
         LocalHostPort {
             shared: Rc::clone(&self.shared),
         }
+    }
+
+    /// Admit or reuse the host-owned ordered shutdown command.
+    ///
+    /// Native cancellation uses one reserved lifecycle slot after every
+    /// command already admitted through [`HostPort`]. The method closes normal
+    /// ingress immediately, never bypasses that existing total order, and
+    /// returns the same command status on every later call.
+    pub fn request_shutdown(&mut self) -> Result<CommandStatus, HostAccessError> {
+        if let Some(command_id) = self.shared.borrow().shutdown_command_id {
+            return self
+                .shared
+                .borrow()
+                .statuses
+                .get(&command_id)
+                .cloned()
+                .ok_or_else(|| protocol_violation("shutdown command status is missing"));
+        }
+
+        let command_id = loop {
+            let sequence = self.next_lifecycle_command_sequence;
+            self.next_lifecycle_command_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
+            let candidate =
+                CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
+            if !self.shared.borrow().statuses.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        self.shared.borrow_mut().submit(
+            CommandEnvelope::new(command_id, HostCommand::Shutdown),
+            true,
+        )
+    }
+
+    /// Stable identity of the admitted ordered shutdown, when one exists.
+    #[must_use]
+    pub fn shutdown_command_id(&self) -> Option<CommandId> {
+        self.shared.borrow().shutdown_command_id
     }
 
     /// Latest immutable host publication.
@@ -405,10 +468,112 @@ impl HostCore {
         self.world.tick()
     }
 
+    /// Canonical full scientific digest without exposing the mutable world.
+    pub fn scientific_digest_v1(&self) -> Result<WorldDigestV1, CharacterizationError> {
+        self.world.world_digest_v1()
+    }
+
+    /// Nominal automatic cadence configured for this host.
+    #[must_use]
+    pub const fn tick_period_nanos(&self) -> u64 {
+        self.options.tick_period_nanos
+    }
+
+    /// Maximum automatic science work one drive boundary may perform.
+    #[must_use]
+    pub const fn max_automatic_steps_per_drive(&self) -> usize {
+        self.options.max_automatic_steps_per_drive
+    }
+
+    /// Current scheduling interest for a platform-owned driver.
+    #[must_use]
+    pub fn drive_interest(&self) -> HostDriveInterest {
+        if self.lifecycle == HostLifecycle::Stopped {
+            return HostDriveInterest::Terminated;
+        }
+        if self.health.fault().is_some() {
+            return HostDriveInterest::Faulted;
+        }
+        if self.retained_journal.is_some() {
+            return HostDriveInterest::WakeOnly;
+        }
+        if !self.shared.borrow().queue.is_empty() {
+            return HostDriveInterest::ReadyNow;
+        }
+        if self.lifecycle == HostLifecycle::Stopping
+            || (!self.inflight_journal.is_empty()
+                && (self.playback.paused
+                    || speed_units(self.playback.speed_multiplier) == 0))
+        {
+            return HostDriveInterest::Draining;
+        }
+        if self.playback.paused || speed_units(self.playback.speed_multiplier) == 0 {
+            HostDriveInterest::WakeOnly
+        } else {
+            HostDriveInterest::Deadline
+        }
+    }
+
     /// Exact immutable batch retained after non-admission.
     #[must_use]
     pub fn pending_journal_batch(&self) -> Option<Arc<JournalBatch>> {
         self.retained_journal.as_ref().map(Arc::clone)
+    }
+
+    /// Exact command whose owner boundary did not return normally.
+    ///
+    /// This is diagnostic evidence only. A returned envelope has already
+    /// entered the host's admission order and must never be resubmitted.
+    #[must_use]
+    pub fn panicked_command(&self) -> Option<&CommandEnvelope> {
+        self.active_command
+            .as_ref()
+            .map(|admitted| &admitted.envelope)
+    }
+
+    /// Exact journal batch whose adapter handoff panicked after application.
+    ///
+    /// The adapter may or may not have accepted this batch before unwinding,
+    /// so this evidence is deliberately separate from retryable
+    /// [`Self::pending_journal_batch`] state.
+    #[must_use]
+    pub fn indeterminate_journal_batch(&self) -> Option<Arc<JournalBatch>> {
+        self.indeterminate_journal_batch.as_ref().map(Arc::clone)
+    }
+
+    /// Seal admissions and publish exact fault evidence after a driver unwind.
+    pub(crate) fn record_panicked_boundary(
+        &mut self,
+        message: &str,
+    ) -> Result<(), HostAccessError> {
+        if self.indeterminate_journal_batch.is_none()
+            && let Some(batch) = self.active_journal_batch.take()
+        {
+            if self
+                .retained_journal
+                .as_ref()
+                .is_some_and(|retained| retained.id() == batch.id())
+            {
+                self.retained_journal = None;
+                self.retained_blocker = None;
+            }
+            self.indeterminate_journal_batch = Some(batch);
+        }
+        if self.lifecycle == HostLifecycle::Running {
+            self.lifecycle = HostLifecycle::Stopping;
+            let mut shared = self.shared.borrow_mut();
+            shared.admission_lifecycle = HostLifecycle::Stopping;
+            shared.emit(HostEventKind::LifecycleChanged(HostLifecycle::Stopping))?;
+        }
+        self.latched_fault = Some(HostFault::Protocol {
+            code: "native_lifecycle_panic".to_owned(),
+            message: message.to_owned(),
+        });
+        let changed = self.synchronize_health()?;
+        if changed {
+            self.publish_snapshot()?;
+        }
+        Ok(())
     }
 
     /// Explicitly retry the exact retained journal allocation once.
@@ -420,41 +585,16 @@ impl HostCore {
         let Some(batch) = self.retained_journal.as_ref().map(Arc::clone) else {
             return Ok(None);
         };
+        self.active_journal_batch = Some(Arc::clone(&batch));
         let admission = self.journal.try_admit(&batch);
-        if self.retain_identity_violation(&batch, admission)? {
-            self.publish_snapshot()?;
-            return Ok(Some(admission));
+        let shutdown = batch
+            .command()
+            .is_some_and(|command| matches!(&command.command, HostCommand::Shutdown));
+        let result = self.finish_journal_admission(&batch, admission, shutdown, true);
+        if result.is_ok() {
+            self.active_journal_batch = None;
         }
-        match admission {
-            JournalAdmission::Accepted { .. } => {
-                self.seal_core_persistence()?;
-                let shutdown_requirement = if batch
-                    .command()
-                    .is_some_and(|command| matches!(&command.command, HostCommand::Shutdown))
-                {
-                    Some(self.journal.shutdown_commit_requirement())
-                } else {
-                    None
-                };
-                self.inflight_journal.insert(
-                    batch.id(),
-                    InflightJournal {
-                        command_id: batch.command_id(),
-                        shutdown_requirement,
-                        committed_volatile: false,
-                    },
-                );
-                self.retained_journal = None;
-                self.retained_blocker = None;
-            }
-            JournalAdmission::Full { batch_id, capacity } => {
-                self.retained_blocker = Some(HostBlocker::JournalFull { batch_id, capacity });
-            }
-            JournalAdmission::Closed { batch_id } => {
-                self.retained_blocker = Some(HostBlocker::JournalClosed { batch_id });
-                self.fail_closed_batch(&batch)?;
-            }
-        }
+        result?;
         let changed = self.synchronize_health()?;
         if changed {
             self.publish_snapshot()?;
@@ -739,7 +879,9 @@ impl HostCore {
             && expected != self.revisions.control
         {
             if matches!(&envelope.command, HostCommand::Shutdown) {
-                self.shared.borrow_mut().admission_lifecycle = HostLifecycle::Running;
+                let mut shared = self.shared.borrow_mut();
+                shared.admission_lifecycle = HostLifecycle::Running;
+                shared.shutdown_command_id = None;
             }
             let status = CommandStatus::try_new(
                 envelope.command_id,
@@ -1034,39 +1176,13 @@ impl HostCore {
             scientific,
             persistence,
         ));
+        self.active_journal_batch = Some(Arc::clone(&batch));
         let admission = self.journal.try_admit(&batch);
-        if self.retain_identity_violation(&batch, admission)? {
-            return Ok(true);
+        let result = self.finish_journal_admission(&batch, admission, shutdown, false);
+        if result.is_ok() {
+            self.active_journal_batch = None;
         }
-        match admission {
-            JournalAdmission::Accepted { .. } => {
-                self.seal_core_persistence()?;
-                let shutdown_requirement = if shutdown {
-                    Some(self.journal.shutdown_commit_requirement())
-                } else {
-                    None
-                };
-                self.inflight_journal.insert(
-                    batch_id,
-                    InflightJournal {
-                        command_id: batch.command_id(),
-                        shutdown_requirement,
-                        committed_volatile: false,
-                    },
-                );
-                Ok(false)
-            }
-            JournalAdmission::Full { capacity, .. } => {
-                self.retained_journal = Some(batch);
-                self.retained_blocker = Some(HostBlocker::JournalFull { batch_id, capacity });
-                self.synchronize_health()?;
-                Ok(true)
-            }
-            JournalAdmission::Closed { .. } => {
-                self.fail_closed_batch(&batch)?;
-                Ok(true)
-            }
-        }
+        result
     }
 
     fn offer_automatic_journal(
@@ -1087,31 +1203,58 @@ impl HostCore {
             Some(scientific),
             persistence,
         ));
+        self.active_journal_batch = Some(Arc::clone(&batch));
         let admission = self.journal.try_admit(&batch);
-        if self.retain_identity_violation(&batch, admission)? {
+        let result = self.finish_journal_admission(&batch, admission, false, false);
+        if result.is_ok() {
+            self.active_journal_batch = None;
+        }
+        result
+    }
+
+    fn finish_journal_admission(
+        &mut self,
+        batch: &Arc<JournalBatch>,
+        admission: JournalAdmission,
+        shutdown: bool,
+        was_retained: bool,
+    ) -> Result<bool, HostAccessError> {
+        if self.retain_identity_violation(batch, admission)? {
             return Ok(true);
         }
         match admission {
             JournalAdmission::Accepted { .. } => {
                 self.seal_core_persistence()?;
+                let shutdown_requirement = if shutdown {
+                    Some(self.journal.shutdown_commit_requirement())
+                } else {
+                    None
+                };
                 self.inflight_journal.insert(
-                    batch_id,
+                    batch.id(),
                     InflightJournal {
-                        command_id: None,
-                        shutdown_requirement: None,
+                        command_id: batch.command_id(),
+                        shutdown_requirement,
                         committed_volatile: false,
                     },
                 );
+                if was_retained {
+                    self.retained_journal = None;
+                    self.retained_blocker = None;
+                }
                 Ok(false)
             }
             JournalAdmission::Full { capacity, .. } => {
-                self.retained_journal = Some(batch);
-                self.retained_blocker = Some(HostBlocker::JournalFull { batch_id, capacity });
+                self.retained_journal = Some(Arc::clone(batch));
+                self.retained_blocker = Some(HostBlocker::JournalFull {
+                    batch_id: batch.id(),
+                    capacity,
+                });
                 self.synchronize_health()?;
                 Ok(true)
             }
             JournalAdmission::Closed { .. } => {
-                self.fail_closed_batch(&batch)?;
+                self.fail_closed_batch(batch)?;
                 Ok(true)
             }
         }
@@ -1194,19 +1337,31 @@ impl HostCore {
         ))
     }
 
-    fn automatic_budget(&mut self, elapsed_nanos: u64, speed_multiplier: f32) -> usize {
+    fn automatic_budget(
+        &mut self,
+        elapsed_nanos: u64,
+        speed_multiplier: f32,
+    ) -> AutomaticBudget {
         let speed_units = speed_units(speed_multiplier);
         let threshold = u128::from(self.options.tick_period_nanos) * SPEED_SCALE;
         let maximum_steps =
             u128::try_from(self.options.max_automatic_steps_per_drive).unwrap_or(u128::MAX);
-        let maximum_credit = threshold.saturating_mul(maximum_steps);
-        self.cadence_credit = self
+        let total_credit = self
             .cadence_credit
-            .saturating_add(u128::from(elapsed_nanos).saturating_mul(u128::from(speed_units)))
-            .min(maximum_credit);
-        usize::try_from(self.cadence_credit / threshold)
+            .saturating_add(u128::from(elapsed_nanos).saturating_mul(u128::from(speed_units)));
+        let due = total_credit / threshold;
+        let admitted = due.min(maximum_steps);
+        let steps = usize::try_from(admitted)
             .unwrap_or(self.options.max_automatic_steps_per_drive)
-            .min(self.options.max_automatic_steps_per_drive)
+            .min(self.options.max_automatic_steps_per_drive);
+        let skipped = due.saturating_sub(admitted);
+        self.cadence_credit = (total_credit % threshold)
+            .saturating_add(admitted.saturating_mul(threshold));
+        AutomaticBudget {
+            steps,
+            due: u64::try_from(due).unwrap_or(u64::MAX),
+            skipped: u64::try_from(skipped).unwrap_or(u64::MAX),
+        }
     }
 
     fn consume_automatic_credit(&mut self) {
@@ -1236,11 +1391,18 @@ impl ManualHostDriver for HostCore {
         let mut changed = self.poll_journal_receipts()?;
         let mut commands_completed = 0;
         let mut scientific_steps = 0;
+        let mut automatic_steps_due = 0;
+        let mut automatic_steps_skipped = 0;
         let mut explicit_step_applied = false;
 
         if self.retained_journal.is_none() {
             while let Some(admitted) = self.pop_command() {
-                let result = self.apply_command(admitted)?;
+                self.active_command = Some(admitted.clone());
+                let result = self.apply_command(admitted);
+                if result.is_ok() {
+                    self.active_command = None;
+                }
+                let result = result?;
                 commands_completed += usize::from(result.command_completed);
                 scientific_steps += usize::from(result.science_completed);
                 explicit_step_applied |= result.science_completed;
@@ -1260,7 +1422,9 @@ impl ManualHostDriver for HostCore {
             && self.latched_fault.is_none()
         {
             let budget = self.automatic_budget(elapsed_nanos, prior_speed);
-            for _ in 0..budget {
+            automatic_steps_due = budget.due;
+            automatic_steps_skipped = budget.skipped;
+            for _ in 0..budget.steps {
                 let result = self.automatic_step()?;
                 if result.science_completed {
                     self.consume_automatic_credit();
@@ -1285,12 +1449,21 @@ impl ManualHostDriver for HostCore {
             now,
             commands_completed,
             scientific_steps,
+            automatic_steps_due,
+            automatic_steps_skipped,
             scientific_revision: self.revisions.scientific,
             snapshots_published,
             events_published,
             blocker: self.current_blocker(),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AutomaticBudget {
+    steps: usize,
+    due: u64,
+    skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2089,6 +2262,77 @@ mod tests {
             Err(HostAccessError::ProtocolViolation { .. })
         ));
         assert_eq!(core.latest_snapshot(), before);
+    }
+
+    #[test]
+    fn lifecycle_shutdown_uses_one_reserved_ordered_slot_and_is_idempotent() {
+        let mut constrained = options(true);
+        constrained.command_capacity = 1;
+        let mut core = HostCore::new(HostSessionId::new(21), world(0), constrained)
+            .expect("constrained host");
+        let mut port = core.local_port();
+        let first = submit(&mut port, 1, HostCommand::Pause);
+        assert_eq!(first.admission_sequence(), Some(AdmissionSequence::new(1)));
+
+        let shutdown = core.request_shutdown().expect("reserved shutdown slot");
+        assert_eq!(
+            shutdown.admission_sequence(),
+            Some(AdmissionSequence::new(2))
+        );
+        let repeated = core.request_shutdown().expect("idempotent shutdown");
+        assert_eq!(repeated, shutdown);
+        assert_eq!(core.shutdown_command_id(), Some(shutdown.command_id()));
+        assert!(matches!(
+            submit(&mut port, 2, HostCommand::Resume).application(),
+            ApplicationState::Rejected(RejectionReason::HostStopping)
+        ));
+
+        let applied = core
+            .drive(ManualInstant::from_nanos(0))
+            .expect("ordered pause then shutdown");
+        assert_eq!(applied.commands_completed, 2);
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("volatile shutdown barrier");
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+    }
+
+    #[test]
+    fn bounded_catch_up_reports_skips_and_preserves_fractional_credit() {
+        let (mut core, _port) = host(false);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("initial boundary");
+
+        let late = core
+            .drive(ManualInstant::from_nanos(105))
+            .expect("bounded late boundary");
+        assert_eq!(late.automatic_steps_due, 10);
+        assert_eq!(late.automatic_steps_skipped, 6);
+        assert_eq!(late.scientific_steps, 4);
+        assert_eq!(core.world_tick(), Tick(4));
+
+        let fractional = core
+            .drive(ManualInstant::from_nanos(110))
+            .expect("fractional credit boundary");
+        assert_eq!(fractional.automatic_steps_due, 1);
+        assert_eq!(fractional.automatic_steps_skipped, 0);
+        assert_eq!(fractional.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(5));
+    }
+
+    #[test]
+    fn drive_interest_disarms_paused_science_and_exposes_immediate_work() {
+        let (mut core, mut port) = host(true);
+        assert_eq!(core.drive_interest(), HostDriveInterest::WakeOnly);
+        submit(&mut port, 1, HostCommand::Step);
+        assert_eq!(core.drive_interest(), HostDriveInterest::ReadyNow);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("explicit step");
+        assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("volatile step receipt");
+        assert_eq!(core.drive_interest(), HostDriveInterest::WakeOnly);
+        assert!(core.scientific_digest_v1().is_ok());
     }
 
     #[test]

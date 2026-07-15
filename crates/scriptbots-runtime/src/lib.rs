@@ -17,9 +17,19 @@ use std::{fmt, sync::Arc};
 use thiserror::Error;
 
 mod host_core;
+mod native;
 
 pub use host_core::{
     HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, VolatileJournal,
+};
+pub use native::{
+    FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError,
+};
+
+#[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+pub use native::{
+    NativeControl, NativeIngressError, NativeLifecycleMetrics, NativeRunError, NativeRunOutcome,
+    NativeRunner, NativeRunnerOptions, NativeRunnerOptionsError, NativeWakeResult,
 };
 
 macro_rules! monotonic_newtype {
@@ -726,7 +736,13 @@ pub trait JournalPort {
     ///
     /// This value must remain stable for the lifetime of a host. The durable
     /// default prevents a file-backed adapter from accidentally treating an
-    /// intermediate volatile receipt as shutdown completion.
+    /// intermediate volatile receipt as shutdown completion. Admission of the
+    /// ordered shutdown [`JournalBatch`] is also the adapter-neutral flush
+    /// barrier request: its qualifying receipt may be emitted only after that
+    /// batch and every earlier accepted batch in the host session meet this
+    /// threshold. A native lifecycle may time out while waiting, but the host
+    /// retains the exact pending or inflight work so a later drive can resume
+    /// the same barrier rather than inventing a second one.
     fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
         ShutdownCommitRequirement::Durable
     }
@@ -756,6 +772,28 @@ pub enum HostBlocker {
     LifecycleStopped,
     /// A latched scientific fault prevents a later transition.
     ScientificFault,
+}
+
+/// Scheduling interest derived from the sole-owner host state.
+///
+/// Native and browser adapters use this value only to decide when to call
+/// [`ManualHostDriver::drive`]. It never grants permission to mutate the world
+/// or to infer scientific time from repaint activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostDriveInterest {
+    /// Already-admitted command work can be processed at the current instant.
+    ReadyNow,
+    /// Healthy automatic playback needs the next fixed cadence deadline.
+    Deadline,
+    /// No periodic science deadline is useful; wait for an explicit wake.
+    WakeOnly,
+    /// Journal receipts or ordered shutdown finalization still need polling.
+    Draining,
+    /// The host reached its clean terminal lifecycle.
+    Terminated,
+    /// A queryable host fault prevents normal progress.
+    Faulted,
 }
 
 /// Queryable host fault that is independent of frontend or transport state.
@@ -1183,6 +1221,13 @@ pub struct DriveReceipt {
     pub commands_completed: usize,
     /// Scientific transitions completed during this drive.
     pub scientific_steps: usize,
+    /// Speed-scaled automatic science opportunities due at this boundary.
+    ///
+    /// This excludes an explicit [`HostCommand::Step`].
+    pub automatic_steps_due: u64,
+    /// Whole automatic opportunities deliberately discarded by the bounded
+    /// catch-up policy. Fractional cadence credit is retained.
+    pub automatic_steps_skipped: u64,
     /// Scientific revision visible after this drive.
     pub scientific_revision: ScientificRevision,
     /// Snapshots published during this drive.
@@ -1720,6 +1765,8 @@ mod tests {
                         .saturating_sub(scientific_before.get()),
                 )
                 .expect("test scientific-step count fits usize"),
+                automatic_steps_due: 0,
+                automatic_steps_skipped: 0,
                 scientific_revision: self.revisions.scientific,
                 snapshots_published,
                 events_published: self.events.len() - events_before,

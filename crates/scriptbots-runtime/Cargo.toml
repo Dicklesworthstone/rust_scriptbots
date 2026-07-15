@@ -8,7 +8,12 @@ authors.workspace = true
 description = "Renderer-neutral ScriptBots host, command, snapshot, and event protocol."
 repository.workspace = true
 
+[features]
+default = []
+native-asupersync = ["dep:asupersync"]
+
 [dependencies]
+asupersync = { workspace = true, optional = true }
 scriptbots-core = { path = "../scriptbots-core", default-features = false }
 serde = { workspace = true }
 thiserror = { workspace = true }

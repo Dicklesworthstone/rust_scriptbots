@@ -10238,6 +10238,7 @@ dependencies = [
 name = "scriptbots-runtime"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "scriptbots-core",
  "serde",
  "serde_json",

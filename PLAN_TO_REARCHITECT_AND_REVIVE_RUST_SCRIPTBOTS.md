@@ -2205,6 +2205,20 @@ standalone `scriptbots-runtime` `wasm32-unknown-unknown` check on exact source
 
 **Exit:** native lifecycle tests are cancel-clean and produce the same host-core traces as manual time.
 
+**Code-first implementation staged:** `FixedDeadlineHost` drives the exact `.4.5` owner at injected
+absolute deadlines, reports bounded missed opportunities without dropping fractional cadence, and
+rejects backward time before touching the host. The optional exact Asupersync `=0.3.6` adapter keeps
+that `!Send` host in one current-thread root future; its bounded outer ingress is explicitly enqueue,
+not host admission, while commands, journal readiness, cancellation, and controller loss all converge
+on the same stable ordered shutdown envelope. Command admission closes separately from the lifecycle
+wake path, so retained journal work can become ready during shutdown; typed timeout, fault, panic,
+and terminal-race paths retain the exact host or bounded unresolved envelopes for inspection. Tests
+cover manual/native trace identity, early/late/backward clocks, bounded catch-up, actual virtual-clock
+deadlines, long paused virtual time, wake storms, full queues, cancellation before/during/after
+science, stale-CAS and empty/nonempty shutdown, journal full-to-ready recovery, controller loss,
+timeout/failure, panic retention, repeated shutdown identity, and zero detached scheduler tasks.
+Central DSR batch proof remains required before this section or bead is marked complete.
+
 #### 2.6 canonical snapshot hub and projections
 
 - current summary;
