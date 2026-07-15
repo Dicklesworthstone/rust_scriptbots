@@ -1,12 +1,12 @@
 use crossfire::mpmc;
 use crossfire::{MAsyncTx, MRx, TryRecvError, TrySendError, detect_backoff_cfg};
-use scriptbots_core::{ControlCommand, WorldState, apply_control_command};
+use scriptbots_core::ControlCommand;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::warn;
 
 pub type CommandSender = MAsyncTx<ControlCommand>;
 pub type CommandReceiver = MRx<ControlCommand>;
-pub type CommandDrain = Arc<dyn Fn(&mut WorldState) + Send + Sync>;
+pub type CommandDrain = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
 pub type CommandSubmit = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
 
 pub fn create_command_bus(capacity: usize) -> (CommandSender, CommandReceiver) {
@@ -14,26 +14,22 @@ pub fn create_command_bus(capacity: usize) -> (CommandSender, CommandReceiver) {
     mpmc::bounded_tx_async_rx_blocking(capacity)
 }
 
-pub fn drain_pending_commands(receiver: &CommandReceiver, world: &mut WorldState) {
+#[must_use]
+pub fn drain_pending_commands(receiver: &CommandReceiver) -> Vec<ControlCommand> {
+    let mut commands = Vec::new();
     loop {
         match receiver.try_recv() {
-            Ok(command) => {
-                debug!(?command, "applying control command");
-                if let Err(err) = apply_control_command(world, command) {
-                    warn!(?err, "failed to apply control command");
-                }
-            }
+            Ok(command) => commands.push(command),
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,
         }
     }
+    commands
 }
 
 pub fn make_command_drain(receiver: CommandReceiver) -> CommandDrain {
     let receiver = Arc::new(receiver);
-    Arc::new(move |world: &mut WorldState| {
-        drain_pending_commands(&receiver, world);
-    })
+    Arc::new(move || drain_pending_commands(&receiver))
 }
 
 pub fn make_command_submit(sender: CommandSender) -> CommandSubmit {
@@ -60,7 +56,9 @@ pub fn make_command_submit(sender: CommandSender) -> CommandSubmit {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
-    use scriptbots_core::{ScriptBotsConfig, SimulationCommand};
+    use scriptbots_core::{
+        ControlDisposition, ScriptBotsConfig, SimulationCommand, WorldState, apply_control_command,
+    };
 
     #[test]
     fn submit_rejects_non_finite_speed_before_queue_admission() {
@@ -89,17 +87,30 @@ mod validation_tests {
         )));
 
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
-        drain_pending_commands(&receiver, &mut world);
-        let pending = world.drain_simulation_commands();
+        let pending = drain_pending_commands(&receiver);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].speed_multiplier, Some(32.0));
+        let disposition = apply_control_command(
+            &mut world,
+            pending.into_iter().next().expect("one playback command"),
+        )
+        .expect("normalized playback disposition");
+        assert_eq!(
+            disposition,
+            ControlDisposition::Playback(SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(32.0),
+                step_once: false,
+            })
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{ScriptBotsConfig, SimulationCommand};
+    use scriptbots_core::{
+        ControlDisposition, ScriptBotsConfig, SimulationCommand, WorldState, apply_control_command,
+    };
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,10 +523,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "KNOWN DEFECT bd-2z0.4.1: mixed command classes do not apply in enqueue order"
-    )]
-    fn target_mixed_command_classes_apply_atomically_in_enqueue_order() {
+    fn drained_mixed_command_classes_preserve_enqueue_order() {
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let (sender, receiver) = create_command_bus(2);
         sender
@@ -531,13 +539,60 @@ mod tests {
             .try_send(ControlCommand::UpdateConfig(Box::new(updated)))
             .expect("config fits");
 
-        drain_pending_commands(&receiver, &mut world);
+        let commands = drain_pending_commands(&receiver);
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(commands[0], ControlCommand::UpdateSimulation(_)));
+        assert!(matches!(commands[1], ControlCommand::UpdateConfig(_)));
+
+        let dispositions = commands
+            .into_iter()
+            .map(|command| {
+                apply_control_command(&mut world, command).expect("ordered command application")
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            dispositions.as_slice(),
+            [
+                ControlDisposition::Playback(_),
+                ControlDisposition::WorldApplied
+            ]
+        ));
         assert!((world.config().food_max - 0.73).abs() < f32::EPSILON);
-        let deferred_playback = world.drain_simulation_commands();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "KNOWN DEFECT bd-2z0.4.1: mixed command classes do not apply in enqueue order"
+    )]
+    fn target_mixed_command_classes_apply_atomically_in_enqueue_order() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let (sender, receiver) = create_command_bus(2);
+        sender
+            .try_send(ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: true,
+            }))
+            .expect("step fits");
+        let mut updated = world.config().clone();
+        updated.food_max = 0.73;
+        sender
+            .try_send(ControlCommand::UpdateConfig(Box::new(updated)))
+            .expect("config fits");
+
+        let mut deferred_playback = Vec::new();
+        for command in drain_pending_commands(&receiver) {
+            match apply_control_command(&mut world, command).expect("apply drained command") {
+                ControlDisposition::WorldApplied => {}
+                ControlDisposition::Playback(command) => deferred_playback.push(command),
+            }
+        }
+
+        assert!((world.config().food_max - 0.73).abs() < f32::EPSILON);
         assert_eq!(
             deferred_playback.len(),
             1,
-            "current defect must stay visible"
+            "current semantic-order defect must stay visible"
         );
         assert!(
             deferred_playback.is_empty(),
@@ -562,7 +617,12 @@ mod tests {
         let observed_at_shutdown = world.lock().expect("world lock").config().food_max;
         assert!((observed_at_shutdown - 0.73).abs() > f32::EPSILON);
 
-        (drain.as_ref())(&mut world.lock().expect("world lock"));
+        let mut world_guard = world.lock().expect("world lock");
+        for command in (drain.as_ref())() {
+            let _ = apply_control_command(&mut world_guard, command)
+                .expect("apply command after shutdown");
+        }
+        drop(world_guard);
         assert!((world.lock().expect("world lock").config().food_max - 0.73).abs() < f32::EPSILON);
         assert!(
             (observed_at_shutdown - 0.73).abs() < f32::EPSILON,

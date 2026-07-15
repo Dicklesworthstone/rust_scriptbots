@@ -676,6 +676,27 @@ impl SimulationCommand {
         }
         Ok(())
     }
+
+    /// Validate and normalize playback input for an external simulation driver.
+    pub fn into_normalized(mut self) -> Result<Self, WorldStateError> {
+        self.validate()?;
+        if let Some(speed) = self.speed_multiplier.as_mut() {
+            *speed = speed.clamp(0.0, 32.0);
+        }
+        Ok(self)
+    }
+}
+
+/// Result of applying the world-owned portion of a control command.
+///
+/// Playback remains owned by the external simulation driver. Returning it explicitly allows that
+/// driver to preserve command-stream order without installing a second transport queue inside
+/// [`WorldState`].
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum ControlDisposition {
+    WorldApplied,
+    Playback(SimulationCommand),
 }
 
 impl ControlCommand {
@@ -689,19 +710,24 @@ impl ControlCommand {
     }
 }
 
-/// Apply a control command to the world state.
+/// Apply the world-owned portion of a command and return playback for the external driver.
 pub fn apply_control_command(
     world: &mut WorldState,
     command: ControlCommand,
-) -> Result<(), WorldStateError> {
+) -> Result<ControlDisposition, WorldStateError> {
     command.validate()?;
     match command {
-        ControlCommand::UpdateConfig(config) => world.apply_config_update(*config),
+        ControlCommand::UpdateConfig(config) => {
+            world.apply_config_update(*config)?;
+            Ok(ControlDisposition::WorldApplied)
+        }
         ControlCommand::UpdateSelection(update) => {
             world.apply_selection_update(update);
-            Ok(())
+            Ok(ControlDisposition::WorldApplied)
         }
-        ControlCommand::UpdateSimulation(update) => world.enqueue_simulation_command(update),
+        ControlCommand::UpdateSimulation(update) => {
+            Ok(ControlDisposition::Playback(update.into_normalized()?))
+        }
     }
 }
 
@@ -2107,9 +2133,12 @@ impl fmt::Display for WorldContinuationBlocker {
 /// Failures encountered while characterizing a world boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CharacterizationError {
-    /// V0 is defined only between ticks, with no queued stage/control work.
+    /// V0 is defined only between ticks, with no queued stage or boundary work.
+    ///
+    /// `simulation_commands` is the stable legacy wire-field name. Since playback transport left
+    /// `WorldState`, it counts pending interventions that still make the boundary non-quiescent.
     #[error(
-        "world is not at a quiescent boundary (pending deaths: {pending_deaths}, pending spawns: {pending_spawns}, simulation commands: {simulation_commands})"
+        "world is not at a quiescent boundary (pending deaths: {pending_deaths}, pending spawns: {pending_spawns}, legacy queued boundary work: {simulation_commands})"
     )]
     NonQuiescent {
         pending_deaths: usize,
@@ -10611,7 +10640,6 @@ pub struct WorldState {
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
     activation_probe: Option<AgentId>,
-    simulation_commands: Vec<SimulationCommand>,
 }
 
 impl fmt::Debug for WorldState {
@@ -10739,7 +10767,6 @@ impl WorldState {
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
             activation_probe: None,
-            simulation_commands: Vec::new(),
         })
     }
 
@@ -15934,7 +15961,6 @@ impl WorldState {
         if require_quiescent
             && (!self.pending_deaths.is_empty()
             || !self.pending_spawns.is_empty()
-            || !self.simulation_commands.is_empty()
             // A queued intervention is undelivered science: digesting now would
             // fingerprint a world that is about to change for reasons the digest
             // cannot see.
@@ -15943,8 +15969,7 @@ impl WorldState {
             return Err(CharacterizationError::NonQuiescent {
                 pending_deaths: self.pending_deaths.len(),
                 pending_spawns: self.pending_spawns.len(),
-                simulation_commands: self.simulation_commands.len()
-                    + self.pending_interventions.len(),
+                simulation_commands: self.pending_interventions.len(),
             });
         }
 
@@ -16471,7 +16496,11 @@ impl WorldState {
         }
 
         encoder.postcard("pending interventions", &self.pending_interventions)?;
-        encoder.postcard("simulation commands", &self.simulation_commands)?;
+        // V1.1 encoded the core-owned playback queue here. The queue is now an explicit host
+        // boundary input, but retaining its structurally empty domain preserves every successful
+        // fixed trace hash across the ownership extraction.
+        let simulation_commands: &[SimulationCommand] = &[];
+        encoder.postcard("simulation commands", &simulation_commands)?;
         Ok(encoder.finish())
     }
 
@@ -16586,29 +16615,6 @@ impl WorldState {
             Self::encode_resource_flow_for_trace(&mut encoder, *flow);
         }
         encoder.finish()
-    }
-
-    /// Queue a simulation control request for external renderers.
-    pub fn enqueue_simulation_command(
-        &mut self,
-        mut command: SimulationCommand,
-    ) -> Result<(), WorldStateError> {
-        command.validate()?;
-        if let Some(speed) = command.speed_multiplier.as_mut() {
-            *speed = speed.clamp(0.0, 32.0);
-        }
-        self.simulation_commands.push(command);
-        Ok(())
-    }
-
-    /// Drain pending simulation control requests (clearing the queue).
-    #[must_use]
-    pub fn drain_simulation_commands(&mut self) -> Vec<SimulationCommand> {
-        if self.simulation_commands.is_empty() {
-            Vec::new()
-        } else {
-            std::mem::take(&mut self.simulation_commands)
-        }
     }
 
     fn record_config_audit(&mut self, patch: serde_json::Value) {
@@ -16948,8 +16954,7 @@ impl WorldState {
             && self.narrative.events().is_empty()
             && self.config_audit.is_empty()
             && self.pending_interventions.is_empty()
-            && self.active_effects.is_empty()
-            && self.simulation_commands.is_empty();
+            && self.active_effects.is_empty();
         if !pristine_tick_zero {
             return Err(ScientificStateError::TimeResetRequiresNewRun {
                 path: "world.tick".to_owned(),
@@ -27144,15 +27149,15 @@ mod tests {
     }
 
     #[test]
-    fn characterization_v0_rejects_queued_control_work() {
+    fn characterization_v0_rejects_pending_intervention_work() {
         let (mut world, _) = characterization_world(7);
         world
-            .enqueue_simulation_command(SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: false,
+            .enqueue_intervention(Intervention::Drought {
+                region: Region::All,
+                ticks: 1,
+                growth_scale: 0.0,
             })
-            .expect("valid simulation command");
+            .expect("valid intervention");
         assert!(matches!(
             world.characterization_digest_v0(),
             Err(CharacterizationError::NonQuiescent {
@@ -27163,11 +27168,13 @@ mod tests {
     }
 
     #[test]
-    fn simulation_commands_queue_and_drain() {
+    fn simulation_command_returns_explicit_playback_disposition() {
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
-        assert!(world.drain_simulation_commands().is_empty());
-
-        apply_control_command(
+        let before = world
+            .characterization_digest_v0()
+            .expect("quiescent world digest");
+        let revision_before = world.config_revision();
+        let disposition = apply_control_command(
             &mut world,
             ControlCommand::UpdateSimulation(SimulationCommand {
                 paused: Some(true),
@@ -27176,13 +27183,21 @@ mod tests {
             }),
         )
         .expect("apply control command");
-
-        let pending = world.drain_simulation_commands();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].paused, Some(true));
-        assert_eq!(pending[0].speed_multiplier, Some(0.0));
-        assert!(!pending[0].step_once);
-        assert!(world.drain_simulation_commands().is_empty());
+        assert_eq!(
+            disposition,
+            ControlDisposition::Playback(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: Some(0.0),
+                step_once: false,
+            })
+        );
+        assert_eq!(world.config_revision(), revision_before);
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("playback leaves world quiescent"),
+            before
+        );
     }
 
     #[test]
@@ -27209,35 +27224,60 @@ mod tests {
     }
 
     #[test]
-    fn simulation_command_rejects_non_finite_speed_without_queueing() {
+    fn simulation_command_rejects_non_finite_speed_without_world_mutation() {
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let before = world
+            .characterization_digest_v0()
+            .expect("quiescent world digest");
         let command = SimulationCommand {
             paused: Some(false),
             speed_multiplier: Some(f32::NAN),
             step_once: false,
         };
         let message = invalid_config_message(
-            world
-                .enqueue_simulation_command(command)
+            apply_control_command(&mut world, ControlCommand::UpdateSimulation(command))
                 .expect_err("non-finite speed must be rejected"),
         );
         assert_eq!(message, "speed_multiplier must be finite");
-        assert!(world.drain_simulation_commands().is_empty());
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("world remains quiescent"),
+            before
+        );
     }
 
     #[test]
     fn simulation_command_preserves_finite_clamp_semantics() {
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
-        world
-            .enqueue_simulation_command(SimulationCommand {
-                paused: Some(false),
-                speed_multiplier: Some(128.0),
-                step_once: false,
-            })
+        let before = world
+            .characterization_digest_v0()
+            .expect("quiescent world digest");
+        for (input, expected) in [(-4.0, 0.0), (128.0, 32.0)] {
+            let disposition = apply_control_command(
+                &mut world,
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(false),
+                    speed_multiplier: Some(input),
+                    step_once: true,
+                }),
+            )
             .expect("finite speed remains admissible");
-        let pending = world.drain_simulation_commands();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].speed_multiplier, Some(32.0));
+            assert_eq!(
+                disposition,
+                ControlDisposition::Playback(SimulationCommand {
+                    paused: Some(false),
+                    speed_multiplier: Some(expected),
+                    step_once: true,
+                })
+            );
+        }
+        assert_eq!(
+            world
+                .characterization_digest_v0()
+                .expect("normalization leaves world quiescent"),
+            before
+        );
     }
 
     fn ledger_flow(world: &WorldState, kind: ResourceFlowKind) -> ResourceFlow {
@@ -27721,6 +27761,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_command_trace_wire_slots_remain_pinned() {
+        let boundary_error = WorldStepTraceError::NonQuiescent {
+            pending_deaths: 1,
+            pending_spawns: 2,
+            simulation_commands: 3,
+        };
+        let boundary_wire = postcard::to_allocvec(&boundary_error).expect("encode boundary error");
+        assert_eq!(boundary_wire, [0, 1, 2, 3]);
+        assert_eq!(
+            postcard::from_bytes::<WorldStepTraceError>(&boundary_wire)
+                .expect("decode boundary error"),
+            boundary_error
+        );
+
+        let context = WorldStepTraceEncodingContext::SimulationCommands;
+        let context_wire = postcard::to_allocvec(&context).expect("encode legacy context");
+        assert_eq!(context_wire, [4]);
+        assert_eq!(
+            postcard::from_bytes::<WorldStepTraceEncodingContext>(&context_wire)
+                .expect("decode legacy context"),
+            context
+        );
+    }
+
+    #[test]
     fn traced_step_observes_six_v1_checkpoints_without_changing_science() {
         fn traced_world() -> WorldState {
             let config = ScriptBotsConfig {
@@ -28165,39 +28230,6 @@ mod tests {
         let reordered_deaths = capture(&world);
         assert_ne!(duplicate_death.transition, reordered_deaths.transition);
 
-        world.pending_deaths.clear();
-        world.simulation_commands = vec![SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: None,
-            step_once: false,
-        }];
-        let first_command = capture(&world);
-        world.simulation_commands.push(SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: None,
-            step_once: false,
-        });
-        let duplicate_command = capture(&world);
-        assert_eq!(first_command.world, duplicate_command.world);
-        assert_ne!(first_command.transition, duplicate_command.transition);
-        world.simulation_commands = vec![
-            SimulationCommand {
-                paused: None,
-                speed_multiplier: Some(2.0),
-                step_once: false,
-            },
-            SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: false,
-            },
-        ];
-        let ordered_commands = capture(&world);
-        world.simulation_commands.reverse();
-        let reversed_commands = capture(&world);
-        assert_ne!(ordered_commands.transition, reversed_commands.transition);
-
-        world.simulation_commands.clear();
         world.pending_deaths.clear();
         world.pending_spawns.push(SpawnOrder {
             parent_index: world.agents.index_of(first).expect("parent index"),

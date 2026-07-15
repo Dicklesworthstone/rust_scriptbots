@@ -62,11 +62,11 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 │  - SoA AgentColumns · Spatial index (scriptbots-index)                              │
 │  - Deterministic: sense → brains → actuation → persistence hooks                    │
 └───────────────┬───────────────────────────┬───────────────────────────┬─────────────┘
-                │ AgentSnapshots            │ PersistenceBatch          │ CommandDrain (in-tick)
+                │ AgentSnapshots            │ PersistenceBatch          │ ControlCommand ↑ / disposition ↓
                 │                           │                           │
         ┌───────▼────────┐           ┌──────▼──────────┐          ┌─────▼──────────┐
-        │ Renderer (GUI) │           │ scriptbots-     │          │ CommandBus     │
-        │ GPUI window    │           │ storage         │          │ (crossfire MPMC)│
+        │ Renderer (GUI) │           │ scriptbots-     │          │ Application   │
+        │ GPUI window    │           │ storage         │          │ command driver│
         │ or Terminal TUI│           │  StoragePipeline│          └─────┬───────────┘
         │ (console text) │           │  (async worker) │                │
         └───────┬────────┘           └──────┬──────────┘                │
@@ -82,6 +82,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
                                  ┌─────────────────────────────────────────▼────────────────────┐
                                  │ scriptbots-app (orchestrator)                                │
                                  │ - launches ControlRuntime (Tokio thread)                     │
+                                 │ - owns CommandBus and drains one ordered vector per boundary │
                                  │ - selects Renderer (CLI flag/env)                            │
                                  │ - seeds world, installs brains, primes history               │
                                  └───────────────┬───────────────────────────────┬──────────────┘
@@ -103,11 +104,11 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Background workers: `StoragePipeline` is a bounded-admission writer whose dedicated thread creates and exclusively owns its FrankenSQLite connection; `ControlRuntime` (Tokio) is separately isolated. A successful enqueue is not a durability receipt: flush or shutdown must acknowledge the earlier transactions. The core drains commands inside the tick loop for deterministic application.
+- Background workers: `StoragePipeline` is a bounded-admission writer whose dedicated thread creates and exclusively owns its FrankenSQLite connection; `ControlRuntime` (Tokio) is separately isolated. A successful enqueue is not a durability receipt: flush or shutdown must acknowledge the earlier transactions. Application drivers drain one ordered command vector at a boundary; core applies world-owned mutations and returns normalized playback explicitly instead of owning a second queue.
 - Startup is fail-closed and transactional. Renderer selection and control-environment validation happen first, then every enabled REST/MCP socket is prebound and held before configuration output, auto-tuning, process-priority changes, world construction, or storage reservation. Launch consumes those exact listeners, so a bind failure cannot leave config, tuning, or run-database artifacts behind and cannot race a later rebind.
 - REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
 - That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
-- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The presentation boundary is not yet complete, however: GPUI now contains its characterized double-drive by making the HUD the sole interim simulation driver and the world window read-only, but scientific time still belongs to a renderer and GPUI's inner command queue remains incorrect; Bevy still owns a simulation worker. Moving all scientific time and command authority into `HostCore` remains explicit roadmap work, and the interim containment is not the architectural fix.
+- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The presentation boundary is not yet complete, however: GPUI contains its characterized double-drive by making the HUD the sole interim simulation driver and the world window read-only, and it now services explicit playback before paused/accumulator early returns. Scientific time still belongs to a renderer, TUI/Bevy retain interim playback policies, and Bevy still owns a simulation worker. Moving all scientific time, exact command sequencing, and status authority into `HostCore` remains explicit roadmap work.
 - Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
 
 ### Crate roles
@@ -497,7 +498,7 @@ Deterministic, staged tick pipeline (seeded RNG; explicit staged ordering):
 - **Explicit order of effects**: floating-point reductions and removals are staged. The current dense agent order can still affect reductions, parent selection, and RNG assignment, so `WorldDigestV1` records that order by stable `AgentUid` instead of claiming it is irrelevant. Canonicalizing every execution/spawn stage by UID is tracked by `bd-2z0.3.14`.
 - **Restorable RNG state**: the world owns a versioned, restorable random stream whose exact state enters V1. Draw assignment still follows current stage/execution order; independent domain-separated agent streams remain roadmap work rather than a claimed property.
 - **Feature-gated parallelism**: `scriptbots-core` defaults to `parallel` (Rayon), while web builds disable it for single-thread determinism.
-- **Completed-boundary outcome seam (migration in progress)**: `WorldState::step_outcome()` returns a `StepCompletion` whose `StepOutcome` owns the exact current summary, lifecycle/combat records, resource tick, config revision, events, and persistence projection without calling the installed sink. Completed population faults travel beside that outcome instead of discarding it. The clock-free traced outcome has the same boundary; the profiled outcome uses the core-only `scriptbots.world-step-profile.v3` timing contract. The legacy `step`, `step_traced`, and `step_profiled` wrappers still admit the moved batch (`step_profiled` retains the reviewed v2 timing contract), and `WorldState` still owns the command queue and sink until the remaining `bd-2z0.4.2` slices land.
+- **Completed-boundary outcome seam (migration in progress)**: `WorldState::step_outcome()` returns a `StepCompletion` whose `StepOutcome` owns the exact current summary, lifecycle/combat records, resource tick, config revision, events, and persistence projection without calling the installed sink. Completed population faults travel beside that outcome instead of discarding it. The clock-free traced outcome has the same boundary; the profiled outcome uses the core-only `scriptbots.world-step-profile.v3` timing contract. The hidden playback transport queue has been retired: application drains now return one ordered `Vec<ControlCommand>`, and core command application returns normalized playback as an explicit driver-owned disposition instead of storing it in `WorldState`. The legacy `step`, `step_traced`, and `step_profiled` wrappers still admit the moved batch (`step_profiled` retains the reviewed v2 timing contract), and `WorldState` still owns the persistence sink/session until the final `bd-2z0.4.2` extraction slice lands.
 
 #### Canonical digest and first-divergence trace
 

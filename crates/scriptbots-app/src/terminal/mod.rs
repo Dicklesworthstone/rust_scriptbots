@@ -26,8 +26,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Widget},
 };
 use scriptbots_core::{
-    AgentId, BrainActivations, ControlCommand, ControlSettings, SimulationCommand, TerrainKind,
-    TerrainLayer, TickSummary, WorldState,
+    AgentId, BrainActivations, ControlCommand, ControlDisposition, ControlSettings,
+    SimulationCommand, TerrainKind, TerrainLayer, TickSummary, WorldState, apply_control_command,
 };
 #[cfg(test)]
 use scriptbots_storage::AnalyticsSnapshotProvider;
@@ -440,8 +440,15 @@ impl<'a> TerminalApp<'a> {
                 latched_fault = Some(Arc::<str>::from(error.to_string()));
                 None
             } else {
-                (self.command_drain.as_ref())(&mut world);
-                Some(world.drain_simulation_commands())
+                let mut playback = Vec::new();
+                for command in (self.command_drain.as_ref())() {
+                    match apply_control_command(&mut world, command) {
+                        Ok(ControlDisposition::WorldApplied) => {}
+                        Ok(ControlDisposition::Playback(command)) => playback.push(command),
+                        Err(error) => warn!(%error, "terminal rejected a drained control command"),
+                    }
+                }
+                Some(playback)
             }
         } else {
             None
@@ -3621,10 +3628,11 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
             .expect("single-step key");
 
-        let mut guard = world.lock().expect("world lock");
+        let guard = world.lock().expect("world lock");
         assert!(!exit);
         assert_eq!(guard.tick().0, before + 1);
-        assert!(guard.drain_simulation_commands().is_empty());
+        drop(guard);
+        assert!((app.command_drain)().is_empty());
         assert!(app.paused);
         assert_eq!(app.speed_multiplier, 0.0);
     }
@@ -3797,10 +3805,8 @@ mod tests {
             step_once: false,
         });
 
-        let mut world = world.lock().expect("world lock");
-        (app.command_drain)(&mut world);
         assert!(
-            world.drain_simulation_commands().is_empty(),
+            (app.command_drain)().is_empty(),
             "terminal admitted a non-finite speed command"
         );
     }

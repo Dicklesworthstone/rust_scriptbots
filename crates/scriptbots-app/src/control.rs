@@ -922,6 +922,13 @@ mod tests {
         (handle, receiver)
     }
 
+    fn drain_and_apply(receiver: &crate::command::CommandReceiver, world: &mut WorldState) {
+        for command in crate::command::drain_pending_commands(receiver) {
+            let _ = scriptbots_core::apply_control_command(world, command)
+                .expect("drained test command applies");
+        }
+    }
+
     #[test]
     fn patch_updates_single_field() {
         let (handle, receiver) = handle();
@@ -942,7 +949,7 @@ mod tests {
 
         // ensure queue drained for consistency
         let mut world = handle.lock_world().expect("world lock");
-        crate::command::drain_pending_commands(&receiver, &mut world);
+        drain_and_apply(&receiver, &mut world);
         assert!((world.config().food_max - 0.6).abs() < f32::EPSILON);
     }
 
@@ -1035,7 +1042,7 @@ mod tests {
             ])
             .expect("a hostile world is a legitimate experiment");
         let mut world = handle.lock_world().expect("world lock");
-        crate::command::drain_pending_commands(&receiver, &mut world);
+        drain_and_apply(&receiver, &mut world);
     }
 
     #[test]
@@ -1193,7 +1200,7 @@ mod tests {
                 agent_ids: vec![id.data().as_ffi()],
                 state: SelectionState::Selected,
             });
-            crate::command::drain_pending_commands(&receiver, &mut world);
+            drain_and_apply(&receiver, &mut world);
             id.data().as_ffi()
         };
 
@@ -1227,7 +1234,7 @@ mod tests {
             .expect("enqueue selection command");
 
         let mut world = handle.lock_world().expect("world lock");
-        crate::command::drain_pending_commands(&receiver, &mut world);
+        drain_and_apply(&receiver, &mut world);
         let agent_id = scriptbots_core::AgentId::from(KeyData::from_ffi(raw_id));
         let runtime = world.agent_runtime(agent_id).expect("runtime");
         assert!(matches!(runtime.selection, SelectionState::Selected));

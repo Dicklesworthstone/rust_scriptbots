@@ -222,6 +222,7 @@ fn occupied_mcp_port_refuses_before_config_tuning_or_storage() {
     assert_no_startup_artifacts(&storage_path, &config_path, &tuning_dir);
 }
 
+#[cfg(any(not(feature = "gui"), not(feature = "bevy_render")))]
 fn assert_uncompiled_renderer_refuses_before_storage_reservation(mode: &str, expected_error: &str) {
     let temp_dir = tempdir().expect("temp storage directory");
     let storage_path = temp_dir.path().join("must-not-be-created.sqlite");

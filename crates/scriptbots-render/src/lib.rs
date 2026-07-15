@@ -14,10 +14,11 @@ use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
-    BrainActivations, ControlCommand, Generation, IndicatorState, MutationRates, NUM_EYES,
-    OutputChannel, OutputsExt, Position, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
-    SelectionMode, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer,
-    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
+    BrainActivations, ControlCommand, ControlDisposition, Generation, IndicatorState,
+    MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position, RenderTonemapMode, SENSOR_LAYOUT,
+    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
+    TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
+    apply_control_command,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -1565,7 +1566,7 @@ fn start_gui_health_monitor(
 pub fn run_demo(
     world: Arc<Mutex<WorldState>>,
     analytics: AnalyticsSnapshotProvider,
-    command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+    command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     health_probe: GuiHealthProbe,
 ) -> Result<(), GuiRunError> {
@@ -1701,7 +1702,7 @@ struct SimulationView {
     world: Arc<Mutex<WorldState>>,
     analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
-    command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+    command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     camera: Arc<Mutex<Camera>>,
     inspector: Arc<Mutex<InspectorState>>,
@@ -1736,7 +1737,7 @@ impl SimulationView {
         world: Arc<Mutex<WorldState>>,
         analytics_provider: AnalyticsSnapshotProvider,
         title: SharedString,
-        command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
         command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
     ) -> Self {
         let mut inspector_state = InspectorState::default();
@@ -1816,14 +1817,42 @@ impl SimulationView {
         let last = self.last_sim_instant.unwrap_or(now);
         self.last_sim_instant = Some(now);
 
-        let latched_fault = self
-            .world
-            .lock()
-            .ok()
-            .and_then(|world| world.latched_step_error().map(|error| error.to_string()));
-        if let Some(error) = latched_fault {
+        let mut playback = Vec::new();
+        let mut step_error = None;
+        if let Ok(mut world) = self.world.lock() {
+            if let Some(error) = world.latched_step_error() {
+                step_error = Some(error.to_string());
+            } else {
+                for command in (self.command_drain.as_ref())() {
+                    match apply_control_command(&mut world, command) {
+                        Ok(ControlDisposition::WorldApplied) => {}
+                        Ok(ControlDisposition::Playback(command)) => playback.push(command),
+                        Err(error) => warn!(%error, "GPUI rejected a drained control command"),
+                    }
+                }
+            }
+        }
+        if let Some(error) = step_error {
             self.pause_for_simulation_failure(error);
             return;
+        }
+
+        let mut force_step = false;
+        for command in playback {
+            if let Some(paused) = command.paused {
+                self.controls.paused = paused;
+                if paused {
+                    self.sim_accumulator = 0.0;
+                }
+            }
+            if let Some(speed) = command.speed_multiplier {
+                self.controls.speed_multiplier = speed;
+            }
+            if command.step_once {
+                force_step = true;
+                self.controls.paused = true;
+                self.sim_accumulator = 0.0;
+            }
         }
 
         // Auto-pause: honor control config thresholds without mutating world state directly.
@@ -1855,48 +1884,47 @@ impl SimulationView {
             }
         }
 
-        if self.controls.paused || self.controls.speed_multiplier <= 0.0 {
+        if !force_step && (self.controls.paused || self.controls.speed_multiplier <= 0.0) {
             self.sim_accumulator = 0.0;
             return;
         }
 
-        let delta = (now - last).as_secs_f32();
-        self.sim_accumulator += delta * self.controls.speed_multiplier;
-
         let step_interval = SIM_TICK_INTERVAL;
-        if self.sim_accumulator < step_interval {
-            return;
-        }
-
-        // Clamp accumulator to avoid long-frame backlogs
-        let max_accumulator = step_interval * MAX_SIM_STEPS_PER_FRAME as f32;
-        // Hard clamp to 0.5s to prevent spike-induced lag
-        let hard_cap = 0.5f32;
-        self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(hard_cap);
-
-        let mut steps = (self.sim_accumulator / step_interval).floor() as usize;
-        if steps == 0 {
-            return;
-        }
-        // Adaptive cap: reduce max steps under low FPS to keep UI responsive
-        let avg_ms = self.last_perf.average_ms.max(0.0);
-        let dynamic_cap = if avg_ms > 16.0 {
-            (MAX_SIM_STEPS_PER_FRAME / 2).max(1)
+        let steps = if force_step {
+            1
         } else {
-            MAX_SIM_STEPS_PER_FRAME
-        };
-        if steps > dynamic_cap {
-            steps = dynamic_cap;
-        }
+            let delta = (now - last).as_secs_f32();
+            self.sim_accumulator += delta * self.controls.speed_multiplier;
+            if self.sim_accumulator < step_interval {
+                return;
+            }
 
-        self.sim_accumulator -= step_interval * steps as f32;
+            // Clamp accumulator to avoid long-frame backlogs.
+            let max_accumulator = step_interval * MAX_SIM_STEPS_PER_FRAME as f32;
+            let hard_cap = 0.5f32;
+            self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(hard_cap);
+
+            let mut steps = (self.sim_accumulator / step_interval).floor() as usize;
+            if steps == 0 {
+                return;
+            }
+            let avg_ms = self.last_perf.average_ms.max(0.0);
+            let dynamic_cap = if avg_ms > 16.0 {
+                (MAX_SIM_STEPS_PER_FRAME / 2).max(1)
+            } else {
+                MAX_SIM_STEPS_PER_FRAME
+            };
+            if steps > dynamic_cap {
+                steps = dynamic_cap;
+            }
+            self.sim_accumulator -= step_interval * steps as f32;
+            steps
+        };
 
         let mut step_error = None;
         if let Ok(mut world) = self.world.lock() {
             if let Some(error) = world.latched_step_error() {
                 step_error = Some(error.to_string());
-            } else {
-                (self.command_drain.as_ref())(&mut world);
             }
             for _ in 0..steps {
                 if step_error.is_some() {
@@ -13442,7 +13470,7 @@ mod command_characterization_tests {
             })
             .expect("sealed-boundary world"),
         ));
-        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
         let view = simulation_view(Arc::clone(&world), drain);
 
         {
@@ -13480,7 +13508,7 @@ mod command_characterization_tests {
 
     fn simulation_view(
         world: Arc<Mutex<WorldState>>,
-        command_drain: Arc<dyn Fn(&mut WorldState) + Send + Sync + 'static>,
+        command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     ) -> SimulationView {
         SimulationView::new(
             world,
@@ -13502,7 +13530,7 @@ mod command_characterization_tests {
     #[test]
     fn minimal_canvas_is_a_read_only_projection_until_hostcore_lands() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
         let mut canvas = simulation_view(Arc::clone(&world), drain);
         canvas.set_minimal_canvas_mode();
         prime_exactly_one_view_step(&mut canvas);
@@ -13520,7 +13548,7 @@ mod command_characterization_tests {
     )]
     fn target_two_gpui_views_share_one_simulation_clock() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
         let mut hud = simulation_view(Arc::clone(&world), Arc::clone(&drain));
         let mut canvas = simulation_view(Arc::clone(&world), drain);
         prime_exactly_one_view_step(&mut hud);
@@ -13536,42 +13564,56 @@ mod command_characterization_tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "KNOWN DEFECT bd-2z0.4.1: GPUI leaves playback in the inner world queue"
-    )]
-    fn target_gpui_applies_playback_before_stepping() {
+    fn gpui_applies_drained_playback_before_stepping() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|world| {
-            scriptbots_core::apply_control_command(
-                world,
-                ControlCommand::UpdateSimulation(SimulationCommand {
-                    paused: Some(true),
-                    speed_multiplier: Some(0.0),
-                    step_once: false,
-                }),
-            )
-            .expect("queue pause command");
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(|| {
+            vec![ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: Some(0.0),
+                step_once: false,
+            })]
         });
         let mut view = simulation_view(Arc::clone(&world), drain);
         prime_exactly_one_view_step(&mut view);
 
         view.pump_simulation();
 
-        let (tick, pending) = {
-            let mut world = world.lock().expect("world lock");
-            (world.tick().0, world.drain_simulation_commands().len())
-        };
-        assert_eq!(
-            (tick, pending),
-            (0, 0),
-            "KNOWN DEFECT bd-2z0.4.1: GPUI leaves playback in the inner world queue"
-        );
+        assert_eq!(world.lock().expect("world lock").tick().0, 0);
+        assert!(view.controls.paused);
+        assert_eq!(view.controls.speed_multiplier, 0.0);
+    }
+
+    #[test]
+    fn gpui_services_world_and_resume_commands_while_paused() {
+        let world = command_characterization_world();
+        let mut updated = world.lock().expect("world lock").config().clone();
+        updated.food_max = 0.73;
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(move || {
+            vec![
+                ControlCommand::UpdateConfig(Box::new(updated.clone())),
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(false),
+                    speed_multiplier: Some(1.0),
+                    step_once: false,
+                }),
+            ]
+        });
+        let mut view = simulation_view(Arc::clone(&world), drain);
+        view.controls.paused = true;
+        view.sim_accumulator = 0.0;
+        view.last_sim_instant = Some(Instant::now());
+
+        view.pump_simulation();
+
+        assert!((world.lock().expect("world lock").config().food_max - 0.73).abs() < f32::EPSILON);
+        assert!(!view.controls.paused);
+        assert_eq!(view.controls.speed_multiplier, 1.0);
     }
 
     #[test]
     fn simulation_fault_survives_storage_health_refresh() {
         let world = command_characterization_world();
-        let drain: Arc<dyn Fn(&mut WorldState) + Send + Sync> = Arc::new(|_world| {});
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
         let mut view = simulation_view(world, drain);
         view.pause_for_simulation_failure("deliberate brain construction failure".to_owned());
 

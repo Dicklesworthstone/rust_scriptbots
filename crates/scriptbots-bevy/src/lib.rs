@@ -20,9 +20,9 @@ use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AgentId, ControlCommand, IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderSettings,
-    RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
-    TerrainKind, TraitModifiers, WorldState,
+    AgentId, ControlCommand, ControlDisposition, IndicatorState, NUM_EYES, OutputChannel,
+    OutputsExt, RenderSettings, RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate,
+    SimulationCommand, TerrainKind, TraitModifiers, WorldState, apply_control_command,
 };
 use slotmap::Key;
 use std::{
@@ -41,7 +41,7 @@ use tracing::{error, info, warn};
 
 /// Launch context supplied by the ScriptBots application shell.
 pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> bool + Send + Sync>;
-pub type CommandDrainFn = Arc<dyn Fn(&mut WorldState) + Send + Sync>;
+pub type CommandDrainFn = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
 pub type ControlHealthFn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
 pub struct BevyRendererContext {
@@ -865,6 +865,12 @@ fn apply_simulation_command_to_state(state: &mut SimControlData, command: &Simul
         state.step_requested = true;
         state.paused = true;
     }
+}
+
+fn apply_auto_pause_to_state(state: &mut SimControlData, reason: &str) {
+    state.paused = true;
+    state.auto_pause_reason = Some(reason.to_owned());
+    state.step_requested = false;
 }
 
 fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCommand) {
@@ -4372,21 +4378,24 @@ fn spawn_simulation_driver(
                             "Simulation stopped after a terminal step failure: {error}"
                         ));
                     } else {
-                        (command_drain.as_ref())(&mut world_guard);
-                        let pending = world_guard.drain_simulation_commands();
-                        if !pending.is_empty() {
-                            for command in pending {
-                                controls.update(|state| {
-                                    apply_simulation_command_to_state(state, &command)
-                                });
+                        for command in (command_drain.as_ref())() {
+                            match apply_control_command(&mut world_guard, command) {
+                                Ok(ControlDisposition::WorldApplied) => {}
+                                Ok(ControlDisposition::Playback(command)) => {
+                                    controls.update(|state| {
+                                        apply_simulation_command_to_state(state, &command)
+                                    });
+                                }
+                                Err(error) => {
+                                    warn!(%error, "Bevy rejected a drained control command");
+                                }
                             }
                         }
                     }
                 }
                 if let Some(reason) = latched_step_failure {
                     controls.update(|state| {
-                        state.paused = true;
-                        state.auto_pause_reason = Some(reason.clone());
+                        apply_auto_pause_to_state(state, &reason);
                     });
                     accumulator = 0.0;
                     thread::sleep(Duration::from_millis(4));
@@ -4480,20 +4489,8 @@ fn spawn_simulation_driver(
 
                     if let Some(reason) = reason {
                         controls.update(|state| {
-                            state.paused = true;
-                            state.auto_pause_reason = Some(reason.clone());
-                            state.step_requested = false;
+                            apply_auto_pause_to_state(state, &reason);
                         });
-                        if !step_failed
-                            && let Err(error) =
-                                world_guard.enqueue_simulation_command(SimulationCommand {
-                                    paused: Some(true),
-                                    speed_multiplier: Some(0.0),
-                                    step_once: false,
-                                })
-                        {
-                            warn!(%error, "failed to queue Bevy auto-pause command");
-                        }
                         if step_failed {
                             warn!(%reason, "Bevy simulation paused after terminal step failure");
                         } else {
@@ -4866,6 +4863,26 @@ mod tests {
         assert!(
             snapshot.paused,
             "spacebar shortcut should toggle pause state to true"
+        );
+    }
+
+    #[test]
+    fn auto_pause_preserves_speed_and_records_the_trigger() {
+        let mut state = SimControlData {
+            paused: false,
+            speed_multiplier: 3.5,
+            step_requested: true,
+            auto_pause_reason: Some("stale reason".to_owned()),
+        };
+
+        apply_auto_pause_to_state(&mut state, "Spike hits detected (2)");
+
+        assert!(state.paused);
+        assert_eq!(state.speed_multiplier, 3.5);
+        assert!(!state.step_requested);
+        assert_eq!(
+            state.auto_pause_reason.as_deref(),
+            Some("Spike hits detected (2)")
         );
     }
 

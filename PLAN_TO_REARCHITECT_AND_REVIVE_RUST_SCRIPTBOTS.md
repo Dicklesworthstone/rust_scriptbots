@@ -2078,11 +2078,17 @@ Executable evidence on source baseline `a4dce8fb9635834d387e0cd353d2d2f6670abf19
 
 #### 2.2 extract core side effects [Currently In Progress — `bd-2z0.4.2`]
 
-- remove simulation-command queue ownership from `WorldState`;
-- make core step return deterministic `StepOutcome`/domain deltas;
+- remove simulation-command queue ownership from `WorldState`; **completed in integration slice 3**
+- make core step return deterministic `StepOutcome`/domain deltas; **completed in integration slice 2**
 - remove synchronous `WorldPersistence::on_tick` I/O from the scientific transition;
 - keep current summary/event accumulation scientifically correct;
 - prove the same fixed trace before/after the boundary.
+
+Current extraction status: application drains expose the original ordered `ControlCommand` stream,
+core returns validated/normalized playback as an explicit disposition, and GPUI, TUI, and Bevy no
+longer use a hidden world-owned transport queue. The fixed six-point trace remains unchanged. The
+remaining slice moves the sink, exact retained batch/error, and admitted watermark into an external
+admission session while preserving a payload-free core boundary marker and all mutation-sealing rules.
 
 **Exit:** core performs one deterministic state transition with no command transport or storage I/O.
 
