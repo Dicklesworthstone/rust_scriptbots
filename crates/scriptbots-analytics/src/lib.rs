@@ -334,14 +334,11 @@ impl Report for MetricSummary {
             // A metric with non-finite values is a real problem worth surfacing, but the stats
             // functions already reject it; map that to a report-level error rather than a panic.
             let mean = stats::mean(&values).map_err(|error| metric_stats_error(&error))?;
-            let std_dev =
-                stats::std_dev(&values).map_err(|error| metric_stats_error(&error))?;
-            let q05 =
-                stats::quantile(&values, 0.05).map_err(|error| metric_stats_error(&error))?;
+            let std_dev = stats::std_dev(&values).map_err(|error| metric_stats_error(&error))?;
+            let q05 = stats::quantile(&values, 0.05).map_err(|error| metric_stats_error(&error))?;
             let median =
                 stats::quantile(&values, 0.50).map_err(|error| metric_stats_error(&error))?;
-            let q95 =
-                stats::quantile(&values, 0.95).map_err(|error| metric_stats_error(&error))?;
+            let q95 = stats::quantile(&values, 0.95).map_err(|error| metric_stats_error(&error))?;
             let min = values.iter().copied().fold(f64::INFINITY, f64::min);
             let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let coefficient_of_variation =
