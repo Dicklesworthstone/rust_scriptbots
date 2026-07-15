@@ -10,7 +10,7 @@
 
 use scriptbots_core::{DynamicWorldSnapshot, ScriptBotsConfig, SelectionUpdate, Tick};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 use thiserror::Error;
 
 macro_rules! monotonic_newtype {
@@ -50,9 +50,8 @@ macro_rules! monotonic_newtype {
 
 /// Stable idempotency key supplied by a client for one logical command.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
-#[serde(transparent)]
 pub struct CommandId(u128);
 
 impl CommandId {
@@ -74,6 +73,37 @@ impl CommandId {
         self.0
     }
 }
+
+impl fmt::Display for CommandId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:032x}", self.0)
+    }
+}
+
+impl Serialize for CommandId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.len() != 32 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom(
+                "command id must be exactly 32 hexadecimal characters",
+            ));
+        }
+        u128::from_str_radix(&encoded, 16)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+monotonic_newtype!(
+    /// Stable identity shared by one host's ingress port and manual driver.
+    HostSessionId
+);
 
 monotonic_newtype!(
     /// Total order assigned to successfully admitted commands.
@@ -212,6 +242,12 @@ impl HostCommand {
             }),
             _ => Ok(()),
         }
+    }
+
+    /// Whether successful application requires an independent journal acknowledgement.
+    #[must_use]
+    pub const fn requires_journal(&self) -> bool {
+        matches!(self, Self::Step | Self::UpdateConfig(_) | Self::Shutdown)
     }
 }
 
@@ -598,9 +634,51 @@ pub enum HostAccessError {
         /// Diagnostic identifying the violated invariant.
         message: String,
     },
-    /// A null frontend exhausted its namespaced command-id sequence.
+    /// A manual driver belongs to a different host than the frontend's ingress port.
+    #[error("manual driver session {actual:?} does not match client session {expected:?}")]
+    DriverSessionMismatch {
+        /// Session bound to the frontend's client port.
+        expected: HostSessionId,
+        /// Session reported by the supplied manual driver.
+        actual: HostSessionId,
+    },
+}
+
+/// A null-frontend submission failure that preserves an indeterminate command envelope.
+#[derive(Debug, Error)]
+pub enum NullFrontendSubmissionError {
+    /// The frontend exhausted its stable namespaced command-id sequence before submitting.
     #[error("command id sequence exhausted")]
     CommandIdExhausted,
+    /// Host access failed after an exact retryable envelope had been prepared.
+    #[error("null frontend command submission failed: {source}")]
+    HostAccess {
+        /// Exact envelope whose admission may be indeterminate.
+        envelope: CommandEnvelope,
+        /// Port failure observed by the frontend.
+        #[source]
+        source: HostAccessError,
+    },
+}
+
+impl NullFrontendSubmissionError {
+    /// Exact retryable envelope, when the failure happened after preparation.
+    #[must_use]
+    pub const fn envelope(&self) -> Option<&CommandEnvelope> {
+        match self {
+            Self::CommandIdExhausted => None,
+            Self::HostAccess { envelope, .. } => Some(envelope),
+        }
+    }
+
+    /// Consume the error and recover the exact retryable envelope.
+    #[must_use]
+    pub fn into_envelope(self) -> Option<CommandEnvelope> {
+        match self {
+            Self::CommandIdExhausted => None,
+            Self::HostAccess { envelope, .. } => Some(envelope),
+        }
+    }
 }
 
 /// Synchronous, renderer-neutral client port implemented by a host handle.
@@ -608,6 +686,9 @@ pub enum HostAccessError {
 /// Implementations may use channels internally, but the concrete transport is
 /// intentionally hidden behind [`HostClient`].
 pub trait HostPort {
+    /// Stable identity of the host reached through this port.
+    fn session_id(&self) -> HostSessionId;
+
     /// Submit or retry a logical command.
     fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError>;
 
@@ -633,6 +714,9 @@ pub trait HostPort {
 
 /// Optional extension for deterministic same-thread and browser-owned hosts.
 pub trait ManualHostDriver {
+    /// Stable identity of the host owned by this driver.
+    fn session_id(&self) -> HostSessionId;
+
     /// Drive the host to one explicit monotonic time boundary.
     fn drive(&mut self, now: ManualInstant) -> Result<DriveReceipt, HostAccessError>;
 }
@@ -769,6 +853,7 @@ impl<P: HostPort> HostClient<P> {
 /// connection, renderer, server, or scheduler.
 pub struct NullFrontend<P> {
     client: HostClient<P>,
+    host_session_id: HostSessionId,
     client_namespace: u64,
     next_sequence: Option<u64>,
     snapshots: SnapshotSubscription,
@@ -779,9 +864,11 @@ pub struct NullFrontend<P> {
 impl<P: HostPort> NullFrontend<P> {
     /// Construct a frontend with a stable command-id namespace.
     #[must_use]
-    pub const fn new(port: P, client_namespace: u64) -> Self {
+    pub fn new(port: P, client_namespace: u64) -> Self {
+        let host_session_id = port.session_id();
         Self {
             client: HostClient::new(port),
+            host_session_id,
             client_namespace,
             next_sequence: Some(1),
             snapshots: SnapshotSubscription::current(),
@@ -795,36 +882,53 @@ impl<P: HostPort> NullFrontend<P> {
         &mut self,
         command: HostCommand,
         expected_control_revision: Option<ControlRevision>,
-    ) -> Result<CommandStatus, HostAccessError> {
+    ) -> Result<CommandStatus, NullFrontendSubmissionError> {
         let sequence = self
             .next_sequence
-            .ok_or(HostAccessError::CommandIdExhausted)?;
+            .ok_or(NullFrontendSubmissionError::CommandIdExhausted)?;
         self.next_sequence = sequence.checked_add(1);
         let mut envelope = CommandEnvelope::new(
             CommandId::from_client_sequence(self.client_namespace, sequence),
             command,
         );
         envelope.expected_control_revision = expected_control_revision;
-        self.client.submit(envelope)
+        self.submit_envelope(envelope)
+    }
+
+    /// Submit or retry an already prepared envelope without changing its stable identity.
+    pub fn submit_envelope(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandStatus, NullFrontendSubmissionError> {
+        let retry_envelope = envelope.clone();
+        self.client
+            .submit(envelope)
+            .map_err(|source| NullFrontendSubmissionError::HostAccess {
+                envelope: retry_envelope,
+                source,
+            })
     }
 
     /// Pause automatic ticks.
-    pub fn pause(&mut self) -> Result<CommandStatus, HostAccessError> {
+    pub fn pause(&mut self) -> Result<CommandStatus, NullFrontendSubmissionError> {
         self.submit(HostCommand::Pause, None)
     }
 
     /// Resume automatic ticks.
-    pub fn resume(&mut self) -> Result<CommandStatus, HostAccessError> {
+    pub fn resume(&mut self) -> Result<CommandStatus, NullFrontendSubmissionError> {
         self.submit(HostCommand::Resume, None)
     }
 
     /// Set the playback multiplier.
-    pub fn set_speed(&mut self, speed: f32) -> Result<CommandStatus, HostAccessError> {
+    pub fn set_speed(
+        &mut self,
+        speed: f32,
+    ) -> Result<CommandStatus, NullFrontendSubmissionError> {
         self.submit(HostCommand::SetSpeed(speed), None)
     }
 
     /// Request exactly one scientific tick.
-    pub fn step(&mut self) -> Result<CommandStatus, HostAccessError> {
+    pub fn step(&mut self) -> Result<CommandStatus, NullFrontendSubmissionError> {
         self.submit(HostCommand::Step, None)
     }
 
@@ -832,12 +936,12 @@ impl<P: HostPort> NullFrontend<P> {
     pub fn update_config(
         &mut self,
         config: ScriptBotsConfig,
-    ) -> Result<CommandStatus, HostAccessError> {
+    ) -> Result<CommandStatus, NullFrontendSubmissionError> {
         self.submit(HostCommand::UpdateConfig(Box::new(config)), None)
     }
 
     /// Request orderly host shutdown.
-    pub fn shutdown(&mut self) -> Result<CommandStatus, HostAccessError> {
+    pub fn shutdown(&mut self) -> Result<CommandStatus, NullFrontendSubmissionError> {
         self.submit(HostCommand::Shutdown, None)
     }
 
@@ -868,8 +972,20 @@ impl<P: HostPort> NullFrontend<P> {
         if self.last_drive.is_some_and(|last_drive| now < last_drive) {
             return Err(protocol_violation("null frontend manual time moved backwards"));
         }
+        let driver_session_id = driver.session_id();
+        if driver_session_id != self.host_session_id {
+            return Err(HostAccessError::DriverSessionMismatch {
+                expected: self.host_session_id,
+                actual: driver_session_id,
+            });
+        }
         let receipt = driver.drive(now)?;
-        self.last_drive = Some(now);
+        if receipt.now != now {
+            return Err(protocol_violation(
+                "manual driver returned a receipt for a different time boundary",
+            ));
+        }
+        self.last_drive = Some(receipt.now);
         Ok(receipt)
     }
 }
@@ -883,9 +999,16 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{DynamicSnapshotSummary, DynamicSnapshotWorld};
+    use scriptbots_core::{
+        DynamicSnapshotSummary, DynamicSnapshotWorld, SelectionMode, SelectionState,
+    };
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::sync::{Barrier, Mutex, MutexGuard};
+    use std::sync::{
+        Barrier, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_FAKE_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
     #[derive(Clone)]
     struct SharedFakeHost {
@@ -896,10 +1019,15 @@ mod tests {
         inner: Arc<Mutex<FakeHost>>,
     }
 
+    struct LyingFakeDriver {
+        session_id: HostSessionId,
+    }
+
     impl SharedFakeHost {
         fn new() -> Self {
+            let session_id = HostSessionId::new(NEXT_FAKE_SESSION_ID.fetch_add(1, Ordering::Relaxed));
             Self {
-                inner: Arc::new(Mutex::new(FakeHost::new())),
+                inner: Arc::new(Mutex::new(FakeHost::new(session_id))),
             }
         }
 
@@ -913,6 +1041,10 @@ mod tests {
             self.lock().fail_on_application.insert(command_id);
         }
 
+        fn lose_next_submission_receipt(&self, command_id: CommandId) {
+            self.lock().lost_submission_receipts.insert(command_id);
+        }
+
         fn driver(&self) -> SharedFakeDriver {
             SharedFakeDriver {
                 inner: Arc::clone(&self.inner),
@@ -921,11 +1053,22 @@ mod tests {
     }
 
     impl HostPort for SharedFakeHost {
+        fn session_id(&self) -> HostSessionId {
+            self.lock().session_id
+        }
+
         fn submit(
             &mut self,
             envelope: CommandEnvelope,
         ) -> Result<CommandStatus, HostAccessError> {
-            self.lock().submit(envelope)
+            let command_id = envelope.command_id;
+            let mut host = self.lock();
+            let status = host.submit(envelope)?;
+            if host.lost_submission_receipts.remove(&command_id) {
+                Err(HostAccessError::Disconnected)
+            } else {
+                Ok(status)
+            }
         }
 
         fn command_status(
@@ -967,6 +1110,13 @@ mod tests {
     }
 
     impl ManualHostDriver for SharedFakeDriver {
+        fn session_id(&self) -> HostSessionId {
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .session_id
+        }
+
         fn drive(&mut self, now: ManualInstant) -> Result<DriveReceipt, HostAccessError> {
             self.inner
                 .lock()
@@ -975,7 +1125,25 @@ mod tests {
         }
     }
 
+    impl ManualHostDriver for LyingFakeDriver {
+        fn session_id(&self) -> HostSessionId {
+            self.session_id
+        }
+
+        fn drive(&mut self, now: ManualInstant) -> Result<DriveReceipt, HostAccessError> {
+            Ok(DriveReceipt {
+                now: ManualInstant::from_nanos(
+                    now.as_nanos()
+                        .checked_add(1)
+                        .expect("lying test time has headroom"),
+                ),
+                ..DriveReceipt::default()
+            })
+        }
+    }
+
     struct FakeHost {
+        session_id: HostSessionId,
         now: ManualInstant,
         next_admission: AdmissionSequence,
         next_event: EventSequence,
@@ -991,12 +1159,14 @@ mod tests {
         snapshots: Vec<Arc<HostSnapshot>>,
         events: Vec<HostEvent>,
         fail_on_application: HashSet<CommandId>,
+        lost_submission_receipts: HashSet<CommandId>,
     }
 
     impl FakeHost {
-        fn new() -> Self {
+        fn new(session_id: HostSessionId) -> Self {
             let config = ScriptBotsConfig::default();
             let mut host = Self {
+                session_id,
                 now: ManualInstant::default(),
                 next_admission: AdmissionSequence::new(1),
                 next_event: EventSequence::new(1),
@@ -1012,6 +1182,7 @@ mod tests {
                 snapshots: Vec::new(),
                 events: Vec::new(),
                 fail_on_application: HashSet::new(),
+                lost_submission_receipts: HashSet::new(),
             };
             host.publish_snapshot();
             host.events.clear();
@@ -1049,11 +1220,16 @@ mod tests {
             self.next_admission = admission
                 .checked_next()
                 .ok_or_else(|| protocol_violation("admission sequence exhausted"))?;
+            let journal = if envelope.command.requires_journal() {
+                JournalState::Pending
+            } else {
+                JournalState::NotRequired
+            };
             let status = CommandStatus::try_new(
                 envelope.command_id,
                 Some(admission),
                 ApplicationState::Admitted,
-                JournalState::Pending,
+                journal,
             )
             .map_err(|error| protocol_violation(error.to_string()))?;
             self.admission_order.push(envelope.command_id);
@@ -1093,6 +1269,7 @@ mod tests {
                 .and_then(CommandStatus::admission_sequence)
                 .ok_or_else(|| protocol_violation("queued command was not admitted"))?;
 
+            let requires_journal = envelope.command.requires_journal();
             let application = if let Some(expected) = envelope.expected_control_revision
                 && expected != self.revisions.control
             {
@@ -1116,6 +1293,7 @@ mod tests {
                     HostCommand::Resume => self.playback.paused = false,
                     HostCommand::SetSpeed(speed) => self.playback.speed_multiplier = speed,
                     HostCommand::Step => {
+                        self.playback.paused = true;
                         self.tick.0 = self
                             .tick
                             .0
@@ -1144,7 +1322,9 @@ mod tests {
                 })
             };
 
-            let journal = if matches!(&application, ApplicationState::Rejected(_)) {
+            let journal = if matches!(&application, ApplicationState::Rejected(_))
+                || !requires_journal
+            {
                 JournalState::NotRequired
             } else {
                 JournalState::Durable
@@ -1231,6 +1411,52 @@ mod tests {
     }
 
     #[test]
+    fn command_ids_use_fixed_width_json_strings() {
+        for command_id in [
+            CommandId::new(0),
+            CommandId::from_client_sequence(u64::MAX, u64::MAX),
+            CommandId::new(u128::MAX),
+        ] {
+            let encoded = serde_json::to_string(&command_id).expect("command id should encode");
+            assert_eq!(encoded.len(), 34, "quotes plus 32 hexadecimal digits");
+            assert!(encoded.starts_with('"') && encoded.ends_with('"'));
+            let decoded: CommandId =
+                serde_json::from_str(&encoded).expect("command id should round trip");
+            assert_eq!(decoded, command_id);
+        }
+        assert_eq!(
+            serde_json::to_string(&CommandId::new(u128::MAX)).expect("maximum id encodes"),
+            "\"ffffffffffffffffffffffffffffffff\""
+        );
+        assert!(serde_json::from_str::<CommandId>("1").is_err());
+        assert!(serde_json::from_str::<CommandId>("\"abc\"").is_err());
+    }
+
+    #[test]
+    fn journal_requirement_matches_the_frozen_command_classes() {
+        let selection = HostCommand::UpdateSelection(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::Selected,
+        });
+        for command in [
+            HostCommand::Pause,
+            HostCommand::Resume,
+            HostCommand::SetSpeed(1.0),
+            selection,
+        ] {
+            assert!(!command.requires_journal());
+        }
+        for command in [
+            HostCommand::Step,
+            HostCommand::UpdateConfig(Box::new(ScriptBotsConfig::default())),
+            HostCommand::Shutdown,
+        ] {
+            assert!(command.requires_journal());
+        }
+    }
+
+    #[test]
     fn admission_is_totally_ordered_and_duplicate_ids_never_reapply() {
         let shared = SharedFakeHost::new();
         let mut driver = shared.driver();
@@ -1243,12 +1469,34 @@ mod tests {
         assert_eq!(first.admission_sequence(), Some(AdmissionSequence::new(1)));
         assert_eq!(second.admission_sequence(), Some(AdmissionSequence::new(2)));
         assert_eq!(third.admission_sequence(), Some(AdmissionSequence::new(3)));
+        assert_eq!(first.journal(), &JournalState::NotRequired);
+        assert_eq!(second.journal(), &JournalState::NotRequired);
+        assert_eq!(third.journal(), &JournalState::Pending);
         assert_eq!(submit_ok(&mut client, second_envelope), second);
 
         let receipt = driver
             .drive(ManualInstant::from_nanos(1))
             .expect("drive should succeed");
         assert_eq!(receipt.commands_completed, 3);
+        for command_id in [CommandId::new(1), CommandId::new(2)] {
+            assert_eq!(
+                client
+                    .command_status(command_id)
+                    .expect("playback status lookup")
+                    .expect("playback status retained")
+                    .journal(),
+                &JournalState::NotRequired
+            );
+        }
+        assert_eq!(
+            client
+                .command_status(CommandId::new(3))
+                .expect("step status lookup")
+                .expect("step status retained")
+                .journal(),
+            &JournalState::Durable
+        );
+        assert!(shared.lock().playback.paused, "Step must leave playback paused");
         let retried = submit_ok(
             &mut client,
             envelope(2, HostCommand::SetSpeed(99.0)),
@@ -1295,6 +1543,63 @@ mod tests {
         assert_eq!(left, right);
         assert_eq!(left.admission_sequence(), Some(AdmissionSequence::new(1)));
         assert_eq!(shared.lock().admission_order, vec![CommandId::new(44)]);
+    }
+
+    #[test]
+    fn null_frontend_preserves_id_after_an_indeterminate_submission_receipt() {
+        let shared = SharedFakeHost::new();
+        let command_id = CommandId::from_client_sequence(0x77, 1);
+        shared.lose_next_submission_receipt(command_id);
+        let mut frontend = NullFrontend::new(shared, 0x77);
+
+        let failure = frontend
+            .pause()
+            .expect_err("the first admitted receipt should be lost");
+        assert_eq!(failure.envelope().map(|envelope| envelope.command_id), Some(command_id));
+        let retry_envelope = failure
+            .into_envelope()
+            .expect("an indeterminate submission preserves its exact envelope");
+        let admitted = frontend
+            .submit_envelope(retry_envelope)
+            .expect("retry should return the existing admission");
+        assert_eq!(admitted.command_id(), command_id);
+        assert_eq!(admitted.admission_sequence(), Some(AdmissionSequence::new(1)));
+
+        let next = frontend.resume().expect("a later command should use the next id");
+        assert_eq!(
+            next.command_id(),
+            CommandId::from_client_sequence(0x77, 2)
+        );
+        assert_eq!(next.admission_sequence(), Some(AdmissionSequence::new(2)));
+    }
+
+    #[test]
+    fn null_frontend_rejects_unrelated_or_lying_manual_drivers() {
+        let shared = SharedFakeHost::new();
+        let mut frontend = NullFrontend::new(shared.clone(), 0x88);
+        let unrelated = SharedFakeHost::new();
+        let mut unrelated_driver = unrelated.driver();
+        assert!(matches!(
+            frontend.drive_at(&mut unrelated_driver, ManualInstant::from_nanos(1)),
+            Err(HostAccessError::DriverSessionMismatch { .. })
+        ));
+
+        let mut lying_driver = LyingFakeDriver {
+            session_id: shared.session_id(),
+        };
+        assert!(matches!(
+            frontend.drive_at(&mut lying_driver, ManualInstant::from_nanos(1)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+
+        let mut matching_driver = shared.driver();
+        assert_eq!(
+            frontend
+                .drive_at(&mut matching_driver, ManualInstant::from_nanos(1))
+                .expect("matching driver should be accepted")
+                .now,
+            ManualInstant::from_nanos(1)
+        );
     }
 
     #[test]
@@ -1612,6 +1917,12 @@ mod tests {
             let sequence = u64::try_from(index).expect("test command count fits u64") + 1;
             status.command_id() == CommandId::from_client_sequence(0x51, sequence)
         }));
+        assert_eq!(statuses[0].journal(), &JournalState::NotRequired);
+        assert_eq!(statuses[1].journal(), &JournalState::NotRequired);
+        assert_eq!(statuses[2].journal(), &JournalState::NotRequired);
+        assert_eq!(statuses[3].journal(), &JournalState::Pending);
+        assert_eq!(statuses[4].journal(), &JournalState::Pending);
+        assert_eq!(statuses[5].journal(), &JournalState::Pending);
 
         let receipt = frontend
             .drive_at(&mut driver, ManualInstant::from_nanos(10))
@@ -1622,8 +1933,19 @@ mod tests {
             .expect("snapshot poll")
             .expect("drive should publish a snapshot");
         assert_eq!(snapshot.playback.speed_multiplier, 2.5);
+        assert!(snapshot.playback.paused, "Step must leave playback paused");
         assert_eq!(snapshot.world.tick, 1);
         assert_eq!(snapshot.lifecycle, HostLifecycle::Stopped);
+        for status in &statuses[3..=5] {
+            assert_eq!(
+                frontend
+                    .command_status(status.command_id())
+                    .expect("journalled status lookup")
+                    .expect("journalled status retained")
+                    .journal(),
+                &JournalState::Durable
+            );
+        }
         assert!(!frontend
             .read_events(128)
             .expect("event observation")
