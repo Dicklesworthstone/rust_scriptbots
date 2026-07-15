@@ -2195,7 +2195,7 @@ Clippy, 446 native core/runtime/app tests, the authoritative 62-crate WASM graph
 standalone `scriptbots-runtime` `wasm32-unknown-unknown` check on exact source
 `91fb652cdb9af0829ff6fce484a5ff80f877e0a8`.
 
-#### 2.5 native scheduler and lifecycle
+#### 2.5 native scheduler and lifecycle [Currently In Progress — `bd-2z0.4.6`, TopazCastle, 2026-07-15]
 
 - drive the same `HostCore` with a fixed-deadline native scheduler;
 - Asupersync structured cancellation/obligations if the spike passes;
