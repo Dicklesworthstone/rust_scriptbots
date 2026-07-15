@@ -18056,16 +18056,34 @@ impl PersistenceAdmissionSession {
         self.admit_pending(world)
     }
 
-    /// Project and admit the final partial cadence tail, retrying already-staged work exactly.
-    pub fn finalize(&mut self, world: &mut WorldState) -> Result<bool, PersistenceSessionError> {
+    /// Project the final partial cadence tail without performing downstream I/O.
+    ///
+    /// The returned [`Arc`] is the exact allocation owned by this admission
+    /// session. A host may embed a clone in its own immutable journal envelope,
+    /// retain that envelope under backpressure, and call [`Self::admit_pending`]
+    /// only after the outer journal accepts the same work. An already-staged
+    /// retry returns the original allocation.
+    pub fn stage_final_batch(
+        &mut self,
+        world: &mut WorldState,
+    ) -> Result<Option<Arc<PersistenceBatch>>, PersistenceSessionError> {
         self.ensure_binding(world)?;
-        if self.pending.is_some() {
-            return self.admit_pending(world);
+        if let Some(pending) = &self.pending {
+            return Ok(Some(Arc::clone(&pending.batch)));
         }
         let Some(projection) = world.finalize_persistence_projection()? else {
-            return Ok(false);
+            return Ok(None);
         };
         self.stage_projection(world, &projection);
+        Ok(self
+            .pending
+            .as_ref()
+            .map(|pending| Arc::clone(&pending.batch)))
+    }
+
+    /// Project and admit the final partial cadence tail, retrying already-staged work exactly.
+    pub fn finalize(&mut self, world: &mut WorldState) -> Result<bool, PersistenceSessionError> {
+        self.stage_final_batch(world)?;
         self.admit_pending(world)
     }
 

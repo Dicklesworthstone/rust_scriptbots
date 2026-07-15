@@ -1,19 +1,26 @@
 //! Renderer-neutral host protocol for `ScriptBots`.
 //!
-//! This crate deliberately stops at the command, status, snapshot, and event
-//! boundary. It does not own a [`scriptbots_core::WorldState`], schedule ticks,
-//! open storage, or depend on any renderer, server, or platform runtime. The
-//! sole-owner host state machine is built on this contract by the next recovery
-//! phase.
+//! The public protocol remains renderer, server, storage-engine, and platform-
+//! runtime neutral. [`HostCore`] implements that protocol as a deterministic
+//! synchronous state machine: it owns one [`scriptbots_core::WorldState`] by
+//! value, advances it only under injected time, and delegates native or browser
+//! scheduling to later adapters.
 
 #![warn(missing_docs, unsafe_code)]
 
 use scriptbots_core::{
-    DynamicWorldSnapshot, PersistenceBatch, ScriptBotsConfig, SelectionUpdate, Tick,
+    BirthRecord, DeathRecord, DynamicWorldSnapshot, PersistenceBatch, ResourceLedgerTick,
+    ScriptBotsConfig, SelectionUpdate, Tick, TickCombatSummary, TickEvents, TickSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
 use thiserror::Error;
+
+mod host_core;
+
+pub use host_core::{
+    HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, VolatileJournal,
+};
 
 macro_rules! monotonic_newtype {
     ($(#[$metadata:meta])* $name:ident) => {
@@ -417,7 +424,136 @@ pub struct JournalBatch {
     id: JournalBatchId,
     command: Option<CommandEnvelope>,
     applied: AppliedCommand,
+    scientific: Option<Arc<ScientificBoundary>>,
     persistence: Option<Arc<PersistenceBatch>>,
+}
+
+/// Complete engine-neutral payload produced by one scientific transition.
+///
+/// This mirrors every non-persistence field of `StepOutcome`. Keeping it in the
+/// runtime journal prevents disabled or deferred persistence cadence from
+/// silently erasing births, deaths, combat, resource, summary, or tick-event
+/// evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScientificBoundary {
+    events: TickEvents,
+    summary: TickSummary,
+    births: Vec<BirthRecord>,
+    deaths: Vec<DeathRecord>,
+    combat: TickCombatSummary,
+    config_revision: u64,
+    resource_tick: Option<ResourceLedgerTick>,
+    fault: Option<ScientificBoundaryFault>,
+}
+
+/// Durable runtime-neutral record of a fault discovered after science completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScientificBoundaryFault {
+    code: String,
+    message: String,
+}
+
+impl ScientificBoundaryFault {
+    /// Construct a stable fault record from a core-specific completed fault.
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Stable machine-readable category.
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// Human-readable diagnostic detail.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl ScientificBoundary {
+    /// Capture one completed scientific boundary without downstream I/O.
+    #[must_use]
+    pub fn new(
+        events: TickEvents,
+        summary: TickSummary,
+        births: Vec<BirthRecord>,
+        deaths: Vec<DeathRecord>,
+        combat: TickCombatSummary,
+        config_revision: u64,
+        resource_tick: Option<ResourceLedgerTick>,
+    ) -> Self {
+        Self {
+            events,
+            summary,
+            births,
+            deaths,
+            combat,
+            config_revision,
+            resource_tick,
+            fault: None,
+        }
+    }
+
+    /// Attach a fault discovered after this scientific boundary completed.
+    #[must_use]
+    pub fn with_fault(mut self, fault: ScientificBoundaryFault) -> Self {
+        self.fault = Some(fault);
+        self
+    }
+
+    /// User-facing events from the completed tick.
+    #[must_use]
+    pub const fn events(&self) -> &TickEvents {
+        &self.events
+    }
+
+    /// Exact current-tick summary.
+    #[must_use]
+    pub const fn summary(&self) -> &TickSummary {
+        &self.summary
+    }
+
+    /// Complete birth stream independent of persistence cadence.
+    #[must_use]
+    pub fn births(&self) -> &[BirthRecord] {
+        &self.births
+    }
+
+    /// Complete death stream independent of persistence cadence.
+    #[must_use]
+    pub fn deaths(&self) -> &[DeathRecord] {
+        &self.deaths
+    }
+
+    /// Combat counters accumulated during this tick.
+    #[must_use]
+    pub const fn combat(&self) -> TickCombatSummary {
+        self.combat
+    }
+
+    /// Configuration revision active at this boundary.
+    #[must_use]
+    pub const fn config_revision(&self) -> u64 {
+        self.config_revision
+    }
+
+    /// Optional resource-conservation evidence for this tick.
+    #[must_use]
+    pub const fn resource_tick(&self) -> Option<&ResourceLedgerTick> {
+        self.resource_tick.as_ref()
+    }
+
+    /// Fault discovered after completion, when the boundary advanced but future science stopped.
+    #[must_use]
+    pub const fn fault(&self) -> Option<&ScientificBoundaryFault> {
+        self.fault.as_ref()
+    }
 }
 
 impl JournalBatch {
@@ -427,12 +563,14 @@ impl JournalBatch {
         id: JournalBatchId,
         command: Option<CommandEnvelope>,
         applied: AppliedCommand,
+        scientific: Option<Arc<ScientificBoundary>>,
         persistence: Option<Arc<PersistenceBatch>>,
     ) -> Self {
         Self {
             id,
             command,
             applied,
+            scientific,
             persistence,
         }
     }
@@ -459,6 +597,12 @@ impl JournalBatch {
     #[must_use]
     pub const fn applied(&self) -> AppliedCommand {
         self.applied
+    }
+
+    /// Exact scientific boundary, or `None` for command-only work.
+    #[must_use]
+    pub fn scientific(&self) -> Option<&Arc<ScientificBoundary>> {
+        self.scientific.as_ref()
     }
 
     /// Exact immutable scientific persistence payload, when this boundary produced one.
