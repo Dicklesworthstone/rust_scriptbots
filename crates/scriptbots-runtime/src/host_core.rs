@@ -2173,7 +2173,6 @@ mod tests {
         let mut fast_a = hub.subscribe();
         let mut fast_b = hub.subscribe();
         let mut stalled = hub.subscribe();
-        let mut dropped = hub.subscribe();
 
         let initial_a = hub
             .poll_latest(&mut fast_a)
@@ -2187,10 +2186,12 @@ mod tests {
             .poll_latest(&mut stalled)
             .expect("stalled initial poll")
             .expect("stalled cursor starts current");
-        let dropped_initial = hub
-            .poll_latest(&mut dropped)
-            .expect("dropped initial poll")
-            .expect("dropped cursor starts current");
+        let dropped_initial = {
+            let mut dropped = hub.subscribe();
+            hub.poll_latest(&mut dropped)
+                .expect("dropped initial poll")
+                .expect("dropped cursor starts current")
+        };
         assert!(Arc::ptr_eq(&initial_a, &initial_b));
         assert!(Arc::ptr_eq(&initial_a, &stalled_initial));
         let initial_weak = Arc::downgrade(&initial_a);
@@ -2198,7 +2199,6 @@ mod tests {
         drop(initial_b);
         drop(stalled_initial);
         drop(dropped_initial);
-        drop(dropped);
 
         let mut newest = SnapshotRevision::new(1);
         for sequence in 1_u128..=3 {
