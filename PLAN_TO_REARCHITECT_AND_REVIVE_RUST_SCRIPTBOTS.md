@@ -2175,7 +2175,7 @@ and authoritative snapshot guard, and compiled `scriptbots-runtime` by itself fo
 `wasm32-unknown-unknown`. The final WASM proof also verifies that core owns both required
 `getrandom` browser backends, rather than relying on a consumer-only feature accident.
 
-#### 2.4 pure host state machine [Currently In Progress — `bd-2z0.4.5`, TopazCastle, 2026-07-15]
+#### 2.4 pure host state machine [Completed — `bd-2z0.4.5`, exact-source DSR batch `hostcore-union13-91fb652-20260715t050500z`, TopazCastle, 2026-07-15]
 
 - sole world ownership;
 - deterministic command drain;
@@ -2184,6 +2184,16 @@ and authoritative snapshot guard, and compiled `scriptbots-runtime` by itself fo
 - status and health.
 
 **Exit:** host-core tests prove exactly-one-step, deduplication, revision conflicts, and command ordering under manual time without any platform runtime.
+
+**Completion evidence:** `HostCore` owns `WorldState` by value and drives ordered commands,
+injected-time cadence, lossless scientific journals, exact retained-batch retry, independent
+application/journal status, and durability-gated shutdown without spawning a thread or exposing a
+shared world lock. Production startup defaults to tick zero; explicit bootstrap work records its
+requested/completed count and pre/post `WorldDigestV1` evidence. DSR run
+`run-1784091059-88486` passed formatting, scoped UBS with zero critical findings, strict all-target
+Clippy, 446 native core/runtime/app tests, the authoritative 62-crate WASM graph guard, and the
+standalone `scriptbots-runtime` `wasm32-unknown-unknown` check on exact source
+`91fb652cdb9af0829ff6fce484a5ff80f877e0a8`.
 
 #### 2.5 native scheduler and lifecycle
 
