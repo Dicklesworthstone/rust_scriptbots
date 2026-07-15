@@ -1,4 +1,4 @@
-//! Renderer-neutral host protocol for ScriptBots.
+//! Renderer-neutral host protocol for `ScriptBots`.
 //!
 //! This crate deliberately stops at the command, status, snapshot, and event
 //! boundary. It does not own a [`scriptbots_core::WorldState`], schedule ticks,
@@ -49,9 +49,7 @@ macro_rules! monotonic_newtype {
 }
 
 /// Stable idempotency key supplied by a client for one logical command.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommandId(u128);
 
 impl CommandId {
@@ -239,11 +237,13 @@ impl HostCommand {
             Self::SetSpeed(speed) if !speed.is_finite() || *speed < 0.0 => {
                 Err(CommandValidationError::InvalidSpeed)
             }
-            Self::UpdateConfig(config) => config.validate().map_err(|error| {
-                CommandValidationError::InvalidConfig {
-                    message: error.to_string(),
-                }
-            }),
+            Self::UpdateConfig(config) => {
+                config
+                    .validate()
+                    .map_err(|error| CommandValidationError::InvalidConfig {
+                        message: error.to_string(),
+                    })
+            }
             _ => Ok(()),
         }
     }
@@ -432,11 +432,7 @@ impl CommandStatus {
 
     /// Revalidate cross-axis invariants after transport deserialization.
     pub fn validate(&self) -> Result<(), StatusCombinationError> {
-        validate_status_combination(
-            self.admission_sequence,
-            &self.application,
-            &self.journal,
-        )
+        validate_status_combination(self.admission_sequence, &self.application, &self.journal)
     }
 }
 
@@ -464,9 +460,7 @@ fn validate_status_combination(
                 return Err(StatusCombinationError::RejectedWasJournaled);
             }
             match reason {
-                RejectionReason::ControlRevisionConflict { .. }
-                    if admission_sequence.is_none() =>
-                {
+                RejectionReason::ControlRevisionConflict { .. } if admission_sequence.is_none() => {
                     return Err(StatusCombinationError::ConflictMissingAdmission);
                 }
                 RejectionReason::Validation { .. }
@@ -752,14 +746,13 @@ impl<P: HostPort> HostClient<P> {
     }
 
     /// Submit a new command or retry an existing idempotency key.
-    pub fn submit(
-        &mut self,
-        envelope: CommandEnvelope,
-    ) -> Result<CommandStatus, HostAccessError> {
+    pub fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
         let requested_id = envelope.command_id;
         let status = self.port.submit(envelope)?;
         if status.command_id() != requested_id {
-            return Err(protocol_violation("submission returned a different command id"));
+            return Err(protocol_violation(
+                "submission returned a different command id",
+            ));
         }
         status
             .validate()
@@ -829,7 +822,9 @@ impl<P: HostPort> HostClient<P> {
     ) -> Result<Vec<HostEvent>, HostAccessError> {
         let events = self.port.events_after(cursor.last_seen, limit)?;
         if events.len() > limit {
-            return Err(protocol_violation("event port exceeded the requested limit"));
+            return Err(protocol_violation(
+                "event port exceeded the requested limit",
+            ));
         }
         let mut previous = cursor.last_seen;
         for event in &events {
@@ -924,10 +919,7 @@ impl<P: HostPort> NullFrontend<P> {
     }
 
     /// Set the playback multiplier.
-    pub fn set_speed(
-        &mut self,
-        speed: f32,
-    ) -> Result<CommandStatus, NullFrontendSubmissionError> {
+    pub fn set_speed(&mut self, speed: f32) -> Result<CommandStatus, NullFrontendSubmissionError> {
         self.submit(HostCommand::SetSpeed(speed), None)
     }
 
@@ -974,7 +966,9 @@ impl<P: HostPort> NullFrontend<P> {
         now: ManualInstant,
     ) -> Result<DriveReceipt, HostAccessError> {
         if self.last_drive.is_some_and(|last_drive| now < last_drive) {
-            return Err(protocol_violation("null frontend manual time moved backwards"));
+            return Err(protocol_violation(
+                "null frontend manual time moved backwards",
+            ));
         }
         let driver_session_id = driver.session_id();
         if driver_session_id != self.host_session_id {
@@ -1029,7 +1023,8 @@ mod tests {
 
     impl SharedFakeHost {
         fn new() -> Self {
-            let session_id = HostSessionId::new(NEXT_FAKE_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+            let session_id =
+                HostSessionId::new(NEXT_FAKE_SESSION_ID.fetch_add(1, Ordering::Relaxed));
             Self {
                 inner: Arc::new(Mutex::new(FakeHost::new(session_id))),
             }
@@ -1061,10 +1056,7 @@ mod tests {
             self.lock().session_id
         }
 
-        fn submit(
-            &mut self,
-            envelope: CommandEnvelope,
-        ) -> Result<CommandStatus, HostAccessError> {
+        fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
             let command_id = envelope.command_id;
             let mut host = self.lock();
             let status = host.submit(envelope)?;
@@ -1087,14 +1079,15 @@ mod tests {
             after: Option<SnapshotRevision>,
         ) -> Result<Option<Arc<HostSnapshot>>, HostAccessError> {
             let host = self.lock();
-            Ok(match after {
-                None => host.snapshots.last().cloned(),
-                Some(revision) => host
-                    .snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.revision > revision)
-                    .cloned(),
-            })
+            Ok(after.map_or_else(
+                || host.snapshots.last().cloned(),
+                |revision| {
+                    host.snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.revision > revision)
+                        .cloned()
+                },
+            ))
         }
 
         fn events_after(
@@ -1194,10 +1187,7 @@ mod tests {
             host
         }
 
-        fn submit(
-            &mut self,
-            envelope: CommandEnvelope,
-        ) -> Result<CommandStatus, HostAccessError> {
+        fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
             if let Some(status) = self.statuses.get(&envelope.command_id) {
                 return Ok(status.clone());
             }
@@ -1303,11 +1293,10 @@ mod tests {
                             .0
                             .checked_add(1)
                             .ok_or_else(|| protocol_violation("tick exhausted"))?;
-                        self.revisions.scientific = self
-                            .revisions
-                            .scientific
-                            .checked_next()
-                            .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+                        self.revisions.scientific =
+                            self.revisions.scientific.checked_next().ok_or_else(|| {
+                                protocol_violation("scientific revision exhausted")
+                            })?;
                     }
                     HostCommand::UpdateConfig(config) => {
                         self.config = *config;
@@ -1326,20 +1315,15 @@ mod tests {
                 })
             };
 
-            let journal = if matches!(&application, ApplicationState::Rejected(_))
-                || !requires_journal
-            {
-                JournalState::NotRequired
-            } else {
-                JournalState::Durable
-            };
-            let status = CommandStatus::try_new(
-                envelope.command_id,
-                Some(admission),
-                application,
-                journal,
-            )
-            .map_err(|error| protocol_violation(error.to_string()))?;
+            let journal =
+                if matches!(&application, ApplicationState::Rejected(_)) || !requires_journal {
+                    JournalState::NotRequired
+                } else {
+                    JournalState::Durable
+                };
+            let status =
+                CommandStatus::try_new(envelope.command_id, Some(admission), application, journal)
+                    .map_err(|error| protocol_violation(error.to_string()))?;
             self.statuses.insert(envelope.command_id, status.clone());
             self.emit_status(status);
             if self.lifecycle == HostLifecycle::Stopped {
@@ -1401,7 +1385,10 @@ mod tests {
         CommandEnvelope::new(CommandId::new(id), command)
     }
 
-    fn submit_ok(client: &mut HostClient<SharedFakeHost>, envelope: CommandEnvelope) -> CommandStatus {
+    fn submit_ok(
+        client: &mut HostClient<SharedFakeHost>,
+        envelope: CommandEnvelope,
+    ) -> CommandStatus {
         client
             .submit(envelope)
             .expect("the conformance host should accept this request")
@@ -1434,9 +1421,7 @@ mod tests {
         );
         assert!(serde_json::from_str::<CommandId>("1").is_err());
         assert!(serde_json::from_str::<CommandId>("\"abc\"").is_err());
-        assert!(
-            serde_json::from_str::<CommandId>("\"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\"").is_err()
-        );
+        assert!(serde_json::from_str::<CommandId>("\"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\"").is_err());
     }
 
     #[test]
@@ -1456,7 +1441,7 @@ mod tests {
         }
         for command in [
             HostCommand::Step,
-            HostCommand::UpdateConfig(Box::new(ScriptBotsConfig::default())),
+            HostCommand::UpdateConfig(Box::default()),
             HostCommand::Shutdown,
         ] {
             assert!(command.requires_journal());
@@ -1503,12 +1488,15 @@ mod tests {
                 .journal(),
             &JournalState::Durable
         );
-        assert!(shared.lock().playback.paused, "Step must leave playback paused");
-        let retried = submit_ok(
-            &mut client,
-            envelope(2, HostCommand::SetSpeed(99.0)),
+        assert!(
+            shared.lock().playback.paused,
+            "Step must leave playback paused"
         );
-        assert!(matches!(retried.application(), ApplicationState::Applied(_)));
+        let retried = submit_ok(&mut client, envelope(2, HostCommand::SetSpeed(99.0)));
+        assert!(matches!(
+            retried.application(),
+            ApplicationState::Applied(_)
+        ));
         assert_eq!(retried.admission_sequence(), second.admission_sequence());
         assert_eq!(
             driver
@@ -1542,7 +1530,10 @@ mod tests {
         let right = spawn_submitter(shared.clone());
         barrier.wait();
 
-        let left = left.join().expect("left submitter should not panic").expect("left retry");
+        let left = left
+            .join()
+            .expect("left submitter should not panic")
+            .expect("left retry");
         let right = right
             .join()
             .expect("right submitter should not panic")
@@ -1562,7 +1553,10 @@ mod tests {
         let failure = frontend
             .pause()
             .expect_err("the first admitted receipt should be lost");
-        assert_eq!(failure.envelope().map(|envelope| envelope.command_id), Some(command_id));
+        assert_eq!(
+            failure.envelope().map(|envelope| envelope.command_id),
+            Some(command_id)
+        );
         let retry_envelope = failure
             .into_envelope()
             .expect("an indeterminate submission preserves its exact envelope");
@@ -1570,13 +1564,15 @@ mod tests {
             .submit_envelope(retry_envelope)
             .expect("retry should return the existing admission");
         assert_eq!(admitted.command_id(), command_id);
-        assert_eq!(admitted.admission_sequence(), Some(AdmissionSequence::new(1)));
-
-        let next = frontend.resume().expect("a later command should use the next id");
         assert_eq!(
-            next.command_id(),
-            CommandId::from_client_sequence(0x77, 2)
+            admitted.admission_sequence(),
+            Some(AdmissionSequence::new(1))
         );
+
+        let next = frontend
+            .resume()
+            .expect("a later command should use the next id");
+        assert_eq!(next.command_id(), CommandId::from_client_sequence(0x77, 2));
         assert_eq!(next.admission_sequence(), Some(AdmissionSequence::new(2)));
     }
 
@@ -1616,8 +1612,7 @@ mod tests {
         let mut client = HostClient::new(shared.clone());
         let winner = client
             .submit(
-                envelope(9, HostCommand::Pause)
-                    .expecting_control_revision(ControlRevision::new(0)),
+                envelope(9, HostCommand::Pause).expecting_control_revision(ControlRevision::new(0)),
             )
             .expect("first compare-and-set candidate should be admitted");
         let conflict = client
@@ -1652,8 +1647,10 @@ mod tests {
         );
         assert_eq!(conflict.journal(), &JournalState::NotRequired);
 
-        let mut invalid_config = ScriptBotsConfig::default();
-        invalid_config.world_width = 0;
+        let invalid_config = ScriptBotsConfig {
+            world_width: 0,
+            ..ScriptBotsConfig::default()
+        };
         let rejected = client
             .submit(envelope(
                 11,
@@ -1728,7 +1725,7 @@ mod tests {
             &mut client,
             envelope(
                 81,
-                HostCommand::UpdateConfig(Box::new(ScriptBotsConfig::default())),
+                HostCommand::UpdateConfig(Box::default()),
             ),
         );
         driver
@@ -1776,10 +1773,15 @@ mod tests {
             .read_events(&mut cursor, usize::MAX)
             .expect("ordered event read");
         assert!(events.len() >= 9);
-        assert!(events
-            .windows(2)
-            .all(|pair| pair[0].sequence.checked_next() == Some(pair[1].sequence)));
-        assert_eq!(cursor.last_seen(), events.last().expect("events exist").sequence);
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[0].sequence.checked_next() == Some(pair[1].sequence))
+        );
+        assert_eq!(
+            cursor.last_seen(),
+            events.last().expect("events exist").sequence
+        );
     }
 
     #[test]
@@ -1806,33 +1808,39 @@ mod tests {
         ];
 
         for journal in [JournalState::NotRequired, JournalState::Pending] {
-            assert!(CommandStatus::try_new(
-                CommandId::new(1),
-                Some(AdmissionSequence::new(1)),
-                ApplicationState::Admitted,
-                journal,
-            )
-            .is_ok());
+            assert!(
+                CommandStatus::try_new(
+                    CommandId::new(1),
+                    Some(AdmissionSequence::new(1)),
+                    ApplicationState::Admitted,
+                    journal,
+                )
+                .is_ok()
+            );
         }
         for application in terminal_applications {
             for journal in journals.clone() {
-                assert!(CommandStatus::try_new(
-                    CommandId::new(1),
-                    Some(AdmissionSequence::new(1)),
-                    application.clone(),
-                    journal,
-                )
-                .is_ok());
+                assert!(
+                    CommandStatus::try_new(
+                        CommandId::new(1),
+                        Some(AdmissionSequence::new(1)),
+                        application.clone(),
+                        journal,
+                    )
+                    .is_ok()
+                );
             }
         }
         let rejected = ApplicationState::Rejected(RejectionReason::HostStopping);
-        assert!(CommandStatus::try_new(
-            CommandId::new(2),
-            None,
-            rejected.clone(),
-            JournalState::NotRequired,
-        )
-        .is_ok());
+        assert!(
+            CommandStatus::try_new(
+                CommandId::new(2),
+                None,
+                rejected.clone(),
+                JournalState::NotRequired,
+            )
+            .is_ok()
+        );
         assert_eq!(
             CommandStatus::try_new(
                 CommandId::new(2),
@@ -1842,35 +1850,25 @@ mod tests {
             ),
             Err(StatusCombinationError::PreAdmissionRejectionWasAdmitted)
         );
-        let conflict = ApplicationState::Rejected(
-            RejectionReason::ControlRevisionConflict {
-                expected: ControlRevision::new(1),
-                actual: ControlRevision::new(2),
-            },
-        );
-        assert!(CommandStatus::try_new(
-            CommandId::new(2),
-            Some(AdmissionSequence::new(2)),
-            conflict.clone(),
-            JournalState::NotRequired,
-        )
-        .is_ok());
-        assert_eq!(
+        let conflict = ApplicationState::Rejected(RejectionReason::ControlRevisionConflict {
+            expected: ControlRevision::new(1),
+            actual: ControlRevision::new(2),
+        });
+        assert!(
             CommandStatus::try_new(
                 CommandId::new(2),
-                None,
-                conflict,
+                Some(AdmissionSequence::new(2)),
+                conflict.clone(),
                 JournalState::NotRequired,
-            ),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            CommandStatus::try_new(CommandId::new(2), None, conflict, JournalState::NotRequired,),
             Err(StatusCombinationError::ConflictMissingAdmission)
         );
         assert_eq!(
-            CommandStatus::try_new(
-                CommandId::new(2),
-                None,
-                rejected,
-                JournalState::Pending,
-            ),
+            CommandStatus::try_new(CommandId::new(2), None, rejected, JournalState::Pending,),
             Err(StatusCombinationError::RejectedWasJournaled)
         );
         assert_eq!(
@@ -1891,6 +1889,10 @@ mod tests {
             ),
             Err(StatusCombinationError::AdmittedJournalAdvanced)
         );
+    }
+
+    #[test]
+    fn status_deserialization_rejects_applied_state_without_admission() {
         assert_eq!(
             CommandStatus::try_from(CommandStatusWire {
                 command_id: CommandId::new(5),
@@ -1939,7 +1941,10 @@ mod tests {
             .poll_snapshot()
             .expect("snapshot poll")
             .expect("drive should publish a snapshot");
-        assert_eq!(snapshot.playback.speed_multiplier, 2.5);
+        assert!(
+            (snapshot.playback.speed_multiplier - 2.5).abs() <= f32::EPSILON,
+            "speed command must be reflected exactly in the host snapshot"
+        );
         assert!(snapshot.playback.paused, "Step must leave playback paused");
         assert_eq!(snapshot.world.tick, 1);
         assert_eq!(snapshot.lifecycle, HostLifecycle::Stopped);
@@ -1953,10 +1958,12 @@ mod tests {
                 &JournalState::Durable
             );
         }
-        assert!(!frontend
-            .read_events(128)
-            .expect("event observation")
-            .is_empty());
+        assert!(
+            !frontend
+                .read_events(128)
+                .expect("event observation")
+                .is_empty()
+        );
         assert!(matches!(
             frontend
                 .command_status(statuses[3].command_id())
@@ -1965,8 +1972,10 @@ mod tests {
                 .application(),
             ApplicationState::Applied(_)
         ));
-        assert!(frontend
-            .drive_at(&mut driver, ManualInstant::from_nanos(9))
-            .is_err());
+        assert!(
+            frontend
+                .drive_at(&mut driver, ManualInstant::from_nanos(9))
+                .is_err()
+        );
     }
 }

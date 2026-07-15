@@ -7171,8 +7171,7 @@ mod tests {
             objects
                 .into_iter()
                 .filter(|object| {
-                    !INTERNAL_TABLES.contains(&object.table_name.as_str())
-                        && object.sql.is_some()
+                    !INTERNAL_TABLES.contains(&object.table_name.as_str()) && object.sql.is_some()
                 })
                 .map(|object| {
                     let normalized_sql = normalize_schema_sql(
