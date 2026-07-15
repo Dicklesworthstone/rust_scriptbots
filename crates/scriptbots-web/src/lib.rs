@@ -16,7 +16,7 @@ use scriptbots_core::{
 };
 #[cfg(test)]
 use scriptbots_core::{
-    DynamicAgentSnapshot as AgentSnapshot, DynamicSnapshotSummary as SnapshotSummary,
+    AgentUid, DynamicAgentSnapshot as AgentSnapshot, DynamicSnapshotSummary as SnapshotSummary,
     DynamicSnapshotWorld as SnapshotWorld,
 };
 use serde::{Deserialize, Serialize};
@@ -534,6 +534,7 @@ mod tests {
             },
             agents: vec![AgentSnapshot {
                 id: 7,
+                uid: AgentUid(11),
                 position: [1.25, -2.5],
                 velocity: [0.5, -0.25],
                 heading: 3.0,
@@ -542,6 +543,10 @@ mod tests {
                 color: [0.1, 0.2, 0.3],
                 spike_length: 0.75,
                 boost: true,
+                age: 12,
+                generation: Generation(13),
+                herbivore_tendency: 0.625,
+                brain_key: Some(17),
             }],
         };
 
@@ -550,9 +555,9 @@ mod tests {
             encoded,
             [
                 172, 2, 2, 128, 5, 224, 3, 1, 1, 2, 3, 0, 0, 144, 64, 0, 0, 144, 64, 0, 0, 64, 63,
-                1, 7, 0, 0, 160, 63, 0, 0, 32, 192, 0, 0, 0, 63, 0, 0, 128, 190, 0, 0, 64, 64, 0,
-                0, 192, 63, 0, 0, 144, 64, 205, 204, 204, 61, 205, 204, 76, 62, 154, 153, 153, 62,
-                0, 0, 64, 63, 1,
+                1, 7, 11, 0, 0, 160, 63, 0, 0, 32, 192, 0, 0, 0, 63, 0, 0, 128, 190, 0, 0, 64,
+                64, 0, 0, 192, 63, 0, 0, 144, 64, 205, 204, 204, 61, 205, 204, 76, 62, 154, 153,
+                153, 62, 0, 0, 64, 63, 1, 12, 13, 0, 0, 32, 63, 1, 17,
             ],
             "Postcard is positional: changing these bytes requires a versioned snapshot schema"
         );
@@ -576,6 +581,7 @@ mod tests {
         );
         assert_eq!(decoded.agents.len(), 1);
         assert_eq!(decoded.agents[0].id, snapshot.agents[0].id);
+        assert_eq!(decoded.agents[0].uid, snapshot.agents[0].uid);
         assert_eq!(decoded.agents[0].position, snapshot.agents[0].position);
         assert_eq!(decoded.agents[0].velocity, snapshot.agents[0].velocity);
         assert_eq!(decoded.agents[0].heading, snapshot.agents[0].heading);
@@ -587,6 +593,13 @@ mod tests {
             snapshot.agents[0].spike_length
         );
         assert_eq!(decoded.agents[0].boost, snapshot.agents[0].boost);
+        assert_eq!(decoded.agents[0].age, snapshot.agents[0].age);
+        assert_eq!(decoded.agents[0].generation, snapshot.agents[0].generation);
+        assert_eq!(
+            decoded.agents[0].herbivore_tendency,
+            snapshot.agents[0].herbivore_tendency
+        );
+        assert_eq!(decoded.agents[0].brain_key, snapshot.agents[0].brain_key);
         assert_eq!(
             to_allocvec(&decoded).expect("re-encode postcard snapshot"),
             encoded
@@ -813,6 +826,8 @@ mod tests {
                 .iter()
                 .zip(wasm_snapshot.agents.iter())
             {
+                assert_eq!(expected.id, actual.id);
+                assert_eq!(expected.uid, actual.uid);
                 assert_float_eq(expected.position[0], actual.position[0]);
                 assert_float_eq(expected.position[1], actual.position[1]);
                 assert_float_eq(expected.velocity[0], actual.velocity[0]);
@@ -820,8 +835,13 @@ mod tests {
                 assert_float_eq(expected.heading, actual.heading);
                 assert_float_eq(expected.health, actual.health);
                 assert_float_eq(expected.energy, actual.energy);
+                assert_eq!(expected.color, actual.color);
                 assert_float_eq(expected.spike_length, actual.spike_length);
                 assert_eq!(expected.boost, actual.boost);
+                assert_eq!(expected.age, actual.age);
+                assert_eq!(expected.generation, actual.generation);
+                assert_float_eq(expected.herbivore_tendency, actual.herbivore_tendency);
+                assert_eq!(expected.brain_key, actual.brain_key);
             }
         }
     }
