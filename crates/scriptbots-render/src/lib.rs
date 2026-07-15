@@ -13,19 +13,23 @@ use gpui_platform::application;
 use rand::Rng;
 use scriptbots_core::PresetKind;
 use scriptbots_core::{
-    ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime,
-    BrainActivations, ControlCommand, ControlDisposition, Generation, IndicatorState,
+    ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime, AgentUid,
+    BrainActivations, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
+    BrainInspectionUnavailable, ControlCommand, ControlDisposition, Generation, IndicatorState,
     MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position, RenderTonemapMode, SENSOR_LAYOUT,
-    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
-    TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
-    WorldStepDriver, apply_control_command,
+    ScriptBotsConfig, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
+    SelectionUpdate, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile, TickSummary,
+    TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, VecDeque},
     f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -1703,6 +1707,7 @@ pub fn run_demo(
 const MAX_SELECTION_EVENTS: usize = 64;
 const SIM_TICK_INTERVAL: f32 = 1.0 / 60.0;
 const MAX_SIM_STEPS_PER_FRAME: usize = 240;
+static NEXT_BRAIN_INSPECTION_CLIENT: AtomicU64 = AtomicU64::new(1);
 
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
@@ -1738,6 +1743,9 @@ struct SimulationView {
     drives_simulation: bool,
     // Per-agent short history of brain outputs for inspector sparklines
     brain_history: std::collections::HashMap<AgentId, OutputHistory>,
+    brain_client_id: BrainInspectionClientId,
+    brain_request_revision: BrainInspectionRevision,
+    brain_inspection_cache: Option<BrainInspectorCapture>,
 }
 impl SimulationView {
     fn new(
@@ -1792,6 +1800,11 @@ impl SimulationView {
             minimal_canvas_mode: false,
             drives_simulation: true,
             brain_history: std::collections::HashMap::new(),
+            brain_client_id: BrainInspectionClientId::new(
+                NEXT_BRAIN_INSPECTION_CLIENT.fetch_add(1, AtomicOrdering::Relaxed),
+            ),
+            brain_request_revision: BrainInspectionRevision::new(0),
+            brain_inspection_cache: None,
         }
     }
 
@@ -2266,14 +2279,23 @@ impl SimulationView {
             .lock()
             .map(|state| state.clone())
             .unwrap_or_default();
+        let brain_request = (!self.minimal_canvas_mode
+            && matches!(self.playback.mode(), PlaybackMode::Live))
+        .then(|| {
+            let revision = self
+                .brain_request_revision
+                .get()
+                .checked_add(1)
+                .expect("GPUI brain-inspection revision exhausted");
+            (self.brain_client_id, BrainInspectionRevision::new(revision))
+        });
+        let cached_brain_inspection = self.brain_inspection_cache.clone();
+        let mut next_brain_inspection_cache = cached_brain_inspection.clone();
+        let mut brain_request_issued = false;
 
         let analytics_trigger = {
             let mut trigger: Option<(u64, usize)> = None;
-            if let Ok(mut world) = self.world.lock() {
-                // Activation capture is bounded (ACTIVATION_CAPTURE_BUDGET), so a
-                // bulk selection cannot guarantee the inspected agent is captured.
-                // Point the probe at whichever agent the inspector is focused on.
-                world.set_activation_probe(inspector_state.focused_agent);
+            if let Ok(world) = self.world.lock() {
                 snapshot.tick = world.tick().0;
                 snapshot.epoch = world.epoch();
                 snapshot.is_closed = world.is_closed();
@@ -2295,12 +2317,25 @@ impl SimulationView {
                     snapshot.summary = Some(HudMetrics::from(latest));
                 }
                 snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
-                snapshot.inspector = InspectorSnapshot::from_world(&world, &inspector_state);
+                let (inspector, cache, issued) = InspectorSnapshot::from_world(
+                    &world,
+                    &inspector_state,
+                    cached_brain_inspection.as_ref(),
+                    brain_request,
+                );
+                snapshot.inspector = inspector;
+                next_brain_inspection_cache = cache;
+                brain_request_issued = issued;
 
                 trigger = Some((snapshot.tick, snapshot.agent_count));
             }
             trigger
         };
+
+        self.brain_inspection_cache = next_brain_inspection_cache;
+        if brain_request_issued && let Some((_, revision)) = brain_request {
+            self.brain_request_revision = revision;
+        }
 
         if let Some((tick, count)) = analytics_trigger {
             self.maybe_refresh_analytics(tick, count);
@@ -6314,6 +6349,47 @@ impl SimulationView {
             .child(sensor_bars)
             .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Outputs"))
             .child(output_bars)
+            .child({
+                let provenance = match (
+                    detail.brain_source_tick,
+                    detail.brain_request_revision,
+                    detail.brain_payload_bytes,
+                    detail.brain_inspection_status.as_deref(),
+                ) {
+                    (
+                        Some(source_tick),
+                        Some(request_revision),
+                        Some(payload_bytes),
+                        Some("ready"),
+                    ) => {
+                        let payload_status = if detail
+                            .brain_activations
+                            .as_ref()
+                            .is_some_and(|activations| activations.truncated)
+                        {
+                            "payload CLIPPED"
+                        } else {
+                            "payload complete"
+                        };
+                        format!(
+                            "Brain detail · tick {source_tick} · request {request_revision} · {payload_bytes} B · {payload_status}"
+                        )
+                    }
+                    (
+                        Some(source_tick),
+                        Some(request_revision),
+                        Some(payload_bytes),
+                        Some(status),
+                    ) => format!(
+                        "Brain detail · tick {source_tick} · request {request_revision} · {payload_bytes} B · {status}"
+                    ),
+                    _ => "Brain detail · not requested".to_owned(),
+                };
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(provenance)
+            })
             .child(render_activation_heatmaps(&detail.brain_activations))
             .child(self.render_output_sparklines_for(detail.agent_id))
             .child(self.render_diet_gauges())
@@ -8057,32 +8133,44 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
 fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
     let mut rows: Vec<Div> = Vec::new();
     if let Some(act) = activations {
+        if act.truncated {
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xf59e0b))
+                    .child("Activation view clipped to the explicit inspection budget"),
+            );
+        }
         for layer in &act.layers {
-            let state = layer.clone();
-            let state_for_canvas = state.clone();
+            let layer_name = layer.name.clone();
+            let state = Arc::new(layer.clone());
+            let state_for_canvas = Arc::clone(&state);
             let canvas_el = canvas(
-                move |_, _, _| state_for_canvas.clone(),
-                move |bounds, st, window, _| paint_activation_grid(bounds, &st, window),
+                move |_, _, _| Arc::clone(&state_for_canvas),
+                move |bounds, st, window, _| {
+                    paint_activation_grid(bounds, st.as_ref(), window);
+                },
             )
             .w(px(200.0))
             .h(px(120.0));
 
             // Optional edges overlay limited to within this layer's index space
-            let edges_in_layer: Vec<ActivationEdge> = activations
-                .as_ref()
-                .map(|a| a.connections.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| {
-                    e.from < state.width * state.height && e.to < state.width * state.height
-                })
+            let cell_count = state.width.checked_mul(state.height).unwrap_or_default();
+            let edges_in_layer: Vec<ActivationEdge> = act
+                .connections
+                .iter()
+                .copied()
+                .filter(|e| e.from < cell_count && e.to < cell_count)
                 .take(64)
                 .collect();
 
-            let edges_state = (state.width, state.height, edges_in_layer.clone());
+            let edges_state = Arc::new((state.width, state.height, edges_in_layer));
+            let edges_state_for_canvas = Arc::clone(&edges_state);
             let edges_canvas = canvas(
-                move |_, _, _| edges_state.clone(),
-                move |bounds, st, window, _| paint_activation_edges(bounds, st, window),
+                move |_, _, _| Arc::clone(&edges_state_for_canvas),
+                move |bounds, st, window, _| {
+                    paint_activation_edges(bounds, st.as_ref(), window);
+                },
             )
             .w(px(200.0))
             .h(px(120.0));
@@ -8092,22 +8180,29 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x94a3b8))
-                            .child(state.name.clone()),
-                    )
+                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(layer_name))
                     .child(div().relative().child(canvas_el).child(edges_canvas)),
             );
         }
         // Optional: show top-N connections if provided (textual summary)
         if !act.connections.is_empty() {
             let mut lines: Vec<Div> = Vec::new();
+            if act.connections.len() > 64 {
+                lines.push(div().text_xs().text_color(rgb(0xf59e0b)).child(format!(
+                    "Display overlay is limited to 64 of {} payload edges per layer",
+                    act.connections.len()
+                )));
+            }
             for edge in act.connections.iter().take(8) {
                 lines.push(div().text_xs().text_color(rgb(0x64748b)).child(format!(
                     "edge {}→{} w={:.2}",
                     edge.from, edge.to, edge.weight
+                )));
+            }
+            if act.connections.len() > 8 {
+                lines.push(div().text_xs().text_color(rgb(0xf59e0b)).child(format!(
+                    "Text summary shows 8 of {} payload edges",
+                    act.connections.len()
                 )));
             }
             rows.push(div().flex().flex_col().gap_0().children(lines));
@@ -9645,7 +9740,12 @@ impl SelectionEventKind {
     }
 }
 impl InspectorSnapshot {
-    fn from_world(world: &WorldState, inspector: &InspectorState) -> Self {
+    fn from_world(
+        world: &WorldState,
+        inspector: &InspectorState,
+        cached_brain: Option<&BrainInspectorCapture>,
+        brain_request: Option<(BrainInspectionClientId, BrainInspectionRevision)>,
+    ) -> (Self, Option<BrainInspectorCapture>, bool) {
         let mut snapshot = InspectorSnapshot {
             total_agents: world.agent_count(),
             brush_enabled: inspector.brush_enabled,
@@ -9691,8 +9791,62 @@ impl InspectorSnapshot {
 
         let focus_id = focus_candidate;
 
-        let focused =
-            focus_id.and_then(|agent_id| AgentInspectorDetails::from_world(world, agent_id));
+        let mut request_issued = false;
+        let brain_capture = focus_id.and_then(|agent_id| {
+            let agent_uid = world.agent_uid(agent_id)?;
+            let (client_id, revision) = brain_request?;
+            if let Some(cached) = cached_brain
+                && cached.agent_uid == agent_uid
+                && cached.source_tick == world.tick().0
+            {
+                return Some(cached.clone());
+            }
+
+            request_issued = true;
+            let response = match world.inspect_brains(&BrainInspectionRequest::single(
+                client_id, revision, agent_uid,
+            )) {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(%error, agent_uid = agent_uid.get(), "brain inspection request refused");
+                    return Some(BrainInspectorCapture {
+                        agent_uid,
+                        source_tick: world.tick().0,
+                        request_revision: revision.get(),
+                        retained_payload_bytes: 0,
+                        status: BrainInspectorCaptureStatus::Refused(error.to_string()),
+                    });
+                }
+            };
+            let source_tick = response.source_tick.0;
+            let request_revision = response.request_revision.get();
+            let status = match response.telemetry.into_iter().next() {
+                Some(SelectedBrainTelemetryOutcome::Ready { telemetry }) => {
+                    BrainInspectorCaptureStatus::Ready(telemetry.inspection.activations)
+                }
+                Some(SelectedBrainTelemetryOutcome::Unavailable { reason, .. }) => {
+                    BrainInspectorCaptureStatus::Unavailable(reason)
+                }
+                None => BrainInspectorCaptureStatus::Refused(
+                    "inspection returned no outcome for the requested agent".to_owned(),
+                ),
+            };
+            let retained_payload_bytes = match &status {
+                BrainInspectorCaptureStatus::Ready(_) => response.build.retained_payload_bytes,
+                BrainInspectorCaptureStatus::Unavailable(_)
+                | BrainInspectorCaptureStatus::Refused(_) => 0,
+            };
+            Some(BrainInspectorCapture {
+                agent_uid,
+                source_tick,
+                request_revision,
+                retained_payload_bytes,
+                status,
+            })
+        });
+        let focused = focus_id.and_then(|agent_id| {
+            AgentInspectorDetails::from_world(world, agent_id, brain_capture.clone())
+        });
 
         for entry in &mut selected {
             entry.is_focused = Some(entry.agent_id) == focus_id;
@@ -9705,7 +9859,7 @@ impl InspectorSnapshot {
         snapshot.selected = selected;
         snapshot.hovered = hovered;
         snapshot.focus_id = focus_id;
-        snapshot
+        (snapshot, brain_capture, request_issued)
     }
 }
 
@@ -10184,10 +10338,34 @@ struct AgentInspectorDetails {
     sensors: Vec<f32>,
     outputs: Vec<f32>,
     brain_activations: Option<BrainActivations>,
+    brain_source_tick: Option<u64>,
+    brain_request_revision: Option<u64>,
+    brain_payload_bytes: Option<usize>,
+    brain_inspection_status: Option<String>,
+}
+
+#[derive(Clone)]
+struct BrainInspectorCapture {
+    agent_uid: AgentUid,
+    source_tick: u64,
+    request_revision: u64,
+    retained_payload_bytes: usize,
+    status: BrainInspectorCaptureStatus,
+}
+
+#[derive(Clone)]
+enum BrainInspectorCaptureStatus {
+    Ready(BrainActivations),
+    Unavailable(BrainInspectionUnavailable),
+    Refused(String),
 }
 
 impl AgentInspectorDetails {
-    fn from_world(world: &WorldState, agent_id: AgentId) -> Option<Self> {
+    fn from_world(
+        world: &WorldState,
+        agent_id: AgentId,
+        brain_capture: Option<BrainInspectorCapture>,
+    ) -> Option<Self> {
         let arena = world.agents();
         let columns = arena.columns();
         let runtime = world.runtime();
@@ -10204,7 +10382,32 @@ impl AgentInspectorDetails {
 
         let sensors = agent_runtime.sensors.to_vec();
         let outputs = agent_runtime.outputs.to_vec();
-        let brain_activations = agent_runtime.brain_activations.clone();
+        let (
+            brain_activations,
+            brain_source_tick,
+            brain_request_revision,
+            brain_payload_bytes,
+            brain_inspection_status,
+        ) = brain_capture.map_or((None, None, None, None, None), |capture| {
+            let (activations, status) = match capture.status {
+                BrainInspectorCaptureStatus::Ready(activations) => {
+                    (Some(activations), "ready".to_owned())
+                }
+                BrainInspectorCaptureStatus::Unavailable(reason) => {
+                    (None, format!("unavailable: {reason:?}"))
+                }
+                BrainInspectorCaptureStatus::Refused(detail) => {
+                    (None, format!("refused: {detail}"))
+                }
+            };
+            (
+                activations,
+                Some(capture.source_tick),
+                Some(capture.request_revision),
+                Some(capture.retained_payload_bytes),
+                Some(status),
+            )
+        });
 
         let label = format!("Agent {:?} · Gen {} · Age {}", agent_id, generation.0, age);
 
@@ -10226,6 +10429,10 @@ impl AgentInspectorDetails {
             sensors,
             outputs,
             brain_activations,
+            brain_source_tick,
+            brain_request_revision,
+            brain_payload_bytes,
+            brain_inspection_status,
         })
     }
 }
@@ -10422,7 +10629,6 @@ impl PlaybackState {
         }
     }
 
-    #[allow(dead_code)]
     fn mode(&self) -> PlaybackMode {
         self.mode
     }
@@ -13559,6 +13765,149 @@ mod command_characterization_tests {
         assert_eq!(world.lock().expect("world lock").tick().0, 0);
         assert!(canvas.minimal_canvas_mode);
         assert!(!canvas.drives_simulation);
+    }
+
+    #[test]
+    fn gpui_brain_pull_is_client_isolated_cached_and_suppressed_for_canvas() {
+        #[derive(Debug)]
+        struct GuiInspectionBrain {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl scriptbots_core::BrainRunner for GuiInspectionBrain {
+            fn kind(&self) -> &'static str {
+                "gpui.inspection"
+            }
+
+            fn tick(
+                &mut self,
+                _inputs: &[f32; scriptbots_core::INPUT_SIZE],
+            ) -> [f32; scriptbots_core::OUTPUT_SIZE] {
+                [0.0; scriptbots_core::OUTPUT_SIZE]
+            }
+
+            fn inspect(
+                &self,
+                request: scriptbots_core::BrainInspection,
+            ) -> Result<
+                Option<scriptbots_core::BrainInspectionSnapshot>,
+                scriptbots_core::BrainInspectionError,
+            > {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let scriptbots_core::BrainInspection::Activations(limits) = request;
+                scriptbots_core::bound_brain_inspection(
+                    self.kind(),
+                    BrainActivations {
+                        layers: vec![ActivationLayer {
+                            name: "gpui".to_owned(),
+                            width: 1,
+                            height: 1,
+                            values: vec![0.5],
+                        }],
+                        connections: Vec::new(),
+                        truncated: false,
+                    },
+                    1,
+                    limits,
+                )
+                .map(Some)
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x4750_5549_4252_4149)
+            }
+        }
+
+        let world = command_characterization_world();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let focused_agent = {
+            let mut guard = world.lock().expect("GPUI inspection world lock");
+            let family = guard
+                .brain_registry_mut()
+                .expect("GPUI inspection registry mutation")
+                .register_with_state_digest("gpui.inspection", 0x4750_5549_4252_4149, {
+                    let calls = Arc::clone(&calls);
+                    move |_rng| {
+                        Ok(Box::new(GuiInspectionBrain {
+                            calls: Arc::clone(&calls),
+                        }))
+                    }
+                });
+            let agent_id = guard.spawn_agent(AgentData::default());
+            guard
+                .bind_agent_brain(agent_id, family)
+                .expect("bind GPUI inspection brain");
+            agent_id
+        };
+        let digest_before = world
+            .lock()
+            .expect("pre-GPUI-inspection world lock")
+            .world_digest_v1()
+            .expect("pre-GPUI-inspection digest");
+        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
+        let mut hud = simulation_view(Arc::clone(&world), Arc::clone(&drain));
+        hud.controls.paused = true;
+        hud.inspector
+            .lock()
+            .expect("HUD inspector lock")
+            .focused_agent = Some(focused_agent);
+
+        let first = hud.snapshot();
+        let first_detail = first
+            .inspector
+            .focused
+            .as_ref()
+            .expect("immediate paused HUD inspection");
+        assert_eq!(first_detail.brain_request_revision, Some(1));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let second = hud.snapshot();
+        assert_eq!(
+            second
+                .inspector
+                .focused
+                .as_ref()
+                .expect("cached paused HUD inspection")
+                .brain_request_revision,
+            Some(1)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let mut peer = simulation_view(Arc::clone(&world), Arc::clone(&drain));
+        peer.controls.paused = true;
+        peer.inspector
+            .lock()
+            .expect("peer inspector lock")
+            .focused_agent = Some(focused_agent);
+        assert_ne!(hud.brain_client_id, peer.brain_client_id);
+        assert_eq!(
+            peer.snapshot()
+                .inspector
+                .focused
+                .as_ref()
+                .expect("peer client inspection")
+                .brain_request_revision,
+            Some(1)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let mut canvas = simulation_view(Arc::clone(&world), drain);
+        canvas.set_minimal_canvas_mode();
+        canvas
+            .inspector
+            .lock()
+            .expect("canvas inspector lock")
+            .focused_agent = Some(focused_agent);
+        let _ = canvas.snapshot();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            world
+                .lock()
+                .expect("post-GPUI-inspection world lock")
+                .world_digest_v1()
+                .expect("post-GPUI-inspection digest"),
+            digest_before
+        );
     }
 
     #[test]

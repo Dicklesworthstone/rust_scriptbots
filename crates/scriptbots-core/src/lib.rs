@@ -15,7 +15,10 @@ use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{SeqAccess, Visitor},
+};
 use slotmap::{Key, KeyData, SecondaryMap, SlotMap, new_key_type};
 use std::any::Any;
 use std::borrow::Cow;
@@ -31,7 +34,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 #[cfg(feature = "simd_wide")]
 use wide::f32x4;
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainActivations {
     pub layers: Vec<ActivationLayer>,
     #[serde(default)]
@@ -45,7 +48,7 @@ pub struct BrainActivations {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActivationLayer {
     pub name: String,
     pub width: usize,
@@ -53,7 +56,7 @@ pub struct ActivationLayer {
     pub values: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ActivationEdge {
     pub from: usize,
     pub to: usize,
@@ -470,18 +473,19 @@ pub const OUTPUT_SIZE: usize = 9;
 /// Number of directional eyes each agent possesses.
 pub const NUM_EYES: usize = 4;
 
-/// Maximum number of *selected* agents whose brain activations are captured per
-/// tick, on top of the always-captured activation probe.
+/// Maximum stable agent identities admitted by one explicit brain-inspection request.
 ///
-/// Activation snapshots allocate per-agent layer buffers (a Neuroflow brain
-/// serializes its whole network), so capture must be bounded, not merely
-/// demand-driven: without this cap a single "select all" from a frontend would
-/// reinstate population-wide capture every tick. Inspectors show one agent at a
-/// time; a small budget covers every real use while keeping the cost
-/// population-independent.
+/// Selection and hover state never authorize inspection. A caller that needs more
+/// targets must issue another bounded request rather than silently sampling a subset.
 pub const ACTIVATION_CAPTURE_BUDGET: usize = 8;
 
-/// Maximum number of activation values copied out of a single brain per tick.
+/// Maximum activation layers retained by one inspected brain.
+pub const ACTIVATION_LAYER_BUDGET: usize = 64;
+
+/// Maximum UTF-8 bytes retained across activation-layer names.
+pub const ACTIVATION_NAME_BYTE_BUDGET: usize = 1_024;
+
+/// Maximum number of activation values copied out of a single brain per request.
 ///
 /// Bounding *how many* agents are captured is not enough: one agent's snapshot
 /// must also be bounded in size. Brain topology is configuration (a Neuroflow
@@ -491,30 +495,339 @@ pub const ACTIVATION_CAPTURE_BUDGET: usize = 8;
 /// [`BrainActivations::truncated`] — never silently shortened.
 pub const ACTIVATION_VALUE_BUDGET: usize = 4_096;
 
-/// Clip an activation snapshot to [`ACTIVATION_VALUE_BUDGET`] values.
+/// Maximum activation edges retained by one inspected brain.
+pub const ACTIVATION_EDGE_BUDGET: usize = 1_024;
+
+/// Maximum retained in-memory bytes for one activation payload.
+pub const ACTIVATION_PAYLOAD_BYTE_BUDGET: usize = 64 * 1_024;
+
+/// Maximum family-owned scalar work admitted before an activation payload is built.
 ///
-/// Whole layers are kept or dropped rather than partially copied: half a layer
-/// is a lie about the shape of the network.
-fn clamp_activations(mut activations: BrainActivations) -> BrainActivations {
-    let mut budget = ACTIVATION_VALUE_BUDGET;
-    let mut kept = Vec::with_capacity(activations.layers.len());
-    let mut truncated = false;
-    for layer in activations.layers {
-        if layer.values.len() <= budget {
-            budget -= layer.values.len();
-            kept.push(layer);
-        } else {
-            truncated = true;
+/// NeuroFlow uses this preflight before serializing its private network representation.
+pub const ACTIVATION_SOURCE_SCALAR_BUDGET: usize = 65_536;
+
+/// Producer-side limits carried by every explicit brain-inspection request.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct BrainInspectionLimits {
+    max_layers: usize,
+    max_name_bytes: usize,
+    max_values: usize,
+    max_edges: usize,
+    max_payload_bytes: usize,
+    max_source_scalars: usize,
+}
+
+#[derive(Deserialize)]
+struct BrainInspectionLimitsWire {
+    max_layers: usize,
+    max_name_bytes: usize,
+    max_values: usize,
+    max_edges: usize,
+    max_payload_bytes: usize,
+    max_source_scalars: usize,
+}
+
+impl<'de> Deserialize<'de> for BrainInspectionLimits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BrainInspectionLimitsWire::deserialize(deserializer)?;
+        Ok(Self::tightened(
+            wire.max_layers,
+            wire.max_name_bytes,
+            wire.max_values,
+            wire.max_edges,
+            wire.max_payload_bytes,
+            wire.max_source_scalars,
+        ))
+    }
+}
+
+impl BrainInspectionLimits {
+    /// The project-wide hard ceiling. Callers may tighten but never expand it.
+    #[must_use]
+    pub const fn hard() -> Self {
+        Self {
+            max_layers: ACTIVATION_LAYER_BUDGET,
+            max_name_bytes: ACTIVATION_NAME_BYTE_BUDGET,
+            max_values: ACTIVATION_VALUE_BUDGET,
+            max_edges: ACTIVATION_EDGE_BUDGET,
+            max_payload_bytes: ACTIVATION_PAYLOAD_BYTE_BUDGET,
+            max_source_scalars: ACTIVATION_SOURCE_SCALAR_BUDGET,
         }
     }
-    activations.layers = kept;
-    activations.truncated = truncated;
-    if truncated {
-        // Edges index into layers we may have dropped; a dangling edge would
-        // paint a connection to a node the viewer cannot see.
-        activations.connections.clear();
+
+    /// Construct a request no larger than the hard ceiling on every axis.
+    #[must_use]
+    pub const fn tightened(
+        max_layers: usize,
+        max_name_bytes: usize,
+        max_values: usize,
+        max_edges: usize,
+        max_payload_bytes: usize,
+        max_source_scalars: usize,
+    ) -> Self {
+        Self {
+            max_layers: max_layers.min(ACTIVATION_LAYER_BUDGET),
+            max_name_bytes: max_name_bytes.min(ACTIVATION_NAME_BYTE_BUDGET),
+            max_values: max_values.min(ACTIVATION_VALUE_BUDGET),
+            max_edges: max_edges.min(ACTIVATION_EDGE_BUDGET),
+            max_payload_bytes: max_payload_bytes.min(ACTIVATION_PAYLOAD_BYTE_BUDGET),
+            max_source_scalars: max_source_scalars.min(ACTIVATION_SOURCE_SCALAR_BUDGET),
+        }
     }
-    activations
+
+    #[must_use]
+    pub const fn max_layers(self) -> usize {
+        self.max_layers
+    }
+
+    #[must_use]
+    pub const fn max_name_bytes(self) -> usize {
+        self.max_name_bytes
+    }
+
+    #[must_use]
+    pub const fn max_values(self) -> usize {
+        self.max_values
+    }
+
+    #[must_use]
+    pub const fn max_edges(self) -> usize {
+        self.max_edges
+    }
+
+    #[must_use]
+    pub const fn max_payload_bytes(self) -> usize {
+        self.max_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn max_source_scalars(self) -> usize {
+        self.max_source_scalars
+    }
+}
+
+impl Default for BrainInspectionLimits {
+    fn default() -> Self {
+        Self::hard()
+    }
+}
+
+/// Structural work and retained-memory evidence for one activation inspection.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainInspectionBuildStats {
+    pub source_scalars: usize,
+    pub source_layers: usize,
+    pub source_name_bytes: usize,
+    pub source_values: usize,
+    pub source_edges: usize,
+    pub retained_layers: usize,
+    pub retained_name_bytes: usize,
+    pub retained_values: usize,
+    pub retained_edges: usize,
+    pub retained_payload_bytes: usize,
+    pub truncated: bool,
+}
+
+/// A family-produced activation payload after all request-time bounds are applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrainInspectionSnapshot {
+    pub activations: BrainActivations,
+    pub build: BrainInspectionBuildStats,
+}
+
+/// Typed refusal at the read-only brain-inspection boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]
+pub enum BrainInspectionError {
+    #[error("brain inspection requested {requested} targets, exceeding hard limit {limit}")]
+    TargetLimitExceeded { requested: usize, limit: usize },
+    #[error(
+        "brain family `{family}` requires {required} source scalars for inspection, exceeding request limit {limit}"
+    )]
+    SourceScalarLimitExceeded {
+        family: String,
+        required: usize,
+        limit: usize,
+    },
+    #[error("brain family `{family}` produced invalid inspection data: {detail}")]
+    InvalidPayload { family: String, detail: String },
+}
+
+fn activation_payload_bytes(activations: &BrainActivations) -> usize {
+    activation_payload_bytes_parts(
+        &activations.layers,
+        activations.layers.capacity(),
+        activations.connections.capacity(),
+    )
+}
+
+fn activation_payload_bytes_parts(
+    layers: &[ActivationLayer],
+    layer_capacity: usize,
+    connection_capacity: usize,
+) -> usize {
+    layer_capacity
+        .saturating_mul(std::mem::size_of::<ActivationLayer>())
+        .saturating_add(
+            layers
+                .iter()
+                .map(|layer| {
+                    layer.name.capacity().saturating_add(
+                        layer
+                            .values
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<f32>()),
+                    )
+                })
+                .fold(0usize, usize::saturating_add),
+        )
+        .saturating_add(connection_capacity.saturating_mul(std::mem::size_of::<ActivationEdge>()))
+}
+
+/// Apply the complete structural and retained-byte contract to a family payload.
+///
+/// Families call this while constructing their response; the world calls it again as
+/// defense in depth. Output capacities are rebuilt from bounded lengths so an untrusted
+/// producer cannot retain a tiny vector backed by an enormous allocation.
+pub fn bound_brain_inspection(
+    family: &str,
+    activations: BrainActivations,
+    source_scalars: usize,
+    limits: BrainInspectionLimits,
+) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
+    if source_scalars > limits.max_source_scalars {
+        return Err(BrainInspectionError::SourceScalarLimitExceeded {
+            family: family.to_owned(),
+            required: source_scalars,
+            limit: limits.max_source_scalars,
+        });
+    }
+
+    let source_layers = activations.layers.len();
+    let source_name_bytes = activations
+        .layers
+        .iter()
+        .map(|layer| layer.name.len())
+        .fold(0usize, usize::saturating_add);
+    let source_values = activations
+        .layers
+        .iter()
+        .map(|layer| layer.values.len())
+        .fold(0usize, usize::saturating_add);
+    let source_edges = activations.connections.len();
+    let mut truncated = activations.truncated;
+    let mut retained_name_bytes = 0usize;
+    let mut retained_values = 0usize;
+    let layer_capacity = source_layers.min(limits.max_layers);
+    let mut layers = Vec::with_capacity(layer_capacity);
+
+    for layer in activations.layers {
+        if layers.len() == limits.max_layers {
+            truncated = true;
+            break;
+        }
+        let Some(cell_count) = layer.width.checked_mul(layer.height) else {
+            truncated = true;
+            break;
+        };
+        if cell_count < layer.values.len()
+            || cell_count > ACTIVATION_VALUE_BUDGET
+            || layer.values.iter().any(|value| !value.is_finite())
+            || retained_name_bytes.saturating_add(layer.name.len()) > limits.max_name_bytes
+            || retained_values.saturating_add(layer.values.len()) > limits.max_values
+        {
+            truncated = true;
+            break;
+        }
+
+        let name = layer.name.into_boxed_str().into_string();
+        let values = layer.values.into_boxed_slice().into_vec();
+        let candidate = ActivationLayer {
+            name,
+            width: layer.width,
+            height: layer.height,
+            values,
+        };
+        retained_name_bytes = retained_name_bytes.saturating_add(candidate.name.len());
+        retained_values = retained_values.saturating_add(candidate.values.len());
+        layers.push(candidate);
+
+        if activation_payload_bytes_parts(&layers, layers.len(), 0) > limits.max_payload_bytes {
+            if let Some(removed) = layers.pop() {
+                retained_name_bytes = retained_name_bytes.saturating_sub(removed.name.len());
+                retained_values = retained_values.saturating_sub(removed.values.len());
+            }
+            truncated = true;
+            break;
+        }
+    }
+
+    let mut connections = Vec::new();
+    if !truncated {
+        let max_cells = layers
+            .iter()
+            .filter_map(|layer| layer.width.checked_mul(layer.height))
+            .max()
+            .unwrap_or_default();
+        connections = Vec::with_capacity(source_edges.min(limits.max_edges));
+        for edge in activations.connections {
+            if connections.len() == limits.max_edges
+                || !edge.weight.is_finite()
+                || edge.from >= max_cells
+                || edge.to >= max_cells
+            {
+                truncated = true;
+                break;
+            }
+            connections.push(edge);
+            if activation_payload_bytes_parts(&layers, layers.len(), connections.len())
+                > limits.max_payload_bytes
+            {
+                connections.pop();
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    let mut activations = BrainActivations {
+        layers: layers.into_boxed_slice().into_vec(),
+        connections: connections.into_boxed_slice().into_vec(),
+        truncated,
+    };
+    let retained_payload_bytes = activation_payload_bytes(&activations);
+    if retained_payload_bytes > limits.max_payload_bytes {
+        activations.layers = Vec::new();
+        activations.connections = Vec::new();
+        activations.truncated = true;
+    }
+    let retained_payload_bytes = activation_payload_bytes(&activations);
+    Ok(BrainInspectionSnapshot {
+        build: BrainInspectionBuildStats {
+            source_scalars,
+            source_layers,
+            source_name_bytes,
+            source_values,
+            source_edges,
+            retained_layers: activations.layers.len(),
+            retained_name_bytes: activations
+                .layers
+                .iter()
+                .map(|layer| layer.name.len())
+                .sum(),
+            retained_values: activations
+                .layers
+                .iter()
+                .map(|layer| layer.values.len())
+                .sum(),
+            retained_edges: activations.connections.len(),
+            retained_payload_bytes,
+            truncated: activations.truncated,
+        },
+        activations,
+    })
 }
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
@@ -1241,10 +1554,14 @@ impl BrainBinding {
         self.runner.as_mut().map(|brain| brain.tick(inputs))
     }
 
-    /// Fetch a snapshot of internal brain activations if supported by the runner.
-    #[must_use]
-    pub fn snapshot_activations(&self) -> Option<BrainActivations> {
-        self.runner.as_ref().and_then(|r| r.snapshot_activations())
+    /// Perform one explicit bounded read-only inspection if supported by the runner.
+    pub fn inspect(
+        &self,
+        request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        self.runner
+            .as_ref()
+            .map_or(Ok(None), |runner| runner.inspect(request))
     }
 }
 
@@ -1256,10 +1573,13 @@ pub trait BrainRunner: Send + Sync {
     /// Evaluate outputs for the provided sensors.
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE];
 
-    /// Optional snapshot of internal activation state for visualization.
+    /// Optional bounded read-only state for an explicit visualization request.
     /// Defaults to `None` when the runner does not support introspection.
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        None
+    fn inspect(
+        &self,
+        _request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        Ok(None)
     }
 
     /// Stable digest of everything this brain CARRIES — its genome and its evaluator state.
@@ -1537,8 +1857,6 @@ pub struct AgentRuntime {
     pub lineage: [Option<AgentUid>; 2],
     pub mutation_log: Vec<String>,
     pub food_balance_total: f32,
-    #[serde(skip)]
-    pub brain_activations: Option<BrainActivations>,
 }
 
 impl Default for AgentRuntime {
@@ -1568,10 +1886,185 @@ impl Default for AgentRuntime {
             lineage: [None, None],
             mutation_log: Vec::new(),
             food_balance_total: 0.0,
-            brain_activations: None,
         }
     }
 }
+
+/// Stable presentation-client identity for isolated brain-detail requests.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(transparent)]
+pub struct BrainInspectionClientId(u64);
+
+impl BrainInspectionClientId {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Client-owned revision of one brain-detail request.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(transparent)]
+pub struct BrainInspectionRevision(u64);
+
+impl BrainInspectionRevision {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// One synchronous, bounded, client-isolated brain-detail request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainInspectionRequest {
+    pub client_id: BrainInspectionClientId,
+    pub revision: BrainInspectionRevision,
+    #[serde(deserialize_with = "deserialize_brain_inspection_targets")]
+    pub targets: Vec<AgentUid>,
+    pub limits: BrainInspectionLimits,
+}
+
+/// Deserialize a target sequence without ever allocating beyond the hard request budget.
+pub fn deserialize_brain_inspection_targets<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AgentUid>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TargetVisitor;
+
+    impl<'de> Visitor<'de> for TargetVisitor {
+        type Value = Vec<AgentUid>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {ACTIVATION_CAPTURE_BUDGET} stable agent identities"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut targets = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(ACTIVATION_CAPTURE_BUDGET),
+            );
+            while let Some(target) = sequence.next_element()? {
+                if targets.len() == ACTIVATION_CAPTURE_BUDGET {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "brain inspection target count exceeds hard limit {ACTIVATION_CAPTURE_BUDGET}"
+                    )));
+                }
+                targets.push(target);
+            }
+            Ok(targets)
+        }
+    }
+
+    deserializer.deserialize_seq(TargetVisitor)
+}
+
+impl BrainInspectionRequest {
+    #[must_use]
+    pub fn single(
+        client_id: BrainInspectionClientId,
+        revision: BrainInspectionRevision,
+        target: AgentUid,
+    ) -> Self {
+        Self {
+            client_id,
+            revision,
+            targets: vec![target],
+            limits: BrainInspectionLimits::hard(),
+        }
+    }
+}
+
+/// Why an explicitly requested stable identity has no activation payload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainInspectionUnavailable {
+    MissingAgent,
+    UnboundBrain,
+    Unsupported,
+}
+
+/// Current selected-agent detail captured without mutating the evaluator or world.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelectedBrainTelemetry {
+    pub agent_id: AgentId,
+    pub agent_uid: AgentUid,
+    pub sensors: [f32; INPUT_SIZE],
+    pub outputs: [f32; OUTPUT_SIZE],
+    pub lineage: [Option<AgentUid>; 2],
+    pub inspection: BrainInspectionSnapshot,
+}
+
+/// Result for one unique stable identity in request order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SelectedBrainTelemetryOutcome {
+    Ready {
+        telemetry: SelectedBrainTelemetry,
+    },
+    Unavailable {
+        agent_uid: AgentUid,
+        reason: BrainInspectionUnavailable,
+    },
+}
+
+/// Structural cost evidence for one complete batch request.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainInspectionBatchStats {
+    pub requested_targets: usize,
+    pub unique_targets: usize,
+    pub duplicate_targets: usize,
+    pub agents_examined: usize,
+    pub runner_inspections: usize,
+    pub source_scalars: usize,
+    pub retained_payload_bytes: usize,
+}
+
+/// Immutable response tagged to the exact client request and completed world tick.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrainInspectionResponse {
+    pub client_id: BrainInspectionClientId,
+    pub request_revision: BrainInspectionRevision,
+    pub source_tick: Tick,
+    pub telemetry: Vec<SelectedBrainTelemetryOutcome>,
+    pub build: BrainInspectionBatchStats,
+}
+
+impl BrainInspectionResponse {
+    #[must_use]
+    pub fn ready_for(&self, target: AgentUid) -> Option<&SelectedBrainTelemetry> {
+        self.telemetry.iter().find_map(|outcome| match outcome {
+            SelectedBrainTelemetryOutcome::Ready { telemetry } if telemetry.agent_uid == target => {
+                Some(telemetry)
+            }
+            _ => None,
+        })
+    }
+}
+
 impl AgentRuntime {
     /// Validate every floating-point runtime field before committing an external update.
     pub fn validate(&self) -> Result<(), ScientificStateError> {
@@ -5721,7 +6214,7 @@ pub enum OffspringStatePolicy {
 /// Bounded request for optional brain inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrainInspection {
-    Activations,
+    Activations(BrainInspectionLimits),
 }
 
 /// Object-safe scalar evaluator reconstructed from exact genome and state envelopes.
@@ -5739,7 +6232,7 @@ pub trait BrainEvaluator: Send {
     fn inspect(
         &self,
         request: BrainInspection,
-    ) -> Result<Option<BrainActivations>, BrainProtocolError>;
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError>;
 
     /// Capture every future-affecting dynamic value in a bounded state envelope.
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError>;
@@ -10828,7 +11321,6 @@ pub struct WorldState {
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
-    activation_probe: Option<AgentId>,
 }
 
 impl fmt::Debug for WorldState {
@@ -10968,7 +11460,6 @@ impl WorldState {
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
-            activation_probe: None,
         })
     }
 
@@ -12152,41 +12643,20 @@ impl WorldState {
             agent_id: AgentId,
             runner: Option<Box<dyn BrainRunner>>,
             sensors: [f32; INPUT_SIZE],
-            capture: bool,
             outputs: [f32; OUTPUT_SIZE],
-            activations: Option<BrainActivations>,
         }
 
-        let probe = self.activation_probe;
-        // Activation capture is demand-driven AND bounded. Selection alone must
-        // never authorize population-wide capture: a single "select all" would
-        // otherwise reinstate the per-agent, per-tick layer allocations this
-        // gate exists to remove. The probed agent is always captured; selected
-        // agents are captured in stable handle order until the budget is spent.
-        let mut capture_budget = ACTIVATION_CAPTURE_BUDGET;
         // Pull each runner out of its binding so evaluation can run
         // data-parallel (independent networks, no RNG); results are written
         // back serially in handle order, keeping the stage deterministic.
         let mut jobs: Vec<BrainJob> = Vec::with_capacity(self.agents.len());
         for agent_id in self.agents.iter_handles() {
             if let Some(runtime) = self.runtime.get_mut(agent_id) {
-                let probed = probe == Some(agent_id);
-                let selected = runtime.selection != SelectionState::None;
-                let capture = if probed {
-                    true
-                } else if selected && capture_budget > 0 {
-                    capture_budget -= 1;
-                    true
-                } else {
-                    false
-                };
                 jobs.push(BrainJob {
                     agent_id,
                     runner: runtime.brain.runner.take(),
                     sensors: runtime.sensors,
-                    capture,
                     outputs: [0.0; OUTPUT_SIZE],
-                    activations: None,
                 });
             }
         }
@@ -12194,12 +12664,6 @@ impl WorldState {
         let evaluate = |job: &mut BrainJob| {
             if let Some(runner) = job.runner.as_mut() {
                 job.outputs = runner.tick(&job.sensors);
-                // Activation snapshots feed inspector UIs only; capturing
-                // them for every agent allocates layer buffers across the
-                // whole population every tick.
-                if job.capture {
-                    job.activations = runner.snapshot_activations().map(clamp_activations);
-                }
             } else {
                 job.outputs = Self::default_outputs(&job.sensors);
             }
@@ -12213,7 +12677,6 @@ impl WorldState {
             if let Some(runtime) = self.runtime.get_mut(job.agent_id) {
                 runtime.brain.runner = job.runner;
                 runtime.outputs = job.outputs;
-                runtime.brain_activations = job.activations;
             }
         }
     }
@@ -16948,11 +17411,148 @@ impl WorldState {
         self.config_revision
     }
 
-    /// Ask the next ticks to capture brain activations for `agent` (in
-    /// addition to any hovered/selected agents). Frontends set this for the
-    /// agent their inspector is focused on; `None` disables the extra probe.
-    pub fn set_activation_probe(&mut self, agent: Option<AgentId>) {
-        self.activation_probe = agent;
+    /// Pull current selected-brain detail without mutating simulation or evaluator state.
+    ///
+    /// The response is synchronous, so paused worlds have no pending state and a caller never
+    /// receives an untagged value from an earlier focus. Stable UIDs prevent a removed agent's
+    /// request from aliasing a later occupant of the same generational slot.
+    pub fn inspect_brains(
+        &self,
+        request: &BrainInspectionRequest,
+    ) -> Result<BrainInspectionResponse, BrainInspectionError> {
+        if request.targets.len() > ACTIVATION_CAPTURE_BUDGET {
+            return Err(BrainInspectionError::TargetLimitExceeded {
+                requested: request.targets.len(),
+                limit: ACTIVATION_CAPTURE_BUDGET,
+            });
+        }
+
+        let mut unique_targets = Vec::with_capacity(request.targets.len());
+        for target in &request.targets {
+            if !unique_targets.contains(target) {
+                unique_targets.push(*target);
+            }
+        }
+        let mut resolved = vec![None; unique_targets.len()];
+        let mut agents_examined = 0usize;
+        let mut unresolved = resolved.len();
+        if unresolved != 0 {
+            for agent_id in self.agents.iter_handles() {
+                agents_examined = agents_examined.saturating_add(1);
+                let Some(agent_uid) = self.agent_uid(agent_id) else {
+                    continue;
+                };
+                if let Some(index) = unique_targets
+                    .iter()
+                    .position(|target| *target == agent_uid)
+                    && resolved[index].is_none()
+                {
+                    resolved[index] = Some(agent_id);
+                    unresolved -= 1;
+                    if unresolved == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut telemetry = Vec::with_capacity(unique_targets.len());
+        let mut runner_inspections = 0usize;
+        let mut source_scalars = 0usize;
+        let mut retained_payload_bytes = 0usize;
+        for (agent_uid, agent_id) in unique_targets.iter().copied().zip(resolved) {
+            let Some(agent_id) = agent_id else {
+                telemetry.push(SelectedBrainTelemetryOutcome::Unavailable {
+                    agent_uid,
+                    reason: BrainInspectionUnavailable::MissingAgent,
+                });
+                continue;
+            };
+            let Some(runtime) = self.runtime.get(agent_id) else {
+                telemetry.push(SelectedBrainTelemetryOutcome::Unavailable {
+                    agent_uid,
+                    reason: BrainInspectionUnavailable::MissingAgent,
+                });
+                continue;
+            };
+            if !runtime.brain.is_bound() {
+                telemetry.push(SelectedBrainTelemetryOutcome::Unavailable {
+                    agent_uid,
+                    reason: BrainInspectionUnavailable::UnboundBrain,
+                });
+                continue;
+            }
+
+            runner_inspections = runner_inspections.saturating_add(1);
+            let family = runtime.brain.kind().unwrap_or("unknown");
+            let Some(produced) = runtime
+                .brain
+                .inspect(BrainInspection::Activations(request.limits))?
+            else {
+                telemetry.push(SelectedBrainTelemetryOutcome::Unavailable {
+                    agent_uid,
+                    reason: BrainInspectionUnavailable::Unsupported,
+                });
+                continue;
+            };
+            let producer_build = produced.build;
+            let mut snapshot = bound_brain_inspection(
+                family,
+                produced.activations,
+                producer_build.source_scalars,
+                request.limits,
+            )?;
+            snapshot.build.source_layers = snapshot
+                .build
+                .source_layers
+                .max(producer_build.source_layers);
+            snapshot.build.source_name_bytes = snapshot
+                .build
+                .source_name_bytes
+                .max(producer_build.source_name_bytes);
+            snapshot.build.source_values = snapshot
+                .build
+                .source_values
+                .max(producer_build.source_values);
+            snapshot.build.source_edges =
+                snapshot.build.source_edges.max(producer_build.source_edges);
+            let evidence_is_truncated = snapshot.build.source_layers
+                > snapshot.build.retained_layers
+                || snapshot.build.source_name_bytes > snapshot.build.retained_name_bytes
+                || snapshot.build.source_values > snapshot.build.retained_values
+                || snapshot.build.source_edges > snapshot.build.retained_edges;
+            snapshot.build.truncated |= producer_build.truncated || evidence_is_truncated;
+            snapshot.activations.truncated |= snapshot.build.truncated;
+            source_scalars = source_scalars.saturating_add(snapshot.build.source_scalars);
+            retained_payload_bytes =
+                retained_payload_bytes.saturating_add(snapshot.build.retained_payload_bytes);
+            telemetry.push(SelectedBrainTelemetryOutcome::Ready {
+                telemetry: SelectedBrainTelemetry {
+                    agent_id,
+                    agent_uid,
+                    sensors: runtime.sensors,
+                    outputs: runtime.outputs,
+                    lineage: runtime.lineage,
+                    inspection: snapshot,
+                },
+            });
+        }
+
+        Ok(BrainInspectionResponse {
+            client_id: request.client_id,
+            request_revision: request.revision,
+            source_tick: self.tick,
+            telemetry,
+            build: BrainInspectionBatchStats {
+                requested_targets: request.targets.len(),
+                unique_targets: unique_targets.len(),
+                duplicate_targets: request.targets.len().saturating_sub(unique_targets.len()),
+                agents_examined,
+                runner_inspections,
+                source_scalars,
+                retained_payload_bytes,
+            },
+        })
     }
 
     fn finalize_persistence_projection(
@@ -18157,7 +18757,10 @@ impl PersistenceAdmissionSession {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering as AtomicUsizeOrdering},
+    };
 
     #[test]
     fn sensory_bearing_is_bit_exact_for_cross_libc_regression_geometry() {
@@ -21353,97 +21956,306 @@ mod tests {
     }
 
     #[test]
-    fn a_single_activation_snapshot_is_size_bounded_and_says_when_it_was_clipped() {
-        // Bounding how MANY agents are captured is not enough: brain topology is
-        // configuration (a Neuroflow net can declare arbitrarily wide hidden
-        // layers), so one inspected agent could otherwise copy megabytes out of
-        // the simulation every single tick.
-        let huge = BrainActivations {
+    fn activation_payload_is_bounded_on_every_structural_axis() {
+        let limits = BrainInspectionLimits::tightened(2, 8, 4, 2, 512, 32);
+        let deserialized: BrainInspectionLimits = serde_json::from_value(serde_json::json!({
+            "max_layers": ACTIVATION_LAYER_BUDGET + 1,
+            "max_name_bytes": ACTIVATION_NAME_BYTE_BUDGET + 1,
+            "max_values": ACTIVATION_VALUE_BUDGET + 1,
+            "max_edges": ACTIVATION_EDGE_BUDGET + 1,
+            "max_payload_bytes": ACTIVATION_PAYLOAD_BYTE_BUDGET + 1,
+            "max_source_scalars": ACTIVATION_SOURCE_SCALAR_BUDGET + 1,
+        }))
+        .expect("deserialize inspection limits");
+        assert_eq!(
+            deserialized,
+            BrainInspectionLimits::hard(),
+            "wire input cannot expand the hard inspection ceiling"
+        );
+        let adversarial = BrainActivations {
             layers: vec![
                 ActivationLayer {
-                    name: "small".to_owned(),
-                    width: 4,
-                    height: 4,
-                    values: vec![0.1; 16],
+                    name: "ok".to_owned(),
+                    width: 2,
+                    height: 2,
+                    values: vec![0.1; 4],
                 },
                 ActivationLayer {
-                    name: "enormous".to_owned(),
-                    width: 1_000,
-                    height: 1_000,
-                    values: vec![0.2; 1_000_000],
+                    name: "name-that-does-not-fit".to_owned(),
+                    width: usize::MAX,
+                    height: 2,
+                    values: vec![f32::NAN],
+                },
+                ActivationLayer {
+                    name: "later".to_owned(),
+                    width: 0,
+                    height: 0,
+                    values: Vec::new(),
                 },
             ],
-            connections: vec![ActivationEdge {
-                from: 0,
-                to: 1,
-                weight: 1.0,
-            }],
-            truncated: false,
+            connections: vec![
+                ActivationEdge {
+                    from: 0,
+                    to: 1,
+                    weight: 1.0,
+                },
+                ActivationEdge {
+                    from: usize::MAX,
+                    to: 0,
+                    weight: f32::INFINITY,
+                },
+            ],
+            truncated: true,
         };
 
-        let clipped = clamp_activations(huge);
-        let total: usize = clipped.layers.iter().map(|l| l.values.len()).sum();
+        let bounded = bound_brain_inspection("adversarial", adversarial, 16, limits)
+            .expect("bounded adversarial inspection");
         assert!(
-            total <= ACTIVATION_VALUE_BUDGET,
-            "snapshot kept {total} values, budget is {ACTIVATION_VALUE_BUDGET}"
+            bounded.activations.truncated,
+            "upstream truncation is sticky"
         );
+        assert_eq!(bounded.activations.layers.len(), 1);
+        assert_eq!(bounded.activations.layers[0].name, "ok");
+        assert!(bounded.activations.connections.is_empty());
+        assert!(bounded.build.retained_layers <= limits.max_layers());
+        assert!(bounded.build.retained_name_bytes <= limits.max_name_bytes());
+        assert!(bounded.build.retained_values <= limits.max_values());
+        assert!(bounded.build.retained_edges <= limits.max_edges());
+        assert!(bounded.build.retained_payload_bytes <= limits.max_payload_bytes());
         assert!(
-            clipped.truncated,
-            "a clipped snapshot must SAY it was clipped; silently dropping layers \
-             would let a user conclude the brain has no deep structure"
+            postcard::to_allocvec(&bounded.activations)
+                .expect("encode bounded activations")
+                .len()
+                <= limits.max_payload_bytes()
         );
-        // Whole layers survive or are dropped — half a layer is a lie about the
-        // shape of the network — and dangling edges are removed.
-        assert_eq!(clipped.layers.len(), 1);
-        assert_eq!(clipped.layers[0].name, "small");
-        assert!(clipped.connections.is_empty());
 
-        // A snapshot that fits is passed through untouched and unflagged.
-        let small = BrainActivations {
-            layers: vec![ActivationLayer {
-                name: "fits".to_owned(),
-                width: 2,
-                height: 2,
-                values: vec![0.5; 4],
-            }],
-            connections: Vec::new(),
-            truncated: false,
+        let unit_layer = || ActivationLayer {
+            name: "x".to_owned(),
+            width: 1,
+            height: 1,
+            values: vec![0.25],
         };
-        let kept = clamp_activations(small);
-        assert!(!kept.truncated);
-        assert_eq!(kept.layers.len(), 1);
+        let layer_limited = bound_brain_inspection(
+            "layer-limit",
+            BrainActivations {
+                layers: vec![unit_layer(), unit_layer(), unit_layer()],
+                connections: Vec::new(),
+                truncated: false,
+            },
+            3,
+            BrainInspectionLimits::tightened(2, 16, 16, 0, ACTIVATION_PAYLOAD_BYTE_BUDGET, 16),
+        )
+        .expect("layer-limited payload");
+        assert_eq!(layer_limited.build.retained_layers, 2);
+        assert!(layer_limited.build.truncated);
+
+        let name_limited = bound_brain_inspection(
+            "name-limit",
+            BrainActivations {
+                layers: vec![
+                    ActivationLayer {
+                        name: "four".to_owned(),
+                        ..unit_layer()
+                    },
+                    ActivationLayer {
+                        name: "five!".to_owned(),
+                        ..unit_layer()
+                    },
+                ],
+                connections: Vec::new(),
+                truncated: false,
+            },
+            2,
+            BrainInspectionLimits::tightened(4, 8, 16, 0, ACTIVATION_PAYLOAD_BYTE_BUDGET, 16),
+        )
+        .expect("name-limited payload");
+        assert_eq!(name_limited.build.retained_name_bytes, 4);
+        assert!(name_limited.build.truncated);
+
+        let value_limited = bound_brain_inspection(
+            "value-limit",
+            BrainActivations {
+                layers: vec![
+                    ActivationLayer {
+                        width: 3,
+                        height: 1,
+                        values: vec![0.1; 3],
+                        ..unit_layer()
+                    },
+                    ActivationLayer {
+                        width: 2,
+                        height: 1,
+                        values: vec![0.2; 2],
+                        ..unit_layer()
+                    },
+                ],
+                connections: Vec::new(),
+                truncated: false,
+            },
+            5,
+            BrainInspectionLimits::tightened(4, 16, 4, 0, ACTIVATION_PAYLOAD_BYTE_BUDGET, 16),
+        )
+        .expect("value-limited payload");
+        assert_eq!(value_limited.build.retained_values, 3);
+        assert!(value_limited.build.truncated);
+
+        let edge_limited = bound_brain_inspection(
+            "edge-limit",
+            BrainActivations {
+                layers: vec![ActivationLayer {
+                    name: "grid".to_owned(),
+                    width: 2,
+                    height: 2,
+                    values: vec![0.1; 4],
+                }],
+                connections: (0..3)
+                    .map(|index| ActivationEdge {
+                        from: index,
+                        to: index + 1,
+                        weight: 0.5,
+                    })
+                    .collect(),
+                truncated: false,
+            },
+            4,
+            BrainInspectionLimits::tightened(4, 16, 16, 2, ACTIVATION_PAYLOAD_BYTE_BUDGET, 16),
+        )
+        .expect("edge-limited payload");
+        assert_eq!(edge_limited.build.retained_edges, 2);
+        assert!(edge_limited.build.truncated);
+
+        let one_layer_bytes =
+            std::mem::size_of::<ActivationLayer>() + "x".len() + std::mem::size_of::<f32>();
+        let byte_limited = bound_brain_inspection(
+            "byte-limit",
+            BrainActivations {
+                layers: vec![unit_layer(), unit_layer()],
+                connections: Vec::new(),
+                truncated: false,
+            },
+            2,
+            BrainInspectionLimits::tightened(4, 16, 16, 0, one_layer_bytes, 16),
+        )
+        .expect("byte-limited payload");
+        assert_eq!(byte_limited.build.retained_layers, 1);
+        assert_eq!(byte_limited.build.retained_payload_bytes, one_layer_bytes);
+        assert!(byte_limited.build.truncated);
+
+        let mut oversized_name = String::with_capacity(10_000);
+        oversized_name.push('x');
+        let mut oversized_values = Vec::with_capacity(10_000);
+        oversized_values.push(0.5);
+        let mut oversized_layers = Vec::with_capacity(10_000);
+        oversized_layers.push(ActivationLayer {
+            name: oversized_name,
+            width: 1,
+            height: 1,
+            values: oversized_values,
+        });
+        let oversized_capacity = bound_brain_inspection(
+            "capacity",
+            BrainActivations {
+                layers: oversized_layers,
+                connections: Vec::with_capacity(10_000),
+                truncated: false,
+            },
+            1,
+            BrainInspectionLimits::hard(),
+        )
+        .expect("oversized backing capacities are rebuilt");
+        assert_eq!(oversized_capacity.activations.layers.capacity(), 1);
+        assert_eq!(oversized_capacity.activations.layers[0].name.capacity(), 1);
+        assert_eq!(
+            oversized_capacity.activations.layers[0].values.capacity(),
+            1
+        );
+        assert_eq!(oversized_capacity.activations.connections.capacity(), 0);
+
+        let error = bound_brain_inspection(
+            "expensive",
+            BrainActivations {
+                layers: Vec::new(),
+                connections: Vec::new(),
+                truncated: false,
+            },
+            33,
+            limits,
+        )
+        .expect_err("source work above request limit must fail before construction");
+        assert!(matches!(
+            error,
+            BrainInspectionError::SourceScalarLimitExceeded {
+                required: 33,
+                limit: 32,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn activation_capture_is_bounded_even_when_every_agent_is_selected() {
-        // Regression guard: a frontend "select all" must not reinstate
-        // population-wide activation capture. Capture is demand-driven AND
-        // bounded; the probed agent is always captured, selected agents only
-        // up to the budget.
+    fn brain_inspection_is_explicit_deduplicated_revisioned_and_digest_neutral() {
         #[derive(Debug)]
-        struct ChattyBrain;
-        impl BrainRunner for ChattyBrain {
+        struct CountingBrain {
+            inspections: Arc<AtomicUsize>,
+        }
+        impl BrainRunner for CountingBrain {
             fn kind(&self) -> &'static str {
-                "chatty"
+                "counting"
             }
             fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
                 [0.0; OUTPUT_SIZE]
             }
-            fn snapshot_activations(&self) -> Option<BrainActivations> {
-                Some(BrainActivations {
-                    layers: vec![ActivationLayer {
-                        name: "layer".to_owned(),
-                        width: 1,
-                        height: 1,
-                        values: vec![0.5],
-                    }],
-                    connections: Vec::new(),
-                    truncated: false,
-                })
+            fn inspect(
+                &self,
+                request: BrainInspection,
+            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+                self.inspections.fetch_add(1, AtomicUsizeOrdering::Relaxed);
+                let BrainInspection::Activations(limits) = request;
+                let mut snapshot = bound_brain_inspection(
+                    self.kind(),
+                    BrainActivations {
+                        layers: vec![ActivationLayer {
+                            name: "layer".to_owned(),
+                            width: 1,
+                            height: 1,
+                            values: vec![0.5],
+                        }],
+                        connections: Vec::new(),
+                        truncated: false,
+                    },
+                    1,
+                    limits,
+                )?;
+                snapshot.build.source_layers = 3;
+                snapshot.build.source_name_bytes = 12;
+                snapshot.build.source_values = 4;
+                snapshot.build.source_edges = 2;
+                snapshot.build.truncated = false;
+                Ok(Some(snapshot))
+            }
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x434f_554e_5449_4e47)
             }
         }
 
-        let population = ACTIVATION_CAPTURE_BUDGET * 4;
+        #[derive(Debug)]
+        struct UnsupportedBrain;
+
+        impl BrainRunner for UnsupportedBrain {
+            fn kind(&self) -> &'static str {
+                "unsupported"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x554e_5355_5050_4f52)
+            }
+        }
+
+        let inspections = Arc::new(AtomicUsize::new(0));
         let mut world = WorldState::new(ScriptBotsConfig {
             rng_seed: Some(21),
             ..ScriptBotsConfig::default()
@@ -21452,49 +22264,331 @@ mod tests {
         let key = world
             .brain_registry_mut()
             .expect("activation registry mutation")
-            .register("chatty", |_rng| Ok(Box::new(ChattyBrain)));
+            .register_with_state_digest("counting", 0x434f_554e_5449_4e47, {
+                let inspections = Arc::clone(&inspections);
+                move |_rng| {
+                    Ok(Box::new(CountingBrain {
+                        inspections: Arc::clone(&inspections),
+                    }))
+                }
+            });
 
         let mut ids = Vec::new();
-        for seed in 0..population {
+        for seed in 0..3 {
             let id = world.spawn_agent(sample_agent(seed as u32));
             world
                 .bind_agent_brain(id, key)
-                .expect("chatty brain factory");
+                .expect("counting brain factory");
             ids.push(id);
         }
-
-        // Simulate a "select all" from a frontend.
         for id in &ids {
             if let Some(runtime) = world.agent_runtime_mut(*id) {
                 runtime.selection = SelectionState::Selected;
             }
         }
-        // The inspector is focused on an agent well past the budget cutoff.
-        let probed = ids[population - 1];
-        world.set_activation_probe(Some(probed));
-
         world.stage_brains();
+        assert_eq!(inspections.load(AtomicUsizeOrdering::Relaxed), 0);
 
-        let captured = ids
-            .iter()
-            .filter(|id| {
-                world
-                    .agent_runtime(**id)
-                    .is_some_and(|rt| rt.brain_activations.is_some())
+        let before = world.world_digest_v1().expect("pre-inspection digest");
+        let first_uid = world.agent_uid(ids[0]).expect("first stable uid");
+        let second_uid = world.agent_uid(ids[1]).expect("second stable uid");
+        let response = world
+            .inspect_brains(&BrainInspectionRequest {
+                client_id: BrainInspectionClientId::new(7),
+                revision: BrainInspectionRevision::new(11),
+                targets: vec![first_uid, second_uid, first_uid],
+                limits: BrainInspectionLimits::hard(),
             })
-            .count();
-        assert!(
-            captured <= ACTIVATION_CAPTURE_BUDGET + 1,
-            "select-all captured {captured} activations; budget is {ACTIVATION_CAPTURE_BUDGET} (+1 probe)"
+            .expect("two-target inspection");
+        assert_eq!(response.client_id, BrainInspectionClientId::new(7));
+        assert_eq!(response.request_revision, BrainInspectionRevision::new(11));
+        assert_eq!(response.source_tick, world.tick());
+        assert_eq!(response.build.unique_targets, 2);
+        assert_eq!(response.build.duplicate_targets, 1);
+        assert_eq!(response.build.runner_inspections, 2);
+        assert_eq!(inspections.load(AtomicUsizeOrdering::Relaxed), 2);
+        let first = response
+            .ready_for(first_uid)
+            .expect("first ready telemetry");
+        assert_eq!(first.inspection.build.source_layers, 3);
+        assert_eq!(first.inspection.build.source_name_bytes, 12);
+        assert_eq!(first.inspection.build.source_values, 4);
+        assert_eq!(first.inspection.build.source_edges, 2);
+        assert!(first.inspection.build.truncated);
+        assert!(first.inspection.activations.truncated);
+        assert!(response.ready_for(second_uid).is_some());
+        assert_eq!(
+            world.world_digest_v1().expect("post-inspection digest"),
+            before
         );
-        assert!(
-            world
-                .agent_runtime(probed)
-                .expect("probed runtime")
-                .brain_activations
-                .is_some(),
-            "the probed agent must always be captured, even beyond the budget"
+
+        let removed_uid = world.agent_uid(ids[2]).expect("removed stable uid");
+        assert!(world.remove_agent(ids[2]).is_some());
+        let replacement = world.spawn_agent(sample_agent(99));
+        world
+            .bind_agent_brain(replacement, key)
+            .expect("replacement counting brain");
+        assert_ne!(world.agent_uid(replacement), Some(removed_uid));
+        let missing = world
+            .inspect_brains(&BrainInspectionRequest::single(
+                BrainInspectionClientId::new(8),
+                BrainInspectionRevision::new(1),
+                removed_uid,
+            ))
+            .expect("removed uid is a typed unavailable result");
+        assert!(matches!(
+            missing.telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                agent_uid,
+                reason: BrainInspectionUnavailable::MissingAgent
+            }] if *agent_uid == removed_uid
+        ));
+        assert_eq!(inspections.load(AtomicUsizeOrdering::Relaxed), 2);
+
+        let unbound_id = world.spawn_agent(sample_agent(100));
+        let unbound_uid = world.agent_uid(unbound_id).expect("unbound stable uid");
+        let unbound = world
+            .inspect_brains(&BrainInspectionRequest::single(
+                BrainInspectionClientId::new(8),
+                BrainInspectionRevision::new(2),
+                unbound_uid,
+            ))
+            .expect("unbound brain outcome");
+        assert!(matches!(
+            unbound.telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                reason: BrainInspectionUnavailable::UnboundBrain,
+                ..
+            }]
+        ));
+
+        let unsupported_key = world
+            .brain_registry_mut()
+            .expect("unsupported registry mutation")
+            .register_with_state_digest("unsupported", 0x554e_5355_5050_4f52, |_rng| {
+                Ok(Box::new(UnsupportedBrain))
+            });
+        let unsupported_id = world.spawn_agent(sample_agent(101));
+        world
+            .bind_agent_brain(unsupported_id, unsupported_key)
+            .expect("bind unsupported brain");
+        let unsupported_uid = world
+            .agent_uid(unsupported_id)
+            .expect("unsupported stable uid");
+        let unsupported = world
+            .inspect_brains(&BrainInspectionRequest::single(
+                BrainInspectionClientId::new(8),
+                BrainInspectionRevision::new(3),
+                unsupported_uid,
+            ))
+            .expect("unsupported brain outcome");
+        assert!(matches!(
+            unsupported.telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                reason: BrainInspectionUnavailable::Unsupported,
+                ..
+            }]
+        ));
+
+        let too_many = BrainInspectionRequest {
+            client_id: BrainInspectionClientId::new(9),
+            revision: BrainInspectionRevision::new(1),
+            targets: vec![first_uid; ACTIVATION_CAPTURE_BUDGET + 1],
+            limits: BrainInspectionLimits::hard(),
+        };
+        assert!(matches!(
+            world.inspect_brains(&too_many),
+            Err(BrainInspectionError::TargetLimitExceeded { .. })
+        ));
+
+        let exact_limit = BrainInspectionRequest {
+            client_id: BrainInspectionClientId::new(10),
+            revision: BrainInspectionRevision::new(1),
+            targets: vec![first_uid; ACTIVATION_CAPTURE_BUDGET],
+            limits: BrainInspectionLimits::hard(),
+        };
+        let exact_json = serde_json::to_vec(&exact_limit).expect("encode exact-limit JSON");
+        let exact_postcard =
+            postcard::to_allocvec(&exact_limit).expect("encode exact-limit postcard");
+        assert_eq!(
+            serde_json::from_slice::<BrainInspectionRequest>(&exact_json)
+                .expect("decode exact-limit JSON")
+                .targets
+                .len(),
+            ACTIVATION_CAPTURE_BUDGET
         );
+        assert_eq!(
+            postcard::from_bytes::<BrainInspectionRequest>(&exact_postcard)
+                .expect("decode exact-limit postcard")
+                .targets
+                .len(),
+            ACTIVATION_CAPTURE_BUDGET
+        );
+        let oversized_json = serde_json::to_vec(&too_many).expect("encode oversized JSON");
+        let oversized_postcard =
+            postcard::to_allocvec(&too_many).expect("encode oversized postcard");
+        assert!(serde_json::from_slice::<BrainInspectionRequest>(&oversized_json).is_err());
+        assert!(postcard::from_bytes::<BrainInspectionRequest>(&oversized_postcard).is_err());
+    }
+
+    #[test]
+    #[ignore = "DSR-only request-cost and payload measurement"]
+    fn brain_inspection_request_cost_and_payload_measurement() {
+        #[derive(Debug)]
+        struct MeasurementBrain;
+
+        impl BrainRunner for MeasurementBrain {
+            fn kind(&self) -> &'static str {
+                "inspection.measurement"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+
+            fn inspect(
+                &self,
+                request: BrainInspection,
+            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+                let BrainInspection::Activations(limits) = request;
+                let values = vec![0.25; ACTIVATION_VALUE_BUDGET];
+                let connections = (0..ACTIVATION_EDGE_BUDGET)
+                    .map(|index| ActivationEdge {
+                        from: index % ACTIVATION_VALUE_BUDGET,
+                        to: (index + 1) % ACTIVATION_VALUE_BUDGET,
+                        weight: 0.5,
+                    })
+                    .collect();
+                bound_brain_inspection(
+                    self.kind(),
+                    BrainActivations {
+                        layers: vec![ActivationLayer {
+                            name: "measurement".to_owned(),
+                            width: 64,
+                            height: 64,
+                            values,
+                        }],
+                        connections,
+                        truncated: false,
+                    },
+                    ACTIVATION_VALUE_BUDGET,
+                    limits,
+                )
+                .map(Some)
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x494e_5350_4543_5401)
+            }
+        }
+
+        const WARMUPS: usize = 5;
+        const SAMPLES: usize = 50;
+        for population in [1_000usize, 10_000] {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(0x0049_4e53_5045_4354),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("measurement world");
+            let family = world
+                .brain_registry_mut()
+                .expect("measurement registry mutation")
+                .register_with_state_digest(
+                    "inspection.measurement",
+                    0x494e_5350_4543_5401,
+                    |_rng| Ok(Box::new(MeasurementBrain)),
+                );
+            let mut tail = VecDeque::with_capacity(ACTIVATION_CAPTURE_BUDGET);
+            for seed in 0..population {
+                let agent_id = world.spawn_agent(sample_agent(seed as u32));
+                if tail.len() == ACTIVATION_CAPTURE_BUDGET {
+                    tail.pop_front();
+                }
+                tail.push_back(agent_id);
+            }
+            let tail: Vec<_> = tail.into_iter().collect();
+            for agent_id in &tail {
+                world
+                    .bind_agent_brain(*agent_id, family)
+                    .expect("bind measurement brain");
+            }
+            let target_uids: Vec<_> = tail
+                .iter()
+                .map(|agent_id| world.agent_uid(*agent_id).expect("measurement stable uid"))
+                .collect();
+            let digest_before = world
+                .world_digest_v1()
+                .expect("pre-measurement scientific digest");
+
+            for target_count in [0usize, 1, ACTIVATION_CAPTURE_BUDGET] {
+                let targets = if target_count == 0 {
+                    Vec::new()
+                } else if target_count == 1 {
+                    vec![*target_uids.last().expect("last measurement uid")]
+                } else {
+                    target_uids.clone()
+                };
+                let request = BrainInspectionRequest {
+                    client_id: BrainInspectionClientId::new(0x004d_4541_5355_5245),
+                    revision: BrainInspectionRevision::new(target_count as u64),
+                    targets,
+                    limits: BrainInspectionLimits::hard(),
+                };
+                for _ in 0..WARMUPS {
+                    std::hint::black_box(
+                        world
+                            .inspect_brains(&request)
+                            .expect("warmup brain inspection"),
+                    );
+                }
+
+                let mut elapsed_ns = Vec::with_capacity(SAMPLES);
+                let mut maximum_payload_bytes = 0usize;
+                let mut maximum_agents_examined = 0usize;
+                for _ in 0..SAMPLES {
+                    let started = std::time::Instant::now();
+                    let response = world
+                        .inspect_brains(&request)
+                        .expect("measured brain inspection");
+                    elapsed_ns.push(started.elapsed().as_nanos());
+                    maximum_payload_bytes =
+                        maximum_payload_bytes.max(response.build.retained_payload_bytes);
+                    maximum_agents_examined =
+                        maximum_agents_examined.max(response.build.agents_examined);
+                    assert_eq!(response.build.runner_inspections, target_count);
+                    assert!(
+                        response.build.retained_payload_bytes
+                            <= target_count.saturating_mul(ACTIVATION_PAYLOAD_BYTE_BUDGET)
+                    );
+                    std::hint::black_box(response);
+                }
+                elapsed_ns.sort_unstable();
+                let p50_ns = elapsed_ns[(elapsed_ns.len() - 1) * 50 / 100];
+                let p95_ns = elapsed_ns[(elapsed_ns.len() - 1) * 95 / 100];
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "scriptbots.brain_inspection.measurement.v1",
+                        "population": population,
+                        "targets": target_count,
+                        "samples": SAMPLES,
+                        "p50_ns": p50_ns,
+                        "p95_ns": p95_ns,
+                        "maximum_agents_examined": maximum_agents_examined,
+                        "maximum_retained_payload_bytes": maximum_payload_bytes,
+                        "per_target_payload_ceiling_bytes": ACTIVATION_PAYLOAD_BYTE_BUDGET,
+                    })
+                );
+            }
+
+            assert_eq!(
+                world
+                    .world_digest_v1()
+                    .expect("post-measurement scientific digest"),
+                digest_before,
+                "measurement requests must not mutate scientific state"
+            );
+        }
     }
 
     #[test]
@@ -22268,7 +23362,7 @@ mod tests {
         fn inspect(
             &self,
             _request: BrainInspection,
-        ) -> Result<Option<BrainActivations>, BrainProtocolError> {
+        ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
             Ok(None)
         }
 
@@ -22722,7 +23816,7 @@ mod tests {
             fn inspect(
                 &self,
                 _request: BrainInspection,
-            ) -> Result<Option<BrainActivations>, BrainProtocolError> {
+            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
                 Ok(None)
             }
 

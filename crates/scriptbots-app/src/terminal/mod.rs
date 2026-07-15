@@ -26,7 +26,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Widget},
 };
 use scriptbots_core::{
-    AgentId, BrainActivations, ControlCommand, ControlDisposition, ControlSettings,
+    AgentId, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
+    BrainInspectionRevision, ControlCommand, ControlDisposition, ControlSettings,
     SimulationCommand, TerrainKind, TerrainLayer, TickSummary, WorldState, apply_control_command,
 };
 #[cfg(test)]
@@ -50,6 +51,8 @@ const MAX_HEADLESS_FRAMES: usize = 360;
 const EVENT_LOG_CAPACITY: usize = 16;
 const LEADERBOARD_LIMIT: usize = 6;
 const BRAINBOARD_LIMIT: usize = 4;
+const TERMINAL_BRAIN_INSPECTION_CLIENT_ID: BrainInspectionClientId =
+    BrainInspectionClientId::new(0x5455_4900_0000_0001);
 
 trait TerminalRestore {
     fn show_cursor(&mut self);
@@ -340,6 +343,8 @@ struct TerminalApp<'a> {
     activation_layer_index: usize,
     activation_row_offset: usize,
     focus_lock: FocusLockMode,
+    brain_inspection_revision: BrainInspectionRevision,
+    brain_inspection_cache: Option<TerminalBrainInspectionCache>,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -386,6 +391,8 @@ impl<'a> TerminalApp<'a> {
             activation_layer_index: 0,
             activation_row_offset: 0,
             focus_lock: FocusLockMode::Manual,
+            brain_inspection_revision: BrainInspectionRevision::new(0),
+            brain_inspection_cache: None,
         };
         app.refresh_snapshot();
         app
@@ -1042,6 +1049,17 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_insights(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
         let mut lines: Vec<Line> = Vec::new();
+        if let Some(inspection) = self.snapshot.brain_inspection {
+            let (source, bounds) = inspection.status_lines(self.snapshot.tick);
+            lines.push(Line::from(vec![
+                Span::styled("Brain ", self.palette.header_style()),
+                Span::raw(source),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Probe ", self.palette.header_style()),
+                Span::raw(bounds),
+            ]));
+        }
         if let Some(error) = &self.simulation_fault {
             lines.push(Line::from(vec![
                 Span::styled("Simulation ", self.palette.header_style()),
@@ -1190,7 +1208,6 @@ impl<'a> TerminalApp<'a> {
                 )),
             ]));
         }
-
         // Compact brain activation row if available (pull selected layer)
         if let Some(layer) = self
             .snapshot
@@ -1675,8 +1692,17 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn refresh_snapshot(&mut self) {
+        let next_request_revision = BrainInspectionRevision::new(
+            self.brain_inspection_revision
+                .get()
+                .checked_add(1)
+                .expect("terminal brain-inspection revision exhausted"),
+        );
+        let cached_inspection = self.brain_inspection_cache.clone();
+        let mut next_inspection_cache = None;
+        let mut request_issued = false;
         let new_snapshot = match self.world.lock() {
-            Ok(mut world) => {
+            Ok(world) => {
                 let mut snap = Snapshot::from_world(&world);
                 // Determine focused agent id
                 let agent_id_opt = match self.focus_lock {
@@ -1703,19 +1729,76 @@ impl<'a> TerminalApp<'a> {
                             .find(|h| h.data().as_ffi() == e.label)
                     }),
                 };
-                // Activations are captured lazily: tell the world which agent
-                // the console heatmap follows so the next ticks snapshot it.
-                world.set_activation_probe(agent_id_opt);
-                if let Some(agent_id) = agent_id_opt
-                    && let Some(rt) = world.runtime().get(agent_id)
-                    && let Some(act) = rt.brain_activations.as_ref()
-                {
-                    snap.brain_layers = convert_layers(act);
+                if let Some(agent_uid) = agent_id_opt.and_then(|id| world.agent_uid(id)) {
+                    if let Some(cached) = cached_inspection.as_ref().filter(|cached| {
+                        cached.metadata.agent_uid == agent_uid.get()
+                            && cached.metadata.source_tick == world.tick().0
+                    }) {
+                        snap.brain_layers.clone_from(&cached.layers);
+                        snap.brain_inspection = Some(cached.metadata);
+                        next_inspection_cache = Some(cached.clone());
+                    } else {
+                        request_issued = true;
+                        let request = BrainInspectionRequest::single(
+                            TERMINAL_BRAIN_INSPECTION_CLIENT_ID,
+                            next_request_revision,
+                            agent_uid,
+                        );
+                        let cache = match world.inspect_brains(&request) {
+                            Ok(response) => {
+                                let mut metadata = BrainInspectionViewMetadata {
+                                    agent_uid: agent_uid.get(),
+                                    source_tick: response.source_tick.0,
+                                    request_revision: response.request_revision.get(),
+                                    truncated: false,
+                                    retained_payload_bytes: response.build.retained_payload_bytes,
+                                    ready: false,
+                                };
+                                let layers = response.ready_for(agent_uid).map_or_else(
+                                    Vec::new,
+                                    |telemetry| {
+                                        metadata.truncated = telemetry.inspection.build.truncated;
+                                        metadata.retained_payload_bytes =
+                                            telemetry.inspection.build.retained_payload_bytes;
+                                        metadata.ready = true;
+                                        convert_layers(&telemetry.inspection.activations)
+                                    },
+                                );
+                                TerminalBrainInspectionCache { metadata, layers }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    %error,
+                                    agent_uid = agent_uid.get(),
+                                    request_revision = next_request_revision.get(),
+                                    "terminal brain inspection failed"
+                                );
+                                TerminalBrainInspectionCache {
+                                    metadata: BrainInspectionViewMetadata {
+                                        agent_uid: agent_uid.get(),
+                                        source_tick: world.tick().0,
+                                        request_revision: next_request_revision.get(),
+                                        truncated: false,
+                                        retained_payload_bytes: 0,
+                                        ready: false,
+                                    },
+                                    layers: Vec::new(),
+                                }
+                            }
+                        };
+                        snap.brain_layers.clone_from(&cache.layers);
+                        snap.brain_inspection = Some(cache.metadata);
+                        next_inspection_cache = Some(cache);
+                    }
                 }
                 snap
             }
             Err(_) => return,
         };
+        self.brain_inspection_cache = next_inspection_cache;
+        if request_issued {
+            self.brain_inspection_revision = next_request_revision;
+        }
         self.ingest_events(&new_snapshot);
         self.snapshot = new_snapshot;
         self.evaluate_auto_pause();
@@ -2027,6 +2110,47 @@ struct Snapshot {
     control: ControlSettings,
     spike_hits: u32,
     brain_layers: Vec<BrainLayerView>,
+    brain_inspection: Option<BrainInspectionViewMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrainInspectionViewMetadata {
+    agent_uid: u64,
+    source_tick: u64,
+    request_revision: u64,
+    truncated: bool,
+    retained_payload_bytes: usize,
+    ready: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalBrainInspectionCache {
+    metadata: BrainInspectionViewMetadata,
+    layers: Vec<BrainLayerView>,
+}
+
+impl BrainInspectionViewMetadata {
+    fn status_lines(self, current_tick: u64) -> (String, String) {
+        let freshness = match self.source_tick.cmp(&current_tick) {
+            Ordering::Less => "STALE",
+            Ordering::Equal => "current",
+            Ordering::Greater => "FUTURE",
+        };
+        let payload_status = if !self.ready {
+            "UNAVAILABLE"
+        } else if self.truncated {
+            "CLIPPED"
+        } else {
+            "complete"
+        };
+        (
+            format!("uid {} · t{} {freshness}", self.agent_uid, self.source_tick),
+            format!(
+                "r{} · {}B · {payload_status}",
+                self.request_revision, self.retained_payload_bytes
+            ),
+        )
+    }
 }
 
 #[derive(Clone, Default, Debug)]
@@ -2480,6 +2604,7 @@ impl Snapshot {
             control: config.control.clone(),
             spike_hits: summary.spike_hits,
             brain_layers: Vec::new(),
+            brain_inspection: None,
         }
     }
 
@@ -3485,6 +3610,68 @@ mod tests {
     use super::*;
     use scriptbots_core::{AgentData, ScriptBotsConfig};
 
+    #[test]
+    fn brain_inspection_metadata_exposes_provenance_clipping_and_staleness() {
+        let inspection = BrainInspectionViewMetadata {
+            agent_uid: 41,
+            source_tick: 99,
+            request_revision: 7,
+            truncated: true,
+            retained_payload_bytes: 2_048,
+            ready: true,
+        };
+
+        assert_eq!(inspection.status_lines(100).0, "uid 41 · t99 STALE");
+        assert_eq!(inspection.status_lines(100).1, "r7 · 2048B · CLIPPED");
+    }
+
+    #[test]
+    fn narrow_insights_panel_keeps_brain_provenance_and_clipping_visible() {
+        let world = command_characterization_world();
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
+            world,
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        app.snapshot.tick = 100;
+        app.snapshot.brain_inspection = Some(BrainInspectionViewMetadata {
+            agent_uid: 41,
+            source_tick: 99,
+            request_revision: 7,
+            truncated: true,
+            retained_payload_bytes: 2_048,
+            ready: true,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(30, 7);
+        let mut terminal = Terminal::new(backend).expect("narrow insights terminal");
+        terminal
+            .draw(|frame| app.draw_insights(frame, frame.area(), &app.snapshot))
+            .expect("draw narrow insights");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("t99 STALE"),
+            "rendered buffer: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("r7 · 2048B · CLIPPED"),
+            "rendered buffer: {rendered:?}"
+        );
+    }
+
     #[derive(Clone)]
     struct FakeTerminalRestore {
         operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -3616,6 +3803,136 @@ mod tests {
                 .expect("world mutex poisoned while executing test simulation step")
                 .step()
         })
+    }
+
+    #[test]
+    fn terminal_brain_pull_is_immediate_uid_keyed_and_cached_while_paused() {
+        #[derive(Debug)]
+        struct TerminalInspectionBrain {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl scriptbots_core::BrainRunner for TerminalInspectionBrain {
+            fn kind(&self) -> &'static str {
+                "terminal.inspection"
+            }
+
+            fn tick(
+                &mut self,
+                _inputs: &[f32; scriptbots_core::INPUT_SIZE],
+            ) -> [f32; scriptbots_core::OUTPUT_SIZE] {
+                [0.0; scriptbots_core::OUTPUT_SIZE]
+            }
+
+            fn inspect(
+                &self,
+                request: scriptbots_core::BrainInspection,
+            ) -> Result<
+                Option<scriptbots_core::BrainInspectionSnapshot>,
+                scriptbots_core::BrainInspectionError,
+            > {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let scriptbots_core::BrainInspection::Activations(limits) = request;
+                scriptbots_core::bound_brain_inspection(
+                    self.kind(),
+                    BrainActivations {
+                        layers: vec![scriptbots_core::ActivationLayer {
+                            name: "terminal".to_owned(),
+                            width: 1,
+                            height: 1,
+                            values: vec![0.5],
+                        }],
+                        connections: Vec::new(),
+                        truncated: false,
+                    },
+                    1,
+                    limits,
+                )
+                .map(Some)
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x5455_495f_4252_4149)
+            }
+        }
+
+        let world = command_characterization_world();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let mut guard = world.lock().expect("terminal inspection world lock");
+            let family = guard
+                .brain_registry_mut()
+                .expect("terminal inspection registry mutation")
+                .register_with_state_digest("terminal.inspection", 0x5455_495f_4252_4149, {
+                    let calls = Arc::clone(&calls);
+                    move |_rng| {
+                        Ok(Box::new(TerminalInspectionBrain {
+                            calls: Arc::clone(&calls),
+                        }))
+                    }
+                });
+            for _ in 0..2 {
+                let agent_id = guard.spawn_agent(AgentData::default());
+                guard
+                    .bind_agent_brain(agent_id, family)
+                    .expect("bind terminal inspection brain");
+            }
+        }
+        let digest_before = world
+            .lock()
+            .expect("pre-inspection world lock")
+            .world_digest_v1()
+            .expect("pre-inspection digest");
+        let analytics = AnalyticsSnapshotProvider::empty();
+        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
+            world: Arc::clone(&world),
+            analytics,
+            control_runtime: &runtime,
+            command_drain: drain,
+            command_submit: submit,
+        };
+        let mut app = TerminalApp::new(&renderer, ctx);
+        app.paused = true;
+        let first = app
+            .snapshot
+            .brain_inspection
+            .expect("initial immediate terminal inspection");
+        assert!(first.ready);
+        assert_eq!(first.request_revision, 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        app.refresh_snapshot();
+        assert_eq!(
+            app.snapshot
+                .brain_inspection
+                .expect("cached terminal inspection")
+                .request_revision,
+            1
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        app.focused_agent_cursor = 1;
+        app.refresh_snapshot();
+        let second = app
+            .snapshot
+            .brain_inspection
+            .expect("second focused terminal inspection");
+        assert!(second.ready);
+        assert_eq!(second.request_revision, 2);
+        assert_ne!(first.agent_uid, second.agent_uid);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            world
+                .lock()
+                .expect("post-inspection world lock")
+                .world_digest_v1()
+                .expect("post-inspection digest"),
+            digest_before
+        );
     }
 
     #[test]

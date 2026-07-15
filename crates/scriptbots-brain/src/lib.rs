@@ -1,8 +1,8 @@
 //! Traits and adapters for ScriptBots brain implementations.
 
 use scriptbots_core::{
-    AgentUid, BrainActivations, BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE,
-    RandomStream, Tick,
+    AgentUid, BrainInspection, BrainInspectionError, BrainInspectionSnapshot, BrainRunner,
+    BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream, Tick,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -141,10 +141,13 @@ pub trait Brain: Send + Sync + Any {
     /// Mutable downcast support for concrete brain logic.
     fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync);
 
-    /// Optional introspection hook for visualization/debug UIs.
-    /// Default returns `None` for brains that do not expose activations.
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        None
+    /// Optional bounded, read-only introspection hook for visualization/debug UIs.
+    /// Default returns `None` for brains that do not expose the requested view.
+    fn inspect(
+        &self,
+        _request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        Ok(None)
     }
 
     /// Stable digest of the brain's GENOME and EVALUATOR STATE.
@@ -221,6 +224,14 @@ mod tests {
         let outputs = runner.tick(&inputs);
         assert!((outputs[0] - 1.0).abs() < f32::EPSILON);
         assert!((outputs[1] - 2.0).abs() < f32::EPSILON);
+        assert!(
+            runner
+                .inspect(BrainInspection::Activations(
+                    scriptbots_core::BrainInspectionLimits::hard(),
+                ))
+                .expect("default inspection response")
+                .is_none()
+        );
     }
 }
 
@@ -260,8 +271,11 @@ impl BrainRunner for BrainRunnerAdapter {
         self.brain.tick(inputs)
     }
 
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        self.brain.snapshot_activations()
+    fn inspect(
+        &self,
+        request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        self.brain.inspect(request)
     }
 
     fn state_digest(&self) -> Option<u64> {

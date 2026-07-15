@@ -4,8 +4,9 @@ use rand::Rng;
 use scriptbots_core::{
     ActivationLayer, BrainActivations, BrainEnvelopeKind, BrainEvaluator,
     BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope,
-    BrainGenomeMaterial, BrainInspection, BrainProtocolError, MutationRates, OffspringStatePolicy,
-    RandomStream,
+    BrainGenomeMaterial, BrainInspection, BrainInspectionError, BrainInspectionLimits,
+    BrainInspectionSnapshot, BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream,
+    bound_brain_inspection,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -37,6 +38,9 @@ const STATE_HEADER_BYTES: usize = STATE_DIGEST_END + STATE_BRAIN_SIZE_BYTES;
 const STATE_NODE_BYTES: usize = 4;
 const STATE_PAYLOAD_BYTES: usize = STATE_HEADER_BYTES + BRAIN_SIZE * STATE_NODE_BYTES;
 const GENOME_DIGEST_CONTEXT: &str = "rust-scriptbots.dwraon.genome-state-binding.v1";
+const ACTIVATION_LAYER_NAME: &str = "dwraon.state";
+const ACTIVATION_LAYER_WIDTH: usize = 20;
+const ACTIVATION_LAYER_HEIGHT: usize = 10;
 
 static DWRAON_FAMILY_ID: LazyLock<BrainFamilyId> = LazyLock::new(|| {
     BrainFamilyId::new(DWRAON_FAMILY_NAME).expect("the built-in DWRAON family id is canonical")
@@ -194,17 +198,50 @@ impl DwraonBrain {
             .unwrap_or_default()
     }
 
-    fn activations(&self) -> BrainActivations {
-        BrainActivations {
-            layers: vec![ActivationLayer {
-                name: "dwraon.state".to_owned(),
-                width: 20,
-                height: 10,
-                values: self.state.iter().map(|node| node.output).collect(),
-            }],
-            connections: Vec::new(),
-            truncated: false,
-        }
+    fn inspect_activations(
+        &self,
+        limits: BrainInspectionLimits,
+    ) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
+        let source_values = self.state.len();
+        let source_payload_bytes = std::mem::size_of::<ActivationLayer>()
+            .saturating_add(ACTIVATION_LAYER_NAME.len())
+            .saturating_add(source_values.saturating_mul(std::mem::size_of::<f32>()));
+        let retain_layer = limits.max_layers() >= 1
+            && limits.max_name_bytes() >= ACTIVATION_LAYER_NAME.len()
+            && limits.max_values() >= source_values
+            && limits.max_source_scalars() >= source_values
+            && limits.max_payload_bytes() >= source_payload_bytes;
+
+        let activations = if retain_layer {
+            let mut values = Vec::with_capacity(source_values);
+            values.extend(self.state.iter().map(|node| node.output));
+            let mut layers = Vec::with_capacity(1);
+            layers.push(ActivationLayer {
+                name: ACTIVATION_LAYER_NAME.to_owned(),
+                width: ACTIVATION_LAYER_WIDTH,
+                height: ACTIVATION_LAYER_HEIGHT,
+                values,
+            });
+            BrainActivations {
+                layers,
+                connections: Vec::new(),
+                truncated: false,
+            }
+        } else {
+            BrainActivations {
+                layers: Vec::new(),
+                connections: Vec::new(),
+                truncated: true,
+            }
+        };
+
+        let mut snapshot =
+            bound_brain_inspection(Self::KIND.as_str(), activations, source_values, limits)?;
+        snapshot.build.source_layers = 1;
+        snapshot.build.source_name_bytes = ACTIVATION_LAYER_NAME.len();
+        snapshot.build.source_values = source_values;
+        snapshot.build.source_edges = 0;
+        Ok(snapshot)
     }
 }
 
@@ -682,9 +719,11 @@ impl BrainEvaluator for DwraonEvaluator {
     fn inspect(
         &self,
         request: BrainInspection,
-    ) -> Result<Option<BrainActivations>, BrainProtocolError> {
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
         match request {
-            BrainInspection::Activations => Ok(Some(self.brain.activations())),
+            BrainInspection::Activations(limits) => {
+                self.brain.inspect_activations(limits).map(Some)
+            }
         }
     }
 
@@ -903,8 +942,13 @@ impl Brain for DwraonBrain {
         self
     }
 
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        Some(self.activations())
+    fn inspect(
+        &self,
+        request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        match request {
+            BrainInspection::Activations(limits) => self.inspect_activations(limits).map(Some),
+        }
     }
 }
 
@@ -1432,11 +1476,112 @@ mod tests {
                 .checkpoint_evaluator(restored.as_ref())
                 .expect("restored next checkpoint")
         );
-        assert!(
-            restored
-                .inspect(BrainInspection::Activations)
-                .expect("bounded inspection")
-                .is_some()
+        let inspection = restored
+            .inspect(BrainInspection::Activations(BrainInspectionLimits::hard()))
+            .expect("bounded inspection")
+            .expect("DWRAON exposes activations");
+        assert_eq!(inspection.build.source_scalars, BRAIN_SIZE);
+        assert_eq!(inspection.build.source_layers, 1);
+        assert_eq!(inspection.build.source_values, BRAIN_SIZE);
+        assert_eq!(inspection.build.retained_values, BRAIN_SIZE);
+        assert!(!inspection.build.truncated);
+    }
+
+    #[test]
+    fn tight_inspection_is_bounded_and_preserves_checkpoint_and_continuation() {
+        let family = DwraonFamilyAdapter::default();
+        let mut rng = SmallRngStream::seed_from_u64(0xD0A0_1A5C);
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut rng)
+            .expect("genome");
+        let state = family.initial_state(&genome, &mut rng).expect("state");
+        let mut evaluator = family.evaluator(&genome, &state).expect("evaluator");
+        evaluator
+            .evaluate(&[0.25; INPUT_SIZE])
+            .expect("primer output");
+
+        let checkpoint_before = family
+            .checkpoint_evaluator(evaluator.as_ref())
+            .expect("checkpoint before inspection");
+        let mut control = family
+            .evaluator(&genome, &checkpoint_before)
+            .expect("control evaluator");
+        let hard = BrainInspectionLimits::hard();
+        let limits = BrainInspectionLimits::tightened(
+            1,
+            ACTIVATION_LAYER_NAME.len(),
+            BRAIN_SIZE - 1,
+            0,
+            hard.max_payload_bytes(),
+            BRAIN_SIZE,
+        );
+        let inspection = evaluator
+            .inspect(BrainInspection::Activations(limits))
+            .expect("tight inspection")
+            .expect("DWRAON exposes activations");
+
+        assert_eq!(inspection.build.source_scalars, BRAIN_SIZE);
+        assert_eq!(inspection.build.source_layers, 1);
+        assert_eq!(
+            inspection.build.source_name_bytes,
+            ACTIVATION_LAYER_NAME.len()
+        );
+        assert_eq!(inspection.build.source_values, BRAIN_SIZE);
+        assert_eq!(inspection.build.source_edges, 0);
+        assert_eq!(inspection.build.retained_layers, 0);
+        assert_eq!(inspection.build.retained_values, 0);
+        assert!(inspection.build.retained_values <= limits.max_values());
+        assert!(inspection.build.retained_payload_bytes <= limits.max_payload_bytes());
+        assert!(inspection.build.truncated);
+        assert!(inspection.activations.layers.is_empty());
+        assert!(inspection.activations.truncated);
+        assert_eq!(
+            family
+                .checkpoint_evaluator(evaluator.as_ref())
+                .expect("checkpoint after inspection"),
+            checkpoint_before,
+            "read-only inspection must not alter recurrent evaluator state"
+        );
+
+        let next = [0.75; INPUT_SIZE];
+        assert_eq!(
+            evaluator
+                .evaluate(&next)
+                .expect("inspected continuation")
+                .map(f32::to_bits),
+            control
+                .evaluate(&next)
+                .expect("control continuation")
+                .map(f32::to_bits),
+            "inspection must not alter the next output"
+        );
+        assert_eq!(
+            family
+                .checkpoint_evaluator(evaluator.as_ref())
+                .expect("inspected continuation checkpoint"),
+            family
+                .checkpoint_evaluator(control.as_ref())
+                .expect("control continuation checkpoint")
+        );
+    }
+
+    #[test]
+    fn legacy_inspection_preserves_state_digest_and_next_output() {
+        let mut rng = SmallRngStream::seed_from_u64(0x00D1_6E57);
+        let mut brain = DwraonBrain::random(&mut rng);
+        brain.tick(&[0.125; INPUT_SIZE]);
+        let mut control = brain.clone();
+        let digest_before = brain.state_digest();
+
+        let inspection = brain
+            .inspect(BrainInspection::Activations(BrainInspectionLimits::hard()))
+            .expect("legacy bounded inspection")
+            .expect("DWRAON exposes activations");
+        assert_eq!(inspection.build.retained_values, BRAIN_SIZE);
+        assert_eq!(brain.state_digest(), digest_before);
+        assert_eq!(
+            brain.tick(&[0.625; INPUT_SIZE]).map(f32::to_bits),
+            control.tick(&[0.625; INPUT_SIZE]).map(f32::to_bits)
         );
     }
 

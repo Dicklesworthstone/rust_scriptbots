@@ -1,26 +1,27 @@
 //! Deterministic sole-owner simulation host.
 
 use super::{
-    AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, CommandEnvelope,
-    CommandId, CommandStatus, ConfigRevision, ControlRevision, DriveReceipt, EventCatchUp,
-    EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment,
-    EventHub, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot,
-    EventSequence, EventSequenceRange, FoodLayerSnapshot, HostAccessError, HostBlocker,
-    HostCommand, HostDriveInterest, HostEvent, HostEventKind, HostFault, HostHealth, HostLifecycle,
-    HostPort, HostRevisions, HostSessionId, HydrologyLayerSnapshot, HydrologyTileSnapshot,
-    JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
-    JournalReceiptState, JournalState, JournaledScientificEvent, LayerRevision, ManualHostDriver,
-    ManualInstant, PlaybackSnapshot, ProtocolEventSequence, RejectionReason, RenderSnapshot,
-    ScientificBoundary, ScientificBoundaryFault, ScientificEvent, ScientificRevision,
-    ShutdownCommitRequirement, SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions,
-    SnapshotLayers, SnapshotRevision, StatusCombinationError, TerrainLayerSnapshot,
-    TerrainTileSnapshot,
+    AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, BrainProjection,
+    BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId, CommandStatus,
+    ConfigRevision, ControlRevision, DriveReceipt, EventCatchUp, EventCatchUpGuarantee,
+    EventCatchUpLocator, EventCatchUpUnavailableReason, EventCommitment, EventHub,
+    EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot, EventSequence,
+    EventSequenceRange, FoodLayerSnapshot, HostAccessError, HostBlocker, HostCommand,
+    HostDriveInterest, HostEvent, HostEventKind, HostFault, HostHealth, HostLifecycle, HostPort,
+    HostRevisions, HostSessionId, HydrologyLayerSnapshot, HydrologyTileSnapshot, JournalAdmission,
+    JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt, JournalReceiptState,
+    JournalState, JournaledScientificEvent, LayerRevision, ManualHostDriver, ManualInstant,
+    PlaybackSnapshot, ProtocolEventSequence, RejectionReason, RenderSnapshot, ScientificBoundary,
+    ScientificBoundaryFault, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
+    SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions, SnapshotLayers, SnapshotRevision,
+    StatusCombinationError, TerrainLayerSnapshot, TerrainTileSnapshot,
 };
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    CharacterizationError, CompletedStepFault, DynamicAgentSnapshot, DynamicWorldSnapshot,
-    NullPersistence, PersistenceAdmissionSession, PersistenceSessionError, ScriptBotsConfig, Tick,
-    TickSummary, WorldDigestV1, WorldState,
+    ACTIVATION_CAPTURE_BUDGET, BrainInspectionClientId, BrainInspectionError,
+    BrainInspectionRequest, BrainInspectionRevision, CharacterizationError, CompletedStepFault,
+    DynamicAgentSnapshot, DynamicWorldSnapshot, NullPersistence, PersistenceAdmissionSession,
+    PersistenceSessionError, ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState,
 };
 use std::{
     cell::RefCell,
@@ -1176,6 +1177,37 @@ impl HostCore {
     #[must_use]
     pub fn latest_snapshot(&self) -> Arc<RenderSnapshot> {
         self.snapshots.latest()
+    }
+
+    /// Pull bounded selected-brain detail for one client without mutating host or science state.
+    pub fn inspect_brains(
+        &self,
+        request: &BrainProjectionRequest,
+    ) -> Result<BrainProjection, BrainInspectionError> {
+        if request.targets.len() > ACTIVATION_CAPTURE_BUDGET {
+            return Err(BrainInspectionError::TargetLimitExceeded {
+                requested: request.targets.len(),
+                limit: ACTIVATION_CAPTURE_BUDGET,
+            });
+        }
+        let latest = self.latest_snapshot();
+        let inspection = self.world.inspect_brains(&BrainInspectionRequest {
+            client_id: BrainInspectionClientId::new(request.client_id.get()),
+            revision: BrainInspectionRevision::new(request.revision.get()),
+            targets: request.targets.clone(),
+            limits: request.limits,
+        })?;
+        Ok(BrainProjection {
+            source: BrainProjectionSource {
+                session_id: self.session_id,
+                published_snapshot: latest.revision,
+                published_host: latest.revisions,
+                inspected_host: self.revisions,
+                inspected_tick: self.world.tick(),
+            },
+            request: request.clone(),
+            inspection,
+        })
     }
 
     /// Current queryable health.
@@ -2492,14 +2524,16 @@ fn protocol_violation(message: impl Into<String>) -> HostAccessError {
 mod tests {
     use super::*;
     use crate::{
-        ProjectionBroker, ProjectionCamera, ProjectionClientId, ProjectionDetail, ProjectionLimits,
-        ProjectionRanking, ProjectionRequest, ProjectionSelection, ProjectionViewport,
-        project_snapshot,
+        BrainProjectionRequest, ProjectionBroker, ProjectionCamera, ProjectionClientId,
+        ProjectionDetail, ProjectionLimits, ProjectionRanking, ProjectionRequest,
+        ProjectionRequestRevision, ProjectionSelection, ProjectionViewport, project_snapshot,
     };
     use scriptbots_core::{
-        AgentData, AgentUid, Generation, HydrologyField, HydrologyFlowDirection, HydrologyTile,
-        HydrologyTileLayer, MapArtifact, MapArtifactMetadata, MapGeneratorKind, Position,
-        ScriptBotsConfig, TerrainLayer, Velocity,
+        ActivationLayer, AgentData, AgentUid, BrainActivations, BrainInspection,
+        BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, Generation, HydrologyField,
+        HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer, INPUT_SIZE, MapArtifact,
+        MapArtifactMetadata, MapGeneratorKind, OUTPUT_SIZE, Position, ScriptBotsConfig,
+        TerrainLayer, Velocity, bound_brain_inspection,
     };
     use std::{hint::black_box, time::Instant};
 
@@ -3162,6 +3196,166 @@ mod tests {
                 .expect("post-projection matrix digest"),
             digest_before
         );
+    }
+
+    #[test]
+    fn selected_brain_projection_is_client_isolated_revisioned_and_science_neutral() {
+        #[derive(Debug)]
+        struct ProjectionBrain;
+
+        impl BrainRunner for ProjectionBrain {
+            fn kind(&self) -> &'static str {
+                "runtime.projection"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                [0.0; OUTPUT_SIZE]
+            }
+
+            fn inspect(
+                &self,
+                request: BrainInspection,
+            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+                let BrainInspection::Activations(limits) = request;
+                bound_brain_inspection(
+                    self.kind(),
+                    BrainActivations {
+                        layers: vec![ActivationLayer {
+                            name: "runtime".to_owned(),
+                            width: 2,
+                            height: 1,
+                            values: vec![0.25, 0.75],
+                        }],
+                        connections: Vec::new(),
+                        truncated: false,
+                    },
+                    2,
+                    limits,
+                )
+                .map(Some)
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x5255_4e54_494d_4501)
+            }
+        }
+
+        let mut world = snapshot_measurement_world(2);
+        let family = world
+            .brain_registry_mut()
+            .expect("runtime projection registry mutation")
+            .register_with_state_digest("runtime.projection", 0x5255_4e54_494d_4501, |_rng| {
+                Ok(Box::new(ProjectionBrain))
+            });
+        let agent_ids: Vec<_> = world.agents().iter_handles().collect();
+        for agent_id in agent_ids {
+            world
+                .bind_agent_brain(agent_id, family)
+                .expect("bind runtime projection brain");
+        }
+        let core = HostCore::new(HostSessionId::new(0x4252_4149_4e), world, options(true))
+            .expect("brain projection host");
+        let source = core.latest_snapshot();
+        let first_uid = source.world.agents[0].uid;
+        let second_uid = source.world.agents[1].uid;
+        let digest_before = core
+            .scientific_digest_v1()
+            .expect("pre-inspection scientific digest");
+
+        let first = core
+            .inspect_brains(&BrainProjectionRequest::focused(
+                ProjectionClientId::new(1),
+                ProjectionRequestRevision::new(7),
+                first_uid,
+            ))
+            .expect("first client brain projection");
+        let second = core
+            .inspect_brains(&BrainProjectionRequest::focused(
+                ProjectionClientId::new(2),
+                ProjectionRequestRevision::new(11),
+                second_uid,
+            ))
+            .expect("second client brain projection");
+
+        assert!(first.source.matches_snapshot(&source));
+        assert!(second.source.matches_snapshot(&source));
+        assert_eq!(first.request.client_id, ProjectionClientId::new(1));
+        assert_eq!(first.request.revision, ProjectionRequestRevision::new(7));
+        assert_eq!(first.inspection.client_id.get(), 1);
+        assert_eq!(first.inspection.request_revision.get(), 7);
+        assert_eq!(second.request.client_id, ProjectionClientId::new(2));
+        assert_eq!(second.request.revision, ProjectionRequestRevision::new(11));
+        assert_eq!(second.inspection.client_id.get(), 2);
+        assert_eq!(second.inspection.request_revision.get(), 11);
+        assert_ne!(first.request.targets, second.request.targets);
+        let first_ready = first
+            .inspection
+            .ready_for(first_uid)
+            .expect("first runtime projection payload");
+        assert_eq!(first_ready.inspection.build.source_values, 2);
+        assert_eq!(first_ready.inspection.build.retained_values, 2);
+        assert!(!first_ready.inspection.build.truncated);
+
+        let clipped = core
+            .inspect_brains(&BrainProjectionRequest {
+                client_id: ProjectionClientId::new(3),
+                revision: ProjectionRequestRevision::new(12),
+                targets: vec![first_uid],
+                limits: BrainInspectionLimits::tightened(1, 1, 1, 0, 128, 2),
+            })
+            .expect("clipped runtime projection");
+        let clipped_ready = clipped
+            .inspection
+            .ready_for(first_uid)
+            .expect("clipped ready payload");
+        assert!(clipped_ready.inspection.build.truncated);
+        assert!(clipped_ready.inspection.activations.truncated);
+        assert!(clipped_ready.inspection.build.retained_payload_bytes <= 128);
+        assert_eq!(
+            core.scientific_digest_v1()
+                .expect("post-inspection scientific digest"),
+            digest_before
+        );
+
+        let oversized = BrainProjectionRequest {
+            client_id: ProjectionClientId::new(3),
+            revision: ProjectionRequestRevision::new(1),
+            targets: vec![first_uid; ACTIVATION_CAPTURE_BUDGET + 1],
+            limits: scriptbots_core::BrainInspectionLimits::hard(),
+        };
+        assert!(matches!(
+            core.inspect_brains(&oversized),
+            Err(BrainInspectionError::TargetLimitExceeded { .. })
+        ));
+        let oversized_json = serde_json::to_vec(&oversized).expect("encode oversized projection");
+        assert!(serde_json::from_slice::<BrainProjectionRequest>(&oversized_json).is_err());
+    }
+
+    #[test]
+    fn brain_projection_source_rejects_an_unpublished_owner_advance() {
+        let mut sparse_options = options(false);
+        sparse_options.snapshot_interval_ticks = 3;
+        let mut core = HostCore::new(
+            HostSessionId::new(0x4252_4149_4e02),
+            snapshot_measurement_world(1),
+            sparse_options,
+        )
+        .expect("sparse brain projection host");
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("establish sparse-host clock origin");
+        core.drive(ManualInstant::from_nanos(10))
+            .expect("advance without snapshot publication");
+        let published = core.latest_snapshot();
+        let projection = core
+            .inspect_brains(&BrainProjectionRequest {
+                client_id: ProjectionClientId::new(9),
+                revision: ProjectionRequestRevision::new(1),
+                targets: Vec::new(),
+                limits: BrainInspectionLimits::hard(),
+            })
+            .expect("empty sparse-source inspection");
+        assert_ne!(projection.source.inspected_host, published.revisions);
+        assert!(!projection.source.matches_snapshot(&published));
     }
 
     fn snapshot_measurement_config() -> ScriptBotsConfig {

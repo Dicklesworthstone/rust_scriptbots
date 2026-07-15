@@ -10,9 +10,10 @@
 
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    AgentUid, BirthRecord, DeathRecord, DynamicAgentSnapshot, DynamicWorldSnapshot, Generation,
-    HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScriptBotsConfig, TerrainKind,
-    Tick, TickCombatSummary, TickEvents, TickSummary,
+    AgentUid, BirthRecord, BrainInspectionLimits, BrainInspectionResponse, DeathRecord,
+    DynamicAgentSnapshot, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
+    PersistenceBatch, ResourceLedgerTick, ScriptBotsConfig, TerrainKind, Tick, TickCombatSummary,
+    TickEvents, TickSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -325,6 +326,10 @@ monotonic_newtype!(
 monotonic_newtype!(
     /// Stable frontend identity used only to isolate presentation projections.
     ProjectionClientId
+);
+monotonic_newtype!(
+    /// Client-owned revision of one separately requested presentation detail payload.
+    ProjectionRequestRevision
 );
 
 /// Monotonic time supplied by a deterministic or browser-owned driver.
@@ -659,6 +664,37 @@ pub struct ProjectionRequest {
     pub ranking: ProjectionRanking,
 }
 
+/// Separately requested selected-brain detail; never embedded in every world snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainProjectionRequest {
+    /// Stable client identity used only for presentation isolation.
+    pub client_id: ProjectionClientId,
+    /// Client-owned request revision returned verbatim in the response.
+    pub revision: ProjectionRequestRevision,
+    /// Stable scientific identities requested in client order.
+    #[serde(deserialize_with = "scriptbots_core::deserialize_brain_inspection_targets")]
+    pub targets: Vec<AgentUid>,
+    /// Producer-side structural, work, and payload limits.
+    pub limits: BrainInspectionLimits,
+}
+
+impl BrainProjectionRequest {
+    /// Construct one focused-agent request under the project hard limits.
+    #[must_use]
+    pub fn focused(
+        client_id: ProjectionClientId,
+        revision: ProjectionRequestRevision,
+        target: AgentUid,
+    ) -> Self {
+        Self {
+            client_id,
+            revision,
+            targets: vec![target],
+            limits: BrainInspectionLimits::hard(),
+        }
+    }
+}
+
 /// Source identity included in every projection and cache key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionSourceKey {
@@ -670,6 +706,44 @@ pub struct ProjectionSourceKey {
     pub host: HostRevisions,
     /// Independent static-layer content revisions.
     pub layers: SnapshotLayerRevisions,
+}
+
+/// Exact source identity for a synchronous selected-brain detail response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainProjectionSource {
+    /// Host session that owns both world state and the published snapshot stream.
+    pub session_id: HostSessionId,
+    /// Latest immutable snapshot revision visible when inspection occurred.
+    pub published_snapshot: SnapshotRevision,
+    /// Host revisions carried by that latest immutable snapshot.
+    pub published_host: HostRevisions,
+    /// Current owner revisions inspected synchronously.
+    pub inspected_host: HostRevisions,
+    /// Exact completed world tick inspected synchronously.
+    pub inspected_tick: Tick,
+}
+
+impl BrainProjectionSource {
+    /// Whether this detail can be paired with the supplied immutable snapshot without staleness.
+    #[must_use]
+    pub fn matches_snapshot(self, snapshot: &RenderSnapshot) -> bool {
+        self.session_id == snapshot.session_id
+            && self.published_snapshot == snapshot.revision
+            && self.published_host == snapshot.revisions
+            && self.inspected_host == snapshot.revisions
+            && self.inspected_tick.0 == snapshot.world.tick
+    }
+}
+
+/// Immutable, client-isolated, revisioned selected-brain projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrainProjection {
+    /// Exact current and latest-published source revisions.
+    pub source: BrainProjectionSource,
+    /// Canonical request returned for cache and response correlation.
+    pub request: BrainProjectionRequest,
+    /// Bounded current evaluator detail from core.
+    pub inspection: BrainInspectionResponse,
 }
 
 /// Pure world-to-canvas transform returned for frontend reuse and picking.

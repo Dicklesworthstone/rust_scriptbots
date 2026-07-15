@@ -3,8 +3,9 @@
 use rand::Rng;
 use scriptbots_core::{
     BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec,
-    BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection, BrainProtocolError,
-    MutationRates, OffspringStatePolicy, RandomStream,
+    BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection, BrainInspectionError,
+    BrainInspectionLimits, BrainInspectionSnapshot, BrainProtocolError, MutationRates,
+    OffspringStatePolicy, RandomStream, bound_brain_inspection,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -39,6 +40,9 @@ const INITIAL_DAMPING_MIN: f32 = 0.9;
 const INITIAL_DAMPING_MAX: f32 = 1.1;
 const MUTATED_DAMPING_MIN: f32 = 0.01;
 const MUTATED_DAMPING_MAX: f32 = 1.0;
+const ACTIVATION_LAYER_NAME: &str = "mlp.state";
+const ACTIVATION_LAYER_WIDTH: usize = 20;
+const ACTIVATION_LAYER_HEIGHT: usize = 10;
 
 /// Identifies how a synapse samples its source neuron.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,24 +228,50 @@ impl MlpBrain {
         }
     }
 
-    pub(crate) fn activations(&self) -> BrainActivations {
-        // Map internal node outputs into a single-layer activation map for now.
-        let width = 20usize;
-        let height = 10usize;
-        let mut values = vec![0.0_f32; width * height];
-        for (i, node) in self.state.iter().enumerate().take(values.len()) {
-            values[i] = node.output;
-        }
-        BrainActivations {
-            layers: vec![ActivationLayer {
-                name: "mlp.state".to_string(),
-                width,
-                height,
+    fn inspect_activations(
+        &self,
+        limits: BrainInspectionLimits,
+    ) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
+        let source_values = self.state.len();
+        let source_payload_bytes = std::mem::size_of::<ActivationLayer>()
+            .saturating_add(ACTIVATION_LAYER_NAME.len())
+            .saturating_add(source_values.saturating_mul(std::mem::size_of::<f32>()));
+        let retain_layer = limits.max_layers() >= 1
+            && limits.max_name_bytes() >= ACTIVATION_LAYER_NAME.len()
+            && limits.max_values() >= source_values
+            && limits.max_source_scalars() >= source_values
+            && limits.max_payload_bytes() >= source_payload_bytes;
+
+        let activations = if retain_layer {
+            let mut values = Vec::with_capacity(source_values);
+            values.extend(self.state.iter().map(|node| node.output));
+            let mut layers = Vec::with_capacity(1);
+            layers.push(ActivationLayer {
+                name: ACTIVATION_LAYER_NAME.to_owned(),
+                width: ACTIVATION_LAYER_WIDTH,
+                height: ACTIVATION_LAYER_HEIGHT,
                 values,
-            }],
-            connections: Vec::new(),
-            truncated: false,
-        }
+            });
+            BrainActivations {
+                layers,
+                connections: Vec::new(),
+                truncated: false,
+            }
+        } else {
+            BrainActivations {
+                layers: Vec::new(),
+                connections: Vec::new(),
+                truncated: true,
+            }
+        };
+
+        let mut snapshot =
+            bound_brain_inspection(Self::KIND.as_str(), activations, source_values, limits)?;
+        snapshot.build.source_layers = 1;
+        snapshot.build.source_name_bytes = ACTIVATION_LAYER_NAME.len();
+        snapshot.build.source_values = source_values;
+        snapshot.build.source_edges = 0;
+        Ok(snapshot)
     }
 }
 
@@ -754,9 +784,11 @@ impl BrainEvaluator for MlpEvaluator {
     fn inspect(
         &self,
         request: BrainInspection,
-    ) -> Result<Option<BrainActivations>, BrainProtocolError> {
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
         match request {
-            BrainInspection::Activations => Ok(Some(self.brain.activations())),
+            BrainInspection::Activations(limits) => {
+                self.brain.inspect_activations(limits).map(Some)
+            }
         }
     }
 
@@ -981,8 +1013,13 @@ impl Brain for MlpBrain {
         self
     }
 
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        Some(self.activations())
+    fn inspect(
+        &self,
+        request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        match request {
+            BrainInspection::Activations(limits) => self.inspect_activations(limits).map(Some),
+        }
     }
 
     /// Hash everything this brain carries: the GENOME (`nodes` — weights, targets, synapse kinds,
@@ -1049,7 +1086,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-// Specialized adapter impl removed; generic adapter in lib.rs downcasts to call `activations()`.
+// The generic adapter in lib.rs forwards bounded inspection requests through [`Brain::inspect`].
 
 #[cfg(test)]
 mod tests {
@@ -1603,11 +1640,114 @@ mod tests {
                 .checkpoint_evaluator(restored.as_ref())
                 .expect("restored checkpoint")
         );
-        assert!(
-            restored
-                .inspect(BrainInspection::Activations)
-                .expect("bounded inspection")
-                .is_some()
+        let inspection = restored
+            .inspect(BrainInspection::Activations(BrainInspectionLimits::hard()))
+            .expect("bounded inspection")
+            .expect("MLP exposes activations");
+        assert_eq!(inspection.build.source_scalars, BRAIN_SIZE);
+        assert_eq!(inspection.build.source_layers, 1);
+        assert_eq!(inspection.build.source_values, BRAIN_SIZE);
+        assert_eq!(inspection.build.retained_values, BRAIN_SIZE);
+        assert!(!inspection.build.truncated);
+    }
+
+    #[test]
+    fn tight_inspection_is_bounded_and_preserves_checkpoint_and_continuation() {
+        let family = MlpBrainFamily::new();
+        let mut rng = SmallRngStream::seed_from_u64(0x01A5_CEC7);
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut rng)
+            .expect("random genome");
+        let state = family
+            .initial_state(&genome, &mut rng)
+            .expect("initial state");
+        let mut evaluator = family.evaluator(&genome, &state).expect("evaluator");
+        evaluator
+            .evaluate(&[0.25; INPUT_SIZE])
+            .expect("primer output");
+
+        let checkpoint_before = family
+            .checkpoint_evaluator(evaluator.as_ref())
+            .expect("checkpoint before inspection");
+        let mut control = family
+            .evaluator(&genome, &checkpoint_before)
+            .expect("control evaluator");
+        let hard = BrainInspectionLimits::hard();
+        let limits = BrainInspectionLimits::tightened(
+            1,
+            ACTIVATION_LAYER_NAME.len(),
+            BRAIN_SIZE - 1,
+            0,
+            hard.max_payload_bytes(),
+            BRAIN_SIZE,
+        );
+        let inspection = evaluator
+            .inspect(BrainInspection::Activations(limits))
+            .expect("tight inspection")
+            .expect("MLP exposes activations");
+
+        assert_eq!(inspection.build.source_scalars, BRAIN_SIZE);
+        assert_eq!(inspection.build.source_layers, 1);
+        assert_eq!(
+            inspection.build.source_name_bytes,
+            ACTIVATION_LAYER_NAME.len()
+        );
+        assert_eq!(inspection.build.source_values, BRAIN_SIZE);
+        assert_eq!(inspection.build.source_edges, 0);
+        assert_eq!(inspection.build.retained_layers, 0);
+        assert_eq!(inspection.build.retained_values, 0);
+        assert!(inspection.build.retained_values <= limits.max_values());
+        assert!(inspection.build.retained_payload_bytes <= limits.max_payload_bytes());
+        assert!(inspection.build.truncated);
+        assert!(inspection.activations.layers.is_empty());
+        assert!(inspection.activations.truncated);
+        assert_eq!(
+            family
+                .checkpoint_evaluator(evaluator.as_ref())
+                .expect("checkpoint after inspection"),
+            checkpoint_before,
+            "read-only inspection must not alter recurrent evaluator state"
+        );
+
+        let next = [0.75; INPUT_SIZE];
+        assert_eq!(
+            evaluator
+                .evaluate(&next)
+                .expect("inspected continuation")
+                .map(f32::to_bits),
+            control
+                .evaluate(&next)
+                .expect("control continuation")
+                .map(f32::to_bits),
+            "inspection must not alter the next output"
+        );
+        assert_eq!(
+            family
+                .checkpoint_evaluator(evaluator.as_ref())
+                .expect("inspected continuation checkpoint"),
+            family
+                .checkpoint_evaluator(control.as_ref())
+                .expect("control continuation checkpoint")
+        );
+    }
+
+    #[test]
+    fn legacy_inspection_preserves_state_digest_and_next_output() {
+        let mut rng = SmallRngStream::seed_from_u64(0x00D1_6E57);
+        let mut brain = MlpBrain::random(&mut rng);
+        brain.tick(&[0.125; INPUT_SIZE]);
+        let mut control = brain.clone();
+        let digest_before = brain.state_digest();
+
+        let inspection = brain
+            .inspect(BrainInspection::Activations(BrainInspectionLimits::hard()))
+            .expect("legacy bounded inspection")
+            .expect("MLP exposes activations");
+        assert_eq!(inspection.build.retained_values, BRAIN_SIZE);
+        assert_eq!(brain.state_digest(), digest_before);
+        assert_eq!(
+            brain.tick(&[0.625; INPUT_SIZE]).map(f32::to_bits),
+            control.tick(&[0.625; INPUT_SIZE]).map(f32::to_bits)
         );
     }
 

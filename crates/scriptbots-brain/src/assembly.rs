@@ -2,9 +2,9 @@
 
 use rand::Rng;
 use scriptbots_core::{
-    BrainActivations, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
-    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection,
-    BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream,
+    BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec,
+    BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection, BrainInspectionError,
+    BrainInspectionSnapshot, BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream,
 };
 use std::any::Any;
 
@@ -314,9 +314,11 @@ impl BrainEvaluator for AssemblyProtocolEvaluator {
 
     fn inspect(
         &self,
-        _request: BrainInspection,
-    ) -> Result<Option<BrainActivations>, BrainProtocolError> {
-        Ok(None)
+        request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        match request {
+            BrainInspection::Activations(_) => Ok(None),
+        }
     }
 
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
@@ -672,13 +674,24 @@ impl Brain for AssemblyBrain {
     fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
         self
     }
+
+    fn inspect(
+        &self,
+        request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        match request {
+            BrainInspection::Activations(_) => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::RngCore;
-    use scriptbots_core::{AgentUid, BrainFamilyAdapter, SmallRngStream, Tick};
+    use scriptbots_core::{
+        AgentUid, BrainFamilyAdapter, BrainInspectionLimits, SmallRngStream, Tick,
+    };
 
     #[derive(Clone, Debug, Default)]
     struct AlternatingThresholdStream {
@@ -901,6 +914,20 @@ mod tests {
         let checkpoint = family
             .checkpoint_evaluator(evaluator.as_ref())
             .expect("validated checkpoint");
+        assert!(
+            evaluator
+                .inspect(BrainInspection::Activations(BrainInspectionLimits::hard(),))
+                .expect("Assembly inspection refusal")
+                .is_none(),
+            "Assembly must explicitly report that activations are unsupported"
+        );
+        assert_eq!(
+            family
+                .checkpoint_evaluator(evaluator.as_ref())
+                .expect("checkpoint after unsupported inspection"),
+            checkpoint,
+            "unsupported inspection must not alter Assembly working state"
+        );
         assert_ne!(checkpoint.payload(), state.payload());
         let mut restored = family
             .evaluator(&genome, &checkpoint)

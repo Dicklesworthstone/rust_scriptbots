@@ -13,10 +13,14 @@ use serde::{Deserialize, Serialize};
 
 use scriptbots_brain::{Brain, BrainCloneError, BrainKind, BrainMutationError, into_runner};
 use scriptbots_core::{
-    ActivationLayer, BrainActivations, BrainRunner, BrainSpawnError, NeuroflowActivationKind,
-    NeuroflowSettings, RandomStream, ScientificStateError, WorldState,
+    ActivationLayer, BrainActivations, BrainInspection, BrainInspectionError,
+    BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, BrainSpawnError,
+    NeuroflowActivationKind, NeuroflowSettings, RandomStream, ScientificStateError, WorldState,
+    bound_brain_inspection,
 };
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Number of inputs inherited from the simulation sensors.
 const INPUT_SIZE: usize = scriptbots_core::INPUT_SIZE;
@@ -285,6 +289,49 @@ impl NeuroflowBrainConfig {
         }
         Ok(())
     }
+
+    /// Number of numeric scalars NeuroFlow's JSON inspection must traverse.
+    ///
+    /// This is derived solely from the validated architecture, so an inspection request can be
+    /// refused before serializing the live NeuroFlow network. Every layer contains four
+    /// per-neuron state arrays (`v`, `y`, `delta`, and `prev_delta`) plus one bias-inclusive weight
+    /// row per output neuron. The network also serializes learning rate, momentum, and error.
+    fn inspection_source_scalars(&self) -> Result<usize, NeuroflowBrainError> {
+        self.validate()?;
+        const NETWORK_SCALARS: usize = 3;
+        let mut previous = INPUT_SIZE;
+        let mut total = NETWORK_SCALARS;
+        for outputs in self
+            .hidden_layers
+            .iter()
+            .copied()
+            .chain(std::iter::once(OUTPUT_SIZE))
+        {
+            let weights = outputs
+                .checked_mul(previous.checked_add(1).ok_or(
+                    NeuroflowBrainError::ArchitectureOverflow {
+                        context: "inspection weights per neuron",
+                    },
+                )?)
+                .ok_or(NeuroflowBrainError::ArchitectureOverflow {
+                    context: "inspection weight scalar count",
+                })?;
+            let state =
+                outputs
+                    .checked_mul(4)
+                    .ok_or(NeuroflowBrainError::ArchitectureOverflow {
+                        context: "inspection state scalar count",
+                    })?;
+            total = total
+                .checked_add(weights)
+                .and_then(|value| value.checked_add(state))
+                .ok_or(NeuroflowBrainError::ArchitectureOverflow {
+                    context: "inspection source scalar count",
+                })?;
+            previous = outputs;
+        }
+        Ok(total)
+    }
 }
 
 impl Default for NeuroflowBrainConfig {
@@ -303,6 +350,9 @@ pub struct NeuroflowBrain {
     network: FeedForward,
     config: NeuroflowBrainConfig,
     inputs: Vec<f64>,
+    inspection_source_scalars: usize,
+    #[cfg(test)]
+    inspection_json_conversions: AtomicUsize,
 }
 
 #[derive(Serialize)]
@@ -340,11 +390,15 @@ impl NeuroflowBrain {
         config: NeuroflowBrainConfig,
         rng: &mut dyn RandomStream,
     ) -> Result<Self, NeuroflowBrainError> {
+        let inspection_source_scalars = config.inspection_source_scalars()?;
         let network = Self::build_network(&config, rng)?;
         Ok(Self {
             network,
             config,
             inputs: vec![0.0; INPUT_SIZE],
+            inspection_source_scalars,
+            #[cfg(test)]
+            inspection_json_conversions: AtomicUsize::new(0),
         })
     }
 
@@ -516,6 +570,148 @@ impl NeuroflowBrain {
         let u2 = rng.random::<f64>();
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
+
+    fn inspection_error(detail: impl Into<String>) -> BrainInspectionError {
+        BrainInspectionError::InvalidPayload {
+            family: Self::KIND.as_str().to_owned(),
+            detail: detail.into(),
+        }
+    }
+
+    fn decimal_digits(mut value: usize) -> usize {
+        let mut digits = 1;
+        while value >= 10 {
+            value /= 10;
+            digits += 1;
+        }
+        digits
+    }
+
+    fn inspect_activations(
+        &self,
+        limits: BrainInspectionLimits,
+    ) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
+        if self.inspection_source_scalars > limits.max_source_scalars() {
+            return Err(BrainInspectionError::SourceScalarLimitExceeded {
+                family: Self::KIND.as_str().to_owned(),
+                required: self.inspection_source_scalars,
+                limit: limits.max_source_scalars(),
+            });
+        }
+
+        #[cfg(test)]
+        self.inspection_json_conversions
+            .fetch_add(1, Ordering::Relaxed);
+        let value = serde_json::to_value(&self.network).map_err(|error| {
+            Self::inspection_error(format!("NeuroFlow serialization failed: {error}"))
+        })?;
+        let source_layers = value
+            .get("layers")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Self::inspection_error("serialized network has no `layers` array"))?;
+
+        let mut source_name_bytes = 0usize;
+        let mut source_values = 0usize;
+        let mut retained_layers = 0usize;
+        let mut retained_name_bytes = 0usize;
+        let mut retained_values = 0usize;
+        let mut accepting_layers = true;
+
+        for (layer_index, layer) in source_layers.iter().enumerate() {
+            let values = layer
+                .get("y")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Self::inspection_error(format!(
+                        "serialized layer {layer_index} has no `y` array"
+                    ))
+                })?;
+            let name_bytes = "nf.layer.".len() + Self::decimal_digits(layer_index);
+            source_name_bytes = source_name_bytes.saturating_add(name_bytes);
+            source_values = source_values.saturating_add(values.len());
+
+            if !accepting_layers {
+                continue;
+            }
+            let candidate_layers = retained_layers.saturating_add(1);
+            let candidate_name_bytes = retained_name_bytes.saturating_add(name_bytes);
+            let candidate_values = retained_values.saturating_add(values.len());
+            let candidate_payload_bytes = candidate_layers
+                .saturating_mul(std::mem::size_of::<ActivationLayer>())
+                .saturating_add(candidate_name_bytes)
+                .saturating_add(candidate_values.saturating_mul(std::mem::size_of::<f32>()));
+            if candidate_layers > limits.max_layers()
+                || candidate_name_bytes > limits.max_name_bytes()
+                || candidate_values > limits.max_values()
+                || candidate_payload_bytes > limits.max_payload_bytes()
+            {
+                accepting_layers = false;
+                continue;
+            }
+            retained_layers = candidate_layers;
+            retained_name_bytes = candidate_name_bytes;
+            retained_values = candidate_values;
+        }
+
+        let mut layers = Vec::with_capacity(retained_layers);
+        for (layer_index, layer) in source_layers.iter().take(retained_layers).enumerate() {
+            let source_values = layer
+                .get("y")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Self::inspection_error(format!(
+                        "serialized layer {layer_index} has no `y` array"
+                    ))
+                })?;
+            let mut values = Vec::with_capacity(source_values.len());
+            for (value_index, value) in source_values.iter().enumerate() {
+                let value = value.as_f64().ok_or_else(|| {
+                    Self::inspection_error(format!(
+                        "serialized layer {layer_index} activation {value_index} is not numeric"
+                    ))
+                })? as f32;
+                if !value.is_finite() {
+                    return Err(Self::inspection_error(format!(
+                        "serialized layer {layer_index} activation {value_index} is not finite"
+                    )));
+                }
+                values.push(value);
+            }
+            let values = values.into_boxed_slice().into_vec();
+            let width = (values.len() as f32).sqrt().ceil() as usize;
+            let height = if width == 0 {
+                0
+            } else {
+                values.len().div_ceil(width)
+            };
+            layers.push(ActivationLayer {
+                name: format!("nf.layer.{layer_index}")
+                    .into_boxed_str()
+                    .into_string(),
+                width,
+                height,
+                values,
+            });
+        }
+
+        let activations = BrainActivations {
+            layers: layers.into_boxed_slice().into_vec(),
+            connections: Vec::new(),
+            truncated: retained_layers < source_layers.len(),
+        };
+        let mut snapshot = bound_brain_inspection(
+            Self::KIND.as_str(),
+            activations,
+            self.inspection_source_scalars,
+            limits,
+        )?;
+        snapshot.build.source_layers = source_layers.len();
+        snapshot.build.source_name_bytes = source_name_bytes;
+        snapshot.build.source_values = source_values;
+        snapshot.build.source_edges = 0;
+        snapshot.build.truncated = snapshot.activations.truncated;
+        Ok(snapshot)
+    }
 }
 
 impl Brain for NeuroflowBrain {
@@ -612,6 +808,9 @@ impl Brain for NeuroflowBrain {
             network,
             config: self.config.clone(),
             inputs: vec![0.0; INPUT_SIZE],
+            inspection_source_scalars: self.inspection_source_scalars,
+            #[cfg(test)]
+            inspection_json_conversions: AtomicUsize::new(0),
         }))
     }
 
@@ -623,39 +822,13 @@ impl Brain for NeuroflowBrain {
         self
     }
 
-    fn snapshot_activations(&self) -> Option<BrainActivations> {
-        let value = serde_json::to_value(&self.network).ok()?;
-        let layers = value.get("layers")?.as_array()?.to_vec();
-        let mut result_layers: Vec<ActivationLayer> = Vec::new();
-        for (li, layer_val) in layers.iter().enumerate() {
-            let y = layer_val
-                .get("y")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let values: Vec<f32> = y
-                .into_iter()
-                .filter_map(|v| v.as_f64())
-                .map(|v| v as f32)
-                .collect();
-            let width = (values.len() as f32).sqrt().ceil() as usize;
-            let height = if width == 0 {
-                0
-            } else {
-                values.len().div_ceil(width)
-            };
-            result_layers.push(ActivationLayer {
-                name: format!("nf.layer.{li}"),
-                width,
-                height,
-                values,
-            });
+    fn inspect(
+        &self,
+        request: BrainInspection,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        match request {
+            BrainInspection::Activations(limits) => self.inspect_activations(limits).map(Some),
         }
-        Some(BrainActivations {
-            layers: result_layers,
-            connections: Vec::new(),
-            truncated: false,
-        })
     }
 }
 
@@ -663,6 +836,15 @@ impl Brain for NeuroflowBrain {
 mod tests {
     use super::*;
     use scriptbots_core::SmallRngStream;
+
+    fn numeric_scalar_count(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Number(_) => 1,
+            serde_json::Value::Array(values) => values.iter().map(numeric_scalar_count).sum(),
+            serde_json::Value::Object(fields) => fields.values().map(numeric_scalar_count).sum(),
+            _ => 0,
+        }
+    }
 
     #[test]
     fn runner_executes_and_returns_outputs() {
@@ -672,6 +854,124 @@ mod tests {
         let outputs = runner.tick(&[0.0; INPUT_SIZE]);
         assert_eq!(outputs.len(), OUTPUT_SIZE);
         assert!(outputs.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn inspection_applies_tight_bounds_before_building_layers() {
+        let config = NeuroflowBrainConfig {
+            hidden_layers: vec![2, 3],
+            ..NeuroflowBrainConfig::default()
+        };
+        let mut rng = SmallRngStream::seed_from_u64(0x1A5E);
+        let brain = NeuroflowBrain::new(config, &mut rng).expect("small NeuroFlow brain");
+        let limits = BrainInspectionLimits::tightened(1, 10, 2, 0, 128, usize::MAX);
+        let snapshot = brain
+            .inspect(BrainInspection::Activations(limits))
+            .expect("bounded inspection")
+            .expect("NeuroFlow exposes activations");
+
+        assert_eq!(snapshot.activations.layers.len(), 1);
+        assert_eq!(snapshot.activations.layers[0].name, "nf.layer.0");
+        assert_eq!(snapshot.activations.layers[0].values.len(), 2);
+        assert!(snapshot.activations.connections.is_empty());
+        assert!(snapshot.activations.truncated);
+        assert_eq!(snapshot.build.source_layers, 3);
+        assert_eq!(snapshot.build.source_values, 2 + 3 + OUTPUT_SIZE);
+        assert_eq!(snapshot.build.retained_layers, 1);
+        assert_eq!(snapshot.build.retained_name_bytes, 10);
+        assert_eq!(snapshot.build.retained_values, 2);
+        assert_eq!(snapshot.build.retained_edges, 0);
+        assert!(snapshot.build.retained_payload_bytes <= limits.max_payload_bytes());
+        assert_eq!(
+            snapshot.build.source_scalars,
+            numeric_scalar_count(
+                &serde_json::to_value(&brain.network).expect("serialize NeuroFlow network")
+            )
+        );
+    }
+
+    #[test]
+    fn source_scalar_refusal_happens_before_json_conversion() {
+        let mut rng = SmallRngStream::seed_from_u64(0xB0D6E7);
+        let brain = NeuroflowBrain::new(NeuroflowBrainConfig::default(), &mut rng)
+            .expect("default NeuroFlow brain");
+        let required = brain.inspection_source_scalars;
+        let limit = required.saturating_sub(1);
+        let limits = BrainInspectionLimits::tightened(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            limit,
+        );
+
+        let error = brain
+            .inspect(BrainInspection::Activations(limits))
+            .expect_err("source work over the request limit must be refused");
+        assert_eq!(
+            error,
+            BrainInspectionError::SourceScalarLimitExceeded {
+                family: NeuroflowBrain::KIND.as_str().to_owned(),
+                required,
+                limit,
+            }
+        );
+        assert_eq!(
+            brain.inspection_json_conversions.load(Ordering::Relaxed),
+            0,
+            "budget refusal must occur before NeuroFlow JSON conversion"
+        );
+    }
+
+    #[test]
+    fn ordinary_tick_does_not_serialize_inspection_state() {
+        let mut rng = SmallRngStream::seed_from_u64(0x71C);
+        let mut brain = NeuroflowBrain::new(NeuroflowBrainConfig::default(), &mut rng)
+            .expect("default NeuroFlow brain");
+
+        let outputs = brain.tick(&[0.125; INPUT_SIZE]);
+
+        assert!(outputs.iter().all(|value| value.is_finite()));
+        assert_eq!(
+            brain.inspection_json_conversions.load(Ordering::Relaxed),
+            0,
+            "ordinary evaluation must not enter the inspection serializer"
+        );
+    }
+
+    #[test]
+    fn inspection_is_read_only_and_preserves_the_next_output() {
+        let mut rng = SmallRngStream::seed_from_u64(0xF001);
+        let mut inspected = NeuroflowBrain::new(NeuroflowBrainConfig::default(), &mut rng)
+            .expect("default NeuroFlow brain");
+        let mut primer = [0.0; INPUT_SIZE];
+        for (index, value) in primer.iter_mut().enumerate() {
+            *value = index as f32 * 0.03125 - 0.25;
+        }
+        inspected.tick(&primer);
+        let mut control = inspected
+            .clone_box()
+            .expect("inspection control clone must be exact");
+        let state_before =
+            serde_json::to_value(&inspected.network).expect("serialize pre-inspection state");
+
+        inspected
+            .inspect(BrainInspection::Activations(BrainInspectionLimits::hard()))
+            .expect("inspection succeeds")
+            .expect("NeuroFlow exposes activations");
+
+        let state_after =
+            serde_json::to_value(&inspected.network).expect("serialize post-inspection state");
+        assert_eq!(state_after, state_before);
+        assert_eq!(
+            inspected
+                .inspection_json_conversions
+                .load(Ordering::Relaxed),
+            1
+        );
+        let next_inputs = [0.375; INPUT_SIZE];
+        assert_eq!(inspected.tick(&next_inputs), control.tick(&next_inputs));
     }
 
     #[test]

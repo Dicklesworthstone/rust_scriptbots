@@ -454,7 +454,7 @@ Dynamic agent data may be rebuilt at UI cadence. Static terrain and configuratio
 
 Scientific events use different semantics: they live in a sequenced journal. UI subscriptions receive bounded notifications/cursors, detect gaps, and catch up from the journal or explicitly report that their display window was truncated. Snapshot loss never implies scientific event loss.
 
-### 5.6 projection model
+### 5.6 projection model [Currently In Progress — bd-2z0.3.8, TopazCastle; bounded revisioned brain-detail pull]
 
 Shared pure projection functions or a keyed projection broker perform work that is currently duplicated under world locks:
 
@@ -616,7 +616,7 @@ cumulative reports; each completed tick declares an absolute `1e-5` plus relativ
 pools. Ledger state is outside characterization/digest, replay, persistence, RNG,
 and scientific decisions.
 
-### 6.5 brain genome/evaluator-state separation
+### 6.5 brain genome/evaluator-state separation [Currently In Progress — bd-2z0.3.8, TopazCastle; bounded on-demand inspection boundary]
 
 The current `Brain`/`BrainRunner` bridge loses the operations required by evolution. Replace trait-object cloning with versioned heritable data **and** separately versioned dynamic evaluator state. Evaluator state is not universally ephemeral: recurrent MLP/DWRAON node state and Assembly working cells can affect future outputs and must survive checkpoints when the family contract says so.
 
@@ -732,7 +732,7 @@ Each agent stores the exact genome envelope, versioned evaluator state, and a li
 
 This removes the need to clone an opaque runner and makes persistence, replay, lineage, stateful-brain behavior, and external inspection truthful.
 
-### 6.6 brain-family acceptance
+### 6.6 brain-family acceptance [Currently In Progress — bd-2z0.3.8, TopazCastle; producer-side inspection bounds and purity proof]
 
 Before a family can enter a scenario it must prove:
 
