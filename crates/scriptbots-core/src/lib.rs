@@ -560,7 +560,7 @@ impl BrainInspectionLimits {
 
     /// Construct a request no larger than the hard ceiling on every axis.
     #[must_use]
-    pub const fn tightened(
+    pub fn tightened(
         max_layers: usize,
         max_name_bytes: usize,
         max_values: usize,
@@ -755,10 +755,7 @@ pub fn bound_brain_inspection(
         layers.push(candidate);
 
         if activation_payload_bytes_parts(&layers, layers.len(), 0) > limits.max_payload_bytes {
-            if let Some(removed) = layers.pop() {
-                retained_name_bytes = retained_name_bytes.saturating_sub(removed.name.len());
-                retained_values = retained_values.saturating_sub(removed.values.len());
-            }
+            let _removed = layers.pop();
             truncated = true;
             break;
         }
