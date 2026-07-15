@@ -27,6 +27,15 @@ use std::time::Instant;
 use scriptbots_storage::{PersistenceBatchId, StorageError, StorageReader};
 use serde::Serialize;
 
+/// Native, dependency-free statistics for offline detector certification (bd-2z0.11.6).
+///
+/// Bootstrap confidence intervals, permutation tests, and effect sizes as pure functions over
+/// `&[f64]`. Implemented natively rather than via `fsci-stats` because the latter is git-only and
+/// nightly-only, and the four estimators the certification actually needs require neither — the
+/// module's calibration tests demonstrate the native path is sufficient, which is the evidence
+/// bd-2z0.11.3's adapter decision consumes. Never enters core or any tick path.
+pub mod stats;
+
 /// Schema version stamped into every machine-readable report payload.
 ///
 /// Bump ONLY with a migration note in the owning Bead/release evidence. Full
