@@ -924,7 +924,7 @@ The current unbounded storage channel carrying cloned full batches can exhaust m
 
 `Admitted` is not crash durability. `Applied` means the scientific transition occurred. `Durable` is emitted only after the command/event journal is acknowledged by storage. In strict experiment mode, new scientific ticks do not proceed past the lossless high-water mark. The first implementation creates one FrankenSQLite connection inside the storage worker thread, keeps it exclusively there, and commits each accepted batch transactionally. This is mandatory because the current `Connection` is deliberately `!Send + !Sync`; the existing pre-opened `Arc<Mutex<Storage>>` topology cannot be retained. `StoragePipeline` keeps only bounded channels, receipts, published analytics state, and the join handle. Analytics use a separate same-thread read connection or the published read model; a `Connection` is never moved to or concurrently shared across threads. Multi-connection write concurrency is enabled only after a focused MVCC contention/retry test proves the access pattern.
 
-### 7.6 FrankenSQLite replacement and multi-run schema [Currently In Progress — bd-2z0.5.1, TopazCastle, 2026-07-15]
+### 7.6 FrankenSQLite replacement and multi-run schema [Completed — bd-2z0.5.1, TopazCastle, 2026-07-15; DSR workspace proof at `8861e55f123c58c4225bc4fef1d4561e6d7a93ee`]
 
 DuckDB is not an accepted backend. Remove its manifest edges, native build graph, direct test imports, mode names, file extensions, documentation, and CI assumptions. The replacement is the public `fsqlite` facade from `~/projects/frankensqlite`, pinned to immutable commit `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` (package `0.1.16`). This revision provides descriptor-bound `Connection::file_identity`, create-free existing-file open, and expected-identity verification on the already-open VFS handle before recovery can inspect or mutate database bytes, without changing the package version. Its `default-features = false, features = ["native"]` source check passed under this workspace's pinned nightly; JSON payloads remain ordinary `TEXT`, so ScriptBots does not explicitly request extension features. The current upstream `native` feature still activates its extension bundle and is measured separately.
 
@@ -968,7 +968,33 @@ Every table is scoped by `run_id`. The minimum normalized schema includes:
 - `state_digests`;
 - `artifacts`.
 
+The completed V6 schema applies this boundary to every scientific and
+operational table, including the persistence ledger, outbox, progress,
+commands, checkpoints, replay events, artifacts, genomes, lineage, and
+interactions. `RunId` is a canonical nonzero 128-bit identifier serialized as
+32 lowercase hexadecimal characters. Writers are bound to one run; appending
+a run is atomic, rejects duplicate IDs, and requires every earlier run to have
+reached its durable watermark. Readers must select a run explicitly once a
+database contains more than one, and run discovery is a bounded, structurally
+validated catalog page rather than an unbounded scan.
+
+Production startup now materializes the seed before world construction, then
+registers the complete canonical V2 manifest before persistence is bound or
+tick zero can run. It stores independently verified projections for
+scenario identity, config digest, RNG, brain roster, build/source/toolchain,
+features, target, and bootstrap evidence. Recovery recomputes every stored
+manifest digest under the writer/path/descriptor lease. V3-V5 development
+databases are refused read-only before writable open; no implicit destructive
+upgrade exists.
+
 Schema migrations use FrankenSQLite's `MigrationRunner`/`PRAGMA user_version`, are versioned and transactionally tested, and never destructively rewrite a user database without explicit permission. One database may hold multiple matched-seed variants without primary-key collisions. The conformance gate covers file reopen, explicit close/checkpoint, rollback on a failed batch, prepared parameter binding, aggregate queries, replay ordering, two independent connections, shutdown flush, `PRAGMA integrity_check`, and a concurrent-writer retry scenario that preserves FrankenSQLite's default MVCC behavior. Retry the whole transaction only for `FrankenError::is_transient()`.
+
+Acceptance evidence is the DSR-only `darwin/arm64` union run
+`bd-2z0-5-1-v6-20260715-8` at source commit `8861e55f...`: formatting,
+touched-file UBS, workspace all-target check, workspace Clippy with warnings
+denied, and the complete workspace test suite all passed. The proof records
+clean source-status and source-diff digests plus Cargo.lock digest
+`27efb05ff6b7dafa4f7ea7f00a9fcd4218eb6b303fc64f9162dcbf27c7b19700`.
 
 ### 7.7 experiment runner
 

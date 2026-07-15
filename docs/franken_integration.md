@@ -10,7 +10,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 
 | Library | Door | Pin | Feature gate | Status |
 |---|---|---|---|---|
-| `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB |
+| `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; clean V6 multi-run/provenance schema |
 | `asupersync` 0.3.6 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.6` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
 | `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | dependency admitted; FtBrain implementation remains bd-2z0.3.12.3 |
@@ -105,6 +105,13 @@ release-packaging obligation: bd-2z0.13.6).
    `ci/check_franken_licenses.sh`).
 8. **Determinism first**: the world tick stays synchronous; brains and buses
    must prove same-seed bit-identity across thread counts before shipping.
+9. **V6 is run-bound and fail-closed**: canonical nonzero 128-bit `RunId`
+   scopes every scientific and operational row. Writers own one run; append is
+   atomic and allowed only after prior runs are fully durable. Multi-run reads
+   select a run explicitly, catalog discovery is bounded and structurally
+   validated, recovery revalidates canonical V2/V2.1 manifest projections and
+   digests under the writer lease, and V3-V5 files are refused without rewrite
+   (`bd-2z0.5.1`).
 
 ## 5. Program bead index + status
 
@@ -117,7 +124,10 @@ and review log). Status at last reconcile:
   denylist + golden), bd-2z0.11.5 (analytics scaffold), bd-2z0.13.6 (rider
   release packaging), bd-2z0.3.12.1 (frankentorch dependency admission),
   bd-2z0.8.18 (performance gates; DSR-only acceptance), bd-2z0.4.12
-  (legacy app Crossfire removed; bounded Asupersync command bus DSR-verified).
+  (legacy app Crossfire removed; bounded Asupersync command bus DSR-verified),
+  bd-2z0.5.1 (V6 multi-run schema, pre-tick-zero canonical provenance,
+  run-bound recovery/readers, and bounded catalog; DSR workspace-verified at
+  `8861e55f`).
 - **OPEN, ready**: bd-2z0.3.12.2 (BatchBrain — sequenced after the
   bd-16g.15.x sense-lane digest move), bd-2z0.8.9.12 (fsqlite async-api),
   bd-2z0.4.14 (`Cx::scoped_cpu` spike), and bd-2z0.12.4 (BrowserRuntime
@@ -132,3 +142,8 @@ The pinned local DSR verification profile is the only acceptance lane. It runs
 `check_fsqlite_pin.sh`, and `check_wasm_graph.sh` together with their relevant
 build/test surfaces. Each standalone guard has a `--self-test` mode; hosted
 workflow results are not acceptance evidence.
+
+The `bd-2z0.5.1` close proof is DSR run
+`bd-2z0-5-1-v6-20260715-8` on `darwin/arm64`: formatting, touched-file UBS,
+workspace all-target check, strict workspace Clippy, and the complete workspace
+test suite passed at commit `8861e55f`.
