@@ -680,7 +680,7 @@ impl HostCore {
         Ok(true)
     }
 
-    fn current_blocker(&self) -> Option<HostBlocker> {
+    const fn current_blocker(&self) -> Option<HostBlocker> {
         if let Some(blocker) = self.retained_blocker {
             return Some(blocker);
         }
