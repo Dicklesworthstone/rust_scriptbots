@@ -72,7 +72,7 @@ impl LocalRng {
     }
 
     /// A fair coin.
-    fn coin(&mut self) -> bool {
+    const fn coin(&mut self) -> bool {
         self.next_u64() & 1 == 1
     }
 }
