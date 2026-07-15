@@ -140,26 +140,36 @@ pub const SCRIPTBOTS_SCHEMA_V1: &str = r#"
         PRIMARY KEY (tick, agent_uid)
     );
     CREATE TABLE births (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
-        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
-        birth_ordinal INTEGER CHECK (birth_ordinal IS NULL OR birth_ordinal >= 0),
-        parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
-        parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
+        tick INTEGER NOT NULL,
+        agent_uid INTEGER NOT NULL,
+        spawn_ordinal INTEGER NOT NULL,
+        birth_ordinal INTEGER,
+        parent_a INTEGER,
+        parent_b INTEGER,
         brain_kind TEXT,
-        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        brain_key INTEGER,
         herbivore_tendency REAL NOT NULL,
-        generation INTEGER NOT NULL CHECK (generation >= 0),
+        generation INTEGER NOT NULL,
         position_x REAL NOT NULL,
         position_y REAL NOT NULL,
-        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
-        origin TEXT NOT NULL CHECK (origin IN ('born', 'seeded', 'injected')),
-        CHECK (origin <> 'seeded' OR tick = 0),
+        is_hybrid INTEGER NOT NULL,
+        origin TEXT NOT NULL,
+        PRIMARY KEY (tick, agent_uid),
+        CHECK (tick >= 0),
+        CHECK (agent_uid >= 0),
+        CHECK (spawn_ordinal >= 0),
+        CHECK ((birth_ordinal IS NULL) OR (birth_ordinal >= 0)),
+        CHECK ((parent_a IS NULL) OR (parent_a >= 0)),
+        CHECK ((parent_b IS NULL) OR (parent_b >= 0)),
+        CHECK ((brain_key IS NULL) OR (brain_key >= 0)),
+        CHECK (generation >= 0),
+        CHECK (is_hybrid IN (0, 1)),
+        CHECK (origin IN ('born', 'seeded', 'injected')),
+        CHECK ((origin != 'seeded') OR (tick = 0)),
         CHECK (
-            (origin = 'born' AND birth_ordinal IS NOT NULL)
-            OR (origin IN ('seeded', 'injected') AND birth_ordinal IS NULL)
-        ),
-        PRIMARY KEY (tick, agent_uid)
+            ((origin = 'born') AND (birth_ordinal IS NOT NULL))
+            OR ((origin IN ('seeded', 'injected')) AND (birth_ordinal IS NULL))
+        )
     );
     CREATE UNIQUE INDEX births_agent_uid_unique ON births (agent_uid);
     CREATE UNIQUE INDEX births_spawn_ordinal_unique ON births (spawn_ordinal);
