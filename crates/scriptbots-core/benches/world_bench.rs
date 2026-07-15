@@ -181,14 +181,15 @@ fn bench_hydrology_map_generation(c: &mut Criterion) {
     group.finish();
 }
 
-const PERF_GATE_SCHEMA: &str = "scriptbots.perf-gate.v2";
+const PERF_GATE_SCHEMA: &str = "scriptbots.perf-gate.v3";
 const PERF_VERDICT_SCHEMA: &str = "scriptbots.perf-verdict.v1";
-const PERF_SCENARIO_CONTRACT: &str = "scriptbots.perf-scenario.v2";
+const PERF_SCENARIO_CONTRACT: &str = "scriptbots.perf-scenario.v3";
 const PERF_SEED: u64 = 0x5eed_ba5e;
 const PERF_WARMUPS: usize = 3;
 const PERF_REPETITIONS: usize = 5;
 const PERF_TICKS: usize = 200;
 const PERF_WINDOW_TICKS: usize = 20;
+const PERF_SNAPSHOT_SAMPLES_PER_TICK: usize = 5;
 const MAX_CV_PCT: f64 = 5.0;
 const MAX_TPS_REGRESSION_PCT: f64 = 10.0;
 const MIN_TPS_1K: f64 = 60.0;
@@ -508,7 +509,9 @@ struct Fingerprint {
 struct GatePolicy {
     warmup_repetitions: usize,
     measured_repetitions: usize,
-    minimum_snapshot_samples_per_repetition: usize,
+    ticks_per_repetition: usize,
+    snapshot_samples_per_tick: usize,
+    snapshot_samples_per_repetition: usize,
     median_window_ticks: usize,
     max_cv_pct: f64,
     max_tps_regression_pct: f64,
@@ -701,7 +704,10 @@ fn run_repetition(
 
     let mut profiled_world = build_perf_world(agents, brain_family)?;
     let mut profiler = WorldStepProfiler::default();
-    let mut snapshot_ns = Vec::with_capacity(ticks);
+    let snapshot_sample_capacity = ticks
+        .checked_mul(PERF_SNAPSHOT_SAMPLES_PER_TICK)
+        .ok_or_else(|| "snapshot sample count overflowed usize".to_owned())?;
+    let mut snapshot_ns = Vec::with_capacity(snapshot_sample_capacity);
     let mut profiled_step_total_ns = Vec::with_capacity(ticks);
     let mut stage_samples: Vec<Vec<Option<u64>>> = WorldStepStage::all()
         .iter()
@@ -719,17 +725,19 @@ fn run_repetition(
             stage_samples[sample_index].push(profile.elapsed_ns(stage));
         }
 
-        let snapshot_started = Instant::now();
-        let snapshot = DynamicWorldSnapshot::from_world(&profiled_world);
-        let elapsed = duration_ns(snapshot_started.elapsed());
-        if snapshot.agents.len() != agents {
-            return Err(format!(
-                "dynamic snapshot drifted from {agents} to {} agents",
-                snapshot.agents.len()
-            ));
+        for _ in 0..PERF_SNAPSHOT_SAMPLES_PER_TICK {
+            let snapshot_started = Instant::now();
+            let snapshot = DynamicWorldSnapshot::from_world(&profiled_world);
+            let elapsed = duration_ns(snapshot_started.elapsed());
+            if snapshot.agents.len() != agents {
+                return Err(format!(
+                    "dynamic snapshot drifted from {agents} to {} agents",
+                    snapshot.agents.len()
+                ));
+            }
+            black_box(snapshot);
+            snapshot_ns.push(elapsed);
         }
-        black_box(snapshot);
-        snapshot_ns.push(elapsed);
     }
     let profiled_digest = profiled_world
         .characterization_digest_v0()
@@ -1437,10 +1445,22 @@ fn validate_repetition(
         ));
     }
 
-    if repetition.snapshot_ns.len() != ticks || repetition.snapshot_ns.contains(&0) {
+    let expected_snapshot_samples = ticks
+        .checked_mul(policy.snapshot_samples_per_tick)
+        .ok_or_else(|| {
+            format!(
+                "scenario `{}` snapshot sample count overflowed usize",
+                scenario.id
+            )
+        })?;
+    if repetition.snapshot_ns.len() != expected_snapshot_samples
+        || repetition.snapshot_ns.contains(&0)
+    {
         return Err(format!(
-            "scenario `{}` repetition {} has invalid snapshot samples",
-            scenario.id, repetition.index
+            "scenario `{}` repetition {} has invalid snapshot samples: got {}, expected {expected_snapshot_samples}",
+            scenario.id,
+            repetition.index,
+            repetition.snapshot_ns.len()
         ));
     }
     if repetition.snapshot_p50_ns != nearest_rank(&repetition.snapshot_ns, 50)
@@ -1588,9 +1608,17 @@ fn validate_artifact(artifact: &PerfArtifact, require_baseline: bool) -> GateRes
     if artifact.source_commit != artifact.fingerprint.git_commit {
         return Err("source commit does not match the fingerprint".to_owned());
     }
-    let ticks = artifact.policy.minimum_snapshot_samples_per_repetition;
+    let ticks = artifact.policy.ticks_per_repetition;
     if ticks < 200 || !ticks.is_multiple_of(PERF_WINDOW_TICKS) {
         return Err(format!("invalid gate tick count {ticks}"));
+    }
+    let expected_snapshot_samples = ticks
+        .checked_mul(artifact.policy.snapshot_samples_per_tick)
+        .ok_or_else(|| "artifact snapshot sample count overflowed usize".to_owned())?;
+    if artifact.policy.snapshot_samples_per_tick == 0
+        || artifact.policy.snapshot_samples_per_repetition != expected_snapshot_samples
+    {
+        return Err("artifact snapshot sampling policy is internally inconsistent".to_owned());
     }
     if artifact.policy != gate_policy(ticks) {
         return Err("artifact policy differs from the compiled gate policy".to_owned());
@@ -1988,12 +2016,14 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
     let mut output = String::new();
     output.push_str("# ScriptBots performance gate\n\n");
     output.push_str(&format!(
-        "- Verdict: `{:?}`\n- Machine class: `{}`\n- Commit: `{}`\n- Mode: `{}`\n- Snapshot operation: `{}`\n- Stage schema: `{}`\n\n",
+        "- Verdict: `{:?}`\n- Machine class: `{}`\n- Commit: `{}`\n- Mode: `{}`\n- Snapshot operation: `{}`\n- Snapshot sampling: `{} independent timings/tick; {} raw samples/repetition`\n- Stage schema: `{}`\n\n",
         verdict.status,
         artifact.fingerprint.machine_class_id,
         artifact.source_commit,
         artifact.mode,
         artifact.dynamic_snapshot_schema,
+        artifact.policy.snapshot_samples_per_tick,
+        artifact.policy.snapshot_samples_per_repetition,
         artifact.world_step_profile_schema
     ));
     for reason in &verdict.reasons {
@@ -2062,7 +2092,9 @@ fn gate_policy(ticks: usize) -> GatePolicy {
     GatePolicy {
         warmup_repetitions: PERF_WARMUPS,
         measured_repetitions: PERF_REPETITIONS,
-        minimum_snapshot_samples_per_repetition: ticks,
+        ticks_per_repetition: ticks,
+        snapshot_samples_per_tick: PERF_SNAPSHOT_SAMPLES_PER_TICK,
+        snapshot_samples_per_repetition: ticks.saturating_mul(PERF_SNAPSHOT_SAMPLES_PER_TICK),
         median_window_ticks: PERF_WINDOW_TICKS,
         max_cv_pct: MAX_CV_PCT,
         max_tps_regression_pct: MAX_TPS_REGRESSION_PCT,
@@ -2193,7 +2225,10 @@ fn synthetic_repetition(
         total_step_elapsed_ns,
         total_tps,
         median_window_tps: window_tps,
-        snapshot_ns: vec![snapshot_p95_ns; PERF_TICKS],
+        snapshot_ns: vec![
+            snapshot_p95_ns;
+            PERF_TICKS * PERF_SNAPSHOT_SAMPLES_PER_TICK
+        ],
         snapshot_p50_ns: snapshot_p95_ns,
         snapshot_p95_ns,
         snapshot_max_ns: snapshot_p95_ns,
@@ -2429,6 +2464,29 @@ fn run_self_test() -> GateResult<()> {
         VerdictStatus::Advisory,
     );
 
+    let snapshot_noise = [920_000, 1_000_000, 1_000_000, 1_000_000, 1_080_000];
+    let mut snapshot_noisy_candidate =
+        synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
+    replace_synthetic_snapshot_runs(
+        &mut snapshot_noisy_candidate.scenarios[0],
+        snapshot_noise,
+    );
+    assert_self_test_status(
+        "snapshot-only high-CV candidate is advisory",
+        &compare_artifacts(&baseline, &snapshot_noisy_candidate),
+        VerdictStatus::Advisory,
+    );
+
+    let mut snapshot_noisy_baseline = baseline.clone();
+    replace_synthetic_snapshot_runs(&mut snapshot_noisy_baseline.scenarios[0], snapshot_noise);
+    let stable_candidate =
+        synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
+    assert_self_test_status(
+        "snapshot-only high-CV baseline is refused",
+        &compare_artifacts(&snapshot_noisy_baseline, &stable_candidate),
+        VerdictStatus::Refused,
+    );
+
     let mut localized_noise = synthetic_artifact("candidate", "same", [89.0; 5], [1_000_000; 5]);
     let noisy_5k = localized_noise
         .scenarios
@@ -2465,6 +2523,30 @@ fn run_self_test() -> GateResult<()> {
     assert_self_test_status(
         "tampered per-run raw derivation is refused",
         &compare_artifacts(&baseline, &tampered_raw),
+        VerdictStatus::Refused,
+    );
+
+    let mut missing_snapshot_sample =
+        synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
+    if missing_snapshot_sample.scenarios[0].measurements[0]
+        .snapshot_ns
+        .pop()
+        .is_none()
+    {
+        return Err("synthetic snapshot fixture unexpectedly had no raw samples".to_owned());
+    }
+    assert_self_test_status(
+        "missing independent snapshot sample is refused",
+        &compare_artifacts(&baseline, &missing_snapshot_sample),
+        VerdictStatus::Refused,
+    );
+
+    let mut tampered_snapshot_policy =
+        synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
+    tampered_snapshot_policy.policy.snapshot_samples_per_tick = 1;
+    assert_self_test_status(
+        "tampered snapshot sampling policy is refused",
+        &compare_artifacts(&baseline, &tampered_snapshot_policy),
         VerdictStatus::Refused,
     );
 
