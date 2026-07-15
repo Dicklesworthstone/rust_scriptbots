@@ -138,16 +138,16 @@ fn actual_binary_terminal_test_backend_path_reports_rendered_tick_budget() {
         "expected renderer selection log; stderr:\n{clean}"
     );
     assert!(
-        clean.contains("Primed world and persisted initial summary"),
-        "expected bootstrap summary; stderr:\n{clean}"
+        clean.contains("Initialized seeded world at tick zero without bootstrap advancement"),
+        "expected explicit zero-bootstrap diagnostic; stderr:\n{clean}"
     );
     assert!(
         clean.contains("Terminal headless run completed"),
         "expected terminal completion log; stderr:\n{clean}"
     );
     assert!(
-        clean.contains("final_tick=132"),
-        "expected 120 bootstrap ticks plus 12 headless-renderer ticks; stderr:\n{clean}"
+        clean.contains("final_tick=12"),
+        "expected 0 bootstrap ticks plus 12 headless-renderer ticks; stderr:\n{clean}"
     );
 }
 

@@ -435,7 +435,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
   - `gui`: require GPUI; an uncompiled feature or native window launch failure is returned to the caller.
   - `bevy`: require the Bevy frontend and fail clearly unless built with the `bevy_render` application feature.
   - `terminal`: force emoji TUI.
-- `--bootstrap-ticks N`: explicitly run `N` science ticks after seeding and before frontend launch (default `120`; use `0` to launch at tick zero).
+- `--bootstrap-ticks N`: explicitly run `N` science ticks after seeding and before frontend launch (default `0`, so ordinary startup launches at tick zero).
  - `--dump-png <FILE>` (GUI builds): write an offscreen PNG and exit (no UI). Pair with `--png-size WxH`.
  - `--png-size WxH` (GUI builds): snapshot size for `--dump-png` (e.g., `1280x720`).
  - `--debug-watermark`: overlay a tiny diagnostics watermark in the render canvas.
@@ -461,7 +461,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - `RAYON_NUM_THREADS` — set simulation thread pool size when `parallel` is enabled.
 - `SCRIPTBOTS_MODE` — `auto|gui|bevy|terminal` (renderer selection).
 - `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — override Auto-mode renderer detection (`1|true|yes`); explicit `--mode` remains authoritative.
-- `SCRIPTBOTS_BOOTSTRAP_TICKS` — explicit pre-frontend science ticks (default `120`, equivalent to `--bootstrap-ticks`).
+- `SCRIPTBOTS_BOOTSTRAP_TICKS` — explicit pre-frontend science ticks (default `0`, equivalent to `--bootstrap-ticks`; set a nonzero value only when an intentional warmup is part of the run).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
 - `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
 - `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.

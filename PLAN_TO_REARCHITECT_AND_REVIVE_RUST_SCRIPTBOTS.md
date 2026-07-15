@@ -1770,7 +1770,7 @@ loosens that threshold nor blesses the current output.
 
 - [Implemented] explicit `gui`, `bevy`, and `terminal` modes override auto-detection and never fall back after selection;
 - [Implemented] Auto considers only compiled graphical backends and selects one only in a real native graphical session; macOS uses native session availability rather than X11/Wayland variables;
-- [Implemented] `--bootstrap-ticks`/`SCRIPTBOTS_BOOTSTRAP_TICKS` expose the pre-frontend bootstrap with default `120`, while `0` launches the seeded world at tick zero;
+- [Implemented] `--bootstrap-ticks`/`SCRIPTBOTS_BOOTSTRAP_TICKS` expose an explicit pre-frontend warmup with default `0`, so ordinary startup launches the seeded world at tick zero while an operator-requested nonzero warmup remains available and is recorded in the run manifest;
 - [Implemented] control configuration is parsed fail-closed: malformed and non-Unicode values are errors, and TLS-claiming MCP values are rejected because the embedded transport is plaintext HTTP;
 - [Implemented] every enabled REST/MCP socket is transactionally prebound before configuration output, auto-tuning, priority changes, world construction, or storage reservation, and the runtime consumes those exact listeners;
 - [Implemented] REST and MCP are separately supervised; unexpected completion or failure stops the sibling, preserves the root error, publishes failed health, and makes TUI, GPUI, and Bevy exit with that error;
