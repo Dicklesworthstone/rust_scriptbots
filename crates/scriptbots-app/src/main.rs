@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const DEFAULT_BOOTSTRAP_TICKS: u64 = 120;
+const DEFAULT_BOOTSTRAP_TICKS: u64 = 0;
 
 type SharedPersistenceAdmission = Arc<Mutex<PersistenceAdmissionSession>>;
 
@@ -867,14 +867,32 @@ fn recover_storage(path: &Path) -> Result<()> {
 /// is a warning and the run continues — but the warning names exactly what was
 /// lost, because a silent provenance failure is how you end up with a run
 /// directory nobody can explain.
-fn emit_run_manifest(world: &WorldState, storage_path: Option<&str>, thread_policy: ThreadPolicy) {
+fn build_run_manifest(
+    world: &WorldState,
+    bootstrap_ticks: u64,
+) -> std::result::Result<RunManifestV1, scriptbots_app::RunManifestError> {
+    let mut scenario = ScenarioIdentityV0::caller_seeded("default");
+    scenario.bootstrap_ticks = bootstrap_ticks;
+    RunManifestV1::from_world_with_provenance(
+        scenario,
+        world,
+        scriptbots_app::BuildProvenanceV0::current(),
+    )
+}
+
+fn emit_run_manifest(
+    world: &WorldState,
+    storage_path: Option<&str>,
+    thread_policy: ThreadPolicy,
+    bootstrap_ticks: u64,
+) {
     let Some(storage_path) = storage_path else {
         // An in-memory run leaves no directory to describe.
         return;
     };
     let manifest_path = std::path::Path::new(storage_path).with_extension("manifest.json");
 
-    let manifest = match RunManifestV1::from_world("default", world) {
+    let manifest = match build_run_manifest(world, bootstrap_ticks) {
         Ok(manifest) => manifest,
         Err(error) => {
             warn!(
@@ -1018,7 +1036,12 @@ fn bootstrap_world(
         // provenanced, reproducible runs was true of the LIBRARY and false of the
         // PRODUCT. A user could not tell which build, which seed, or which config
         // produced a run directory.
-        emit_run_manifest(&world, manifest_storage_path.as_deref(), thread_policy);
+        emit_run_manifest(
+            &world,
+            manifest_storage_path.as_deref(),
+            thread_policy,
+            bootstrap_ticks,
+        );
 
         for _ in 0..bootstrap_ticks {
             persistence.step(&mut world)?;
@@ -3190,7 +3213,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn startup_defaults_expose_the_bootstrap_tick_contract() {
+    fn startup_defaults_begin_at_tick_zero_and_preserve_explicit_bootstrap() {
         with_env_lock(|| {
             let previous_mode = std::env::var("SCRIPTBOTS_MODE").ok();
             let previous_bootstrap = std::env::var("SCRIPTBOTS_BOOTSTRAP_TICKS").ok();
@@ -3201,6 +3224,7 @@ mod tests {
 
             let cli = default_cli();
             assert_eq!(cli.mode, RendererMode::Auto);
+            assert_eq!(DEFAULT_BOOTSTRAP_TICKS, 0);
             assert_eq!(cli.bootstrap_ticks, DEFAULT_BOOTSTRAP_TICKS);
 
             let cli = AppCli::parse_from([
@@ -3208,14 +3232,28 @@ mod tests {
                 "--mode",
                 "terminal",
                 "--bootstrap-ticks",
-                "0",
+                "37",
             ]);
             assert_eq!(cli.mode, RendererMode::Terminal);
-            assert_eq!(cli.bootstrap_ticks, 0);
+            assert_eq!(cli.bootstrap_ticks, 37);
 
             restore_env("SCRIPTBOTS_MODE", previous_mode);
             restore_env("SCRIPTBOTS_BOOTSTRAP_TICKS", previous_bootstrap);
         });
+    }
+
+    #[test]
+    fn run_manifest_records_requested_bootstrap_before_tick_zero() {
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0xB007_57A4),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+
+        let manifest = build_run_manifest(&world, 37).expect("manifest");
+
+        assert_eq!(world.tick().0, 0, "manifest emission must not advance science");
+        assert_eq!(manifest.scenario.bootstrap_ticks, 37);
     }
 
     #[test]
