@@ -232,15 +232,20 @@ pub fn paired_comparison(
 /// One named metric's matched outcomes.
 #[derive(Debug, Clone)]
 pub struct MetricSeries<'a> {
+    /// Stable metric name included in the comparison result.
     pub name: &'a str,
+    /// Control-arm outcomes ordered by matched seed.
     pub control: &'a [f64],
+    /// Treatment-arm outcomes in the same matched-seed order.
     pub treatment: &'a [f64],
 }
 
 /// A metric's comparison, tagged with its name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NamedComparison {
+    /// Stable metric name copied from the input series.
     pub metric: String,
+    /// Matched-pair effect estimate and corrected significance decision.
     pub comparison: PairedComparison,
 }
 

@@ -30,6 +30,7 @@ pub enum NativeDriveTrigger {
     Maintenance,
 }
 
+#[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
 impl NativeDriveTrigger {
     const fn priority(self) -> u8 {
         match self {
@@ -180,6 +181,7 @@ impl FixedDeadlineHost {
         self.core.retry_retained_journal()
     }
 
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     fn record_panicked_boundary(&mut self, message: &str) -> Result<(), HostAccessError> {
         self.core.record_panicked_boundary(message)
     }
@@ -1600,7 +1602,7 @@ mod tests {
     use super::*;
     use crate::{
         AppliedCommand, CommandId, EventSequence, HostCommand, HostCoreOptions, HostEvent,
-        HostSessionId, JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt,
+        HostSessionId, JournalBatch, JournalBatchId, JournalPort, JournalReceipt,
         JournalReceiptState, PlaybackSnapshot, ScientificBoundary, ShutdownCommitRequirement,
     };
     use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
@@ -1610,7 +1612,7 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
-    use crate::HostLifecycle;
+    use crate::{HostLifecycle, JournalFailure};
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     use asupersync::runtime::RuntimeBuilder;
     #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
@@ -1624,7 +1626,9 @@ mod tests {
     enum ReceiptMode {
         #[default]
         Immediate,
+        #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
         Never,
+        #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
         Failed,
         #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
         Panic,
@@ -1669,7 +1673,9 @@ mod tests {
                             JournalReceiptState::CommittedVolatile,
                         ));
                 }
+                #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
                 ReceiptMode::Never => {}
+                #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
                 ReceiptMode::Failed => {
                     self.state
                         .borrow_mut()
@@ -1844,9 +1850,9 @@ mod tests {
     }
 
     fn persistence_value(
-        batch: Option<&Arc<scriptbots_core::PersistenceBatch>>,
-    ) -> Option<PersistenceTrace> {
-        batch.map(|batch| PersistenceTrace {
+        batch: &Arc<scriptbots_core::PersistenceBatch>,
+    ) -> PersistenceTrace {
+        PersistenceTrace {
             summary: batch.summary.clone(),
             epoch: batch.epoch,
             closed: batch.closed,
@@ -1856,7 +1862,7 @@ mod tests {
             births: batch.births.clone(),
             deaths: batch.deaths.clone(),
             replay_events: batch.replay_events.clone(),
-        })
+        }
     }
 
     fn journal_trace(state: &Rc<RefCell<CaptureState>>) -> Vec<JournalTrace> {
@@ -1873,9 +1879,9 @@ mod tests {
                     batch.applied(),
                     batch
                         .scientific()
-                        .map(|boundary| boundary.as_ref())
+                        .map(std::convert::AsRef::as_ref)
                         .cloned(),
-                    persistence_value(batch.persistence()),
+                    batch.persistence().map(persistence_value),
                 )
             })
             .collect()

@@ -547,6 +547,7 @@ impl HostCore {
     }
 
     /// Seal admissions and publish exact fault evidence after a driver unwind.
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
     pub(crate) fn record_panicked_boundary(
         &mut self,
         message: &str,
