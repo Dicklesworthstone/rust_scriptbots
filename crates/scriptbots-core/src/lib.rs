@@ -657,7 +657,7 @@ pub enum ControlCommand {
     UpdateSimulation(SimulationCommand),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SimulationCommand {
     pub paused: Option<bool>,
     pub speed_multiplier: Option<f32>,
@@ -1344,6 +1344,7 @@ type BrainSpawner = Box<
 
 struct BrainEntry {
     kind: Cow<'static, str>,
+    factory_state_digest: Option<u64>,
     spawner: BrainSpawner,
 }
 
@@ -1377,12 +1378,49 @@ impl BrainRegistry {
             + Sync
             + 'static,
     {
+        self.register_inner(kind, None, factory)
+    }
+
+    /// Registers a factory together with a stable digest of captured construction state.
+    ///
+    /// The supplied digest must change whenever captured seeds, model bytes, architecture
+    /// settings, or other closure state capable of changing a newly spawned brain changes.
+    /// Factories registered through [`Self::register`] remain valid, but V1.1 reports their
+    /// closure state as explicitly uncovered.
+    pub fn register_with_state_digest<F>(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        factory_state_digest: u64,
+        factory: F,
+    ) -> u64
+    where
+        F: Fn(&mut dyn RandomStream) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_inner(kind, Some(factory_state_digest), factory)
+    }
+
+    fn register_inner<F>(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        factory_state_digest: Option<u64>,
+        factory: F,
+    ) -> u64
+    where
+        F: Fn(&mut dyn RandomStream) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
+            + Send
+            + Sync
+            + 'static,
+    {
         let key = self.next_key;
         self.next_key += 1;
         self.entries.insert(
             key,
             BrainEntry {
                 kind: kind.into(),
+                factory_state_digest,
                 spawner: Box::new(factory),
             },
         );
@@ -1786,7 +1824,17 @@ pub struct CharacterizationDigestV0 {
 }
 
 /// Schema tag for [`WorldDigestV1`].
-pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1";
+/// Values carrying the original unqualified V1 tag were noncanonical: their overall lane omitted
+/// configuration, active effects, derived transition caches, algorithm metadata, and identity
+/// metadata. The repaired schema uses an explicit minor version so incompatible values cannot be
+/// mistaken for current evidence.
+pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.1";
+/// Wire revision for the first complete V1.1 payload.
+pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 1;
+/// Stable hash algorithm identifier carried by and hashed into V1.1.
+pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
+/// Stable logical identity used by the V1.1 agent lane.
+pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
 
 /// The world's science-state oracle, version one — see [`WorldState::world_digest_v1`].
 ///
@@ -1798,14 +1846,19 @@ pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1";
 /// moved, or the food did, or only the counters did — which is the difference between a bug you
 /// can find in an hour and one you cannot find at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorldDigestV1 {
     pub schema: String,
+    pub codec_version: u16,
     pub algorithm: String,
     pub tick: Tick,
     /// Hash over every lane below, including the coverage flags.
     pub overall: String,
     /// Agent bodies, ordered by stable `AgentUid`.
     pub agents: String,
+    /// Dense execution order expressed as stable UIDs. Until every stage is UID-canonical, this
+    /// order can affect floating-point reductions, parent selection, and RNG assignment.
+    pub execution_order: String,
     /// Agent BRAINS — genome and evaluator state — kept in their own lane so that "the brains
     /// changed" is distinguishable from "the bodies changed".
     pub brains: String,
@@ -1817,6 +1870,14 @@ pub struct WorldDigestV1 {
     /// Future-affecting allocation counters.
     pub counters: String,
     pub brain_registry: String,
+    /// Canonical scientific projection of the validated world configuration.
+    pub config: String,
+    /// Ordered active intervention effects that can change future transitions.
+    pub effects: String,
+    /// Derived cadence and ecology caches rebuilt from configuration and terrain.
+    pub derived_transition: String,
+    /// Open ancestry-origin rows that still affect same-boundary lineage mutation rules.
+    pub origins: String,
     /// `false` when some BOUND brain could not expose its state. The digest is still valid — but
     /// it is valid over less than the whole world, and it says so rather than letting a reader
     /// assume otherwise.
@@ -1824,9 +1885,166 @@ pub struct WorldDigestV1 {
     /// The families responsible, named. An omission the reader cannot see is not an omission —
     /// it is a lie of composition.
     pub uncovered_families: Vec<String>,
+    /// Whether every registered factory declared the captured state that determines new brains.
+    pub factory_state_covered: bool,
+    /// Registered families whose factory closures remain opaque to the digest.
+    pub uncovered_factory_families: Vec<String>,
     /// Which identity the agent lane is keyed on. Pinned so a future change to agent identity
     /// cannot silently move the oracle.
     pub agent_identity: String,
+}
+
+/// A decoded V1.1 boundary digest violated its pinned semantic contract.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorldDigestV1ContractError {
+    #[error("world-digest schema `{found}` does not match `{expected}`")]
+    Schema {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("world-digest codec version {found} does not match {expected}")]
+    CodecVersion { found: u16, expected: u16 },
+    #[error("world-digest algorithm `{found}` does not match `{expected}`")]
+    Algorithm {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("world-digest agent identity `{found}` does not match `{expected}`")]
+    AgentIdentity {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("world-digest {coverage} coverage flag disagrees with its uncovered-family list")]
+    Coverage { coverage: &'static str },
+    #[error("world-digest {coverage} uncovered-family names are not sorted and unique")]
+    CoverageOrder { coverage: &'static str },
+    #[error("world-digest field `{field}` is not a lowercase 16-digit digest")]
+    DigestFormat { field: &'static str },
+    #[error("world-digest overall does not match its metadata, tick, lanes, and coverage")]
+    Overall,
+}
+
+impl WorldDigestV1 {
+    fn recomputed_overall(&self) -> String {
+        let mut overall =
+            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "overall");
+        overall.string(&self.schema);
+        overall.u16(self.codec_version);
+        overall.string(&self.algorithm);
+        overall.string(&self.agent_identity);
+        overall.u64(self.tick.0);
+        overall.string(&self.agents);
+        overall.string(&self.execution_order);
+        overall.string(&self.brains);
+        overall.string(&self.food);
+        overall.string(&self.terrain);
+        overall.option_string(self.hydrology.as_deref());
+        overall.string(&self.rng);
+        overall.string(&self.counters);
+        overall.string(&self.brain_registry);
+        overall.string(&self.config);
+        overall.string(&self.effects);
+        overall.string(&self.derived_transition);
+        overall.string(&self.origins);
+        overall.bool(self.evaluator_state_covered);
+        overall.usize(self.uncovered_families.len());
+        for family in &self.uncovered_families {
+            overall.string(family);
+        }
+        overall.bool(self.factory_state_covered);
+        overall.usize(self.uncovered_factory_families.len());
+        for family in &self.uncovered_factory_families {
+            overall.string(family);
+        }
+        overall.finish()
+    }
+
+    /// Validate metadata, coverage declarations, digest shape, and the aggregate after decoding.
+    ///
+    /// This proves protocol self-consistency, not authenticity: FNV-1a64 is a diagnostic hash,
+    /// not a signature or collision-resistant content attestation.
+    pub fn validate_contract(&self) -> Result<(), WorldDigestV1ContractError> {
+        if self.schema != WORLD_DIGEST_V1_SCHEMA {
+            return Err(WorldDigestV1ContractError::Schema {
+                found: self.schema.clone(),
+                expected: WORLD_DIGEST_V1_SCHEMA,
+            });
+        }
+        if self.codec_version != WORLD_DIGEST_V1_CODEC_VERSION {
+            return Err(WorldDigestV1ContractError::CodecVersion {
+                found: self.codec_version,
+                expected: WORLD_DIGEST_V1_CODEC_VERSION,
+            });
+        }
+        if self.algorithm != WORLD_DIGEST_V1_ALGORITHM {
+            return Err(WorldDigestV1ContractError::Algorithm {
+                found: self.algorithm.clone(),
+                expected: WORLD_DIGEST_V1_ALGORITHM,
+            });
+        }
+        if self.agent_identity != WORLD_DIGEST_V1_AGENT_IDENTITY {
+            return Err(WorldDigestV1ContractError::AgentIdentity {
+                found: self.agent_identity.clone(),
+                expected: WORLD_DIGEST_V1_AGENT_IDENTITY,
+            });
+        }
+        validate_world_digest_coverage(
+            "evaluator",
+            self.evaluator_state_covered,
+            &self.uncovered_families,
+        )?;
+        validate_world_digest_coverage(
+            "factory",
+            self.factory_state_covered,
+            &self.uncovered_factory_families,
+        )?;
+
+        let required_digests = [
+            ("overall", self.overall.as_str()),
+            ("agents", self.agents.as_str()),
+            ("execution_order", self.execution_order.as_str()),
+            ("brains", self.brains.as_str()),
+            ("food", self.food.as_str()),
+            ("terrain", self.terrain.as_str()),
+            ("rng", self.rng.as_str()),
+            ("counters", self.counters.as_str()),
+            ("brain_registry", self.brain_registry.as_str()),
+            ("config", self.config.as_str()),
+            ("effects", self.effects.as_str()),
+            ("derived_transition", self.derived_transition.as_str()),
+            ("origins", self.origins.as_str()),
+        ];
+        for (field, digest) in required_digests {
+            if !is_characterization_digest(digest) {
+                return Err(WorldDigestV1ContractError::DigestFormat { field });
+            }
+        }
+        if self
+            .hydrology
+            .as_deref()
+            .is_some_and(|digest| !is_characterization_digest(digest))
+        {
+            return Err(WorldDigestV1ContractError::DigestFormat { field: "hydrology" });
+        }
+        if self.overall != self.recomputed_overall() {
+            return Err(WorldDigestV1ContractError::Overall);
+        }
+        Ok(())
+    }
+}
+
+fn validate_world_digest_coverage(
+    coverage: &'static str,
+    covered: bool,
+    uncovered: &[String],
+) -> Result<(), WorldDigestV1ContractError> {
+    if covered != uncovered.is_empty() {
+        return Err(WorldDigestV1ContractError::Coverage { coverage });
+    }
+    if uncovered.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(WorldDigestV1ContractError::CoverageOrder { coverage });
+    }
+    Ok(())
 }
 
 /// Compile-lane identity needed to interpret a characterization digest honestly.
@@ -1867,8 +2085,27 @@ impl CoreBuildIdentityV0 {
     }
 }
 
+/// A latched condition that prevents a world from executing another scientific transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldContinuationBlocker {
+    BrainFault,
+    PersistenceFault,
+    RetainedPersistenceBatch,
+}
+
+impl fmt::Display for WorldContinuationBlocker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BrainFault => "brain fault",
+            Self::PersistenceFault => "persistence fault",
+            Self::RetainedPersistenceBatch => "retained persistence batch",
+        })
+    }
+}
+
 /// Failures encountered while characterizing a world boundary.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CharacterizationError {
     /// V0 is defined only between ticks, with no queued stage/control work.
     #[error(
@@ -1879,12 +2116,21 @@ pub enum CharacterizationError {
         pending_spawns: usize,
         simulation_commands: usize,
     },
+    /// A completed boundary is latched and cannot continue until its typed blocker is resolved.
+    #[error("world cannot continue because it has a latched {blocker}")]
+    NonContinuable { blocker: WorldContinuationBlocker },
     /// An arena handle did not resolve to its dense scalar state.
     #[error("agent {agent_id} is missing dense scalar state")]
     MissingAgentData { agent_id: u64 },
     /// An arena handle did not have matching runtime state.
     #[error("agent {agent_id} is missing runtime state")]
     MissingAgentRuntime { agent_id: u64 },
+    /// A deterministic diagnostic payload could not be encoded.
+    #[error("could not encode {context} for deterministic characterization: {detail}")]
+    Encoding {
+        context: &'static str,
+        detail: String,
+    },
 }
 
 fn characterization_fnv1a64(bytes: &[u8]) -> u64 {
@@ -1905,10 +2151,14 @@ struct CharacterizationEncoderV0 {
 
 impl CharacterizationEncoderV0 {
     fn new(domain: &str) -> Self {
+        Self::new_with_schema(CHARACTERIZATION_DIGEST_V0_SCHEMA, domain)
+    }
+
+    fn new_with_schema(schema: &str, domain: &str) -> Self {
         let mut encoder = Self {
             hash: characterization_fnv1a64(&[]),
         };
-        encoder.string(CHARACTERIZATION_DIGEST_V0_SCHEMA);
+        encoder.string(schema);
         encoder.string(domain);
         encoder
     }
@@ -1947,6 +2197,29 @@ impl CharacterizationEncoderV0 {
 
     fn f32(&mut self, value: f32) {
         self.u32(value.to_bits());
+    }
+
+    fn f64(&mut self, value: f64) {
+        self.u64(value.to_bits());
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.usize(value.len());
+        self.raw(value);
+    }
+
+    fn postcard<T: Serialize + ?Sized>(
+        &mut self,
+        context: &'static str,
+        value: &T,
+    ) -> Result<(), CharacterizationError> {
+        let bytes =
+            postcard::to_allocvec(value).map_err(|error| CharacterizationError::Encoding {
+                context,
+                detail: error.to_string(),
+            })?;
+        self.bytes(&bytes);
+        Ok(())
     }
 
     fn string(&mut self, value: &str) {
@@ -2873,6 +3146,14 @@ impl ResourceLedgerState {
 /// Schema identifier for opt-in per-stage simulation-step timing.
 pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 
+/// Schema identifier for opt-in per-stage scientific-state digests.
+pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.1";
+/// Wire revision for the first fully pinned six-point trace payload.
+pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 1;
+/// Schema identifier for a non-boundary world digest captured during one transition.
+pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
+    "scriptbots.world-step-stage-world-digest.v1";
+
 /// Stable stage identifiers emitted by [`WorldStepProfile`].
 ///
 /// The order is part of [`WORLD_STEP_PROFILE_SCHEMA`]. New or regrouped stages require a new
@@ -2966,6 +3247,58 @@ impl WorldStepStage {
     }
 }
 
+/// The six stable semantic checkpoints in a deterministic step trace.
+///
+/// This is intentionally separate from [`WorldStepStage`]. Performance profiling may gain or
+/// regroup stages without silently changing the diagnostic trace wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldStepTracePoint {
+    Sense,
+    Brains,
+    Actuation,
+    Food,
+    DeathCleanup,
+    Population,
+}
+
+impl WorldStepTracePoint {
+    pub const COUNT: usize = 6;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Sense,
+        Self::Brains,
+        Self::Actuation,
+        Self::Food,
+        Self::DeathCleanup,
+        Self::Population,
+    ];
+
+    /// Stable snake-case label included in trace hash domains and serialized artifacts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sense => "sense",
+            Self::Brains => "brains",
+            Self::Actuation => "actuation",
+            Self::Food => "food",
+            Self::DeathCleanup => "death_cleanup",
+            Self::Population => "population",
+        }
+    }
+
+    const fn from_stage(stage: WorldStepStage) -> Option<Self> {
+        match stage {
+            WorldStepStage::Sense => Some(Self::Sense),
+            WorldStepStage::Brains => Some(Self::Brains),
+            WorldStepStage::Actuation => Some(Self::Actuation),
+            WorldStepStage::Food => Some(Self::Food),
+            WorldStepStage::DeathCleanup => Some(Self::DeathCleanup),
+            WorldStepStage::Population => Some(Self::Population),
+            _ => None,
+        }
+    }
+}
+
 /// Timing for the most recently completed profiled simulation step.
 ///
 /// Timing is disabled by default. When enabled, durations use the process monotonic clock and are
@@ -3040,6 +3373,757 @@ impl WorldStepProfiler {
     }
 }
 
+/// Scientific lanes captured inside a transition rather than at a completed world boundary.
+///
+/// `completed_tick` is the last finalized boundary still stored in [`WorldState::tick`], while
+/// `transition_tick` is the tick currently executing. This distinct type prevents an
+/// intermediate value from being mistaken for a canonical [`WorldDigestV1`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldStepStageWorldDigest {
+    pub schema: String,
+    pub codec_version: u16,
+    pub algorithm: String,
+    pub completed_tick: Tick,
+    pub transition_tick: Tick,
+    pub overall: String,
+    pub agents: String,
+    pub execution_order: String,
+    pub brains: String,
+    pub food: String,
+    pub terrain: String,
+    pub hydrology: Option<String>,
+    pub rng: String,
+    pub counters: String,
+    pub brain_registry: String,
+    pub config: String,
+    pub effects: String,
+    pub derived_transition: String,
+    pub origins: String,
+    pub evaluator_state_covered: bool,
+    pub uncovered_families: Vec<String>,
+    pub factory_state_covered: bool,
+    pub uncovered_factory_families: Vec<String>,
+    pub agent_identity: String,
+}
+
+impl WorldStepStageWorldDigest {
+    fn from_boundary_lanes(digest: WorldDigestV1, transition_tick: Tick) -> Self {
+        let mut stage_world = Self {
+            schema: WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA.to_owned(),
+            codec_version: digest.codec_version,
+            algorithm: digest.algorithm,
+            completed_tick: digest.tick,
+            transition_tick,
+            overall: String::new(),
+            agents: digest.agents,
+            execution_order: digest.execution_order,
+            brains: digest.brains,
+            food: digest.food,
+            terrain: digest.terrain,
+            hydrology: digest.hydrology,
+            rng: digest.rng,
+            counters: digest.counters,
+            brain_registry: digest.brain_registry,
+            config: digest.config,
+            effects: digest.effects,
+            derived_transition: digest.derived_transition,
+            origins: digest.origins,
+            evaluator_state_covered: digest.evaluator_state_covered,
+            uncovered_families: digest.uncovered_families,
+            factory_state_covered: digest.factory_state_covered,
+            uncovered_factory_families: digest.uncovered_factory_families,
+            agent_identity: digest.agent_identity,
+        };
+        stage_world.overall = stage_world.recomputed_overall();
+        stage_world
+    }
+
+    fn recomputed_overall(&self) -> String {
+        let mut overall = CharacterizationEncoderV0::new_with_schema(
+            WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA,
+            "overall",
+        );
+        overall.u16(self.codec_version);
+        overall.string(&self.algorithm);
+        overall.u64(self.completed_tick.0);
+        overall.u64(self.transition_tick.0);
+        overall.string(&self.agent_identity);
+        overall.string(&self.agents);
+        overall.string(&self.execution_order);
+        overall.string(&self.brains);
+        overall.string(&self.food);
+        overall.string(&self.terrain);
+        overall.option_string(self.hydrology.as_deref());
+        overall.string(&self.rng);
+        overall.string(&self.counters);
+        overall.string(&self.brain_registry);
+        overall.string(&self.config);
+        overall.string(&self.effects);
+        overall.string(&self.derived_transition);
+        overall.string(&self.origins);
+        overall.bool(self.evaluator_state_covered);
+        overall.usize(self.uncovered_families.len());
+        for family in &self.uncovered_families {
+            overall.string(family);
+        }
+        overall.bool(self.factory_state_covered);
+        overall.usize(self.uncovered_factory_families.len());
+        for family in &self.uncovered_factory_families {
+            overall.string(family);
+        }
+        overall.finish()
+    }
+}
+
+/// Deterministic state captured at one canonical first-divergence point.
+///
+/// `world` covers scientific state, `transition` covers ordered deferred work, `output_tail`
+/// covers pending observational publication state, and `resource` covers the diagnostic ledger.
+/// Host admission receipts and backend error prose are intentionally excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldStepStageStateDigest {
+    pub world: WorldStepStageWorldDigest,
+    pub transition: String,
+    pub output_tail: String,
+    pub resource: String,
+    pub overall: String,
+}
+
+impl WorldStepStageStateDigest {
+    fn recomputed_overall(&self, trace_tick: Tick, point: WorldStepTracePoint) -> String {
+        let mut overall = WorldState::world_step_trace_encoder(trace_tick, point, "stage-overall");
+        overall.string(&self.world.schema);
+        overall.u16(self.world.codec_version);
+        overall.string(&self.world.algorithm);
+        overall.u64(self.world.completed_tick.0);
+        overall.u64(self.world.transition_tick.0);
+        overall.string(&self.world.agent_identity);
+        overall.string(&self.world.overall);
+        overall.string(&self.transition);
+        overall.string(&self.output_tail);
+        overall.string(&self.resource);
+        overall.bool(self.world.evaluator_state_covered);
+        overall.usize(self.world.uncovered_families.len());
+        for family in &self.world.uncovered_families {
+            overall.string(family);
+        }
+        overall.bool(self.world.factory_state_covered);
+        overall.usize(self.world.uncovered_factory_families.len());
+        for family in &self.world.uncovered_factory_families {
+            overall.string(family);
+        }
+        overall.finish()
+    }
+}
+
+/// Closed set of deterministic payloads whose encoding can fail during trace capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldStepTraceEncodingContext {
+    ScientificConfig,
+    ActiveEffects,
+    PendingBirthRecords,
+    PendingInterventions,
+    SimulationCommands,
+    PendingDeathRecords,
+    PendingLifecycleBirthMetrics,
+    PendingLifecycleDeathMetrics,
+    PendingReplayEvents,
+    TickHistory,
+    NarrativeEvents,
+    NarrativeEmissionWatermarks,
+    Unclassified,
+}
+
+impl WorldStepTraceEncodingContext {
+    fn from_label(label: &str) -> Self {
+        match label {
+            "scientific ScriptBotsConfig" => Self::ScientificConfig,
+            "active effects" => Self::ActiveEffects,
+            "pending birth records" => Self::PendingBirthRecords,
+            "pending interventions" => Self::PendingInterventions,
+            "simulation commands" => Self::SimulationCommands,
+            "pending death records" => Self::PendingDeathRecords,
+            "pending lifecycle birth metrics" => Self::PendingLifecycleBirthMetrics,
+            "pending lifecycle death metrics" => Self::PendingLifecycleDeathMetrics,
+            "pending replay events" => Self::PendingReplayEvents,
+            "tick history" => Self::TickHistory,
+            "narrative events" => Self::NarrativeEvents,
+            "narrative emission watermarks" => Self::NarrativeEmissionWatermarks,
+            _ => Self::Unclassified,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScientificConfig => "scientific_config",
+            Self::ActiveEffects => "active_effects",
+            Self::PendingBirthRecords => "pending_birth_records",
+            Self::PendingInterventions => "pending_interventions",
+            Self::SimulationCommands => "simulation_commands",
+            Self::PendingDeathRecords => "pending_death_records",
+            Self::PendingLifecycleBirthMetrics => "pending_lifecycle_birth_metrics",
+            Self::PendingLifecycleDeathMetrics => "pending_lifecycle_death_metrics",
+            Self::PendingReplayEvents => "pending_replay_events",
+            Self::TickHistory => "tick_history",
+            Self::NarrativeEvents => "narrative_events",
+            Self::NarrativeEmissionWatermarks => "narrative_emission_watermarks",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// Stable typed capture error stored in the trace wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorldStepTraceError {
+    NonQuiescent {
+        pending_deaths: usize,
+        pending_spawns: usize,
+        simulation_commands: usize,
+    },
+    NonContinuable {
+        blocker: WorldContinuationBlocker,
+    },
+    MissingAgentData {
+        agent_id: u64,
+    },
+    MissingAgentRuntime {
+        agent_id: u64,
+    },
+    Encoding {
+        context: WorldStepTraceEncodingContext,
+    },
+    MissingTransitionInput {
+        point: WorldStepTracePoint,
+    },
+}
+
+impl From<CharacterizationError> for WorldStepTraceError {
+    fn from(error: CharacterizationError) -> Self {
+        match error {
+            CharacterizationError::NonQuiescent {
+                pending_deaths,
+                pending_spawns,
+                simulation_commands,
+            } => Self::NonQuiescent {
+                pending_deaths,
+                pending_spawns,
+                simulation_commands,
+            },
+            CharacterizationError::NonContinuable { blocker } => Self::NonContinuable { blocker },
+            CharacterizationError::MissingAgentData { agent_id } => {
+                Self::MissingAgentData { agent_id }
+            }
+            CharacterizationError::MissingAgentRuntime { agent_id } => {
+                Self::MissingAgentRuntime { agent_id }
+            }
+            CharacterizationError::Encoding { context, .. } => Self::Encoding {
+                context: WorldStepTraceEncodingContext::from_label(context),
+            },
+        }
+    }
+}
+
+/// Pinned success/error shape for one trace-point capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorldStepTraceCapture {
+    Complete {
+        state: Box<WorldStepStageStateDigest>,
+    },
+    Error {
+        error: WorldStepTraceError,
+    },
+}
+
+impl WorldStepTraceCapture {
+    fn from_result(result: Result<WorldStepStageStateDigest, CharacterizationError>) -> Self {
+        match result {
+            Ok(state) => Self::Complete {
+                state: Box::new(state),
+            },
+            Err(error) => Self::Error {
+                error: error.into(),
+            },
+        }
+    }
+
+    /// Whether this trace point captured all lanes successfully.
+    #[must_use]
+    pub const fn is_ok(&self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+
+    /// Borrow the state or typed capture error.
+    pub fn as_ref(&self) -> Result<&WorldStepStageStateDigest, &WorldStepTraceError> {
+        match self {
+            Self::Complete { state } => Ok(state.as_ref()),
+            Self::Error { error } => Err(error),
+        }
+    }
+}
+
+/// Capture result for one of the six canonical diagnostic trace points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldStepStageDigest {
+    pub point: WorldStepTracePoint,
+    pub capture: WorldStepTraceCapture,
+}
+
+/// Clock-free diagnostic trace for the most recently completed simulation step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldStepTrace {
+    pub schema: String,
+    pub codec_version: u16,
+    pub tick: Tick,
+    pub stages: Vec<WorldStepStageDigest>,
+    /// Hash of the trace metadata and all six ordered success/error captures.
+    pub overall: String,
+}
+
+/// A deserialized trace violated the pinned six-point wire contract.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorldStepTraceContractError {
+    #[error("trace schema `{found}` does not match `{expected}`")]
+    Schema {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("trace codec version {found} does not match {expected}")]
+    CodecVersion { found: u16, expected: u16 },
+    #[error("trace has {found} stage captures; expected exactly {expected}")]
+    StageCount { found: usize, expected: usize },
+    #[error("trace stage {index} is {found:?}; expected {expected:?}")]
+    StageOrder {
+        index: usize,
+        found: WorldStepTracePoint,
+        expected: WorldStepTracePoint,
+    },
+    #[error("{point:?} capture reports a missing transition for {found:?}")]
+    CaptureErrorPoint {
+        point: WorldStepTracePoint,
+        found: WorldStepTracePoint,
+    },
+    #[error("{point:?} cannot report a missing pre-consumption transition input")]
+    CaptureErrorNotAllowed { point: WorldStepTracePoint },
+    #[error("{point:?} cannot report a quiescent-boundary-only characterization error")]
+    BoundaryErrorNotAllowed { point: WorldStepTracePoint },
+    #[error("{point:?} stage-world schema `{found}` does not match `{expected}`")]
+    StageWorldSchema {
+        point: WorldStepTracePoint,
+        found: String,
+        expected: &'static str,
+    },
+    #[error("{point:?} stage-world codec version {found} does not match {expected}")]
+    StageWorldCodecVersion {
+        point: WorldStepTracePoint,
+        found: u16,
+        expected: u16,
+    },
+    #[error("{point:?} stage-world algorithm `{found}` does not match `{expected}`")]
+    StageWorldAlgorithm {
+        point: WorldStepTracePoint,
+        found: String,
+        expected: &'static str,
+    },
+    #[error("{point:?} stage-world identity `{found}` does not match `{expected}`")]
+    StageWorldIdentity {
+        point: WorldStepTracePoint,
+        found: String,
+        expected: &'static str,
+    },
+    #[error(
+        "{point:?} stage-world ticks ({completed_tick}, {transition_tick}) do not describe trace tick {trace_tick}"
+    )]
+    StageWorldTicks {
+        point: WorldStepTracePoint,
+        completed_tick: u64,
+        transition_tick: u64,
+        trace_tick: u64,
+    },
+    #[error("{point:?} {coverage} coverage flag disagrees with its uncovered-family list")]
+    Coverage {
+        point: WorldStepTracePoint,
+        coverage: &'static str,
+    },
+    #[error("{point:?} {coverage} uncovered-family names are not sorted and unique")]
+    CoverageOrder {
+        point: WorldStepTracePoint,
+        coverage: &'static str,
+    },
+    #[error("{point:?} field `{field}` is not a lowercase 16-digit digest")]
+    DigestFormat {
+        point: WorldStepTracePoint,
+        field: &'static str,
+    },
+    #[error("{point:?} stage-world overall digest does not match its lanes")]
+    StageWorldOverall { point: WorldStepTracePoint },
+    #[error("{point:?} stage overall digest does not match its capture")]
+    StageOverall { point: WorldStepTracePoint },
+    #[error("trace overall field is not a lowercase 16-digit digest")]
+    TraceOverallFormat,
+    #[error("trace overall digest does not match its ordered captures")]
+    TraceOverall,
+}
+
+/// Two traces cannot be compared as canonical first-divergence evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorldStepTraceComparisonError {
+    #[error("left trace is invalid: {0}")]
+    InvalidLeft(WorldStepTraceContractError),
+    #[error("right trace is invalid: {0}")]
+    InvalidRight(WorldStepTraceContractError),
+    #[error("trace ticks differ: left is {left}, right is {right}")]
+    TickMismatch { left: u64, right: u64 },
+}
+
+impl WorldStepTrace {
+    fn new(tick: Tick) -> Self {
+        let mut trace = Self {
+            schema: WORLD_STEP_TRACE_SCHEMA.to_owned(),
+            codec_version: WORLD_STEP_TRACE_CODEC_VERSION,
+            tick,
+            stages: Vec::with_capacity(WorldStepTracePoint::COUNT),
+            overall: String::new(),
+        };
+        trace.refresh_overall();
+        trace
+    }
+
+    fn reset(&mut self, tick: Tick) {
+        self.tick = tick;
+        self.stages.clear();
+        self.refresh_overall();
+    }
+
+    fn refresh_overall(&mut self) {
+        self.overall = self.recomputed_overall();
+    }
+
+    fn recomputed_overall(&self) -> String {
+        let mut overall =
+            CharacterizationEncoderV0::new_with_schema(WORLD_STEP_TRACE_SCHEMA, "overall");
+        overall.string(&self.schema);
+        overall.u16(self.codec_version);
+        overall.u64(self.tick.0);
+        overall.usize(self.stages.len());
+        for stage in &self.stages {
+            overall.string(stage.point.as_str());
+            match &stage.capture {
+                WorldStepTraceCapture::Complete { state } => {
+                    overall.u8(0);
+                    overall.string(&state.overall);
+                }
+                WorldStepTraceCapture::Error { error } => {
+                    overall.u8(1);
+                    encode_world_step_trace_error(&mut overall, error);
+                }
+            }
+        }
+        overall.finish()
+    }
+
+    /// Validate the schema, exact point set/order, stage metadata, and every nested overall hash.
+    ///
+    /// Serde guarantees structural decoding, but Postcard is positional and a `Vec` alone cannot
+    /// enforce the protocol's six-point cardinality. Consumers must call this after decoding a
+    /// trace before treating it as first-divergence evidence. Validation proves structural
+    /// self-consistency, not authenticity or collision resistance.
+    pub fn validate_contract(&self) -> Result<(), WorldStepTraceContractError> {
+        if self.schema != WORLD_STEP_TRACE_SCHEMA {
+            return Err(WorldStepTraceContractError::Schema {
+                found: self.schema.clone(),
+                expected: WORLD_STEP_TRACE_SCHEMA,
+            });
+        }
+        if self.codec_version != WORLD_STEP_TRACE_CODEC_VERSION {
+            return Err(WorldStepTraceContractError::CodecVersion {
+                found: self.codec_version,
+                expected: WORLD_STEP_TRACE_CODEC_VERSION,
+            });
+        }
+        if self.stages.len() != WorldStepTracePoint::COUNT {
+            return Err(WorldStepTraceContractError::StageCount {
+                found: self.stages.len(),
+                expected: WorldStepTracePoint::COUNT,
+            });
+        }
+
+        for (index, (stage, expected)) in
+            self.stages.iter().zip(WorldStepTracePoint::ALL).enumerate()
+        {
+            if stage.point != expected {
+                return Err(WorldStepTraceContractError::StageOrder {
+                    index,
+                    found: stage.point,
+                    expected,
+                });
+            }
+            match &stage.capture {
+                WorldStepTraceCapture::Error {
+                    error: WorldStepTraceError::MissingTransitionInput { point },
+                } if *point != stage.point => {
+                    return Err(WorldStepTraceContractError::CaptureErrorPoint {
+                        point: stage.point,
+                        found: *point,
+                    });
+                }
+                WorldStepTraceCapture::Error {
+                    error: WorldStepTraceError::MissingTransitionInput { .. },
+                } if !matches!(
+                    stage.point,
+                    WorldStepTracePoint::DeathCleanup | WorldStepTracePoint::Population
+                ) =>
+                {
+                    return Err(WorldStepTraceContractError::CaptureErrorNotAllowed {
+                        point: stage.point,
+                    });
+                }
+                WorldStepTraceCapture::Error {
+                    error:
+                        WorldStepTraceError::NonQuiescent { .. }
+                        | WorldStepTraceError::NonContinuable { .. },
+                } => {
+                    return Err(WorldStepTraceContractError::BoundaryErrorNotAllowed {
+                        point: stage.point,
+                    });
+                }
+                WorldStepTraceCapture::Error { .. } => {}
+                WorldStepTraceCapture::Complete { state } => {
+                    self.validate_complete_stage(stage.point, state)?;
+                }
+            }
+        }
+
+        if !is_characterization_digest(&self.overall) {
+            return Err(WorldStepTraceContractError::TraceOverallFormat);
+        }
+        if self.overall != self.recomputed_overall() {
+            return Err(WorldStepTraceContractError::TraceOverall);
+        }
+        Ok(())
+    }
+
+    fn validate_complete_stage(
+        &self,
+        point: WorldStepTracePoint,
+        state: &WorldStepStageStateDigest,
+    ) -> Result<(), WorldStepTraceContractError> {
+        let world = &state.world;
+        if world.schema != WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA {
+            return Err(WorldStepTraceContractError::StageWorldSchema {
+                point,
+                found: world.schema.clone(),
+                expected: WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA,
+            });
+        }
+        if world.codec_version != WORLD_DIGEST_V1_CODEC_VERSION {
+            return Err(WorldStepTraceContractError::StageWorldCodecVersion {
+                point,
+                found: world.codec_version,
+                expected: WORLD_DIGEST_V1_CODEC_VERSION,
+            });
+        }
+        if world.algorithm != WORLD_DIGEST_V1_ALGORITHM {
+            return Err(WorldStepTraceContractError::StageWorldAlgorithm {
+                point,
+                found: world.algorithm.clone(),
+                expected: WORLD_DIGEST_V1_ALGORITHM,
+            });
+        }
+        if world.agent_identity != WORLD_DIGEST_V1_AGENT_IDENTITY {
+            return Err(WorldStepTraceContractError::StageWorldIdentity {
+                point,
+                found: world.agent_identity.clone(),
+                expected: WORLD_DIGEST_V1_AGENT_IDENTITY,
+            });
+        }
+        if world.transition_tick != self.tick
+            || world.completed_tick.0.checked_add(1) != Some(self.tick.0)
+        {
+            return Err(WorldStepTraceContractError::StageWorldTicks {
+                point,
+                completed_tick: world.completed_tick.0,
+                transition_tick: world.transition_tick.0,
+                trace_tick: self.tick.0,
+            });
+        }
+        validate_trace_coverage(
+            point,
+            "evaluator",
+            world.evaluator_state_covered,
+            &world.uncovered_families,
+        )?;
+        validate_trace_coverage(
+            point,
+            "factory",
+            world.factory_state_covered,
+            &world.uncovered_factory_families,
+        )?;
+
+        let required_digests = [
+            ("world.overall", world.overall.as_str()),
+            ("world.agents", world.agents.as_str()),
+            ("world.execution_order", world.execution_order.as_str()),
+            ("world.brains", world.brains.as_str()),
+            ("world.food", world.food.as_str()),
+            ("world.terrain", world.terrain.as_str()),
+            ("world.rng", world.rng.as_str()),
+            ("world.counters", world.counters.as_str()),
+            ("world.brain_registry", world.brain_registry.as_str()),
+            ("world.config", world.config.as_str()),
+            ("world.effects", world.effects.as_str()),
+            (
+                "world.derived_transition",
+                world.derived_transition.as_str(),
+            ),
+            ("world.origins", world.origins.as_str()),
+            ("transition", state.transition.as_str()),
+            ("output_tail", state.output_tail.as_str()),
+            ("resource", state.resource.as_str()),
+            ("stage.overall", state.overall.as_str()),
+        ];
+        for (field, digest) in required_digests {
+            if !is_characterization_digest(digest) {
+                return Err(WorldStepTraceContractError::DigestFormat { point, field });
+            }
+        }
+        if world
+            .hydrology
+            .as_deref()
+            .is_some_and(|digest| !is_characterization_digest(digest))
+        {
+            return Err(WorldStepTraceContractError::DigestFormat {
+                point,
+                field: "world.hydrology",
+            });
+        }
+        if world.overall != world.recomputed_overall() {
+            return Err(WorldStepTraceContractError::StageWorldOverall { point });
+        }
+        if state.overall != state.recomputed_overall(self.tick, point) {
+            return Err(WorldStepTraceContractError::StageOverall { point });
+        }
+        Ok(())
+    }
+
+    /// Return the earliest canonical point at which two valid same-tick traces differ.
+    ///
+    /// Invalid artifacts and different transition ticks are comparison errors, not fabricated
+    /// scientific divergences at Sense.
+    pub fn first_divergence(
+        &self,
+        other: &Self,
+    ) -> Result<Option<WorldStepTracePoint>, WorldStepTraceComparisonError> {
+        self.validate_contract()
+            .map_err(WorldStepTraceComparisonError::InvalidLeft)?;
+        other
+            .validate_contract()
+            .map_err(WorldStepTraceComparisonError::InvalidRight)?;
+        if self.tick != other.tick {
+            return Err(WorldStepTraceComparisonError::TickMismatch {
+                left: self.tick.0,
+                right: other.tick.0,
+            });
+        }
+        Ok(WorldStepTracePoint::ALL
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, point)| {
+                (self.stages[index].capture != other.stages[index].capture).then_some(point)
+            }))
+    }
+}
+
+fn validate_trace_coverage(
+    point: WorldStepTracePoint,
+    coverage: &'static str,
+    covered: bool,
+    uncovered: &[String],
+) -> Result<(), WorldStepTraceContractError> {
+    if covered != uncovered.is_empty() {
+        return Err(WorldStepTraceContractError::Coverage { point, coverage });
+    }
+    if uncovered.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(WorldStepTraceContractError::CoverageOrder { point, coverage });
+    }
+    Ok(())
+}
+
+fn is_characterization_digest(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn encode_world_step_trace_error(
+    encoder: &mut CharacterizationEncoderV0,
+    error: &WorldStepTraceError,
+) {
+    match error {
+        WorldStepTraceError::NonQuiescent {
+            pending_deaths,
+            pending_spawns,
+            simulation_commands,
+        } => {
+            encoder.u8(0);
+            encoder.usize(*pending_deaths);
+            encoder.usize(*pending_spawns);
+            encoder.usize(*simulation_commands);
+        }
+        WorldStepTraceError::NonContinuable { blocker } => {
+            encoder.u8(1);
+            encoder.u8(match blocker {
+                WorldContinuationBlocker::BrainFault => 0,
+                WorldContinuationBlocker::PersistenceFault => 1,
+                WorldContinuationBlocker::RetainedPersistenceBatch => 2,
+            });
+        }
+        WorldStepTraceError::MissingAgentData { agent_id } => {
+            encoder.u8(2);
+            encoder.u64(*agent_id);
+        }
+        WorldStepTraceError::MissingAgentRuntime { agent_id } => {
+            encoder.u8(3);
+            encoder.u64(*agent_id);
+        }
+        WorldStepTraceError::Encoding { context } => {
+            encoder.u8(4);
+            encoder.string(context.as_str());
+        }
+        WorldStepTraceError::MissingTransitionInput { point } => {
+            encoder.u8(5);
+            encoder.string(point.as_str());
+        }
+    }
+}
+
+/// Opt-in clock-free observer for deterministic stage-by-stage regression evidence.
+#[derive(Debug, Default)]
+pub struct WorldStepTracer {
+    latest: Option<WorldStepTrace>,
+    death_cleanup_input_transition: Option<Result<String, WorldStepTraceError>>,
+    population_input_transition: Option<Result<String, WorldStepTraceError>>,
+    #[cfg(test)]
+    death_cleanup_input_pending_deaths: Option<usize>,
+    #[cfg(test)]
+    population_input_pending_spawns: Option<usize>,
+}
+
+impl WorldStepTracer {
+    /// Most recently completed stage trace, if any.
+    #[must_use]
+    pub const fn latest(&self) -> Option<&WorldStepTrace> {
+        self.latest.as_ref()
+    }
+}
+
 trait WorldStepObserver {
     type StepHandle;
     type StageHandle;
@@ -3047,6 +4131,7 @@ trait WorldStepObserver {
     fn begin_step(&mut self, tick: Tick) -> Self::StepHandle;
     fn begin_stage(&mut self, stage: WorldStepStage) -> Self::StageHandle;
     fn end_stage(&mut self, stage: WorldStepStage, handle: Self::StageHandle);
+    fn observe_stage(&mut self, _stage: WorldStepStage, _world: &WorldState) {}
     fn end_step(&mut self, handle: Self::StepHandle);
 }
 
@@ -3091,6 +4176,100 @@ impl WorldStepObserver for WorldStepProfiler {
     fn end_step(&mut self, started_at: Instant) {
         if let Some(latest) = self.latest.as_mut() {
             latest.total_ns = duration_ns(started_at.elapsed());
+        }
+    }
+}
+
+impl WorldStepObserver for WorldStepTracer {
+    type StepHandle = ();
+    type StageHandle = ();
+
+    fn begin_step(&mut self, tick: Tick) {
+        self.death_cleanup_input_transition = None;
+        self.population_input_transition = None;
+        #[cfg(test)]
+        {
+            self.death_cleanup_input_pending_deaths = None;
+            self.population_input_pending_spawns = None;
+        }
+        if let Some(latest) = self.latest.as_mut() {
+            latest.reset(tick);
+        } else {
+            self.latest = Some(WorldStepTrace::new(tick));
+        }
+    }
+
+    fn begin_stage(&mut self, _stage: WorldStepStage) {}
+
+    fn end_stage(&mut self, _stage: WorldStepStage, _handle: ()) {}
+
+    fn observe_stage(&mut self, stage: WorldStepStage, world: &WorldState) {
+        let Some(tick) = self.latest.as_ref().map(|trace| trace.tick) else {
+            return;
+        };
+
+        if stage == WorldStepStage::Combat {
+            #[cfg(test)]
+            {
+                self.death_cleanup_input_pending_deaths = Some(world.pending_deaths.len());
+            }
+            self.death_cleanup_input_transition = Some(
+                world
+                    .world_step_transition_digest(tick, WorldStepTracePoint::DeathCleanup)
+                    .map_err(Into::into),
+            );
+        } else if stage == WorldStepStage::Reproduction {
+            #[cfg(test)]
+            {
+                self.population_input_pending_spawns = Some(world.pending_spawns.len());
+            }
+            self.population_input_transition = Some(
+                world
+                    .world_step_transition_digest(tick, WorldStepTracePoint::Population)
+                    .map_err(Into::into),
+            );
+        }
+
+        let Some(point) = WorldStepTracePoint::from_stage(stage) else {
+            return;
+        };
+        let transition_override = match point {
+            WorldStepTracePoint::DeathCleanup => self.death_cleanup_input_transition.as_ref(),
+            WorldStepTracePoint::Population => self.population_input_transition.as_ref(),
+            _ => None,
+        };
+        let capture = match transition_override {
+            Some(Ok(transition)) => WorldStepTraceCapture::from_result(
+                world.world_step_stage_state_digest_with_transition(
+                    tick,
+                    point,
+                    transition.clone(),
+                ),
+            ),
+            Some(Err(error)) => WorldStepTraceCapture::Error {
+                error: error.clone(),
+            },
+            None if matches!(
+                point,
+                WorldStepTracePoint::DeathCleanup | WorldStepTracePoint::Population
+            ) =>
+            {
+                WorldStepTraceCapture::Error {
+                    error: WorldStepTraceError::MissingTransitionInput { point },
+                }
+            }
+            None => {
+                WorldStepTraceCapture::from_result(world.world_step_stage_state_digest(tick, point))
+            }
+        };
+        if let Some(latest) = self.latest.as_mut() {
+            latest.stages.push(WorldStepStageDigest { point, capture });
+        }
+    }
+
+    fn end_step(&mut self, _handle: ()) {
+        if let Some(latest) = self.latest.as_mut() {
+            latest.refresh_overall();
         }
     }
 }
@@ -6736,6 +7915,20 @@ pub mod narrative {
             &self.events
         }
 
+        pub(super) fn encode_world_step_trace(
+            &self,
+            encoder: &mut super::CharacterizationEncoderV0,
+        ) -> Result<(), super::CharacterizationError> {
+            encoder.postcard("narrative events", &self.events)?;
+            encoder.postcard("narrative emission watermarks", &self.last_emitted)?;
+            encoder.f64(self.policy.min_population_fraction);
+            encoder.f64(self.policy.min_population_absolute);
+            encoder.f64(self.policy.min_energy_absolute);
+            encoder.f64(self.policy.min_combat_absolute);
+            encoder.u64(self.policy.cooldown_ticks);
+            Ok(())
+        }
+
         /// Run the detectors over the tick history and append anything new.
         pub fn observe<'a, I>(&mut self, history: I, capacity: usize)
         where
@@ -9128,6 +10321,7 @@ impl TickCadence {
 
 #[derive(Clone, Copy, Debug)]
 struct PersistenceRuntimeTail {
+    agent_uid: AgentUid,
     food_delta: f32,
     spiked: bool,
     sound_output: f32,
@@ -9136,8 +10330,9 @@ struct PersistenceRuntimeTail {
 }
 
 impl PersistenceRuntimeTail {
-    fn capture(runtime: &AgentRuntime) -> Self {
+    fn capture(agent_uid: AgentUid, runtime: &AgentRuntime) -> Self {
         Self {
+            agent_uid,
             food_delta: runtime.food_delta,
             spiked: runtime.spiked,
             sound_output: runtime.sound_output,
@@ -11303,8 +12498,15 @@ impl WorldState {
         self.pending_persistence_runtime_tail.clear();
         for (agent_id, runtime) in self.runtime.iter_mut() {
             if preserve_persistence_tail {
-                self.pending_persistence_runtime_tail
-                    .insert(agent_id, PersistenceRuntimeTail::capture(runtime));
+                let agent_uid = self
+                    .identities
+                    .get(agent_id)
+                    .expect("live runtime must have stable identity")
+                    .uid;
+                self.pending_persistence_runtime_tail.insert(
+                    agent_id,
+                    PersistenceRuntimeTail::capture(agent_uid, runtime),
+                );
             }
             runtime.spiked = false;
             runtime.food_delta = 0.0;
@@ -13571,7 +14773,7 @@ impl WorldState {
         let mut food_delta_abs_sum = 0.0f64;
 
         let carnivore_threshold = self.config.carnivore_threshold;
-        let mut brain_map: HashMap<String, (usize, f64)> = HashMap::new();
+        let mut brain_map: BTreeMap<String, (usize, f64)> = BTreeMap::new();
 
         let columns = self.agents.columns();
         let healths = columns.health();
@@ -13968,6 +15170,7 @@ impl WorldState {
                 });
             }
         }
+        agents.sort_unstable_by_key(|agent| agent.identity.uid);
 
         if lifecycle_enabled && !self.pending_lifecycle_death_metrics.is_empty() {
             let mut combat_carnivore = 0usize;
@@ -14109,6 +15312,26 @@ impl WorldState {
         self.step_observed(profiler)
     }
 
+    /// Execute one simulation tick while capturing six deterministic first-divergence points.
+    ///
+    /// Unlike [`Self::step_profiled`], this observer never reads a clock. It captures Sense,
+    /// Brains, Actuation, Food, DeathCleanup, and Population rather than all fifteen performance
+    /// stages. DeathCleanup and Population retain the ordered queue digest from immediately before
+    /// those stages consume it. Each point records a typed complete/error capture; a successful
+    /// step does not imply every diagnostic capture succeeded, so consumers must inspect the
+    /// captures and call [`WorldStepTrace::validate_contract`] after decoding an artifact.
+    ///
+    /// Tracing is opt-in because hashing all scientific, deferred-work, output-tail, and resource
+    /// lanes is intentionally expensive diagnostic work rather than part of the production
+    /// transition. The sixth point precedes bookkeeping, persistence, and finalization; compare
+    /// the completed boundary [`WorldDigestV1`] separately when final-state parity matters.
+    pub fn step_traced(
+        &mut self,
+        tracer: &mut WorldStepTracer,
+    ) -> Result<TickEvents, WorldStepError> {
+        self.step_observed(tracer)
+    }
+
     fn step_observed<O: WorldStepObserver>(
         &mut self,
         observer: &mut O,
@@ -14127,6 +15350,7 @@ impl WorldState {
                 let stage_started_at = observer.begin_stage($stage);
                 let value = $body;
                 observer.end_stage($stage, stage_started_at);
+                observer.observe_stage($stage, self);
                 value
             }};
         }
@@ -14377,13 +15601,21 @@ impl WorldState {
     pub fn characterization_digest_v0(
         &self,
     ) -> Result<CharacterizationDigestV0, CharacterizationError> {
-        if !self.pending_deaths.is_empty()
+        self.characterization_digest_v0_inner(true)
+    }
+
+    fn characterization_digest_v0_inner(
+        &self,
+        require_quiescent: bool,
+    ) -> Result<CharacterizationDigestV0, CharacterizationError> {
+        if require_quiescent
+            && (!self.pending_deaths.is_empty()
             || !self.pending_spawns.is_empty()
             || !self.simulation_commands.is_empty()
             // A queued intervention is undelivered science: digesting now would
             // fingerprint a world that is about to change for reasons the digest
             // cannot see.
-            || !self.pending_interventions.is_empty()
+            || !self.pending_interventions.is_empty())
         {
             return Err(CharacterizationError::NonQuiescent {
                 pending_deaths: self.pending_deaths.len(),
@@ -14594,10 +15826,34 @@ impl WorldState {
     /// `uncovered_families`. A digest that quietly skipped those brains would be the same
     /// failure as v0's, wearing a higher version number.
     pub fn world_digest_v1(&self) -> Result<WorldDigestV1, CharacterizationError> {
+        self.world_digest_v1_inner(true)
+    }
+
+    fn world_digest_v1_inner(
+        &self,
+        require_quiescent: bool,
+    ) -> Result<WorldDigestV1, CharacterizationError> {
+        if require_quiescent {
+            if self.brain_fault.is_some() {
+                return Err(CharacterizationError::NonContinuable {
+                    blocker: WorldContinuationBlocker::BrainFault,
+                });
+            }
+            if self.persistence_fault.is_some() {
+                return Err(CharacterizationError::NonContinuable {
+                    blocker: WorldContinuationBlocker::PersistenceFault,
+                });
+            }
+            if self.pending_persistence_batch.is_some() {
+                return Err(CharacterizationError::NonContinuable {
+                    blocker: WorldContinuationBlocker::RetainedPersistenceBatch,
+                });
+            }
+        }
         // The environmental lanes are IDENTITY-INDEPENDENT — food, terrain, hydrology and the
         // registry roster do not depend on how agents are keyed — so v0 computes them correctly
         // and there is nothing to be gained by duplicating that code here.
-        let v0 = self.characterization_digest_v0()?;
+        let v0 = self.characterization_digest_v0_inner(require_quiescent)?;
 
         // AGENTS, ordered by STABLE identity.
         let mut ordered: Vec<(AgentUid, AgentId)> = self
@@ -14612,6 +15868,13 @@ impl WorldState {
                 Ok((uid, id))
             })
             .collect::<Result<_, CharacterizationError>>()?;
+        let mut execution_order_encoder =
+            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "execution-order");
+        execution_order_encoder.usize(ordered.len());
+        for (uid, _) in &ordered {
+            execution_order_encoder.u64(uid.get());
+        }
+        let execution_order = execution_order_encoder.finish();
         ordered.sort_unstable_by_key(|(uid, _)| uid.0);
 
         let mut agents_encoder = CharacterizationEncoderV0::new("agents-v1");
@@ -14694,48 +15957,312 @@ impl WorldState {
         counters_encoder.u64(self.next_birth_ordinal);
         let counters = counters_encoder.finish();
 
+        // SCIENTIFIC CONFIGURATION only. Construction inputs and operational presentation,
+        // control, analytics, persistence, history, and narrative policy do not change the next
+        // core transition after a world exists. Neutralizing them avoids false science
+        // divergences while the live factory/evaluator lanes cover the state they produced.
+        let mut scientific_config = self.config.clone();
+        scientific_config.initial_food = 0.0;
+        scientific_config.rng_seed = None;
+        scientific_config.chart_flush_interval = 0;
+        scientific_config.history_capacity = 0;
+        scientific_config.narrative_interval = 0;
+        scientific_config.narrative_capacity = 0;
+        scientific_config.persistence_interval = 0;
+        scientific_config.analytics_stride = AnalyticsStride {
+            macro_metrics: 0,
+            behavior_metrics: 0,
+            lifecycle_events: 0,
+        };
+        scientific_config.neuroflow = NeuroflowSettings::default();
+        scientific_config.control = ControlSettings::default();
+        scientific_config.render = RenderSettings::default();
+        let mut config_encoder =
+            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "config");
+        config_encoder.postcard("scientific ScriptBotsConfig", &scientific_config)?;
+        let config = config_encoder.finish();
+
+        let mut effects_encoder =
+            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "effects");
+        effects_encoder.postcard("active effects", &self.active_effects)?;
+        let effects = effects_encoder.finish();
+
+        let mut derived_encoder = CharacterizationEncoderV0::new_with_schema(
+            WORLD_DIGEST_V1_SCHEMA,
+            "derived-transition",
+        );
+        derived_encoder.u32(self.cadence.aging_interval);
+        derived_encoder.u32(self.cadence.reproduction_interval);
+        derived_encoder.f32(self.cadence.reproduction_chance);
+        derived_encoder.usize(self.food_profiles.len());
+        for profile in &self.food_profiles {
+            derived_encoder.f32(profile.capacity);
+            derived_encoder.f32(profile.growth_multiplier);
+            derived_encoder.f32(profile.decay_multiplier);
+            derived_encoder.f32(profile.fertility);
+            derived_encoder.f32(profile.nutrient_density);
+        }
+        let derived_transition = derived_encoder.finish();
+
+        let mut origins_encoder =
+            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "origins");
+        origins_encoder.postcard("pending birth records", &self.pending_birth_records)?;
+        let origins = origins_encoder.finish();
+
+        // Registry closure state is separate from bound evaluator state. A factory can capture a
+        // seed or model while keeping the same key and family label, so each registration must
+        // either declare that state digest or be named as an explicit coverage gap.
+        let mut registrations: Vec<_> = self.brain_registry.entries.iter().collect();
+        registrations.sort_unstable_by_key(|(key, _)| **key);
+        let mut uncovered_factories: BTreeSet<String> = BTreeSet::new();
+        let mut registry_encoder =
+            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "brain-registry");
+        registry_encoder.u64(self.brain_registry.next_key);
+        registry_encoder.usize(registrations.len());
+        for (key, entry) in registrations {
+            registry_encoder.u64(*key);
+            registry_encoder.string(entry.kind.as_ref());
+            registry_encoder.option_u64(entry.factory_state_digest);
+            if entry.factory_state_digest.is_none() {
+                uncovered_factories.insert(entry.kind.to_string());
+            }
+        }
+        let brain_registry = registry_encoder.finish();
+
         let evaluator_state_covered = uncovered.is_empty();
         let uncovered_families: Vec<String> = uncovered.into_iter().collect();
+        let factory_state_covered = uncovered_factories.is_empty();
+        let uncovered_factory_families: Vec<String> = uncovered_factories.into_iter().collect();
 
-        let mut overall_encoder = CharacterizationEncoderV0::new("overall-v1");
-        overall_encoder.string(WORLD_DIGEST_V1_SCHEMA);
-        overall_encoder.string(&agents);
-        overall_encoder.string(&brains);
-        overall_encoder.string(&v0.food);
-        overall_encoder.string(&v0.terrain);
-        overall_encoder.bool(v0.hydrology.is_some());
-        if let Some(hydrology) = &v0.hydrology {
-            overall_encoder.string(hydrology);
-        }
-        overall_encoder.string(&rng);
-        overall_encoder.string(&counters);
-        overall_encoder.string(&v0.brain_registry);
         // Coverage is part of the identity: a digest computed while blind to some brains must
-        // never collide with one computed while seeing them all.
-        overall_encoder.bool(evaluator_state_covered);
-        overall_encoder.usize(uncovered_families.len());
-        for family in &uncovered_families {
-            overall_encoder.string(family);
-        }
-        let overall = overall_encoder.finish();
-
-        Ok(WorldDigestV1 {
+        // never collide with one computed while seeing them all. The public tick is bound
+        // directly as metadata as well as transitively through the counters lane.
+        let mut digest = WorldDigestV1 {
             schema: WORLD_DIGEST_V1_SCHEMA.to_owned(),
-            algorithm: "fnv1a64-v0".to_owned(),
+            codec_version: WORLD_DIGEST_V1_CODEC_VERSION,
+            algorithm: WORLD_DIGEST_V1_ALGORITHM.to_owned(),
             tick: self.tick,
-            overall,
+            overall: String::new(),
             agents,
+            execution_order,
             brains,
             food: v0.food,
             terrain: v0.terrain,
             hydrology: v0.hydrology,
             rng,
             counters,
-            brain_registry: v0.brain_registry,
+            brain_registry,
+            config,
+            effects,
+            derived_transition,
+            origins,
             evaluator_state_covered,
             uncovered_families,
-            agent_identity: "AgentUid".to_owned(),
-        })
+            factory_state_covered,
+            uncovered_factory_families,
+            agent_identity: WORLD_DIGEST_V1_AGENT_IDENTITY.to_owned(),
+        };
+        digest.overall = digest.recomputed_overall();
+        Ok(digest)
+    }
+
+    fn world_step_stage_state_digest(
+        &self,
+        trace_tick: Tick,
+        point: WorldStepTracePoint,
+    ) -> Result<WorldStepStageStateDigest, CharacterizationError> {
+        let transition = self.world_step_transition_digest(trace_tick, point)?;
+        self.world_step_stage_state_digest_with_transition(trace_tick, point, transition)
+    }
+
+    fn world_step_stage_state_digest_with_transition(
+        &self,
+        trace_tick: Tick,
+        point: WorldStepTracePoint,
+        transition: String,
+    ) -> Result<WorldStepStageStateDigest, CharacterizationError> {
+        let boundary_lanes = self.world_digest_v1_inner(false)?;
+        let world = WorldStepStageWorldDigest::from_boundary_lanes(boundary_lanes, trace_tick);
+        let output_tail = self.world_step_output_tail_digest(trace_tick, point)?;
+        let resource = self.world_step_resource_digest(trace_tick, point);
+
+        let mut state = WorldStepStageStateDigest {
+            world,
+            transition,
+            output_tail,
+            resource,
+            overall: String::new(),
+        };
+        state.overall = state.recomputed_overall(trace_tick, point);
+        Ok(state)
+    }
+
+    fn world_step_trace_encoder(
+        trace_tick: Tick,
+        point: WorldStepTracePoint,
+        lane: &str,
+    ) -> CharacterizationEncoderV0 {
+        let mut encoder = CharacterizationEncoderV0::new_with_schema(WORLD_STEP_TRACE_SCHEMA, lane);
+        encoder.u64(trace_tick.0);
+        encoder.string(point.as_str());
+        encoder
+    }
+
+    fn required_agent_uid_for_trace(&self, id: AgentId) -> Result<AgentUid, CharacterizationError> {
+        self.agent_uid(id)
+            .ok_or(CharacterizationError::MissingAgentData {
+                agent_id: id.data().as_ffi(),
+            })
+    }
+
+    fn world_step_transition_digest(
+        &self,
+        trace_tick: Tick,
+        point: WorldStepTracePoint,
+    ) -> Result<String, CharacterizationError> {
+        let mut encoder = Self::world_step_trace_encoder(trace_tick, point, "transition");
+
+        encoder.usize(self.pending_deaths.len());
+        for id in &self.pending_deaths {
+            encoder.u64(self.required_agent_uid_for_trace(*id)?.get());
+        }
+
+        encoder.usize(self.pending_spawns.len());
+        for spawn in &self.pending_spawns {
+            encoder.usize(spawn.parent_index);
+            encoder.u64(self.required_agent_uid_for_trace(spawn.parent_id)?.get());
+            encoder.bool(spawn.partner_id.is_some());
+            if let Some(partner_id) = spawn.partner_id {
+                encoder.u64(self.required_agent_uid_for_trace(partner_id)?.get());
+            }
+            encoder.f32(spawn.parent_energy_before_debit);
+            encoder.f32(spawn.parent_reproduction_counter_before_reset);
+            encode_agent_data_v0(&mut encoder, spawn.data);
+            encode_agent_runtime_v0(&mut encoder, &spawn.runtime);
+            let runner_digest = spawn
+                .runtime
+                .brain
+                .runner()
+                .and_then(BrainRunner::state_digest);
+            encoder.option_u64(runner_digest);
+        }
+
+        encoder.postcard("pending interventions", &self.pending_interventions)?;
+        encoder.postcard("simulation commands", &self.simulation_commands)?;
+        Ok(encoder.finish())
+    }
+
+    fn world_step_output_tail_digest(
+        &self,
+        trace_tick: Tick,
+        point: WorldStepTracePoint,
+    ) -> Result<String, CharacterizationError> {
+        let mut encoder = Self::world_step_trace_encoder(trace_tick, point, "output-tail");
+        encoder.postcard("pending death records", &self.pending_death_records)?;
+        encoder.postcard(
+            "pending lifecycle birth metrics",
+            &self.pending_lifecycle_birth_metrics,
+        )?;
+        encoder.postcard(
+            "pending lifecycle death metrics",
+            &self.pending_lifecycle_death_metrics,
+        )?;
+        encoder.u64(self.replay_tick);
+        encoder.postcard("pending replay events", &self.replay_events)?;
+
+        let mut runtime_tails = self
+            .pending_persistence_runtime_tail
+            .iter()
+            .map(|(_, tail)| *tail)
+            .collect::<Vec<_>>();
+        runtime_tails.sort_unstable_by_key(|tail| tail.agent_uid);
+        encoder.usize(runtime_tails.len());
+        for tail in runtime_tails {
+            encoder.u64(tail.agent_uid.get());
+            encoder.f32(tail.food_delta);
+            encoder.bool(tail.spiked);
+            encoder.f32(tail.sound_output);
+            encoder.f32(tail.give_intent);
+            encoder.f32(tail.indicator.intensity);
+            for color in tail.indicator.color {
+                encoder.f32(color);
+            }
+        }
+
+        encoder.usize(self.pending_birth_events);
+        encoder.usize(self.pending_death_events);
+        encoder.u32(self.pending_spike_attempt_events);
+        encoder.u32(self.pending_spike_hit_events);
+        encoder.usize(self.last_births);
+        encoder.usize(self.last_deaths);
+        encoder.u32(self.last_spike_hits);
+        encoder.u32(self.last_max_age);
+        encoder.f32(self.carcass_health_distributed);
+        encoder.f32(self.carcass_reproduction_bonus);
+        encoder.u32(self.combat_spike_attempts);
+        encoder.u32(self.combat_spike_hits);
+        encoder.u64(self.config_revision);
+        encoder.postcard("tick history", &self.history)?;
+        self.narrative.encode_world_step_trace(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    fn encode_resource_amounts_for_trace(
+        encoder: &mut CharacterizationEncoderV0,
+        amounts: ResourceAmounts,
+    ) {
+        encoder.f64(amounts.food);
+        encoder.f64(amounts.energy);
+        encoder.f64(amounts.health);
+    }
+
+    fn encode_resource_flow_for_trace(encoder: &mut CharacterizationEncoderV0, flow: ResourceFlow) {
+        encoder.usize(flow.kind.index());
+        Self::encode_resource_amounts_for_trace(encoder, flow.delta);
+        Self::encode_resource_amounts_for_trace(encoder, flow.activity);
+    }
+
+    fn encode_resource_tick_for_trace(
+        encoder: &mut CharacterizationEncoderV0,
+        tick: &ResourceLedgerTick,
+    ) {
+        encoder.u64(tick.tick.0);
+        Self::encode_resource_amounts_for_trace(encoder, tick.opening);
+        Self::encode_resource_amounts_for_trace(encoder, tick.closing);
+        encoder.usize(tick.flows.len());
+        for flow in &tick.flows {
+            Self::encode_resource_flow_for_trace(encoder, *flow);
+        }
+        Self::encode_resource_amounts_for_trace(encoder, tick.reconciliation.observed_delta);
+        Self::encode_resource_amounts_for_trace(encoder, tick.reconciliation.attributed_delta);
+        Self::encode_resource_amounts_for_trace(encoder, tick.reconciliation.unexplained_delta);
+        encoder.f64(tick.reconciliation.tolerance);
+        encoder.bool(tick.reconciliation.reconciled);
+    }
+
+    fn world_step_resource_digest(&self, trace_tick: Tick, point: WorldStepTracePoint) -> String {
+        let mut encoder = Self::world_step_trace_encoder(trace_tick, point, "resource");
+        encoder.bool(self.resource_ledger.enabled);
+        encoder.bool(self.resource_ledger.working.is_some());
+        if let Some(working) = &self.resource_ledger.working {
+            encoder.u64(working.tick.0);
+            Self::encode_resource_amounts_for_trace(&mut encoder, working.opening);
+            encoder.usize(working.flows.len());
+            for flow in &working.flows {
+                Self::encode_resource_flow_for_trace(&mut encoder, *flow);
+            }
+        }
+
+        encoder.u64(self.resource_ledger.report.completed_ticks);
+        encoder.bool(self.resource_ledger.report.latest.is_some());
+        if let Some(latest) = &self.resource_ledger.report.latest {
+            Self::encode_resource_tick_for_trace(&mut encoder, latest);
+        }
+        encoder.usize(self.resource_ledger.report.cumulative.len());
+        for flow in &self.resource_ledger.report.cumulative {
+            Self::encode_resource_flow_for_trace(&mut encoder, *flow);
+        }
+        encoder.finish()
     }
 
     /// Queue a simulation control request for external renderers.
@@ -18244,6 +19771,10 @@ mod tests {
                 outputs[6] = inputs[0];
             }
             outputs
+        }
+
+        fn state_digest(&self) -> Option<u64> {
+            Some(0x7374_7562_2d76_3100)
         }
     }
 
@@ -24772,6 +26303,10 @@ mod tests {
             outputs[8] = 1.0;
             outputs
         }
+
+        fn state_digest(&self) -> Option<u64> {
+            Some(0x4c45_4447_4552_5f41)
+        }
     }
 
     struct LedgerIdleBrain;
@@ -24783,6 +26318,10 @@ mod tests {
 
         fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
             [0.0; OUTPUT_SIZE]
+        }
+
+        fn state_digest(&self) -> Option<u64> {
+            Some(0x4c45_4447_4552_5f49)
         }
     }
 
@@ -25164,6 +26703,980 @@ mod tests {
         }
     }
 
+    fn quiet_trace_config(seed: u64, persistence_interval: u32) -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 10,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_intake_rate: 0.0,
+            food_waste_rate: 0.0,
+            food_sharing_rate: 0.0,
+            food_transfer_rate: 0.0,
+            bot_speed: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            aging_energy_penalty_rate: 0.0,
+            reproduction_energy_threshold: 10.0,
+            reproduction_attempt_chance: 0.0,
+            carcass_distribution_radius: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            persistence_interval,
+            history_capacity: 1,
+            chart_flush_interval: 0,
+            narrative_interval: 0,
+            narrative_capacity: 0,
+            rng_seed: Some(seed),
+            ..ScriptBotsConfig::default()
+        }
+    }
+
+    #[test]
+    fn traced_step_observes_six_v1_checkpoints_without_changing_science() {
+        fn traced_world() -> WorldState {
+            let config = ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                closed: true,
+                persistence_interval: 0,
+                rng_seed: Some(2_815),
+                ..ScriptBotsConfig::default()
+            };
+            let mut world = WorldState::new(config).expect("traced world");
+            let brain = world
+                .brain_registry_mut()
+                .expect("trace registry mutation")
+                .register_with_state_digest("trace-parity", 0x5452_4143_455f_5631, |_rng| {
+                    Ok(Box::new(StubBrain))
+                });
+            for ordinal in 0..2 {
+                let agent = world.spawn_agent(sample_agent(ordinal));
+                assert!(world.bind_agent_brain(agent, brain).expect("trace brain"));
+            }
+            world.set_resource_ledger_enabled(true);
+            world
+        }
+
+        let mut control = traced_world();
+        let mut traced = traced_world();
+        let mut tracer = WorldStepTracer::default();
+
+        let control_events = control.step().expect("control trace tick");
+        let traced_events = traced
+            .step_traced(&mut tracer)
+            .expect("instrumented trace tick");
+        assert_eq!(control_events, traced_events);
+        assert_eq!(
+            control.world_digest_v1().expect("control final V1"),
+            traced.world_digest_v1().expect("traced final V1")
+        );
+        assert_eq!(control.resource_ledger(), traced.resource_ledger());
+
+        let trace = tracer.latest().expect("completed stage trace");
+        assert_eq!(trace.schema, WORLD_STEP_TRACE_SCHEMA);
+        assert_eq!(trace.codec_version, WORLD_STEP_TRACE_CODEC_VERSION);
+        assert_eq!(trace.tick, Tick(1));
+        assert_eq!(
+            trace
+                .stages
+                .iter()
+                .map(|stage| stage.point)
+                .collect::<Vec<_>>(),
+            WorldStepTracePoint::ALL
+        );
+        assert_eq!(trace.stages.len(), WorldStepTracePoint::COUNT);
+        assert!(trace.stages.iter().all(|stage| stage.capture.is_ok()));
+        trace
+            .validate_contract()
+            .expect("fresh trace must satisfy the pinned wire contract");
+
+        let mut repeated = traced_world();
+        let mut repeated_tracer = WorldStepTracer::default();
+        let repeated_events = repeated
+            .step_traced(&mut repeated_tracer)
+            .expect("repeated instrumented trace tick");
+        assert_eq!(traced_events, repeated_events);
+        assert_eq!(
+            tracer.latest(),
+            repeated_tracer.latest(),
+            "same-lane repeated trace diverged"
+        );
+
+        let postcard = postcard::to_allocvec(trace).expect("encode stage trace");
+        let postcard_round_trip: WorldStepTrace =
+            postcard::from_bytes(&postcard).expect("decode stage trace");
+        assert_eq!(&postcard_round_trip, trace);
+        postcard_round_trip
+            .validate_contract()
+            .expect("Postcard round trip must retain a valid trace");
+        let trace_json = serde_json::to_value(trace).expect("encode stage trace JSON");
+        let json_round_trip: WorldStepTrace =
+            serde_json::from_value(trace_json.clone()).expect("decode stage trace JSON");
+        assert_eq!(&json_round_trip, trace);
+        json_round_trip
+            .validate_contract()
+            .expect("JSON round trip must retain a valid trace");
+        let trace_keys: BTreeSet<String> = trace_json
+            .as_object()
+            .expect("trace JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            trace_keys,
+            ["schema", "codec_version", "tick", "stages", "overall"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(
+            serde_json::to_value(WorldStepTracePoint::ALL).expect("trace point JSON"),
+            serde_json::json!([
+                "sense",
+                "brains",
+                "actuation",
+                "food",
+                "death_cleanup",
+                "population"
+            ])
+        );
+        let stage_world_json = serde_json::to_value(
+            &trace.stages[0]
+                .capture
+                .as_ref()
+                .expect("first stage capture")
+                .world,
+        )
+        .expect("stage-world JSON");
+        let stage_world = stage_world_json
+            .as_object()
+            .expect("stage-world JSON object");
+        assert!(stage_world.contains_key("completed_tick"));
+        assert!(stage_world.contains_key("transition_tick"));
+        assert!(!stage_world.contains_key("tick"));
+
+        let mut missing_overall = trace_json.clone();
+        missing_overall
+            .as_object_mut()
+            .expect("mutable trace JSON")
+            .remove("overall");
+        assert!(serde_json::from_value::<WorldStepTrace>(missing_overall).is_err());
+
+        let mut nested_capture_unknown = trace_json.clone();
+        nested_capture_unknown["stages"][0]["capture"]["complete"]
+            .as_object_mut()
+            .expect("complete capture JSON object")
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<WorldStepTrace>(nested_capture_unknown).is_err());
+
+        let mut unknown_field = trace_json;
+        unknown_field
+            .as_object_mut()
+            .expect("mutable trace JSON")
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<WorldStepTrace>(unknown_field).is_err());
+
+        let mut failed_capture = trace.clone();
+        failed_capture.stages[4].capture = WorldStepTraceCapture::Error {
+            error: WorldStepTraceError::MissingTransitionInput {
+                point: WorldStepTracePoint::DeathCleanup,
+            },
+        };
+        failed_capture.refresh_overall();
+        failed_capture
+            .validate_contract()
+            .expect("typed failed capture remains a valid trace payload");
+        assert_ne!(
+            failed_capture.overall, trace.overall,
+            "trace aggregate must bind typed capture failures"
+        );
+        let failed_postcard =
+            postcard::to_allocvec(&failed_capture).expect("encode failed stage capture");
+        assert_eq!(
+            postcard::from_bytes::<WorldStepTrace>(&failed_postcard)
+                .expect("decode failed stage capture"),
+            failed_capture
+        );
+        let mut nested_error_unknown =
+            serde_json::to_value(&failed_capture).expect("failed capture JSON");
+        nested_error_unknown["stages"][4]["capture"]["error"]["error"]["missing_transition_input"]
+            .as_object_mut()
+            .expect("capture error JSON object")
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<WorldStepTrace>(nested_error_unknown).is_err());
+
+        let mut impossible_capture = trace.clone();
+        impossible_capture.stages[0].capture = WorldStepTraceCapture::Error {
+            error: WorldStepTraceError::MissingTransitionInput {
+                point: WorldStepTracePoint::Sense,
+            },
+        };
+        impossible_capture.refresh_overall();
+        assert!(matches!(
+            impossible_capture.validate_contract(),
+            Err(WorldStepTraceContractError::CaptureErrorNotAllowed {
+                point: WorldStepTracePoint::Sense
+            })
+        ));
+        let mut impossible_boundary_error = trace.clone();
+        impossible_boundary_error.stages[0].capture = WorldStepTraceCapture::Error {
+            error: WorldStepTraceError::NonContinuable {
+                blocker: WorldContinuationBlocker::BrainFault,
+            },
+        };
+        impossible_boundary_error.refresh_overall();
+        assert!(matches!(
+            impossible_boundary_error.validate_contract(),
+            Err(WorldStepTraceContractError::BoundaryErrorNotAllowed {
+                point: WorldStepTracePoint::Sense
+            })
+        ));
+
+        let mut too_short = trace.clone();
+        too_short.stages.pop();
+        assert!(matches!(
+            too_short.validate_contract(),
+            Err(WorldStepTraceContractError::StageCount {
+                found: 5,
+                expected: 6
+            })
+        ));
+        assert!(matches!(
+            trace.first_divergence(&too_short),
+            Err(WorldStepTraceComparisonError::InvalidRight(
+                WorldStepTraceContractError::StageCount { .. }
+            ))
+        ));
+        let mut too_long = trace.clone();
+        too_long
+            .stages
+            .push(trace.stages.last().expect("last trace stage").clone());
+        assert!(matches!(
+            too_long.validate_contract(),
+            Err(WorldStepTraceContractError::StageCount {
+                found: 7,
+                expected: 6
+            })
+        ));
+        let mut duplicate = trace.clone();
+        duplicate.stages[1].point = WorldStepTracePoint::Sense;
+        assert!(matches!(
+            duplicate.validate_contract(),
+            Err(WorldStepTraceContractError::StageOrder { index: 1, .. })
+        ));
+        let mut reordered = trace.clone();
+        reordered.stages.swap(0, 1);
+        assert!(matches!(
+            reordered.validate_contract(),
+            Err(WorldStepTraceContractError::StageOrder { index: 0, .. })
+        ));
+        let mut wrong_schema = trace.clone();
+        wrong_schema.schema = "scriptbots.world-step-trace.v0".to_owned();
+        assert!(matches!(
+            wrong_schema.validate_contract(),
+            Err(WorldStepTraceContractError::Schema { .. })
+        ));
+        let mut wrong_codec = trace.clone();
+        wrong_codec.codec_version = 2;
+        assert!(matches!(
+            wrong_codec.validate_contract(),
+            Err(WorldStepTraceContractError::CodecVersion { .. })
+        ));
+        let mut wrong_stage_algorithm = trace.clone();
+        let mut wrong_stage = wrong_stage_algorithm.stages[0]
+            .capture
+            .as_ref()
+            .expect("first stage capture")
+            .clone();
+        wrong_stage.world.algorithm = "not-the-pinned-algorithm".to_owned();
+        wrong_stage_algorithm.stages[0].capture = WorldStepTraceCapture::Complete {
+            state: Box::new(wrong_stage),
+        };
+        assert!(matches!(
+            wrong_stage_algorithm.validate_contract(),
+            Err(WorldStepTraceContractError::StageWorldAlgorithm { .. })
+        ));
+        let mut corrupt_stage_world = trace.clone();
+        let mut corrupt_state = corrupt_stage_world.stages[0]
+            .capture
+            .as_ref()
+            .expect("first stage capture")
+            .clone();
+        corrupt_state.world.overall = "0000000000000000".to_owned();
+        corrupt_stage_world.stages[0].capture = WorldStepTraceCapture::Complete {
+            state: Box::new(corrupt_state),
+        };
+        assert!(matches!(
+            corrupt_stage_world.validate_contract(),
+            Err(WorldStepTraceContractError::StageWorldOverall { .. })
+        ));
+        let mut corrupt_trace = trace.clone();
+        corrupt_trace.overall = "0000000000000000".to_owned();
+        assert!(matches!(
+            corrupt_trace.validate_contract(),
+            Err(WorldStepTraceContractError::TraceOverall)
+        ));
+
+        let mut diverged = trace.clone();
+        let mut diverged_state = diverged.stages[3]
+            .capture
+            .as_ref()
+            .expect("food-stage capture")
+            .clone();
+        diverged_state.output_tail = "0000000000000000".to_owned();
+        diverged_state.overall =
+            diverged_state.recomputed_overall(trace.tick, WorldStepTracePoint::Food);
+        diverged.stages[3].capture = WorldStepTraceCapture::Complete {
+            state: Box::new(diverged_state),
+        };
+        diverged.refresh_overall();
+        diverged
+            .validate_contract()
+            .expect("divergence fixture must be a valid trace");
+        assert_eq!(
+            trace
+                .first_divergence(&diverged)
+                .expect("same-tick valid trace comparison"),
+            Some(WorldStepTracePoint::Food)
+        );
+        assert_eq!(
+            &trace.stages[..3],
+            &diverged.stages[..3],
+            "first-divergence fixture must preserve the equal prefix"
+        );
+
+        let observed: Vec<_> = trace
+            .stages
+            .iter()
+            .map(|stage| {
+                let capture = stage.capture.as_ref().expect("captured stage state");
+                (
+                    stage.point.as_str(),
+                    capture.world.overall.as_str(),
+                    capture.transition.as_str(),
+                    capture.output_tail.as_str(),
+                    capture.resource.as_str(),
+                    capture.overall.as_str(),
+                )
+            })
+            .collect();
+        const EXPECTED: [(&str, &str, &str, &str, &str, &str); 6] = [
+            (
+                "sense",
+                "f10216be6228c8b6",
+                "253a284da466be42",
+                "62a13216a397a8b8",
+                "44ddeb4e786b776a",
+                "9f6e3791bcf7f177",
+            ),
+            (
+                "brains",
+                "badbff714becb9e9",
+                "9dae7c712cc1cc4e",
+                "68f838243a47b62c",
+                "b1b7dc935eb536d0",
+                "bae7f8e311bc28de",
+            ),
+            (
+                "actuation",
+                "da8ad63d0c07d08f",
+                "f9ce592950d6a180",
+                "1b948f83b4de2972",
+                "1a47c67538a352fc",
+                "259c81cf55201a8e",
+            ),
+            (
+                "food",
+                "d2a536a1bdee223f",
+                "ae7b499f2d757079",
+                "6f65e5d680d5f035",
+                "15946b95087abfb5",
+                "33a805724deec5d4",
+            ),
+            (
+                "death_cleanup",
+                "d2a536a1bdee223f",
+                "ac775f4e0cc86269",
+                "f4ee065ba5245c9d",
+                "69bbb09ff5e16fef",
+                "ca79f71433a7922f",
+            ),
+            (
+                "population",
+                "5f3cbd0c2ef8ee9f",
+                "29a5d296807b3e04",
+                "bb9662aa18c5a5d6",
+                "82e93f6bd75ea162",
+                "3ca8fad3178afdfc",
+            ),
+        ];
+        if std::env::var("SCRIPTBOTS_WORLD_DIGEST_GOLDEN").as_deref() == Ok("1") {
+            let build = CoreBuildIdentityV0::current();
+            assert!(build.parallel);
+            assert!(build.simd_wide);
+            assert_eq!(build.rayon_threads, 4);
+            assert_eq!(build.target_arch, "aarch64");
+            assert_eq!(build.target_os, "macos");
+            assert_eq!(build.target_family, "unix");
+            assert_eq!(build.target_endian, "little");
+            assert_eq!(build.pointer_width, 64);
+            assert_eq!(observed, EXPECTED);
+            assert_eq!(trace.overall, "6e3bcdad6c3719e4");
+            println!(
+                "scriptbots.world-digest-golden.v1: six checkpoints and trace overall {} verified",
+                trace.overall
+            );
+        } else {
+            assert_eq!(observed.len(), WorldStepTracePoint::COUNT);
+        }
+    }
+
+    #[test]
+    fn stage_trace_lanes_detect_future_affecting_pending_and_diagnostic_state() {
+        fn trace_world() -> (WorldState, AgentId, AgentId) {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                closed: true,
+                persistence_interval: 0,
+                rng_seed: Some(2_816),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("anti-collision trace world");
+            let first = world.spawn_agent(sample_agent(0));
+            let second = world.spawn_agent(sample_agent(1));
+            (world, first, second)
+        }
+
+        fn capture(world: &WorldState) -> WorldStepStageStateDigest {
+            world
+                .world_step_stage_state_digest(Tick(1), WorldStepTracePoint::Sense)
+                .expect("stage-state digest")
+        }
+
+        let (mut world, first, second) = trace_world();
+        let no_deaths = capture(&world);
+        world.pending_deaths.push(first);
+        let first_death = capture(&world);
+        assert_eq!(no_deaths.world, first_death.world);
+        assert_ne!(no_deaths.transition, first_death.transition);
+        assert_eq!(no_deaths.output_tail, first_death.output_tail);
+        assert_eq!(no_deaths.resource, first_death.resource);
+
+        world.pending_deaths.push(first);
+        let duplicate_death = capture(&world);
+        assert_ne!(first_death.transition, duplicate_death.transition);
+        world.pending_deaths = vec![second, first];
+        let reordered_deaths = capture(&world);
+        assert_ne!(duplicate_death.transition, reordered_deaths.transition);
+
+        world.pending_deaths.clear();
+        world.simulation_commands = vec![SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: false,
+        }];
+        let first_command = capture(&world);
+        world.simulation_commands.push(SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: None,
+            step_once: false,
+        });
+        let duplicate_command = capture(&world);
+        assert_eq!(first_command.world, duplicate_command.world);
+        assert_ne!(first_command.transition, duplicate_command.transition);
+        world.simulation_commands = vec![
+            SimulationCommand {
+                paused: None,
+                speed_multiplier: Some(2.0),
+                step_once: false,
+            },
+            SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: false,
+            },
+        ];
+        let ordered_commands = capture(&world);
+        world.simulation_commands.reverse();
+        let reversed_commands = capture(&world);
+        assert_ne!(ordered_commands.transition, reversed_commands.transition);
+
+        world.simulation_commands.clear();
+        world.pending_deaths.clear();
+        world.pending_spawns.push(SpawnOrder {
+            parent_index: world.agents.index_of(first).expect("parent index"),
+            parent_id: first,
+            partner_id: Some(second),
+            parent_energy_before_debit: 0.75,
+            parent_reproduction_counter_before_reset: 2.0,
+            data: sample_agent(2),
+            runtime: AgentRuntime::default(),
+        });
+        let spawn_before = capture(&world);
+        world.pending_spawns[0].parent_energy_before_debit += 0.25;
+        let spawn_after = capture(&world);
+        assert_eq!(spawn_before.world, spawn_after.world);
+        assert_ne!(spawn_before.transition, spawn_after.transition);
+        assert_eq!(spawn_before.output_tail, spawn_after.output_tail);
+        assert_eq!(spawn_before.resource, spawn_after.resource);
+
+        world.pending_spawns.clear();
+        let birth_before = capture(&world);
+        world.pending_birth_records[0].herbivore_tendency = 0.25;
+        let birth_after = capture(&world);
+        assert_ne!(birth_before.world.origins, birth_after.world.origins);
+        assert_ne!(birth_before.world.overall, birth_after.world.overall);
+        assert_eq!(birth_before.transition, birth_after.transition);
+        assert_eq!(birth_before.output_tail, birth_after.output_tail);
+        assert_eq!(birth_before.resource, birth_after.resource);
+
+        let tail = PersistenceRuntimeTail::capture(
+            world.agent_uid(first).expect("first stable identity"),
+            world.agent_runtime(first).expect("first runtime tail"),
+        );
+        world.pending_persistence_runtime_tail.insert(first, tail);
+        let tail_before = capture(&world);
+        world
+            .pending_persistence_runtime_tail
+            .get_mut(first)
+            .expect("inserted persistence tail")
+            .food_delta += 1.0;
+        let tail_after = capture(&world);
+        assert_eq!(tail_before.world, tail_after.world);
+        assert_eq!(tail_before.transition, tail_after.transition);
+        assert_ne!(tail_before.output_tail, tail_after.output_tail);
+        assert_eq!(tail_before.resource, tail_after.resource);
+
+        world.resource_ledger.set_enabled(true);
+        world
+            .resource_ledger
+            .begin_tick(Tick(1), ResourceAmounts::default());
+        let resource_before = capture(&world);
+        world
+            .resource_ledger
+            .working
+            .as_mut()
+            .expect("working resource ledger")
+            .flows[ResourceFlowKind::FoodDynamics.index()]
+        .delta
+        .food = 1.0;
+        let resource_after = capture(&world);
+        assert_eq!(resource_before.world, resource_after.world);
+        assert_eq!(resource_before.transition, resource_after.transition);
+        assert_eq!(resource_before.output_tail, resource_after.output_tail);
+        assert_ne!(resource_before.resource, resource_after.resource);
+        assert_ne!(resource_before.overall, resource_after.overall);
+    }
+
+    #[test]
+    fn traced_combat_captures_death_queue_before_cleanup_consumes_it() {
+        let config = ScriptBotsConfig {
+            spike_radius: 20.0,
+            spike_damage: 0.5,
+            spike_energy_cost: 0.0,
+            spike_min_length: 0.1,
+            spike_alignment_cosine: 0.1,
+            spike_speed_damage_bonus: 0.0,
+            spike_length_damage_bonus: 0.0,
+            ..quiet_trace_config(2_818, 0)
+        };
+        let mut world = WorldState::new(config).expect("combat trace world");
+        let attacker = world.spawn_agent(sample_agent(0));
+        let victim = world.spawn_agent(sample_agent(1));
+        let attacker_brain = world
+            .brain_registry_mut()
+            .expect("combat trace attacker registry")
+            .register_with_state_digest(
+                "test.resource-ledger-aggressor",
+                0x4c45_4447_4552_5f41,
+                |_rng| Ok(Box::new(LedgerAggressorBrain)),
+            );
+        let victim_brain = world
+            .brain_registry_mut()
+            .expect("combat trace victim registry")
+            .register_with_state_digest(
+                "test.resource-ledger-idle",
+                0x4c45_4447_4552_5f49,
+                |_rng| Ok(Box::new(LedgerIdleBrain)),
+            );
+        assert!(
+            world
+                .bind_agent_brain(attacker, attacker_brain)
+                .expect("bind combat trace attacker")
+        );
+        assert!(
+            world
+                .bind_agent_brain(victim, victim_brain)
+                .expect("bind combat trace victim")
+        );
+        {
+            let attacker_index = world.agents.index_of(attacker).expect("attacker index");
+            let victim_index = world.agents.index_of(victim).expect("victim index");
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[attacker_index] = Position::new(10.0, 10.0);
+            columns.positions_mut()[victim_index] = Position::new(15.0, 10.0);
+            columns.headings_mut()[attacker_index] = 0.0;
+            columns.headings_mut()[victim_index] = 0.0;
+            columns.health_mut()[victim_index] = 0.08;
+            columns.spike_lengths_mut()[attacker_index] = 1.0;
+            columns.spike_lengths_mut()[victim_index] = 0.0;
+        }
+        {
+            let runtime = world
+                .agent_runtime_mut(attacker)
+                .expect("combat trace attacker runtime");
+            runtime.energy = 1.0;
+            runtime.herbivore_tendency = 0.0;
+        }
+        {
+            let runtime = world
+                .agent_runtime_mut(victim)
+                .expect("combat trace victim runtime");
+            runtime.energy = 0.2;
+            runtime.herbivore_tendency = 1.0;
+        }
+
+        let mut tracer = WorldStepTracer::default();
+        world
+            .step_traced(&mut tracer)
+            .expect("combat traced transition");
+        assert!(world.agent_uid(victim).is_none());
+        assert_eq!(tracer.death_cleanup_input_pending_deaths, Some(1));
+        let trace = tracer.latest().expect("combat trace");
+        assert!(trace.stages.iter().all(|stage| stage.capture.is_ok()));
+        let captured = trace
+            .stages
+            .iter()
+            .find(|stage| stage.point == WorldStepTracePoint::DeathCleanup)
+            .expect("death-cleanup trace point")
+            .capture
+            .as_ref()
+            .expect("death-cleanup capture");
+        let post_consumption = world
+            .world_step_transition_digest(Tick(1), WorldStepTracePoint::DeathCleanup)
+            .expect("post-cleanup transition");
+        assert_ne!(captured.transition, post_consumption);
+    }
+
+    #[test]
+    fn traced_reproduction_captures_spawn_queue_before_population_consumes_it() {
+        let config = ScriptBotsConfig {
+            reproduction_energy_threshold: 0.4,
+            reproduction_energy_cost: 0.1,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
+            reproduction_child_energy: 0.6,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_mutation_scale: 0.0,
+            reproduction_partner_chance: 0.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            ..quiet_trace_config(2_819, 0)
+        };
+        let mut world = WorldState::new(config).expect("reproduction trace world");
+        let parent = world.spawn_agent(sample_agent(0));
+        {
+            let runtime = world
+                .agent_runtime_mut(parent)
+                .expect("reproduction trace parent runtime");
+            runtime.energy = 1.0;
+            runtime.reproduction_counter = 1.0;
+        }
+
+        let mut tracer = WorldStepTracer::default();
+        world
+            .step_traced(&mut tracer)
+            .expect("reproduction traced transition");
+        assert_eq!(world.agent_count(), 2);
+        assert!(world.pending_spawns.is_empty());
+        assert_eq!(tracer.population_input_pending_spawns, Some(1));
+        let trace = tracer.latest().expect("reproduction trace");
+        assert!(trace.stages.iter().all(|stage| stage.capture.is_ok()));
+        let captured = trace
+            .stages
+            .iter()
+            .find(|stage| stage.point == WorldStepTracePoint::Population)
+            .expect("population trace point")
+            .capture
+            .as_ref()
+            .expect("population capture");
+        let post_consumption = world
+            .world_step_transition_digest(Tick(1), WorldStepTracePoint::Population)
+            .expect("post-population transition");
+        assert_ne!(captured.transition, post_consumption);
+    }
+
+    #[test]
+    fn traced_step_keeps_retained_tail_identity_after_agent_death() {
+        let mut world =
+            WorldState::new(quiet_trace_config(2_820, 3)).expect("retained-tail trace world");
+        let agent = world.spawn_agent(sample_agent(0));
+        let agent_uid = world.agent_uid(agent).expect("retained-tail stable uid");
+        world.step().expect("non-cadence retained-tail tick");
+        assert_eq!(
+            world
+                .pending_persistence_runtime_tail
+                .get(agent)
+                .expect("retained runtime tail")
+                .agent_uid,
+            agent_uid
+        );
+        let index = world
+            .agents
+            .index_of(agent)
+            .expect("retained-tail agent index");
+        world.agents.columns_mut().health_mut()[index] = 0.0;
+
+        let mut tracer = WorldStepTracer::default();
+        world
+            .step_traced(&mut tracer)
+            .expect("death with retained tail remains traceable");
+        assert!(world.agent_uid(agent).is_none());
+        assert!(
+            tracer
+                .latest()
+                .expect("retained-tail trace")
+                .stages
+                .iter()
+                .all(|stage| stage.capture.is_ok())
+        );
+        assert!(world.pending_persistence_runtime_tail.is_empty());
+    }
+
+    #[test]
+    fn world_digest_v1_covers_declared_factory_state_and_names_opaque_factories() {
+        fn registry_world(factory_digest: u64) -> WorldState {
+            let mut world =
+                WorldState::new(quiet_trace_config(2_821, 0)).expect("factory digest world");
+            world
+                .brain_registry_mut()
+                .expect("factory digest registry")
+                .register_with_state_digest("factory-family", factory_digest, |_rng| {
+                    Ok(Box::new(StubBrain))
+                });
+            world
+        }
+
+        let left = registry_world(11)
+            .world_digest_v1()
+            .expect("left factory digest");
+        let right = registry_world(12)
+            .world_digest_v1()
+            .expect("right factory digest");
+        assert_ne!(left.brain_registry, right.brain_registry);
+        assert_ne!(left.overall, right.overall);
+        assert!(left.factory_state_covered);
+        assert!(left.uncovered_factory_families.is_empty());
+
+        let mut opaque =
+            WorldState::new(quiet_trace_config(2_821, 0)).expect("opaque factory world");
+        opaque
+            .brain_registry_mut()
+            .expect("opaque factory registry")
+            .register("opaque-family", |_rng| Ok(Box::new(StubBrain)));
+        let opaque = opaque
+            .world_digest_v1()
+            .expect("opaque factory digest remains honest");
+        assert!(!opaque.factory_state_covered);
+        assert_eq!(
+            opaque.uncovered_factory_families,
+            vec!["opaque-family".to_owned()]
+        );
+    }
+
+    #[test]
+    fn world_digest_v1_names_dense_execution_order_until_stages_are_uid_canonical() {
+        fn two_identical_agents() -> WorldState {
+            let mut world =
+                WorldState::new(quiet_trace_config(2_823, 0)).expect("execution-order world");
+            world.spawn_agent(sample_agent(0));
+            world.spawn_agent(sample_agent(0));
+            world
+        }
+
+        let left = two_identical_agents();
+        let mut right = two_identical_agents();
+        let first = right.agents.handles[0];
+        let second = right.agents.handles[1];
+        right.agents.handles.swap(0, 1);
+        *right.agents.slots.get_mut(first).expect("first dense slot") = 1;
+        *right
+            .agents
+            .slots
+            .get_mut(second)
+            .expect("second dense slot") = 0;
+
+        let left = left.world_digest_v1().expect("left execution order");
+        let right = right.world_digest_v1().expect("right execution order");
+        assert_eq!(left.agents, right.agents);
+        assert_eq!(left.brains, right.brains);
+        assert_eq!(left.rng, right.rng);
+        assert_eq!(left.counters, right.counters);
+        assert_eq!(left.origins, right.origins);
+        assert_ne!(left.execution_order, right.execution_order);
+        assert_ne!(left.overall, right.overall);
+    }
+
+    #[test]
+    fn persistence_batch_orders_agents_and_brain_metrics_stably() {
+        let config = ScriptBotsConfig {
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            ..quiet_trace_config(2_822, 1)
+        };
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world =
+            WorldState::with_persistence(config, Box::new(spy)).expect("ordered batch world");
+        let first = world.spawn_agent(sample_agent(0));
+        let second = world.spawn_agent(sample_agent(1));
+        let third = world.spawn_agent(sample_agent(2));
+        let aggressor = world
+            .brain_registry_mut()
+            .expect("ordered batch aggressor registry")
+            .register("test.resource-ledger-aggressor", |_rng| {
+                Ok(Box::new(LedgerAggressorBrain))
+            });
+        let idle = world
+            .brain_registry_mut()
+            .expect("ordered batch idle registry")
+            .register("test.resource-ledger-idle", |_rng| {
+                Ok(Box::new(LedgerIdleBrain))
+            });
+        assert!(
+            world
+                .bind_agent_brain(second, aggressor)
+                .expect("ordered batch aggressor binding")
+        );
+        assert!(
+            world
+                .bind_agent_brain(third, idle)
+                .expect("ordered batch idle binding")
+        );
+        assert!(world.remove_agent(first).is_some());
+
+        world.step().expect("ordered persistence batch tick");
+        let entries = logs.lock().expect("ordered batch logs");
+        let batch = entries.last().expect("ordered persistence batch");
+        let agent_uids: Vec<_> = batch
+            .agents
+            .iter()
+            .map(|agent| agent.identity.uid)
+            .collect();
+        let mut sorted_agent_uids = agent_uids.clone();
+        sorted_agent_uids.sort_unstable();
+        assert_eq!(agent_uids, sorted_agent_uids);
+
+        let brain_count_metrics: Vec<_> = batch
+            .metrics
+            .iter()
+            .map(|metric| metric.name.as_ref())
+            .filter(|name| name.starts_with("brain.population.") && name.ends_with(".count"))
+            .collect();
+        let mut sorted_brain_count_metrics = brain_count_metrics.clone();
+        sorted_brain_count_metrics.sort_unstable();
+        assert_eq!(brain_count_metrics, sorted_brain_count_metrics);
+        assert_eq!(brain_count_metrics.len(), 2);
+    }
+
+    #[test]
+    fn world_digest_v1_covers_config_effects_and_derived_transition_state() {
+        let (mut world, _, _) = {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                closed: true,
+                rng_seed: Some(2_817),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("V1 lane world");
+            let first = world.spawn_agent(sample_agent(0));
+            let second = world.spawn_agent(sample_agent(1));
+            (world, first, second)
+        };
+
+        let before_config = world.world_digest_v1().expect("config baseline V1");
+        world.config.closed = false;
+        let after_config = world.world_digest_v1().expect("config-mutated V1");
+        assert_ne!(before_config.config, after_config.config);
+        assert_ne!(before_config.overall, after_config.overall);
+        assert_eq!(before_config.effects, after_config.effects);
+        assert_eq!(
+            before_config.derived_transition,
+            after_config.derived_transition
+        );
+
+        let before_effect = after_config;
+        world.active_effects.push(ActiveEffect {
+            region: Region::All,
+            ticks_remaining: 2,
+            growth_scale: 1.0,
+        });
+        let after_effect = world.world_digest_v1().expect("effect-mutated V1");
+        assert_eq!(before_effect.config, after_effect.config);
+        assert_ne!(before_effect.effects, after_effect.effects);
+        assert_eq!(
+            before_effect.derived_transition,
+            after_effect.derived_transition
+        );
+        assert_ne!(before_effect.overall, after_effect.overall);
+
+        let before_derived = after_effect;
+        world.food_profiles[0].nutrient_density += 0.125;
+        let after_derived = world.world_digest_v1().expect("derived-mutated V1");
+        assert_eq!(before_derived.config, after_derived.config);
+        assert_eq!(before_derived.effects, after_derived.effects);
+        assert_ne!(
+            before_derived.derived_transition,
+            after_derived.derived_transition
+        );
+        assert_ne!(before_derived.overall, after_derived.overall);
+
+        let before_operational = after_derived;
+        world.config.initial_food = 0.375;
+        world.config.rng_seed = Some(99);
+        world.config.chart_flush_interval = 7;
+        world.config.history_capacity = 3;
+        world.config.narrative_interval = 2;
+        world.config.narrative_capacity = 4;
+        world.config.persistence_interval = 9;
+        world.config.analytics_stride = AnalyticsStride {
+            macro_metrics: 8,
+            behavior_metrics: 7,
+            lifecycle_events: 6,
+        };
+        world.config.neuroflow.enabled = !world.config.neuroflow.enabled;
+        world.config.control.auto_pause_on_spike_hit = true;
+        world.config.render.tonemap_exposure_bias = Some(1.25);
+        let after_operational = world
+            .world_digest_v1()
+            .expect("operational-policy-mutated V1");
+        assert_eq!(before_operational.config, after_operational.config);
+        assert_eq!(before_operational.overall, after_operational.overall);
+    }
+
     #[test]
     fn profiled_step_preserves_persistence_failure_and_latched_boundary() {
         let config = ScriptBotsConfig {
@@ -25209,6 +27722,12 @@ mod tests {
         }
         assert_eq!(control.tick(), Tick(1));
         assert_eq!(profiled.tick(), Tick(1));
+        assert!(matches!(
+            profiled.world_digest_v1(),
+            Err(CharacterizationError::NonContinuable {
+                blocker: WorldContinuationBlocker::PersistenceFault
+            })
+        ));
         assert_eq!(
             profiler.latest().expect("failed tick profile").tick,
             Tick(1)

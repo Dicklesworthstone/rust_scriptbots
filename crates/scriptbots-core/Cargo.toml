@@ -22,11 +22,11 @@ getrandom = { workspace = true }
 libm = { workspace = true }
 num_cpus = { workspace = true }
 serde_json = { workspace = true }
+postcard = { workspace = true }
 wide = { version = "1.5.0", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", default-features = false, features = ["html_reports"] }
-postcard = { workspace = true }
 scriptbots-brain = { path = "../scriptbots-brain", default-features = false, features = ["mlp"] }
 scriptbots-brain-neuro = { path = "../scriptbots-brain-neuro", default-features = false }
 

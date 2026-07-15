@@ -480,7 +480,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - This is lifecycle hardening plus interim double-drive containment: the HUD is the only current GPUI simulation driver and the world window is read-only. It is not the final ownership fix—the renderer still owns scientific time and GPUI command draining remains incorrect. The `HostCore` migration owns both remaining defects and the permanent exactly-one-driver proof.
 
 ## Simulation overview
-Deterministic, staged tick pipeline (seeded RNG; stable ordering):
+Deterministic, staged tick pipeline (seeded RNG; explicit staged ordering):
 1. Aging and scheduled tasks
 2. Food respawn/diffusion
 3. Sense (spatial index snapshot)
@@ -494,9 +494,16 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 
 ### Design principles & determinism
 - **No undefined behavior**: workspace lints flag `unsafe`; the remaining platform/environment boundary blocks are explicit and reviewable.
-- **Stable order of effects**: floating-point reductions and removals are staged and applied in a fixed order for bitwise-stable runs across thread counts.
-- **Per-agent RNG**: seeds derive from a global seed + `AgentId`, keeping behavior stable as populations change and threads vary.
+- **Explicit order of effects**: floating-point reductions and removals are staged. The current dense agent order can still affect reductions, parent selection, and RNG assignment, so `WorldDigestV1` records that order by stable `AgentUid` instead of claiming it is irrelevant. Canonicalizing every execution/spawn stage by UID is tracked by `bd-2z0.3.14`.
+- **Restorable RNG state**: the world owns a versioned, restorable random stream whose exact state enters V1. Draw assignment still follows current stage/execution order; independent domain-separated agent streams remain roadmap work rather than a claimed property.
 - **Feature-gated parallelism**: `scriptbots-core` defaults to `parallel` (Rayon), while web builds disable it for single-thread determinism.
+
+#### Canonical digest and first-divergence trace
+
+- `WorldState::world_digest_v1()` emits the exact `scriptbots.world-digest.v1.1` science-state wire. Its aggregate covers stable-UID agent bodies, current dense execution order, brain genomes/evaluator coverage, food, terrain/hydrology, restorable RNG state, identity counters, registered-factory coverage, a scientific configuration projection, active effects, derived transition caches, and open ancestry origins. Operational rendering, analytics, persistence-admission policy, host receipts, and backend error prose do not enter the science digest.
+- `WorldState::step_traced()` is an opt-in, clock-free diagnostic API. It records exactly six semantic checkpoints—Sense, Brains, Actuation, Food, DeathCleanup, and Population—with separate world, ordered deferred-work, pending output-tail, and resource-ledger hashes. The trace has its own aggregate hash, typed capture failures, and `validate_contract()` enforcement for schema, cardinality, order, ticks, coverage, digest shape, and nested aggregate hashes.
+- Both V1 and trace validation prove protocol self-consistency, not artifact authenticity. Their FNV-1a64 hashes are diagnostic first-divergence aids, not signatures or collision-resistant attestations; a durable run bundle will require separate provenance/authentication.
+- DeathCleanup and Population retain the ordered queue state immediately before consumption, while the final completed-boundary V1 and resource report prove traced/untraced parity after finalization. The literal six-point golden is enabled only by the `SCRIPTBOTS_WORLD_DIGEST_GOLDEN=1` environment guard in its pinned DSR test lane, so ordinary `--all-features` tests remain portable; there is no product CLI or replay-file claim yet.
 
 #### Reproducible runs (seed control)
 - Set a fixed seed in config: `rng_seed = <u64>`. At runtime you can apply via REST:
@@ -507,7 +514,7 @@ Deterministic, staged tick pipeline (seeded RNG; stable ordering):
 
 ### Data model & spatial indexing
 - **SoA layout**: agents use cache-friendly columns (`AgentColumns`) for fast scans during sense/actuation.
-- **Generational IDs**: slotmap-backed `AgentId` prevents stale references and enables stable iteration.
+- **Two identity layers**: slotmap-backed `AgentId` prevents stale references; monotonic `AgentUid` is the stable scientific identity used by digests, lineage, replay, and persistence.
 - **Spatial index**: uniform hash grid. Sense builds a read-only snapshot; the declared `rstar`/`kd` features do not yet provide alternate implementations.
 
 ### Sensors & outputs

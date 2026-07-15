@@ -8,8 +8,14 @@
 //! it. The second half is what makes the first half mean anything — on its own, "v1 changed"
 //! would prove only that v1 is sensitive to *something*.
 
+use std::collections::BTreeSet;
+
 use scriptbots_brain::mlp::MlpBrain;
-use scriptbots_core::{AgentData, ScriptBotsConfig, SmallRngStream, WorldState};
+use scriptbots_core::{
+    AgentData, Intervention, Region, ScriptBotsConfig, SmallRngStream, WorldDigestV1,
+    WorldDigestV1ContractError, WorldState,
+};
+use serde::Serialize;
 
 /// A world whose agents all carry an MLP brain built from `brain_seed`.
 ///
@@ -30,7 +36,7 @@ fn world_with_brain_seed(brain_seed: u64, agent_count: usize) -> WorldState {
     let key = world
         .brain_registry_mut()
         .expect("digest registry mutation")
-        .register(MlpBrain::KIND.as_str(), move |_world_rng| {
+        .register_with_state_digest(MlpBrain::KIND.as_str(), brain_seed, move |_world_rng| {
             let mut fixed = SmallRngStream::seed_from_u64(brain_seed);
             Ok(MlpBrain::runner(&mut fixed))
         });
@@ -102,9 +108,12 @@ fn v0_is_blind_to_the_genomes_and_v1_is_not() {
     assert_eq!(
         v1_left.agents, v1_right.agents,
         "the AGENTS (body) lane differs between worlds whose bodies are identical. The lanes are \
-         not separating what they claim to separate, so 'the brains changed' could not be \
+        not separating what they claim to separate, so 'the brains changed' could not be \
          distinguished from 'the bodies changed'."
     );
+    assert_eq!(v1_left.config, v1_right.config);
+    assert_eq!(v1_left.effects, v1_right.effects);
+    assert_eq!(v1_left.derived_transition, v1_right.derived_transition);
 }
 
 #[test]
@@ -131,6 +140,13 @@ fn v1_reports_honestly_how_much_of_the_world_it_can_see() {
         "the agent lane must be keyed on the STABLE uid, not the recycled slot key that v0 used"
     );
     assert_eq!(digest.schema, scriptbots_core::WORLD_DIGEST_V1_SCHEMA);
+    assert_eq!(
+        digest.codec_version,
+        scriptbots_core::WORLD_DIGEST_V1_CODEC_VERSION
+    );
+    assert_eq!(digest.algorithm, scriptbots_core::WORLD_DIGEST_V1_ALGORITHM);
+    assert!(digest.factory_state_covered);
+    assert!(digest.uncovered_factory_families.is_empty());
 }
 
 #[test]
@@ -138,12 +154,240 @@ fn the_digest_is_deterministic() {
     // Everything above rests on this. If the digest varied between calls on an unchanged world,
     // every comparison in the project would be noise.
     let world = world_with_brain_seed(3, 6);
+    let first = world.world_digest_v1().expect("first V1");
+    let second = world.world_digest_v1().expect("second V1");
+    first
+        .validate_contract()
+        .expect("fresh V1 must satisfy its semantic wire contract");
     assert_eq!(
-        world.world_digest_v1().expect("v1"),
-        world.world_digest_v1().expect("v1"),
+        first, second,
         "two digests of the SAME unchanged world disagree — the oracle is not a function of the \
          world, and nothing built on it means anything"
     );
+    let encoded = postcard::to_allocvec(&first).expect("encode V1");
+    let decoded: WorldDigestV1 = postcard::from_bytes(&encoded).expect("decode V1");
+    assert_eq!(decoded, first, "V1 postcard round-trip changed the oracle");
+    decoded
+        .validate_contract()
+        .expect("Postcard round trip must retain a valid V1");
+}
+
+#[test]
+fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
+    #[derive(Serialize)]
+    struct LegacyWorldDigestV1 {
+        schema: String,
+        algorithm: String,
+        tick: scriptbots_core::Tick,
+        overall: String,
+        agents: String,
+        brains: String,
+        food: String,
+        terrain: String,
+        hydrology: Option<String>,
+        rng: String,
+        counters: String,
+        brain_registry: String,
+        evaluator_state_covered: bool,
+        uncovered_families: Vec<String>,
+        agent_identity: String,
+    }
+
+    let digest = world_with_brain_seed(17, 2)
+        .world_digest_v1()
+        .expect("V1.1 wire fixture");
+    let json = serde_json::to_value(&digest).expect("encode V1.1 JSON");
+    let json_round_trip: WorldDigestV1 =
+        serde_json::from_value(json.clone()).expect("decode V1.1 JSON");
+    assert_eq!(json_round_trip, digest);
+    json_round_trip
+        .validate_contract()
+        .expect("JSON round trip must retain a valid V1");
+    let keys: BTreeSet<String> = json
+        .as_object()
+        .expect("V1.1 JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    let expected: BTreeSet<String> = [
+        "schema",
+        "codec_version",
+        "algorithm",
+        "tick",
+        "overall",
+        "agents",
+        "execution_order",
+        "brains",
+        "food",
+        "terrain",
+        "hydrology",
+        "rng",
+        "counters",
+        "brain_registry",
+        "config",
+        "effects",
+        "derived_transition",
+        "origins",
+        "evaluator_state_covered",
+        "uncovered_families",
+        "factory_state_covered",
+        "uncovered_factory_families",
+        "agent_identity",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(keys, expected);
+
+    for required in [
+        "codec_version",
+        "config",
+        "effects",
+        "derived_transition",
+        "origins",
+        "factory_state_covered",
+        "uncovered_factory_families",
+    ] {
+        let mut missing = json.clone();
+        missing
+            .as_object_mut()
+            .expect("mutable V1.1 JSON")
+            .remove(required);
+        assert!(
+            serde_json::from_value::<WorldDigestV1>(missing).is_err(),
+            "missing required field {required} decoded successfully"
+        );
+    }
+    let mut unknown = json;
+    unknown
+        .as_object_mut()
+        .expect("mutable V1.1 JSON")
+        .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+    assert!(serde_json::from_value::<WorldDigestV1>(unknown).is_err());
+
+    let mut wrong_schema = digest.clone();
+    wrong_schema.schema = "scriptbots.world-digest.v1".to_owned();
+    assert!(matches!(
+        wrong_schema.validate_contract(),
+        Err(WorldDigestV1ContractError::Schema { .. })
+    ));
+    let mut wrong_codec = digest.clone();
+    wrong_codec.codec_version += 1;
+    assert!(matches!(
+        wrong_codec.validate_contract(),
+        Err(WorldDigestV1ContractError::CodecVersion { .. })
+    ));
+    let mut wrong_algorithm = digest.clone();
+    wrong_algorithm.algorithm = "other".to_owned();
+    assert!(matches!(
+        wrong_algorithm.validate_contract(),
+        Err(WorldDigestV1ContractError::Algorithm { .. })
+    ));
+    let mut wrong_identity = digest.clone();
+    wrong_identity.agent_identity = "AgentId".to_owned();
+    assert!(matches!(
+        wrong_identity.validate_contract(),
+        Err(WorldDigestV1ContractError::AgentIdentity { .. })
+    ));
+    let mut changed_tick = digest.clone();
+    changed_tick.tick = changed_tick.tick.next();
+    assert!(matches!(
+        changed_tick.validate_contract(),
+        Err(WorldDigestV1ContractError::Overall)
+    ));
+    let mut invalid_digest = digest.clone();
+    invalid_digest.config = "NOT-A-DIGEST".to_owned();
+    assert!(matches!(
+        invalid_digest.validate_contract(),
+        Err(WorldDigestV1ContractError::DigestFormat { field: "config" })
+    ));
+    let mut inconsistent_coverage = digest.clone();
+    inconsistent_coverage.factory_state_covered = false;
+    assert!(matches!(
+        inconsistent_coverage.validate_contract(),
+        Err(WorldDigestV1ContractError::Coverage {
+            coverage: "factory"
+        })
+    ));
+
+    let legacy = LegacyWorldDigestV1 {
+        schema: "scriptbots.world-digest.v1".to_owned(),
+        algorithm: digest.algorithm.clone(),
+        tick: digest.tick,
+        overall: digest.overall.clone(),
+        agents: digest.agents.clone(),
+        brains: digest.brains.clone(),
+        food: digest.food.clone(),
+        terrain: digest.terrain.clone(),
+        hydrology: digest.hydrology.clone(),
+        rng: digest.rng.clone(),
+        counters: digest.counters.clone(),
+        brain_registry: digest.brain_registry.clone(),
+        evaluator_state_covered: digest.evaluator_state_covered,
+        uncovered_families: digest.uncovered_families.clone(),
+        agent_identity: digest.agent_identity.clone(),
+    };
+    let legacy = postcard::to_allocvec(&legacy).expect("encode legacy V1 fixture");
+    assert!(
+        postcard::from_bytes::<WorldDigestV1>(&legacy).is_err(),
+        "legacy positional V1 payload decoded as V1.1"
+    );
+}
+
+#[test]
+fn future_scientific_config_changes_only_the_config_lane() {
+    let left = world_with_brain_seed(11, 4);
+    let mut right = world_with_brain_seed(11, 4);
+    let mut changed = right.config().clone();
+    changed.bot_speed += 0.125;
+    right
+        .apply_config_update(changed)
+        .expect("future-science config update");
+
+    let before = left.world_digest_v1().expect("config control V1");
+    let after = right.world_digest_v1().expect("config changed V1");
+    assert_ne!(before.config, after.config);
+    assert_ne!(before.overall, after.overall);
+    assert_eq!(before.agents, after.agents);
+    assert_eq!(before.brains, after.brains);
+    assert_eq!(before.food, after.food);
+    assert_eq!(before.terrain, after.terrain);
+    assert_eq!(before.hydrology, after.hydrology);
+    assert_eq!(before.rng, after.rng);
+    assert_eq!(before.counters, after.counters);
+    assert_eq!(before.brain_registry, after.brain_registry);
+    assert_eq!(before.effects, after.effects);
+    assert_eq!(before.derived_transition, after.derived_transition);
+}
+
+#[test]
+fn an_active_effect_changes_only_the_effects_lane() {
+    let mut control = world_with_brain_seed(13, 4);
+    let mut drought = world_with_brain_seed(13, 4);
+    drought
+        .enqueue_intervention(Intervention::Drought {
+            region: Region::All,
+            ticks: 2,
+            growth_scale: 1.0,
+        })
+        .expect("neutral drought");
+    control.step().expect("control tick");
+    drought.step().expect("drought tick");
+
+    let before = control.world_digest_v1().expect("effect control V1");
+    let after = drought.world_digest_v1().expect("effect changed V1");
+    assert_ne!(before.effects, after.effects);
+    assert_ne!(before.overall, after.overall);
+    assert_eq!(before.config, after.config);
+    assert_eq!(before.agents, after.agents);
+    assert_eq!(before.brains, after.brains);
+    assert_eq!(before.food, after.food);
+    assert_eq!(before.terrain, after.terrain);
+    assert_eq!(before.hydrology, after.hydrology);
+    assert_eq!(before.rng, after.rng);
+    assert_eq!(before.counters, after.counters);
+    assert_eq!(before.brain_registry, after.brain_registry);
+    assert_eq!(before.derived_transition, after.derived_transition);
 }
 
 #[test]

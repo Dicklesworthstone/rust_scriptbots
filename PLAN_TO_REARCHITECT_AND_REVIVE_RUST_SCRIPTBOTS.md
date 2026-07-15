@@ -1949,11 +1949,19 @@ claim that world integration early.
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
-#### 1.8 canonical digest and checkpoint skeleton
+#### 1.8 canonical digest and checkpoint skeleton [Digest Oracle Completed — `bd-2z0.3.13`; checkpoint/manifest work remains]
 
-- canonical, versioned `WorldDigestV1` using `AgentUid` and stable ordering;
+- [Completed — `bd-2z0.3.13`] Canonical `scriptbots.world-digest.v1.1`: stable-UID
+  science lanes, explicit current dense execution-order lane, evaluator/factory coverage,
+  scientific config/effects/derived/origin state, and aggregate metadata binding;
+- [Follow-up — `bd-2z0.3.14`] Make every dense agent execution and spawn stage canonical by
+  `AgentUid`, then advance the digest schema before retiring the explicit execution-order lane;
 - include genome, evaluator state, RNG state, config, terrain/food, spawn ordinals, and all future-affecting counters;
-- per-stage digest hooks enabled only in diagnostic/test mode;
+- [Completed — `bd-2z0.3.13`] Opt-in clock-free trace with exactly six semantic checkpoints,
+  separate world/deferred-work/output/resource lanes, pre-consumption death/spawn queues,
+  typed capture errors, first-divergence lookup, an aggregate trace hash, and strict decoded-wire
+  validation. The literal golden remains confined to a pinned DSR-only environment guard rather
+  than a Cargo feature, so generic `--all-features` testing remains portable;
 - checkpoint envelope/codec skeleton;
 - encode/decode idempotence fixtures;
 - upgrade `RunManifestV0` to a versioned canonical manifest.
@@ -2068,7 +2076,7 @@ Executable evidence on source baseline `a4dce8fb9635834d387e0cd353d2d2f6670abf19
 - `target_command_truth_table_is_complete_and_self_consistent` checks every row above, including
   Step/Resume order, revision deltas, application counts, and journal counts.
 
-#### 2.2 extract core side effects
+#### 2.2 extract core side effects [Currently In Progress — `bd-2z0.4.2`]
 
 - remove simulation-command queue ownership from `WorldState`;
 - make core step return deterministic `StepOutcome`/domain deltas;
