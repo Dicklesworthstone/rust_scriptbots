@@ -506,13 +506,11 @@ mod asupersync_runner {
                 Err(SendError::Full(NativeMessage::Command(envelope))) => {
                     Err(NativeIngressError::Full(envelope))
                 }
-                Err(SendError::Disconnected(NativeMessage::Command(envelope))) => {
-                    Err(NativeIngressError::Closed(envelope))
-                }
                 // Pinned Asupersync 0.3.6 `try_send` has no cancellation
                 // context, but the shared error enum still requires this
                 // exhaustive defensive arm.
-                Err(SendError::Cancelled(NativeMessage::Command(envelope))) => {
+                Err(SendError::Disconnected(NativeMessage::Command(envelope)))
+                | Err(SendError::Cancelled(NativeMessage::Command(envelope))) => {
                     Err(NativeIngressError::Closed(envelope))
                 }
                 Err(SendError::Full(_) | SendError::Disconnected(_) | SendError::Cancelled(_)) => {
@@ -685,7 +683,7 @@ mod asupersync_runner {
         /// `Runtime::block_on` did not install its documented ambient context.
         #[error("native Asupersync runtime did not install a Cx")]
         MissingContext,
-        /// Fixed-deadline or HostCore boundary failure.
+        /// Fixed-deadline or `HostCore` boundary failure.
         #[error(transparent)]
         Schedule(#[from] NativeScheduleError),
         /// Host journal or scientific state reached a queryable fault.
@@ -1581,13 +1579,15 @@ mod asupersync_runner {
     }
 
     fn panic_message(payload: &(dyn Any + Send)) -> String {
-        if let Some(message) = payload.downcast_ref::<&str>() {
-            (*message).to_owned()
-        } else if let Some(message) = payload.downcast_ref::<String>() {
-            message.clone()
-        } else {
-            "non-string panic payload".to_owned()
-        }
+        payload.downcast_ref::<&str>().map_or_else(
+            || {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "non-string panic payload".to_owned())
+            },
+            |message| (*message).to_owned(),
+        )
     }
 }
 
@@ -2382,7 +2382,7 @@ mod tests {
         control
             .try_submit(stale.clone())
             .expect("stale shutdown enqueue");
-        let producer = control.clone();
+        let producer = control;
         let followup = std::thread::spawn(move || {
             let mut candidate = envelope(2, HostCommand::Shutdown);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -3215,7 +3215,7 @@ mod tests {
             .enable_platform_reactor(false)
             .build()
             .expect("paused virtual runtime");
-        let lifecycle = control.clone();
+        let lifecycle = control;
         let advancer = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while !lifecycle.is_owner_waiting() {
