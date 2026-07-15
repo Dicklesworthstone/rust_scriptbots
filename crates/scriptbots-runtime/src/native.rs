@@ -1849,9 +1849,7 @@ mod tests {
         replay_events: Vec<scriptbots_core::ReplayEvent>,
     }
 
-    fn persistence_value(
-        batch: &Arc<scriptbots_core::PersistenceBatch>,
-    ) -> PersistenceTrace {
+    fn persistence_value(batch: &Arc<scriptbots_core::PersistenceBatch>) -> PersistenceTrace {
         PersistenceTrace {
             summary: batch.summary.clone(),
             epoch: batch.epoch,
@@ -1877,10 +1875,7 @@ mod tests {
                         .command()
                         .map(|command| serde_json::to_value(command).expect("command trace JSON")),
                     batch.applied(),
-                    batch
-                        .scientific()
-                        .map(std::convert::AsRef::as_ref)
-                        .cloned(),
+                    batch.scientific().map(std::convert::AsRef::as_ref).cloned(),
                     batch.persistence().map(persistence_value),
                 )
             })
