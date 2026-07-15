@@ -2016,7 +2016,7 @@ fn summary_markdown(artifact: &PerfArtifact, verdict: &PerfVerdict) -> String {
     let mut output = String::new();
     output.push_str("# ScriptBots performance gate\n\n");
     output.push_str(&format!(
-        "- Verdict: `{:?}`\n- Machine class: `{}`\n- Commit: `{}`\n- Mode: `{}`\n- Snapshot operation: `{}`\n- Snapshot sampling: `{} independent timings/tick; {} raw samples/repetition`\n- Stage schema: `{}`\n\n",
+        "- Verdict: `{:?}`\n- Machine class: `{}`\n- Commit: `{}`\n- Mode: `{}`\n- Snapshot operation: `{}`\n- Snapshot sampling: `{} separately timed operations/tick; {} raw samples/repetition`\n- Stage schema: `{}`\n\n",
         verdict.status,
         artifact.fingerprint.machine_class_id,
         artifact.source_commit,
@@ -2529,7 +2529,7 @@ fn run_self_test() -> GateResult<()> {
         return Err("synthetic snapshot fixture unexpectedly had no raw samples".to_owned());
     }
     assert_self_test_status(
-        "missing independent snapshot sample is refused",
+        "missing separately timed snapshot sample is refused",
         &compare_artifacts(&baseline, &missing_snapshot_sample),
         VerdictStatus::Refused,
     );
@@ -2537,6 +2537,9 @@ fn run_self_test() -> GateResult<()> {
     let mut tampered_snapshot_policy =
         synthetic_artifact("candidate", "same", [100.0; 5], [1_000_000; 5]);
     tampered_snapshot_policy.policy.snapshot_samples_per_tick = 1;
+    tampered_snapshot_policy
+        .policy
+        .snapshot_samples_per_repetition = PERF_TICKS;
     assert_self_test_status(
         "tampered snapshot sampling policy is refused",
         &compare_artifacts(&baseline, &tampered_snapshot_policy),
