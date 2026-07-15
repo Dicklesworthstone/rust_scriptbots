@@ -1032,8 +1032,10 @@ mod tests {
         // Default `initial_food` and `food_respawn_amount` are both 0.5, so every
         // live `food_max` update must remain at or above that validation floor.
         const FOOD_MAX_SCHEDULE: &[&[f32]] = &[&[0.61, 0.57], &[], &[0.58], &[], &[0.52, 0.63]];
-        let mut config = ScriptBotsConfig::default();
-        config.rng_seed = Some(0x0412);
+        let config = ScriptBotsConfig {
+            rng_seed: Some(0x0412),
+            ..ScriptBotsConfig::default()
+        };
         let mut direct = WorldState::new(config.clone()).expect("direct seeded world");
         let mut queued = WorldState::new(config).expect("queued seeded world");
         let (sender, receiver) = create_command_bus(4);
