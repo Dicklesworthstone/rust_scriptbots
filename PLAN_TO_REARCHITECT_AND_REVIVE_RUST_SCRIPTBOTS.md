@@ -2244,7 +2244,7 @@ authoritative 62-crate WASM graph guard, and standalone default-feature
 `scriptbots-runtime` `wasm32-unknown-unknown` check on source
 `96e51093e3066f817d60fd45882a2fec6285665e`.
 
-#### 2.6a per-client projections and sequenced event journal [Currently In Progress — bd-2z0.4.8, TopazCastle, 2026-07-15]
+#### 2.6a per-client projections and sequenced event journal [Complete — bd-2z0.4.8, TopazCastle, 2026-07-15]
 
 - selected detail and viewport projection as per-client pure requests or keyed broker state, never one global camera/selection;
 - sequenced scientific-event journal with explicit UI lag/catch-up behavior;
@@ -2263,8 +2263,35 @@ pin the hot ring before loss; live-memory catch-up, unavailable truncation, reco
 and detached readers are covered; slow readers retain no per-client queue; 1k/10k projection and
 event-ring scaling are measured under explicit DSR budgets.
 
-**Completion evidence:** pending the exact-source DSR batch-verification and reference-hardware
-projection/event measurement run for `bd-2z0.4.8`.
+**Completion evidence:** `0b0ef92` added dynamic snapshot v2 with stable `AgentUid` identity,
+pure per-client projection requests, an all-input keyed and byte-bounded projection broker, and a
+bounded `EventSequence` journal contract. The event path separates protocol and scientific
+sequences, returns contiguous pages or typed gaps with catch-up locators, pins pending records,
+stops science at high water before loss, supports live-memory catch-up and explicit unavailable
+truncation, and keeps detached readers bounded without per-client queues. Tests cover isolated
+clients and 128-client fanout, digest/revision purity, duplicate polls, wrap and catch-up,
+disconnect/reconnect, shutdown, reader lifetime, receipt ordering, and serialized-reopen reader
+semantics. `540578b` migrated the WASM/Postcard consumer to the v2 wire schema. Production
+FrankenSQLite file admission and crash-durability proof remain intentionally assigned to
+`bd-2z0.4.10`.
+
+DSR-local record run `run-1784138338-9750` and clean post-baseline comparison
+`run-1784138885-39816` passed formatting, nine scoped UBS scans with zero critical findings
+(non-fatal warning/info findings remained), all-target checks, strict Clippy, 516 default tests
+with 3 intentionally ignored measurement tests, 83 native-Asupersync tests with the same 3
+measurement tests ignored, all three dedicated release measurements, the Asupersync 0.3.6
+single-universe guard, the 32-package franken license audit, the exact FrankenSQLite pin guard,
+the authoritative 62-crate WASM graph guard, and the runtime/web `wasm32-unknown-unknown` check.
+
+On the Apple M4 reference class, 1k/10k projection cold p95 was 0.020/0.153 ms, moving-request
+p95 was 0.021/0.169 ms, warm-hit p95 was 0.000042 ms, and 128-client cold fanout took
+2.942/24.557 ms. The 10,000-consumer event journal published at 0.0014 ms p95, polled the tip at
+0.000084 ms p95, and fanned out in 0.516 ms while retaining a 7,168-byte hot ring and 160,000
+bytes of cursor state. The committed v3 performance golden (`914df03`, SHA-256
+`cdf6d0af3a1812fbb37fa6d497e7e3c7452d1010afe101f180b449fe511a28cd`) uses five separately
+timed snapshots per tick and 1,000 raw observations per repetition. The final exact-class
+comparison was typed `pass`; all four scenarios stayed below 5% CV with every regression,
+absolute-throughput, snapshot-budget, and noise flag false.
 
 #### 2.7 control/server migration
 
