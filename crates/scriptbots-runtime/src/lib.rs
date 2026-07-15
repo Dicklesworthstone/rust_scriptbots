@@ -668,6 +668,21 @@ pub enum JournalReceiptState {
     Failed(JournalFailure),
 }
 
+/// Minimum journal commitment required before an ordered shutdown may finish.
+///
+/// The requirement applies to the shutdown batch and every earlier accepted
+/// batch in the same host session. Durable is the safe default for adapters
+/// backed by files or remote storage. Purely volatile adapters must opt in to
+/// volatile shutdown explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownCommitRequirement {
+    /// In-memory commitment is sufficient for this adapter's contract.
+    CommittedVolatile,
+    /// Every ordered batch must reach crash-durable storage.
+    Durable,
+}
+
 /// Typed acknowledgement for one previously accepted journal batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalReceipt {
@@ -706,6 +721,15 @@ pub trait JournalPort {
 
     /// Poll at most `limit` acknowledgements without blocking.
     fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt>;
+
+    /// Commitment threshold that gates ordered host shutdown.
+    ///
+    /// This value must remain stable for the lifetime of a host. The durable
+    /// default prevents a file-backed adapter from accidentally treating an
+    /// intermediate volatile receipt as shutdown completion.
+    fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+        ShutdownCommitRequirement::Durable
+    }
 }
 
 /// Typed reason scientific progress stopped at a manual-drive boundary.

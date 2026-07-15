@@ -7,8 +7,8 @@ use super::{
     HostLifecycle, HostPort, HostRevisions, HostSessionId, HostSnapshot, JournalAdmission,
     JournalBatch, JournalBatchId, JournalFailure, JournalPort, JournalReceipt, JournalReceiptState,
     JournalState, ManualHostDriver, ManualInstant, PlaybackSnapshot, RejectionReason,
-    ScientificBoundary, ScientificBoundaryFault, ScientificRevision, SnapshotRevision,
-    StatusCombinationError,
+    ScientificBoundary, ScientificBoundaryFault, ScientificRevision, ShutdownCommitRequirement,
+    SnapshotRevision, StatusCombinationError,
 };
 use scriptbots_core::{
     CompletedStepFault, DynamicWorldSnapshot, NullPersistence, PersistenceAdmissionSession,
@@ -102,6 +102,10 @@ impl JournalPort for VolatileJournal {
     fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
         let count = limit.min(self.receipts.len());
         self.receipts.drain(..count).collect()
+    }
+
+    fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+        ShutdownCommitRequirement::CommittedVolatile
     }
 }
 
@@ -268,8 +272,8 @@ impl HostPort for LocalHostPort {
 #[derive(Debug, Clone, Copy)]
 struct InflightJournal {
     command_id: Option<CommandId>,
-    shutdown: bool,
-    committed: bool,
+    shutdown_requirement: Option<ShutdownCommitRequirement>,
+    committed_volatile: bool,
 }
 
 /// Pure synchronous authority for command order and scientific time.
@@ -295,7 +299,8 @@ pub struct HostCore {
     retained_journal: Option<Arc<JournalBatch>>,
     retained_blocker: Option<HostBlocker>,
     inflight_journal: HashMap<JournalBatchId, InflightJournal>,
-    shutdown_receipt: Option<JournalBatchId>,
+    shutdown_receipt: Option<(JournalBatchId, ShutdownCommitRequirement)>,
+    failed_journal_batches: HashSet<JournalBatchId>,
     latched_fault: Option<HostFault>,
 }
 
@@ -370,6 +375,7 @@ impl HostCore {
             retained_blocker: None,
             inflight_journal: HashMap::new(),
             shutdown_receipt: None,
+            failed_journal_batches: HashSet::new(),
             latched_fault: None,
         })
     }
@@ -425,14 +431,20 @@ impl HostCore {
         match admission {
             JournalAdmission::Accepted { .. } => {
                 self.seal_core_persistence()?;
+                let shutdown_requirement = if batch
+                    .command()
+                    .is_some_and(|command| matches!(&command.command, HostCommand::Shutdown))
+                {
+                    Some(self.journal.shutdown_commit_requirement())
+                } else {
+                    None
+                };
                 self.inflight_journal.insert(
                     batch.id(),
                     InflightJournal {
                         command_id: batch.command_id(),
-                        shutdown: batch.command().is_some_and(|command| {
-                            matches!(&command.command, HostCommand::Shutdown)
-                        }),
-                        committed: false,
+                        shutdown_requirement,
+                        committed_volatile: false,
                     },
                 );
                 self.retained_journal = None;
@@ -478,6 +490,7 @@ impl HostCore {
                 }),
             )?;
         }
+        self.failed_journal_batches.insert(batch.id());
         self.latched_fault = Some(HostFault::Protocol {
             code: "journal_identity_mismatch".to_owned(),
             message: format!(
@@ -509,6 +522,7 @@ impl HostCore {
         if let Some(command_id) = batch.command_id() {
             self.update_command_journal(command_id, JournalState::Failed(failure.clone()))?;
         }
+        self.failed_journal_batches.insert(batch.id());
         self.latched_fault = Some(HostFault::Journal {
             batch_id: batch.id(),
             failure,
@@ -541,20 +555,23 @@ impl HostCore {
             match receipt.state() {
                 JournalReceiptState::CommittedVolatile => {
                     if let Some(entry) = self.inflight_journal.get_mut(&batch_id) {
-                        entry.committed = true;
+                        entry.committed_volatile = true;
                     }
-                    if inflight.shutdown {
-                        self.shutdown_receipt = Some(batch_id);
+                    if let Some(requirement @ ShutdownCommitRequirement::CommittedVolatile) =
+                        inflight.shutdown_requirement
+                    {
+                        self.shutdown_receipt = Some((batch_id, requirement));
                     }
                 }
                 JournalReceiptState::Durable => {
                     self.inflight_journal.remove(&batch_id);
-                    if inflight.shutdown {
-                        self.shutdown_receipt = Some(batch_id);
+                    if let Some(requirement) = inflight.shutdown_requirement {
+                        self.shutdown_receipt = Some((batch_id, requirement));
                     }
                 }
                 JournalReceiptState::Failed(failure) => {
                     self.inflight_journal.remove(&batch_id);
+                    self.failed_journal_batches.insert(batch_id);
                     self.latched_fault = Some(HostFault::Journal {
                         batch_id,
                         failure: failure.clone(),
@@ -608,16 +625,25 @@ impl HostCore {
     }
 
     fn try_finish_shutdown(&mut self) -> Result<bool, HostAccessError> {
-        let Some(shutdown_id) = self.shutdown_receipt else {
+        let Some((shutdown_id, requirement)) = self.shutdown_receipt else {
             return Ok(false);
         };
-        if matches!(&self.latched_fault, Some(HostFault::Journal { .. })) {
+        let earlier_work_failed = self.failed_journal_batches.iter().any(|batch_id| {
+            batch_id.session_id() == shutdown_id.session_id()
+                && batch_id.sequence() <= shutdown_id.sequence()
+        });
+        if earlier_work_failed {
             return Ok(false);
         }
         let earlier_work_pending = self.inflight_journal.iter().any(|(batch_id, inflight)| {
             batch_id.session_id() == shutdown_id.session_id()
                 && batch_id.sequence() <= shutdown_id.sequence()
-                && !inflight.committed
+                && match requirement {
+                    ShutdownCommitRequirement::CommittedVolatile => {
+                        !inflight.committed_volatile
+                    }
+                    ShutdownCommitRequirement::Durable => true,
+                }
         });
         if earlier_work_pending {
             Ok(false)
@@ -1026,12 +1052,17 @@ impl HostCore {
         match admission {
             JournalAdmission::Accepted { .. } => {
                 self.seal_core_persistence()?;
+                let shutdown_requirement = if shutdown {
+                    Some(self.journal.shutdown_commit_requirement())
+                } else {
+                    None
+                };
                 self.inflight_journal.insert(
                     batch_id,
                     InflightJournal {
                         command_id: batch.command_id(),
-                        shutdown,
-                        committed: false,
+                        shutdown_requirement,
+                        committed_volatile: false,
                     },
                 );
                 Ok(false)
@@ -1081,8 +1112,8 @@ impl HostCore {
                     batch_id,
                     InflightJournal {
                         command_id: None,
-                        shutdown: false,
-                        committed: false,
+                        shutdown_requirement: None,
+                        committed_volatile: false,
                     },
                 );
                 Ok(false)
@@ -1669,6 +1700,7 @@ mod tests {
     struct FakeJournalState {
         full: bool,
         closed: bool,
+        suppress_receipts: bool,
         attempts: Vec<Arc<JournalBatch>>,
         receipts: VecDeque<JournalReceipt>,
     }
@@ -1691,10 +1723,12 @@ mod tests {
                     capacity: 1,
                 }
             } else {
-                state.receipts.push_back(JournalReceipt::new(
-                    batch.id(),
-                    JournalReceiptState::Durable,
-                ));
+                if !state.suppress_receipts {
+                    state.receipts.push_back(JournalReceipt::new(
+                        batch.id(),
+                        JournalReceiptState::Durable,
+                    ));
+                }
                 JournalAdmission::Accepted {
                     batch_id: batch.id(),
                 }
@@ -1774,6 +1808,21 @@ mod tests {
         );
         assert!(retained.persistence().is_some());
         assert!(Arc::ptr_eq(&retained, &journal_state.borrow().attempts[0]));
+
+        let blocked_now = DEFAULT_TICK_PERIOD_NANOS.saturating_mul(4);
+        let still_blocked = core
+            .drive(ManualInstant::from_nanos(blocked_now))
+            .expect("elapsed time cannot bypass retained journal work");
+        assert_eq!(still_blocked.scientific_steps, 0);
+        assert_eq!(core.world_tick(), Tick(1));
+        assert_eq!(port.queue_depth(), 1);
+        assert!(Arc::ptr_eq(
+            &retained,
+            &core
+                .pending_journal_batch()
+                .expect("same batch remains retained")
+        ));
+
         journal_state.borrow_mut().full = false;
         let retried = core
             .retry_retained_journal()
@@ -1786,7 +1835,7 @@ mod tests {
         ));
 
         let resumed = core
-            .drive(ManualInstant::from_nanos(1))
+            .drive(ManualInstant::from_nanos(blocked_now.saturating_add(1)))
             .expect("receipt and queued resume");
         assert_eq!(resumed.scientific_steps, 0);
         assert_eq!(core.world_tick(), Tick(1));
@@ -1846,6 +1895,102 @@ mod tests {
             status(&mut port, 1).journal(),
             &JournalState::CommittedVolatile
         );
+    }
+
+    #[test]
+    fn durable_adapter_shutdown_waits_past_a_volatile_receipt() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState {
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(12),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("host with progressive durable journal");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Shutdown);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("shutdown application");
+
+        let shutdown_id = journal_state.borrow().attempts[0].id();
+        journal_state
+            .borrow_mut()
+            .receipts
+            .push_back(JournalReceipt::new(
+                shutdown_id,
+                JournalReceiptState::CommittedVolatile,
+            ));
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("progressive volatile receipt");
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+        assert_eq!(
+            status(&mut port, 1).journal(),
+            &JournalState::CommittedVolatile
+        );
+
+        journal_state
+            .borrow_mut()
+            .receipts
+            .push_back(JournalReceipt::new(
+                shutdown_id,
+                JournalReceiptState::Durable,
+            ));
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("durable shutdown receipt");
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Durable);
+    }
+
+    #[test]
+    fn earlier_journal_failure_blocks_shutdown_even_if_health_fault_is_overwritten() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState {
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let session_id = HostSessionId::new(13);
+        let mut core = HostCore::with_journal(
+            session_id,
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("host with manually acknowledged journal");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        submit(&mut port, 2, HostCommand::Shutdown);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("ordered step and shutdown application");
+
+        let earlier_id = journal_state.borrow().attempts[0].id();
+        let shutdown_id = journal_state.borrow().attempts[1].id();
+        journal_state.borrow_mut().receipts.extend([
+            JournalReceipt::new(
+                earlier_id,
+                JournalReceiptState::Failed(JournalFailure {
+                    code: "write_failed".to_owned(),
+                    message: "injected terminal failure".to_owned(),
+                }),
+            ),
+            JournalReceipt::new(
+                JournalBatchId::new(session_id, 999),
+                JournalReceiptState::Durable,
+            ),
+            JournalReceipt::new(shutdown_id, JournalReceiptState::Durable),
+        ]);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("failure, malformed receipt, and shutdown durability");
+
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+        assert!(matches!(status(&mut port, 1).journal(), JournalState::Failed(_)));
+        assert_eq!(status(&mut port, 2).journal(), &JournalState::Durable);
+        assert!(matches!(core.health(), HostHealth::Faulted(HostFault::Protocol { .. })));
     }
 
     #[test]
