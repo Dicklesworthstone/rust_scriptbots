@@ -58,6 +58,135 @@ pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
     "-lock-pending",
 ];
 
+/// Canonical one-shot DDL for the production ScriptBots scientific workload tables.
+///
+/// This export is versioned independently of the historical migration ledger. It exists for
+/// conformance harnesses that need the exact current table constraints without copying a weaker
+/// approximation of the production schema. Storage recovery continues to use the immutable
+/// migration sequence below.
+pub const SCRIPTBOTS_SCHEMA_V1: &str = r#"
+    CREATE TABLE ticks (
+        tick INTEGER PRIMARY KEY CHECK (tick >= 0),
+        epoch INTEGER NOT NULL CHECK (epoch >= 0),
+        closed INTEGER NOT NULL CHECK (closed IN (0, 1)),
+        agent_count INTEGER NOT NULL CHECK (agent_count >= 0),
+        births INTEGER NOT NULL CHECK (births >= 0),
+        deaths INTEGER NOT NULL CHECK (deaths >= 0),
+        total_energy REAL NOT NULL,
+        average_energy REAL NOT NULL,
+        average_health REAL NOT NULL
+    );
+    CREATE TABLE metrics (
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        name TEXT NOT NULL,
+        value REAL NOT NULL,
+        PRIMARY KEY (tick, name)
+    );
+    CREATE TABLE events (
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        kind TEXT NOT NULL,
+        count INTEGER NOT NULL CHECK (count >= 0),
+        PRIMARY KEY (tick, kind)
+    );
+    CREATE TABLE replay_events (
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
+        scope TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (tick, seq)
+    );
+    CREATE TABLE agents (
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        age INTEGER NOT NULL CHECK (age >= 0),
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        velocity_x REAL NOT NULL,
+        velocity_y REAL NOT NULL,
+        heading REAL NOT NULL,
+        health REAL NOT NULL,
+        energy REAL NOT NULL,
+        color_r REAL NOT NULL,
+        color_g REAL NOT NULL,
+        color_b REAL NOT NULL,
+        spike_length REAL NOT NULL,
+        boost INTEGER NOT NULL CHECK (boost IN (0, 1)),
+        herbivore_tendency REAL NOT NULL,
+        sound_multiplier REAL NOT NULL,
+        reproduction_counter REAL NOT NULL,
+        mutation_rate_primary REAL NOT NULL,
+        mutation_rate_secondary REAL NOT NULL,
+        trait_smell REAL NOT NULL,
+        trait_sound REAL NOT NULL,
+        trait_hearing REAL NOT NULL,
+        trait_eye REAL NOT NULL,
+        trait_blood REAL NOT NULL,
+        give_intent REAL NOT NULL,
+        brain_binding TEXT NOT NULL,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        food_delta REAL NOT NULL,
+        spiked INTEGER NOT NULL CHECK (spiked IN (0, 1)),
+        hybrid INTEGER NOT NULL CHECK (hybrid IN (0, 1)),
+        sound_output REAL NOT NULL,
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        PRIMARY KEY (tick, agent_uid)
+    );
+    CREATE TABLE births (
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
+        birth_ordinal INTEGER CHECK (birth_ordinal IS NULL OR birth_ordinal >= 0),
+        parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
+        parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
+        brain_kind TEXT,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        herbivore_tendency REAL NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
+        origin TEXT NOT NULL CHECK (origin IN ('born', 'seeded', 'injected')),
+        CHECK (origin <> 'seeded' OR tick = 0),
+        CHECK (
+            (origin = 'born' AND birth_ordinal IS NOT NULL)
+            OR (origin IN ('seeded', 'injected') AND birth_ordinal IS NULL)
+        ),
+        PRIMARY KEY (tick, agent_uid)
+    );
+    CREATE UNIQUE INDEX births_agent_uid_unique ON births (agent_uid);
+    CREATE UNIQUE INDEX births_spawn_ordinal_unique ON births (spawn_ordinal);
+    CREATE UNIQUE INDEX births_birth_ordinal_unique ON births (birth_ordinal);
+    CREATE TABLE deaths (
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
+        age INTEGER NOT NULL CHECK (age >= 0),
+        generation INTEGER NOT NULL CHECK (generation >= 0),
+        herbivore_tendency REAL NOT NULL,
+        brain_kind TEXT,
+        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
+        energy REAL NOT NULL,
+        food_balance_total REAL NOT NULL,
+        cause TEXT NOT NULL,
+        was_hybrid INTEGER NOT NULL CHECK (was_hybrid IN (0, 1)),
+        spike_attacker INTEGER NOT NULL CHECK (spike_attacker IN (0, 1)),
+        spike_victim INTEGER NOT NULL CHECK (spike_victim IN (0, 1)),
+        hit_carnivore INTEGER NOT NULL CHECK (hit_carnivore IN (0, 1)),
+        hit_herbivore INTEGER NOT NULL CHECK (hit_herbivore IN (0, 1)),
+        hit_by_carnivore INTEGER NOT NULL CHECK (hit_by_carnivore IN (0, 1)),
+        hit_by_herbivore INTEGER NOT NULL CHECK (hit_by_herbivore IN (0, 1)),
+        PRIMARY KEY (tick, agent_uid)
+    );
+    CREATE UNIQUE INDEX deaths_agent_uid_unique ON deaths (agent_uid);
+"#;
+
 const SCRIPTBOTS_SCHEMA_V3: &str = "
     CREATE TABLE ticks (
         tick INTEGER PRIMARY KEY CHECK (tick >= 0),
@@ -370,6 +499,26 @@ const AGENT_COLUMNS: &[&str] = &[
     "hit_by_carnivore",
     "hit_by_herbivore",
 ];
+
+/// Number of values bound by [`scriptbots_agent_insert_sql`].
+pub const SCRIPTBOTS_AGENT_COLUMN_COUNT: usize = AGENT_COLUMNS.len();
+
+/// Canonical production insert statement for one full scientific agent snapshot.
+///
+/// The statement is generated from the same ordered column list used by [`Storage`], so external
+/// conformance tests cannot silently drift to a different column order or placeholder count.
+#[must_use]
+pub fn scriptbots_agent_insert_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| {
+        let columns = AGENT_COLUMNS.join(", ");
+        let placeholders = (1..=AGENT_COLUMNS.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<String>>()
+            .join(", ");
+        format!("insert or replace into agents ({columns}) values ({placeholders})")
+    })
+}
 
 /// Storage error wrapper.
 #[derive(Debug, Error)]
@@ -4305,7 +4454,7 @@ impl Storage {
         }
         for row in rows {
             tx.execute_with_params(
-                Self::agent_insert_sql(),
+                scriptbots_agent_insert_sql(),
                 &[
                     row.tick.into(),
                     row.agent_uid.into(),
@@ -4350,18 +4499,6 @@ impl Storage {
             )?;
         }
         Ok(())
-    }
-
-    fn agent_insert_sql() -> &'static str {
-        static SQL: OnceLock<String> = OnceLock::new();
-        SQL.get_or_init(|| {
-            let columns = AGENT_COLUMNS.join(", ");
-            let placeholders = (1..=AGENT_COLUMNS.len())
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<String>>()
-                .join(", ");
-            format!("insert or replace into agents ({columns}) values ({placeholders})")
-        })
     }
 
     fn insert_births(tx: &Transaction<'_>, rows: &[BirthRow]) -> Result<(), FrankenError> {
@@ -6994,6 +7131,50 @@ mod tests {
             timestamp
         ));
         path
+    }
+
+    #[test]
+    fn exported_schema_v1_executes_with_canonical_workload_table_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        connection.execute_batch(SCRIPTBOTS_SCHEMA_V1)?;
+
+        let table_names = connection
+            .query(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name ASC",
+            )?
+            .into_iter()
+            .map(|row| row.get_typed::<String>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            table_names,
+            vec![
+                "agents",
+                "births",
+                "deaths",
+                "events",
+                "metrics",
+                "replay_events",
+                "ticks",
+            ]
+        );
+        assert_eq!(
+            scriptbots_agent_insert_sql()
+                .bytes()
+                .filter(|byte| *byte == b'?')
+                .count(),
+            SCRIPTBOTS_AGENT_COLUMN_COUNT,
+            "canonical agent insert placeholder count drifted from its column list"
+        );
+        assert!(
+            scriptbots_agent_insert_sql().ends_with("?39)"),
+            "canonical agent insert no longer binds all production columns in order"
+        );
+
+        connection.close()?;
+        Ok(())
     }
 
     fn sample_agent(energy: f32) -> AgentState {

@@ -1,4 +1,7 @@
 use fsqlite::{Connection, SqliteValue, compat::RowExt};
+use scriptbots_storage::{
+    SCRIPTBOTS_AGENT_COLUMN_COUNT, SCRIPTBOTS_SCHEMA_V1, scriptbots_agent_insert_sql,
+};
 use std::{
     fs,
     path::PathBuf,
@@ -9,148 +12,7 @@ const FIRST_TICK: i64 = 41;
 const SECOND_TICK: i64 = 42;
 const ROLLED_BACK_TICK: i64 = 9_001;
 
-const SCHEMA_SQL: &str = r#"
-    CREATE TABLE ticks (
-        tick INTEGER PRIMARY KEY,
-        epoch INTEGER,
-        closed INTEGER,
-        agent_count INTEGER,
-        births INTEGER,
-        deaths INTEGER,
-        total_energy REAL,
-        average_energy REAL,
-        average_health REAL
-    );
-    CREATE TABLE metrics (
-        tick INTEGER,
-        name TEXT,
-        value REAL,
-        PRIMARY KEY (tick, name)
-    );
-    CREATE TABLE events (
-        tick INTEGER,
-        kind TEXT,
-        count INTEGER,
-        PRIMARY KEY (tick, kind)
-    );
-    CREATE TABLE replay_events (
-        tick INTEGER,
-        seq INTEGER,
-        agent_uid INTEGER,
-        scope TEXT,
-        event_type TEXT,
-        payload TEXT,
-        PRIMARY KEY (tick, seq)
-    );
-    CREATE TABLE agents (
-        tick INTEGER,
-        agent_uid INTEGER,
-        generation INTEGER,
-        age INTEGER,
-        position_x REAL,
-        position_y REAL,
-        velocity_x REAL,
-        velocity_y REAL,
-        heading REAL,
-        health REAL,
-        energy REAL,
-        color_r REAL,
-        color_g REAL,
-        color_b REAL,
-        spike_length REAL,
-        boost INTEGER,
-        herbivore_tendency REAL,
-        sound_multiplier REAL,
-        reproduction_counter REAL,
-        mutation_rate_primary REAL,
-        mutation_rate_secondary REAL,
-        trait_smell REAL,
-        trait_sound REAL,
-        trait_hearing REAL,
-        trait_eye REAL,
-        trait_blood REAL,
-        give_intent REAL,
-        brain_binding TEXT,
-        brain_key INTEGER,
-        food_delta REAL,
-        spiked INTEGER,
-        hybrid INTEGER,
-        sound_output REAL,
-        spike_attacker INTEGER,
-        spike_victim INTEGER,
-        hit_carnivore INTEGER,
-        hit_herbivore INTEGER,
-        hit_by_carnivore INTEGER,
-        hit_by_herbivore INTEGER,
-        PRIMARY KEY (tick, agent_uid)
-    );
-    CREATE TABLE births (
-        tick INTEGER NOT NULL CHECK (tick >= 0),
-        agent_uid INTEGER NOT NULL CHECK (agent_uid >= 0),
-        spawn_ordinal INTEGER NOT NULL CHECK (spawn_ordinal >= 0),
-        birth_ordinal INTEGER CHECK (birth_ordinal IS NULL OR birth_ordinal >= 0),
-        parent_a INTEGER CHECK (parent_a IS NULL OR parent_a >= 0),
-        parent_b INTEGER CHECK (parent_b IS NULL OR parent_b >= 0),
-        brain_kind TEXT,
-        brain_key INTEGER CHECK (brain_key IS NULL OR brain_key >= 0),
-        herbivore_tendency REAL NOT NULL,
-        generation INTEGER NOT NULL CHECK (generation >= 0),
-        position_x REAL NOT NULL,
-        position_y REAL NOT NULL,
-        is_hybrid INTEGER NOT NULL CHECK (is_hybrid IN (0, 1)),
-        origin TEXT NOT NULL CHECK (origin IN ('born', 'seeded', 'injected')),
-        CHECK (
-            (origin = 'born' AND birth_ordinal IS NOT NULL)
-            OR (origin IN ('seeded', 'injected') AND birth_ordinal IS NULL)
-        ),
-        PRIMARY KEY (tick, agent_uid)
-    );
-    CREATE UNIQUE INDEX births_agent_uid_unique ON births (agent_uid);
-    CREATE UNIQUE INDEX births_spawn_ordinal_unique ON births (spawn_ordinal);
-    CREATE UNIQUE INDEX births_birth_ordinal_unique ON births (birth_ordinal);
-    CREATE TABLE deaths (
-        tick INTEGER,
-        agent_uid INTEGER,
-        age INTEGER,
-        generation INTEGER,
-        herbivore_tendency REAL,
-        brain_kind TEXT,
-        brain_key INTEGER,
-        energy REAL,
-        food_balance_total REAL,
-        cause TEXT,
-        was_hybrid INTEGER,
-        spike_attacker INTEGER,
-        spike_victim INTEGER,
-        hit_carnivore INTEGER,
-        hit_herbivore INTEGER,
-        hit_by_carnivore INTEGER,
-        hit_by_herbivore INTEGER,
-        PRIMARY KEY (tick, agent_uid)
-    );
-    CREATE UNIQUE INDEX deaths_agent_uid_unique ON deaths (agent_uid);
-"#;
-
-const AGENT_INSERT_SQL: &str = r#"
-    INSERT OR REPLACE INTO agents (
-        tick, agent_uid, generation, age,
-        position_x, position_y, velocity_x, velocity_y, heading,
-        health, energy, color_r, color_g, color_b, spike_length, boost,
-        herbivore_tendency, sound_multiplier, reproduction_counter,
-        mutation_rate_primary, mutation_rate_secondary,
-        trait_smell, trait_sound, trait_hearing, trait_eye, trait_blood,
-        give_intent, brain_binding, brain_key, food_delta, spiked, hybrid,
-        sound_output, spike_attacker, spike_victim, hit_carnivore,
-        hit_herbivore, hit_by_carnivore, hit_by_herbivore
-    ) VALUES (
-        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39
-    )
-"#;
-
-fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; 39] {
+fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; SCRIPTBOTS_AGENT_COLUMN_COUNT] {
     [
         tick.into(),
         agent_uid.into(),
@@ -195,9 +57,17 @@ fn agent_values(tick: i64, agent_uid: i64) -> [SqliteValue; 39] {
 }
 
 fn create_schema(connection: &Connection) {
+    let statement_count = SCRIPTBOTS_SCHEMA_V1
+        .split(';')
+        .filter(|statement| !statement.trim().is_empty())
+        .count();
+    eprintln!(
+        "scriptbots conformance: applying canonical schema v1 DDL batch: {} bytes, {statement_count} statements",
+        SCRIPTBOTS_SCHEMA_V1.len()
+    );
     connection
-        .execute_batch(SCHEMA_SQL)
-        .expect("FrankenSQLite should create all seven ScriptBots tables");
+        .execute_batch(SCRIPTBOTS_SCHEMA_V1)
+        .expect("FrankenSQLite should execute the canonical ScriptBots schema batch");
 }
 
 fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
@@ -243,8 +113,11 @@ fn insert_table_group(connection: &Connection, tick: i64, agent_uid: i64) {
         )
         .expect("replay insert should preserve nullable ids and JSON encoded as TEXT");
     connection
-        .execute_with_params(AGENT_INSERT_SQL, &agent_values(tick, agent_uid))
-        .expect("agent insert should bind all 39 numbered parameters");
+        .execute_with_params(
+            scriptbots_agent_insert_sql(),
+            &agent_values(tick, agent_uid),
+        )
+        .expect("canonical agent insert should bind every production column");
     connection
         .execute_with_params(
             "INSERT INTO births VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
@@ -364,6 +237,39 @@ fn prove_failed_transaction_rolls_back_every_table(connection: &Connection) {
             .get_typed::<i64>(0)
             .expect("rollback count should be an integer");
         assert_eq!(count, 0, "rollback left partial rows in {table}");
+    }
+}
+
+fn verify_production_constraints(connection: &Connection) {
+    let missing_metric_value = connection.execute(
+        "INSERT INTO metrics (tick, name, value)
+         VALUES (9102, 'missing-value-probe', NULL)",
+    );
+    assert!(
+        missing_metric_value.is_err(),
+        "production metrics.value NOT NULL constraint must reject NULL"
+    );
+
+    let negative_event_count = connection.execute(
+        "INSERT INTO events (tick, kind, count)
+         VALUES (9103, 'negative-count-probe', -1)",
+    );
+    assert!(
+        negative_event_count.is_err(),
+        "production events.count CHECK constraint must reject negative counts"
+    );
+
+    for (table, tick) in [("metrics", 9_102_i64), ("events", 9_103_i64)] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE tick = ?1");
+        let count = connection
+            .query_row_with_params(&sql, &[tick.into()])
+            .expect("constraint-probe count should be queryable")
+            .get_typed::<i64>(0)
+            .expect("constraint-probe count should be INTEGER");
+        assert_eq!(
+            count, 0,
+            "failed constraint probe leaked a row into {table}"
+        );
     }
 }
 
@@ -582,9 +488,9 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
             "INSERT INTO births (
                 tick, agent_uid, spawn_ordinal, birth_ordinal,
                 herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-             ) VALUES (2003, 2003, 2002, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+             ) VALUES (0, 2003, 2002, NULL, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
         )
-        .expect("birth ordinal UNIQUE index must accept a seeded NULL ordinal");
+        .expect("birth ordinal UNIQUE index must accept a tick-zero seeded NULL ordinal");
     connection
         .execute(
             "INSERT INTO births (
@@ -667,11 +573,11 @@ fn verify_nullable_payloads_and_agent_row(connection: &Connection) {
         "INSERT INTO births (
             tick, agent_uid, spawn_ordinal, birth_ordinal,
             herbivore_tendency, generation, position_x, position_y, is_hybrid, origin
-         ) VALUES (2002, 2002, 2001, 2001, 0.5, 0, 1.0, 2.0, 0, 'seeded')",
+         ) VALUES (2002, 2002, 2001, 2001, 0.5, 0, 1.0, 2.0, 0, 'injected')",
     );
     assert!(
         non_birth_with_ordinal.is_err(),
-        "a seeded arrival must not persist a demographic birth ordinal"
+        "an injected arrival must not persist a demographic birth ordinal"
     );
 
     let births_schema = connection
@@ -709,10 +615,33 @@ fn verify_integrity(connection: &Connection) {
 }
 
 fn verify_committed_workload(connection: &Connection) {
+    verify_production_constraints(connection);
     verify_tick_queries(connection);
     verify_metric_aggregates(connection);
     verify_nullable_payloads_and_agent_row(connection);
     verify_integrity(connection);
+}
+
+fn log_and_verify_reopened_row_counts(connection: &Connection) {
+    eprintln!("scriptbots conformance: reopened committed workload row counts");
+    for (table, expected) in [
+        ("ticks", 2_i64),
+        ("metrics", 4),
+        ("events", 2),
+        ("replay_events", 2),
+        ("agents", 2),
+        ("births", 2),
+        ("deaths", 2),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count = connection
+            .query_row(&sql)
+            .expect("reopened row count should be queryable")
+            .get_typed::<i64>(0)
+            .expect("reopened row count should be INTEGER");
+        eprintln!("  table={table} rows={count} expected={expected}");
+        assert_eq!(count, expected, "reopened {table} row count drifted");
+    }
 }
 
 fn exercise_workload(connection: &Connection) {
@@ -763,6 +692,7 @@ fn frankensqlite_file_backed_round_trips_scriptbots_storage_workload() {
 
     let reopened = Connection::open(path)
         .expect("FrankenSQLite should reopen the committed ScriptBots database");
+    log_and_verify_reopened_row_counts(&reopened);
     verify_committed_workload(&reopened);
     reopened
         .close()
