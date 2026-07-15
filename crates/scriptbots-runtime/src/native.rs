@@ -2092,10 +2092,14 @@ mod tests {
                 std::thread::yield_now();
             }
             clock.advance_to(Time::from_nanos(10));
-            Ok(timer.process_timers())
+            // The coordinator and `Runtime::block_on` may race to drain the
+            // shared driver; the native deadline telemetry below is the
+            // authoritative evidence that this registered timer woke it.
+            let _ = timer.process_timers();
+            Ok(())
         });
         let native_run = native.run_on_runtime(&runtime);
-        let timers_fired = advancer
+        advancer
             .join()
             .expect("native parity advancer")
             .expect("native parity deadline registration");
@@ -2105,7 +2109,8 @@ mod tests {
             } => shutdown_command_id,
             other => panic!("unexpected native parity outcome: {other:?}"),
         };
-        assert_eq!(timers_fired, 1);
+        assert_eq!(native.metrics().deadline_wakes, 1);
+        assert_eq!(native.host().core().world_tick(), Tick(1));
 
         manual
             .drive(ManualInstant::from_nanos(0))
@@ -2688,7 +2693,7 @@ mod tests {
                 std::thread::yield_now();
             }
             clock.advance_to(Time::from_nanos(10));
-            let first_fired = timer.process_timers();
+            let _ = timer.process_timers();
 
             let blocked_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while !(blocked.load(Ordering::Acquire) && lifecycle.is_owner_waiting()) {
@@ -2707,7 +2712,9 @@ mod tests {
                 return Err("journal-full wake-only wait retained a cadence timer");
             }
             clock.advance_to(Time::from_nanos(1_000));
-            let paused_fired = timer.process_timers();
+            // The empty wheel above, followed by the runner's zero additional
+            // deadline wakes, proves wake-only mode stayed timer-free.
+            let _ = timer.process_timers();
             if lifecycle.try_submit(pause).is_err() || lifecycle.try_submit(shutdown).is_err() {
                 ready.store(true, Ordering::Release);
                 let _ = lifecycle.journal_ready();
@@ -2716,16 +2723,14 @@ mod tests {
             }
             ready.store(true, Ordering::Release);
             let ready_wake = lifecycle.journal_ready();
-            Ok((first_fired, paused_fired, ready_wake))
+            Ok(ready_wake)
         });
 
         let run = runner.run_on_runtime(&runtime);
-        let (first_fired, paused_fired, ready_wake) = coordinator
+        let ready_wake = coordinator
             .join()
             .expect("journal-full coordinator")
             .expect("journal-full coordination");
-        assert_eq!(first_fired, 1);
-        assert_eq!(paused_fired, 0);
         assert!(matches!(
             ready_wake,
             NativeWakeResult::Enqueued | NativeWakeResult::Coalesced
@@ -3386,19 +3391,22 @@ mod tests {
                 }
                 std::thread::yield_now();
             }
+            if timer.pending_count() != 0 {
+                let _ = lifecycle.cancel();
+                return Err("paused native wake-only wait retained a cadence timer");
+            }
             clock.advance_to(Time::from_nanos(1_000_000_000_000));
-            let fired = timer.process_timers();
+            let _ = timer.process_timers();
             let first_cancel = lifecycle.cancel();
-            Ok((fired, first_cancel))
+            Ok(first_cancel)
         });
 
         let run = runner.run_on_runtime(&runtime);
-        let (timers_fired, first_cancel) = advancer
+        let first_cancel = advancer
             .join()
             .expect("paused virtual advancer")
             .expect("paused owner wait registration");
         assert!(matches!(run, Ok(NativeRunOutcome::Cancelled { .. })));
-        assert_eq!(timers_fired, 0);
         assert!(first_cancel);
         assert_eq!(runner.host().core().world_tick(), Tick(0));
         assert_eq!(runner.metrics().deadline_wakes, 0);
@@ -3491,10 +3499,14 @@ mod tests {
                 std::thread::yield_now();
             }
             clock.advance_to(Time::from_nanos(2_000_000));
-            Ok(timer.process_timers())
+            // `Runtime::block_on` and this coordinator both drain the same
+            // timer driver. Either may win after the virtual clock advances,
+            // so this caller's fired count is not lifecycle evidence.
+            let _ = timer.process_timers();
+            Ok(())
         });
         let first_run = timed_out.run_on_runtime(&runtime);
-        let timers_fired = advancer
+        advancer
             .join()
             .expect("virtual timeout advancer")
             .expect("virtual timeout registration");
@@ -3502,7 +3514,6 @@ mod tests {
             first_run,
             Err(NativeRunError::ShutdownTimedOut { .. })
         ));
-        assert!(timers_fired >= 1);
         assert_eq!(
             timed_out.host().core().latest_snapshot().lifecycle,
             HostLifecycle::Stopping
