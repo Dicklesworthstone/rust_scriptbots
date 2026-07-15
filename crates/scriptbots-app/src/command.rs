@@ -1029,8 +1029,11 @@ mod tests {
 
     #[test]
     fn seeded_command_schedule_matches_direct_world_digest_each_tick() {
-        const FOOD_MAX_SCHEDULE: &[&[f32]] = &[&[0.61, 0.47], &[], &[0.58], &[], &[0.52, 0.63]];
-        let config = ScriptBotsConfig::default();
+        // Default `initial_food` and `food_respawn_amount` are both 0.5, so every
+        // live `food_max` update must remain at or above that validation floor.
+        const FOOD_MAX_SCHEDULE: &[&[f32]] = &[&[0.61, 0.57], &[], &[0.58], &[], &[0.52, 0.63]];
+        let mut config = ScriptBotsConfig::default();
+        config.rng_seed = Some(0x0412);
         let mut direct = WorldState::new(config.clone()).expect("direct seeded world");
         let mut queued = WorldState::new(config).expect("queued seeded world");
         let (sender, receiver) = create_command_bus(4);
