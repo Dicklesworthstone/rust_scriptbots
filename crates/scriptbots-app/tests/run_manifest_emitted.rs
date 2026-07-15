@@ -46,6 +46,10 @@ fn launch_with(dir: &Path, envs: &[(&str, &str)], args: &[&str]) -> std::process
     // couple of frames into a test backend, and exits.
     let mut command = Command::new(binary());
     command
+        // The test process can inherit this from its verifier (DSR deliberately
+        // pins it). Each case below must control the resolver's environment
+        // input explicitly or it is testing the verifier rather than the app.
+        .env_remove("SCRIPTBOTS_MAX_THREADS")
         .env("SCRIPTBOTS_STORAGE_PATH", &db)
         .env("SCRIPTBOTS_RNG_SEED", "4242")
         .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "2")
