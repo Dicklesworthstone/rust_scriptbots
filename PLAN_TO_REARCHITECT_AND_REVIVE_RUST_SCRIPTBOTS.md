@@ -335,37 +335,50 @@ The exact crate boundary is proven through implementation, but the logical modul
 - `control_api`: request/receipt/read-model API and MCP tools;
 - `experiments`: sweeps, matched seeds, comparisons, reports.
 
-Creating a new crate is justified only when it enforces a dependency boundary used by multiple frontends. The likely justified addition is a small `scriptbots-runtime` crate that depends on core and exposes the host/control/snapshot protocol without depending on GPUI, Bevy, Ratatui, or Axum. This decision must be confirmed by the dependency-direction bead before creation.
+Creating a new crate is justified only when it enforces a dependency boundary used by multiple
+frontends. `bd-2z0.4.3` confirmed `scriptbots-runtime` as that shared boundary: it depends on core
+and never on storage, Axum/Tokio, GPUI, Bevy, FrankenTUI/Ratatui, or application composition.
+`bd-2z0.4.4` introduces only its renderer-neutral protocol, typed revisions and receipts,
+synchronous ports, and null frontend. It does not own `WorldState` or drive scientific ticks;
+`bd-2z0.4.5` implements the sole-owner `HostCore`.
 
 ### 5.2 `SimulationHost`
+
+The target below spans multiple beads. The first `scriptbots-runtime` slice defines and exercises
+the protocol without implementing the production simulation host. Sole world ownership and
+tick-boundary application begin in `bd-2z0.4.5`.
 
 `SimulationHost` is the only owner of `WorldState`. It exposes handles rather than the world itself:
 
 ```rust,ignore
-pub struct SimulationClient {
-    commands: CommandSender,
-    snapshots: SnapshotSubscription,
-    events: EventJournalCursor,
-    status: StatusReader,
+pub struct HostClient<P> {
+    port: P,
 }
 
 pub struct CommandEnvelope {
-    pub id: CommandId,
-    pub expected: ExpectedRevisions,
-    pub command: SimulationCommand,
-    pub status: CommandStatusSender,
+    pub command_id: CommandId,
+    pub expected_control_revision: Option<ControlRevision>,
+    pub command: HostCommand,
 }
 
-pub enum CommandStatus {
-    Admitted { id: CommandId, admission_seq: u64 },
-    Applied { id: CommandId, tick: Tick, scientific_revision: u64 },
-    Durable { id: CommandId, event_seq: u64 },
-    Rejected { id: CommandId, reason: CommandRejection },
-    Failed { id: CommandId, reason: CommandFailure },
+pub struct CommandStatus {
+    command_id: CommandId,
+    admission_sequence: Option<AdmissionSequence>,
+    application: ApplicationState,
+    journal: JournalState,
 }
 ```
 
-`CommandId`, host admission sequence, scientific revision, config revision, snapshot revision, and event sequence are distinct types. The host deduplicates retrying `CommandId`s, preserves queryable status after client disconnect, and defines whether an expected revision applies to scientific state, config, or both. A single-step command received while running atomically pauses, advances once, and remains paused. Shutdown uses a formally ordered admission rule rather than bypassing total order invisibly.
+`ApplicationState` independently represents `Admitted`, `Applied`, `Rejected`, and `Failed`;
+`JournalState` independently represents `NotRequired`, `Pending`, `CommittedVolatile`, `Durable`,
+and `Failed`. `CommandId`, host admission sequence, control revision, scientific revision, config
+revision, snapshot revision, and event sequence are distinct types. The host deduplicates retrying
+`CommandId`s, preserves queryable status after client disconnect, and uses only `ControlRevision`
+as the optimistic command CAS token. That guard is checked at the envelope's ordered application
+boundary, so a conflict retains its `AdmissionSequence` while validation, overload, and a closed
+admission gate remain pre-admission rejections. A single-step command received while running
+atomically pauses, advances once, and remains paused. Shutdown uses a formally ordered admission
+rule rather than bypassing total order invisibly.
 
 The concrete channel types may use Asupersync, but the protocol is not coupled to a runtime. A synchronous `HostCore`/`SimulationEngine` owns command/state transitions under injected time. Native Asupersync or a dedicated scheduler drives it; a browser adapter can drive the same state machine without requestAnimationFrame becoming scientific time. Async infrastructure handles lifecycle, control I/O, storage, and blocking isolation around the synchronous state machine.
 
@@ -2137,6 +2150,22 @@ check took 0.63s wall time. Its isolated normal dependency tree contains no Toki
 frontend, server, or storage edge.
 
 **Exit:** dependency graph enforces that renderers cannot call `WorldState::step`.
+
+#### 2.3.1 runtime-neutral host protocol [Currently In Progress — `bd-2z0.4.4`]
+
+- introduce the dependency-approved `scriptbots-runtime` boundary without taking ownership of
+  `WorldState` ahead of the pure host-state-machine bead;
+- define stable command identity and admission ordering plus distinct typed control, scientific,
+  configuration, snapshot, and event revision domains;
+- model application and journal state as independent receipt axes, with idempotent retry and
+  later status lookup;
+- expose synchronous host/client, snapshot, event-cursor, and null-frontend ports that contain no
+  renderer, server, storage-connection, mutable-world, or platform-runtime type;
+- prove ordering, deduplication, revision conflict, validation/application failure, disconnect,
+  typed monotonicity, valid receipt combinations, and manual-time null-frontend behavior.
+
+**Exit:** the public protocol is renderer-neutral and executable through the null frontend; actual
+sole ownership and tick-boundary application remain explicitly assigned to `bd-2z0.4.5`.
 
 #### 2.4 pure host state machine
 

@@ -1,6 +1,6 @@
 ## Rust ScriptBots
 
-ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-based evolution simulator. Our goal is a faithful, deterministic port with a GPU-accelerated UI, pluggable brain implementations, and first-class analytics. This is a multi-crate Cargo workspace separating simulation core, brains, storage, rendering, and the application shell.
+ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-based evolution simulator. Our goal is a faithful, deterministic port with a GPU-accelerated UI, pluggable brain implementations, and first-class analytics. This is a multi-crate Cargo workspace separating simulation core, renderer-neutral runtime protocol, brains, storage, rendering, and the application shell.
 
 The authoritative roadmap is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`. The older GPUI port plan is retained as historical design evidence, and a sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
 
@@ -35,6 +35,7 @@ rust_scriptbots/
 ├── rust-toolchain.toml       # Pinned nightly-2026-07-09 toolchain (MSRV 1.89)
 ├── crates/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
+│   ├── scriptbots-runtime    # Host/client protocol + null frontend; sole-owner HostCore pending
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
 │   ├── scriptbots-brain-ml   # Compile probes for Candle/Tract/tch/Frankentorch; no inference yet
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
@@ -110,10 +111,12 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
 - That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
 - Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The presentation boundary is not yet complete, however: GPUI contains its characterized double-drive by making the HUD the sole interim simulation driver and the world window read-only, and it now services explicit playback before paused/accumulator early returns. Scientific time still belongs to a renderer, TUI/Bevy retain interim playback policies, and Bevy still owns a simulation worker. Moving all scientific time, exact command sequencing, and status authority into `HostCore` remains explicit roadmap work.
+- `scriptbots-runtime` now defines the renderer-neutral command, status, snapshot, event-cursor, and manual-drive contracts exercised by its null frontend. The diagram still shows the live application-owned drivers: this first runtime slice does not own `WorldState`, apply commands, or drive scientific ticks. The sole-owner `HostCore` begins in `bd-2z0.4.5`.
 - Control surfaces are transport-agnostic; both REST and MCP use the same safe `ControlHandle` and enqueue commands with back-pressure.
 
 ### Crate roles
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
+- **`scriptbots-runtime`**: Renderer-neutral command, two-axis status, snapshot, and event-cursor contracts with typed revision domains and a synchronous null frontend. It depends on core but not storage, servers, renderers, or an async runtime. Sole `WorldState` ownership remains assigned to `bd-2z0.4.5`.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
 - **`scriptbots-brain-ml`**: Feature selection and a sensor-copy placeholder for future Candle, Tract, tch, and Frankentorch inference. It does not load or execute models yet; `brain-ft` currently admits and compiles the pinned Frankentorch dependency family only.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
@@ -126,6 +129,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 ## Current status
 - Workspace scaffolding, shared lints, and profiles are in place.
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
+- `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, opaque client ports, cursors, manual-drive contract, and null frontend are implemented. Production `HostCore` ownership and legacy frontend migration remain pending.
 - `scriptbots-render`: GPUI window + HUD + canvas renderer with camera controls, selection highlights, and diagnostics overlay; audio is optional via `kira` feature.
 - `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
@@ -905,9 +909,9 @@ Runtime constraints:
 - Some composite changes may be coerced (e.g., number/string parsing) but type mismatches are rejected with a clear error.
 
 ### Control bus architecture
-- The app owns a bounded MPMC `CommandBus`; external surfaces (REST, MCP, CLI) enqueue `ControlCommand`s.
-- The simulation drains the queue inside the tick loop before state mutation, guaranteeing coherent updates and avoiding data races.
-- Back-pressure: when the queue is full, commands are rejected with a clear error; clients should retry with jitter.
+- The live app still owns a bounded MPMC `CommandBus`; REST, MCP, CLI, and interim frontend drivers enqueue legacy `ControlCommand`s and drain them at simulation boundaries.
+- The new `scriptbots-runtime` crate defines the replacement protocol surface: stable command identity, one admission order, a single `ControlRevision` CAS token, independent application/journal status axes, immutable snapshots, and independent event cursors.
+- This protocol slice deliberately does not claim production command application. `bd-2z0.4.5` installs the sole-owner `HostCore`; later adapter beads migrate REST/MCP, GPUI, Bevy, TUI, headless, and WASM callers away from the legacy bus.
 
 ## Contributing
 - Keep changes scoped to the relevant crate; prefer improving existing files over adding new ones unless functionality is genuinely new.
@@ -949,7 +953,7 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 
 ## FAQ
 - **What platforms are supported?** Linux, macOS, and Windows 11 are targeted. Windows is supported natively (MSVC toolchain) and via WSL2. Early UI milestones may see platform-specific polish arriving at different times.
-- **Where do I start hacking?** `scriptbots-core` for the world model; `scriptbots-render` for the GPUI view; `scriptbots-brain` for brain interfaces; `scriptbots-storage` for persistence.
+- **Where do I start hacking?** `scriptbots-core` for the world model; `scriptbots-runtime` for host/client protocol work; `scriptbots-render` for the GPUI view; `scriptbots-brain` for brain interfaces; `scriptbots-storage` for persistence.
 
 ## Troubleshooting
 - **MSVC/SDK link errors on Windows**: Ensure VS Build Tools "Desktop development with C++" and Windows 11 SDK are installed. Then run `rustup default stable-x86_64-pc-windows-msvc`.
@@ -968,8 +972,9 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 2. World mechanics and determinism under parallelism; spatial index tuning.
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
 4. Storage: harden the integrated durable-outbox and bounded-controller-wait protocol with exact identity/schema recovery and complete direct-write/root-cause unification, then add strict-run pause/fail-closed host policy, the multi-run schema, and complete command/replay journals.
-5. Rendering: HUD/overlays/inspector polish; performance diagnostics.
-6. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.
+5. Runtime: renderer-neutral protocol landed; implement the sole-owner `HostCore`, then migrate every frontend and transport adapter off the legacy app-owned drivers.
+6. Rendering: HUD/overlays/inspector polish; performance diagnostics.
+7. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.
 
 ### Mixed brain families (default)
 - The app now registers multiple brain families by default (MLP, DWRAON, Assembly experimental, NeuroFlow) and seeds mixed populations automatically. Random spawns are bound to a sampled brain family.
