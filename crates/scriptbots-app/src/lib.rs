@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use scriptbots_core::{
     CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
-    PersistenceAdmissionSession, RandomStreamState, ScriptBotsConfig, TickEvents, WorldState,
+    PersistenceAdmissionSession, RandomStreamState, ScriptBotsConfig, TickEvents, WorldDigestV1,
+    WorldDigestV1ContractError, WorldState,
 };
 use scriptbots_storage::AnalyticsSnapshotProvider;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
@@ -17,6 +18,8 @@ pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
 /// Schema identifier for the stable-identity/random-stream run manifest.
 pub const RUN_MANIFEST_V1_SCHEMA: &str = "scriptbots.run-manifest.v1";
+/// Compatible V1 minor schema used when a manifest carries bootstrap execution evidence.
+pub const RUN_MANIFEST_V1_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v1.1";
 /// Schema identifier for a sequence of V0 world characterization points.
 pub const CHARACTERIZATION_TRACE_V0_SCHEMA: &str = "scriptbots.characterization-trace";
 /// Safety bound for the temporary characterization runner.
@@ -235,6 +238,23 @@ pub struct ThreadPolicyV0 {
     pub overridden: Option<String>,
 }
 
+/// Exact scientific boundaries proving an explicitly requested startup warmup.
+///
+/// Both digests are complete [`WorldDigestV1`] values rather than tick-only claims. The start
+/// boundary is captured from the seeded launch state before any bootstrap transition, and the end
+/// boundary is captured after `completed` persistence-session steps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapEvidenceV0 {
+    /// Number of bootstrap transitions requested by startup policy.
+    pub requested: u64,
+    /// Number of persistence-session transitions that completed successfully.
+    pub completed: u64,
+    /// Launch-state digest captured before the first bootstrap transition.
+    pub start: WorldDigestV1,
+    /// Final digest captured after the last completed bootstrap transition.
+    pub end: WorldDigestV1,
+}
+
 /// Version-one record tying scenario construction, stable identity allocation, random-stream
 /// continuation, and normalized configuration to a build.
 ///
@@ -253,6 +273,13 @@ pub struct RunManifestV1 {
     /// resolved. A real run always records one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_policy: Option<ThreadPolicyV0>,
+    /// Explicit proof of the requested startup warmup, attached only after it completes.
+    ///
+    /// The field is optional so existing V1 manifests remain decodable. Attaching it through
+    /// [`Self::with_bootstrap_evidence`] validates the two digests and upgrades the schema tag to
+    /// [`RUN_MANIFEST_V1_BOOTSTRAP_SCHEMA`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_evidence: Option<BootstrapEvidenceV0>,
     pub random_stream: RandomStreamState,
     pub next_agent_uid: u64,
     pub next_spawn_ordinal: u64,
@@ -279,6 +306,61 @@ pub enum RunManifestError {
     ConfigSerialization(#[source] serde_json::Error),
     #[error("failed to encode ScriptBots configuration for its V0 digest: {0}")]
     ConfigDigestSerialization(String),
+    /// Bootstrap evidence was already attached and cannot be silently replaced.
+    #[error("run manifest already carries bootstrap evidence")]
+    BootstrapEvidenceAlreadyAttached,
+    /// The evidence described a different request from the launch scenario.
+    #[error(
+        "bootstrap evidence requested {evidence_requested} ticks, but the scenario requested {scenario_requested}"
+    )]
+    BootstrapRequestMismatch {
+        /// Bootstrap count recorded in the launch scenario.
+        scenario_requested: u64,
+        /// Bootstrap count claimed by the evidence.
+        evidence_requested: u64,
+    },
+    /// A manifest may be written only after the requested session transitions all complete.
+    #[error("bootstrap completed {completed} of {requested} requested ticks")]
+    BootstrapCompletionMismatch {
+        /// Bootstrap count requested at launch.
+        requested: u64,
+        /// Successfully completed persistence-session transitions.
+        completed: u64,
+    },
+    /// Fresh-run bootstrap evidence must begin at the visible tick-zero launch boundary.
+    #[error("bootstrap evidence starts at tick {found}, expected tick 0")]
+    BootstrapStartTick {
+        /// Unexpected starting tick.
+        found: u64,
+    },
+    /// The requested transition count overflowed the tick domain.
+    #[error("bootstrap tick arithmetic overflowed: start={start}, completed={completed}")]
+    BootstrapTickOverflow {
+        /// Starting scientific tick.
+        start: u64,
+        /// Number of completed transitions.
+        completed: u64,
+    },
+    /// The end digest did not describe the boundary reached by the completed transition count.
+    #[error("bootstrap evidence ends at tick {found}, expected tick {expected}")]
+    BootstrapEndTick {
+        /// Expected ending tick.
+        expected: u64,
+        /// Ending tick carried by the evidence.
+        found: u64,
+    },
+    /// A zero-transition warmup changed scientific state despite executing no transition.
+    #[error("zero-tick bootstrap evidence must carry identical start and end digests")]
+    BootstrapZeroChanged,
+    /// One of the embedded world digests violated the V1 contract.
+    #[error("bootstrap {boundary} digest violates the WorldDigestV1 contract: {source}")]
+    BootstrapDigest {
+        /// Whether the invalid digest was the `start` or `end` boundary.
+        boundary: &'static str,
+        /// Typed world-digest contract failure.
+        #[source]
+        source: WorldDigestV1ContractError,
+    },
 }
 
 impl RunManifestV1 {
@@ -294,6 +376,74 @@ impl RunManifestV1 {
     pub fn with_thread_policy(mut self, policy: ThreadPolicyV0) -> Self {
         self.thread_policy = Some(policy);
         self
+    }
+
+    /// Validate and attach exact bootstrap execution evidence.
+    ///
+    /// This is deliberately fallible: the manifest must never claim a request different from its
+    /// launch scenario, claim partial completion as success, start after a hidden warmup, or carry
+    /// malformed digest values. A zero-tick request is represented explicitly by two identical
+    /// tick-zero digests.
+    pub fn with_bootstrap_evidence(
+        mut self,
+        evidence: BootstrapEvidenceV0,
+    ) -> Result<Self, RunManifestError> {
+        if self.bootstrap_evidence.is_some() {
+            return Err(RunManifestError::BootstrapEvidenceAlreadyAttached);
+        }
+        if evidence.requested != self.scenario.bootstrap_ticks {
+            return Err(RunManifestError::BootstrapRequestMismatch {
+                scenario_requested: self.scenario.bootstrap_ticks,
+                evidence_requested: evidence.requested,
+            });
+        }
+        if evidence.completed != evidence.requested {
+            return Err(RunManifestError::BootstrapCompletionMismatch {
+                requested: evidence.requested,
+                completed: evidence.completed,
+            });
+        }
+        if evidence.start.tick.0 != 0 {
+            return Err(RunManifestError::BootstrapStartTick {
+                found: evidence.start.tick.0,
+            });
+        }
+        let expected_end = evidence
+            .start
+            .tick
+            .0
+            .checked_add(evidence.completed)
+            .ok_or(RunManifestError::BootstrapTickOverflow {
+                start: evidence.start.tick.0,
+                completed: evidence.completed,
+            })?;
+        if evidence.end.tick.0 != expected_end {
+            return Err(RunManifestError::BootstrapEndTick {
+                expected: expected_end,
+                found: evidence.end.tick.0,
+            });
+        }
+        if evidence.completed == 0 && evidence.start != evidence.end {
+            return Err(RunManifestError::BootstrapZeroChanged);
+        }
+        evidence
+            .start
+            .validate_contract()
+            .map_err(|source| RunManifestError::BootstrapDigest {
+                boundary: "start",
+                source,
+            })?;
+        evidence
+            .end
+            .validate_contract()
+            .map_err(|source| RunManifestError::BootstrapDigest {
+                boundary: "end",
+                source,
+            })?;
+
+        self.schema = RUN_MANIFEST_V1_BOOTSTRAP_SCHEMA.to_owned();
+        self.bootstrap_evidence = Some(evidence);
+        Ok(self)
     }
 
     /// Capture a run manifest using provenance embedded in the current build.
@@ -353,6 +503,7 @@ impl RunManifestV1 {
             // `with_thread_policy`, so a manifest that carries no policy is one that was built
             // outside a real run — which is a true statement, not a missing field.
             thread_policy: None,
+            bootstrap_evidence: None,
             random_stream,
             next_agent_uid,
             next_spawn_ordinal,
@@ -741,6 +892,132 @@ mod characterization_tests {
             "fnv1a64:09d4c1cee0922e9e",
             "manifest wire changes require a versioned schema boundary"
         );
+    }
+
+    #[test]
+    fn bootstrap_evidence_is_explicit_validated_and_schema_tagged() {
+        let world = test_world(Some(0xB007_57A4));
+        let start = world.world_digest_v1().expect("tick-zero start digest");
+        let base = RunManifestV1::from_world_with_provenance(
+            ScenarioIdentityV0::caller_seeded("zero-bootstrap"),
+            &world,
+            complete_test_build(),
+        )
+        .expect("base manifest");
+        assert_eq!(base.schema, RUN_MANIFEST_V1_SCHEMA);
+        assert!(base.bootstrap_evidence.is_none());
+
+        let manifest = base
+            .clone()
+            .with_bootstrap_evidence(BootstrapEvidenceV0 {
+                requested: 0,
+                completed: 0,
+                start: start.clone(),
+                end: start.clone(),
+            })
+            .expect("zero bootstrap evidence");
+        assert_eq!(manifest.schema, RUN_MANIFEST_V1_BOOTSTRAP_SCHEMA);
+        let evidence = manifest
+            .bootstrap_evidence
+            .as_ref()
+            .expect("attached bootstrap evidence");
+        assert_eq!((evidence.requested, evidence.completed), (0, 0));
+        assert_eq!((evidence.start.tick.0, evidence.end.tick.0), (0, 0));
+        assert_eq!(evidence.start, evidence.end);
+
+        let encoded = manifest.canonical_json_bytes().expect("evidence JSON");
+        let decoded: RunManifestV1 = serde_json::from_slice(&encoded).expect("evidence round trip");
+        assert_eq!(decoded, manifest);
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("evidence wire");
+        assert_eq!(value["schema"], RUN_MANIFEST_V1_BOOTSTRAP_SCHEMA);
+        assert_eq!(
+            value["bootstrap_evidence"]
+                .as_object()
+                .expect("bootstrap evidence object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["completed", "end", "requested", "start"],
+            "bootstrap evidence wire changes require another schema boundary"
+        );
+
+        let request_mismatch = base
+            .clone()
+            .with_bootstrap_evidence(BootstrapEvidenceV0 {
+                requested: 1,
+                completed: 1,
+                start: start.clone(),
+                end: start.clone(),
+            })
+            .expect_err("scenario request mismatch must fail");
+        assert!(matches!(
+            request_mismatch,
+            RunManifestError::BootstrapRequestMismatch {
+                scenario_requested: 0,
+                evidence_requested: 1,
+            }
+        ));
+
+        let completion_mismatch = base
+            .clone()
+            .with_bootstrap_evidence(BootstrapEvidenceV0 {
+                requested: 0,
+                completed: 1,
+                start: start.clone(),
+                end: start.clone(),
+            })
+            .expect_err("partial bootstrap evidence must fail");
+        assert!(matches!(
+            completion_mismatch,
+            RunManifestError::BootstrapCompletionMismatch {
+                requested: 0,
+                completed: 1,
+            }
+        ));
+
+        let different_zero = test_world(Some(0xB007_57A5))
+            .world_digest_v1()
+            .expect("different tick-zero digest");
+        let zero_changed = base
+            .with_bootstrap_evidence(BootstrapEvidenceV0 {
+                requested: 0,
+                completed: 0,
+                start,
+                end: different_zero,
+            })
+            .expect_err("zero bootstrap cannot change state");
+        assert!(matches!(
+            zero_changed,
+            RunManifestError::BootstrapZeroChanged
+        ));
+    }
+
+    #[test]
+    fn bootstrap_evidence_counts_real_world_transitions() {
+        let mut world = test_world(Some(0xB007_57A6));
+        let start = world.world_digest_v1().expect("start digest");
+        world.step().expect("one bootstrap transition");
+        let end = world.world_digest_v1().expect("end digest");
+        let mut scenario = ScenarioIdentityV0::caller_seeded("one-bootstrap");
+        scenario.bootstrap_ticks = 1;
+        let manifest = RunManifestV1::from_world_with_provenance(
+            scenario,
+            &test_world(Some(0xB007_57A6)),
+            complete_test_build(),
+        )
+        .expect("launch-state manifest")
+        .with_bootstrap_evidence(BootstrapEvidenceV0 {
+            requested: 1,
+            completed: 1,
+            start,
+            end,
+        })
+        .expect("one-tick evidence");
+        let evidence = manifest
+            .bootstrap_evidence
+            .expect("attached one-tick evidence");
+        assert_eq!((evidence.start.tick.0, evidence.end.tick.0), (0, 1));
+        assert_ne!(evidence.start.overall, evidence.end.overall);
     }
 
     #[test]

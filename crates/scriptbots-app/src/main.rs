@@ -3,11 +3,10 @@ use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
-    CharacterizationTraceV0, ControlServerConfig, ControlServerReservation, RunManifestV1,
-    ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0, WorldStepDriver,
-    precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
-    renderer::{Renderer, RendererContext},
-    terminal::TerminalRenderer,
+    BootstrapEvidenceV0, CharacterizationTraceV0, ControlServerConfig, ControlServerReservation,
+    RunManifestV1, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
+    WorldStepDriver, precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
+    renderer::{Renderer, RendererContext}, terminal::TerminalRenderer,
 };
 #[cfg(feature = "bevy_render")]
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
@@ -15,7 +14,8 @@ use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
     AgentData, BrainRunner, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
     PersistenceSessionError, RenderAutoExposureSettings, RenderSettings, RenderTonemapMode,
-    ReplayEventKind, ScriptBotsConfig, SmallRngStream, TickSummary, WorldPersistence, WorldState,
+    ReplayEventKind, ScriptBotsConfig, SmallRngStream, TickSummary, WorldDigestV1, WorldPersistence,
+    WorldState,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
@@ -880,15 +880,23 @@ fn build_run_manifest(
     )
 }
 
-fn emit_run_manifest(
+struct PendingRunManifest {
+    path: PathBuf,
+    manifest: RunManifestV1,
+    start: WorldDigestV1,
+    requested: u64,
+    thread_policy: ThreadPolicy,
+}
+
+fn prepare_run_manifest(
     world: &WorldState,
     storage_path: Option<&str>,
     thread_policy: ThreadPolicy,
     bootstrap_ticks: u64,
-) {
+) -> Option<PendingRunManifest> {
     let Some(storage_path) = storage_path else {
         // An in-memory run leaves no directory to describe.
-        return;
+        return None;
     };
     let manifest_path = std::path::Path::new(storage_path).with_extension("manifest.json");
 
@@ -901,7 +909,20 @@ fn emit_run_manifest(
                 "could not build the run manifest; this run will carry NO provenance \
                  record and nobody will be able to say what produced it"
             );
-            return;
+            return None;
+        }
+    };
+
+    let start = match world.world_digest_v1() {
+        Ok(digest) => digest,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %manifest_path.display(),
+                "could not capture the launch-state WorldDigestV1; this run will carry NO \
+                 provenance record"
+            );
+            return None;
         }
     };
 
@@ -920,22 +941,83 @@ fn emit_run_manifest(
             .map(|declined| declined.wire_tag().to_owned()),
     });
 
+    Some(PendingRunManifest {
+        path: manifest_path,
+        manifest,
+        start,
+        requested: bootstrap_ticks,
+        thread_policy,
+    })
+}
+
+fn emit_run_manifest(
+    world: &WorldState,
+    pending: Option<PendingRunManifest>,
+    completed: u64,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    let PendingRunManifest {
+        path,
+        manifest,
+        start,
+        requested,
+        thread_policy,
+    } = pending;
+    let end = match world.world_digest_v1() {
+        Ok(digest) => digest,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %path.display(),
+                completed,
+                "could not capture the post-bootstrap WorldDigestV1; this run will carry NO \
+                 provenance record"
+            );
+            return;
+        }
+    };
+    let start_tick = start.tick.0;
+    let end_tick = end.tick.0;
+    let manifest = match manifest.with_bootstrap_evidence(BootstrapEvidenceV0 {
+        requested,
+        completed,
+        start,
+        end,
+    }) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %path.display(),
+                "bootstrap evidence did not satisfy the run-manifest contract; this run will \
+                 carry NO provenance"
+            );
+            return;
+        }
+    };
+
     match manifest.canonical_json_bytes() {
         Ok(encoded) => {
-            if let Err(error) = std::fs::write(&manifest_path, &encoded) {
+            if let Err(error) = std::fs::write(&path, &encoded) {
                 warn!(
                     error = %error,
-                    path = %manifest_path.display(),
+                    path = %path.display(),
                     "could not write the run manifest; the run continues WITHOUT provenance"
                 );
                 return;
             }
             info!(
-                path = %manifest_path.display(),
+                path = %path.display(),
                 config_digest = %manifest.config_digest,
                 root_seed = manifest.root_seed,
                 reproducible = manifest.reproducible,
                 warnings = manifest.warnings.len(),
+                bootstrap_requested = requested,
+                bootstrap_completed = completed,
+                bootstrap_start_tick = start_tick,
+                bootstrap_end_tick = end_tick,
                 threads = ?thread_policy.threads,
                 thread_source = %thread_policy.source,
                 "wrote run manifest"
@@ -1027,16 +1109,17 @@ fn bootstrap_world(
         let brain_keys = install_brains(&mut world)?.population;
         seed_agents(&mut world, &brain_keys)?;
 
-        // PROVENANCE. Emitted here — after the brains are installed and the agents
-        // seeded, so the roster is real — and BEFORE any bootstrap tick, so the
-        // manifest describes the run as it was launched.
+        // PROVENANCE. Freeze the manifest and the first scientific digest here — after the brains
+        // are installed and the agents seeded, so the roster is real — and BEFORE any bootstrap
+        // tick, so those fields describe the run as it was launched. Disk emission waits until the
+        // requested session steps complete and the matching end digest exists.
         //
         // Until now `main` never wrote a manifest at all: the type was well-built
         // and thoroughly tested and simply never reached disk, so every claim about
         // provenanced, reproducible runs was true of the LIBRARY and false of the
         // PRODUCT. A user could not tell which build, which seed, or which config
         // produced a run directory.
-        emit_run_manifest(
+        let pending_manifest = prepare_run_manifest(
             &world,
             manifest_storage_path.as_deref(),
             thread_policy,
@@ -1046,6 +1129,8 @@ fn bootstrap_world(
         for _ in 0..bootstrap_ticks {
             persistence.step(&mut world)?;
         }
+        let completed_bootstrap_ticks = bootstrap_ticks;
+        emit_run_manifest(&world, pending_manifest, completed_bootstrap_ticks);
 
         if let Some(summary) = world.history().last() {
             info!(
@@ -3254,6 +3339,8 @@ mod tests {
 
         assert_eq!(world.tick().0, 0, "manifest emission must not advance science");
         assert_eq!(manifest.scenario.bootstrap_ticks, 37);
+        assert!(manifest.bootstrap_evidence.is_none());
+        assert_eq!(manifest.schema, scriptbots_app::RUN_MANIFEST_V1_SCHEMA);
     }
 
     #[test]

@@ -203,6 +203,19 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         manifest["root_seed"], 4242,
         "the manifest records a different seed than the run actually used"
     );
+    assert_eq!(
+        manifest["schema"], "scriptbots.run-manifest.v1.1",
+        "bootstrap evidence must move the manifest onto its compatible minor schema"
+    );
+    let bootstrap = &manifest["bootstrap_evidence"];
+    assert_eq!(bootstrap["requested"], 2);
+    assert_eq!(bootstrap["completed"], 2);
+    assert_eq!(bootstrap["start"]["tick"], 0);
+    assert_eq!(bootstrap["end"]["tick"], 2);
+    assert_ne!(
+        bootstrap["start"]["overall"], bootstrap["end"]["overall"],
+        "two completed bootstrap transitions must move the full-state digest"
+    );
     for field in [
         "schema",
         "schema_version",
