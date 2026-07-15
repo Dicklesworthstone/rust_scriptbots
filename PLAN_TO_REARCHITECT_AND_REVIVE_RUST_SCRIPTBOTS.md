@@ -2195,7 +2195,7 @@ Clippy, 446 native core/runtime/app tests, the authoritative 62-crate WASM graph
 standalone `scriptbots-runtime` `wasm32-unknown-unknown` check on exact source
 `91fb652cdb9af0829ff6fce484a5ff80f877e0a8`.
 
-#### 2.5 native scheduler and lifecycle [Currently In Progress — `bd-2z0.4.6`, TopazCastle, 2026-07-15]
+#### 2.5 native scheduler and lifecycle [Completed — `bd-2z0.4.6`, exact-source DSR batch `native-union24-5b1a5a8-20260715t073000z`, TopazCastle, 2026-07-15]
 
 - drive the same `HostCore` with a fixed-deadline native scheduler;
 - Asupersync structured cancellation/obligations if the spike passes;
@@ -2205,7 +2205,7 @@ standalone `scriptbots-runtime` `wasm32-unknown-unknown` check on exact source
 
 **Exit:** native lifecycle tests are cancel-clean and produce the same host-core traces as manual time.
 
-**Code-first implementation staged:** `FixedDeadlineHost` drives the exact `.4.5` owner at injected
+**Completed implementation:** `FixedDeadlineHost` drives the exact `.4.5` owner at injected
 absolute deadlines, reports bounded missed opportunities without dropping fractional cadence, and
 rejects backward time before touching the host. The optional exact Asupersync `=0.3.6` adapter keeps
 that `!Send` host in one current-thread root future; its bounded outer ingress is explicitly enqueue,
@@ -2217,7 +2217,13 @@ cover manual/native trace identity, early/late/backward clocks, bounded catch-up
 deadlines, long paused virtual time, wake storms, full queues, cancellation before/during/after
 science, stale-CAS and empty/nonempty shutdown, journal full-to-ready recovery, controller loss,
 timeout/failure, panic retention, repeated shutdown identity, and zero detached scheduler tasks.
-Central DSR batch proof remains required before this section or bead is marked complete.
+
+**Completion evidence:** DSR run `run-1784098822-44227` passed formatting, five scoped UBS scans
+with zero critical findings, strict default and `native-asupersync` all-target Clippy, 487 default
+core/runtime/app/analytics tests plus 60 native-feature runtime tests, the Asupersync single-universe
+guard at `0.3.6`, the 32-package franken license audit, the authoritative 62-crate WASM graph guard,
+and the standalone default-feature `scriptbots-runtime` `wasm32-unknown-unknown` check on exact
+source `5b1a5a8d6c8d7629c3822712e59361e3fa9014e0`.
 
 #### 2.6 canonical snapshot hub and projections
 
