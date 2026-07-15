@@ -2268,10 +2268,9 @@ impl ManualHostDriver for HostCore {
                 };
                 self.active_command = Some(admitted.clone());
                 let result = self.apply_command(admitted);
-                let reservation_unused = match &result {
-                    Ok(result) => !result.science_completed,
-                    Err(_) => true,
-                };
+                let reservation_unused = result
+                    .as_ref()
+                    .map_or(true, |result| !result.science_completed);
                 if reservation_unused {
                     self.events.cancel_publish_reservation();
                 }
@@ -2306,10 +2305,9 @@ impl ManualHostDriver for HostCore {
                     break;
                 }
                 let result = self.automatic_step();
-                let reservation_unused = match &result {
-                    Ok(result) => !result.science_completed,
-                    Err(_) => true,
-                };
+                let reservation_unused = result
+                    .as_ref()
+                    .map_or(true, |result| !result.science_completed);
                 if reservation_unused {
                     self.events.cancel_publish_reservation();
                 }
@@ -3279,7 +3277,7 @@ mod tests {
             .get(1)
             .map_or_else(|| vec![focused], |agent| vec![focused, agent.uid]);
         ProjectionRequest {
-            client_id: ProjectionClientId::new(0x4d45_4153_5552_45),
+            client_id: ProjectionClientId::new(0x004d_4541_5355_5245),
             viewport: ProjectionViewport {
                 width: 160,
                 height: 90,
@@ -3803,11 +3801,15 @@ mod tests {
             .expect("slow event read")
         {
             crate::EventPoll::Gap(gap) => gap,
-            other => panic!("wrapped hot ring must report a gap, got {other:?}"),
+            other @ crate::EventPoll::Contiguous(_) => {
+                panic!("wrapped hot ring must report a gap, got {other:?}")
+            }
         };
         let locator = match gap.catch_up {
             crate::EventCatchUpState::Available(locator) => locator,
-            other => panic!("lightweight live catch-up must be available, got {other:?}"),
+            other @ crate::EventCatchUpState::Unavailable(_) => {
+                panic!("lightweight live catch-up must be available, got {other:?}")
+            }
         };
         assert_eq!(locator.range().first, EventSequence::new(1));
         assert_eq!(locator.range().last, EventSequence::new(1));
@@ -4121,7 +4123,9 @@ mod tests {
             .expect("slow event poll")
         {
             crate::EventPoll::Gap(gap) => gap,
-            other => panic!("slow cursor must receive a gap, got {other:?}"),
+            other @ crate::EventPoll::Contiguous(_) => {
+                panic!("slow cursor must receive a gap, got {other:?}")
+            }
         };
         assert_eq!(gap.expected, EventSequence::new(1));
         assert_eq!(gap.missing.first, EventSequence::new(1));
@@ -4131,7 +4135,9 @@ mod tests {
         assert_eq!(slow.last_seen(), EventSequence::new(0));
         let locator = match gap.catch_up {
             crate::EventCatchUpState::Available(locator) => locator,
-            other => panic!("live memory locator expected, got {other:?}"),
+            other @ crate::EventCatchUpState::Unavailable(_) => {
+                panic!("live memory locator expected, got {other:?}")
+            }
         };
         assert_eq!(locator.guarantee(), EventCatchUpGuarantee::LiveMemory);
         let caught_up = client
@@ -4211,11 +4217,15 @@ mod tests {
             .expect("public live frontend event read")
         {
             crate::EventPoll::Gap(gap) => gap,
-            other => panic!("wrapped live frontend must observe a gap, got {other:?}"),
+            other @ crate::EventPoll::Contiguous(_) => {
+                panic!("wrapped live frontend must observe a gap, got {other:?}")
+            }
         };
         let live_locator = match live_gap.catch_up {
             crate::EventCatchUpState::Available(locator) => locator,
-            other => panic!("live frontend must receive a catch-up locator, got {other:?}"),
+            other @ crate::EventCatchUpState::Unavailable(_) => {
+                panic!("live frontend must receive a catch-up locator, got {other:?}")
+            }
         };
         let EventCatchUp::Contiguous(caught_up) = live_frontend
             .catch_up_events(live_locator, 1)
@@ -4271,7 +4281,9 @@ mod tests {
             .expect("public unavailable frontend event read")
         {
             crate::EventPoll::Gap(gap) => gap,
-            other => panic!("no-reader frontend must observe a gap, got {other:?}"),
+            other @ crate::EventPoll::Contiguous(_) => {
+                panic!("no-reader frontend must observe a gap, got {other:?}")
+            }
         };
         assert_eq!(
             unavailable_gap.catch_up,
