@@ -318,18 +318,18 @@ fn two_runs_with_overlapping_scientific_and_operational_keys_remain_isolated()
         assert_eq!(ticks.len(), 1);
         assert_eq!(ticks[0].tick, 0);
         assert_eq!(ticks[0].epoch, expected_epoch);
-        assert_eq!(ticks[0].total_energy, f64::from(expected_energy));
+        assert_eq!(ticks[0].total_energy, expected_energy);
 
         let metrics = reader.recent_metrics(8)?;
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].tick, 0);
         assert_eq!(metrics[0].name, "run_energy");
-        assert_eq!(metrics[0].value, f64::from(expected_energy));
+        assert_eq!(metrics[0].value, expected_energy);
 
         let agents = reader.top_predators(8)?;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].agent_uid, 1);
-        assert_eq!(agents[0].avg_energy, f64::from(expected_energy));
+        assert_eq!(agents[0].avg_energy, expected_energy);
         assert_eq!(agents[0].last_tick, 0);
 
         let ancestry = reader.load_ancestry_births()?;
