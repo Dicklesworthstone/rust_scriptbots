@@ -54,6 +54,13 @@ pub mod certify;
 /// that pulls per-seed outcomes from two run databases is a thin adapter on top.
 pub mod compare;
 
+/// Single change-point detection over a metric series (bd-2z0.11.6).
+///
+/// Finds the split that maximizes the absolute mean shift in a metric — the "if this run had one
+/// regime shift, where was it?" question — which the `metric-changepoints` report then certifies
+/// via [`certify`]. Pure; the certification that consumes it is where the resampling lives.
+pub mod changepoint;
+
 /// Schema version stamped into every machine-readable report payload.
 ///
 /// Bump ONLY with a migration note in the owning Bead/release evidence. Full
@@ -226,6 +233,7 @@ impl Registry {
                 Box::new(RunSummary),
                 Box::new(NarrativeTimeline),
                 Box::new(MetricSummary),
+                Box::new(MetricChangepoints),
             ],
         }
     }
@@ -423,6 +431,216 @@ fn metric_stats_error(error: &crate::stats::StatsError) -> AnalyticsError {
         context: "analytics.metric_summary",
         reason: error.to_string(),
     })
+}
+
+/// `metric-changepoints`: find and CERTIFY the most prominent regime shift in each metric.
+///
+/// This is the certification pipeline (bd-2z0.11.6) run over real persisted data. For every metric
+/// the run recorded, it locates the single largest mean shift ([`changepoint::largest_shift`]),
+/// certifies it — permutation test, bootstrap CI on the shift, effect sizes — and applies
+/// Benjamini-Hochberg across all metrics, so a run with a dozen metrics cannot report a chance
+/// "regime change" it never had. It answers "which metrics genuinely shifted in this run, and
+/// when?" with statistics rather than an eyeballed threshold.
+///
+/// Distinct from `scriptbots-core::detect`, which is the ONLINE detector: this is the offline
+/// certification of shifts, over the finished series.
+struct MetricChangepoints;
+
+#[derive(Debug, Serialize)]
+struct ChangepointsMachine {
+    /// Certification window (samples on each side of the shift).
+    window: usize,
+    /// Target false-discovery rate for the across-metrics correction.
+    fdr: f64,
+    /// Metrics whose series was long enough to admit a certified change-point.
+    metrics_examined: usize,
+    /// How many of those hold up under FDR control — the honest count of real regime shifts.
+    significant: usize,
+    /// True when the bounded metric read hit its cap, so early history was not analysed and a
+    /// change-point in it would be invisible. A truncated analysis must not read as a complete one.
+    truncated: bool,
+    changepoints: Vec<ChangepointRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChangepointRow {
+    metric: String,
+    /// The tick at which the new regime begins.
+    change_tick: u64,
+    shift: f64,
+    before_mean: f64,
+    after_mean: f64,
+    p_value: f64,
+    ci_lower: f64,
+    ci_upper: f64,
+    cohens_d: f64,
+    cliffs_delta: f64,
+    /// Survives Benjamini-Hochberg across the run's metrics. The field to act on.
+    significant_fdr: bool,
+}
+
+impl Report for MetricChangepoints {
+    fn name(&self) -> &'static str {
+        "metric-changepoints"
+    }
+
+    fn description(&self) -> &'static str {
+        "Find and statistically certify the largest regime shift in each metric (FDR-controlled)"
+    }
+
+    fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let window = params.get_usize("window")?.unwrap_or(30);
+        if window == 0 {
+            return Err(AnalyticsError::BadParam {
+                name: "window".to_owned(),
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+
+        let read_started = Instant::now();
+        let readings = cx.reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
+        // `recent_metrics` is a bounded most-recent-N read. If it came back full, earlier history
+        // was dropped and a change-point in it is invisible — say so rather than let a truncated
+        // analysis read as a complete one.
+        let truncated = readings.len() >= METRIC_SUMMARY_ROW_LIMIT;
+        log_report_stage("read", &read_started, readings.len());
+
+        let render_started = Instant::now();
+        // Group into ordered (tick, value) series per metric. recent_metrics order is not
+        // contractually chronological here, so we sort by tick explicitly — a change-point over a
+        // mis-ordered series would be meaningless.
+        let mut by_metric: BTreeMap<String, Vec<(u64, f64)>> = BTreeMap::new();
+        for PersistedMetric { tick, name, value } in readings {
+            by_metric.entry(name).or_default().push((tick, value));
+        }
+
+        let cert_params = certify::CertificationParams {
+            window,
+            fdr: params
+                .get("fdr")
+                .map(str::parse::<f64>)
+                .transpose()
+                .map_err(|e| AnalyticsError::BadParam {
+                    name: "fdr".to_owned(),
+                    reason: e.to_string(),
+                })?
+                .unwrap_or(0.05),
+            ..certify::CertificationParams::default()
+        };
+
+        // First pass: locate and certify one change-point per eligible metric. The window equals
+        // `min_segment`, so a shift found by `largest_shift(series, window)` always leaves a full
+        // `window` of samples on each side — `certify_event` can never see an out-of-range window.
+        struct Candidate {
+            metric: String,
+            change_tick: u64,
+            shift: f64,
+            before_mean: f64,
+            after_mean: f64,
+            certification: certify::EventCertification,
+        }
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (metric, mut points) in by_metric {
+            points.sort_by_key(|(tick, _)| *tick);
+            let series: Vec<f64> = points.iter().map(|(_, value)| *value).collect();
+            let Some(cp) = changepoint::largest_shift(&series, window) else {
+                continue; // too short to admit a certified change-point
+            };
+            let certification = certify::certify_event(&series, cp.index, &cert_params)
+                .map_err(|e| metric_stats_error(&e))?;
+            candidates.push(Candidate {
+                metric,
+                change_tick: points[cp.index].0,
+                shift: cp.shift,
+                before_mean: cp.before_mean,
+                after_mean: cp.after_mean,
+                certification,
+            });
+        }
+
+        // Second pass: Benjamini-Hochberg across every metric's p-value at once.
+        let p_values: Vec<f64> = candidates.iter().map(|c| c.certification.p_value).collect();
+        let rejected = certify::benjamini_hochberg(&p_values, cert_params.fdr);
+
+        let mut rows = Vec::with_capacity(candidates.len());
+        let mut significant = 0usize;
+        for (candidate, &is_rejected) in candidates.into_iter().zip(&rejected) {
+            if is_rejected {
+                significant += 1;
+            }
+            rows.push(ChangepointRow {
+                metric: candidate.metric,
+                change_tick: candidate.change_tick,
+                shift: candidate.shift,
+                before_mean: candidate.before_mean,
+                after_mean: candidate.after_mean,
+                p_value: candidate.certification.p_value,
+                ci_lower: candidate.certification.shift_ci.lower,
+                ci_upper: candidate.certification.shift_ci.upper,
+                cohens_d: candidate.certification.cohens_d,
+                cliffs_delta: candidate.certification.cliffs_delta,
+                significant_fdr: is_rejected,
+            });
+        }
+
+        let machine = ChangepointsMachine {
+            window,
+            fdr: cert_params.fdr,
+            metrics_examined: rows.len(),
+            significant,
+            truncated,
+            changepoints: rows,
+        };
+
+        let mut md = String::new();
+        let _ = writeln!(md, "# Metric change-points\n");
+        if machine.truncated {
+            let _ = writeln!(
+                md,
+                "> **Note:** the metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; early \
+                 history was not analysed and a shift in it is not reported here.\n"
+            );
+        }
+        let _ = writeln!(
+            md,
+            "_window={}, FDR={}, {} of {} metrics show a certified regime shift._\n",
+            machine.window, machine.fdr, machine.significant, machine.metrics_examined
+        );
+        if machine.changepoints.is_empty() {
+            let _ = writeln!(
+                md,
+                "_No metric series was long enough to certify a change-point._"
+            );
+        } else {
+            let _ = writeln!(md, "| metric | tick | shift | p | 95% CI | d | δ | real? |");
+            let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
+            for row in &machine.changepoints {
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {:+.4} | {:.4} | [{:.3}, {:.3}] | {:.3} | {:.3} | {} |",
+                    row.metric,
+                    row.change_tick,
+                    row.shift,
+                    row.p_value,
+                    row.ci_lower,
+                    row.ci_upper,
+                    row.cohens_d,
+                    row.cliffs_delta,
+                    if row.significant_fdr { "yes" } else { "no" },
+                );
+            }
+        }
+
+        let output = base_output(
+            self.name(),
+            cx,
+            machine.changepoints.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
+    }
 }
 
 fn base_output(

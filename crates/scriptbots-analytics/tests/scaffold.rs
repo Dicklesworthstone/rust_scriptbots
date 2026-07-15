@@ -324,7 +324,12 @@ fn registry_lists_builtin_reports_with_descriptions() {
     let names: Vec<&str> = listed.iter().map(|(n, _)| *n).collect();
     assert_eq!(
         names,
-        vec!["run-summary", "narrative-timeline", "metric-summary"]
+        vec![
+            "run-summary",
+            "narrative-timeline",
+            "metric-summary",
+            "metric-changepoints",
+        ]
     );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));
 }
