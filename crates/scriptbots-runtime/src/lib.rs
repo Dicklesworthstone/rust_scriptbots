@@ -1723,10 +1723,7 @@ mod tests {
 
         let config = submit_ok(
             &mut client,
-            envelope(
-                81,
-                HostCommand::UpdateConfig(Box::default()),
-            ),
+            envelope(81, HostCommand::UpdateConfig(Box::default())),
         );
         driver
             .drive(ManualInstant::from_nanos(2))
@@ -1873,15 +1870,6 @@ mod tests {
         );
         assert_eq!(
             CommandStatus::try_new(
-                CommandId::new(3),
-                None,
-                ApplicationState::Admitted,
-                JournalState::NotRequired,
-            ),
-            Err(StatusCombinationError::MissingAdmissionSequence)
-        );
-        assert_eq!(
-            CommandStatus::try_new(
                 CommandId::new(4),
                 Some(AdmissionSequence::new(4)),
                 ApplicationState::Admitted,
@@ -1892,7 +1880,16 @@ mod tests {
     }
 
     #[test]
-    fn status_deserialization_rejects_applied_state_without_admission() {
+    fn status_validation_rejects_missing_admission() {
+        assert_eq!(
+            CommandStatus::try_new(
+                CommandId::new(3),
+                None,
+                ApplicationState::Admitted,
+                JournalState::NotRequired,
+            ),
+            Err(StatusCombinationError::MissingAdmissionSequence)
+        );
         assert_eq!(
             CommandStatus::try_from(CommandStatusWire {
                 command_id: CommandId::new(5),
