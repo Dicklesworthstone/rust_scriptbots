@@ -2413,7 +2413,7 @@ mod tests {
         );
         assert!(matches!(
             receiver.try_recv(),
-            Err(crossfire::TryRecvError::Empty)
+            Err(crate::command::CommandRecvError::Empty)
         ));
     }
 
@@ -2437,7 +2437,7 @@ mod tests {
         );
         assert!(matches!(
             receiver.try_recv(),
-            Err(crossfire::TryRecvError::Empty)
+            Err(crate::command::CommandRecvError::Empty)
         ));
     }
 }

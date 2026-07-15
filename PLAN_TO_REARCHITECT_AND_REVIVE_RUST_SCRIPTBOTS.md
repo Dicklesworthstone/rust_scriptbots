@@ -479,6 +479,17 @@ Asupersync is a strong fit for:
 
 It must not turn the deterministic world tick into a collection of independently scheduled async tasks. The world step remains synchronous and ordered. Tokio/Axum replacement is a later, evidence-driven migration; it is not bundled into the first host extraction.
 
+The adopted boundary is intentionally narrower than the original channel-spine
+sketch. `scriptbots-runtime` owns the production bounded Asupersync ingress and
+ordered cancellation/shutdown path, while its canonical `SnapshotHub` retains
+one immutable latest value with independent consumer cursors. `bd-2z0.4.12`
+removes Crossfire from the still-legacy app callback bus without introducing a
+second snapshot transport. The remaining Bevy worker and unbounded snapshot
+queue migrate directly to `SnapshotHub` under `bd-2z0.7.2`; the Tokio watches
+in `servers.rs` remain private to the Axum adapter. The first-party pin remains
+exactly `=0.3.6`; any advancement is serialized through the dependency lane
+and must preserve one resolved Asupersync type universe.
+
 ### 5.8 renderer decision
 
 The plan treats renderer selection as an evidence gate, not loyalty to the historical plan.
@@ -1459,7 +1470,7 @@ The following are architectural migrations, not routine bumps:
 | `wide` | `1.5.0` | MSRV >=1.89, scalar/SIMD numerical and benchmark gates |
 | `criterion` | `0.8.2` | isolated benchmark harness migration |
 | `reqwest` | `0.13.4` | explicit rustls feature/default decision and control CLI E2E |
-| `crossfire` | `3.1.19` | replace broken command driver first; prefer removal if Asupersync channel wins |
+| `crossfire` | removed by `bd-2z0.4.12` | bounded Asupersync MPSC capacity/FIFO/disconnect proof through DSR |
 | `ron` | `0.12.2` | scenario/config corpus golden round trips |
 | `toml` | `1.1.2+spec-1.1.0` | config corpus and formatted-output review |
 | `pollster` | `1.0.1` | update after renderer/WGPU family |
@@ -1478,7 +1489,7 @@ Primary migration references:
 - [ordered-float 5.0 release](https://github.com/reem/rust-ordered-float/releases/tag/v5.0.0)
 - [wide 1.5 changelog](https://github.com/Lokathor/wide/blob/v1.5.0/changelog.md)
 - [Reqwest TLS documentation](https://docs.rs/reqwest/latest/reqwest/tls/index.html)
-- [Crossfire MPMC API](https://docs.rs/crossfire/latest/crossfire/mpmc/index.html)
+- [Asupersync MPSC API](https://docs.rs/asupersync/0.3.6/asupersync/channel/mpsc/index.html)
 - [RON 0.12 changelog](https://github.com/ron-rs/ron/blob/v0.12.2/CHANGELOG.md)
 - [TOML 1.1 changelog](https://github.com/toml-rs/toml/blob/toml-v1.1.2/crates/toml/CHANGELOG.md)
 - [Tract 0.23 changelog](https://github.com/sonos/tract/blob/v0.23.4/CHANGELOG.md)

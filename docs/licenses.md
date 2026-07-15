@@ -55,7 +55,7 @@ direct dep; `planned` = admission bead exists, not yet in tree.
 | Component | Door | Source / pin | License | wasm32 | Notes |
 |---|---|---|---|---|---|
 | `fsqlite` (frankensqlite) 0.1.16 | direct | git; manifest and lock rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guarded by `ci/check_fsqlite_pin.sh` | MIT + Rider (verified) | experimental upstream (`fsqlite-wasm`, not used here) | Sole embedded DB (bd-2z0.8.9). License decision first recorded in bd-2z0.8.9.1; this audit adds the rider analysis. |
-| `asupersync` 0.3.6 | transitive (via fsqlite) → direct planned (bd-2z0.4.12) | crates.io (lock-verified) | MIT + Rider (verified) | yes (browser profiles) | Matches the bd-2z0.4.3 `=0.3.6` decision. Single-universe guard: bd-2z0.8.17. |
+| `asupersync` 0.3.6 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.6` (lock-verified) | MIT + Rider (verified) | yes (browser profiles) | Matches the bd-2z0.4.3/.4.12 exact-pin decision. Single-universe guard: bd-2z0.8.17. |
 | `franken-kernel` / `franken-evidence` / `franken-decision` 0.3.x | transitive (via fsqlite/asupersync) | crates.io (lock-verified) | same family — **verify per-crate LICENSE at first direct use** | n/a | Same publisher; rider assumed identical; do not cite as verified until checked. |
 | `ftui` family 0.5.0 / pinned rev ≥ `15cc6543` | planned (bd-2z0.6.2 / bd-2z0.8.8) | crates.io + git rev | MIT + Rider (verified at repo) | yes (`ftui-web`) | Pin must contain lifecycle fix `15cc6543` (see comments on bd-2z0.6.2). |
 | `fnx-classes` / `fnx-algorithms` 0.2.0 | planned (bd-2z0.11.7) | **crates.io only** (git repo has broken `/dp/frankentui` path dep) | MIT + Rider (verified at repo) | no | Offline analytics only (`scriptbots-analytics`). |
@@ -119,7 +119,7 @@ components; kept here only as a record of what changed.)
 
 ## 4. Enforcement
 
-`ci/check_franken_licenses.sh` (wired into the CI `security` job) fails the
+`ci/check_franken_licenses.sh` (run by the pinned local DSR profile) fails the
 build if any `Cargo.lock` package matching the franken-family name patterns is
 absent from the component table above — i.e., a franken crate cannot enter the
 tree without this document (and therefore the license question) being updated
@@ -130,7 +130,7 @@ status verbosely.
 **cargo-deny status:** full workspace adoption deferred, deliberately. The lock
 holds a very large third-party tree (GPUI/Bevy/wgpu); a blanket license
 allowlist would drown this audit's signal in hundreds of unrelated entries and
-booby-trap CI. The focused guard above enforces exactly the recorded decision.
+booby-trap verification. The focused guard above enforces exactly the recorded decision.
 Revisit if/when repo-wide cargo-deny lands (owner: bd-2z0.8 lane).
 
 ## 5. Admission checklist (for every future franken dependency bead)

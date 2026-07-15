@@ -4,7 +4,8 @@
 # Guards the single-version-universe invariant for crates whose TYPES cross
 # consumer boundaries. Three consumers of asupersync are converging in this
 # workspace: fsqlite (pinned git dep), fastmcp_rust (bd-2z0.8.7.1), and our own
-# direct dependency (bd-2z0.4.12; bd-2z0.4.3 decided =0.3.6). Cargo unifies
+# direct dependencies (scriptbots-runtime + scriptbots-app; bd-2z0.4.3 and
+# bd-2z0.4.12 retain exact =0.3.6). Cargo unifies
 # caret-compatible 0.3.x into ONE compiled crate — which is required, because
 # a Cx built by our runtime must be THE SAME TYPE as the Cx fsqlite's
 # AsyncConnection methods take. Two entries in the lock = two type universes =
@@ -15,11 +16,10 @@
 #   2. (Informational) consumer list printed on every run for drift forensics.
 #
 # Fix playbook (in order):
-#   a. Prefer widening OUR requirement to a caret floor (e.g. ">=0.3.6, <0.4")
-#      over exact "=x.y.z" pins — exact pins FORCE a split the moment another
-#      consumer floats forward.
-#   b. If two consumers declare incompatible ranges, escalate to the
-#      bd-2z0.8 lane owner; do not "fix" by vendoring or renaming.
+#   a. Keep the first-party exact pin. Coordinate any version advancement with
+#      every boundary consumer through the serialized bd-2z0.8 dependency lane.
+#   b. If two consumers declare incompatible ranges, escalate to that lane;
+#      do not widen ad hoc, vendor, or rename around the type split.
 #
 # Parameterized: check additional families with
 #   ci/check_asupersync_universe.sh asupersync ftui
@@ -60,9 +60,10 @@ check_crate() {
 Remediation (bd-2z0.8.17 playbook):
   1. Run: cargo tree --locked -i $crate   (once per resolved version:
      cargo tree --locked -i $crate@<ver>) to list the consumers forcing each.
-  2. Prefer widening OUR requirement to a caret floor over exact pins.
-  3. If consumer ranges are irreconcilable, escalate to the bd-2z0.8 lane —
-     never vendor/rename around it.
+  2. Preserve the first-party exact pin and coordinate any advancement across
+     all consumers through the serialized bd-2z0.8 dependency lane.
+  3. If consumer ranges are irreconcilable, escalate to that lane — never
+     widen ad hoc, vendor, or rename around the type split.
 REMEDY
     return 1
   fi

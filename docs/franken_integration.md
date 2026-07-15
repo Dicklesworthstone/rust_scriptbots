@@ -1,6 +1,6 @@
 # Franken Ecosystem Integration — Program Guide (bd-2js6)
 
-Last reconciled: **2026-07-14** (update this line whenever a program bead
+Last reconciled: **2026-07-15** (update this line whenever a program bead
 closes — that is part of each bead's close checklist by convention). This
 document is what a new contributor reads INSTEAD of re-running the six-repo
 survey that produced the program. Style: terse, factual. Authority order when
@@ -11,7 +11,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | Library | Door | Pin | Feature gate | Status |
 |---|---|---|---|---|
 | `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB |
-| `asupersync` 0.3.6 | transitive via fsqlite (direct planned: bd-2z0.4.12) | crates.io — guard: `ci/check_asupersync_universe.sh` | n/a | in tree, unexploited by first-party code |
+| `asupersync` 0.3.6 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.6` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
 | `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | dependency admitted; FtBrain implementation remains bd-2z0.3.12.3 |
 | everything else (ftui, fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
@@ -19,13 +19,15 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 ## 2. Verdicts (with the one-paragraph why)
 
 **Adopt profoundly:**
-- **asupersync** — channel spine (bounded mpsc command bus, watch snapshot bus,
-  two-phase reserve/commit), region-owned background services with structured
-  shutdown, LabRuntime deterministic chaos testing of the persistence
+- **asupersync** — bounded MPSC command ingress with two-phase
+  reserve/commit, native structured cancellation and ordered shutdown,
+  region-owned background services, LabRuntime deterministic chaos testing of the persistence
   protocol, `Cx::scoped_cpu` spike as a cancellable rayon alternative,
   BrowserRuntime evaluation for `scriptbots-web`. Decision lineage:
   bd-2z0.4.3 (closed spike, `=0.3.6`); beads bd-2z0.4.12/.13/.14,
-  bd-2z0.8.9.15, bd-2z0.12.4.
+  bd-2z0.8.9.15, bd-2z0.12.4. Immutable latest snapshots use the canonical
+  `SnapshotHub`; Bevy consumes that hub directly under bd-2z0.7.2 rather than
+  adding an Asupersync watch competitor.
 - **frankentui** — Evolution Lab TUI (owned by the pre-existing bd-2z0.6 epic,
   not this program). Program contribution: the pin must contain upstream
   lifecycle fix `15cc6543` (postdates published 0.5.0) — recorded on
@@ -117,15 +119,16 @@ and review log). Status at last reconcile:
   bd-2z0.8.18 (performance gates; DSR-only acceptance).
 - **OPEN, ready**: bd-2z0.3.12.2 (BatchBrain — sequenced after the
   bd-16g.15.x sense-lane digest move).
+- **IN PROGRESS**: bd-2z0.4.12 (final Crossfire removal from the legacy app
+  command callback; production runtime ingress/snapshot/shutdown already landed).
 - **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.12/.13
-  (async-api / MVCC decision), bd-2z0.4.12/.13/.14 + bd-2z0.8.9.15 +
+  (async-api / MVCC decision), bd-2z0.4.13/.14 + bd-2z0.8.9.15 +
   bd-2z0.12.4 (asupersync spine chain), bd-2z0.11.6/.7/.8/.9 (analytics
   implementations), bd-2z0.3.12.3–.6 (FtBrain chain), bd-2z0.5.9
   (interaction persistence, rides bd-2z0.5.2).
 
-CI controls live in `.github/workflows/ci.yml`: the security job runs
-`check_franken_licenses.sh`, `check_asupersync_universe.sh`, and
-`check_fsqlite_pin.sh`; the wasm job runs `check_wasm_graph.sh` before its
-expensive build; and the `frankentorch-admission` matrix compiles `brain-ft`
-and checks its explicit app propagation on Linux, macOS, and Windows. Each
-standalone guard has a `--self-test` mode.
+The pinned local DSR verification profile is the only acceptance lane. It runs
+`check_franken_licenses.sh`, `check_asupersync_universe.sh`,
+`check_fsqlite_pin.sh`, and `check_wasm_graph.sh` together with their relevant
+build/test surfaces. Each standalone guard has a `--self-test` mode; hosted
+workflow results are not acceptance evidence.

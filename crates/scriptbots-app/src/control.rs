@@ -2,7 +2,6 @@ use std::cmp::Reverse;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 // removed duplicate import
 
-use crossfire::TrySendError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -15,7 +14,7 @@ use scriptbots_core::{
 };
 
 use crate::SharedWorld;
-use crate::command::CommandSender;
+use crate::command::{CommandSendError, CommandSender};
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::check_knob_ranges;
 #[cfg(feature = "gui")]
@@ -542,8 +541,8 @@ impl ControlHandle {
             .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_msg)) => Err(ControlError::CommandQueueFull),
-            Err(TrySendError::Disconnected(_msg)) => Err(ControlError::CommandQueueClosed),
+            Err(CommandSendError::Full(_command)) => Err(ControlError::CommandQueueFull),
+            Err(CommandSendError::Disconnected(_command)) => Err(ControlError::CommandQueueClosed),
         }
     }
 }
@@ -1100,7 +1099,7 @@ mod tests {
         );
         assert!(matches!(
             receiver.try_recv(),
-            Err(crossfire::TryRecvError::Empty)
+            Err(crate::command::CommandRecvError::Empty)
         ));
         let value = handle
             .snapshot()
@@ -1147,7 +1146,7 @@ mod tests {
         );
         assert!(matches!(
             receiver.try_recv(),
-            Err(crossfire::TryRecvError::Empty)
+            Err(crate::command::CommandRecvError::Empty)
         ));
         assert_eq!(
             handle.snapshot().expect("snapshot").config.get("food_max"),
