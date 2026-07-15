@@ -23,6 +23,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 use std::sync::OnceLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 #[cfg(feature = "simd_wide")]
@@ -3174,8 +3178,9 @@ impl ResourceLedgerState {
 
 /// Schema identifier for legacy opt-in per-stage simulation-step timing.
 ///
-/// Version 2 includes downstream persistence admission in the Persistence stage and whole-step
-/// total. It remains the schema consumed by the reviewed performance baseline.
+/// Version 2 includes downstream session staging and persistence admission in the Persistence
+/// stage, and its whole-step total extends through typed result composition. It remains the
+/// schema consumed by the reviewed performance baseline.
 pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 /// Schema identifier for deterministic-core timing returned by profiled outcome steps.
 ///
@@ -3227,8 +3232,8 @@ pub enum WorldStepStage {
     Bookkeeping,
     /// Project persistence policy and materialize the exact batch when due.
     ///
-    /// Legacy v2 profiles add downstream admission time to this stage; core-only v3 profiles do
-    /// not admit the batch.
+    /// Legacy v2 profiles add downstream session staging and admission time to this stage;
+    /// core-only v3 profiles do not stage or admit the batch inside this timing boundary.
     Persistence,
     /// Reset transient events, finish diagnostic ledgers, and advance the tick.
     Finalize,
@@ -3352,7 +3357,8 @@ pub struct WorldStepProfile {
     pub tick: Tick,
     /// Whole-step elapsed time under the profile's declared schema.
     ///
-    /// Legacy v2 includes downstream admission; core-only v3 ends after finalization.
+    /// Legacy v2 includes session staging, admission, and typed result composition; core-only v3
+    /// ends after finalization.
     pub total_ns: u64,
     stage_ns: [u64; WorldStepStage::COUNT],
     stage_executed: [bool; WorldStepStage::COUNT],
@@ -3407,11 +3413,22 @@ impl WorldStepProfile {
 /// Ordinary [`WorldState::step`] uses a monomorphized no-op observer, so enabling this type for a
 /// dedicated measurement pass cannot add clock reads to production or pure-throughput steps.
 /// Core-only v3 profiles end after finalization. Legacy v2 profiles retain their historical
-/// contract by adding downstream persistence admission to both the Persistence stage and total.
+/// contract by adding session staging and downstream admission to the Persistence stage, then
+/// extending the whole-step total through typed result composition.
 #[derive(Debug)]
 pub struct WorldStepProfiler {
     latest: Option<WorldStepProfile>,
     next_schema: &'static str,
+    #[cfg(test)]
+    legacy_test_clock: LegacyProfileTestClock,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct LegacyProfileTestClock {
+    now_ns: u64,
+    staging_advance_ns: u64,
+    result_advance_ns: u64,
 }
 
 impl Default for WorldStepProfiler {
@@ -3419,6 +3436,8 @@ impl Default for WorldStepProfiler {
         Self {
             latest: None,
             next_schema: WORLD_STEP_PROFILE_SCHEMA,
+            #[cfg(test)]
+            legacy_test_clock: LegacyProfileTestClock::default(),
         }
     }
 }
@@ -3432,6 +3451,36 @@ impl WorldStepProfiler {
 
     fn select_schema(&mut self, schema: &'static str) {
         self.next_schema = schema;
+    }
+
+    #[cfg(test)]
+    fn inject_legacy_tail_costs(&mut self, staging_ns: u64, result_ns: u64) {
+        self.legacy_test_clock = LegacyProfileTestClock {
+            now_ns: 0,
+            staging_advance_ns: staging_ns,
+            result_advance_ns: result_ns,
+        };
+    }
+
+    #[cfg(test)]
+    const fn legacy_test_now_ns(&self) -> u64 {
+        self.legacy_test_clock.now_ns
+    }
+
+    #[cfg(test)]
+    fn advance_legacy_test_staging(&mut self) {
+        self.legacy_test_clock.now_ns = self
+            .legacy_test_clock
+            .now_ns
+            .saturating_add(self.legacy_test_clock.staging_advance_ns);
+    }
+
+    #[cfg(test)]
+    fn advance_legacy_test_result(&mut self) {
+        self.legacy_test_clock.now_ns = self
+            .legacy_test_clock
+            .now_ns
+            .saturating_add(self.legacy_test_clock.result_advance_ns);
     }
 
     fn finish_legacy_boundary(
@@ -4766,7 +4815,7 @@ pub enum PersistenceProjectionStatus {
 #[must_use = "a ready persistence projection owns drained scientific records"]
 pub struct PersistenceProjection {
     status: PersistenceProjectionStatus,
-    batch: Option<PersistenceBatch>,
+    batch: Option<Arc<PersistenceBatch>>,
 }
 
 impl PersistenceProjection {
@@ -4784,10 +4833,10 @@ impl PersistenceProjection {
         }
     }
 
-    const fn ready(batch: PersistenceBatch) -> Self {
+    fn ready(batch: PersistenceBatch) -> Self {
         Self {
             status: PersistenceProjectionStatus::Ready,
-            batch: Some(batch),
+            batch: Some(Arc::new(batch)),
         }
     }
 
@@ -4799,13 +4848,13 @@ impl PersistenceProjection {
 
     /// Borrow the exact ready batch without consuming this projection.
     #[must_use]
-    pub const fn batch(&self) -> Option<&PersistenceBatch> {
-        self.batch.as_ref()
+    pub fn batch(&self) -> Option<&PersistenceBatch> {
+        self.batch.as_deref()
     }
 
-    /// Move the exact ready batch to its downstream owner.
+    /// Share ownership of the exact immutable ready batch with a downstream owner.
     #[must_use]
-    pub fn into_batch(self) -> Option<PersistenceBatch> {
+    pub fn into_batch(self) -> Option<Arc<PersistenceBatch>> {
         debug_assert_eq!(
             self.status == PersistenceProjectionStatus::Ready,
             self.batch.is_some()
@@ -4839,9 +4888,10 @@ pub enum CompletedStepFault {
 
 /// Complete deterministic result of one advanced simulation tick.
 ///
-/// This value is renderer- and storage-engine-neutral. A ready persistence projection
-/// owns the exact cadence batch and must be moved to its admission owner rather than
-/// reconstructed from mutable world state.
+/// This value is renderer- and storage-engine-neutral. When a ready persistence projection is
+/// returned through [`PersistenceAdmissionSession`], that session already shares its exact
+/// immutable batch and remains the sole admission owner. Consumers may inspect the projection;
+/// they must not reconstruct or independently admit it from mutable world state.
 #[derive(Debug)]
 #[must_use = "a completed step outcome may own lifecycle and persistence records"]
 pub struct StepOutcome {
@@ -4887,6 +4937,99 @@ pub trait WorldPersistence: Send {
     /// retry through stable identity and exact-payload deduplication. A changed payload is never
     /// a valid retry for the same completed tick.
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError>;
+}
+
+/// Payload-free state of the world's current persistence boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceBoundaryStatus {
+    /// No immutable batch has been staged for the current tick.
+    Open { tick: Tick },
+    /// The external admission session owns the exact immutable batch for this tick.
+    Pending { tick: Tick },
+    /// The external sink acknowledged the immutable batch for this tick.
+    Sealed { tick: Tick },
+}
+
+#[derive(Debug, Default)]
+struct PersistenceSessionToken {
+    claimed: AtomicBool,
+}
+
+#[derive(Debug)]
+struct PendingPersistenceAdmission {
+    batch: Arc<PersistenceBatch>,
+    error: Option<PersistenceAdmissionError>,
+}
+
+/// External owner of persistence admission state for exactly one [`WorldState`].
+///
+/// The session owns the sink, the exact immutable batch retained across failed or indeterminate
+/// acknowledgements, and the historical admission watermark. `WorldState` keeps only a
+/// payload-free boundary marker, so no database, channel, or retry payload is hidden inside the
+/// deterministic simulation state.
+pub struct PersistenceAdmissionSession {
+    sink: Box<dyn WorldPersistence>,
+    pending: Option<PendingPersistenceAdmission>,
+    last_admitted_tick: Option<Tick>,
+    binding: Arc<PersistenceSessionToken>,
+}
+
+/// Shared host callback that advances a locked world through its external admission session.
+///
+/// Renderers receive this capability instead of receiving the session itself. The host therefore
+/// remains the sole owner of retry state and lock ordering while every frontend uses the same
+/// lossless step boundary.
+pub type WorldStepDriver = Arc<dyn Fn() -> Result<TickEvents, WorldStepError> + Send + Sync>;
+
+impl fmt::Debug for PersistenceAdmissionSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistenceAdmissionSession")
+            .field(
+                "pending_tick",
+                &self
+                    .pending
+                    .as_ref()
+                    .map(|pending| pending.batch.summary.tick),
+            )
+            .field("fault", &self.fault())
+            .field("last_admitted_tick", &self.last_admitted_tick)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Structural or downstream failure at the external persistence-session boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PersistenceSessionError {
+    /// A world permits exactly one lifetime persistence-session binding.
+    #[error("a persistence admission session is already bound to this world")]
+    AlreadyBound,
+    /// A session was presented with a different world's opaque binding.
+    #[error("persistence admission session belongs to a different world")]
+    WrongWorld,
+    /// Persistence-enabled stepping requires the world's bound external session.
+    #[error("persistence-enabled tick {tick} requires the bound admission session")]
+    SessionRequired { tick: u64 },
+    /// The session and payload-free world marker disagreed before sink I/O.
+    #[error(
+        "persistence session expected pending tick {pending_tick}, but world boundary was {boundary:?}"
+    )]
+    BoundaryMismatch {
+        pending_tick: Tick,
+        boundary: PersistenceBoundaryStatus,
+    },
+    /// The world is pending but this session no longer owns its exact payload.
+    #[error("persistence batch for pending tick {tick} is unavailable")]
+    MissingPendingBatch { tick: Tick },
+    /// The host could not acquire the external session that owns admission state.
+    #[error("persistence admission session is unavailable: {detail}")]
+    Unavailable { detail: String },
+    /// A scientific-state guard rejected finalization or session-driven stepping.
+    #[error(transparent)]
+    ScientificState(#[from] ScientificStateError),
+    /// The sink did not acknowledge the exact retained batch.
+    #[error(transparent)]
+    Admission(#[from] PersistenceAdmissionError),
 }
 
 /// What the caller knows about a completed batch after admission failed.
@@ -4959,6 +5102,9 @@ pub enum WorldStepError {
     /// The completed tick could not be admitted to persistence.
     #[error(transparent)]
     Persistence(#[from] PersistenceAdmissionError),
+    /// The external admission session did not match the world's boundary contract.
+    #[error(transparent)]
+    PersistenceSession(#[from] PersistenceSessionError),
     /// Brain construction and persistence admission both failed at the same completed boundary.
     #[error(
         "brain construction failed while the completed tick was also rejected by persistence: {brain}; {persistence}"
@@ -5817,6 +5963,12 @@ impl BrainFamilyRegistry {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tick(pub u64);
 
+impl fmt::Display for Tick {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 /// Controls analytics sampling cadence for various metric families.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnalyticsStride {
@@ -6512,7 +6664,7 @@ pub enum ScientificStateError {
     SeededArrivalAfterBootstrap { path: String, tick: u64 },
     /// Disabling persistence would strand scientific material that has not reached its sink.
     #[error(
-        "cannot disable persistence at `{path}` because tick {tick} has an unadmitted scientific tail; call `WorldState::finalize_persistence()` before disabling persistence"
+        "cannot disable persistence at `{path}` because tick {tick} has an unadmitted scientific tail; finalize the world's bound `PersistenceAdmissionSession` before disabling persistence"
     )]
     PersistenceDisableRequiresFinalization { path: String, tick: u64 },
     /// Persistence was disabled long enough to discard scientific records from this run.
@@ -10611,11 +10763,9 @@ pub struct WorldState {
     #[allow(dead_code)]
     replay_tick: u64,
     replay_events: Vec<ReplayEvent>,
-    persistence: Box<dyn WorldPersistence>,
-    pending_persistence_batch: Option<PersistenceBatch>,
-    persistence_fault: Option<PersistenceAdmissionError>,
+    persistence_binding: Arc<PersistenceSessionToken>,
+    persistence_boundary: PersistenceBoundaryStatus,
     brain_fault: Option<BrainSpawnError>,
-    last_admitted_persistence_tick: Option<Tick>,
     persistence_discarded_records_at: Option<Tick>,
     pending_persistence_runtime_tail: AgentMap<PersistenceRuntimeTail>,
     pending_birth_events: usize,
@@ -10668,14 +10818,29 @@ impl fmt::Debug for WorldState {
 impl WorldState {
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
-        Self::with_persistence(config, Box::new(NullPersistence))
+        Self::build(config)
     }
 
-    /// Instantiate a new world using the supplied configuration and persistence sink.
+    /// Instantiate a world and its one lifetime external persistence-admission session.
     pub fn with_persistence(
         config: ScriptBotsConfig,
         persistence: Box<dyn WorldPersistence>,
-    ) -> Result<Self, WorldStateError> {
+    ) -> Result<(Self, PersistenceAdmissionSession), WorldStateError> {
+        let world = Self::build(config)?;
+        world
+            .persistence_binding
+            .claimed
+            .store(true, AtomicOrdering::Release);
+        let session = PersistenceAdmissionSession {
+            sink: persistence,
+            pending: None,
+            last_admitted_tick: None,
+            binding: Arc::clone(&world.persistence_binding),
+        };
+        Ok((world, session))
+    }
+
+    fn build(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
         configure_parallelism();
         let (food_w, food_h) = config.food_dimensions()?;
         let mut rng = config.seeded_rng();
@@ -10740,11 +10905,9 @@ impl WorldState {
             pending_lifecycle_death_metrics: Vec::new(),
             replay_tick: 0,
             replay_events: Vec::new(),
-            persistence,
-            pending_persistence_batch: None,
-            persistence_fault: None,
+            persistence_binding: Arc::new(PersistenceSessionToken::default()),
+            persistence_boundary: PersistenceBoundaryStatus::Open { tick: Tick::zero() },
             brain_fault: None,
-            last_admitted_persistence_tick: None,
             persistence_discarded_records_at: None,
             pending_persistence_runtime_tail: AgentMap::new(),
             pending_birth_events: 0,
@@ -10767,6 +10930,25 @@ impl WorldState {
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
             activation_probe: None,
+        })
+    }
+
+    /// Bind the only lifetime persistence-admission session accepted by this world.
+    ///
+    /// The claim is one-shot: dropping the returned session does not make the world bindable again.
+    pub fn bind_persistence(
+        &self,
+        sink: Box<dyn WorldPersistence>,
+    ) -> Result<PersistenceAdmissionSession, PersistenceSessionError> {
+        self.persistence_binding
+            .claimed
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .map_err(|_| PersistenceSessionError::AlreadyBound)?;
+        Ok(PersistenceAdmissionSession {
+            sink,
+            pending: None,
+            last_admitted_tick: None,
+            binding: Arc::clone(&self.persistence_binding),
         })
     }
 
@@ -14896,6 +15078,14 @@ impl WorldState {
         next_tick: Tick,
         force_partial_batch: bool,
     ) -> PersistenceProjection {
+        debug_assert!(
+            !matches!(
+                self.persistence_boundary,
+                PersistenceBoundaryStatus::Pending { .. }
+            ),
+            "pending persistence must be resolved before preparing another boundary"
+        );
+        self.persistence_boundary = PersistenceBoundaryStatus::Open { tick: next_tick };
         if self.config.persistence_interval == 0 {
             // A completed boundary is itself part of the scientific timeline, even when that
             // particular tick produced no lifecycle or replay rows. Remember the first disabled
@@ -15481,63 +15671,25 @@ impl WorldState {
         PersistenceProjection::ready(batch)
     }
 
-    fn admit_prepared_persistence(
-        &mut self,
-        batch: PersistenceBatch,
-    ) -> Result<(), PersistenceAdmissionError> {
-        match self.persistence.on_tick(&batch) {
-            Ok(()) => {
-                self.last_admitted_persistence_tick = Some(batch.summary.tick);
-                Ok(())
-            }
-            Err(error) => {
-                self.persistence_fault = Some(error.clone());
-                self.pending_persistence_batch = Some(batch);
-                Err(error)
-            }
-        }
-    }
-
-    fn stage_persistence(
-        &mut self,
-        next_tick: Tick,
-        force_partial_batch: bool,
-    ) -> Result<(), PersistenceAdmissionError> {
-        if let Some(batch) = self
-            .prepare_persistence(next_tick, force_partial_batch)
-            .into_batch()
-        {
-            self.admit_prepared_persistence(batch)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Execute one simulation tick pipeline returning emitted events.
+    /// Execute one persistence-disabled simulation tick and return its emitted events.
     ///
-    /// A returned error can describe a tick that has already reached its completed boundary. A
-    /// generation-capacity rejection occurs before the first stage, RNG draw, or state
-    /// mutation. A persistence rejection retains that exact completed batch for explicit retry and sets
-    /// [`Self::persistence_fault`]. A brain-construction failure rolls back population inserts and
-    /// refuses a partial queued-birth commit, completes the remaining tick bookkeeping and
-    /// persistence boundary, advances `tick`, and sets [`Self::brain_fault`]. If both fail, both faults are retained and
-    /// [`WorldStepError::BrainAndPersistence`] reports them together. Completed-boundary failures
-    /// latch and block later science ticks without mutation; callers must not retry `step` as
-    /// though those failed returns meant the current tick was unapplied. A pre-tick generation
-    /// rejection is not latched because no part of that tick was applied; callers may disable the
-    /// relevant reproduction policy or replace the offending scientific state before retrying.
+    /// Persistence-enabled worlds must use their bound [`PersistenceAdmissionSession`], which
+    /// stages the exact immutable batch before returning a completion. This convenience path is
+    /// intentionally limited to disabled persistence so it cannot drop a ready projection.
     pub fn step(&mut self) -> Result<TickEvents, WorldStepError> {
+        self.require_external_session_if_enabled()?;
         let completion = self.step_outcome()?;
-        self.finish_legacy_step(completion)
+        Self::finish_without_admission(completion)
     }
 
     /// Execute one simulation transition without performing downstream persistence I/O.
     ///
     /// `Err` means no new transition started. Once a tick advances, this always returns its
     /// [`StepCompletion`]; a population fault discovered at that completed boundary is carried in
-    /// [`StepCompletion::fault`]. A ready [`StepOutcome::persistence`] owns the exact
-    /// cadence batch and has not been offered to this world's legacy persistence sink.
+    /// [`StepCompletion::fault`]. This direct API is limited to persistence-disabled worlds;
+    /// persistence-enabled callers use [`PersistenceAdmissionSession::step_outcome`].
     pub fn step_outcome(&mut self) -> Result<StepCompletion, WorldStepError> {
+        self.require_external_session_if_enabled()?;
         self.step_outcome_observed(&mut NoopWorldStepObserver)
     }
 
@@ -15550,9 +15702,10 @@ impl WorldState {
         &mut self,
         profiler: &mut WorldStepProfiler,
     ) -> Result<TickEvents, WorldStepError> {
-        profiler.select_schema(WORLD_STEP_PROFILE_SCHEMA);
+        self.require_external_session_if_enabled()?;
+        profiler.select_schema(WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
         let completion = self.step_outcome_observed(profiler)?;
-        self.finish_profiled_legacy_step(completion, profiler)
+        Self::finish_without_admission(completion)
     }
 
     /// Execute the no-storage-I/O transition while recording per-stage wall-clock timings.
@@ -15564,6 +15717,7 @@ impl WorldState {
         &mut self,
         profiler: &mut WorldStepProfiler,
     ) -> Result<StepCompletion, WorldStepError> {
+        self.require_external_session_if_enabled()?;
         profiler.select_schema(WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
         self.step_outcome_observed(profiler)
     }
@@ -15585,8 +15739,9 @@ impl WorldState {
         &mut self,
         tracer: &mut WorldStepTracer,
     ) -> Result<TickEvents, WorldStepError> {
+        self.require_external_session_if_enabled()?;
         let completion = self.step_traced_outcome(tracer)?;
-        self.finish_legacy_step(completion)
+        Self::finish_without_admission(completion)
     }
 
     /// Execute the pure transition while capturing the six deterministic trace points.
@@ -15594,15 +15749,33 @@ impl WorldState {
         &mut self,
         tracer: &mut WorldStepTracer,
     ) -> Result<StepCompletion, WorldStepError> {
+        self.require_external_session_if_enabled()?;
         self.step_outcome_observed(tracer)
+    }
+
+    fn require_external_session_if_enabled(&self) -> Result<(), PersistenceSessionError> {
+        if self.config.persistence_interval == 0 {
+            Ok(())
+        } else {
+            Err(PersistenceSessionError::SessionRequired {
+                tick: self.tick.next().0,
+            })
+        }
     }
 
     fn step_outcome_observed<O: WorldStepObserver>(
         &mut self,
         observer: &mut O,
     ) -> Result<StepCompletion, WorldStepError> {
-        if let Some(error) = self.latched_step_error() {
-            return Err(error);
+        if let Some(brain) = self.brain_fault.clone() {
+            return Err(brain.into());
+        }
+        if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
+            return Err(ScientificStateError::PersistenceBoundaryUnresolved {
+                path: "world.step".to_owned(),
+                tick: tick.0,
+            }
+            .into());
         }
 
         let next_tick = self.tick.next();
@@ -15839,67 +16012,31 @@ impl WorldState {
         })
     }
 
-    fn finish_legacy_step(
-        &mut self,
-        completion: StepCompletion,
-    ) -> Result<TickEvents, WorldStepError> {
+    fn finish_without_admission(completion: StepCompletion) -> Result<TickEvents, WorldStepError> {
         let StepCompletion { outcome, fault } = completion;
-        let StepOutcome {
-            events,
-            persistence,
-            ..
-        } = outcome;
-        let persistence_result = self.admit_persistence_projection(persistence);
-        Self::combine_legacy_step_result(events, fault, persistence_result)
+        debug_assert_ne!(
+            outcome.persistence.status(),
+            PersistenceProjectionStatus::Ready
+        );
+        Self::combine_completed_fault(outcome.events, fault, None)
     }
 
-    fn finish_profiled_legacy_step(
-        &mut self,
-        completion: StepCompletion,
-        profiler: &mut WorldStepProfiler,
-    ) -> Result<TickEvents, WorldStepError> {
-        let total_tail_started_at = Instant::now();
-        let StepCompletion { outcome, fault } = completion;
-        let StepOutcome {
-            events,
-            persistence,
-            ..
-        } = outcome;
-        let admission_started_at = Instant::now();
-        let persistence_result = self.admit_persistence_projection(persistence);
-        let admission_elapsed = admission_started_at.elapsed();
-        let result = Self::combine_legacy_step_result(events, fault, persistence_result);
-        profiler.finish_legacy_boundary(admission_elapsed, total_tail_started_at.elapsed());
-        result
-    }
-
-    fn admit_persistence_projection(
-        &mut self,
-        persistence: PersistenceProjection,
-    ) -> Result<(), PersistenceAdmissionError> {
-        if let Some(batch) = persistence.into_batch() {
-            self.admit_prepared_persistence(batch)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn combine_legacy_step_result(
+    fn combine_completed_fault(
         events: TickEvents,
         fault: Option<CompletedStepFault>,
-        persistence_result: Result<(), PersistenceAdmissionError>,
+        persistence: Option<PersistenceAdmissionError>,
     ) -> Result<TickEvents, WorldStepError> {
-        match (fault, persistence_result) {
-            (None, Ok(())) => Ok(events),
-            (None, Err(persistence)) => Err(persistence.into()),
-            (Some(CompletedStepFault::BrainSpawn(brain)), Ok(())) => Err(brain.into()),
-            (Some(CompletedStepFault::BrainSpawn(brain)), Err(persistence)) => {
+        match (fault, persistence) {
+            (None, None) => Ok(events),
+            (None, Some(persistence)) => Err(persistence.into()),
+            (Some(CompletedStepFault::BrainSpawn(brain)), None) => Err(brain.into()),
+            (Some(CompletedStepFault::BrainSpawn(brain)), Some(persistence)) => {
                 Err(WorldStepError::BrainAndPersistence { brain, persistence })
             }
-            (Some(CompletedStepFault::ScientificState(scientific_state)), Ok(())) => {
+            (Some(CompletedStepFault::ScientificState(scientific_state)), None) => {
                 Err(scientific_state.into())
             }
-            (Some(CompletedStepFault::ScientificState(scientific_state)), Err(persistence)) => {
+            (Some(CompletedStepFault::ScientificState(scientific_state)), Some(persistence)) => {
                 Err(WorldStepError::ScientificStateAndPersistence {
                     scientific_state,
                     persistence,
@@ -16187,12 +16324,10 @@ impl WorldState {
                     blocker: WorldContinuationBlocker::BrainFault,
                 });
             }
-            if self.persistence_fault.is_some() {
-                return Err(CharacterizationError::NonContinuable {
-                    blocker: WorldContinuationBlocker::PersistenceFault,
-                });
-            }
-            if self.pending_persistence_batch.is_some() {
+            if matches!(
+                self.persistence_boundary,
+                PersistenceBoundaryStatus::Pending { .. }
+            ) {
                 return Err(CharacterizationError::NonContinuable {
                     blocker: WorldContinuationBlocker::RetainedPersistenceBatch,
                 });
@@ -16648,16 +16783,16 @@ impl WorldState {
     }
 
     fn has_unadmitted_scientific_tail(&self) -> bool {
-        let completed_tick_is_unadmitted =
-            self.tick != Tick::zero() && self.last_admitted_persistence_tick != Some(self.tick);
+        let completed_tick_is_unadmitted = self.tick != Tick::zero()
+            && self.persistence_boundary != (PersistenceBoundaryStatus::Sealed { tick: self.tick });
         completed_tick_is_unadmitted || self.has_pending_persistence_material()
     }
 
     fn ensure_scientific_mutation_allowed(&self, path: &str) -> Result<(), ScientificStateError> {
-        if self.persistence_fault.is_some() || self.pending_persistence_batch.is_some() {
+        if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
             return Err(ScientificStateError::PersistenceBoundaryUnresolved {
                 path: path.to_owned(),
-                tick: self.tick.0,
+                tick: tick.0,
             });
         }
         Ok(())
@@ -16668,8 +16803,10 @@ impl WorldState {
         &mut self,
         new_config: ScriptBotsConfig,
     ) -> Result<(), WorldStateError> {
-        let unresolved_admission =
-            self.persistence_fault.is_some() || self.pending_persistence_batch.is_some();
+        let unresolved_admission = matches!(
+            self.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { .. }
+        );
         let pure_disable_during_unresolved = if unresolved_admission
             && self.config.persistence_interval != 0
             && new_config.persistence_interval == 0
@@ -16779,81 +16916,41 @@ impl WorldState {
         self.activation_probe = agent;
     }
 
-    /// Retry the exact completed batch retained after an unacknowledged admission attempt.
-    ///
-    /// Returns `Ok(true)` after admitting a retained batch, `Ok(false)` when no retry was
-    /// pending, and leaves the world latched on the same batch after another definite or
-    /// indeterminate admission failure.
-    pub fn retry_pending_persistence(&mut self) -> Result<bool, PersistenceAdmissionError> {
-        let Some(batch) = self.pending_persistence_batch.take() else {
-            debug_assert!(self.persistence_fault.is_none());
-            return Ok(false);
-        };
-        match self.persistence.on_tick(&batch) {
-            Ok(()) => {
-                self.last_admitted_persistence_tick = Some(batch.summary.tick);
-                self.persistence_fault = None;
-                Ok(true)
-            }
-            Err(error) => {
-                self.persistence_fault = Some(error.clone());
-                self.pending_persistence_batch = Some(batch);
-                Err(error)
-            }
-        }
-    }
-
-    /// Admit the final partial persistence-cadence batch, if one exists.
-    ///
-    /// This is idempotent at a completed tick boundary. It proves only the configured sink's
-    /// synchronous admission guarantee. The FrankenSQLite file sink thereby proves its durable
-    /// outbox commit; callers still need a flush or shutdown receipt before claiming scientific
-    /// table application and terminal durable-watermark advancement.
-    pub fn finalize_persistence(&mut self) -> Result<bool, PersistenceAdmissionError> {
-        if let Some(error) = &self.persistence_fault {
-            return Err(error.clone());
+    fn finalize_persistence_projection(
+        &mut self,
+    ) -> Result<Option<PersistenceProjection>, ScientificStateError> {
+        if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
+            return Err(ScientificStateError::PersistenceBoundaryUnresolved {
+                path: "persistence.finalize".to_owned(),
+                tick: tick.0,
+            });
         }
         if self.config.persistence_interval == 0
-            || self.last_admitted_persistence_tick == Some(self.tick)
+            || self.persistence_boundary == (PersistenceBoundaryStatus::Sealed { tick: self.tick })
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Tick zero has no completed simulation step to summarize, but bootstrap
-        // arrivals are still scientific origin records. Admit them when present;
+        // arrivals are still scientific origin records. Project them when present;
         // keep an untouched empty world idempotently empty.
         if self.tick == Tick::zero()
             && self.pending_birth_records.is_empty()
             && self.pending_death_records.is_empty()
             && self.replay_events.is_empty()
         {
-            return Ok(false);
+            return Ok(None);
         }
 
-        self.stage_persistence(self.tick, true)?;
-        Ok(true)
+        let projection = self.prepare_persistence(self.tick, true);
+        debug_assert_eq!(projection.status(), PersistenceProjectionStatus::Ready);
+        Ok(Some(projection))
     }
 
-    /// Most recent simulation boundary synchronously admitted by the persistence sink.
-    ///
-    /// This is historical admission state, independent of the current persistence cadence.
-    /// Shutdown code uses it to validate the worker receipt even when configuration changed
-    /// after admission.
+    /// Payload-free state of the world's current persistence boundary.
     #[must_use]
-    pub const fn last_admitted_persistence_tick(&self) -> Option<Tick> {
-        self.last_admitted_persistence_tick
-    }
-
-    /// Whether a completed tick is paused at the persistence admission boundary.
-    #[must_use]
-    pub const fn has_pending_persistence_batch(&self) -> bool {
-        self.pending_persistence_batch.is_some()
-    }
-
-    /// Latched admission error that prevents any later science tick from starting.
-    #[must_use]
-    pub const fn persistence_fault(&self) -> Option<&PersistenceAdmissionError> {
-        self.persistence_fault.as_ref()
+    pub const fn persistence_boundary_status(&self) -> PersistenceBoundaryStatus {
+        self.persistence_boundary
     }
 
     /// Latched brain-construction error that prevents any later science tick from starting.
@@ -16862,17 +16959,24 @@ impl WorldState {
         self.brain_fault.as_ref()
     }
 
-    /// Combined typed view of any terminal fault that prevents a later science tick.
+    /// World-owned view of any fault or unresolved marker that prevents a later science tick.
+    ///
+    /// Detailed sink acknowledgement failures live on [`PersistenceAdmissionSession`].
     #[must_use]
     pub fn latched_step_error(&self) -> Option<WorldStepError> {
-        match (&self.brain_fault, &self.persistence_fault) {
-            (Some(brain), Some(persistence)) => Some(WorldStepError::BrainAndPersistence {
-                brain: brain.clone(),
-                persistence: persistence.clone(),
-            }),
-            (Some(brain), None) => Some(WorldStepError::BrainSpawn(brain.clone())),
-            (None, Some(persistence)) => Some(WorldStepError::Persistence(persistence.clone())),
-            (None, None) => None,
+        if let Some(brain) = &self.brain_fault {
+            return Some(WorldStepError::BrainSpawn(brain.clone()));
+        }
+        match self.persistence_boundary {
+            PersistenceBoundaryStatus::Pending { tick } => Some(WorldStepError::ScientificState(
+                ScientificStateError::PersistenceBoundaryUnresolved {
+                    path: "world.step".to_owned(),
+                    tick: tick.0,
+                },
+            )),
+            PersistenceBoundaryStatus::Open { .. } | PersistenceBoundaryStatus::Sealed { .. } => {
+                None
+            }
         }
     }
 
@@ -16936,16 +17040,17 @@ impl WorldState {
     /// history, or admission marker returns [`ScientificStateError::TimeResetRequiresNewRun`];
     /// construct a new world and storage identity instead of relabeling existing science.
     pub fn reset_time(&self) -> Result<(), ScientificStateError> {
-        if self.persistence_fault.is_some() || self.pending_persistence_batch.is_some() {
+        if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
             return Err(ScientificStateError::PersistenceBoundaryUnresolved {
                 path: "world.tick".to_owned(),
-                tick: self.tick.0,
+                tick: tick.0,
             });
         }
 
         let pristine_tick_zero = self.tick == Tick::zero()
             && self.epoch == 0
-            && self.last_admitted_persistence_tick.is_none()
+            && self.persistence_boundary
+                == (PersistenceBoundaryStatus::Open { tick: Tick::zero() })
             && self.persistence_discarded_records_at.is_none()
             && self.pending_deaths.is_empty()
             && self.pending_spawns.is_empty()
@@ -17149,19 +17254,18 @@ impl WorldState {
     /// current tick was successfully admitted. The caller must advance the world
     /// to a new tick before adding an external arrival.
     pub fn validate_external_arrival_boundary(&self) -> Result<(), ScientificStateError> {
-        let unresolved_admission =
-            self.persistence_fault.is_some() || self.pending_persistence_batch.is_some();
-        if unresolved_admission {
+        if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
             return Err(ScientificStateError::PersistenceBoundaryUnresolved {
                 path: "agent".to_owned(),
-                tick: self.tick.0,
+                tick: tick.0,
             });
         }
 
         // Sealing is historical for this tick. A temporary runtime toggle to
         // persistence_interval=0 must not reopen an already-admitted identity;
         // re-enabling later would otherwise make finalization skip new material.
-        let admitted_current_tick = self.last_admitted_persistence_tick == Some(self.tick);
+        let admitted_current_tick =
+            self.persistence_boundary == (PersistenceBoundaryStatus::Sealed { tick: self.tick });
         if admitted_current_tick {
             return Err(ScientificStateError::PersistenceBoundarySealed {
                 path: "agent".to_owned(),
@@ -17726,6 +17830,272 @@ impl WorldState {
         AgentId::from(KeyData::from_ffi(raw))
     }
 }
+
+impl PersistenceAdmissionSession {
+    fn ensure_binding(&self, world: &WorldState) -> Result<(), PersistenceSessionError> {
+        if Arc::ptr_eq(&self.binding, &world.persistence_binding) {
+            Ok(())
+        } else {
+            Err(PersistenceSessionError::WrongWorld)
+        }
+    }
+
+    fn preflight_step(&self, world: &WorldState) -> Result<(), WorldStepError> {
+        self.ensure_binding(world)?;
+        match (world.persistence_boundary, self.pending.as_ref()) {
+            (PersistenceBoundaryStatus::Pending { tick }, None) => {
+                Err(PersistenceSessionError::MissingPendingBatch { tick }.into())
+            }
+            (PersistenceBoundaryStatus::Pending { tick }, Some(pending))
+                if pending.batch.summary.tick == tick =>
+            {
+                match (&world.brain_fault, &pending.error) {
+                    (Some(brain), Some(persistence)) => Err(WorldStepError::BrainAndPersistence {
+                        brain: brain.clone(),
+                        persistence: persistence.clone(),
+                    }),
+                    (None, Some(persistence)) => {
+                        Err(WorldStepError::Persistence(persistence.clone()))
+                    }
+                    (_, None) => Err(ScientificStateError::PersistenceBoundaryUnresolved {
+                        path: "world.step".to_owned(),
+                        tick: tick.0,
+                    }
+                    .into()),
+                }
+            }
+            (boundary, Some(pending)) => Err(PersistenceSessionError::BoundaryMismatch {
+                pending_tick: pending.batch.summary.tick,
+                boundary,
+            }
+            .into()),
+            (_, None) => Ok(()),
+        }
+    }
+
+    fn stage_projection(&mut self, world: &mut WorldState, projection: &PersistenceProjection) {
+        let Some(batch) = projection.batch.as_ref() else {
+            debug_assert_ne!(projection.status, PersistenceProjectionStatus::Ready);
+            return;
+        };
+        let tick = batch.summary.tick;
+        debug_assert!(self.pending.is_none());
+        debug_assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Open { tick }
+        );
+        self.pending = Some(PendingPersistenceAdmission {
+            batch: Arc::clone(batch),
+            error: None,
+        });
+        world.persistence_boundary = PersistenceBoundaryStatus::Pending { tick };
+    }
+
+    fn stage_completion(&mut self, world: &mut WorldState, completion: &StepCompletion) {
+        self.stage_projection(world, &completion.outcome.persistence);
+    }
+
+    /// Execute one deterministic transition and stage any ready immutable batch without sink I/O.
+    pub fn step_outcome(
+        &mut self,
+        world: &mut WorldState,
+    ) -> Result<StepCompletion, WorldStepError> {
+        self.preflight_step(world)?;
+        let completion = world.step_outcome_observed(&mut NoopWorldStepObserver)?;
+        self.stage_completion(world, &completion);
+        Ok(completion)
+    }
+
+    /// Execute, stage, and synchronously offer one completed transition to the owned sink.
+    pub fn step(&mut self, world: &mut WorldState) -> Result<TickEvents, WorldStepError> {
+        let completion = self.step_outcome(world)?;
+        self.finish_completion(world, completion)
+    }
+
+    /// Execute and stage one transition while recording core-only stage timings.
+    pub fn step_profiled_outcome(
+        &mut self,
+        world: &mut WorldState,
+        profiler: &mut WorldStepProfiler,
+    ) -> Result<StepCompletion, WorldStepError> {
+        self.preflight_step(world)?;
+        profiler.select_schema(WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
+        let completion = world.step_outcome_observed(profiler)?;
+        self.stage_completion(world, &completion);
+        Ok(completion)
+    }
+
+    /// Execute, stage, and admit one profiled transition using the legacy v2 timing boundary.
+    pub fn step_profiled(
+        &mut self,
+        world: &mut WorldState,
+        profiler: &mut WorldStepProfiler,
+    ) -> Result<TickEvents, WorldStepError> {
+        self.preflight_step(world)?;
+        profiler.select_schema(WORLD_STEP_PROFILE_SCHEMA);
+        let completion = world.step_outcome_observed(profiler)?;
+
+        let total_tail_started_at = Instant::now();
+        #[cfg(test)]
+        let total_tail_test_started_at = profiler.legacy_test_now_ns();
+        let admission_started_at = Instant::now();
+        #[cfg(test)]
+        let admission_test_started_at = profiler.legacy_test_now_ns();
+        self.stage_completion(world, &completion);
+        #[cfg(test)]
+        profiler.advance_legacy_test_staging();
+        let admission_result = self.admit_pending(world);
+        let admission_elapsed = admission_started_at.elapsed();
+        #[cfg(test)]
+        let admission_elapsed = admission_elapsed.saturating_add(Duration::from_nanos(
+            profiler
+                .legacy_test_now_ns()
+                .saturating_sub(admission_test_started_at),
+        ));
+
+        let result = Self::combine_completion_admission(completion, admission_result);
+        #[cfg(test)]
+        profiler.advance_legacy_test_result();
+        let total_tail_elapsed = total_tail_started_at.elapsed();
+        #[cfg(test)]
+        let total_tail_elapsed = total_tail_elapsed.saturating_add(Duration::from_nanos(
+            profiler
+                .legacy_test_now_ns()
+                .saturating_sub(total_tail_test_started_at),
+        ));
+        profiler.finish_legacy_boundary(admission_elapsed, total_tail_elapsed);
+        result
+    }
+
+    /// Execute and stage one clock-free transition with deterministic divergence tracing.
+    pub fn step_traced_outcome(
+        &mut self,
+        world: &mut WorldState,
+        tracer: &mut WorldStepTracer,
+    ) -> Result<StepCompletion, WorldStepError> {
+        self.preflight_step(world)?;
+        let completion = world.step_outcome_observed(tracer)?;
+        self.stage_completion(world, &completion);
+        Ok(completion)
+    }
+
+    /// Execute, stage, and admit one clock-free traced transition.
+    pub fn step_traced(
+        &mut self,
+        world: &mut WorldState,
+        tracer: &mut WorldStepTracer,
+    ) -> Result<TickEvents, WorldStepError> {
+        let completion = self.step_traced_outcome(world, tracer)?;
+        self.finish_completion(world, completion)
+    }
+
+    fn finish_completion(
+        &mut self,
+        world: &mut WorldState,
+        completion: StepCompletion,
+    ) -> Result<TickEvents, WorldStepError> {
+        let admission_result = self.admit_pending(world);
+        Self::combine_completion_admission(completion, admission_result)
+    }
+
+    fn combine_completion_admission(
+        completion: StepCompletion,
+        admission_result: Result<bool, PersistenceSessionError>,
+    ) -> Result<TickEvents, WorldStepError> {
+        let StepCompletion { outcome, fault } = completion;
+        match admission_result {
+            Ok(_) => WorldState::combine_completed_fault(outcome.events, fault, None),
+            Err(PersistenceSessionError::Admission(persistence)) => {
+                WorldState::combine_completed_fault(outcome.events, fault, Some(persistence))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Offer the exact staged batch to the sink, retaining it across every failure class.
+    pub fn admit_pending(
+        &mut self,
+        world: &mut WorldState,
+    ) -> Result<bool, PersistenceSessionError> {
+        self.ensure_binding(world)?;
+        let Some(pending) = self.pending.as_mut() else {
+            return match world.persistence_boundary {
+                PersistenceBoundaryStatus::Pending { tick } => {
+                    Err(PersistenceSessionError::MissingPendingBatch { tick })
+                }
+                _ => Ok(false),
+            };
+        };
+        let tick = pending.batch.summary.tick;
+        if world.persistence_boundary != (PersistenceBoundaryStatus::Pending { tick }) {
+            return Err(PersistenceSessionError::BoundaryMismatch {
+                pending_tick: tick,
+                boundary: world.persistence_boundary,
+            });
+        }
+
+        match self.sink.on_tick(pending.batch.as_ref()) {
+            Ok(()) => {
+                self.last_admitted_tick = Some(tick);
+                self.pending = None;
+                world.persistence_boundary = PersistenceBoundaryStatus::Sealed { tick };
+                Ok(true)
+            }
+            Err(error) => {
+                pending.error = Some(error.clone());
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Retry the exact retained batch, or report that this session has no staged work.
+    pub fn retry_pending(
+        &mut self,
+        world: &mut WorldState,
+    ) -> Result<bool, PersistenceSessionError> {
+        self.admit_pending(world)
+    }
+
+    /// Project and admit the final partial cadence tail, retrying already-staged work exactly.
+    pub fn finalize(&mut self, world: &mut WorldState) -> Result<bool, PersistenceSessionError> {
+        self.ensure_binding(world)?;
+        if self.pending.is_some() {
+            return self.admit_pending(world);
+        }
+        let Some(projection) = world.finalize_persistence_projection()? else {
+            return Ok(false);
+        };
+        self.stage_projection(world, &projection);
+        self.admit_pending(world)
+    }
+
+    /// Exact immutable batch currently staged for first admission or retry.
+    #[must_use]
+    pub fn pending_batch(&self) -> Option<&PersistenceBatch> {
+        self.pending.as_ref().map(|pending| pending.batch.as_ref())
+    }
+
+    /// Latched sink acknowledgement failure, if the staged batch was attempted.
+    #[must_use]
+    pub fn fault(&self) -> Option<&PersistenceAdmissionError> {
+        self.pending
+            .as_ref()
+            .and_then(|pending| pending.error.as_ref())
+    }
+
+    /// Whether this session owns an exact staged batch.
+    #[must_use]
+    pub const fn has_pending_batch(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Most recent tick synchronously acknowledged by the owned sink.
+    #[must_use]
+    pub const fn last_admitted_tick(&self) -> Option<Tick> {
+        self.last_admitted_tick
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19857,12 +20227,12 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
 
-        let mut world = WorldState::new(config).expect("world");
+        let (mut world, mut session) = world_with_session(config, NullPersistence);
         world.spawn_agent(sample_agent(0));
 
         let mut flushed = Vec::new();
         for _ in 0..6 {
-            let events = world.step().expect("chart cadence step");
+            let events = session.step(&mut world).expect("chart cadence step");
             if events.charts_flushed {
                 flushed.push(events.tick.0);
             }
@@ -21572,12 +21942,12 @@ mod tests {
         assert!(steps > 0, "steps must be greater than zero");
         config.history_capacity = steps;
         config.persistence_interval = 1;
-        let mut world = WorldState::new(config).expect("world");
+        let (mut world, mut session) = world_with_session(config, NullPersistence);
         for seed in 0..6 {
             world.spawn_agent(sample_agent(seed));
         }
         for _ in 0..steps {
-            world.step().expect("seeded history step");
+            session.step(&mut world).expect("seeded history step");
         }
         let history: Vec<_> = world.history().cloned().collect();
         let food: Vec<f32> = world.food().cells().to_vec();
@@ -22548,6 +22918,53 @@ mod tests {
         }
     }
 
+    fn world_with_session(
+        config: ScriptBotsConfig,
+        sink: impl WorldPersistence + 'static,
+    ) -> (WorldState, PersistenceAdmissionSession) {
+        WorldState::with_persistence(config, Box::new(sink)).expect("world and persistence session")
+    }
+
+    fn ready_batch_arc(projection: &PersistenceProjection) -> Arc<PersistenceBatch> {
+        assert_eq!(projection.status(), PersistenceProjectionStatus::Ready);
+        Arc::clone(
+            projection
+                .batch
+                .as_ref()
+                .expect("ready projection owns an immutable batch"),
+        )
+    }
+
+    fn assert_same_staged_batch(
+        session: &PersistenceAdmissionSession,
+        projected: &Arc<PersistenceBatch>,
+    ) {
+        let retained = &session
+            .pending
+            .as_ref()
+            .expect("session staged the ready projection")
+            .batch;
+        assert!(
+            Arc::ptr_eq(projected, retained),
+            "session must share the projection's exact Arc allocation"
+        );
+    }
+
+    fn assert_persistence_batches_exact(left: &PersistenceBatch, right: &PersistenceBatch) {
+        assert_eq!(left.summary, right.summary);
+        assert_eq!(left.epoch, right.epoch);
+        assert_eq!(left.closed, right.closed);
+        assert_eq!(left.metrics, right.metrics);
+        assert_eq!(left.events, right.events);
+        assert_eq!(left.births, right.births);
+        assert_eq!(left.deaths, right.deaths);
+        assert_eq!(left.replay_events, right.replay_events);
+        assert_eq!(
+            postcard::to_allocvec(&left.agents).expect("encode left agents"),
+            postcard::to_allocvec(&right.agents).expect("encode right agents")
+        );
+    }
+
     fn sealed_agent_boundary(tick: u64) -> ScientificStateError {
         ScientificStateError::PersistenceBoundarySealed {
             path: "agent".to_owned(),
@@ -22569,7 +22986,7 @@ mod tests {
             logs: Arc::clone(&logs),
             reject_next: true,
         };
-        let mut world = WorldState::with_persistence(
+        let (mut world, mut session) = world_with_session(
             ScriptBotsConfig {
                 persistence_interval: 1,
                 population_minimum: 0,
@@ -22578,9 +22995,8 @@ mod tests {
                 rng_seed: Some(0xA11D_5EED),
                 ..ScriptBotsConfig::default()
             },
-            Box::new(persistence),
-        )
-        .expect("world");
+            persistence,
+        );
         let live_agent = world
             .try_spawn_agent(sample_agent(7))
             .expect("seed live projection agent");
@@ -22614,9 +23030,7 @@ mod tests {
         let projection = world.prepare_persistence(Tick(1), false);
         assert!(logs.lock().unwrap().is_empty());
         assert_eq!(projection.status(), PersistenceProjectionStatus::Ready);
-        let Some(batch) = projection.into_batch() else {
-            panic!("cadence boundary must prepare an owned batch");
-        };
+        let batch = ready_batch_arc(&projection);
         assert_eq!(batch.summary.tick, Tick(1));
         assert_eq!(batch.summary.births, 1);
         assert_eq!(batch.summary.deaths, 1);
@@ -22651,18 +23065,25 @@ mod tests {
         assert_eq!(world.carcass_health_distributed, 0.0);
         assert_eq!(world.carcass_reproduction_bonus, 0.0);
 
-        let expected = batch.clone();
-        let digest_before_admission = world.world_digest_v1().expect("prepared world V1");
-        let rejection = world
-            .admit_prepared_persistence(batch)
+        let expected = Arc::clone(&batch);
+        let digest_before_admission = world
+            .world_digest_v1_inner(false)
+            .expect("prepared scientific lanes");
+        session.stage_projection(&mut world, &projection);
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
+        assert_same_staged_batch(&session, &batch);
+        assert!(logs.lock().unwrap().is_empty());
+
+        let rejection = session
+            .admit_pending(&mut world)
             .expect_err("injected admission rejection");
+        let PersistenceSessionError::Admission(rejection) = rejection else {
+            panic!("expected typed sink rejection");
+        };
         assert_eq!(rejection.state(), PersistenceAdmissionState::NotAdmitted);
-        assert!(matches!(
-            world.world_digest_v1(),
-            Err(CharacterizationError::NonContinuable {
-                blocker: WorldContinuationBlocker::PersistenceFault,
-            })
-        ));
         assert_eq!(
             world
                 .world_digest_v1_inner(false)
@@ -22670,42 +23091,30 @@ mod tests {
             digest_before_admission
         );
         assert_eq!(logs.lock().unwrap().len(), 1);
-        let retained = world
-            .pending_persistence_batch
-            .as_ref()
-            .expect("the exact projected batch must be retained");
-        assert_eq!(retained.summary, expected.summary);
-        assert_eq!(retained.epoch, expected.epoch);
-        assert_eq!(retained.closed, expected.closed);
-        assert_eq!(retained.metrics, expected.metrics);
-        assert_eq!(retained.events, expected.events);
-        assert_eq!(retained.births, expected.births);
-        assert_eq!(retained.deaths, expected.deaths);
-        assert_eq!(retained.replay_events, expected.replay_events);
+        assert_eq!(session.fault(), Some(&rejection));
+        assert_same_staged_batch(&session, &expected);
+        let retained = session.pending_batch().expect("exact retained batch");
+        assert_persistence_batches_exact(retained, expected.as_ref());
         assert_eq!(
             postcard::to_allocvec(&retained.agents).expect("encode retained agents"),
             postcard::to_allocvec(&expected.agents).expect("encode projected agents")
         );
 
         assert!(
-            world
-                .retry_pending_persistence()
+            session
+                .retry_pending(&mut world)
                 .expect("exact retained batch retry")
+        );
+        assert!(!session.has_pending_batch());
+        assert!(session.fault().is_none());
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
         );
         let attempts = logs.lock().unwrap();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].summary, attempts[1].summary);
-        assert_eq!(attempts[0].epoch, attempts[1].epoch);
-        assert_eq!(attempts[0].closed, attempts[1].closed);
-        assert_eq!(attempts[0].metrics, attempts[1].metrics);
-        assert_eq!(attempts[0].events, attempts[1].events);
-        assert_eq!(attempts[0].births, attempts[1].births);
-        assert_eq!(attempts[0].deaths, attempts[1].deaths);
-        assert_eq!(attempts[0].replay_events, attempts[1].replay_events);
-        assert_eq!(
-            postcard::to_allocvec(&attempts[0].agents).expect("encode first attempt agents"),
-            postcard::to_allocvec(&attempts[1].agents).expect("encode retry agents")
-        );
+        assert_persistence_batches_exact(&attempts[0], &attempts[1]);
     }
 
     #[test]
@@ -22726,8 +23135,7 @@ mod tests {
             logs: Arc::clone(&logs),
             reject_next: true,
         };
-        let mut world =
-            WorldState::with_persistence(config, Box::new(persistence)).expect("outcome world");
+        let (mut world, mut session) = world_with_session(config, persistence);
         let mut updated = world.config().clone();
         updated.chart_flush_interval = 1;
         world
@@ -22785,8 +23193,9 @@ mod tests {
         }
         world.set_resource_ledger_enabled(true);
 
-        let StepCompletion { outcome, fault } =
-            world.step_outcome().expect("completed outcome step");
+        let StepCompletion { outcome, fault } = session
+            .step_outcome(&mut world)
+            .expect("completed outcome step");
 
         assert!(fault.is_none());
         assert!(logs.lock().unwrap().is_empty());
@@ -22829,6 +23238,12 @@ mod tests {
             outcome.persistence.status(),
             PersistenceProjectionStatus::Ready
         );
+        let expected = ready_batch_arc(&outcome.persistence);
+        assert_same_staged_batch(&session, &expected);
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
         {
             let batch = outcome.persistence.batch().expect("ready exact batch");
             assert_eq!(batch.summary, outcome.summary);
@@ -22842,9 +23257,9 @@ mod tests {
             assert_eq!(current_births, outcome.births);
             assert_eq!(batch.births.len(), outcome.births.len() + 2);
         }
-        assert_eq!(world.last_admitted_persistence_tick(), None);
-        assert!(!world.has_pending_persistence_batch());
-        assert!(world.persistence_fault().is_none());
+        assert_eq!(session.last_admitted_tick(), None);
+        assert!(session.has_pending_batch());
+        assert!(session.fault().is_none());
 
         let science_before_admission = world
             .world_digest_v1_inner(false)
@@ -22855,16 +23270,17 @@ mod tests {
         let config_revision_before_admission = world.config_revision();
         let last_spike_hits_before_admission = world.last_spike_hits();
         let last_max_age_before_admission = world.last_max_age();
-        let expected = outcome
-            .persistence
-            .into_batch()
-            .expect("move exact ready batch");
-        let rejection = world
-            .admit_prepared_persistence(expected.clone())
+        let rejection = session
+            .admit_pending(&mut world)
             .expect_err("injected downstream rejection");
+        let PersistenceSessionError::Admission(rejection) = rejection else {
+            panic!("expected typed sink rejection");
+        };
         assert_eq!(rejection.state(), PersistenceAdmissionState::NotAdmitted);
         assert_eq!(logs.lock().unwrap().len(), 1);
-        assert!(world.has_pending_persistence_batch());
+        assert_eq!(session.fault(), Some(&rejection));
+        assert!(session.has_pending_batch());
+        assert_same_staged_batch(&session, &expected);
         assert_eq!(
             world
                 .world_digest_v1_inner(false)
@@ -22880,64 +23296,67 @@ mod tests {
         assert_eq!(world.config_revision(), config_revision_before_admission);
         assert_eq!(world.last_spike_hits(), last_spike_hits_before_admission);
         assert_eq!(world.last_max_age(), last_max_age_before_admission);
-        let retained = world
-            .pending_persistence_batch
-            .as_ref()
+        let retained = session
+            .pending_batch()
             .expect("exact outcome batch retained");
-        assert_eq!(retained.summary, expected.summary);
-        assert_eq!(retained.births, expected.births);
-        assert_eq!(retained.deaths, expected.deaths);
-        assert_eq!(retained.metrics, expected.metrics);
-        assert_eq!(retained.events, expected.events);
-        assert_eq!(retained.replay_events, expected.replay_events);
-        assert_eq!(
-            postcard::to_allocvec(&retained.agents).expect("encode retained outcome agents"),
-            postcard::to_allocvec(&expected.agents).expect("encode expected outcome agents")
-        );
+        assert_persistence_batches_exact(retained, expected.as_ref());
     }
 
     #[test]
     fn outcome_step_variants_never_admit_the_installed_sink() {
-        fn outcome_world(seed: u64) -> (WorldState, Arc<Mutex<Vec<PersistenceBatch>>>) {
+        fn outcome_world(
+            seed: u64,
+        ) -> (
+            WorldState,
+            PersistenceAdmissionSession,
+            Arc<Mutex<Vec<PersistenceBatch>>>,
+        ) {
             let spy = SpyPersistence::default();
             let logs = Arc::clone(&spy.logs);
-            let world = WorldState::with_persistence(quiet_trace_config(seed, 1), Box::new(spy))
-                .expect("outcome variant world");
-            (world, logs)
+            let (world, session) = world_with_session(quiet_trace_config(seed, 1), spy);
+            (world, session, logs)
         }
 
-        let (mut plain, plain_logs) = outcome_world(0x0A71_0001);
-        let plain_completion = plain.step_outcome().expect("plain outcome");
+        let (mut plain, mut plain_session, plain_logs) = outcome_world(0x0A71_0001);
+        let plain_completion = plain_session
+            .step_outcome(&mut plain)
+            .expect("plain outcome");
         assert_eq!(
             plain_completion.outcome.persistence.status(),
             PersistenceProjectionStatus::Ready
         );
+        let plain_batch = ready_batch_arc(&plain_completion.outcome.persistence);
+        assert_same_staged_batch(&plain_session, &plain_batch);
         assert!(plain_logs.lock().unwrap().is_empty());
 
-        let (mut profiled, profiled_logs) = outcome_world(0x0A71_0002);
+        let (mut profiled, mut profiled_session, profiled_logs) = outcome_world(0x0A71_0002);
         let mut profiler = WorldStepProfiler::default();
-        let profiled_completion = profiled
-            .step_profiled_outcome(&mut profiler)
+        let profiled_completion = profiled_session
+            .step_profiled_outcome(&mut profiled, &mut profiler)
             .expect("profiled outcome");
         assert_eq!(
             profiled_completion.outcome.persistence.status(),
             PersistenceProjectionStatus::Ready
         );
+        let profiled_batch = ready_batch_arc(&profiled_completion.outcome.persistence);
+        assert_same_staged_batch(&profiled_session, &profiled_batch);
         assert!(profiled_logs.lock().unwrap().is_empty());
         assert_eq!(
             profiler.latest().expect("core profile").schema,
             WORLD_STEP_OUTCOME_PROFILE_SCHEMA
         );
 
-        let (mut traced, traced_logs) = outcome_world(0x0A71_0003);
+        let (mut traced, mut traced_session, traced_logs) = outcome_world(0x0A71_0003);
         let mut tracer = WorldStepTracer::default();
-        let traced_completion = traced
-            .step_traced_outcome(&mut tracer)
+        let traced_completion = traced_session
+            .step_traced_outcome(&mut traced, &mut tracer)
             .expect("traced outcome");
         assert_eq!(
             traced_completion.outcome.persistence.status(),
             PersistenceProjectionStatus::Ready
         );
+        let traced_batch = ready_batch_arc(&traced_completion.outcome.persistence);
+        assert_same_staged_batch(&traced_session, &traced_batch);
         assert!(traced_logs.lock().unwrap().is_empty());
         tracer
             .latest()
@@ -22951,14 +23370,11 @@ mod tests {
             logs: Arc::clone(&legacy_logs),
             delay: legacy_delay,
         };
-        let mut legacy = WorldState::with_persistence(
-            quiet_trace_config(0x0A71_0004, 1),
-            Box::new(legacy_persistence),
-        )
-        .expect("legacy profiled world");
+        let (mut legacy, mut legacy_session) =
+            world_with_session(quiet_trace_config(0x0A71_0004, 1), legacy_persistence);
         let mut legacy_profiler = WorldStepProfiler::default();
-        legacy
-            .step_profiled(&mut legacy_profiler)
+        legacy_session
+            .step_profiled(&mut legacy, &mut legacy_profiler)
             .expect("legacy profiled step");
         assert_eq!(legacy_logs.lock().unwrap().len(), 1);
         let legacy_profile = legacy_profiler.latest().expect("legacy profile");
@@ -22979,13 +23395,70 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v2_profile_includes_staging_and_result_tail_without_contaminating_v3() {
+        const STAGING_NS: u64 = 1_000_000_000_000;
+        const RESULT_NS: u64 = 2_000_000_000_000;
+
+        {
+            let spy = SpyPersistence::default();
+            let (mut world, mut session) =
+                world_with_session(quiet_trace_config(0x0A71_00A3, 1), spy);
+            let mut profiler = WorldStepProfiler::default();
+            profiler.inject_legacy_tail_costs(STAGING_NS, RESULT_NS);
+
+            let completion = session
+                .step_profiled_outcome(&mut world, &mut profiler)
+                .expect("v3 profiled outcome");
+            let profile = profiler.latest().expect("v3 profile");
+            assert_eq!(profile.schema, WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
+            assert_eq!(
+                profiler.legacy_test_now_ns(),
+                0,
+                "the core-only v3 outcome boundary must not enter either legacy tail"
+            );
+            let projected = ready_batch_arc(&completion.outcome.persistence);
+            assert_same_staged_batch(&session, &projected);
+        }
+
+        let spy = SpyPersistence::default();
+        let (mut world, mut session) = world_with_session(quiet_trace_config(0x0A71_00A2, 1), spy);
+        let mut profiler = WorldStepProfiler::default();
+        profiler.inject_legacy_tail_costs(STAGING_NS, RESULT_NS);
+
+        session
+            .step_profiled(&mut world, &mut profiler)
+            .expect("legacy v2 profiled step");
+        let profile = profiler.latest().expect("legacy v2 profile");
+        let persistence_ns = profile
+            .elapsed_ns(WorldStepStage::Persistence)
+            .expect("legacy persistence timing");
+        assert_eq!(profile.schema, WORLD_STEP_PROFILE_SCHEMA);
+        assert_eq!(
+            profiler.legacy_test_now_ns(),
+            STAGING_NS.saturating_add(RESULT_NS)
+        );
+        assert!(
+            persistence_ns >= STAGING_NS,
+            "legacy persistence timing must start before session staging"
+        );
+        assert!(
+            profile.total_ns >= STAGING_NS.saturating_add(RESULT_NS),
+            "legacy total must include both downstream tail segments"
+        );
+        assert!(
+            profile.total_ns.saturating_sub(persistence_ns) >= RESULT_NS,
+            "legacy total must end only after typed result composition"
+        );
+    }
+
+    #[test]
     fn step_outcomes_are_tick_local_while_ready_persistence_accumulates_cadence() {
         let mut config = quiet_trace_config(0x0A7C_CADE, 2);
         config.aging_tick_interval = 1;
         config.aging_health_decay_start = 0;
         config.aging_health_decay_rate = 0.1;
         config.aging_health_decay_max = 0.1;
-        let mut world = WorldState::new(config).expect("outcome cadence world");
+        let (mut world, mut session) = world_with_session(config, NullPersistence);
         let first = world.spawn_agent(sample_agent(0));
         let second = world.spawn_agent(sample_agent(1));
         let first_uid = world.agent_uid(first).expect("first cadence uid");
@@ -22998,7 +23471,9 @@ mod tests {
             health[second_index] = 0.15;
         }
 
-        let first_completion = world.step_outcome().expect("first cadence outcome");
+        let first_completion = session
+            .step_outcome(&mut world)
+            .expect("first cadence outcome");
         assert!(first_completion.fault.is_none());
         assert_eq!(first_completion.outcome.summary.deaths, 1);
         assert_eq!(first_completion.outcome.deaths.len(), 1);
@@ -23008,8 +23483,15 @@ mod tests {
             PersistenceProjectionStatus::Deferred
         );
         assert!(first_completion.outcome.persistence.batch().is_none());
+        assert!(!session.has_pending_batch());
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Open { tick: Tick(1) }
+        );
 
-        let second_completion = world.step_outcome().expect("second cadence outcome");
+        let second_completion = session
+            .step_outcome(&mut world)
+            .expect("second cadence outcome");
         assert!(second_completion.fault.is_none());
         assert_eq!(second_completion.outcome.summary.deaths, 1);
         assert_eq!(second_completion.outcome.deaths.len(), 1);
@@ -23018,11 +23500,13 @@ mod tests {
             second_completion.outcome.persistence.status(),
             PersistenceProjectionStatus::Ready
         );
-        let batch = second_completion
-            .outcome
-            .persistence
-            .batch()
-            .expect("cadence aggregate batch");
+        let projected_batch = ready_batch_arc(&second_completion.outcome.persistence);
+        assert_same_staged_batch(&session, &projected_batch);
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(2) }
+        );
+        let batch = projected_batch.as_ref();
         assert_eq!(batch.summary.tick, Tick(2));
         assert_eq!(batch.summary.deaths, 2);
         assert_eq!(batch.deaths.len(), 2);
@@ -23077,21 +23561,27 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let seeded = world
             .try_spawn_agent(sample_agent(2))
             .expect("tick-zero seed");
         let seeded_uid = world.agent_uid(seeded).expect("seeded uid");
 
-        assert!(world.finalize_persistence().expect("first finalization"));
+        assert!(session.finalize(&mut world).expect("first finalization"));
         assert!(
-            !world
-                .finalize_persistence()
+            !session
+                .finalize(&mut world)
                 .expect("idempotent second finalization")
         );
 
         assert!(world.pending_birth_records.is_empty());
-        assert_eq!(world.last_admitted_persistence_tick, Some(Tick::zero()));
+        assert_eq!(session.last_admitted_tick(), Some(Tick::zero()));
+        assert!(!session.has_pending_batch());
+        assert!(session.fault().is_none());
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick::zero() }
+        );
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
         let batch = &entries[0];
@@ -23115,16 +23605,22 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let (mut world, mut session) = world_with_session(config, spy);
 
-        assert!(!world.finalize_persistence().expect("empty finalization"));
+        assert!(!session.finalize(&mut world).expect("empty finalization"));
         assert!(
-            !world
-                .finalize_persistence()
+            !session
+                .finalize(&mut world)
                 .expect("repeated empty finalization")
         );
         assert_eq!(world.validate_external_arrival_boundary(), Ok(()));
-        assert_eq!(world.last_admitted_persistence_tick, None);
+        assert_eq!(session.last_admitted_tick(), None);
+        assert!(!session.has_pending_batch());
+        assert!(session.fault().is_none());
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Open { tick: Tick::zero() }
+        );
         assert!(logs.lock().unwrap().is_empty());
     }
 
@@ -23139,11 +23635,16 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let (mut world, mut session) = world_with_session(config, spy);
         world
             .try_spawn_agent(sample_agent(1))
             .expect("initial tick-zero seed");
-        assert!(world.finalize_persistence().expect("tick-zero admission"));
+        assert!(session.finalize(&mut world).expect("tick-zero admission"));
+        assert_eq!(session.last_admitted_tick(), Some(Tick::zero()));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick::zero() }
+        );
 
         // The admitted marker is historical: temporarily disabling persistence
         // must not reopen this already-admitted tick to a second origin row.
@@ -23217,8 +23718,8 @@ mod tests {
             .apply_config_update(reenabled)
             .expect("re-enable persistence after admitted marker");
         assert!(
-            !world
-                .finalize_persistence()
+            !session
+                .finalize(&mut world)
                 .expect("historical admission remains final")
         );
         assert_eq!(
@@ -23250,12 +23751,18 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
-        world.step().expect("tick-one cadence admission");
+        let (mut world, mut session) = world_with_session(config, spy);
+        session
+            .step(&mut world)
+            .expect("tick-one cadence admission");
 
         let expected = sealed_agent_boundary(1);
         assert_eq!(world.tick(), Tick(1));
-        assert_eq!(world.last_admitted_persistence_tick, Some(Tick(1)));
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+        );
         assert_eq!(
             world.validate_external_arrival_boundary(),
             Err(expected.clone())
@@ -23304,10 +23811,17 @@ mod tests {
             logs: Arc::clone(&rejected_logs),
             reject_next: true,
         };
-        let mut world = WorldState::with_persistence(config, Box::new(persistence)).expect("world");
-        assert!(matches!(world.step(), Err(WorldStepError::Persistence(_))));
-        assert!(world.has_pending_persistence_batch());
-        assert!(world.persistence_fault().is_some());
+        let (mut world, mut session) = world_with_session(config, persistence);
+        assert!(matches!(
+            session.step(&mut world),
+            Err(WorldStepError::Persistence(_))
+        ));
+        assert!(session.has_pending_batch());
+        assert!(session.fault().is_some());
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
 
         let config_before = world.config().clone();
         let revision_before = world.config_revision();
@@ -23317,12 +23831,8 @@ mod tests {
         let digest_before_bundled_update = world
             .characterization_digest_v0()
             .expect("pre-config-rejection digest");
-        let retained_summary_before = world
-            .pending_persistence_batch
-            .as_ref()
-            .expect("retained batch")
-            .summary
-            .clone();
+        let retained_before = Arc::clone(&session.pending.as_ref().expect("retained batch").batch);
+        let retained_summary_before = retained_before.summary.clone();
         let mut bundled = config_before.clone();
         bundled.persistence_interval = 0;
         bundled.closed = !bundled.closed;
@@ -23356,13 +23866,13 @@ mod tests {
             digest_before_bundled_update
         );
         assert_eq!(
-            world
-                .pending_persistence_batch
-                .as_ref()
+            session
+                .pending_batch()
                 .expect("unchanged retained batch")
                 .summary,
             retained_summary_before
         );
+        assert_same_staged_batch(&session, &retained_before);
 
         let mut disabled = world.config().clone();
         disabled.persistence_interval = 0;
@@ -23386,12 +23896,7 @@ mod tests {
         let before_digest = world
             .characterization_digest_v0()
             .expect("pre-rejection digest");
-        let fault_before = world.persistence_fault().cloned().expect("latched fault");
-        let retained_before = world
-            .pending_persistence_batch
-            .as_ref()
-            .expect("retained batch")
-            .clone();
+        let fault_before = session.fault().cloned().expect("latched fault");
         let callback_calls = Cell::new(0usize);
 
         assert_eq!(
@@ -23406,19 +23911,10 @@ mod tests {
         assert_eq!(world.identity_sequence_state(), before_identity);
         assert_eq!(world.agent_count(), 0);
         assert!(world.pending_birth_records.is_empty());
-        assert_eq!(world.persistence_fault(), Some(&fault_before));
-        let retained_after = world
-            .pending_persistence_batch
-            .as_ref()
-            .expect("unchanged retained batch");
-        assert_eq!(retained_after.summary, retained_before.summary);
-        assert_eq!(retained_after.epoch, retained_before.epoch);
-        assert_eq!(retained_after.closed, retained_before.closed);
-        assert_eq!(retained_after.metrics, retained_before.metrics);
-        assert_eq!(retained_after.events, retained_before.events);
-        assert_eq!(retained_after.births, retained_before.births);
-        assert_eq!(retained_after.deaths, retained_before.deaths);
-        assert_eq!(retained_after.replay_events, retained_before.replay_events);
+        assert_eq!(session.fault(), Some(&fault_before));
+        assert_same_staged_batch(&session, &retained_before);
+        let retained_after = session.pending_batch().expect("unchanged retained batch");
+        assert_persistence_batches_exact(retained_after, retained_before.as_ref());
         assert!(retained_after.agents.is_empty());
         assert_eq!(
             world
@@ -23431,19 +23927,24 @@ mod tests {
         // Defensive precedence: even if an admitted marker coexists with the
         // retained failure state, callers must be sent to the retry path rather
         // than being told merely to advance past a successfully sealed tick.
-        world.last_admitted_persistence_tick = Some(world.tick());
+        session.last_admitted_tick = Some(world.tick());
         assert_eq!(
             world.validate_external_arrival_boundary(),
             Err(unresolved_agent_boundary(1))
         );
         assert!(
-            world
-                .retry_pending_persistence()
+            session
+                .retry_pending(&mut world)
                 .expect("the retained exact batch remains retryable while disabled")
         );
         assert_eq!(world.config().persistence_interval, 0);
-        assert!(world.persistence_fault().is_none());
-        assert!(!world.has_pending_persistence_batch());
+        assert!(session.fault().is_none());
+        assert!(!session.has_pending_batch());
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+        );
         assert_eq!(rejected_logs.lock().unwrap().len(), 2);
     }
 
@@ -23462,7 +23963,7 @@ mod tests {
             logs: Arc::clone(&rejected_logs),
             reject_next: true,
         };
-        let mut world = WorldState::with_persistence(config, Box::new(persistence)).expect("world");
+        let (mut world, mut session) = world_with_session(config, persistence);
         let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted_factory_calls = Arc::clone(&factory_calls);
         let brain_key = world
@@ -23501,9 +24002,12 @@ mod tests {
         )
         .expect("valid same-shape map artifact");
 
-        assert!(matches!(world.step(), Err(WorldStepError::Persistence(_))));
-        assert!(world.has_pending_persistence_batch());
-        assert!(world.persistence_fault().is_some());
+        assert!(matches!(
+            session.step(&mut world),
+            Err(WorldStepError::Persistence(_))
+        ));
+        assert!(session.has_pending_batch());
+        assert!(session.fault().is_some());
 
         let unresolved =
             |path: String| ScientificStateError::PersistenceBoundaryUnresolved { path, tick: 1 };
@@ -23518,11 +24022,7 @@ mod tests {
         let digest_before = world
             .characterization_digest_v0()
             .expect("pre-guard digest");
-        let retained_before = world
-            .pending_persistence_batch
-            .as_ref()
-            .expect("retained batch")
-            .clone();
+        let retained_before = Arc::clone(&session.pending.as_ref().expect("retained batch").batch);
         let food_callback_calls = Cell::new(0usize);
         let agent_callback_calls = Cell::new(0usize);
         let runtime_callback_calls = Cell::new(0usize);
@@ -23638,20 +24138,9 @@ mod tests {
                 .expect("post-guard digest"),
             digest_before
         );
-        let retained_after = world
-            .pending_persistence_batch
-            .as_ref()
-            .expect("unchanged retained batch");
-        assert_eq!(retained_after.summary, retained_before.summary);
-        assert_eq!(retained_after.metrics, retained_before.metrics);
-        assert_eq!(retained_after.events, retained_before.events);
-        assert_eq!(
-            postcard::to_allocvec(&retained_after.agents).expect("encode retained agents after"),
-            postcard::to_allocvec(&retained_before.agents).expect("encode retained agents before")
-        );
-        assert_eq!(retained_after.births, retained_before.births);
-        assert_eq!(retained_after.deaths, retained_before.deaths);
-        assert_eq!(retained_after.replay_events, retained_before.replay_events);
+        assert_same_staged_batch(&session, &retained_before);
+        let retained_after = session.pending_batch().expect("unchanged retained batch");
+        assert_persistence_batches_exact(retained_after, retained_before.as_ref());
         assert_eq!(rejected_logs.lock().unwrap().len(), 1);
 
         let mut disabled = world.config().clone();
@@ -23660,12 +24149,17 @@ mod tests {
             .apply_config_update(disabled)
             .expect("pure persistence disable remains the deliberate exception");
         assert!(
-            world
-                .retry_pending_persistence()
+            session
+                .retry_pending(&mut world)
                 .expect("exact retained batch remains retryable")
         );
-        assert!(world.persistence_fault().is_none());
-        assert!(!world.has_pending_persistence_batch());
+        assert!(session.fault().is_none());
+        assert!(!session.has_pending_batch());
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+        );
         assert_eq!(rejected_logs.lock().unwrap().len(), 2);
     }
 
@@ -23673,7 +24167,7 @@ mod tests {
     fn disabling_persistence_rejects_a_pending_tick_zero_origin_atomically() {
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(
+        let (mut world, mut session) = world_with_session(
             ScriptBotsConfig {
                 persistence_interval: 3,
                 population_minimum: 0,
@@ -23681,9 +24175,8 @@ mod tests {
                 rng_seed: Some(0xD15A_B1E0),
                 ..ScriptBotsConfig::default()
             },
-            Box::new(spy),
-        )
-        .expect("world");
+            spy,
+        );
         world
             .try_spawn_agent(sample_agent(1))
             .expect("pending tick-zero origin");
@@ -23711,8 +24204,8 @@ mod tests {
             ) if path == "config.persistence_interval"
         ));
         assert!(
-            error.to_string().contains("finalize_persistence"),
-            "the diagnostic must name the required finalization step"
+            error.to_string().contains("PersistenceAdmissionSession"),
+            "the diagnostic must name the bound session finalization step"
         );
         assert_eq!(
             world.config().persistence_interval,
@@ -23727,10 +24220,11 @@ mod tests {
         assert!(logs.lock().unwrap().is_empty());
 
         assert!(
-            world
-                .finalize_persistence()
+            session
+                .finalize(&mut world)
                 .expect("finalize tick-zero origin")
         );
+        assert_eq!(session.last_admitted_tick(), Some(Tick::zero()));
         disabled.food_max = previous_config.food_max;
         world
             .apply_config_update(disabled)
@@ -23743,7 +24237,7 @@ mod tests {
     fn disabling_persistence_rejects_an_empty_non_cadence_tick_gap() {
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(
+        let (mut world, mut session) = world_with_session(
             ScriptBotsConfig {
                 persistence_interval: 3,
                 population_minimum: 0,
@@ -23752,13 +24246,17 @@ mod tests {
                 rng_seed: Some(0xD15A_B1E1),
                 ..ScriptBotsConfig::default()
             },
-            Box::new(spy),
-        )
-        .expect("world");
-        world.step().expect("empty non-cadence tick");
+            spy,
+        );
+        session.step(&mut world).expect("empty non-cadence tick");
         assert_eq!(world.tick(), Tick(1));
         assert!(logs.lock().unwrap().is_empty());
         assert!(!world.has_pending_persistence_material());
+        assert!(!session.has_pending_batch());
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Open { tick: Tick(1) }
+        );
 
         let mut disabled = world.config().clone();
         disabled.persistence_interval = 0;
@@ -23773,10 +24271,11 @@ mod tests {
         ));
 
         assert!(
-            world
-                .finalize_persistence()
+            session
+                .finalize(&mut world)
                 .expect("finalize empty tick tail")
         );
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
         world
             .apply_config_update(disabled)
             .expect("disable after empty tick admission");
@@ -23810,9 +24309,10 @@ mod tests {
 
         let mut death_world = make_world();
         death_world.pending_death_records.push(lifecycle_death(3));
-        death_world
-            .stage_persistence(Tick(8), false)
-            .expect("disabled persistence stage");
+        assert!(matches!(
+            death_world.prepare_persistence(Tick(8), false),
+            projection if projection.status() == PersistenceProjectionStatus::Disabled
+        ));
         assert_eq!(death_world.persistence_discarded_records_at, Some(Tick(8)));
         assert!(death_world.pending_death_records.is_empty());
 
@@ -23823,9 +24323,10 @@ mod tests {
                 outputs: Vec::new(),
             },
         });
-        replay_world
-            .stage_persistence(Tick(9), false)
-            .expect("disabled persistence stage");
+        assert!(matches!(
+            replay_world.prepare_persistence(Tick(9), false),
+            projection if projection.status() == PersistenceProjectionStatus::Disabled
+        ));
         assert_eq!(replay_world.persistence_discarded_records_at, Some(Tick(9)));
         assert!(replay_world.replay_events.is_empty());
     }
@@ -23931,9 +24432,8 @@ mod tests {
             population_spawn_interval: 0,
             ..ScriptBotsConfig::default()
         };
-        let mut world = WorldState::with_persistence(config, Box::new(SpyPersistence::default()))
-            .expect("world");
-        world.step().expect("admit tick one");
+        let (mut world, mut session) = world_with_session(config, SpyPersistence::default());
+        session.step(&mut world).expect("admit tick one");
         let tick_before = world.tick();
         let epoch_before = world.epoch();
 
@@ -23955,18 +24455,20 @@ mod tests {
             logs: Arc::new(Mutex::new(Vec::new())),
             reject_next: true,
         };
-        let mut world = WorldState::with_persistence(
+        let (mut world, mut session) = world_with_session(
             ScriptBotsConfig {
                 persistence_interval: 1,
                 population_minimum: 0,
                 population_spawn_interval: 0,
                 ..ScriptBotsConfig::default()
             },
-            Box::new(persistence),
-        )
-        .expect("world");
-        assert!(matches!(world.step(), Err(WorldStepError::Persistence(_))));
-        world.last_admitted_persistence_tick = Some(world.tick());
+            persistence,
+        );
+        assert!(matches!(
+            session.step(&mut world),
+            Err(WorldStepError::Persistence(_))
+        ));
+        session.last_admitted_tick = Some(world.tick());
         let tick_before = world.tick();
 
         assert_eq!(
@@ -23977,7 +24479,12 @@ mod tests {
             })
         );
         assert_eq!(world.tick(), tick_before);
-        assert!(world.has_pending_persistence_batch());
+        assert!(session.has_pending_batch());
+        assert!(session.fault().is_some());
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
     }
 
     #[test]
@@ -24010,7 +24517,7 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let brain_key = world
             .brain_registry_mut()
             .expect("post-admission registry mutation")
@@ -24020,7 +24527,7 @@ mod tests {
             .expect("tick-zero seed");
         let insertion_record = world.pending_birth_records[0].clone();
         assert!(insertion_record.brain_key.is_none());
-        assert!(world.finalize_persistence().expect("origin admission"));
+        assert!(session.finalize(&mut world).expect("origin admission"));
         assert!(world.pending_birth_records.is_empty());
 
         assert!(
@@ -24086,8 +24593,8 @@ mod tests {
         );
         assert!(world.pending_birth_records.is_empty());
         assert!(
-            !world
-                .finalize_persistence()
+            !session
+                .finalize(&mut world)
                 .expect("admitted boundary remains idempotent")
         );
 
@@ -24132,8 +24639,7 @@ mod tests {
             logs: Arc::clone(&persistence_logs),
             reject_next: true,
         };
-        let mut world =
-            WorldState::with_persistence(config, Box::new(persistence)).expect("test world");
+        let (mut world, mut session) = world_with_session(config, persistence);
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let factory_attempts = Arc::clone(&attempts);
         world
@@ -24150,8 +24656,8 @@ mod tests {
                 }
             });
 
-        let first_error = world
-            .step()
+        let first_error = session
+            .step(&mut world)
             .expect_err("both terminal failures must be reported at the completed boundary");
         assert!(matches!(
             &first_error,
@@ -24173,13 +24679,20 @@ mod tests {
             world.brain_fault().map(BrainSpawnError::kind),
             Some("test.double-fault")
         );
-        assert_eq!(world.persistence_fault(), Some(&persistence));
+        assert_eq!(session.fault(), Some(&persistence));
+        let retained = Arc::clone(
+            &session
+                .pending
+                .as_ref()
+                .expect("combined-fault batch remains staged")
+                .batch,
+        );
 
         let completed_digest = world
             .characterization_digest_v0()
             .expect("double-fault tick must finish at a coherent boundary");
         assert!(matches!(
-            world.step(),
+            session.step(&mut world),
             Err(WorldStepError::BrainAndPersistence { .. })
         ));
         assert_eq!(world.tick(), Tick(1));
@@ -24192,8 +24705,14 @@ mod tests {
             completed_digest,
             "repeated step must not mutate after a combined terminal fault"
         );
-        assert!(world.has_pending_persistence_batch());
-        assert_eq!(world.last_admitted_persistence_tick(), None);
+        assert!(session.has_pending_batch());
+        assert_same_staged_batch(&session, &retained);
+        assert_eq!(session.last_admitted_tick(), None);
+        assert_eq!(session.fault(), Some(&persistence));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
         assert_eq!(
             persistence_logs.lock().unwrap()[0].summary,
             *world.history().next_back().expect("completed summary")
@@ -24215,8 +24734,7 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let persistence_logs = Arc::clone(&spy.logs);
-        let mut world =
-            WorldState::with_persistence(config, Box::new(spy)).expect("outcome fault world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let mut doomed = sample_agent(9);
         doomed.health = 0.0;
         let doomed = world.spawn_agent(doomed);
@@ -24238,8 +24756,8 @@ mod tests {
                 }
             });
 
-        let StepCompletion { outcome, fault } = world
-            .step_outcome()
+        let StepCompletion { outcome, fault } = session
+            .step_outcome(&mut world)
             .expect("completed population failure must retain its outcome");
 
         assert!(persistence_logs.lock().unwrap().is_empty());
@@ -24276,14 +24794,20 @@ mod tests {
             outcome.persistence.status(),
             PersistenceProjectionStatus::Ready
         );
-        let batch = outcome.persistence.batch().expect("fault boundary batch");
+        let projected = ready_batch_arc(&outcome.persistence);
+        assert_same_staged_batch(&session, &projected);
+        let batch = projected.as_ref();
         assert_eq!(batch.summary, outcome.summary);
         assert_eq!(batch.deaths, outcome.deaths);
         assert_eq!(batch.births.len(), 1);
         assert_eq!(batch.births[0].origin, BirthOrigin::Seeded);
-        assert!(world.persistence_fault().is_none());
-        assert!(!world.has_pending_persistence_batch());
-        assert_eq!(world.last_admitted_persistence_tick(), None);
+        assert!(session.fault().is_none());
+        assert!(session.has_pending_batch());
+        assert_eq!(session.last_admitted_tick(), None);
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
     }
 
     #[test]
@@ -24293,25 +24817,30 @@ mod tests {
             logs: Arc::clone(&logs),
             reject_next: true,
         };
-        let mut world =
-            WorldState::with_persistence(quiet_trace_config(0x5C13_0C3E, 1), Box::new(persistence))
-                .expect("scientific adapter world");
-        let StepCompletion { outcome, fault } =
-            world.step_outcome().expect("completed adapter boundary");
+        let (mut world, mut session) =
+            world_with_session(quiet_trace_config(0x5C13_0C3E, 1), persistence);
+        let StepCompletion { outcome, fault } = session
+            .step_outcome(&mut world)
+            .expect("completed adapter boundary");
         assert!(fault.is_none());
         assert!(logs.lock().unwrap().is_empty());
+        let projected = ready_batch_arc(&outcome.persistence);
+        assert_same_staged_batch(&session, &projected);
         let scientific_state = ScientificStateError::GenerationOverflow {
             path: "pending_spawns[0].generation".to_owned(),
             generation: u32::MAX,
         };
 
-        let error = world
-            .finish_legacy_step(StepCompletion {
-                outcome,
-                fault: Some(CompletedStepFault::ScientificState(
-                    scientific_state.clone(),
-                )),
-            })
+        let error = session
+            .finish_completion(
+                &mut world,
+                StepCompletion {
+                    outcome,
+                    fault: Some(CompletedStepFault::ScientificState(
+                        scientific_state.clone(),
+                    )),
+                },
+            )
             .expect_err("legacy adapter must retain both completed faults");
         let WorldStepError::ScientificStateAndPersistence {
             scientific_state: returned_scientific_state,
@@ -24327,8 +24856,14 @@ mod tests {
             PersistenceAdmissionState::NotAdmitted
         );
         assert_eq!(logs.lock().unwrap().len(), 1);
-        assert!(world.has_pending_persistence_batch());
-        assert_eq!(world.persistence_fault(), Some(&returned_persistence));
+        assert!(session.has_pending_batch());
+        assert_same_staged_batch(&session, &projected);
+        assert_eq!(session.fault(), Some(&returned_persistence));
+        assert_eq!(session.last_admitted_tick(), None);
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
     }
 
     fn lifecycle_birth(tick: u64) -> BirthRecord {
@@ -24392,8 +24927,7 @@ mod tests {
             logs: Arc::clone(&persistence_logs),
             reject_next: true,
         };
-        let mut world =
-            WorldState::with_persistence(config, Box::new(rejecting)).expect("test world");
+        let (mut world, mut session) = world_with_session(config, rejecting);
         world.pending_birth_records.push(lifecycle_birth(1));
         world
             .pending_lifecycle_birth_metrics
@@ -24403,8 +24937,8 @@ mod tests {
         world.last_deaths = 1;
         world.replay_events.push(replay_marker(0.25));
 
-        let first_error = world
-            .step()
+        let first_error = session
+            .step(&mut world)
             .expect_err("definite persistence rejection must fail the completed tick");
         assert!(matches!(&first_error, WorldStepError::Persistence(_)));
         let WorldStepError::Persistence(first_error) = first_error else {
@@ -24413,15 +24947,22 @@ mod tests {
         assert_eq!(first_error.tick(), 1);
         assert_eq!(first_error.state(), PersistenceAdmissionState::NotAdmitted);
         assert_eq!(world.tick(), Tick(1));
-        assert!(world.has_pending_persistence_batch());
-        assert_eq!(world.persistence_fault(), Some(&first_error));
+        assert!(session.has_pending_batch());
+        assert_eq!(session.fault(), Some(&first_error));
+        let retained = Arc::clone(
+            &session
+                .pending
+                .as_ref()
+                .expect("rejected batch remains staged")
+                .batch,
+        );
 
         let digest_after_failure = world
             .characterization_digest_v0()
             .expect("failed tick must end at a quiescent science boundary");
         let rejected_call_count = persistence_logs.lock().unwrap().len();
-        let repeated_error = world
-            .step()
+        let repeated_error = session
+            .step(&mut world)
             .expect_err("a latched failure must prevent tick two from starting");
         assert!(matches!(&repeated_error, WorldStepError::Persistence(_)));
         let WorldStepError::Persistence(repeated_error) = repeated_error else {
@@ -24430,6 +24971,7 @@ mod tests {
         assert_eq!(repeated_error, first_error);
         assert_eq!(world.tick(), Tick(1));
         assert_eq!(persistence_logs.lock().unwrap().len(), rejected_call_count);
+        assert_same_staged_batch(&session, &retained);
         assert_eq!(
             world.characterization_digest_v0().unwrap(),
             digest_after_failure,
@@ -24437,29 +24979,170 @@ mod tests {
         );
 
         assert!(
-            world
-                .retry_pending_persistence()
+            session
+                .retry_pending(&mut world)
                 .expect("the original sink must accept the retained batch on retry")
         );
-        assert!(!world.has_pending_persistence_batch());
-        assert!(world.persistence_fault().is_none());
+        assert!(!session.has_pending_batch());
+        assert!(session.fault().is_none());
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+        );
 
         let attempts = persistence_logs.lock().unwrap();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[1].summary, attempts[0].summary);
-        assert_eq!(attempts[1].metrics, attempts[0].metrics);
-        assert_eq!(attempts[1].events, attempts[0].events);
-        assert_eq!(attempts[1].births, attempts[0].births);
-        assert_eq!(attempts[1].deaths, attempts[0].deaths);
-        assert_eq!(attempts[1].replay_events, attempts[0].replay_events);
-        assert_eq!(attempts[1].agents.len(), attempts[0].agents.len());
+        assert_persistence_batches_exact(&attempts[1], &attempts[0]);
         drop(attempts);
 
-        world
-            .step()
+        session
+            .step(&mut world)
             .expect("world may advance only after retained batch admission");
         assert_eq!(world.tick(), Tick(2));
         assert_eq!(persistence_logs.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn dropping_ready_completion_preserves_staged_arc_and_blocks_next_tick() {
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let (mut world, mut session) = world_with_session(quiet_trace_config(0xD09C_0A11, 1), spy);
+
+        let projected = {
+            let completion = session.step_outcome(&mut world).expect("ready completion");
+            let projected = ready_batch_arc(&completion.outcome.persistence);
+            assert_same_staged_batch(&session, &projected);
+            projected
+        };
+
+        assert_same_staged_batch(&session, &projected);
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
+        let blocked = session
+            .step_outcome(&mut world)
+            .expect_err("a dropped completion must not drop its staged batch");
+        assert!(matches!(
+            blocked,
+            WorldStepError::ScientificState(
+                ScientificStateError::PersistenceBoundaryUnresolved { ref path, tick: 1 }
+            ) if path == "world.step"
+        ));
+        assert_eq!(world.tick(), Tick(1));
+        assert!(logs.lock().unwrap().is_empty());
+        assert_same_staged_batch(&session, &projected);
+    }
+
+    #[test]
+    fn bind_persistence_claim_is_irrevocable_for_the_world_lifetime() {
+        let mut world = WorldState::new(quiet_trace_config(0xB10D_0001, 1)).expect("unbound world");
+        let primary = SpyPersistence::default();
+        let primary_logs = Arc::clone(&primary.logs);
+        let rejected_while_live = SpyPersistence::default();
+        let rejected_while_live_logs = Arc::clone(&rejected_while_live.logs);
+
+        {
+            let mut session = world
+                .bind_persistence(Box::new(primary))
+                .expect("first public bind must claim the world");
+            assert!(matches!(
+                world.bind_persistence(Box::new(rejected_while_live)),
+                Err(PersistenceSessionError::AlreadyBound)
+            ));
+            session
+                .step(&mut world)
+                .expect("the first bound session remains authoritative");
+        }
+
+        let rejected_after_drop = SpyPersistence::default();
+        let rejected_after_drop_logs = Arc::clone(&rejected_after_drop.logs);
+        assert!(matches!(
+            world.bind_persistence(Box::new(rejected_after_drop)),
+            Err(PersistenceSessionError::AlreadyBound)
+        ));
+        assert_eq!(primary_logs.lock().unwrap().len(), 1);
+        assert!(rejected_while_live_logs.lock().unwrap().is_empty());
+        assert!(rejected_after_drop_logs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dropping_persistence_session_leaves_world_pending_and_fail_closed() {
+        let spy = SpyPersistence::default();
+        let logs = Arc::clone(&spy.logs);
+        let mut world = {
+            let (mut world, mut session) =
+                world_with_session(quiet_trace_config(0xD09C_5E55, 1), spy);
+            let completion = session
+                .step_outcome(&mut world)
+                .expect("ready completion before session drop");
+            assert_eq!(
+                completion.outcome.persistence.status(),
+                PersistenceProjectionStatus::Ready
+            );
+            world
+        };
+
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
+        assert!(matches!(
+            world.latched_step_error(),
+            Some(WorldStepError::ScientificState(
+                ScientificStateError::PersistenceBoundaryUnresolved { ref path, tick: 1 }
+            )) if path == "world.step"
+        ));
+        assert!(matches!(
+            world.step(),
+            Err(WorldStepError::PersistenceSession(
+                PersistenceSessionError::SessionRequired { tick: 2 }
+            ))
+        ));
+        assert_eq!(world.tick(), Tick(1));
+        assert!(logs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wrong_world_session_rejects_before_sink_io() {
+        let first_spy = SpyPersistence::default();
+        let first_logs = Arc::clone(&first_spy.logs);
+        let second_spy = SpyPersistence::default();
+        let second_logs = Arc::clone(&second_spy.logs);
+        let (mut first_world, mut first_session) =
+            world_with_session(quiet_trace_config(0xA110_C001, 1), first_spy);
+        let (mut second_world, mut second_session) =
+            world_with_session(quiet_trace_config(0xA110_C002, 1), second_spy);
+
+        let completion = first_session
+            .step_outcome(&mut first_world)
+            .expect("first world ready completion");
+        let projected = ready_batch_arc(&completion.outcome.persistence);
+        assert_same_staged_batch(&first_session, &projected);
+
+        assert_eq!(
+            first_session.admit_pending(&mut second_world),
+            Err(PersistenceSessionError::WrongWorld)
+        );
+        assert!(matches!(
+            second_session.step_outcome(&mut first_world),
+            Err(WorldStepError::PersistenceSession(
+                PersistenceSessionError::WrongWorld
+            ))
+        ));
+        assert!(first_logs.lock().unwrap().is_empty());
+        assert!(second_logs.lock().unwrap().is_empty());
+        assert_same_staged_batch(&first_session, &projected);
+        assert_eq!(
+            first_world.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
+        assert_eq!(
+            second_world.persistence_boundary,
+            PersistenceBoundaryStatus::Open { tick: Tick::zero() }
+        );
+        assert_eq!(second_world.tick(), Tick::zero());
     }
 
     #[test]
@@ -24559,14 +25242,14 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+        let (mut world, mut session) = world_with_session(config, spy);
 
         world.pending_birth_records.push(lifecycle_birth(1));
         world.last_births = 1;
         world.combat_spike_attempts = 1;
         world.combat_spike_hits = 2;
         world.replay_events.push(replay_marker(0.1));
-        world.step().expect("tick one");
+        session.step(&mut world).expect("tick one");
         assert!(logs.lock().unwrap().is_empty());
         let tick_one = world.history().next_back().expect("tick one summary");
         assert_eq!(tick_one.tick, Tick(1));
@@ -24581,7 +25264,7 @@ mod tests {
         world.combat_spike_attempts = 2;
         world.combat_spike_hits = 1;
         world.replay_events.push(replay_marker(0.2));
-        world.step().expect("tick two");
+        session.step(&mut world).expect("tick two");
         assert!(logs.lock().unwrap().is_empty());
         let tick_two = world.history().next_back().expect("tick two summary");
         assert_eq!(tick_two.tick, Tick(2));
@@ -24589,7 +25272,9 @@ mod tests {
         assert_eq!(tick_two.deaths, 1);
         assert_eq!(tick_two.spike_hits, 1);
 
-        world.step().expect("tick three persistence boundary");
+        session
+            .step(&mut world)
+            .expect("tick three persistence boundary");
         let tick_three = world.history().next_back().expect("tick three summary");
         assert_eq!(tick_three.tick, Tick(3));
         assert_eq!(tick_three.births, 0);
@@ -24638,8 +25323,7 @@ mod tests {
             };
             let spy = SpyPersistence::default();
             let logs = Arc::clone(&spy.logs);
-            let mut world =
-                WorldState::with_persistence(config, Box::new(spy)).expect("cadence world");
+            let (mut world, mut session) = world_with_session(config, spy);
 
             for tick in 1..=6 {
                 match tick {
@@ -24661,7 +25345,7 @@ mod tests {
                     world.combat_spike_attempts = 1;
                     world.combat_spike_hits = 2;
                 }
-                world.step().expect("cadence comparison tick");
+                session.step(&mut world).expect("cadence comparison tick");
             }
 
             let entries = logs.lock().unwrap();
@@ -24732,26 +25416,28 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+        let (mut world, mut session) = world_with_session(config, spy);
 
         world.pending_birth_records.push(lifecycle_birth(1));
         world
             .pending_lifecycle_birth_metrics
             .push(lifecycle_birth(1));
         world.last_births = 1;
-        world.step().expect("tick one");
-        world.step().expect("tick two");
-        world.step().expect("tick three persistence boundary");
+        session.step(&mut world).expect("tick one");
+        session.step(&mut world).expect("tick two");
+        session
+            .step(&mut world)
+            .expect("tick three persistence boundary");
 
         world.pending_birth_records.push(lifecycle_birth(4));
         world
             .pending_lifecycle_birth_metrics
             .push(lifecycle_birth(4));
         world.last_births = 1;
-        world.step().expect("tick four");
-        world.step().expect("tick five");
-        world
-            .step()
+        session.step(&mut world).expect("tick four");
+        session.step(&mut world).expect("tick five");
+        session
+            .step(&mut world)
             .expect("tick six persistence and lifecycle boundary");
 
         let entries = logs.lock().unwrap();
@@ -24811,14 +25497,16 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let agent_id = world.spawn_agent(sample_agent(0));
 
         world.pending_birth_records.push(lifecycle_birth(1));
         world.last_births = 1;
-        world.step().expect("tick one");
-        world.step().expect("tick two");
-        world.step().expect("tick three persistence boundary");
+        session.step(&mut world).expect("tick one");
+        session.step(&mut world).expect("tick two");
+        session
+            .step(&mut world)
+            .expect("tick three persistence boundary");
 
         world.pending_birth_records.push(lifecycle_birth(4));
         world.pending_death_records.push(lifecycle_death(4));
@@ -24826,14 +25514,21 @@ mod tests {
         world.last_deaths = 1;
         world.replay_events.push(replay_marker(0.4));
         world.agent_runtime_mut(agent_id).unwrap().food_delta = 0.4;
-        world.step().expect("tick four partial cadence tail");
+        session
+            .step(&mut world)
+            .expect("tick four partial cadence tail");
         assert_eq!(world.agent_runtime(agent_id).unwrap().food_delta, 0.0);
 
-        assert!(world.finalize_persistence().expect("tail admission"));
+        assert!(session.finalize(&mut world).expect("tail admission"));
         assert!(
-            !world
-                .finalize_persistence()
+            !session
+                .finalize(&mut world)
                 .expect("idempotent tail finalization")
+        );
+        assert_eq!(session.last_admitted_tick(), Some(Tick(4)));
+        assert_eq!(
+            world.persistence_boundary,
+            PersistenceBoundaryStatus::Sealed { tick: Tick(4) }
         );
 
         let entries = logs.lock().unwrap();
@@ -24873,12 +25568,12 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("test world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let agent_id = world.spawn_agent(sample_agent(0));
 
         for (index, delta) in [0.5, -0.25, 1.0].into_iter().enumerate() {
             world.agent_runtime_mut(agent_id).unwrap().food_delta = delta;
-            world.step().expect("persistence cadence step");
+            session.step(&mut world).expect("persistence cadence step");
             assert_eq!(world.tick(), Tick(index as u64 + 1));
         }
 
@@ -24933,11 +25628,11 @@ mod tests {
 
         let spy = SpyPersistence::default();
         let logs = spy.logs.clone();
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let id = world.spawn_agent(sample_agent(0));
         world.agent_runtime_mut(id).unwrap().energy = 1.0;
 
-        world.step().expect("persistence fixture step");
+        session.step(&mut world).expect("persistence fixture step");
 
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
@@ -24995,7 +25690,7 @@ mod tests {
 
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let parent_id = world.spawn_agent(sample_agent(0));
         {
             let runtime = world.agent_runtime_mut(parent_id).expect("runtime");
@@ -25004,7 +25699,7 @@ mod tests {
         }
 
         assert_eq!(world.agent_count(), 1);
-        world.step().expect("reproduction step");
+        session.step(&mut world).expect("reproduction step");
         assert_eq!(world.agent_count(), 2);
 
         let handles: Vec<_> = world.agents().iter_handles().collect();
@@ -25843,7 +26538,7 @@ mod tests {
 
         let spy = SpyPersistence::default();
         let logs = spy.logs.clone();
-        let mut world = WorldState::with_persistence(config, Box::new(spy)).expect("world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let victim = world.spawn_agent(sample_agent(0));
         let neighbor = world.spawn_agent(sample_agent(1));
 
@@ -25873,9 +26568,15 @@ mod tests {
         world.pending_deaths.push(victim);
         world.stage_death_cleanup(Tick::zero());
         world.stage_accumulate_tick_events();
-        world
-            .stage_persistence(Tick(1), false)
-            .expect("carcass metrics should be admitted");
+        let projection = world.prepare_persistence(Tick(1), false);
+        let projected = ready_batch_arc(&projection);
+        session.stage_projection(&mut world, &projection);
+        assert_same_staged_batch(&session, &projected);
+        assert!(
+            session
+                .admit_pending(&mut world)
+                .expect("carcass metrics should be admitted")
+        );
 
         let entries = logs.lock().unwrap();
         assert_eq!(entries.len(), 1);
@@ -27695,7 +28396,7 @@ mod tests {
             assert_eq!(control_events, profiled_events);
 
             let report = profiler.latest().expect("completed profile");
-            assert_eq!(report.schema, WORLD_STEP_PROFILE_SCHEMA);
+            assert_eq!(report.schema, WORLD_STEP_OUTCOME_PROFILE_SCHEMA);
             assert_eq!(report.tick, Tick(expected_tick));
             assert_eq!(report.stages().count(), WorldStepStage::COUNT);
             assert_eq!(report.elapsed_ns(WorldStepStage::Aging), None);
@@ -28438,11 +29139,13 @@ mod tests {
 
     #[test]
     fn traced_step_keeps_retained_tail_identity_after_agent_death() {
-        let mut world =
-            WorldState::new(quiet_trace_config(2_820, 3)).expect("retained-tail trace world");
+        let (mut world, mut session) =
+            world_with_session(quiet_trace_config(2_820, 3), NullPersistence);
         let agent = world.spawn_agent(sample_agent(0));
         let agent_uid = world.agent_uid(agent).expect("retained-tail stable uid");
-        world.step().expect("non-cadence retained-tail tick");
+        session
+            .step(&mut world)
+            .expect("non-cadence retained-tail tick");
         assert_eq!(
             world
                 .pending_persistence_runtime_tail
@@ -28458,8 +29161,8 @@ mod tests {
         world.agents.columns_mut().health_mut()[index] = 0.0;
 
         let mut tracer = WorldStepTracer::default();
-        world
-            .step_traced(&mut tracer)
+        session
+            .step_traced(&mut world, &mut tracer)
             .expect("death with retained tail remains traceable");
         assert!(world.agent_uid(agent).is_none());
         assert!(
@@ -28556,8 +29259,7 @@ mod tests {
         };
         let spy = SpyPersistence::default();
         let logs = Arc::clone(&spy.logs);
-        let mut world =
-            WorldState::with_persistence(config, Box::new(spy)).expect("ordered batch world");
+        let (mut world, mut session) = world_with_session(config, spy);
         let first = world.spawn_agent(sample_agent(0));
         let second = world.spawn_agent(sample_agent(1));
         let third = world.spawn_agent(sample_agent(2));
@@ -28585,7 +29287,9 @@ mod tests {
         );
         assert!(world.remove_agent(first).is_some());
 
-        world.step().expect("ordered persistence batch tick");
+        session
+            .step(&mut world)
+            .expect("ordered persistence batch tick");
         let entries = logs.lock().expect("ordered batch logs");
         let batch = entries.last().expect("ordered persistence batch");
         let agent_uids: Vec<_> = batch
@@ -28700,27 +29404,27 @@ mod tests {
         };
         let control_logs = Arc::new(Mutex::new(Vec::new()));
         let profiled_logs = Arc::new(Mutex::new(Vec::new()));
-        let mut control = WorldState::with_persistence(
+        let (mut control, mut control_session) = world_with_session(
             config.clone(),
-            Box::new(RejectOncePersistence {
+            RejectOncePersistence {
                 logs: Arc::clone(&control_logs),
                 reject_next: true,
-            }),
-        )
-        .expect("control world");
-        let mut profiled = WorldState::with_persistence(
+            },
+        );
+        let (mut profiled, mut profiled_session) = world_with_session(
             config,
-            Box::new(RejectOncePersistence {
+            RejectOncePersistence {
                 logs: Arc::clone(&profiled_logs),
                 reject_next: true,
-            }),
-        )
-        .expect("profiled world");
+            },
+        );
         let mut profiler = WorldStepProfiler::default();
 
-        let control_error = control.step().expect_err("control persistence rejection");
-        let profiled_error = profiled
-            .step_profiled(&mut profiler)
+        let control_error = control_session
+            .step(&mut control)
+            .expect_err("control persistence rejection");
+        let profiled_error = profiled_session
+            .step_profiled(&mut profiled, &mut profiler)
             .expect_err("profiled persistence rejection");
         match (&control_error, &profiled_error) {
             (
@@ -28736,9 +29440,31 @@ mod tests {
         assert!(matches!(
             profiled.world_digest_v1(),
             Err(CharacterizationError::NonContinuable {
-                blocker: WorldContinuationBlocker::PersistenceFault
+                blocker: WorldContinuationBlocker::RetainedPersistenceBatch
             })
         ));
+        assert!(control_session.fault().is_some());
+        assert!(profiled_session.fault().is_some());
+        assert_persistence_batches_exact(
+            control_session
+                .pending_batch()
+                .expect("control rejected batch remains staged"),
+            profiled_session
+                .pending_batch()
+                .expect("profiled rejected batch remains staged"),
+        );
+        assert_eq!(
+            control.persistence_boundary,
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
+        assert_eq!(control.persistence_boundary, profiled.persistence_boundary);
+        let profiled_retained = Arc::clone(
+            &profiled_session
+                .pending
+                .as_ref()
+                .expect("profiled rejected batch remains staged")
+                .batch,
+        );
         assert_eq!(
             profiler.latest().expect("failed tick profile").tick,
             Tick(1)
@@ -28759,10 +29485,11 @@ mod tests {
         let digest = profiled
             .characterization_digest_v0()
             .expect("latched digest");
-        let repeated = profiled
-            .step_profiled(&mut profiler)
+        let repeated = profiled_session
+            .step_profiled(&mut profiled, &mut profiler)
             .expect_err("latched failure blocks a second tick");
         assert_eq!(repeated.to_string(), profiled_error.to_string());
+        assert_same_staged_batch(&profiled_session, &profiled_retained);
         assert_eq!(profiled.tick(), Tick(1));
         assert_eq!(
             profiled

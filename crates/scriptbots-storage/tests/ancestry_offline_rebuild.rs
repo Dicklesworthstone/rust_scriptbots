@@ -18,9 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A sink that records exactly what storage successfully admitted.
 ///
 /// Admission happens first so a definite rejection cannot mutate the live oracle
-/// and then duplicate its rows when the world retries the retained batch. If the
-/// test recorded a different stream from storage, a mismatch between live and
-/// rebuilt could be blamed on the test rather than on the database.
+/// and then duplicate its rows when the admission session retries the retained batch.
+/// If the test recorded a different stream from storage, a mismatch between live
+/// and rebuilt could be blamed on the test rather than on the database.
 struct TeeSink {
     inner: Box<dyn WorldPersistence>,
     seen: Arc<Mutex<AncestryGraph>>,
@@ -83,7 +83,8 @@ fn the_run_database_alone_rebuilds_the_identical_ancestry_graph() {
             inner: Box::new(pipeline.sink()),
             seen: Arc::clone(&seen),
         };
-        let mut world = WorldState::with_persistence(config, Box::new(tee)).expect("world");
+        let (mut world, mut persistence) =
+            WorldState::with_persistence(config, Box::new(tee)).expect("world");
 
         // Every agent that enters the world now emits an origin record. The tee
         // must observe these roots from the production stream; synthesizing them
@@ -95,7 +96,7 @@ fn the_run_database_alone_rebuilds_the_identical_ancestry_graph() {
         }
 
         for _ in 0..600 {
-            world.step().expect("step");
+            persistence.step(&mut world).expect("step");
         }
         world.identity_sequence_state()
     };
@@ -202,7 +203,7 @@ fn tick_zero_origins_finalize_once_and_seal_the_real_storage_boundary() {
     let path = temp_db("tick-zero-origins");
     let mut pipeline =
         StoragePipeline::create_new_file_with_thresholds(&path, 1, 1, 1, 1).expect("pipeline");
-    let mut world = WorldState::with_persistence(
+    let (mut world, mut persistence) = WorldState::with_persistence(
         ScriptBotsConfig {
             persistence_interval: 1,
             population_minimum: 0,
@@ -217,10 +218,14 @@ fn tick_zero_origins_finalize_once_and_seal_the_real_storage_boundary() {
     world
         .try_spawn_agent(AgentData::default())
         .expect("tick-zero founder");
-    assert!(world.finalize_persistence().expect("tick-zero admission"));
     assert!(
-        !world
-            .finalize_persistence()
+        persistence
+            .finalize(&mut world)
+            .expect("tick-zero admission")
+    );
+    assert!(
+        !persistence
+            .finalize(&mut world)
             .expect("idempotent tick-zero finalization")
     );
 
@@ -237,6 +242,7 @@ fn tick_zero_origins_finalize_once_and_seal_the_real_storage_boundary() {
     );
     assert!(!callback_ran.get(), "sealed ingress invoked its callback");
     drop(world);
+    drop(persistence);
 
     let shutdown = pipeline.shutdown().expect("durable shutdown");
     assert_eq!(shutdown.committed_tick, Some(0));

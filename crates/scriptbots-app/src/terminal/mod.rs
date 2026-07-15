@@ -38,7 +38,7 @@ use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::{info, warn};
 
 use crate::{
-    CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld,
+    CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld, WorldStepDriver,
     renderer::{Renderer, RendererContext},
 };
 
@@ -305,6 +305,7 @@ enum FocusLockMode {
 
 struct TerminalApp<'a> {
     world: SharedWorld,
+    simulation_step: WorldStepDriver,
     analytics_provider: SharedAnalytics,
     control: &'a ControlRuntime,
     command_drain: CommandDrain,
@@ -353,6 +354,7 @@ impl<'a> TerminalApp<'a> {
         };
         let mut app = Self {
             world: Arc::clone(&ctx.world),
+            simulation_step: Arc::clone(&ctx.simulation_step),
             analytics_provider: ctx.analytics.clone(),
             control: ctx.control_runtime,
             command_drain: Arc::clone(&ctx.command_drain),
@@ -501,12 +503,10 @@ impl<'a> TerminalApp<'a> {
         }
 
         let mut step_error = None;
-        if let Ok(mut world) = self.world.lock() {
-            for _ in 0..steps {
-                if let Err(error) = world.step() {
-                    step_error = Some(Arc::<str>::from(error.to_string()));
-                    break;
-                }
+        for _ in 0..steps {
+            if let Err(error) = (self.simulation_step)() {
+                step_error = Some(Arc::<str>::from(error.to_string()));
+                break;
             }
         }
 
@@ -3608,6 +3608,16 @@ mod tests {
         ))
     }
 
+    fn disabled_persistence_step_driver(world: &SharedWorld) -> WorldStepDriver {
+        let world = Arc::clone(world);
+        Arc::new(move || {
+            world
+                .lock()
+                .expect("world mutex poisoned while executing test simulation step")
+                .step()
+        })
+    }
+
     #[test]
     fn terminal_app_key_handler_single_step_advances_exactly_once_and_stays_paused() {
         let world = command_characterization_world();
@@ -3615,6 +3625,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world: Arc::clone(&world),
             analytics,
             control_runtime: &runtime,
@@ -3644,6 +3655,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world: Arc::clone(&world),
             analytics,
             control_runtime: &runtime,
@@ -3692,6 +3704,7 @@ mod tests {
         let repeat_world = command_characterization_world();
         let (repeat_runtime, repeat_drain, repeat_submit) = crate::servers::ControlRuntime::dummy();
         let repeat_ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&repeat_world),
             world: repeat_world,
             analytics: AnalyticsSnapshotProvider::empty(),
             control_runtime: &repeat_runtime,
@@ -3748,6 +3761,7 @@ mod tests {
             .expect("fill command queue");
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world,
             analytics,
             control_runtime: &runtime,
@@ -3791,6 +3805,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world: Arc::clone(&world),
             analytics,
             control_runtime: &runtime,
@@ -3818,6 +3833,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world,
             analytics,
             control_runtime: &runtime,
@@ -3846,6 +3862,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world: Arc::clone(&world),
             analytics,
             control_runtime: &runtime,
@@ -3871,6 +3888,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world: Arc::clone(&world),
             analytics,
             control_runtime: &runtime,
@@ -3903,6 +3921,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world: Arc::clone(&world),
             analytics,
             control_runtime: &runtime,
@@ -3930,6 +3949,7 @@ mod tests {
         let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = crate::renderer::RendererContext {
+            simulation_step: disabled_persistence_step_driver(&world),
             world: Arc::clone(&world),
             analytics,
             control_runtime: &runtime,

@@ -18,7 +18,7 @@ use scriptbots_core::{
     MutationRates, NUM_EYES, OutputChannel, OutputsExt, Position, RenderTonemapMode, SENSOR_LAYOUT,
     ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, SimulationCommand,
     TerrainKind, TerrainLayer, TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState,
-    apply_control_command,
+    WorldStepDriver, apply_control_command,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
@@ -1565,6 +1565,7 @@ fn start_gui_health_monitor(
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
 pub fn run_demo(
     world: Arc<Mutex<WorldState>>,
+    simulation_step: WorldStepDriver,
     analytics: AnalyticsSnapshotProvider,
     command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     command_submit: Arc<dyn Fn(ControlCommand) -> bool + Send + Sync + 'static>,
@@ -1587,6 +1588,7 @@ pub fn run_demo(
     let title_for_options = window_title.clone();
     let title_for_view = window_title.clone();
     let world_for_view = Arc::clone(&world);
+    let simulation_step_for_view = Arc::clone(&simulation_step);
     let drain_for_view = Arc::clone(&command_drain);
     let submit_for_view = Arc::clone(&command_submit);
     let analytics_for_view = analytics.clone();
@@ -1607,6 +1609,7 @@ pub fn run_demo(
             }
 
             let world_handle = Arc::clone(&world_for_view);
+            let simulation_step_for_hud = Arc::clone(&simulation_step_for_view);
             let view_title = title_for_view.clone();
             let drain_for_hud = Arc::clone(&drain_for_view);
             let submit_for_hud = Arc::clone(&submit_for_view);
@@ -1615,6 +1618,7 @@ pub fn run_demo(
                 cx.new(|_| {
                     SimulationView::new(
                         Arc::clone(&world_handle),
+                        Arc::clone(&simulation_step_for_hud),
                         analytics_for_hud.clone(),
                         view_title.clone(),
                         Arc::clone(&drain_for_hud),
@@ -1646,6 +1650,7 @@ pub fn run_demo(
             }
 
             let world_for_canvas = Arc::clone(&world_for_view);
+            let simulation_step_for_canvas = Arc::clone(&simulation_step_for_view);
             let analytics_for_canvas = analytics_for_view.clone();
             let drain_for_canvas = Arc::clone(&drain_for_view);
             let submit_for_canvas = Arc::clone(&submit_for_view);
@@ -1654,6 +1659,7 @@ pub fn run_demo(
                     // Reuse SimulationView but render only the canvas section by enabling an overlay-only layout flag.
                     let mut view = SimulationView::new(
                         Arc::clone(&world_for_canvas),
+                        Arc::clone(&simulation_step_for_canvas),
                         analytics_for_canvas.clone(),
                         "World".into(),
                         Arc::clone(&drain_for_canvas),
@@ -1700,6 +1706,7 @@ const MAX_SIM_STEPS_PER_FRAME: usize = 240;
 
 struct SimulationView {
     world: Arc<Mutex<WorldState>>,
+    simulation_step: WorldStepDriver,
     analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
     command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
@@ -1735,6 +1742,7 @@ struct SimulationView {
 impl SimulationView {
     fn new(
         world: Arc<Mutex<WorldState>>,
+        simulation_step: WorldStepDriver,
         analytics_provider: AnalyticsSnapshotProvider,
         title: SharedString,
         command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
@@ -1750,6 +1758,7 @@ impl SimulationView {
 
         Self {
             world,
+            simulation_step,
             analytics_provider,
             title,
             command_drain,
@@ -1921,19 +1930,18 @@ impl SimulationView {
             steps
         };
 
-        let mut step_error = None;
-        if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.latched_step_error() {
-                step_error = Some(error.to_string());
+        let mut step_error = self
+            .world
+            .lock()
+            .ok()
+            .and_then(|world| world.latched_step_error().map(|error| error.to_string()));
+        for _ in 0..steps {
+            if step_error.is_some() {
+                break;
             }
-            for _ in 0..steps {
-                if step_error.is_some() {
-                    break;
-                }
-                if let Err(error) = world.step() {
-                    step_error = Some(error.to_string());
-                    break;
-                }
+            if let Err(error) = (self.simulation_step)() {
+                step_error = Some(error.to_string());
+                break;
             }
         }
         if let Some(error) = step_error {
@@ -13457,27 +13465,26 @@ mod command_characterization_tests {
 
     #[test]
     fn manual_agent_injection_refuses_a_sealed_persistence_boundary() {
-        let world = Arc::new(Mutex::new(
-            WorldState::new(ScriptBotsConfig {
-                world_width: 100,
-                world_height: 100,
-                food_cell_size: 50,
-                population_minimum: 0,
-                population_spawn_interval: 0,
-                persistence_interval: 1,
-                rng_seed: Some(0x005E_A1ED),
-                ..ScriptBotsConfig::default()
-            })
-            .expect("sealed-boundary world"),
-        ));
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 1,
+            rng_seed: Some(0x005E_A1ED),
+            ..ScriptBotsConfig::default()
+        };
+        let (mut world, mut persistence) =
+            WorldState::with_persistence(config, Box::new(scriptbots_core::NullPersistence))
+                .expect("sealed-boundary world");
+        persistence
+            .step(&mut world)
+            .expect("seal the first persistence boundary");
+        assert_eq!(world.tick().0, 1);
+        let world = Arc::new(Mutex::new(world));
         let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(Vec::new);
         let view = simulation_view(Arc::clone(&world), drain);
-
-        {
-            let mut world = world.lock().expect("world lock");
-            world.step().expect("seal the first persistence boundary");
-            assert_eq!(world.tick().0, 1);
-        }
 
         let (agent_count_before, rng_before, identity_before) = {
             let world = world.lock().expect("world lock");
@@ -13506,12 +13513,24 @@ mod command_characterization_tests {
         assert_eq!(world.identity_sequence_state(), identity_before);
     }
 
+    fn disabled_persistence_step_driver(world: &Arc<Mutex<WorldState>>) -> WorldStepDriver {
+        let world = Arc::clone(world);
+        Arc::new(move || {
+            world
+                .lock()
+                .expect("world mutex poisoned while executing test simulation step")
+                .step()
+        })
+    }
+
     fn simulation_view(
         world: Arc<Mutex<WorldState>>,
         command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync + 'static>,
     ) -> SimulationView {
+        let simulation_step = disabled_persistence_step_driver(&world);
         SimulationView::new(
             world,
+            simulation_step,
             AnalyticsSnapshotProvider::empty(),
             "command characterization".into(),
             command_drain,

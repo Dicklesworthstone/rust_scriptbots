@@ -1,7 +1,7 @@
 use scriptbots_core::{
-    AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, NUM_EYES, OUTPUT_SIZE,
-    Position, SENSOR_LAYOUT, ScriptBotsConfig, SensorKind, Tick, TickSummary, TraitModifiers,
-    WorldState,
+    AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, NUM_EYES,
+    NullPersistence, OUTPUT_SIZE, Position, SENSOR_LAYOUT, ScriptBotsConfig, SensorKind, Tick,
+    TickSummary, TraitModifiers, WorldState,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1208,14 +1208,15 @@ fn run_world_summary(seed: u64, ticks: u32) -> TickSummary {
         ..ScriptBotsConfig::default()
     };
 
-    let mut world = WorldState::new(config).expect("world");
+    let (mut world, mut persistence) =
+        WorldState::with_persistence(config, Box::new(NullPersistence)).expect("world");
     world
         .try_spawn_agent(AgentData::default())
         .expect("default agent is finite");
 
     for _ in 0..ticks {
-        world
-            .step()
+        persistence
+            .step(&mut world)
             .expect("regression world should accept each simulation step");
     }
 

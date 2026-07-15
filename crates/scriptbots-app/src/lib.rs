@@ -4,8 +4,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use scriptbots_core::{
-    CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0, RandomStreamState,
-    ScriptBotsConfig, TickEvents, WorldState,
+    CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
+    PersistenceAdmissionSession, RandomStreamState, ScriptBotsConfig, TickEvents, WorldState,
 };
 use scriptbots_storage::AnalyticsSnapshotProvider;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
@@ -416,7 +416,10 @@ pub enum CharacterizationTraceErrorV0 {
 }
 
 impl CharacterizationTraceV0 {
-    /// Capture tick zero and every boundary through `ticks` from an already constructed world.
+    /// Capture tick zero and every boundary through `ticks` from a persistence-disabled world.
+    ///
+    /// When `world.config().persistence_interval` is nonzero, use
+    /// [`Self::capture_with_scenario_and_session`] with the world's bound admission session.
     pub fn capture(
         scenario_id: impl Into<String>,
         world: &mut WorldState,
@@ -426,10 +429,34 @@ impl CharacterizationTraceV0 {
     }
 
     /// Capture a trace with explicit temporary scenario construction metadata.
+    ///
+    /// This direct stepping entry point is persistence-disabled-only. Persistence-enabled worlds
+    /// must use [`Self::capture_with_scenario_and_session`] so no completed batch is discarded.
     pub fn capture_with_scenario(
         scenario: ScenarioIdentityV0,
         world: &mut WorldState,
         ticks: u64,
+    ) -> Result<Self, CharacterizationTraceErrorV0> {
+        Self::capture_with_scenario_and_step(scenario, world, ticks, |world| world.step())
+    }
+
+    /// Capture through the world's external persistence session without changing its config.
+    pub fn capture_with_scenario_and_session(
+        scenario: ScenarioIdentityV0,
+        world: &mut WorldState,
+        persistence: &mut PersistenceAdmissionSession,
+        ticks: u64,
+    ) -> Result<Self, CharacterizationTraceErrorV0> {
+        Self::capture_with_scenario_and_step(scenario, world, ticks, |world| {
+            persistence.step(world)
+        })
+    }
+
+    fn capture_with_scenario_and_step(
+        scenario: ScenarioIdentityV0,
+        world: &mut WorldState,
+        ticks: u64,
+        mut step: impl FnMut(&mut WorldState) -> Result<TickEvents, scriptbots_core::WorldStepError>,
     ) -> Result<Self, CharacterizationTraceErrorV0> {
         if ticks > MAX_CHARACTERIZATION_TICKS_V0 {
             return Err(CharacterizationTraceErrorV0::ExcessiveTickCount {
@@ -453,7 +480,7 @@ impl CharacterizationTraceV0 {
             tick_events: None,
         });
         for _ in 0..ticks {
-            let events = world.step()?;
+            let events = step(world)?;
             let digest = world.characterization_digest_v0()?;
             points.push(TracePointV0 {
                 tick: digest.tick.0,
@@ -574,6 +601,7 @@ fn manifest_digest(domain: &str, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod characterization_tests {
     use super::*;
+    use scriptbots_core::{NullPersistence, PersistenceSessionError, WorldStepError};
 
     fn test_world(seed: Option<u64>) -> WorldState {
         let mut world = WorldState::new(ScriptBotsConfig {
@@ -872,6 +900,66 @@ mod characterization_tests {
             Err(CharacterizationTraceErrorV0::ExcessiveTickCount { .. })
         ));
     }
+
+    #[test]
+    fn persistence_enabled_trace_requires_and_accepts_its_bound_session() {
+        let (mut world, mut persistence) = WorldState::with_persistence(
+            ScriptBotsConfig {
+                world_width: 40,
+                world_height: 40,
+                food_cell_size: 10,
+                initial_food: 0.25,
+                food_respawn_interval: 0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 1,
+                rng_seed: Some(0x05E5_510A),
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(NullPersistence),
+        )
+        .expect("persistence-enabled characterization world");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("characterization founder is finite");
+
+        let direct_error = CharacterizationTraceV0::capture("direct-enabled-trace", &mut world, 1)
+            .expect_err("direct capture must not bypass the bound persistence session");
+        assert!(matches!(
+            direct_error,
+            CharacterizationTraceErrorV0::Step(WorldStepError::PersistenceSession(
+                PersistenceSessionError::SessionRequired { tick: 1 }
+            ))
+        ));
+        assert_eq!(
+            world.tick().0,
+            0,
+            "rejected direct capture mutated the world"
+        );
+        assert_eq!(persistence.last_admitted_tick(), None);
+
+        let trace = CharacterizationTraceV0::capture_with_scenario_and_session(
+            ScenarioIdentityV0::caller_seeded("session-enabled-trace"),
+            &mut world,
+            &mut persistence,
+            2,
+        )
+        .expect("bound session capture");
+        assert_eq!(
+            trace
+                .points
+                .iter()
+                .map(|point| point.tick)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            persistence.last_admitted_tick(),
+            Some(scriptbots_core::Tick(2))
+        );
+        assert!(!persistence.has_pending_batch());
+        assert!(persistence.fault().is_none());
+    }
 }
 
 pub mod command;
@@ -884,11 +972,14 @@ pub mod terminal;
 pub mod renderer {
     use anyhow::Result;
 
-    use crate::{CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld};
+    use crate::{
+        CommandDrain, CommandSubmit, ControlRuntime, SharedAnalytics, SharedWorld, WorldStepDriver,
+    };
 
     /// Shared context passed to renderer implementations.
     pub struct RendererContext<'a> {
         pub world: SharedWorld,
+        pub simulation_step: WorldStepDriver,
         pub analytics: SharedAnalytics,
         pub control_runtime: &'a ControlRuntime,
         pub command_drain: CommandDrain,
@@ -911,7 +1002,7 @@ pub use command::{
 pub use control::{
     ConfigSnapshot, ControlError, ControlHandle, HydrologySnapshot, KnobEntry, KnobKind, KnobUpdate,
 };
-pub use scriptbots_core::ControlCommand;
+pub use scriptbots_core::{ControlCommand, WorldStepDriver};
 pub use servers::{
     ConfigPatchRequest, ControlRuntime, ControlRuntimeStatus, ControlServerConfig,
     ControlServerReservation, DEFAULT_CONTROL_MCP_HTTP_ADDRESS, DEFAULT_CONTROL_REST_ADDRESS,

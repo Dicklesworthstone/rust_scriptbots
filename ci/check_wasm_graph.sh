@@ -74,8 +74,12 @@ wasm_graph() {
     | sed -E 's/ \(.*//' | sed -E 's/ v[0-9].*$//' | sort -u
 }
 
+# Native guards intentionally inspect the union of every target-specific edge.
+# Without `--target all`, a caller-level `CARGO_BUILD_TARGET` (including DSR's
+# pinned Apple Silicon target) silently changes the reviewed dependency universe.
 core_default_graph() {
   ( cd "$REPO_ROOT" && cargo tree --locked \
+      --target all \
       -p scriptbots-core \
       --edges normal \
       --prefix none --format '{p}' 2>/dev/null ) \
@@ -84,6 +88,7 @@ core_default_graph() {
 
 brain_ml_default_graph() {
   ( cd "$REPO_ROOT" && cargo tree --locked \
+      --target all \
       -p scriptbots-brain-ml \
       --edges normal,build,dev \
       --prefix none --format '{p}' 2>/dev/null ) \
@@ -92,6 +97,7 @@ brain_ml_default_graph() {
 
 app_default_graph() {
   ( cd "$REPO_ROOT" && cargo tree --locked \
+      --target all \
       -p scriptbots-app \
       --edges normal,build,dev \
       --prefix none --format '{p}' 2>/dev/null ) \
@@ -100,6 +106,7 @@ app_default_graph() {
 
 brain_ft_graph() {
   ( cd "$REPO_ROOT" && cargo tree --locked \
+      --target all \
       -p scriptbots-brain-ml --no-default-features --features brain-ft \
       --edges normal \
       --prefix none --format '{p}' 2>/dev/null ) \

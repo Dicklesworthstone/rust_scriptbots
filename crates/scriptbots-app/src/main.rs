@@ -4,7 +4,7 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     CharacterizationTraceV0, ControlServerConfig, ControlServerReservation, RunManifestV1,
-    ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
+    ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0, WorldStepDriver,
     precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
@@ -13,9 +13,9 @@ use scriptbots_app::{
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
-    AgentData, BrainRunner, NeuroflowActivationKind, RenderAutoExposureSettings, RenderSettings,
-    RenderTonemapMode, ReplayEventKind, ScriptBotsConfig, SmallRngStream, TickSummary,
-    WorldPersistence, WorldState,
+    AgentData, BrainRunner, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
+    PersistenceSessionError, RenderAutoExposureSettings, RenderSettings, RenderTonemapMode,
+    ReplayEventKind, ScriptBotsConfig, SmallRngStream, TickSummary, WorldPersistence, WorldState,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
@@ -42,6 +42,29 @@ use tracing::{debug, info, warn};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DEFAULT_BOOTSTRAP_TICKS: u64 = 120;
+
+type SharedPersistenceAdmission = Arc<Mutex<PersistenceAdmissionSession>>;
+
+fn persistence_step_driver(
+    world: &SharedWorld,
+    session: &SharedPersistenceAdmission,
+) -> WorldStepDriver {
+    let world = Arc::clone(world);
+    let session = Arc::clone(session);
+    Arc::new(move || {
+        let mut world = world
+            .lock()
+            .map_err(|error| PersistenceSessionError::Unavailable {
+                detail: format!("world mutex poisoned while stepping: {error}"),
+            })?;
+        let mut session = session
+            .lock()
+            .map_err(|error| PersistenceSessionError::Unavailable {
+                detail: format!("session mutex poisoned while stepping: {error}"),
+            })?;
+        session.step(&mut world)
+    })
+}
 
 fn main() -> Result<()> {
     let cli = AppCli::parse();
@@ -221,8 +244,9 @@ fn main() -> Result<()> {
             std::env::set_var("SCRIPTBOTS_RENDER_SAFE", "1");
         }
     }
-    let (world, analytics, mut storage_pipeline) =
+    let (world, persistence, analytics, mut storage_pipeline) =
         bootstrap_world(config, cli.storage, thresholds, cli.bootstrap_ticks, policy)?;
+    let simulation_step = persistence_step_driver(&world, &persistence);
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
     // finalized and the worker is acknowledged before this function returns.
@@ -315,6 +339,7 @@ fn main() -> Result<()> {
         let context = RendererContext {
             world: Arc::clone(&world),
             analytics: analytics.clone(),
+            simulation_step: Arc::clone(&simulation_step),
             control_runtime: &control_runtime,
             command_drain,
             command_submit,
@@ -331,7 +356,7 @@ fn main() -> Result<()> {
         }
     })();
     finish_with_storage(runtime_result, "runtime", || {
-        finalize_and_shutdown_storage(&world, &mut storage_pipeline)
+        finalize_and_shutdown_storage(&world, &persistence, &mut storage_pipeline)
     })
 }
 
@@ -373,20 +398,23 @@ struct StorageFinalization {
     required_tick: Option<u64>,
 }
 
-fn finalize_world_persistence(world: &mut WorldState) -> Result<StorageFinalization> {
+fn finalize_world_persistence(
+    world: &mut WorldState,
+    persistence: &mut PersistenceAdmissionSession,
+) -> Result<StorageFinalization> {
     let mut admitted_tail = false;
-    if world.persistence_fault().is_some() {
-        admitted_tail |= world
-            .retry_pending_persistence()
+    if persistence.fault().is_some() {
+        admitted_tail |= persistence
+            .retry_pending(world)
             .context("failed to re-admit the retained persistence batch before shutdown")?;
     }
 
-    match world.finalize_persistence() {
+    match persistence.finalize(world) {
         Ok(admitted) => admitted_tail |= admitted,
-        Err(first_error) => {
+        Err(first_error) if persistence.has_pending_batch() => {
             // Finalization itself can create the retained batch. Retry that
             // exact batch before closing worker admission; never reconstruct it.
-            let retried = world.retry_pending_persistence().with_context(|| {
+            let retried = persistence.retry_pending(world).with_context(|| {
                 format!(
                     "failed to re-admit the final partial persistence batch after its first rejection: {first_error}"
                 )
@@ -398,9 +426,10 @@ fn finalize_world_persistence(world: &mut WorldState) -> Result<StorageFinalizat
             }
             admitted_tail = true;
         }
+        Err(error) => return Err(error).context("failed to finalize persistence boundary"),
     }
 
-    if world.persistence_fault().is_some() || world.has_pending_persistence_batch() {
+    if persistence.fault().is_some() || persistence.has_pending_batch() {
         bail!("storage finalization left an unresolved retained persistence batch");
     }
 
@@ -410,19 +439,23 @@ fn finalize_world_persistence(world: &mut WorldState) -> Result<StorageFinalizat
         // shutdown contract. A runtime update may disable persistence after a
         // batch was admitted, and bootstrap origins can admit a real tick-zero
         // batch even though an untouched tick-zero world has no batch at all.
-        required_tick: world.last_admitted_persistence_tick().map(|tick| tick.0),
+        required_tick: persistence.last_admitted_tick().map(|tick| tick.0),
     })
 }
 
 fn finalize_and_shutdown_storage(
     world: &Arc<Mutex<WorldState>>,
+    persistence: &SharedPersistenceAdmission,
     pipeline: &mut StoragePipeline,
 ) -> Result<()> {
     let finalization = (|| -> Result<StorageFinalization> {
         let mut world = world
             .lock()
             .map_err(|error| anyhow::anyhow!("world mutex poisoned during shutdown: {error}"))?;
-        finalize_world_persistence(&mut world)
+        let mut persistence = persistence.lock().map_err(|error| {
+            anyhow::anyhow!("persistence session mutex poisoned during shutdown: {error}")
+        })?;
+        finalize_world_persistence(&mut world, &mut persistence)
     })();
     finalize_then_shutdown_storage(finalization, pipeline)
 }
@@ -532,7 +565,8 @@ fn init_tracing() {
 }
 
 fn run_characterization_v0(cli: &AppCli, config: ScriptBotsConfig, ticks: u64) -> Result<()> {
-    let mut world = WorldState::new(config)?;
+    let (mut world, mut persistence) =
+        WorldState::with_persistence(config, Box::new(NullPersistence))?;
     let brain_keys = install_brains(&mut world)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
@@ -554,7 +588,12 @@ fn run_characterization_v0(cli: &AppCli, config: ScriptBotsConfig, ticks: u64) -
         scenario.record_config_layer(&bytes);
     }
 
-    let trace = CharacterizationTraceV0::capture_with_scenario(scenario, &mut world, ticks)?;
+    let trace = CharacterizationTraceV0::capture_with_scenario_and_session(
+        scenario,
+        &mut world,
+        &mut persistence,
+        ticks,
+    )?;
     let mut bytes = trace.canonical_json_bytes()?;
     bytes.push(b'\n');
 
@@ -905,7 +944,12 @@ fn bootstrap_world(
     thresholds: ThresholdsOverride,
     bootstrap_ticks: u64,
     thread_policy: ThreadPolicy,
-) -> Result<(SharedWorld, SharedAnalytics, StoragePipeline)> {
+) -> Result<(
+    SharedWorld,
+    SharedPersistenceAdmission,
+    SharedAnalytics,
+    StoragePipeline,
+)> {
     #[cfg(feature = "neuro")]
     let _ = validated_neuroflow_config(&config)?;
 
@@ -952,14 +996,15 @@ fn bootstrap_world(
         info!("Selected volatile in-memory FrankenSQLite storage");
     }
     let analytics = pipeline.analytics_provider();
-    let mut world = match WorldState::with_persistence(config, Box::new(pipeline.sink())) {
-        Ok(world) => world,
-        Err(error) => {
-            return finish_with_storage(Err(error.into()), "world construction", || {
-                shutdown_storage(&mut pipeline).map(|_| ())
-            });
-        }
-    };
+    let (mut world, mut persistence) =
+        match WorldState::with_persistence(config, Box::new(pipeline.sink())) {
+            Ok(boundary) => boundary,
+            Err(error) => {
+                return finish_with_storage(Err(error.into()), "world construction", || {
+                    shutdown_storage(&mut pipeline).map(|_| ())
+                });
+            }
+        };
     let bootstrap_result = (|| -> Result<()> {
         let brain_keys = install_brains(&mut world)?.population;
         seed_agents(&mut world, &brain_keys)?;
@@ -976,7 +1021,7 @@ fn bootstrap_world(
         emit_run_manifest(&world, manifest_storage_path.as_deref(), thread_policy);
 
         for _ in 0..bootstrap_ticks {
-            world.step()?;
+            persistence.step(&mut world)?;
         }
 
         if let Some(summary) = world.history().last() {
@@ -998,12 +1043,17 @@ fn bootstrap_world(
     })();
     if let Err(error) = bootstrap_result {
         return finish_with_storage(Err(error), "world bootstrap", || {
-            let finalization = finalize_world_persistence(&mut world);
+            let finalization = finalize_world_persistence(&mut world, &mut persistence);
             finalize_then_shutdown_storage(finalization, &mut pipeline)
         });
     }
 
-    Ok((Arc::new(Mutex::new(world)), analytics, pipeline))
+    Ok((
+        Arc::new(Mutex::new(world)),
+        Arc::new(Mutex::new(persistence)),
+        analytics,
+        pipeline,
+    ))
 }
 
 fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
@@ -1657,6 +1707,7 @@ impl Renderer for GuiRenderer {
             Arc::new(ctx.control_runtime.health_probe());
         run_demo(
             Arc::clone(&ctx.world),
+            Arc::clone(&ctx.simulation_step),
             ctx.analytics.clone(),
             Arc::clone(&ctx.command_drain),
             Arc::clone(&ctx.command_submit),
@@ -1682,6 +1733,7 @@ impl Renderer for BevyRenderer {
             Arc::new(ctx.control_runtime.health_probe());
         let bevy_ctx = BevyRendererContext {
             world: Arc::clone(&ctx.world),
+            simulation_step: Arc::clone(&ctx.simulation_step),
             command_submit: Arc::clone(&ctx.command_submit),
             command_drain: Arc::clone(&ctx.command_drain),
             control_health: Some(control_health),
@@ -1977,18 +2029,20 @@ struct ReplayRun {
 
 fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
-    let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
+    let (mut world, mut persistence) =
+        WorldState::with_persistence(config.clone(), Box::new(collector))?;
     let brain_keys = install_brains(&mut world)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
     for _ in 0..tick_limit {
-        world.step()?;
+        persistence.step(&mut world)?;
     }
-    world
-        .finalize_persistence()
+    persistence
+        .finalize(&mut world)
         .context("failed to admit the final partial replay batch")?;
 
     drop(world);
+    drop(persistence);
 
     let records = Arc::try_unwrap(handle)
         .map_err(|_| anyhow::anyhow!("replay collector still in use"))?
@@ -2017,13 +2071,14 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
 
 fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
     let (collector, _handle) = ReplayCollector::new();
-    let mut world = WorldState::with_persistence(config.clone(), Box::new(collector))?;
+    let (mut world, mut persistence) =
+        WorldState::with_persistence(config.clone(), Box::new(collector))?;
     let brain_keys = install_brains(&mut world)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
     let start = Instant::now();
     for _ in 0..tick_limit {
-        world.step()?;
+        persistence.step(&mut world)?;
     }
     let elapsed = start.elapsed();
     let secs = elapsed.as_secs_f64().max(1e-9);
@@ -2073,25 +2128,28 @@ fn profile_world_steps_with_storage(
         )?,
     };
 
-    let mut world = match WorldState::with_persistence(config.clone(), Box::new(pipeline.sink())) {
-        Ok(world) => world,
-        Err(error) => {
-            return finish_with_storage(Err(error.into()), "profile world construction", || {
-                shutdown_storage(&mut pipeline).map(|_| ())
-            });
-        }
-    };
+    let (mut world, mut persistence) =
+        match WorldState::with_persistence(config.clone(), Box::new(pipeline.sink())) {
+            Ok(boundary) => boundary,
+            Err(error) => {
+                return finish_with_storage(
+                    Err(error.into()),
+                    "profile world construction",
+                    || shutdown_storage(&mut pipeline).map(|_| ()),
+                );
+            }
+        };
     let start = Instant::now();
     let profile_result = (|| -> Result<()> {
         let brain_keys = install_brains(&mut world)?.population;
         seed_agents(&mut world, &brain_keys)?;
         for _ in 0..tick_limit {
-            world.step()?;
+            persistence.step(&mut world)?;
         }
         Ok(())
     })();
     finish_with_storage(profile_result, "storage profiling", || {
-        let finalization = finalize_world_persistence(&mut world);
+        let finalization = finalize_world_persistence(&mut world, &mut persistence);
         finalize_then_shutdown_storage(finalization, &mut pipeline)
     })?;
     let elapsed = start.elapsed();
@@ -3089,7 +3147,7 @@ mod tests {
         }
 
         let batches = Arc::new(Mutex::new(Vec::new()));
-        let mut world = WorldState::with_persistence(
+        let (mut world, mut persistence) = WorldState::with_persistence(
             ScriptBotsConfig {
                 persistence_interval: 1,
                 population_minimum: 0,
@@ -3106,7 +3164,9 @@ mod tests {
         let installed = install_brains(&mut world).expect("install seed brains");
         seed_agents(&mut world, &installed.population).expect("seed founding population");
 
-        world.step().expect("persist seeded lifecycle records");
+        persistence
+            .step(&mut world)
+            .expect("persist seeded lifecycle records");
 
         let batches = batches.lock().expect("birth capture lock");
         let batch = batches.last().expect("first persistence cadence batch");
@@ -3449,14 +3509,15 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
         let mut pipeline = StoragePipeline::memory().expect("volatile pipeline");
-        let mut world = WorldState::with_persistence(config, Box::new(pipeline.sink()))
-            .expect("world with persistence");
+        let (mut world, mut persistence) =
+            WorldState::with_persistence(config, Box::new(pipeline.sink()))
+                .expect("world with persistence");
         world
             .try_spawn_agent(AgentData::default())
             .expect("seeded bootstrap arrival");
 
-        let finalization =
-            finalize_world_persistence(&mut world).expect("tick-zero origin finalization");
+        let finalization = finalize_world_persistence(&mut world, &mut persistence)
+            .expect("tick-zero origin finalization");
         assert!(finalization.admitted_tail);
         assert_eq!(finalization.required_tick, Some(0));
 
@@ -3475,11 +3536,12 @@ mod tests {
             ..ScriptBotsConfig::default()
         };
         let mut pipeline = StoragePipeline::memory().expect("volatile pipeline");
-        let mut world = WorldState::with_persistence(config, Box::new(pipeline.sink()))
-            .expect("world with persistence");
-        world.step().expect("cadence admission");
+        let (mut world, mut persistence) =
+            WorldState::with_persistence(config, Box::new(pipeline.sink()))
+                .expect("world with persistence");
+        persistence.step(&mut world).expect("cadence admission");
         assert_eq!(
-            world.last_admitted_persistence_tick(),
+            persistence.last_admitted_tick(),
             Some(scriptbots_core::Tick(1))
         );
 
@@ -3489,8 +3551,8 @@ mod tests {
             .apply_config_update(disabled)
             .expect("disable persistence after admission");
 
-        let finalization =
-            finalize_world_persistence(&mut world).expect("shutdown after disabling persistence");
+        let finalization = finalize_world_persistence(&mut world, &mut persistence)
+            .expect("shutdown after disabling persistence");
         assert!(!finalization.admitted_tail);
         assert_eq!(finalization.required_tick, Some(1));
 
@@ -3895,14 +3957,17 @@ activation = "Sigmoid"
             let mut pipeline =
                 StoragePipeline::create_new_file_with_thresholds(&db_str, 1, 1, 1, 1)
                     .expect("pipeline");
-            let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))
-                .expect("world");
+            let (mut world, mut persistence) =
+                WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))
+                    .expect("world");
             let keys = install_brains(&mut world).expect("install replay-fixture brains");
             seed_agents(&mut world, &keys.population).expect("seed replay-fixture brains");
             for _ in 0..16 {
-                world.step().expect("durable replay fixture step");
+                persistence
+                    .step(&mut world)
+                    .expect("durable replay fixture step");
             }
-            let finalization = finalize_world_persistence(&mut world);
+            let finalization = finalize_world_persistence(&mut world, &mut persistence);
             finalize_then_shutdown_storage(finalization, &mut pipeline)
                 .expect("durable replay fixture finalization and shutdown");
         }
@@ -3949,14 +4014,17 @@ activation = "Sigmoid"
             rng_seed: Some(0xC105_E0A1),
             ..ScriptBotsConfig::default()
         };
-        let mut initial_world =
+        let (mut initial_world, mut initial_persistence) =
             WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
-        initial_world.step().expect("non-boundary tick");
+        initial_persistence
+            .step(&mut initial_world)
+            .expect("non-boundary tick");
         let world = Arc::new(Mutex::new(initial_world));
+        let persistence = Arc::new(Mutex::new(initial_persistence));
 
         let operation: Result<()> = Err(anyhow::anyhow!("injected renderer failure"));
         let error = finish_with_storage(operation, "runtime", || {
-            finalize_and_shutdown_storage(&world, &mut pipeline)
+            finalize_and_shutdown_storage(&world, &persistence, &mut pipeline)
         })
         .expect_err("runtime error must survive acknowledged storage cleanup");
         assert!(format!("{error:#}").contains("injected renderer failure"));
@@ -4018,22 +4086,24 @@ activation = "Sigmoid"
         };
 
         let accepted_batches = Arc::new(Mutex::new(Vec::new()));
-        let mut accepted = make_world(1, Arc::clone(&accepted_batches));
-        accepted.step().expect("non-boundary tick");
-        accepted
-            .finalize_persistence()
+        let (mut accepted, mut accepted_persistence) = make_world(1, Arc::clone(&accepted_batches));
+        accepted_persistence
+            .step(&mut accepted)
+            .expect("non-boundary tick");
+        accepted_persistence
+            .finalize(&mut accepted)
             .expect_err("first tail admission is rejected and retained");
         let mut disabled = accepted.config().clone();
         disabled.persistence_interval = 0;
         accepted
             .apply_config_update(disabled)
             .expect("disable persistence while the exact tail is retained");
-        let finalization = finalize_world_persistence(&mut accepted)
+        let finalization = finalize_world_persistence(&mut accepted, &mut accepted_persistence)
             .expect("exact retained final tail should succeed on bounded retry");
         assert!(finalization.admitted_tail);
         assert_eq!(finalization.required_tick, Some(1));
-        assert!(!accepted.has_pending_persistence_batch());
-        assert!(accepted.persistence_fault().is_none());
+        assert!(!accepted_persistence.has_pending_batch());
+        assert!(accepted_persistence.fault().is_none());
         let batches = accepted_batches.lock().expect("accepted batch log");
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].epoch, batches[1].epoch);
@@ -4048,12 +4118,14 @@ activation = "Sigmoid"
         drop(batches);
 
         let rejected_batches = Arc::new(Mutex::new(Vec::new()));
-        let mut rejected = make_world(2, Arc::clone(&rejected_batches));
-        rejected.step().expect("non-boundary tick");
+        let (mut rejected, mut rejected_persistence) = make_world(2, Arc::clone(&rejected_batches));
+        rejected_persistence
+            .step(&mut rejected)
+            .expect("non-boundary tick");
         let mut pipeline = StoragePipeline::memory().expect("cleanup pipeline");
         let operation: Result<()> = Err(anyhow::anyhow!("injected runtime failure"));
         let error = finish_with_storage(operation, "runtime", || {
-            let finalization = finalize_world_persistence(&mut rejected);
+            let finalization = finalize_world_persistence(&mut rejected, &mut rejected_persistence);
             finalize_then_shutdown_storage(finalization, &mut pipeline)
         })
         .expect_err("second rejection and runtime error must both remain observable");
@@ -4064,8 +4136,8 @@ activation = "Sigmoid"
             pipeline.shutdown().is_err(),
             "failed finalization must still close the storage worker"
         );
-        assert!(rejected.has_pending_persistence_batch());
-        assert!(rejected.persistence_fault().is_some());
+        assert!(rejected_persistence.has_pending_batch());
+        assert!(rejected_persistence.fault().is_some());
         let batches = rejected_batches.lock().expect("rejected batch log");
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].epoch, batches[1].epoch);

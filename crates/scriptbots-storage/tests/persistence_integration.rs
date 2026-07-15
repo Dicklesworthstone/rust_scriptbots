@@ -65,14 +65,16 @@ fn storage_persists_metrics_roundtrip() {
     };
 
     {
-        let mut world =
+        let (mut world, mut persistence) =
             WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
         world
             .try_spawn_agent(AgentData::default())
             .expect("default agent is finite");
 
         for _ in 0..5 {
-            world.step().expect("file-backed persistence step");
+            persistence
+                .step(&mut world)
+                .expect("file-backed persistence step");
         }
     }
     let shutdown = pipeline.shutdown().expect("durable pipeline shutdown");

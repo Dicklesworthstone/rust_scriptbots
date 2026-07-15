@@ -369,7 +369,7 @@ pub enum CommandStatus {
 
 The concrete channel types may use Asupersync, but the protocol is not coupled to a runtime. A synchronous `HostCore`/`SimulationEngine` owns command/state transitions under injected time. Native Asupersync or a dedicated scheduler drives it; a browser adapter can drive the same state machine without requestAnimationFrame becoming scientific time. Async infrastructure handles lifecycle, control I/O, storage, and blocking isolation around the synchronous state machine.
 
-This ownership claim has a strict prerequisite: core stepping must stop performing external side effects. Today `WorldState` owns `Box<dyn WorldPersistence>`, stores simulation-command queues, and calls persistence from inside `step`. Before the host is introduced:
+This ownership claim had a strict prerequisite: core stepping had to stop performing external side effects. At the plan snapshot, `WorldState` owned `Box<dyn WorldPersistence>`, stored simulation-command queues, and called persistence from inside `step`. The `bd-2z0.4.2` extraction now removes those responsibilities behind the following boundary:
 
 - playback/control queue ownership moves out of core;
 - `WorldState::step` stops calling storage or other external services;
@@ -2076,19 +2076,23 @@ Executable evidence on source baseline `a4dce8fb9635834d387e0cd353d2d2f6670abf19
 - `target_command_truth_table_is_complete_and_self_consistent` checks every row above, including
   Step/Resume order, revision deltas, application counts, and journal counts.
 
-#### 2.2 extract core side effects [Currently In Progress — `bd-2z0.4.2`]
+#### 2.2 extract core side effects [Completed — `bd-2z0.4.2`]
 
 - remove simulation-command queue ownership from `WorldState`; **completed in integration slice 3**
 - make core step return deterministic `StepOutcome`/domain deltas; **completed in integration slice 2**
-- remove synchronous `WorldPersistence::on_tick` I/O from the scientific transition;
+- remove synchronous `WorldPersistence::on_tick` I/O from the scientific transition; **completed and batch-verified**
 - keep current summary/event accumulation scientifically correct;
 - prove the same fixed trace before/after the boundary.
 
 Current extraction status: application drains expose the original ordered `ControlCommand` stream,
 core returns validated/normalized playback as an explicit disposition, and GPUI, TUI, and Bevy no
-longer use a hidden world-owned transport queue. The fixed six-point trace remains unchanged. The
-remaining slice moves the sink, exact retained batch/error, and admitted watermark into an external
-admission session while preserving a payload-free core boundary marker and all mutation-sealing rules.
+longer use a hidden world-owned transport queue. The current tree also moves the sink, exact retained
+batch/error, and admitted watermark into an external admission session while preserving a payload-free
+core boundary marker and all mutation-sealing rules. TUI, GPUI, Bevy, headless, profiling, and WASM
+step through application-owned drivers bound to the matching session. The fixed six-point trace remains
+unchanged. Centralized DSR run `session-boundary-union5-20260715t023800z` verified the full union:
+formatter, scoped UBS, all touched-crate Clippy and tests, WASM graph/self-test and target build,
+the fixed trace golden, and scalar/SIMD/parallel determinism lanes all passed.
 
 **Exit:** core performs one deterministic state transition with no command transport or storage I/O.
 

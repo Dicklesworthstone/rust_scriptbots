@@ -11,7 +11,8 @@ use rand::{Rng, SeedableRng};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
-    Generation, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, Velocity, WorldState,
+    Generation, INPUT_SIZE, NullPersistence, OUTPUT_SIZE, PersistenceAdmissionSession, Position,
+    ScriptBotsConfig, Velocity, WorldState,
 };
 #[cfg(test)]
 use scriptbots_core::{
@@ -29,6 +30,7 @@ pub struct SimHandle {
 
 struct Simulation {
     world: WorldState,
+    persistence: PersistenceAdmissionSession,
     spec: SimSpec,
     mlp_key: Option<u64>,
 }
@@ -102,10 +104,12 @@ impl SimSpec {
 
 impl Simulation {
     fn new(spec: SimSpec) -> Result<Self> {
-        let world = WorldState::new(spec.config())
-            .context("failed to initialize ScriptBots world state")?;
+        let (world, persistence) =
+            WorldState::with_persistence(spec.config(), Box::new(NullPersistence))
+                .context("failed to initialize ScriptBots world state")?;
         let mut sim = Self {
             world,
+            persistence,
             spec,
             mlp_key: None,
         };
@@ -115,8 +119,11 @@ impl Simulation {
 
     fn reset(&mut self, seed: Option<u64>) -> Result<()> {
         let spec = self.spec.with_seed(seed);
-        self.world = WorldState::new(spec.config())
-            .context("failed to rebuild ScriptBots world state during reset")?;
+        let (world, persistence) =
+            WorldState::with_persistence(spec.config(), Box::new(NullPersistence))
+                .context("failed to rebuild ScriptBots world state during reset")?;
+        self.world = world;
+        self.persistence = persistence;
         self.mlp_key = None;
         self.spec = spec;
         self.seed_population()?;
@@ -125,7 +132,7 @@ impl Simulation {
 
     fn tick(&mut self, steps: u32) -> Result<SimulationSnapshot> {
         for step_index in 0..steps {
-            self.world.step().with_context(|| {
+            self.persistence.step(&mut self.world).with_context(|| {
                 format!(
                     "simulation failed during WASM step {} of {steps}",
                     step_index + 1
@@ -608,7 +615,7 @@ mod tests {
 
         let capture = |strategy, default_brain| {
             let batches = Arc::new(Mutex::new(Vec::new()));
-            let mut world = WorldState::with_persistence(
+            let (mut world, mut persistence) = WorldState::with_persistence(
                 ScriptBotsConfig {
                     world_width: 200,
                     world_height: 200,
@@ -629,7 +636,9 @@ mod tests {
             seed_agents(&mut world, 3, strategy, default_brain, &mut mlp_key)
                 .expect("seed web agents");
             let random_stream = world.random_stream_state();
-            world.step().expect("persist seeded lifecycle records");
+            persistence
+                .step(&mut world)
+                .expect("persist seeded lifecycle records");
             let births = batches
                 .lock()
                 .expect("birth capture lock")
@@ -664,6 +673,53 @@ mod tests {
             wander_random_stream, unbound_random_stream,
             "installing per-agent wander runners and refreshing their seeded origin records must not consume the world RNG"
         );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn reset_replaces_the_matching_persistence_session_and_remains_step_capable() {
+        let mut simulation = Simulation::new(SimSpec::new(
+            ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 20,
+                persistence_interval: 1,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                rng_seed: Some(11),
+                ..ScriptBotsConfig::default()
+            },
+            3,
+            Some(11),
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            None,
+        ))
+        .expect("persistence-enabled web simulation");
+
+        let before_reset = simulation.tick(1).expect("pre-reset session step");
+        assert_eq!(before_reset.tick, 1);
+        assert_eq!(
+            simulation.persistence.last_admitted_tick(),
+            Some(scriptbots_core::Tick(1))
+        );
+
+        simulation.reset(Some(22)).expect("reset web simulation");
+        assert_eq!(simulation.world.tick().0, 0);
+        assert_eq!(simulation.world.config().rng_seed, Some(22));
+        assert_eq!(simulation.world.agent_count(), 3);
+        assert_eq!(simulation.persistence.last_admitted_tick(), None);
+
+        let after_reset = simulation
+            .tick(2)
+            .expect("replacement session must remain bound to the replacement world");
+        assert_eq!(after_reset.tick, 2);
+        assert_eq!(
+            simulation.persistence.last_admitted_tick(),
+            Some(scriptbots_core::Tick(2))
+        );
+        assert!(!simulation.persistence.has_pending_batch());
+        assert!(simulation.persistence.fault().is_none());
     }
 
     #[wasm_bindgen_test]

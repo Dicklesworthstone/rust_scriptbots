@@ -22,7 +22,8 @@ use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
     AgentId, ControlCommand, ControlDisposition, IndicatorState, NUM_EYES, OutputChannel,
     OutputsExt, RenderSettings, RenderTonemapMode, SelectionMode, SelectionState, SelectionUpdate,
-    SimulationCommand, TerrainKind, TraitModifiers, WorldState, apply_control_command,
+    SimulationCommand, TerrainKind, TraitModifiers, WorldState, WorldStepDriver,
+    apply_control_command,
 };
 use slotmap::Key;
 use std::{
@@ -46,6 +47,7 @@ pub type ControlHealthFn = Arc<dyn Fn() -> std::result::Result<(), String> + Sen
 
 pub struct BevyRendererContext {
     pub world: Arc<Mutex<WorldState>>,
+    pub simulation_step: WorldStepDriver,
     pub command_submit: CommandSubmitFn,
     pub command_drain: CommandDrainFn,
     pub control_health: Option<ControlHealthFn>,
@@ -234,6 +236,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
 
     let BevyRendererContext {
         world,
+        simulation_step,
         command_submit,
         command_drain,
         control_health,
@@ -293,6 +296,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
 
     let simulation_worker = match spawn_simulation_driver(
         world_for_sim,
+        simulation_step,
         drain_for_thread,
         controls_for_thread.clone(),
         Arc::clone(&running_sim),
@@ -4348,6 +4352,7 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Resu
 
 fn spawn_simulation_driver(
     world: Arc<Mutex<WorldState>>,
+    simulation_step: WorldStepDriver,
     command_drain: CommandDrainFn,
     controls: SimulationControl,
     running: Arc<AtomicBool>,
@@ -4357,97 +4362,92 @@ fn spawn_simulation_driver(
         .name("scriptbots-bevy-simulation".into())
         .spawn(move || {
             run_reported_worker("simulation worker", &worker_failures, &running, || {
-            let mut last = Instant::now();
-            let mut accumulator = 0.0f32;
+                let mut last = Instant::now();
+                let mut accumulator = 0.0f32;
 
-            while running.load(Ordering::Acquire) {
-                let now = Instant::now();
-                let mut dt = (now - last).as_secs_f32();
-                last = now;
-                if !dt.is_finite() || dt > 0.25 {
-                    dt = 0.25;
-                }
+                while running.load(Ordering::Acquire) {
+                    let now = Instant::now();
+                    let mut dt = (now - last).as_secs_f32();
+                    last = now;
+                    if !dt.is_finite() || dt > 0.25 {
+                        dt = 0.25;
+                    }
 
-                let mut latched_step_failure = None;
-                {
-                    let mut world_guard = world.lock().map_err(|error| {
-                        anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
-                    })?;
-                    if let Some(error) = world_guard.latched_step_error() {
-                        latched_step_failure = Some(format!(
-                            "Simulation stopped after a terminal step failure: {error}"
-                        ));
-                    } else {
-                        for command in (command_drain.as_ref())() {
-                            match apply_control_command(&mut world_guard, command) {
-                                Ok(ControlDisposition::WorldApplied) => {}
-                                Ok(ControlDisposition::Playback(command)) => {
-                                    controls.update(|state| {
-                                        apply_simulation_command_to_state(state, &command)
-                                    });
-                                }
-                                Err(error) => {
-                                    warn!(%error, "Bevy rejected a drained control command");
+                    let mut latched_step_failure = None;
+                    {
+                        let mut world_guard = world.lock().map_err(|error| {
+                            anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
+                        })?;
+                        if let Some(error) = world_guard.latched_step_error() {
+                            latched_step_failure = Some(format!(
+                                "Simulation stopped after a terminal step failure: {error}"
+                            ));
+                        } else {
+                            for command in (command_drain.as_ref())() {
+                                match apply_control_command(&mut world_guard, command) {
+                                    Ok(ControlDisposition::WorldApplied) => {}
+                                    Ok(ControlDisposition::Playback(command)) => {
+                                        controls.update(|state| {
+                                            apply_simulation_command_to_state(state, &command)
+                                        });
+                                    }
+                                    Err(error) => {
+                                        warn!(%error, "Bevy rejected a drained control command");
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if let Some(reason) = latched_step_failure {
-                    controls.update(|state| {
-                        apply_auto_pause_to_state(state, &reason);
-                    });
-                    accumulator = 0.0;
-                    thread::sleep(Duration::from_millis(4));
-                    continue;
-                }
-
-                let (paused, speed, step_once) = {
-                    let mut paused = false;
-                    let mut speed = 1.0;
-                    let mut step_once = false;
-                    controls.update(|state| {
-                        paused = state.paused;
-                        speed = state.speed_multiplier.clamp(MIN_SPEED, MAX_SPEED);
-                        if state.step_requested {
-                            step_once = true;
-                            state.step_requested = false;
-                            state.paused = true;
-                            state.auto_pause_reason = None;
-                        }
-                    });
-                    (paused, speed, step_once)
-                };
-
-                if paused && !step_once {
-                    thread::sleep(Duration::from_millis(4));
-                    continue;
-                }
-
-                if !step_once {
-                    accumulator += dt * speed.max(0.0);
-                    let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
-                    accumulator = accumulator.min(max_accumulator);
-                }
-
-                let mut steps = if step_once {
-                    accumulator = 0.0;
-                    1
-                } else {
-                    let mut queued = 0usize;
-                    while accumulator >= SIM_TICK_INTERVAL && queued < MAX_SIM_STEPS_PER_FRAME {
-                        accumulator -= SIM_TICK_INTERVAL;
-                        queued += 1;
+                    if let Some(reason) = latched_step_failure {
+                        controls.update(|state| {
+                            apply_auto_pause_to_state(state, &reason);
+                        });
+                        accumulator = 0.0;
+                        thread::sleep(Duration::from_millis(4));
+                        continue;
                     }
-                    queued
-                };
 
-                {
-                    let mut world_guard = world.lock().map_err(|error| {
-                        anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
-                    })?;
+                    let (paused, speed, step_once) = {
+                        let mut paused = false;
+                        let mut speed = 1.0;
+                        let mut step_once = false;
+                        controls.update(|state| {
+                            paused = state.paused;
+                            speed = state.speed_multiplier.clamp(MIN_SPEED, MAX_SPEED);
+                            if state.step_requested {
+                                step_once = true;
+                                state.step_requested = false;
+                                state.paused = true;
+                                state.auto_pause_reason = None;
+                            }
+                        });
+                        (paused, speed, step_once)
+                    };
+
+                    if paused && !step_once {
+                        thread::sleep(Duration::from_millis(4));
+                        continue;
+                    }
+
+                    if !step_once {
+                        accumulator += dt * speed.max(0.0);
+                        let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
+                        accumulator = accumulator.min(max_accumulator);
+                    }
+
+                    let mut steps = if step_once {
+                        accumulator = 0.0;
+                        1
+                    } else {
+                        let mut queued = 0usize;
+                        while accumulator >= SIM_TICK_INTERVAL && queued < MAX_SIM_STEPS_PER_FRAME {
+                            accumulator -= SIM_TICK_INTERVAL;
+                            queued += 1;
+                        }
+                        queued
+                    };
+
                     if steps == 0 && !step_once && speed <= MIN_SPEED {
-                        drop(world_guard);
                         thread::sleep(Duration::from_millis(4));
                         continue;
                     }
@@ -4458,7 +4458,7 @@ fn spawn_simulation_driver(
 
                     let mut step_failure = None;
                     for _ in 0..steps {
-                        if let Err(error) = world_guard.step() {
+                        if let Err(error) = (simulation_step)() {
                             step_failure = Some(format!(
                                 "Simulation stopped after a terminal step failure: {error}"
                             ));
@@ -4466,10 +4466,17 @@ fn spawn_simulation_driver(
                         }
                     }
 
-                    let control = world_guard.config().control.clone();
-                    let agent_count = world_guard.agent_count();
-                    let max_age = world_guard.last_max_age();
-                    let spike_hits = world_guard.last_spike_hits();
+                    let (control, agent_count, max_age, spike_hits) = {
+                        let world_guard = world.lock().map_err(|error| {
+                            anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
+                        })?;
+                        (
+                            world_guard.config().control.clone(),
+                            world_guard.agent_count(),
+                            world_guard.last_max_age(),
+                            world_guard.last_spike_hits(),
+                        )
+                    };
 
                     let step_failed = step_failure.is_some();
                     let mut reason = step_failure;
@@ -4502,13 +4509,10 @@ fn spawn_simulation_driver(
                         });
                     }
 
-                    drop(world_guard);
+                    if steps == 0 {
+                        thread::sleep(Duration::from_millis(2));
+                    }
                 }
-
-                if steps == 0 {
-                    thread::sleep(Duration::from_millis(2));
-                }
-            }
                 Ok(())
             })
         })

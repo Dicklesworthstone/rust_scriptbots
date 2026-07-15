@@ -60,22 +60,23 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 ┌──────────────────────────────────────────▼──────────────────────────────────────────┐
 │                  scriptbots-core (WorldState, Tick Pipeline)                        │
 │  - SoA AgentColumns · Spatial index (scriptbots-index)                              │
-│  - Deterministic: sense → brains → actuation → persistence hooks                    │
+│  - Deterministic: sense → brains → actuation → persistence projection               │
 └───────────────┬───────────────────────────┬───────────────────────────┬─────────────┘
-                │ AgentSnapshots            │ PersistenceBatch          │ ControlCommand ↑ / disposition ↓
-                │                           │                           │
-        ┌───────▼────────┐           ┌──────▼──────────┐          ┌─────▼──────────┐
-        │ Renderer (GUI) │           │ scriptbots-     │          │ Application   │
-        │ GPUI window    │           │ storage         │          │ command driver│
-        │ or Terminal TUI│           │  StoragePipeline│          └─────┬───────────┘
-        │ (console text) │           │  (async worker) │                │
-        └───────┬────────┘           └──────┬──────────┘                │
-                │ World snapshots     └──────┬──────────┘                │
-                │ HUD metrics                 │                          │
-        ┌───────▼────────┐                   │                           │
-        │ scriptbots-    │                   ▼                           │
-        │ render         │       ┌──────────────────────┐                │
-        └────────────────┘       │ FrankenSQLite        │                │
+                │ AgentSnapshots            │ StepOutcome                │ ControlCommand ↑ / disposition ↓
+                │                           │ + Arc<PersistenceBatch>     │
+        ┌───────▼────────┐          ┌────────▼───────────────┐     ┌─────▼──────────┐
+        │ Renderer (GUI) │          │ Application runtime    │     │ Application   │
+        │ GPUI window    │          │ PersistenceAdmission   │     │ command driver│
+        │ or Terminal TUI│          │ Session / step driver  │     └─────┬───────────┘
+        │ (console text) │          └────────┬───────────────┘           │
+        └───────┬────────┘                   │ admitted batch             │
+                │ World snapshots   ┌────────▼───────────┐               │
+                │ HUD metrics       │ scriptbots-storage │               │
+        ┌───────▼────────┐          │ StoragePipeline    │               │
+        │ scriptbots-    │          └────────┬───────────┘               │
+        │ render         │                   ▼                            │
+        └────────────────┘       ┌──────────────────────┐                │
+                                 │ FrankenSQLite        │                │
                                  │ run-name.sqlite      │                │
                                  └──────────────────────┘                │
                                                                           │
@@ -498,7 +499,7 @@ Deterministic, staged tick pipeline (seeded RNG; explicit staged ordering):
 - **Explicit order of effects**: floating-point reductions and removals are staged. The current dense agent order can still affect reductions, parent selection, and RNG assignment, so `WorldDigestV1` records that order by stable `AgentUid` instead of claiming it is irrelevant. Canonicalizing every execution/spawn stage by UID is tracked by `bd-2z0.3.14`.
 - **Restorable RNG state**: the world owns a versioned, restorable random stream whose exact state enters V1. Draw assignment still follows current stage/execution order; independent domain-separated agent streams remain roadmap work rather than a claimed property.
 - **Feature-gated parallelism**: `scriptbots-core` defaults to `parallel` (Rayon), while web builds disable it for single-thread determinism.
-- **Completed-boundary outcome seam (migration in progress)**: `WorldState::step_outcome()` returns a `StepCompletion` whose `StepOutcome` owns the exact current summary, lifecycle/combat records, resource tick, config revision, events, and persistence projection without calling the installed sink. Completed population faults travel beside that outcome instead of discarding it. The clock-free traced outcome has the same boundary; the profiled outcome uses the core-only `scriptbots.world-step-profile.v3` timing contract. The hidden playback transport queue has been retired: application drains now return one ordered `Vec<ControlCommand>`, and core command application returns normalized playback as an explicit driver-owned disposition instead of storing it in `WorldState`. The legacy `step`, `step_traced`, and `step_profiled` wrappers still admit the moved batch (`step_profiled` retains the reviewed v2 timing contract), and `WorldState` still owns the persistence sink/session until the final `bd-2z0.4.2` extraction slice lands.
+- **Completed-boundary outcome and admission seam**: `WorldState` owns deterministic accumulators plus a payload-free `Open`/`Pending`/`Sealed` boundary marker; it no longer owns a sink, retry payload, acknowledgement error, or admission watermark. A one-lifetime `PersistenceAdmissionSession` owns those external concerns. Its step APIs stage the exact immutable `Arc<PersistenceBatch>` before returning, retain that same allocation across definite and indeterminate failures, and seal the world only after acknowledgement. Direct `WorldState` stepping is intentionally limited to persistence-disabled worlds. Application-owned drivers route TUI, GPUI, Bevy, headless, profiling, and WASM ticks through the matching session without exposing session state to renderers. Completed population faults still travel beside the full `StepOutcome`; the clock-free traced outcome keeps the same boundary, and profiled session stepping retains the reviewed v2 timing contract. The hidden playback transport queue is also retired: application drains return one ordered `Vec<ControlCommand>`, while core returns normalized playback as an explicit driver-owned disposition.
 
 #### Canonical digest and first-divergence trace
 
@@ -613,7 +614,7 @@ Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baselin
 - **Two storage targets:** `--storage file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a generated `runs/scriptbots-<unix-ms>-<pid>.sqlite` and prints the selected run database; it refuses reuse or stale sidecars. `--storage memory` opens volatile `:memory:` through the same implementation.
 - **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) is the only application path that opens an existing run database for mutation. It holds the OS writer lease, binds recovery to the identity of the already-open VFS handle, verifies the exact structural schema fingerprint plus the supported migration sequence and persistence invariants, and refuses missing, replaced, unrelated, symlink, and multiply-linked files before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. This is persistence repair, not world resume.
 - **Thread-confined, single-writer connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. File writers hold a nonblocking OS advisory lease on a persistent companion lock file; process-local path/inode tracking is only defense in depth. No connection-owning value is shared through `Arc<Mutex<_>>`.
-- **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. Configurable `StorageDeadlines` bound startup, admission-gate, command-enqueue, receipt, flush, and shutdown acknowledgement waits, but cannot cancel a database call already executing on the owner thread or bound the supervised reaper. Validation, closed-gate, queue-send, and rolled-back outbox failures are definitely `NotAdmitted`; the world retains the exact completed batch, latches the fault, and blocks later science ticks until explicit retry succeeds. A lost or timed-out acknowledgement remains typed as `Indeterminate` at the world boundary, but retrying the unchanged canonical payload is idempotent and reuses its stable batch ID; a conflicting payload is rejected by its BLAKE3 identity. Timed-out shutdown retains the exact pending receipt and worker handle for retry; dropping the controller hands both to an independent supervised reaper rather than abandoning connection ownership. `submit_with_receipt` returns the batch ID after the exact payload enters the worker outbox and reports `Durable` for a file database or `CommittedVolatile` for memory. That receipt proves admission, not scientific-table application. Remaining direct-write/root-cause unification is tracked by `bd-2z0.8.9.4.4`.
+- **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. Configurable `StorageDeadlines` bound startup, admission-gate, command-enqueue, receipt, flush, and shutdown acknowledgement waits, but cannot cancel a database call already executing on the owner thread or bound the supervised reaper. Validation, closed-gate, queue-send, and rolled-back outbox failures are definitely `NotAdmitted`; the external admission session retains the exact completed batch and acknowledgement fault while the world's payload-free `Pending` marker blocks later science ticks until explicit retry succeeds. A lost or timed-out acknowledgement remains typed as `Indeterminate` at the world boundary, but retrying the unchanged canonical payload is idempotent and reuses its stable batch ID; a conflicting payload is rejected by its BLAKE3 identity. Timed-out shutdown retains the exact pending receipt and worker handle for retry; dropping the controller hands both to an independent supervised reaper rather than abandoning connection ownership. `submit_with_receipt` returns the batch ID after the exact payload enters the worker outbox and reports `Durable` for a file database or `CommittedVolatile` for memory. That receipt proves admission, not scientific-table application. Remaining direct-write/root-cause unification is tracked by `bd-2z0.8.9.4.4`.
 - **Durable recovery and watermarks:** each file-backed batch advances three monotonic, separately queryable prefixes: `admitted` after the outbox transaction, `applied` in the same transaction as all scientific-table rows, and `durable` in a later marker transaction that permits outbox-payload compaction. Startup replays admitted-but-unapplied payloads in order and finalizes applied-but-not-durable batches without duplicating rows. Exact duplicate retries reuse the original batch identity; a different payload for an already admitted tick is rejected. Flush and shutdown receipts include all three watermarks.
 - **Complete typed ancestry origins:** every agent insertion emits exactly one immutable `born`, `seeded`, or `injected` origin row under a globally unique stable agent UID. Only `born` rows have a birth ordinal or contribute to demographic birth totals; ancestry and offline rebuilds consume all three origins plus exact death causes. Completing any scientific tick while persistence is disabled creates a history gap, even when that tick has no lifecycle or replay rows, because its summary, metrics, and snapshot were not admitted. That world refuses to re-enable persistence; start a new world and storage identity instead of creating a run database with a hidden interval.
 - **Lock-free frontend reads:** the worker atomically publishes immutable `Arc<AnalyticsSnapshot>` latest-value state. GUI, TUI, and API consumers load it without a mutex and may skip stale snapshots; they never run SQL while rendering.
@@ -692,11 +693,11 @@ BV history and diff are also refused until their handlers honor the explicitly
 isolated tracker source; otherwise a stale checkout snapshot can contaminate the
 result.
 
-## Testing & CI
+## Testing & verification
 - **Core tests**: unit and property tests for reproduction math, spike damage, food sharing/consumption; determinism tests run seeded scenarios and assert stable summaries.
 - **Render tests**: GPUI compile-time view tests; terminal HUD headless smoke tests (`SCRIPTBOTS_TERMINAL_HEADLESS=1`).
 - **Benchmarks**: `criterion` harness for ticks/sec at various agent counts.
-- **CI**: matrix for macOS 14 and Ubuntu 24.04; wasm job builds `scriptbots-web`, runs parity tests in headless Chromium; release job uses `cargo dist` with optional macOS codesigning.
+- **Batch verification**: the pinned Doodlestein Self-Releaser (`dsr`) profile is the only build, lint, test, WASM, and release evidence lane. Hosted workflow results are not used.
 
 ## Performance & profiling
 - CPU profiling (Linux/macOS): run with `RUSTFLAGS='-g'` and use `perf record`/`perf report` or `dtrace`/Instruments; annotate hot paths in sense/actuation.

@@ -3,11 +3,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::Result;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use scriptbots_app::{
-    ControlCommand, ControlRuntime, ControlServerConfig, McpTransportConfig,
+    ControlCommand, ControlRuntime, ControlServerConfig, McpTransportConfig, WorldStepDriver,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
-use scriptbots_core::{AgentData, Generation, Position, ScriptBotsConfig, Velocity, WorldState};
+use scriptbots_core::{
+    AgentData, Generation, PersistenceAdmissionSession, Position, ScriptBotsConfig, Velocity,
+    WorldState,
+};
 use scriptbots_storage::{AnalyticsSnapshotProvider, StoragePipeline, StorageReader};
 use serde::Deserialize;
 use serial_test::serial;
@@ -15,6 +18,26 @@ use tempfile::tempdir;
 use tracing::Level;
 
 static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn disabled_step_driver(world: &Arc<Mutex<WorldState>>) -> WorldStepDriver {
+    let world = Arc::clone(world);
+    Arc::new(move || world.lock().expect("test world mutex").step())
+}
+
+fn persistence_step_driver(
+    world: &Arc<Mutex<WorldState>>,
+    persistence: &Arc<Mutex<PersistenceAdmissionSession>>,
+) -> WorldStepDriver {
+    let world = Arc::clone(world);
+    let persistence = Arc::clone(persistence);
+    Arc::new(move || {
+        let mut world = world.lock().expect("test world mutex");
+        persistence
+            .lock()
+            .expect("test persistence session mutex")
+            .step(&mut world)
+    })
+}
 
 struct EnvCleanup {
     keys: Vec<String>,
@@ -252,6 +275,7 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
     {
         let context = RendererContext {
             world: Arc::clone(&shared_world),
+            simulation_step: disabled_step_driver(&shared_world),
             analytics: analytics.clone(),
             control_runtime: &control_runtime,
             command_drain,
@@ -449,7 +473,8 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         1,
     )?;
     let analytics = pipeline.analytics_provider();
-    let mut world = WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
+    let (mut world, persistence) =
+        WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
 
     let mut rng = SmallRng::seed_from_u64(0xDECAF00D);
     for index in 0..24 {
@@ -480,6 +505,8 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
             .expect("terminal fixture agent is finite");
     }
     let shared_world = Arc::new(Mutex::new(world));
+    let shared_persistence = Arc::new(Mutex::new(persistence));
+    let simulation_step = persistence_step_driver(&shared_world, &shared_persistence);
 
     let control_config = ControlServerConfig {
         rest_enabled: false,
@@ -512,6 +539,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
     {
         let context = RendererContext {
             world: Arc::clone(&shared_world),
+            simulation_step,
             analytics: analytics.clone(),
             control_runtime: &control_runtime,
             command_drain,
@@ -520,10 +548,13 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         renderer.run(context)?;
     }
     control_runtime.shutdown()?;
-    let finalized_tail = shared_world
-        .lock()
-        .expect("world mutex")
-        .finalize_persistence()?;
+    let finalized_tail = {
+        let mut world = shared_world.lock().expect("world mutex");
+        shared_persistence
+            .lock()
+            .expect("persistence session mutex")
+            .finalize(&mut world)?
+    };
     assert!(
         finalized_tail,
         "a 37-tick run with a five-tick cadence must admit its partial tail"

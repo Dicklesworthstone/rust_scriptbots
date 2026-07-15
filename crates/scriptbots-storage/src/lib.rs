@@ -5861,7 +5861,8 @@ impl StoragePipeline {
         self.sink.analytics.clone()
     }
 
-    /// Return a clonable sink for `WorldState` while retaining host control of the worker.
+    /// Return a clonable sink for an external persistence session while retaining host control
+    /// of the worker.
     #[must_use]
     pub fn sink(&self) -> StorageSink {
         self.sink.clone()
