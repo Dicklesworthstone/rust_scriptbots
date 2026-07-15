@@ -2,7 +2,7 @@
 //! native statistics correctly (bd-2z0.11.6 item 2 foundation).
 //!
 //! The stats module is unit-tested in isolation; this test proves the REPORT — load metrics from a
-//! FrankenSQLite run database through the real write→read path, group by metric, and render the
+//! `FrankenSQLite` run database through the real write→read path, group by metric, and render the
 //! summary — produces the hand-computed answers. A report that computed the right statistics over
 //! the wrong rows, or the wrong statistics over the right rows, would pass neither.
 
@@ -11,7 +11,7 @@ use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
 use scriptbots_storage::Storage;
 
 /// A tick batch carrying a set of named metric samples.
-fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
+const fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
     PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),
@@ -40,12 +40,14 @@ fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
 fn fixture(dir: &tempfile::TempDir) -> String {
     let path = dir.path().join("run.sqlite").display().to_string();
     let mut storage = Storage::create_new_file(&path).expect("create fixture run db");
-    for value in 1..=5u64 {
+    for value in 1_u32..=5 {
         let metrics = vec![
-            MetricSample::new("probe", value as f64),
+            MetricSample::new("probe", f64::from(value)),
             MetricSample::new("flat", 7.0),
         ];
-        storage.persist(&batch(value, metrics)).expect("persist");
+        storage
+            .persist(&batch(u64::from(value), metrics))
+            .expect("persist");
     }
     storage.flush().expect("flush");
     storage.close().expect("close");
@@ -108,13 +110,16 @@ fn the_report_computes_the_hand_verified_summary_of_a_real_run() {
     assert_eq!(flat["n"], 5);
     assert!((flat["mean"].as_f64().unwrap() - 7.0).abs() < 1e-9);
     assert_eq!(
-        flat["std_dev"].as_f64().unwrap(),
-        0.0,
+        flat["std_dev"].as_f64().unwrap().to_bits(),
+        0.0_f64.to_bits(),
         "a constant metric has zero spread"
     );
     assert_eq!(
-        flat["coefficient_of_variation"].as_f64().unwrap(),
-        0.0,
+        flat["coefficient_of_variation"]
+            .as_f64()
+            .unwrap()
+            .to_bits(),
+        0.0_f64.to_bits(),
         "a constant non-zero metric has CV 0, not null"
     );
 }
