@@ -4288,8 +4288,8 @@ activation = "Sigmoid"
         let dir = tempdir().expect("tempdir");
         let first_path = dir.path().join("first.toml");
         let second_path = dir.path().join("second.toml");
-        let first = b"rng_seed = 41\nworld_width = 801\n";
-        let second = b"rng_seed = 42\nworld_height = 602\n";
+        let first = b"rng_seed = 41\nworld_width = 800\n";
+        let second = b"rng_seed = 42\nworld_height = 600\n";
         fs::write(&first_path, first).expect("write first layer");
         fs::write(&second_path, second).expect("write second layer");
 
@@ -4304,8 +4304,8 @@ activation = "Sigmoid"
         expected.record_config_layer(second);
         assert_eq!(scenario, expected);
         assert_eq!(config.rng_seed, Some(42));
-        assert_eq!(config.world_width, 801);
-        assert_eq!(config.world_height, 602);
+        assert_eq!(config.world_width, 800);
+        assert_eq!(config.world_height, 600);
     }
 
     #[test]
