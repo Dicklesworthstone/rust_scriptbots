@@ -8,7 +8,7 @@ use js_sys::Uint8Array;
 use postcard::{from_bytes, to_allocvec};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use scriptbots_brain::MlpBrain;
+use scriptbots_brain::{MlpBrain, mlp::MlpBrainFamily};
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
     Generation, INPUT_SIZE, NullPersistence, OUTPUT_SIZE, PersistenceAdmissionSession, Position,
@@ -162,8 +162,8 @@ impl Simulation {
         }
         let key = self
             .world
-            .brain_registry_mut()?
-            .register(MlpBrain::KIND.as_str(), |rng| Ok(MlpBrain::runner(rng)));
+            .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+            .context("failed to register the versioned MLP brain family")?;
         self.mlp_key = Some(key);
         Ok(key)
     }
@@ -339,8 +339,8 @@ fn seed_agents(
             Some(key) => *key,
             None => {
                 let key = world
-                    .brain_registry_mut()?
-                    .register(MlpBrain::KIND.as_str(), |rng| Ok(MlpBrain::runner(rng)));
+                    .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+                    .context("failed to register the versioned MLP brain family")?;
                 *mlp_key_cache = Some(key);
                 key
             }
@@ -648,6 +648,21 @@ mod tests {
             let mut mlp_key = None;
             seed_agents(&mut world, 3, strategy, default_brain, &mut mlp_key)
                 .expect("seed web agents");
+            if let Some(key) = mlp_key {
+                let registry = world.brain_registry();
+                assert!(
+                    registry.is_protocol_family(key),
+                    "WASM MLP seeding must use the versioned family adapter"
+                );
+                assert_eq!(
+                    registry
+                        .family(key)
+                        .expect("protocol MLP key must expose its family adapter")
+                        .family_id()
+                        .as_str(),
+                    "mlp-baseline"
+                );
+            }
             let random_stream = world.random_stream_state();
             persistence
                 .step(&mut world)

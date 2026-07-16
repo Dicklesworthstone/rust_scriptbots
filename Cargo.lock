@@ -10161,6 +10161,7 @@ dependencies = [
 name = "scriptbots-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "criterion",
  "direction",
  "getrandom 0.2.17",

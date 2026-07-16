@@ -29,8 +29,6 @@ const ASSEMBLY_STATE_HEADER_BYTES: usize =
     ASSEMBLY_STATE_MAGIC.len() + ASSEMBLY_GENOME_DIGEST_BYTES;
 const ASSEMBLY_STATE_PAYLOAD_BYTES: usize =
     ASSEMBLY_STATE_HEADER_BYTES + ASSEMBLY_GENOME_PAYLOAD_BYTES;
-const ASSEMBLY_GENOME_DIGEST_CONTEXT: &str = "rust-scriptbots.assembly.genome-state-binding.v1";
-
 /// Maximum instruction slots scanned by one Assembly evaluator tick.
 ///
 /// The language deliberately preserves the legacy single-pass program: every middle cell is
@@ -534,15 +532,7 @@ fn decode_state_payload(
 }
 
 fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; ASSEMBLY_GENOME_DIGEST_BYTES] {
-    let mut hasher = blake3::Hasher::new_derive_key(ASSEMBLY_GENOME_DIGEST_CONTEXT);
-    let family_id = genome.family_id().as_str().as_bytes();
-    hasher.update(&(family_id.len() as u64).to_le_bytes());
-    hasher.update(family_id);
-    hasher.update(&genome.schema_version().to_le_bytes());
-    hasher.update(&genome.codec_version().to_le_bytes());
-    hasher.update(&(genome.payload().len() as u64).to_le_bytes());
-    hasher.update(genome.payload());
-    *hasher.finalize().as_bytes()
+    *genome.material_hash().as_bytes()
 }
 
 fn state_digest_hex(digest: &[u8; ASSEMBLY_GENOME_DIGEST_BYTES]) -> String {
@@ -690,7 +680,8 @@ mod tests {
     use super::*;
     use rand::RngCore;
     use scriptbots_core::{
-        AgentUid, BrainFamilyAdapter, BrainInspectionLimits, SmallRngStream, Tick,
+        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, BrainInspectionLimits, SmallRngStream,
+        Tick,
     };
 
     #[derive(Clone, Debug, Default)]
@@ -764,8 +755,8 @@ mod tests {
 
     fn fixture_provenance() -> BrainProvenance {
         BrainProvenance {
-            parents: [Some(AgentUid(17)), Some(AgentUid(23))],
             created_at: Tick(31),
+            ..BrainProvenance::default()
         }
     }
 
@@ -959,7 +950,9 @@ mod tests {
         let mut rng = SmallRngStream::seed_from_u64(91);
         let unchanged_provenance = BrainProvenance {
             parents: [Some(AgentUid(101)), None],
+            parent_genome_hashes: [Some(left.material_hash()), None],
             created_at: Tick(40),
+            derivation: BrainGenomeDerivation::Clone,
         };
         let unchanged = family
             .mutate_genome(
@@ -977,7 +970,9 @@ mod tests {
 
         let mutated_provenance = BrainProvenance {
             parents: [Some(AgentUid(102)), None],
+            parent_genome_hashes: [Some(left.material_hash()), None],
             created_at: Tick(41),
+            derivation: BrainGenomeDerivation::MutationOnly,
         };
         let mutated = family
             .mutate_genome(
@@ -997,7 +992,9 @@ mod tests {
 
         let child_provenance = BrainProvenance {
             parents: [Some(AgentUid(103)), Some(AgentUid(104))],
+            parent_genome_hashes: [Some(left.material_hash()), Some(right.material_hash())],
             created_at: Tick(42),
+            derivation: BrainGenomeDerivation::Crossover,
         };
         let child = family
             .crossover_genomes(&left, &right, child_provenance.clone(), &mut rng)

@@ -37,7 +37,6 @@ const STATE_DIGEST_END: usize = STATE_MAGIC.len() + GENOME_DIGEST_BYTES;
 const STATE_HEADER_BYTES: usize = STATE_DIGEST_END + STATE_BRAIN_SIZE_BYTES;
 const STATE_NODE_BYTES: usize = 4;
 const STATE_PAYLOAD_BYTES: usize = STATE_HEADER_BYTES + BRAIN_SIZE * STATE_NODE_BYTES;
-const GENOME_DIGEST_CONTEXT: &str = "rust-scriptbots.dwraon.genome-state-binding.v1";
 const ACTIVATION_LAYER_NAME: &str = "dwraon.state";
 const ACTIVATION_LAYER_WIDTH: usize = 20;
 const ACTIVATION_LAYER_HEIGHT: usize = 10;
@@ -563,15 +562,7 @@ fn state_envelope(
 }
 
 fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
-    let mut hasher = blake3::Hasher::new_derive_key(GENOME_DIGEST_CONTEXT);
-    let family_id = genome.family_id().as_str().as_bytes();
-    hasher.update(&(family_id.len() as u64).to_le_bytes());
-    hasher.update(family_id);
-    hasher.update(&genome.schema_version().to_le_bytes());
-    hasher.update(&genome.codec_version().to_le_bytes());
-    hasher.update(&(genome.payload().len() as u64).to_le_bytes());
-    hasher.update(genome.payload());
-    *hasher.finalize().as_bytes()
+    *genome.material_hash().as_bytes()
 }
 
 fn state_digest_hex(digest: &[u8; GENOME_DIGEST_BYTES]) -> String {
@@ -954,7 +945,9 @@ impl Brain for DwraonBrain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{AgentUid, BrainFamilyAdapter, SmallRngStream, Tick};
+    use scriptbots_core::{
+        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, SmallRngStream, Tick,
+    };
 
     fn protocol_genome(nodes: &[NodeParams], provenance: BrainProvenance) -> BrainGenomeEnvelope {
         genome_envelope(nodes, provenance).expect("valid test genome")
@@ -1219,7 +1212,9 @@ mod tests {
             &genome_nodes,
             BrainProvenance {
                 parents: [Some(AgentUid(91)), None],
+                parent_genome_hashes: [Some(genome.material_hash()), None],
                 created_at: Tick(37),
+                derivation: BrainGenomeDerivation::Clone,
             },
         );
         assert_eq!(
@@ -1309,7 +1304,9 @@ mod tests {
         };
         let child_provenance = BrainProvenance {
             parents: [Some(AgentUid(77)), None],
+            parent_genome_hashes: [Some(genome.material_hash()), None],
             created_at: Tick(12),
+            derivation: BrainGenomeDerivation::MutationOnly,
         };
         let mut first_rng = SmallRngStream::seed_from_u64(99);
         let first = family
@@ -1334,21 +1331,23 @@ mod tests {
         let left = protocol_genome(
             &left_nodes,
             BrainProvenance {
-                parents: [Some(AgentUid(11)), None],
                 created_at: Tick(4),
+                ..BrainProvenance::default()
             },
         );
         let right = protocol_genome(
             &right_nodes,
             BrainProvenance {
-                parents: [Some(AgentUid(22)), None],
                 created_at: Tick(9),
+                ..BrainProvenance::default()
             },
         );
         let mut crossover_rng = SmallRngStream::seed_from_u64(0xC205_50E2);
         let child_provenance = BrainProvenance {
             parents: [Some(AgentUid(111)), Some(AgentUid(222))],
+            parent_genome_hashes: [Some(left.material_hash()), Some(right.material_hash())],
             created_at: Tick(15),
+            derivation: BrainGenomeDerivation::Crossover,
         };
         let child = family
             .crossover_genomes(&left, &right, child_provenance.clone(), &mut crossover_rng)

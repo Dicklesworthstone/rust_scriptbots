@@ -628,6 +628,10 @@ and scientific decisions.
 
 ### 6.5 brain genome/evaluator-state separation [Inspection slice completed — bd-2z0.3.8, TopazCastle, 2026-07-15; DSR run-1784156735-28027 green]
 
+**Current implementation task:** [Currently In Progress — bd-2cya,
+TopazCastle; wire the versioned genome/provenance protocol through live
+reproduction and prove it across five generations]
+
 The current `Brain`/`BrainRunner` bridge loses the operations required by evolution. Replace trait-object cloning with versioned heritable data **and** separately versioned dynamic evaluator state. Evaluator state is not universally ephemeral: recurrent MLP/DWRAON node state and Assembly working cells can affect future outputs and must survive checkpoints when the family contract says so.
 
 ```rust,ignore

@@ -23,6 +23,7 @@ libm = { workspace = true }
 num_cpus = { workspace = true }
 serde_json = { workspace = true }
 postcard = { workspace = true }
+blake3 = { workspace = true }
 wide = { version = "1.5.0", default-features = false, optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

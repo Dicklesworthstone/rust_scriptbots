@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
@@ -12,12 +12,14 @@ use scriptbots_app::{
 };
 #[cfg(feature = "bevy_render")]
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
-use scriptbots_brain::MlpBrain;
+use scriptbots_brain::{
+    AssemblyBrain, DwraonBrain, MlpBrain, assembly::AssemblyFamilyAdapter,
+    dwraon::DwraonFamilyAdapter, mlp::MlpBrainFamily,
+};
 use scriptbots_core::{
-    AgentData, BrainRunner, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
+    AgentData, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
     PersistenceSessionError, RenderAutoExposureSettings, RenderSettings, RenderTonemapMode,
-    ReplayEventKind, ScriptBotsConfig, SmallRngStream, TickSummary, WorldDigestV1,
-    WorldPersistence, WorldState,
+    ReplayEventKind, ScriptBotsConfig, TickSummary, WorldDigestV1, WorldPersistence, WorldState,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
@@ -2882,107 +2884,13 @@ fn validated_neuroflow_config(
     Ok(Some(adapter))
 }
 
-/// Does this family actually honour the heredity contract?
-///
-/// We PROVE it rather than trusting a declaration, because the declaration is exactly
-/// what was missing. `BrainRunner`'s own defaults are the trap:
-///
-/// ```ignore
-/// fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> { Ok(None) }
-/// fn mutate(&mut self, ..) -> Result<(), BrainSpawnError> { Ok(()) }
-/// ```
-///
-/// A family that simply does not OVERRIDE these is silently non-heritable: `clone_runner`
-/// returns `Ok(None)`, so reproduction spawns a FRESH runner from the registry and the
-/// child never receives its parent's brain — while `mutate` reports success having changed
-/// nothing. Both failures are silent, and both are reported to the caller as success.
-///
-/// So eligibility is decided by ASKING THE FAMILY TO PERFORM THE CONTRACT — both halves of it:
-/// it must duplicate itself, AND mutating that duplicate must actually change it. Checking only
-/// the first half is the mistake `ml.placeholder` walks through: it clones honestly, and only
-/// its `mutate` is a no-op. Copying without varying is not heredity.
-fn probe_heredity(prototype: &dyn BrainRunner) -> Result<bool> {
-    // (1) STRUCTURAL — can the family duplicate itself at all?
-    //
-    // `Ok(None)` is the trait's DEFAULT and means "my children get a fresh brain".
-    // `Err` is a family that TRIED to clone and failed: broken, not merely limited, and it
-    // must not be registered — otherwise reproduction aborts at some unpredictable later tick.
-    let child = prototype.clone_runner().map_err(|error| {
-        anyhow!(
-            "brain family `{}` failed the heredity probe: {error}. A family that errors when \
-             asked to duplicate itself cannot be registered — reproduction would abort mid-run \
-             instead of here.",
-            prototype.kind()
-        )
-    })?;
-    let Some(mut child) = child else {
-        return Ok(false);
-    };
-
-    // (2) BEHAVIOURAL — does mutation actually CHANGE it?
-    //
-    // This is the half that matters, and structural cloning alone waves the real culprit
-    // straight through: `ml.placeholder` clones itself perfectly well (its `clone_box` is a
-    // genuine clone). What it does not do is MUTATE — its `mutate` ignores the rate and
-    // returns Ok(()). A family that copies but cannot vary is not heritable in any sense a
-    // biologist would accept: its lineage is a set of exact duplicates, and `mutate` reports
-    // success at every generation while the population stands still.
-    //
-    // So the family is made to PERFORM a mutation, and we check it had an effect. Several
-    // probe vectors are tried and ANY single difference proves the mutation took: a real brain
-    // can therefore never be excluded because one input happened to map to the same output,
-    // while a no-op `mutate` cannot escape — it is identical on every probe, by construction.
-    let mut baseline = prototype
-        .clone_runner()
-        .map_err(|error| {
-            anyhow!(
-                "brain family `{}` failed to clone: {error}",
-                prototype.kind()
-            )
-        })?
-        .ok_or_else(|| {
-            anyhow!(
-                "brain family `{}` cloned once and then refused to clone again — its heredity \
-                 is not reproducible, and neither is any run that uses it",
-                prototype.kind()
-            )
-        })?;
-
-    let mut rng = SmallRngStream::seed_from_u64(0x0A11_CE5E);
-    child.mutate(&mut rng, 1.0, 1.0).map_err(|error| {
-        anyhow!(
-            "brain family `{}` failed to mutate: {error}",
-            prototype.kind()
-        )
-    })?;
-
-    for probe in HEREDITY_PROBE_INPUTS {
-        let inputs = [probe; scriptbots_core::INPUT_SIZE];
-        let before = baseline.tick(&inputs);
-        let after = child.tick(&inputs);
-        let differs = before
-            .iter()
-            .zip(after.iter())
-            .any(|(lhs, rhs)| lhs.to_bits() != rhs.to_bits());
-        if differs {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-/// Probe values for the mutation-effect check. A mutation at full rate must perturb a brain's
-/// response to at least ONE of these; a no-op `mutate` leaves every one of them untouched.
-const HEREDITY_PROBE_INPUTS: [f32; 3] = [0.25, 0.5, 0.75];
-
 impl InstalledBrains {
     /// How many families are REGISTERED — eligible plus withheld.
     ///
     /// Registration and population-eligibility are now different questions, and conflating them
     /// is what this bead is about. A withheld family is still registered: it can be bound
-    /// explicitly by an experiment that genuinely wants it. It simply may not FOUND a
-    /// population, because agents seeded with it cannot evolve.
+    /// explicitly by an experiment that genuinely wants it. It simply may not found a
+    /// population until it implements the versioned genome and evaluator-state protocol.
     fn registered(&self) -> usize {
         self.population.len() + self.withheld.len()
     }
@@ -2991,7 +2899,7 @@ impl InstalledBrains {
 /// Registered brain families, split by whether they may found a population.
 #[derive(Debug)]
 struct InstalledBrains {
-    /// Families that PROVED they carry heredity. Only these seed the founding population.
+    /// Versioned protocol families admitted to seed the founding population.
     population: Vec<u64>,
     /// Families registered for explicit selection but withheld from default populations,
     /// with the reason, so the exclusion is inspectable rather than folklore.
@@ -3002,53 +2910,26 @@ fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
     #[cfg(feature = "neuro")]
     let neuro_config = validated_neuroflow_config(world.config())?;
 
-    let mut population = Vec::new();
     let mut withheld = Vec::new();
 
-    // Every family is admitted through this one gate, so a family added later cannot
-    // reach a population without answering the same question.
-    let mut admit = |label: String, key: u64, heritable: bool| {
-        if heritable {
-            population.push(key);
-        } else {
-            warn!(
-                brain = %label,
-                "brain family is NOT heritable (it declines to duplicate itself, so every \
-                 child would be born with a fresh brain instead of its parent's). It stays \
-                 registered for explicit selection, but it is WITHHELD from the founding \
-                 population: seeding it would put agents into the world that cannot evolve, \
-                 and nothing downstream would say so."
-            );
-            withheld.push((label, key));
-        }
-    };
-
+    // Founding-population admission is structural: every eligible entry must own a versioned
+    // genome codec, evaluator-state codec, offspring-state policy, and evaluator constructor.
+    // There is no legacy runner beside these entries that could become a second hereditary truth.
     let mlp_key = world
-        .brain_registry_mut()?
-        .register(MlpBrain::KIND.as_str(), |seed_rng| {
-            Ok(MlpBrain::runner(seed_rng))
-        });
-    {
-        let mut rng = SmallRngStream::seed_from_u64(0);
-        let heritable = probe_heredity(MlpBrain::runner(&mut rng).as_ref())?;
-        admit(MlpBrain::KIND.as_str().to_owned(), mlp_key, heritable);
-    }
-
-    #[cfg(feature = "ml")]
-    {
-        // `ml.placeholder` lands here. Its `tick` copies sensors straight to outputs and
-        // its `mutate` is a no-op that returns Ok(()) — so before this gate existed, the
-        // round-robin in seed_agents handed a THIRD of the founding population a brain that
-        // could neither think nor evolve, and every experiment run under `--features ml`
-        // was quietly contaminated.
-        let prototype = scriptbots_brain_ml::runner();
-        let label = prototype.kind().to_string();
-        let heritable = probe_heredity(prototype.as_ref())?;
-        let key = world
-            .brain_registry_mut()?
-            .register(label.clone(), |_seed_rng| Ok(scriptbots_brain_ml::runner()));
-        admit(label, key, heritable);
-    }
+        .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+        .context("failed to register the versioned MLP brain family")?;
+    let dwraon_key = world
+        .register_brain_family(
+            DwraonBrain::KIND.as_str(),
+            Box::new(DwraonFamilyAdapter::default()),
+        )
+        .context("failed to register the versioned DWRAON brain family")?;
+    let assembly = AssemblyFamilyAdapter::new()
+        .context("failed to construct the versioned Assembly brain family")?;
+    let assembly_key = world
+        .register_brain_family(AssemblyBrain::KIND.as_str(), Box::new(assembly))
+        .context("failed to register the versioned Assembly brain family")?;
+    let population = vec![mlp_key, dwraon_key, assembly_key];
 
     #[cfg(feature = "neuro")]
     {
@@ -3056,37 +2937,21 @@ fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
         if let Some(config) = neuro_config {
             let key = NeuroflowBrain::register(world, config)
                 .context("failed to register configured NeuroFlow brain")?;
-
-            // NeuroFlow registers itself, so the only way to obtain its prototype is through
-            // the registry it just installed into. Spawn one and put it through the same gate
-            // every other family passes — a family that registers itself does not get to skip
-            // the check.
-            let registry = world.brain_registry();
-            let label = registry.kind(key).unwrap_or("neuroflow").to_owned();
-            let mut rng = SmallRngStream::seed_from_u64(0);
-            let prototype = registry.spawn(&mut rng, key).map_err(|error| {
-                anyhow!(
-                    "failed to instantiate a NeuroFlow prototype for the heredity probe: {error}"
-                )
-            })?;
-            let Some(prototype) = prototype else {
-                bail!(
-                    "brain family `{label}` registered key {key} but the registry cannot spawn \
-                     it. A family that cannot be instantiated must not be registered: every \
-                     agent bound to it would fail at some unpredictable later tick."
-                );
-            };
-            let heritable = probe_heredity(prototype.as_ref())?;
-            admit(label, key, heritable);
+            let label = world
+                .brain_registry()
+                .kind(key)
+                .unwrap_or("neuroflow")
+                .to_owned();
+            warn!(
+                brain = %label,
+                key,
+                "NeuroFlow remains available as an explicitly selected legacy runner, but it \
+                 has no versioned genome/evaluator-state protocol codec and is WITHHELD from \
+                 the founding population. Admitting it would reintroduce an opaque hereditary \
+                 state beside the canonical protocol families."
+            );
+            withheld.push((label, key));
         }
-    }
-
-    if population.is_empty() {
-        bail!(
-            "no registered brain family carries heredity, so a founding population would \
-             consist entirely of agents that cannot evolve. Refusing to start: a run like \
-             that produces plausible-looking data and answers no question."
-        );
     }
 
     let installed = InstalledBrains {
@@ -3102,7 +2967,7 @@ fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
         info!(
             registered = installed.registered(),
             eligible = installed.population.len(),
-            "every registered brain family carries heredity; all are eligible to found the population"
+            "every registered brain family implements the versioned genome/evaluator protocol; all are eligible to found the population"
         );
     } else {
         let withheld_labels: Vec<&str> = installed
@@ -3115,10 +2980,9 @@ fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
             eligible = installed.population.len(),
             withheld = ?withheld_labels,
             "SOME BRAIN FAMILIES ARE WITHHELD FROM THE FOUNDING POPULATION because they do \
-             not carry heredity. They remain registered and can still be selected explicitly, \
-             but no founder will be seeded with them: agents bound to a non-heritable family \
-             cannot evolve, and every result drawn from them would be a claim about a \
-             population that is not evolving."
+             not implement the versioned genome/evaluator-state protocol. They remain registered \
+             and can still be selected explicitly, but no founder will be seeded with an opaque \
+             legacy hereditary state."
         );
     }
 
@@ -3319,14 +3183,9 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
 
-    /// The real `install_brains`, exercised as the binary actually calls it.
-    ///
-    /// The integration tests in `tests/heredity_gate.rs` prove the PROPERTY over a registry;
-    /// this proves the SHIPPED FUNCTION obeys it. Both are needed: a property that holds in a
-    /// test harness while the product does something else is exactly the class of lie this
-    /// bead exists to remove.
+    /// Exercise the shipped startup function, not a protocol-only fixture.
     #[test]
-    fn install_brains_seeds_only_families_that_carry_heredity() {
+    fn install_brains_seeds_only_versioned_protocol_families() {
         let mut world = WorldState::new(ScriptBotsConfig {
             rng_seed: Some(11),
             ..ScriptBotsConfig::default()
@@ -3335,65 +3194,46 @@ mod tests {
 
         let installed = install_brains(&mut world).expect("brains install");
 
-        // Anti-vacuity: if the eligible set were empty, every assertion below would pass
-        // while the simulator was incapable of founding any population at all.
-        assert!(
-            !installed.population.is_empty(),
-            "no family was eligible to found a population — the gate would be trivially \
-             satisfied and the simulator could not start"
+        let expected = [
+            (MlpBrain::KIND.as_str(), "mlp-baseline"),
+            (DwraonBrain::KIND.as_str(), "dwraon-baseline"),
+            (AssemblyBrain::KIND.as_str(), "assembly"),
+        ];
+        assert_eq!(
+            installed.population.len(),
+            expected.len(),
+            "startup must admit exactly the three implemented protocol families"
         );
 
-        // EVERY seeding family must actually carry heredity. This re-derives eligibility from
-        // behaviour rather than trusting the value install_brains handed back, so a bug in the
-        // gate itself cannot hide behind the gate's own bookkeeping.
-        let mut rng = SmallRngStream::seed_from_u64(0);
-        for key in &installed.population {
-            let kind = world
-                .brain_registry()
-                .kind(*key)
-                .expect("a seeding key must be registered")
-                .to_owned();
-            let prototype = world
-                .brain_registry()
-                .spawn(&mut rng, *key)
-                .expect("spawn")
-                .expect("runner");
+        let registry = world.brain_registry();
+        for (key, (expected_kind, expected_family_id)) in installed.population.iter().zip(expected)
+        {
+            assert_eq!(registry.kind(*key), Some(expected_kind));
             assert!(
-                matches!(prototype.clone_runner(), Ok(Some(_))),
-                "brain family `{kind}` is seeded into the founding population but does NOT \
-                 duplicate itself. Every agent bound to it would hand its children a fresh \
-                 brain instead of its own, and `mutate` would report success while changing \
-                 nothing — a population evolving in name only."
+                registry.is_protocol_family(*key),
+                "founding family `{expected_kind}` must be backed by the versioned protocol"
             );
+            let family = registry
+                .family(*key)
+                .expect("a protocol registry key must expose its family adapter");
+            assert_eq!(family.family_id().as_str(), expected_family_id);
         }
 
-        // And the placeholder specifically must be WITHHELD, not seeded. This is the exact
-        // regression: `ml.placeholder` cannot think (its tick copies sensors to outputs) and
-        // cannot evolve (its mutate is a no-op), yet seed_agents round-robined it into roughly
-        // a third of the founders under this feature.
-        #[cfg(feature = "ml")]
-        {
-            let placeholder_seeded = installed.population.iter().any(|key| {
-                world
-                    .brain_registry()
-                    .kind(*key)
-                    .is_some_and(|kind| kind.contains("placeholder"))
-            });
+        for (label, key) in &installed.withheld {
             assert!(
-                !placeholder_seeded,
-                "`ml.placeholder` reached the founding population. It can neither think nor \
-                 evolve, so every experiment run under `--features ml` is contaminated and \
-                 nothing downstream reports it."
+                !registry.is_protocol_family(*key),
+                "withheld legacy family `{label}` must not masquerade as a protocol family"
             );
-            assert!(
-                installed
-                    .withheld
-                    .iter()
-                    .any(|(label, _)| label.contains("placeholder")),
-                "`ml.placeholder` must be recorded as WITHHELD. An exclusion nobody can see is \
-                 folklore rather than a decision, and the next reader will re-seed it."
-            );
+            assert!(registry.family(*key).is_none());
         }
+
+        assert!(
+            registry
+                .descriptors()
+                .iter()
+                .all(|(_, kind)| !kind.contains("placeholder")),
+            "`ml.placeholder` has no protocol codec and must not be registered at startup"
+        );
     }
 
     #[test]
@@ -4784,16 +4624,22 @@ activation = "Sigmoid"
     #[cfg(feature = "neuro")]
     #[test]
     fn neuroflow_installation_respects_toggle() {
-        let expected_base = if cfg!(feature = "ml") { 2 } else { 1 };
+        let expected_protocol_families = 3;
         let mut config = ScriptBotsConfig::default();
         config.neuroflow.enabled = false;
         let mut world = WorldState::new(config).expect("world");
         let keys = install_brains(&mut world).expect("install baseline brains");
         assert_eq!(
             keys.registered(),
-            expected_base,
+            expected_protocol_families,
             "NeuroFlow brain should not register when disabled"
         );
+        assert_eq!(keys.population.len(), expected_protocol_families);
+        assert!(keys.withheld.is_empty());
+        for key in &keys.population {
+            assert!(world.brain_registry().is_protocol_family(*key));
+            assert!(world.brain_registry().family(*key).is_some());
+        }
 
         let mut config_enabled = ScriptBotsConfig::default();
         config_enabled.neuroflow.enabled = true;
@@ -4805,11 +4651,31 @@ activation = "Sigmoid"
             install_brains(&mut world_enabled).expect("install enabled NeuroFlow brain");
         assert_eq!(
             keys_enabled.registered(),
-            expected_base + 1,
-            "Expected baseline brains plus NeuroFlow"
+            expected_protocol_families + 1,
+            "expected three protocol families plus explicitly selectable NeuroFlow"
         );
+        assert_eq!(
+            keys_enabled.population.len(),
+            expected_protocol_families,
+            "NeuroFlow has no protocol codec and must not enter the founding population"
+        );
+        for key in &keys_enabled.population {
+            assert!(world_enabled.brain_registry().is_protocol_family(*key));
+            assert!(world_enabled.brain_registry().family(*key).is_some());
+        }
 
-        let neuro_key = *keys_enabled.population.last().expect("neuro key");
+        let (neuro_label, neuro_key) = keys_enabled
+            .withheld
+            .iter()
+            .find(|(label, _)| label.contains("neuroflow"))
+            .expect("enabled NeuroFlow must be registered but withheld");
+        let neuro_key = *neuro_key;
+        assert_eq!(
+            neuro_label.as_str(),
+            scriptbots_brain_neuro::NeuroflowBrain::KIND.as_str()
+        );
+        assert!(!world_enabled.brain_registry().is_protocol_family(neuro_key));
+        assert!(world_enabled.brain_registry().family(neuro_key).is_none());
         let agent_id = world_enabled
             .try_spawn_agent(AgentData::default())
             .expect("default agent is finite");
@@ -4826,8 +4692,20 @@ activation = "Sigmoid"
         let mut world_repeat = WorldState::new(config_enabled).expect("world");
         let keys_repeat =
             install_brains(&mut world_repeat).expect("install repeat NeuroFlow brain");
-        assert_eq!(keys_repeat.registered(), expected_base + 1);
-        let neuro_repeat = *keys_repeat.population.last().unwrap();
+        assert_eq!(keys_repeat.registered(), expected_protocol_families + 1);
+        assert_eq!(keys_repeat.population.len(), expected_protocol_families);
+        let neuro_repeat = keys_repeat
+            .withheld
+            .iter()
+            .find(|(label, _)| label.contains("neuroflow"))
+            .map(|(_, key)| *key)
+            .expect("repeat NeuroFlow registration must remain withheld");
+        assert!(
+            !world_repeat
+                .brain_registry()
+                .is_protocol_family(neuro_repeat)
+        );
+        assert!(world_repeat.brain_registry().family(neuro_repeat).is_none());
         let agent_repeat = world_repeat
             .try_spawn_agent(AgentData::default())
             .expect("default agent is finite");

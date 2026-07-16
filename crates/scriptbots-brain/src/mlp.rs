@@ -35,7 +35,6 @@ const GENOME_DIGEST_BYTES: usize = blake3::OUT_LEN;
 const STATE_HEADER_BYTES: usize = STATE_MAGIC.len() + GENOME_DIGEST_BYTES + 2;
 const STATE_NODE_BYTES: usize = 2 * 4;
 const STATE_PAYLOAD_BYTES: usize = STATE_HEADER_BYTES + BRAIN_SIZE * STATE_NODE_BYTES;
-const GENOME_DIGEST_CONTEXT: &str = "rust-scriptbots.mlp.genome-state-binding.v1";
 const INITIAL_DAMPING_MIN: f32 = 0.9;
 const INITIAL_DAMPING_MAX: f32 = 1.1;
 const MUTATED_DAMPING_MIN: f32 = 0.01;
@@ -722,15 +721,7 @@ impl MlpBrainFamily {
 }
 
 fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
-    let mut hasher = blake3::Hasher::new_derive_key(GENOME_DIGEST_CONTEXT);
-    let family_id = genome.family_id().as_str().as_bytes();
-    hasher.update(&(family_id.len() as u64).to_le_bytes());
-    hasher.update(family_id);
-    hasher.update(&genome.schema_version().to_le_bytes());
-    hasher.update(&genome.codec_version().to_le_bytes());
-    hasher.update(&(genome.payload().len() as u64).to_le_bytes());
-    hasher.update(genome.payload());
-    *hasher.finalize().as_bytes()
+    *genome.material_hash().as_bytes()
 }
 
 fn state_digest_hex(digest: &[u8; GENOME_DIGEST_BYTES]) -> String {
@@ -1090,7 +1081,9 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scriptbots_core::{AgentUid, BrainFamilyAdapter, SmallRngStream, Tick};
+    use scriptbots_core::{
+        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, SmallRngStream, Tick,
+    };
 
     fn fixture_nodes() -> Vec<NodeParams> {
         (0..BRAIN_SIZE)
@@ -1136,10 +1129,10 @@ mod tests {
             .collect()
     }
 
-    fn fixture_provenance(left: u64, right: u64, tick: u64) -> BrainProvenance {
+    fn fixture_provenance(tick: u64) -> BrainProvenance {
         BrainProvenance {
-            parents: [Some(AgentUid(left)), Some(AgentUid(right))],
             created_at: Tick(tick),
+            ..BrainProvenance::default()
         }
     }
 
@@ -1231,7 +1224,7 @@ mod tests {
     fn protocol_codecs_freeze_exact_topology_parameters_and_dynamic_state() {
         let family = MlpBrainFamily::new();
         let nodes = fixture_nodes();
-        let provenance = fixture_provenance(41, 99, 12);
+        let provenance = fixture_provenance(12);
         let genome = family
             .genome(&nodes, provenance.clone())
             .expect("fixture genome");
@@ -1342,15 +1335,15 @@ mod tests {
         let family = MlpBrainFamily::new();
         let nodes = fixture_nodes();
         let genome = family
-            .genome(&nodes, fixture_provenance(1, 2, 3))
+            .genome(&nodes, fixture_provenance(3))
             .expect("fixture genome");
         let same_material_new_lineage = family
-            .genome(&nodes, fixture_provenance(91, 92, 93))
+            .genome(&nodes, fixture_provenance(93))
             .expect("same material with different provenance");
         let mut different_nodes = nodes;
         different_nodes[37].bias += 0.25;
         let different_genome = family
-            .genome(&different_nodes, fixture_provenance(1, 2, 3))
+            .genome(&different_nodes, fixture_provenance(3))
             .expect("different genome material");
 
         assert_eq!(
@@ -1497,8 +1490,8 @@ mod tests {
             node.damping = 0.5;
             node.bias -= 2.0;
         }
-        let left_provenance = fixture_provenance(10, 11, 4);
-        let right_provenance = fixture_provenance(20, 21, 6);
+        let left_provenance = fixture_provenance(4);
+        let right_provenance = fixture_provenance(6);
         let left = family
             .genome(&left_nodes, left_provenance.clone())
             .expect("left genome");
@@ -1509,7 +1502,9 @@ mod tests {
         let mut mutation_rng = SmallRngStream::seed_from_u64(0xA11C_E5E5);
         let mutation_provenance = BrainProvenance {
             parents: [Some(AgentUid(101)), None],
+            parent_genome_hashes: [Some(left.material_hash()), None],
             created_at: Tick(7),
+            derivation: BrainGenomeDerivation::MutationOnly,
         };
         let mutated = family
             .mutate_genome(
@@ -1561,7 +1556,9 @@ mod tests {
         let mut crossover_rng = SmallRngStream::seed_from_u64(0xC205_50FE);
         let child_provenance = BrainProvenance {
             parents: [Some(AgentUid(101)), Some(AgentUid(202))],
+            parent_genome_hashes: [Some(left.material_hash()), Some(right.material_hash())],
             created_at: Tick(8),
+            derivation: BrainGenomeDerivation::Crossover,
         };
         let child = family
             .crossover_genomes(&left, &right, child_provenance.clone(), &mut crossover_rng)

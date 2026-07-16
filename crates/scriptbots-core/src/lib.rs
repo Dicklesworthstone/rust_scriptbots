@@ -1425,12 +1425,34 @@ pub struct CombatEventFlags {
 }
 
 /// Runtime brain attachment tracking.
+///
+/// Protocol and legacy execution are mutually exclusive by construction. Admitted evolutionary
+/// families use `Protocol`; `Legacy` exists only for explicitly non-admitted adapters and tests
+/// while they migrate. Keeping these as enum variants prevents a genome from being evaluated by
+/// an unrelated legacy runner or silently falling back to fresh random construction.
 #[derive(Serialize, Deserialize)]
-pub struct BrainBinding {
-    #[serde(skip)]
-    runner: Option<Box<dyn BrainRunner>>,
-    registry_key: Option<u64>,
-    kind: Option<String>,
+pub enum BrainBinding {
+    Unbound,
+    Protocol {
+        registry_key: u64,
+        kind: String,
+        genome: BrainGenomeEnvelope,
+        #[serde(skip)]
+        evaluator: Option<Box<dyn BrainEvaluator>>,
+    },
+    Legacy {
+        #[serde(skip)]
+        runner: Option<Box<dyn BrainRunner>>,
+        registry_key: Option<u64>,
+        kind: String,
+    },
+}
+
+enum BrainExecution {
+    None,
+    MissingProtocol(BrainFamilyId),
+    Protocol(Box<dyn BrainEvaluator>),
+    Legacy(Box<dyn BrainRunner>),
 }
 
 impl Default for BrainBinding {
@@ -1441,20 +1463,60 @@ impl Default for BrainBinding {
 
 impl Clone for BrainBinding {
     fn clone(&self) -> Self {
-        Self {
-            runner: None,
-            registry_key: self.registry_key,
-            kind: self.kind.clone(),
+        match self {
+            Self::Unbound => Self::Unbound,
+            Self::Protocol {
+                registry_key,
+                kind,
+                genome,
+                evaluator: _,
+            } => Self::Protocol {
+                registry_key: *registry_key,
+                kind: kind.clone(),
+                genome: genome.clone(),
+                evaluator: None,
+            },
+            Self::Legacy {
+                runner: _,
+                registry_key,
+                kind,
+            } => Self::Legacy {
+                runner: None,
+                registry_key: *registry_key,
+                kind: kind.clone(),
+            },
         }
     }
 }
 
 impl fmt::Debug for BrainBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BrainBinding")
-            .field("registry_key", &self.registry_key)
-            .field("kind", &self.kind)
-            .finish()
+        match self {
+            Self::Unbound => f.debug_tuple("BrainBinding::Unbound").finish(),
+            Self::Protocol {
+                registry_key,
+                kind,
+                genome,
+                evaluator,
+            } => f
+                .debug_struct("BrainBinding::Protocol")
+                .field("registry_key", registry_key)
+                .field("kind", kind)
+                .field("family_id", genome.family_id())
+                .field("material_hash", &genome.material_hash())
+                .field("live", &evaluator.is_some())
+                .finish(),
+            Self::Legacy {
+                runner,
+                registry_key,
+                kind,
+            } => f
+                .debug_struct("BrainBinding::Legacy")
+                .field("registry_key", registry_key)
+                .field("kind", kind)
+                .field("live", &runner.is_some())
+                .finish(),
+        }
     }
 }
 
@@ -1462,25 +1524,24 @@ impl BrainBinding {
     /// Construct an unbound brain attachment.
     #[must_use]
     pub fn unbound() -> Self {
-        Self {
-            runner: None,
-            registry_key: None,
-            kind: None,
-        }
+        Self::Unbound
     }
 
     /// Attach a brain runner produced outside the registry.
     #[must_use]
     pub fn with_runner(runner: Box<dyn BrainRunner>) -> Self {
-        let kind = Some(runner.kind().to_string());
-        Self {
+        let kind = runner.kind().to_string();
+        Self::Legacy {
             runner: Some(runner),
             registry_key: None,
             kind,
         }
     }
 
-    /// Instantiate a brain from the registry and bind it to the agent.
+    /// Instantiate a legacy runner entry from the registry and bind it to the agent.
+    ///
+    /// Protocol entries require caller-owned provenance and evaluator state, so live-world code
+    /// constructs them through `WorldState`'s admitted-family path instead.
     pub fn from_registry(
         registry: &BrainRegistry,
         rng: &mut dyn RandomStream,
@@ -1489,8 +1550,11 @@ impl BrainBinding {
         let Some(runner) = registry.spawn(rng, key)? else {
             return Ok(None);
         };
-        let kind = registry.kind(key).map(str::to_string);
-        Ok(Some(Self {
+        let kind = registry
+            .kind(key)
+            .expect("a spawned registry entry must retain its kind")
+            .to_owned();
+        Ok(Some(Self::Legacy {
             runner: Some(runner),
             registry_key: Some(key),
             kind,
@@ -1501,54 +1565,116 @@ impl BrainBinding {
     /// so later generations can still fall back to the registry factory.
     #[must_use]
     pub fn inherited(runner: Box<dyn BrainRunner>, registry_key: Option<u64>) -> Self {
-        let kind = Some(runner.kind().to_string());
-        Self {
+        let kind = runner.kind().to_string();
+        Self::Legacy {
             runner: Some(runner),
             registry_key,
             kind,
         }
     }
 
+    fn protocol(
+        registry_key: u64,
+        kind: String,
+        genome: BrainGenomeEnvelope,
+        evaluator: Box<dyn BrainEvaluator>,
+    ) -> Self {
+        Self::Protocol {
+            registry_key,
+            kind,
+            genome,
+            evaluator: Some(evaluator),
+        }
+    }
+
     /// Borrow the live runner, if any.
     #[must_use]
     pub fn runner(&self) -> Option<&dyn BrainRunner> {
-        self.runner.as_deref()
+        match self {
+            Self::Legacy { runner, .. } => runner.as_deref(),
+            Self::Unbound | Self::Protocol { .. } => None,
+        }
     }
 
     /// Return the registry key, if any, associated with this binding.
     #[must_use]
-    pub const fn registry_key(&self) -> Option<u64> {
-        self.registry_key
+    pub fn registry_key(&self) -> Option<u64> {
+        match self {
+            Self::Unbound => None,
+            Self::Protocol { registry_key, .. } => Some(*registry_key),
+            Self::Legacy { registry_key, .. } => *registry_key,
+        }
     }
 
     /// Return the brain identifier when available.
     #[must_use]
     pub fn kind(&self) -> Option<&str> {
-        self.kind.as_deref()
+        match self {
+            Self::Unbound => None,
+            Self::Protocol { kind, .. } | Self::Legacy { kind, .. } => Some(kind),
+        }
     }
 
-    /// Whether a brain runner is currently attached.
+    /// Whether a live protocol evaluator or legacy runner is currently attached.
     #[must_use]
-    pub const fn is_bound(&self) -> bool {
-        self.runner.is_some()
+    pub fn is_bound(&self) -> bool {
+        match self {
+            Self::Unbound => false,
+            Self::Protocol { evaluator, .. } => evaluator.is_some(),
+            Self::Legacy { runner, .. } => runner.is_some(),
+        }
+    }
+
+    /// Exact protocol genome when this is an admitted evolutionary family.
+    #[must_use]
+    pub fn genome(&self) -> Option<&BrainGenomeEnvelope> {
+        match self {
+            Self::Protocol { genome, .. } => Some(genome),
+            Self::Unbound | Self::Legacy { .. } => None,
+        }
+    }
+
+    fn checkpoint_evaluator_state_with(
+        &self,
+        adapter: &dyn BrainFamilyAdapter,
+    ) -> Result<Option<BrainEvaluatorStateEnvelope>, BrainSpawnError> {
+        match self {
+            Self::Protocol {
+                kind,
+                genome,
+                evaluator,
+                ..
+            } => {
+                adapter
+                    .validate_genome(genome)
+                    .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+                let evaluator = evaluator.as_ref().ok_or_else(|| {
+                    BrainSpawnError::new(
+                        kind.clone(),
+                        MissingProtocolEvaluator {
+                            family_id: genome.family_id().clone(),
+                        },
+                    )
+                })?;
+                adapter
+                    .checkpoint_evaluator_for_genome(genome, evaluator.as_ref())
+                    .map(Some)
+                    .map_err(|error| BrainSpawnError::new(kind.clone(), error))
+            }
+            Self::Unbound | Self::Legacy { .. } => Ok(None),
+        }
     }
 
     /// Produce a short descriptor suitable for persistence logs.
     #[must_use]
     pub fn describe(&self) -> Cow<'_, str> {
-        if let Some(key) = self.registry_key {
+        if let Some(key) = self.registry_key() {
             Cow::Owned(format!("registry:{key}"))
-        } else if let Some(kind) = &self.kind {
-            Cow::Borrowed(kind.as_str())
+        } else if let Some(kind) = self.kind() {
+            Cow::Borrowed(kind)
         } else {
             Cow::Borrowed("unbound")
         }
-    }
-
-    /// Evaluate the brain if one is bound, returning the outputs.
-    #[must_use]
-    pub fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> Option<[f32; OUTPUT_SIZE]> {
-        self.runner.as_mut().map(|brain| brain.tick(inputs))
     }
 
     /// Perform one explicit bounded read-only inspection if supported by the runner.
@@ -1556,9 +1682,76 @@ impl BrainBinding {
         &self,
         request: BrainInspection,
     ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
-        self.runner
-            .as_ref()
-            .map_or(Ok(None), |runner| runner.inspect(request))
+        match self {
+            Self::Unbound => Ok(None),
+            Self::Protocol { evaluator, .. } => evaluator
+                .as_ref()
+                .map_or(Ok(None), |evaluator| evaluator.inspect(request)),
+            Self::Legacy { runner, .. } => runner
+                .as_ref()
+                .map_or(Ok(None), |runner| runner.inspect(request)),
+        }
+    }
+
+    fn take_execution(&mut self) -> BrainExecution {
+        match self {
+            Self::Unbound => BrainExecution::None,
+            Self::Protocol {
+                genome, evaluator, ..
+            } => evaluator.take().map_or_else(
+                || BrainExecution::MissingProtocol(genome.family_id().clone()),
+                BrainExecution::Protocol,
+            ),
+            Self::Legacy { runner, .. } => runner
+                .take()
+                .map_or(BrainExecution::None, BrainExecution::Legacy),
+        }
+    }
+
+    fn restore_execution(&mut self, execution: BrainExecution) {
+        match (self, execution) {
+            (Self::Unbound, BrainExecution::None)
+            | (Self::Protocol { .. }, BrainExecution::None)
+            | (Self::Legacy { .. }, BrainExecution::None)
+            | (Self::Protocol { .. }, BrainExecution::MissingProtocol(_)) => {}
+            (Self::Protocol { evaluator, .. }, BrainExecution::Protocol(restored)) => {
+                debug_assert!(evaluator.is_none());
+                *evaluator = Some(restored);
+            }
+            (Self::Legacy { runner, .. }, BrainExecution::Legacy(restored)) => {
+                debug_assert!(runner.is_none());
+                *runner = Some(restored);
+            }
+            _ => unreachable!("brain execution variant changed while detached"),
+        }
+    }
+
+    fn state_digest(&self) -> Option<u64> {
+        match self {
+            Self::Unbound => None,
+            Self::Legacy { runner, .. } => runner.as_deref().and_then(BrainRunner::state_digest),
+            Self::Protocol {
+                genome, evaluator, ..
+            } => {
+                let state = evaluator.as_ref()?.checkpoint_state().ok()?;
+                let mut hasher = blake3::Hasher::new_derive_key(
+                    "rust-scriptbots.brain-genome-and-evaluator-state.v1",
+                );
+                hasher.update(genome.material_hash().as_bytes());
+                let family = state.family_id().as_str().as_bytes();
+                hasher.update(&(family.len() as u64).to_le_bytes());
+                hasher.update(family);
+                hasher.update(&state.schema_version().to_le_bytes());
+                hasher.update(&state.codec_version().to_le_bytes());
+                hasher.update(&(state.payload().len() as u64).to_le_bytes());
+                hasher.update(state.payload());
+                Some(u64::from_le_bytes(
+                    hasher.finalize().as_bytes()[..8]
+                        .try_into()
+                        .expect("BLAKE3 output always has eight prefix bytes"),
+                ))
+            }
+        }
     }
 }
 
@@ -1634,7 +1827,7 @@ pub trait BrainRunner: Send + Sync {
     }
 }
 
-/// Typed failure returned by a registered brain factory.
+/// Typed failure returned by a registered brain family during construction or evaluation.
 #[derive(Debug, Clone)]
 pub struct BrainSpawnError {
     kind: Cow<'static, str>,
@@ -1643,7 +1836,7 @@ pub struct BrainSpawnError {
 
 impl std::fmt::Display for BrainSpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "brain factory `{}` failed: {}", self.kind, self.source)
+        write!(f, "brain family `{}` failed: {}", self.kind, self.source)
     }
 }
 
@@ -1665,7 +1858,7 @@ impl BrainSpawnError {
         }
     }
 
-    /// Brain-family label whose factory failed.
+    /// Brain-family label whose construction or evaluation failed.
     #[must_use]
     pub fn kind(&self) -> &str {
         self.kind.as_ref()
@@ -1682,6 +1875,12 @@ struct MissingBrainFactory {
 #[error("bound parent has no exact heritable snapshot and no registry fallback")]
 struct MissingHeritableBrain;
 
+#[derive(Debug, Error)]
+#[error("protocol brain `{family_id}` has no live evaluator at offspring preparation")]
+struct MissingProtocolEvaluator {
+    family_id: BrainFamilyId,
+}
+
 type BrainSpawner = Box<
     dyn Fn(&mut dyn RandomStream) -> Result<Box<dyn BrainRunner>, BrainSpawnError>
         + Send
@@ -1692,7 +1891,8 @@ type BrainSpawner = Box<
 struct BrainEntry {
     kind: Cow<'static, str>,
     factory_state_digest: Option<u64>,
-    spawner: BrainSpawner,
+    spawner: Option<BrainSpawner>,
+    protocol_adapter: Option<Box<dyn BrainFamilyAdapter>>,
 }
 
 /// Registry owning brain runners keyed by opaque handles.
@@ -1768,10 +1968,48 @@ impl BrainRegistry {
             BrainEntry {
                 kind: kind.into(),
                 factory_state_digest,
-                spawner: Box::new(factory),
+                spawner: Some(Box::new(factory)),
+                protocol_adapter: None,
             },
         );
         key
+    }
+
+    /// Register one versioned family adapter as an admitted evolutionary family.
+    ///
+    /// Protocol entries do not expose a legacy runner factory: callers must construct an exact
+    /// genome, evaluator state, and evaluator through the adapter contract.
+    pub fn register_family(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        adapter: Box<dyn BrainFamilyAdapter>,
+    ) -> Result<u64, BrainProtocolError> {
+        let family_id = adapter.family_id().clone();
+        if self.entries.values().any(|entry| {
+            entry
+                .protocol_adapter
+                .as_ref()
+                .is_some_and(|registered| registered.family_id() == &family_id)
+        }) {
+            return Err(BrainProtocolError::DuplicateFamily { family_id });
+        }
+
+        let key = self.next_key;
+        self.next_key += 1;
+        self.entries.insert(
+            key,
+            BrainEntry {
+                kind: kind.into(),
+                // A family ID identifies the wire protocol, not every future-affecting adapter
+                // setting or model byte. Until an adapter supplies an explicit construction-state
+                // digest, WorldDigestV1 must name this as uncovered instead of certifying a false
+                // equality between differently configured adapters.
+                factory_state_digest: None,
+                spawner: None,
+                protocol_adapter: Some(adapter),
+            },
+        );
+        Ok(key)
     }
 
     /// Removes a brain factory from the registry.
@@ -1787,7 +2025,22 @@ impl BrainRegistry {
     ) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
         self.entries
             .get(&key)
-            .map_or(Ok(None), |entry| (entry.spawner)(rng).map(Some))
+            .and_then(|entry| entry.spawner.as_ref())
+            .map_or(Ok(None), |spawner| spawner(rng).map(Some))
+    }
+
+    /// Borrow the admitted protocol adapter registered at `key`.
+    #[must_use]
+    pub fn family(&self, key: u64) -> Option<&dyn BrainFamilyAdapter> {
+        self.entries
+            .get(&key)
+            .and_then(|entry| entry.protocol_adapter.as_deref())
+    }
+
+    /// Whether `key` selects a versioned protocol family rather than a legacy runner factory.
+    #[must_use]
+    pub fn is_protocol_family(&self, key: u64) -> bool {
+        self.family(key).is_some()
     }
 
     /// Retrieve the descriptive identifier associated with a registry entry.
@@ -1819,8 +2072,21 @@ impl BrainRegistry {
         if self.entries.is_empty() {
             return None;
         }
-        // Select from a sorted key list for stable ordering across hashseed/platforms
-        let mut keys: Vec<u64> = self.entries.keys().copied().collect();
+        // Once at least one honest protocol family exists, legacy factories are explicit-only:
+        // population maintenance must not silently inject a non-protocol brain into an evolving
+        // scenario. Legacy-only test/transition worlds retain their historical selection path.
+        let has_protocol_family = self
+            .entries
+            .values()
+            .any(|entry| entry.protocol_adapter.is_some());
+        let mut keys: Vec<u64> = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (!has_protocol_family || entry.protocol_adapter.is_some()).then_some(*key)
+            })
+            .collect();
+        // Select from a sorted key list for stable ordering across hashseed/platforms.
         keys.sort_unstable();
         let idx = rng.random_range(0..keys.len());
         keys.get(idx).copied()
@@ -5391,7 +5657,7 @@ pub struct TickCombatSummary {
 /// [`StepCompletion`] so lifecycle records and persistence projection data cannot be lost.
 #[derive(Debug, Clone, Error)]
 pub enum CompletedStepFault {
-    /// A registered brain factory failed during population commitment.
+    /// A brain family failed during evaluation or population commitment.
     #[error(transparent)]
     BrainSpawn(BrainSpawnError),
     /// A scientific-state invariant failed during population commitment.
@@ -5609,7 +5875,7 @@ pub enum WorldStepError {
     /// A lineage or other scientific invariant rejected the tick before it began.
     #[error(transparent)]
     ScientificState(#[from] ScientificStateError),
-    /// A registered brain factory could not construct a runner.
+    /// A registered brain family could not construct, inherit, or evaluate a live brain.
     #[error(transparent)]
     BrainSpawn(#[from] BrainSpawnError),
     /// The completed tick could not be admitted to persistence.
@@ -5655,7 +5921,11 @@ impl WorldPersistence for NullPersistence {
 }
 
 /// Wire version for heritable brain-genome envelopes.
-pub const BRAIN_GENOME_ENVELOPE_VERSION: u16 = 1;
+///
+/// Version two records the canonical material hash and typed derivation metadata. Version one
+/// could name parents, but could not distinguish a clone from a mutation or prove that two
+/// envelopes carried different heritable material.
+pub const BRAIN_GENOME_ENVELOPE_VERSION: u16 = 2;
 /// Wire version for future-affecting evaluator-state envelopes.
 pub const BRAIN_EVALUATOR_STATE_ENVELOPE_VERSION: u16 = 1;
 /// Maximum UTF-8 bytes accepted for a brain-family identifier.
@@ -5749,13 +6019,137 @@ impl<'de> Deserialize<'de> for BrainFamilyId {
     }
 }
 
+/// Domain used by the one core-owned brain-genome material hash.
+const BRAIN_GENOME_HASH_CONTEXT: &str = "rust-scriptbots.brain-genome-material.v1";
+
+/// Stable BLAKE3 identity of heritable brain material.
+///
+/// The hash covers the envelope version, family ID, family schema, payload codec, and exact
+/// payload bytes. Provenance is deliberately excluded: a bit-identical clone created at a later
+/// tick must retain the same material identity while carrying new lineage metadata.
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct BrainGenomeHash([u8; 32]);
+
+impl BrainGenomeHash {
+    /// Borrow the exact 32-byte BLAKE3 output.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn compute(
+        envelope_version: u16,
+        family_id: &BrainFamilyId,
+        schema_version: u32,
+        codec_version: u16,
+        payload: &[u8],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key(BRAIN_GENOME_HASH_CONTEXT);
+        hasher.update(&envelope_version.to_le_bytes());
+        let family = family_id.as_str().as_bytes();
+        hasher.update(&(family.len() as u64).to_le_bytes());
+        hasher.update(family);
+        hasher.update(&schema_version.to_le_bytes());
+        hasher.update(&codec_version.to_le_bytes());
+        hasher.update(&(payload.len() as u64).to_le_bytes());
+        hasher.update(payload);
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl fmt::Debug for BrainGenomeHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "BrainGenomeHash({self})")
+    }
+}
+
+impl fmt::Display for BrainGenomeHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Core-classified operation that produced a genome envelope.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BrainGenomeDerivation {
+    /// A founder or injected brain was generated from a registered family stream.
+    #[default]
+    Founder,
+    /// One parent's material was copied without a material-changing mutation.
+    Clone,
+    /// One parent's material changed after the family mutation operation.
+    MutationOnly,
+    /// Two compatible parent genomes were recombined and the following mutation left it unchanged.
+    Crossover,
+    /// Two compatible parent genomes were recombined and mutation then changed that material.
+    CrossoverThenMutation,
+}
+
 /// Stable scientific lineage metadata carried by a heritable genome.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainProvenance {
-    /// Stable logical identities of the parents, never transient slot-map handles.
+    /// Stable logical identities that contributed brain material, never transient slot handles.
+    ///
+    /// These can intentionally differ from `BirthRecord`'s whole-agent parents: an incompatible
+    /// family may contribute body/runtime genes without contributing brain-genome bytes.
     pub parents: [Option<AgentUid>; 2],
+    /// Canonical material identities aligned with [`Self::parents`].
+    pub parent_genome_hashes: [Option<BrainGenomeHash>; 2],
     /// Completed tick at which this genome was created.
     pub created_at: Tick,
+    /// Exact core-owned derivation classification.
+    pub derivation: BrainGenomeDerivation,
+}
+
+impl BrainProvenance {
+    fn validate(&self) -> Result<(), BrainProtocolError> {
+        for (index, (parent, hash)) in self
+            .parents
+            .iter()
+            .zip(self.parent_genome_hashes.iter())
+            .enumerate()
+        {
+            if parent.is_some() != hash.is_some() {
+                return Err(BrainProtocolError::InvalidProvenance {
+                    detail: format!(
+                        "parent slot {index} must carry both an agent UID and a genome hash"
+                    ),
+                });
+            }
+        }
+        if self.parents[0].is_none() && self.parents[1].is_some() {
+            return Err(BrainProtocolError::InvalidProvenance {
+                detail: "parent slot 1 cannot be populated while slot 0 is empty".to_owned(),
+            });
+        }
+
+        let found = self.parents.iter().flatten().count();
+        let expected = match self.derivation {
+            BrainGenomeDerivation::Founder => 0,
+            BrainGenomeDerivation::Clone | BrainGenomeDerivation::MutationOnly => 1,
+            BrainGenomeDerivation::Crossover | BrainGenomeDerivation::CrossoverThenMutation => 2,
+        };
+        if found != expected {
+            return Err(BrainProtocolError::InvalidProvenance {
+                detail: format!(
+                    "derivation {:?} requires exactly {expected} brain parent(s), found {found}",
+                    self.derivation
+                ),
+            });
+        }
+        if let [Some(left), Some(right)] = self.parents
+            && left == right
+        {
+            return Err(BrainProtocolError::InvalidProvenance {
+                detail: format!("crossover names {left:?} in both parent slots"),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Bounded family-owned genome bytes before core attaches scientific identity and lineage.
@@ -5813,6 +6207,7 @@ pub struct BrainGenomeEnvelope {
     codec_version: u16,
     #[serde(deserialize_with = "deserialize_bounded_brain_genome_payload")]
     payload: Vec<u8>,
+    material_hash: BrainGenomeHash,
     provenance: BrainProvenance,
 }
 
@@ -5830,12 +6225,22 @@ impl BrainGenomeEnvelope {
             payload.len(),
             MAX_BRAIN_GENOME_PAYLOAD_BYTES,
         )?;
+        provenance.validate()?;
+        let envelope_version = BRAIN_GENOME_ENVELOPE_VERSION;
+        let material_hash = BrainGenomeHash::compute(
+            envelope_version,
+            &family_id,
+            schema_version,
+            codec_version,
+            &payload,
+        );
         Ok(Self {
-            envelope_version: BRAIN_GENOME_ENVELOPE_VERSION,
+            envelope_version,
             family_id,
             schema_version,
             codec_version,
             payload,
+            material_hash,
             provenance,
         })
     }
@@ -5863,7 +6268,22 @@ impl BrainGenomeEnvelope {
             BrainEnvelopeKind::Genome,
             self.payload.len(),
             MAX_BRAIN_GENOME_PAYLOAD_BYTES,
-        )
+        )?;
+        self.provenance.validate()?;
+        let expected = BrainGenomeHash::compute(
+            self.envelope_version,
+            &self.family_id,
+            self.schema_version,
+            self.codec_version,
+            &self.payload,
+        );
+        if self.material_hash != expected {
+            return Err(BrainProtocolError::GenomeHashMismatch {
+                recorded: self.material_hash,
+                computed: expected,
+            });
+        }
+        Ok(())
     }
 
     /// Family that owns and interprets the opaque payload.
@@ -5888,6 +6308,12 @@ impl BrainGenomeEnvelope {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// Canonical identity of the exact heritable material, excluding provenance.
+    #[must_use]
+    pub const fn material_hash(&self) -> BrainGenomeHash {
+        self.material_hash
     }
 
     /// Stable lineage metadata.
@@ -6097,6 +6523,19 @@ pub enum BrainProtocolError {
         found: usize,
         maximum: usize,
     },
+    #[error(
+        "brain-genome material hash mismatch: envelope records {recorded}, computed {computed}"
+    )]
+    GenomeHashMismatch {
+        recorded: BrainGenomeHash,
+        computed: BrainGenomeHash,
+    },
+    #[error(
+        "brain family `{family_id}` evaluator did not preserve the supplied future-affecting state"
+    )]
+    EvaluatorStateRoundTripMismatch { family_id: BrainFamilyId },
+    #[error("invalid brain-genome provenance: {detail}")]
+    InvalidProvenance { detail: String },
     #[error("invalid {kind} payload for brain family `{family_id}`: {detail}")]
     InvalidPayload {
         kind: BrainEnvelopeKind,
@@ -6215,11 +6654,15 @@ pub enum BrainInspection {
 }
 
 /// Object-safe scalar evaluator reconstructed from exact genome and state envelopes.
-pub trait BrainEvaluator: Send {
+pub trait BrainEvaluator: Send + Sync {
     /// Owning protocol family.
     fn family_id(&self) -> &BrainFamilyId;
 
     /// Evaluate one fixed ScriptBots sensor vector.
+    ///
+    /// Returning `Err` must leave every future-affecting evaluator value unchanged. Core uses a
+    /// deterministic zero-output containment action for that completed terminal tick and then
+    /// latches the typed fault, so a rejected candidate must never leak partial recurrent state.
     fn evaluate(
         &mut self,
         sensors: &[f32; INPUT_SIZE],
@@ -6338,6 +6781,22 @@ pub trait BrainFamilyCodec: Send + Sync {
         self.validate_evaluator_state(&state)?;
         Ok(state)
     }
+
+    /// Validate and capture an evaluator against the exact genome that owns its state.
+    ///
+    /// Generic state-envelope validation cannot prove a recurrent-state payload is bound to this
+    /// particular genome. Reconstructing through the family hook applies the same exact pairing
+    /// checks used at startup and restore boundaries.
+    fn checkpoint_evaluator_for_genome(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        evaluator: &dyn BrainEvaluator,
+    ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        self.validate_genome(genome)?;
+        let state = self.checkpoint_evaluator(evaluator)?;
+        let _validated_pair = self.evaluator(genome, &state)?;
+        Ok(state)
+    }
 }
 
 fn construct_brain_genome<A>(
@@ -6366,6 +6825,21 @@ pub trait BrainFamilyAdapter: BrainFamilyCodec {
         rng: &mut dyn RandomStream,
     ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
         let material = self.random_genome_material(rng)?;
+        construct_brain_genome(self, material, provenance)
+    }
+
+    /// Copy validated heritable material while attaching the caller's exact child provenance.
+    fn clone_genome(
+        &self,
+        genome: &BrainGenomeEnvelope,
+        provenance: BrainProvenance,
+    ) -> Result<BrainGenomeEnvelope, BrainProtocolError> {
+        self.validate_genome(genome)?;
+        let material = BrainGenomeMaterial::new(
+            genome.schema_version(),
+            genome.codec_version(),
+            genome.payload().to_vec(),
+        )?;
         construct_brain_genome(self, material, provenance)
     }
 
@@ -7270,6 +7744,9 @@ pub enum WorldStateError {
     /// A registered brain factory failed while applying a live-world mutation.
     #[error(transparent)]
     BrainSpawn(#[from] BrainSpawnError),
+    /// A versioned brain-family registration or envelope operation failed.
+    #[error(transparent)]
+    BrainProtocol(#[from] BrainProtocolError),
 }
 
 /// Control-related runtime behavior toggles.
@@ -12635,34 +13112,61 @@ impl WorldState {
         outputs
     }
 
-    fn stage_brains(&mut self) {
+    fn stage_brains(&mut self) -> Result<(), BrainSpawnError> {
         struct BrainJob {
             agent_id: AgentId,
-            runner: Option<Box<dyn BrainRunner>>,
+            kind: String,
+            execution: BrainExecution,
             sensors: [f32; INPUT_SIZE],
             outputs: [f32; OUTPUT_SIZE],
+            error: Option<BrainSpawnError>,
         }
 
-        // Pull each runner out of its binding so evaluation can run
-        // data-parallel (independent networks, no RNG); results are written
-        // back serially in handle order, keeping the stage deterministic.
+        // Pull each live execution object out of its exclusive binding so evaluation can run
+        // data-parallel (independent networks, no RNG); results are written back serially in
+        // handle order, keeping both restoration and first-error selection deterministic.
         let mut jobs: Vec<BrainJob> = Vec::with_capacity(self.agents.len());
         for agent_id in self.agents.iter_handles() {
             if let Some(runtime) = self.runtime.get_mut(agent_id) {
                 jobs.push(BrainJob {
                     agent_id,
-                    runner: runtime.brain.runner.take(),
+                    kind: runtime.brain.kind().unwrap_or("unbound").to_owned(),
+                    execution: runtime.brain.take_execution(),
                     sensors: runtime.sensors,
                     outputs: [0.0; OUTPUT_SIZE],
+                    error: None,
                 });
             }
         }
 
         let evaluate = |job: &mut BrainJob| {
-            if let Some(runner) = job.runner.as_mut() {
-                job.outputs = runner.tick(&job.sensors);
-            } else {
-                job.outputs = Self::default_outputs(&job.sensors);
+            match &mut job.execution {
+                BrainExecution::None => {
+                    job.outputs = Self::default_outputs(&job.sensors);
+                }
+                BrainExecution::MissingProtocol(family_id) => {
+                    // Keep the preinitialized all-zero fail-closed output. The transition is
+                    // still finalized and returned with a typed terminal fault; this is never
+                    // normalized into the unbound sensor-copy behavior below.
+                    job.error = Some(BrainSpawnError::new(
+                        job.kind.clone(),
+                        MissingProtocolEvaluator {
+                            family_id: family_id.clone(),
+                        },
+                    ));
+                }
+                BrainExecution::Legacy(runner) => {
+                    job.outputs = runner.tick(&job.sensors);
+                }
+                BrainExecution::Protocol(evaluator) => match evaluator.evaluate(&job.sensors) {
+                    Ok(outputs) => job.outputs = outputs,
+                    Err(error) => {
+                        // Family evaluators are required to reject atomically. Zero output keeps
+                        // the one containment transition deterministic and inert before the fault
+                        // latch prevents every later transition.
+                        job.error = Some(BrainSpawnError::new(job.kind.clone(), error));
+                    }
+                },
             }
         };
         #[cfg(feature = "parallel")]
@@ -12670,12 +13174,17 @@ impl WorldState {
         #[cfg(not(feature = "parallel"))]
         jobs.iter_mut().for_each(evaluate);
 
+        let mut first_error = None;
         for job in jobs {
             if let Some(runtime) = self.runtime.get_mut(job.agent_id) {
-                runtime.brain.runner = job.runner;
+                runtime.brain.restore_execution(job.execution);
                 runtime.outputs = job.outputs;
             }
+            if first_error.is_none() {
+                first_error = job.error;
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn wrap_position(value: f32, extent: f32) -> f32 {
@@ -13803,6 +14312,245 @@ impl WorldState {
         }
         activity
     }
+    fn prepare_registered_brain(
+        &mut self,
+        key: u64,
+        created_at: Tick,
+    ) -> Result<Option<BrainBinding>, BrainSpawnError> {
+        let Some(kind) = self.brain_registry.kind(key).map(str::to_owned) else {
+            return Ok(None);
+        };
+        let (registry, rng) = (&self.brain_registry, &mut self.rng);
+        let Some(adapter) = registry.family(key) else {
+            return BrainBinding::from_registry(registry, rng, key);
+        };
+        let provenance = BrainProvenance {
+            parents: [None, None],
+            parent_genome_hashes: [None, None],
+            created_at,
+            derivation: BrainGenomeDerivation::Founder,
+        };
+        let genome = adapter
+            .random_genome(provenance, rng)
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+        let state = adapter
+            .initial_state(&genome, rng)
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+        Self::instantiate_protocol_binding(adapter, key, kind, genome, state).map(Some)
+    }
+
+    fn instantiate_protocol_binding(
+        adapter: &dyn BrainFamilyAdapter,
+        key: u64,
+        kind: String,
+        genome: BrainGenomeEnvelope,
+        state: BrainEvaluatorStateEnvelope,
+    ) -> Result<BrainBinding, BrainSpawnError> {
+        adapter
+            .validate_genome(&genome)
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+        adapter
+            .validate_evaluator_state(&state)
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+        let evaluator = adapter
+            .evaluator(&genome, &state)
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+        let reconstructed = adapter
+            .checkpoint_evaluator_for_genome(&genome, evaluator.as_ref())
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+        if reconstructed != state {
+            return Err(BrainSpawnError::new(
+                kind,
+                BrainProtocolError::EvaluatorStateRoundTripMismatch {
+                    family_id: adapter.family_id().clone(),
+                },
+            ));
+        }
+        Ok(BrainBinding::protocol(key, kind, genome, evaluator))
+    }
+
+    fn prepare_protocol_offspring_brain(
+        &mut self,
+        parent_id: AgentId,
+        partner_id: Option<AgentId>,
+        rates: MutationRates,
+        created_at: Tick,
+    ) -> Result<Option<BrainBinding>, BrainSpawnError> {
+        let Some(parent_runtime) = self.runtime.get(parent_id) else {
+            return Ok(None);
+        };
+        let Some(parent_genome) = parent_runtime.brain.genome().cloned() else {
+            return Ok(None);
+        };
+        let kind = parent_runtime.brain.kind().unwrap_or("unknown").to_owned();
+        let key = parent_runtime
+            .brain
+            .registry_key()
+            .ok_or_else(|| BrainSpawnError::new(kind.clone(), MissingHeritableBrain))?;
+        let adapter = self.brain_registry.family(key).ok_or_else(|| {
+            BrainSpawnError::new(
+                kind.clone(),
+                BrainProtocolError::UnknownFamily {
+                    family_id: parent_genome.family_id().clone(),
+                },
+            )
+        })?;
+        if adapter.family_id() != parent_genome.family_id() {
+            return Err(BrainSpawnError::new(
+                kind.clone(),
+                BrainProtocolError::FamilyMismatch {
+                    found: adapter.family_id().clone(),
+                    expected: parent_genome.family_id().clone(),
+                },
+            ));
+        }
+        let parent_uid = self
+            .agent_uid(parent_id)
+            .expect("live brain parent must have stable identity");
+        let parent_state = parent_runtime
+            .brain
+            .checkpoint_evaluator_state_with(adapter)?
+            .ok_or_else(|| {
+                BrainSpawnError::new(
+                    kind.clone(),
+                    MissingProtocolEvaluator {
+                        family_id: parent_genome.family_id().clone(),
+                    },
+                )
+            })?;
+
+        let partner = if let Some(partner_id) = partner_id {
+            let Some(partner_runtime) = self.runtime.get(partner_id) else {
+                return Ok(None);
+            };
+            match partner_runtime.brain.genome() {
+                Some(genome) if genome.family_id() == parent_genome.family_id() => {
+                    let state = partner_runtime
+                        .brain
+                        .checkpoint_evaluator_state_with(adapter)?
+                        .ok_or_else(|| {
+                            BrainSpawnError::new(
+                                kind.clone(),
+                                MissingProtocolEvaluator {
+                                    family_id: genome.family_id().clone(),
+                                },
+                            )
+                        })?;
+                    let uid = self
+                        .agent_uid(partner_id)
+                        .expect("live brain partner must have stable identity");
+                    Some((genome.clone(), state, uid))
+                }
+                // Whole-agent lineage and brain-material lineage are deliberately distinct.
+                // A body-level partner from another family can contribute scalar/runtime genes,
+                // but it contributed no compatible brain bytes, so the brain derivation remains
+                // unary and records only the actual material parent.
+                Some(_) | None => None,
+            }
+        } else {
+            None
+        };
+
+        let parents = [Some(parent_uid), partner.as_ref().map(|(_, _, uid)| *uid)];
+        let parent_genome_hashes = [
+            Some(parent_genome.material_hash()),
+            partner
+                .as_ref()
+                .map(|(genome, _, _)| genome.material_hash()),
+        ];
+        let provenance = |derivation| BrainProvenance {
+            parents,
+            parent_genome_hashes,
+            created_at,
+            derivation,
+        };
+
+        let rng = &mut self.rng;
+
+        let child_genome = if let Some((partner_genome, _, _)) = &partner {
+            let crossed = adapter
+                .crossover_genomes(
+                    &parent_genome,
+                    partner_genome,
+                    provenance(BrainGenomeDerivation::Crossover),
+                    rng,
+                )
+                .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+            let mutated = adapter
+                .mutate_genome(
+                    &crossed,
+                    rates,
+                    provenance(BrainGenomeDerivation::CrossoverThenMutation),
+                    rng,
+                )
+                .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+            if mutated.material_hash() == crossed.material_hash() {
+                adapter
+                    .clone_genome(&mutated, provenance(BrainGenomeDerivation::Crossover))
+                    .map_err(|error| BrainSpawnError::new(kind.clone(), error))?
+            } else {
+                mutated
+            }
+        } else {
+            let mutated = adapter
+                .mutate_genome(
+                    &parent_genome,
+                    rates,
+                    provenance(BrainGenomeDerivation::MutationOnly),
+                    rng,
+                )
+                .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+            if mutated.material_hash() == parent_genome.material_hash() {
+                adapter
+                    .clone_genome(&mutated, provenance(BrainGenomeDerivation::Clone))
+                    .map_err(|error| BrainSpawnError::new(kind.clone(), error))?
+            } else {
+                mutated
+            }
+        };
+
+        let mut parent_states = vec![&parent_state];
+        if let Some((_, partner_state, _)) = &partner {
+            parent_states.push(partner_state);
+        }
+        let state_policy = adapter.offspring_state_policy();
+        match state_policy {
+            OffspringStatePolicy::Reset => {}
+            OffspringStatePolicy::Inherit { parent_index } => {
+                let index = usize::from(parent_index);
+                if index >= parent_states.len() {
+                    return Err(BrainSpawnError::new(
+                        kind,
+                        BrainProtocolError::ParentStateUnavailable {
+                            index,
+                            available: parent_states.len(),
+                        },
+                    ));
+                }
+            }
+            OffspringStatePolicy::Blend if parent_states.is_empty() => {
+                return Err(BrainSpawnError::new(
+                    kind,
+                    BrainProtocolError::ParentStateUnavailable {
+                        index: 0,
+                        available: 0,
+                    },
+                ));
+            }
+            OffspringStatePolicy::Blend => {}
+        }
+        let state_parents = match state_policy {
+            OffspringStatePolicy::Reset => &[][..],
+            OffspringStatePolicy::Inherit { .. } | OffspringStatePolicy::Blend => {
+                parent_states.as_slice()
+            }
+        };
+        let child_state = adapter
+            .offspring_state(&child_genome, state_parents, rng)
+            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
+        Self::instantiate_protocol_binding(adapter, key, kind, child_genome, child_state).map(Some)
+    }
+
     fn spawn_crossover_agent(
         &mut self,
         record_tick: Tick,
@@ -13888,12 +14636,19 @@ impl WorldState {
         };
         let partner_runtime = self.runtime.get(partner_id).cloned();
 
-        // Species barrier: require matching brain kinds for sexual reproduction
+        // Scheduled crossover is an explicit brain crossover, so protocol families must match by
+        // exact wire identity. Display kinds are insufficient: two adapters can share a label
+        // while interpreting genome bytes differently. Legacy runners retain their kind gate.
         if let Some(ref partner_rt) = partner_runtime {
-            let parent_kind = parent_runtime.brain.kind();
-            let partner_kind = partner_rt.brain.kind();
-            let kind_match = parent_kind.is_some() && parent_kind == partner_kind;
-            if !kind_match {
+            let compatible = match (parent_runtime.brain.genome(), partner_rt.brain.genome()) {
+                (Some(parent), Some(partner)) => parent.family_id() == partner.family_id(),
+                (Some(_), None) | (None, Some(_)) => false,
+                (None, None) => {
+                    let parent_kind = parent_runtime.brain.kind();
+                    parent_kind.is_some() && parent_kind == partner_rt.brain.kind()
+                }
+            };
+            if !compatible {
                 return Ok(None); // fall back to random spawn in caller
             }
         } else {
@@ -13932,6 +14687,29 @@ impl WorldState {
 
         let child_rates = child_runtime.mutation_rates;
         let inherited_key = parent_runtime.brain.registry_key();
+        if parent_runtime.brain.genome().is_some() {
+            let binding = self
+                .prepare_protocol_offspring_brain(
+                    parent_id,
+                    Some(partner_id),
+                    child_rates,
+                    record_tick,
+                )?
+                .ok_or_else(|| {
+                    BrainSpawnError::new(
+                        parent_runtime.brain.kind().unwrap_or("unknown").to_owned(),
+                        MissingHeritableBrain,
+                    )
+                })?;
+            child_runtime.brain = binding;
+            let child_id = self.insert_agent(
+                child_data,
+                child_runtime,
+                record_tick,
+                BirthOrigin::Injected,
+            );
+            return Ok(Some(child_id));
+        }
         let parent_was_bound = self
             .runtime
             .get(parent_id)
@@ -14093,7 +14871,7 @@ impl WorldState {
         // without leaving a partially inserted agent on error.
         let mut runtime = AgentRuntime::new_random(&mut self.rng);
         let binding = if let Some(key) = self.brain_registry.random_key(&mut self.rng) {
-            BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+            self.prepare_registered_brain(key, record_tick)?
         } else {
             None
         };
@@ -15092,6 +15870,27 @@ impl WorldState {
                 let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
                 let inherited_key = order.runtime.brain.registry_key();
                 let child_rates = order.runtime.mutation_rates;
+                let parent_uses_protocol = self
+                    .runtime
+                    .get(order.parent_id)
+                    .is_some_and(|runtime| runtime.brain.genome().is_some());
+                if parent_uses_protocol {
+                    let binding = self
+                        .prepare_protocol_offspring_brain(
+                            order.parent_id,
+                            order.partner_id,
+                            child_rates,
+                            tick,
+                        )?
+                        .ok_or_else(|| {
+                            BrainSpawnError::new(
+                                order.runtime.brain.kind().unwrap_or("unknown").to_owned(),
+                                MissingHeritableBrain,
+                            )
+                        })?;
+                    order.runtime.brain = binding;
+                    continue;
+                }
                 let parent_was_bound = self
                     .runtime
                     .get(order.parent_id)
@@ -16183,10 +16982,12 @@ impl WorldState {
 
     /// Execute one simulation transition without performing downstream persistence I/O.
     ///
-    /// `Err` means no new transition started. Once a tick advances, this always returns its
-    /// [`StepCompletion`]; a population fault discovered at that completed boundary is carried in
-    /// [`StepCompletion::fault`]. This direct API is limited to persistence-disabled worlds;
-    /// persistence-enabled callers use [`PersistenceAdmissionSession::step_outcome`].
+    /// `Err` means no new transition started. Once a transition begins, this always advances to a
+    /// completed boundary and returns its [`StepCompletion`]. A brain evaluation failure uses a
+    /// deterministic zero-output containment action, suppresses births, and is carried alongside
+    /// population-construction faults in [`StepCompletion::fault`]; the latch rejects every later
+    /// transition. This direct API is limited to persistence-disabled worlds; persistence-enabled
+    /// callers use [`PersistenceAdmissionSession::step_outcome`].
     pub fn step_outcome(&mut self) -> Result<StepCompletion, WorldStepError> {
         self.require_external_session_if_enabled()?;
         self.step_outcome_observed(&mut NoopWorldStepObserver)
@@ -16325,9 +17126,7 @@ impl WorldState {
         observed_stage!(WorldStepStage::Sense, {
             self.stage_sense();
         });
-        observed_stage!(WorldStepStage::Brains, {
-            self.stage_brains();
-        });
+        let brain_evaluation = observed_stage!(WorldStepStage::Brains, { self.stage_brains() });
         observed_stage!(WorldStepStage::Actuation, {
             self.stage_actuation();
         });
@@ -16393,7 +17192,14 @@ impl WorldState {
         });
         let reproduction_result = observed_stage!(WorldStepStage::Reproduction, {
             let reproduction_before = self.capture_resource_amounts();
-            let result = self.stage_reproduction();
+            // An evaluator failure is completed as a typed, terminal boundary below. Suppress
+            // births from the fail-closed zero-output containment tick: no child should claim a
+            // valid brain decision when one family could not evaluate.
+            let result = if brain_evaluation.is_ok() {
+                self.stage_reproduction()
+            } else {
+                Ok(())
+            };
             self.record_resource_change(
                 ResourceFlowKind::ReproductionAllocation,
                 reproduction_before,
@@ -16402,42 +17208,54 @@ impl WorldState {
         });
         let population_result = observed_stage!(WorldStepStage::Population, {
             let population_before = self.capture_resource_amounts();
-            let population_result = match reproduction_result {
-                Ok(()) => self.stage_population(next_tick),
-                Err(error) => Err(error.into()),
-            };
-            self.record_resource_change(ResourceFlowKind::PopulationInjection, population_before);
-            match population_result {
-                Ok(population_receipt) => {
-                    let spawn_before = self.capture_resource_amounts();
-                    let spawn_result = self.stage_spawn_commit(next_tick);
-                    self.record_resource_change(
-                        ResourceFlowKind::ReproductionAllocation,
-                        spawn_before,
-                    );
-                    match spawn_result {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            if let Some(receipt) = population_receipt {
-                                let rollback_before = self.capture_resource_amounts();
-                                self.rollback_population_spawns(receipt);
-                                self.record_resource_change(
-                                    ResourceFlowKind::PopulationInjection,
-                                    rollback_before,
-                                );
+            if brain_evaluation.is_err() {
+                self.abort_pending_spawns();
+                self.record_resource_change(
+                    ResourceFlowKind::PopulationInjection,
+                    population_before,
+                );
+                Ok(())
+            } else {
+                let population_result = match reproduction_result {
+                    Ok(()) => self.stage_population(next_tick),
+                    Err(error) => Err(error.into()),
+                };
+                self.record_resource_change(
+                    ResourceFlowKind::PopulationInjection,
+                    population_before,
+                );
+                match population_result {
+                    Ok(population_receipt) => {
+                        let spawn_before = self.capture_resource_amounts();
+                        let spawn_result = self.stage_spawn_commit(next_tick);
+                        self.record_resource_change(
+                            ResourceFlowKind::ReproductionAllocation,
+                            spawn_before,
+                        );
+                        match spawn_result {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                if let Some(receipt) = population_receipt {
+                                    let rollback_before = self.capture_resource_amounts();
+                                    self.rollback_population_spawns(receipt);
+                                    self.record_resource_change(
+                                        ResourceFlowKind::PopulationInjection,
+                                        rollback_before,
+                                    );
+                                }
+                                Err(error.into())
                             }
-                            Err(error.into())
                         }
                     }
-                }
-                Err(error) => {
-                    let abort_before = self.capture_resource_amounts();
-                    self.abort_pending_spawns();
-                    self.record_resource_change(
-                        ResourceFlowKind::ReproductionAllocation,
-                        abort_before,
-                    );
-                    Err(error)
+                    Err(error) => {
+                        let abort_before = self.capture_resource_amounts();
+                        self.abort_pending_spawns();
+                        self.record_resource_change(
+                            ResourceFlowKind::ReproductionAllocation,
+                            abort_before,
+                        );
+                        Err(error)
+                    }
                 }
             }
         });
@@ -16485,15 +17303,21 @@ impl WorldState {
         } else {
             None
         };
-        let completed_fault = match population_result {
-            Ok(()) => None,
-            Err(PopulationSpawnError::BrainSpawn(brain)) => {
+        let completed_fault = match brain_evaluation {
+            Err(brain) => {
                 self.brain_fault = Some(brain.clone());
                 Some(CompletedStepFault::BrainSpawn(brain))
             }
-            Err(PopulationSpawnError::ScientificState(scientific_state)) => {
-                Some(CompletedStepFault::ScientificState(scientific_state))
-            }
+            Ok(()) => match population_result {
+                Ok(()) => None,
+                Err(PopulationSpawnError::BrainSpawn(brain)) => {
+                    self.brain_fault = Some(brain.clone());
+                    Some(CompletedStepFault::BrainSpawn(brain))
+                }
+                Err(PopulationSpawnError::ScientificState(scientific_state)) => {
+                    Some(CompletedStepFault::ScientificState(scientific_state))
+                }
+            },
         };
         observer.end_step(step_started_at);
         Ok(StepCompletion {
@@ -16724,6 +17548,9 @@ impl WorldState {
         for (key, entry) in registrations {
             brain_encoder.u64(*key);
             brain_encoder.string(entry.kind.as_ref());
+            if let Some(adapter) = &entry.protocol_adapter {
+                brain_encoder.string(adapter.family_id().as_str());
+            }
         }
         let brain_registry = brain_encoder.finish();
 
@@ -16785,8 +17612,8 @@ impl WorldState {
     ///    bound-ness — and nothing about its weights. Two populations that have evolved for a
     ///    million ticks into completely different brains produce the SAME v0 digest. The oracle
     ///    that decides whether two runs are the same run could not see the only thing that is
-    ///    actually evolving. V1 hashes each brain's genome AND evaluator state via
-    ///    [`BrainRunner::state_digest`].
+    ///    actually evolving. V1 hashes each admitted protocol genome plus its exact evaluator
+    ///    checkpoint; explicitly legacy runners use [`BrainRunner::state_digest`].
     ///
     /// 2. **v0 identifies agents by a REUSABLE slot key.** It orders by, and encodes,
     ///    `AgentId::data().as_ffi()` — a slotmap key whose slots are recycled when agents die.
@@ -16892,7 +17719,7 @@ impl WorldState {
             // something moved.
             brains_encoder.u64(uid.0);
             brains_encoder.option_string(runtime.brain.kind());
-            match runtime.brain.runner().and_then(BrainRunner::state_digest) {
+            match runtime.brain.state_digest() {
                 Some(digest) => {
                     brains_encoder.bool(true);
                     brains_encoder.u64(digest);
@@ -17005,6 +17832,9 @@ impl WorldState {
             registry_encoder.u64(*key);
             registry_encoder.string(entry.kind.as_ref());
             registry_encoder.option_u64(entry.factory_state_digest);
+            if let Some(adapter) = &entry.protocol_adapter {
+                registry_encoder.string(adapter.family_id().as_str());
+            }
             if entry.factory_state_digest.is_none() {
                 uncovered_factories.insert(entry.kind.to_string());
             }
@@ -17121,12 +17951,7 @@ impl WorldState {
             encoder.f32(spawn.parent_reproduction_counter_before_reset);
             encode_agent_data_v0(&mut encoder, spawn.data);
             encode_agent_runtime_v0(&mut encoder, &spawn.runtime);
-            let runner_digest = spawn
-                .runtime
-                .brain
-                .runner()
-                .and_then(BrainRunner::state_digest);
-            encoder.option_u64(runner_digest);
+            encoder.option_u64(spawn.runtime.brain.state_digest());
         }
 
         encoder.postcard("pending interventions", &self.pending_interventions)?;
@@ -18065,6 +18890,16 @@ impl WorldState {
         Ok(&mut self.brain_registry)
     }
 
+    /// Register one versioned family as an admitted evolutionary brain.
+    pub fn register_brain_family(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        adapter: Box<dyn BrainFamilyAdapter>,
+    ) -> Result<u64, WorldStateError> {
+        self.ensure_scientific_mutation_allowed("brain_registry")?;
+        Ok(self.brain_registry.register_family(kind, adapter)?)
+    }
+
     /// Bind a brain from the registry to the specified agent. Returns `true` on success.
     ///
     /// A pending Seeded/Injected origin row at the agent's insertion boundary is refreshed with
@@ -18079,7 +18914,7 @@ impl WorldState {
             return Ok(false);
         }
         let rng_before = self.rng.clone();
-        let binding = match BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key) {
+        let binding = match self.prepare_registered_brain(key, self.tick) {
             Ok(Some(binding)) => binding,
             Ok(None) => {
                 self.rng = rng_before;
@@ -18109,6 +18944,39 @@ impl WorldState {
     #[must_use]
     pub fn agent_runtime(&self, id: AgentId) -> Option<&AgentRuntime> {
         self.runtime.get(id)
+    }
+
+    /// Borrow the exact versioned heritable genome bound to a live protocol brain.
+    #[must_use]
+    pub fn agent_brain_genome(&self, id: AgentId) -> Option<&BrainGenomeEnvelope> {
+        self.runtime.get(id)?.brain.genome()
+    }
+
+    /// Capture the exact future-affecting state of a live protocol evaluator.
+    pub fn agent_brain_evaluator_state(
+        &self,
+        id: AgentId,
+    ) -> Result<Option<BrainEvaluatorStateEnvelope>, BrainSpawnError> {
+        let Some(runtime) = self.runtime.get(id) else {
+            return Ok(None);
+        };
+        let Some(genome) = runtime.brain.genome() else {
+            return Ok(None);
+        };
+        let kind = runtime.brain.kind().unwrap_or("unknown").to_owned();
+        let key = runtime
+            .brain
+            .registry_key()
+            .ok_or_else(|| BrainSpawnError::new(kind.clone(), MissingHeritableBrain))?;
+        let adapter = self.brain_registry.family(key).ok_or_else(|| {
+            BrainSpawnError::new(
+                kind,
+                BrainProtocolError::UnknownFamily {
+                    family_id: genome.family_id().clone(),
+                },
+            )
+        })?;
+        runtime.brain.checkpoint_evaluator_state_with(adapter)
     }
 
     /// Transactionally edit both scalar and runtime state for one agent.
@@ -22283,7 +23151,7 @@ mod tests {
                 runtime.selection = SelectionState::Selected;
             }
         }
-        world.stage_brains();
+        world.stage_brains().expect("brain stage");
         assert_eq!(inspections.load(AtomicUsizeOrdering::Relaxed), 0);
 
         let before = world.world_digest_v1().expect("pre-inspection digest");
@@ -23246,6 +24114,8 @@ mod tests {
     struct FixtureBrainFamily {
         id: BrainFamilyId,
         offspring_policy: OffspringStatePolicy,
+        offspring_parent_counts: Option<Arc<Mutex<Vec<usize>>>>,
+        evaluation_fails: bool,
     }
 
     impl FixtureBrainFamily {
@@ -23253,6 +24123,8 @@ mod tests {
             Self {
                 id: BrainFamilyId::new(id).expect("valid fixture family id"),
                 offspring_policy: OffspringStatePolicy::Reset,
+                offspring_parent_counts: None,
+                evaluation_fails: false,
             }
         }
 
@@ -23260,6 +24132,30 @@ mod tests {
             Self {
                 id: BrainFamilyId::new(id).expect("valid fixture family id"),
                 offspring_policy,
+                offspring_parent_counts: None,
+                evaluation_fails: false,
+            }
+        }
+
+        fn with_policy_probe(
+            id: &str,
+            offspring_policy: OffspringStatePolicy,
+            offspring_parent_counts: Arc<Mutex<Vec<usize>>>,
+        ) -> Self {
+            Self {
+                id: BrainFamilyId::new(id).expect("valid fixture family id"),
+                offspring_policy,
+                offspring_parent_counts: Some(offspring_parent_counts),
+                evaluation_fails: false,
+            }
+        }
+
+        fn failing(id: &str) -> Self {
+            Self {
+                id: BrainFamilyId::new(id).expect("valid fixture family id"),
+                offspring_policy: OffspringStatePolicy::Reset,
+                offspring_parent_counts: None,
+                evaluation_fails: true,
             }
         }
 
@@ -23337,6 +24233,7 @@ mod tests {
         gain: i8,
         bias: i8,
         accumulator: i16,
+        evaluation_fails: bool,
     }
 
     impl BrainEvaluator for FixtureBrainEvaluator {
@@ -23348,6 +24245,13 @@ mod tests {
             &mut self,
             sensors: &[f32; INPUT_SIZE],
         ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+            if self.evaluation_fails {
+                return Err(BrainProtocolError::InvalidPayload {
+                    kind: BrainEnvelopeKind::EvaluatorState,
+                    family_id: self.id.clone(),
+                    detail: "fixture requested an atomic evaluation failure".to_owned(),
+                });
+            }
             let mut outputs = [0.0; OUTPUT_SIZE];
             outputs[0] = sensors[0] * f32::from(self.gain)
                 + f32::from(self.bias)
@@ -23486,6 +24390,12 @@ mod tests {
             rng: &mut dyn RandomStream,
         ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
             self.validate_genome(child)?;
+            if let Some(parent_counts) = &self.offspring_parent_counts {
+                parent_counts
+                    .lock()
+                    .expect("fixture offspring probe mutex")
+                    .push(parents.len());
+            }
             match self.offspring_state_policy() {
                 OffspringStatePolicy::Reset => self.initial_state(child, rng),
                 OffspringStatePolicy::Inherit { parent_index } => {
@@ -23533,6 +24443,7 @@ mod tests {
                 gain,
                 bias,
                 accumulator,
+                evaluation_fails: self.evaluation_fails,
             }))
         }
 
@@ -23556,6 +24467,7 @@ mod tests {
                     gain,
                     bias,
                     accumulator: self.decode_state(state)?,
+                    evaluation_fails: self.evaluation_fails,
                 });
             }
             Ok(Some(Box::new(FixtureBrainBatchEvaluator {
@@ -23567,9 +24479,167 @@ mod tests {
 
     fn fixture_provenance() -> BrainProvenance {
         BrainProvenance {
-            parents: [Some(AgentUid(41)), Some(AgentUid(99))],
             created_at: Tick(12),
+            ..BrainProvenance::default()
         }
+    }
+
+    fn protocol_reproduction_config(partner_chance: f32) -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_sharing_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            bot_speed: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
+            reproduction_child_energy: 1.0,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_spawn_back_distance: 0.0,
+            reproduction_partner_chance: partner_chance,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            persistence_interval: 0,
+            chart_flush_interval: 0,
+            rng_seed: Some(0xB2C_A_2026),
+            ..ScriptBotsConfig::default()
+        }
+    }
+
+    fn protocol_fixture_world(
+        id: &str,
+        policy: OffspringStatePolicy,
+        partner_chance: f32,
+    ) -> (WorldState, u64) {
+        let mut world = WorldState::new(protocol_reproduction_config(partner_chance))
+            .expect("protocol reproduction world");
+        let key = world
+            .register_brain_family(
+                id.to_owned(),
+                Box::new(FixtureBrainFamily::with_policy(id, policy)),
+            )
+            .expect("register live protocol fixture");
+        (world, key)
+    }
+
+    fn protocol_fixture_parent(world: &mut WorldState, key: u64, seed: u32) -> AgentId {
+        let parent = world.spawn_agent(sample_agent(seed));
+        assert!(
+            world
+                .bind_agent_brain(parent, key)
+                .expect("bind live protocol fixture")
+        );
+        assert!(world.agent_brain_genome(parent).is_some());
+        assert!(
+            world
+                .agent_brain_evaluator_state(parent)
+                .expect("checkpoint live protocol fixture")
+                .is_some()
+        );
+        parent
+    }
+
+    fn replace_fixture_material(
+        world: &mut WorldState,
+        key: u64,
+        agent: AgentId,
+        id: &str,
+        gain: i8,
+        bias: i8,
+    ) {
+        let family = FixtureBrainFamily::new(id);
+        let genome = family.genome(
+            gain,
+            bias,
+            BrainProvenance {
+                created_at: world.tick(),
+                ..BrainProvenance::default()
+            },
+        );
+        let state = family
+            .initial_state(&genome, &mut world.rng)
+            .expect("fixture initial state");
+        let evaluator = family
+            .evaluator(&genome, &state)
+            .expect("fixture evaluator");
+        world
+            .agent_runtime_mut(agent)
+            .expect("fixture runtime")
+            .brain = BrainBinding::protocol(key, id.to_owned(), genome, evaluator);
+    }
+
+    fn agent_id_for_uid(world: &WorldState, uid: AgentUid) -> AgentId {
+        world
+            .agents()
+            .iter_handles()
+            .find(|id| world.agent_uid(*id) == Some(uid))
+            .expect("a just-recorded birth UID must resolve to one live agent")
+    }
+
+    fn reproduce_protocol_child(
+        world: &mut WorldState,
+        parent: AgentId,
+        rates: MutationRates,
+        expected_generation: u32,
+    ) -> (AgentId, BirthRecord) {
+        let handles: Vec<_> = world.agents().iter_handles().collect();
+        for id in handles {
+            let runtime = world.agent_runtime_mut(id).expect("live runtime");
+            runtime.energy = 0.0;
+            runtime.reproduction_counter = 0.0;
+        }
+        {
+            let runtime = world
+                .agent_runtime_mut(parent)
+                .expect("reproductive parent runtime");
+            runtime.energy = 5.0;
+            runtime.reproduction_counter = f32::MAX;
+            runtime.mutation_rates = rates;
+        }
+
+        let completion = world.step_outcome().expect("protocol reproduction step");
+        assert!(
+            completion.fault.is_none(),
+            "protocol reproduction faulted at generation {expected_generation}: {:?}",
+            completion.fault
+        );
+        let born: Vec<_> = completion
+            .outcome
+            .births
+            .iter()
+            .filter(|record| record.origin == BirthOrigin::Born)
+            .cloned()
+            .collect();
+        assert_eq!(
+            born.len(),
+            1,
+            "fixture failed to reproduce exactly once at generation {expected_generation}; \
+             a zero-birth pass would prove nothing about live genome provenance"
+        );
+        let record = born.into_iter().next().expect("one checked birth");
+        let child = agent_id_for_uid(world, record.agent_uid);
+        assert_eq!(
+            world
+                .agents()
+                .snapshot(child)
+                .expect("child data")
+                .generation,
+            Generation(expected_generation)
+        );
+        (child, record)
     }
 
     #[test]
@@ -23682,6 +24752,63 @@ mod tests {
 
         let family = FixtureBrainFamily::new("fixture-counter");
         let genome = family.genome(2, -3, fixture_provenance());
+        let mut tampered_hash = genome.clone();
+        tampered_hash.material_hash.0[0] ^= 0x80;
+        assert!(matches!(
+            family.validate_genome(&tampered_hash),
+            Err(BrainProtocolError::GenomeHashMismatch { .. })
+        ));
+
+        for invalid_provenance in [
+            BrainProvenance {
+                parents: [Some(AgentUid(1)), None],
+                parent_genome_hashes: [Some(genome.material_hash()), None],
+                created_at: Tick(1),
+                derivation: BrainGenomeDerivation::Founder,
+            },
+            BrainProvenance {
+                parents: [Some(AgentUid(1)), None],
+                parent_genome_hashes: [None, None],
+                created_at: Tick(1),
+                derivation: BrainGenomeDerivation::Clone,
+            },
+            BrainProvenance {
+                parents: [None, Some(AgentUid(2))],
+                parent_genome_hashes: [None, Some(genome.material_hash())],
+                created_at: Tick(1),
+                derivation: BrainGenomeDerivation::Clone,
+            },
+            BrainProvenance {
+                parents: [Some(AgentUid(3)), Some(AgentUid(3))],
+                parent_genome_hashes: [Some(genome.material_hash()), Some(genome.material_hash())],
+                created_at: Tick(1),
+                derivation: BrainGenomeDerivation::Crossover,
+            },
+        ] {
+            assert!(matches!(
+                BrainGenomeEnvelope::new(
+                    family.id.clone(),
+                    FIXTURE_GENOME_SCHEMA,
+                    FIXTURE_GENOME_CODEC,
+                    genome.payload().to_vec(),
+                    invalid_provenance,
+                ),
+                Err(BrainProtocolError::InvalidProvenance { .. })
+            ));
+        }
+
+        let mut tampered_provenance = genome.clone();
+        tampered_provenance.provenance = BrainProvenance {
+            parents: [Some(AgentUid(4)), None],
+            parent_genome_hashes: [None, None],
+            created_at: Tick(2),
+            derivation: BrainGenomeDerivation::Clone,
+        };
+        assert!(matches!(
+            family.validate_genome(&tampered_provenance),
+            Err(BrainProtocolError::InvalidProvenance { .. })
+        ));
+
         let mut wrong_envelope = genome.clone();
         wrong_envelope.envelope_version += 1;
         assert!(matches!(
@@ -23844,22 +24971,22 @@ mod tests {
             2,
             -3,
             BrainProvenance {
-                parents: [Some(AgentUid(10)), None],
                 created_at: Tick(4),
+                ..BrainProvenance::default()
             },
         );
         let right = reset_family.genome(
             -5,
             7,
             BrainProvenance {
-                parents: [Some(AgentUid(20)), None],
                 created_at: Tick(6),
+                ..BrainProvenance::default()
             },
         );
         let mut rng = SmallRngStream::seed_from_u64(33);
         let random_provenance = BrainProvenance {
-            parents: [Some(AgentUid(1_001)), None],
             created_at: Tick(70),
+            ..BrainProvenance::default()
         };
         let random = adapter
             .random_genome(random_provenance.clone(), &mut rng)
@@ -23869,7 +24996,9 @@ mod tests {
 
         let mutated_provenance = BrainProvenance {
             parents: [Some(AgentUid(2_001)), None],
+            parent_genome_hashes: [Some(left.material_hash()), None],
             created_at: Tick(71),
+            derivation: BrainGenomeDerivation::MutationOnly,
         };
         let mutated = adapter
             .mutate_genome(
@@ -23888,7 +25017,9 @@ mod tests {
 
         let crossover_provenance = BrainProvenance {
             parents: [Some(AgentUid(3_001)), Some(AgentUid(3_002))],
+            parent_genome_hashes: [Some(left.material_hash()), Some(right.material_hash())],
             created_at: Tick(72),
+            derivation: BrainGenomeDerivation::Crossover,
         };
         let child = adapter
             .crossover_genomes(&left, &right, crossover_provenance.clone(), &mut rng)
@@ -23905,6 +25036,7 @@ mod tests {
                         .0
                         .max(right.provenance().created_at.0),
                 ),
+                ..BrainProvenance::default()
             },
             "an adapter must not fabricate child lineage from parent-genome provenance"
         );
@@ -23944,6 +25076,448 @@ mod tests {
                 available: 1
             })
         ));
+    }
+
+    #[test]
+    fn protocol_registry_population_selection_excludes_legacy_entries() {
+        let mut registry = BrainRegistry::new();
+        let legacy = registry.register("legacy-explicit", |_rng| Ok(Box::new(StubBrain)));
+        let protocol = registry
+            .register_family(
+                "protocol-population",
+                Box::new(FixtureBrainFamily::new("protocol-population")),
+            )
+            .expect("register protocol population family");
+        assert_ne!(legacy, protocol);
+        assert!(registry.is_protocol_family(protocol));
+        assert!(
+            registry
+                .entries
+                .get(&protocol)
+                .expect("protocol entry")
+                .factory_state_digest
+                .is_none(),
+            "a family ID alone must not falsely certify opaque adapter construction state"
+        );
+
+        let mut rng = SmallRngStream::seed_from_u64(0xA11D_17ED);
+        for _ in 0..64 {
+            assert_eq!(
+                registry.random_key(&mut rng),
+                Some(protocol),
+                "once a protocol family exists, random population maintenance must never inject \
+                 an explicitly selectable legacy runner"
+            );
+        }
+    }
+
+    #[test]
+    fn live_reproduction_records_clone_mutation_and_crossover_derivations() {
+        let zero_rates = MutationRates {
+            primary: 0.0,
+            secondary: 0.0,
+        };
+
+        let (mut clone_world, clone_key) =
+            protocol_fixture_world("live-clone", OffspringStatePolicy::Reset, 0.0);
+        let clone_parent = protocol_fixture_parent(&mut clone_world, clone_key, 1);
+        let clone_parent_uid = clone_world
+            .agent_uid(clone_parent)
+            .expect("clone parent uid");
+        let clone_parent_hash = clone_world
+            .agent_brain_genome(clone_parent)
+            .expect("clone parent genome")
+            .material_hash();
+        let (clone_child, _) =
+            reproduce_protocol_child(&mut clone_world, clone_parent, zero_rates, 1);
+        let clone = clone_world
+            .agent_brain_genome(clone_child)
+            .expect("clone child genome");
+        assert_eq!(clone.material_hash(), clone_parent_hash);
+        assert_eq!(
+            clone.provenance(),
+            &BrainProvenance {
+                parents: [Some(clone_parent_uid), None],
+                parent_genome_hashes: [Some(clone_parent_hash), None],
+                created_at: Tick(1),
+                derivation: BrainGenomeDerivation::Clone,
+            }
+        );
+
+        let (mut mutation_world, mutation_key) =
+            protocol_fixture_world("live-mutation", OffspringStatePolicy::Reset, 0.0);
+        let mutation_parent = protocol_fixture_parent(&mut mutation_world, mutation_key, 2);
+        let mutation_parent_uid = mutation_world
+            .agent_uid(mutation_parent)
+            .expect("mutation parent uid");
+        let mutation_parent_hash = mutation_world
+            .agent_brain_genome(mutation_parent)
+            .expect("mutation parent genome")
+            .material_hash();
+        let (mutation_child, _) = reproduce_protocol_child(
+            &mut mutation_world,
+            mutation_parent,
+            MutationRates {
+                primary: 1.0,
+                secondary: 0.0,
+            },
+            1,
+        );
+        let mutated = mutation_world
+            .agent_brain_genome(mutation_child)
+            .expect("mutated child genome");
+        assert_ne!(mutated.material_hash(), mutation_parent_hash);
+        assert_eq!(
+            mutated.provenance().parents,
+            [Some(mutation_parent_uid), None]
+        );
+        assert_eq!(
+            mutated.provenance().parent_genome_hashes,
+            [Some(mutation_parent_hash), None]
+        );
+        assert_eq!(
+            mutated.provenance().derivation,
+            BrainGenomeDerivation::MutationOnly
+        );
+
+        let family_id = "live-crossover";
+        let (mut crossover_world, crossover_key) =
+            protocol_fixture_world(family_id, OffspringStatePolicy::Reset, 1.0);
+        let left = protocol_fixture_parent(&mut crossover_world, crossover_key, 3);
+        let right = protocol_fixture_parent(&mut crossover_world, crossover_key, 4);
+        replace_fixture_material(&mut crossover_world, crossover_key, left, family_id, 11, -9);
+        replace_fixture_material(
+            &mut crossover_world,
+            crossover_key,
+            right,
+            family_id,
+            -4,
+            23,
+        );
+        let left_uid = crossover_world.agent_uid(left).expect("left uid");
+        let right_uid = crossover_world.agent_uid(right).expect("right uid");
+        let left_hash = crossover_world
+            .agent_brain_genome(left)
+            .expect("left genome")
+            .material_hash();
+        let right_hash = crossover_world
+            .agent_brain_genome(right)
+            .expect("right genome")
+            .material_hash();
+        let (crossover_child, _) =
+            reproduce_protocol_child(&mut crossover_world, left, zero_rates, 1);
+        let crossed = crossover_world
+            .agent_brain_genome(crossover_child)
+            .expect("crossover child genome");
+        assert_eq!(crossed.payload(), &[11_u8, 23_u8]);
+        assert_ne!(crossed.material_hash(), left_hash);
+        assert_ne!(crossed.material_hash(), right_hash);
+        assert_eq!(
+            crossed.provenance().parents,
+            [Some(left_uid), Some(right_uid)]
+        );
+        assert_eq!(
+            crossed.provenance().parent_genome_hashes,
+            [Some(left_hash), Some(right_hash)]
+        );
+        assert_eq!(
+            crossed.provenance().derivation,
+            BrainGenomeDerivation::Crossover
+        );
+    }
+
+    #[test]
+    fn incompatible_body_partner_does_not_fabricate_a_brain_crossover() {
+        let (mut world, primary_key) =
+            protocol_fixture_world("body-primary", OffspringStatePolicy::Reset, 1.0);
+        let other_key = world
+            .register_brain_family(
+                "body-other",
+                Box::new(FixtureBrainFamily::new("body-other")),
+            )
+            .expect("register incompatible protocol family");
+        let primary = protocol_fixture_parent(&mut world, primary_key, 31);
+        let other = protocol_fixture_parent(&mut world, other_key, 32);
+        let primary_uid = world.agent_uid(primary).expect("primary uid");
+        let other_uid = world.agent_uid(other).expect("other uid");
+        let primary_hash = world
+            .agent_brain_genome(primary)
+            .expect("primary genome")
+            .material_hash();
+
+        let (child, record) = reproduce_protocol_child(
+            &mut world,
+            primary,
+            MutationRates {
+                primary: 0.0,
+                secondary: 0.0,
+            },
+            1,
+        );
+        assert_eq!(
+            [record.parent_a, record.parent_b],
+            [Some(primary_uid), Some(other_uid)]
+        );
+        let genome = world
+            .agent_brain_genome(child)
+            .expect("child protocol genome");
+        assert_eq!(genome.family_id().as_str(), "body-primary");
+        assert_eq!(genome.material_hash(), primary_hash);
+        assert_eq!(genome.provenance().parents, [Some(primary_uid), None]);
+        assert_eq!(
+            genome.provenance().parent_genome_hashes,
+            [Some(primary_hash), None]
+        );
+        assert_eq!(genome.provenance().derivation, BrainGenomeDerivation::Clone);
+    }
+
+    #[test]
+    fn protocol_evaluation_failure_completes_one_fail_closed_tick_then_latches() {
+        let mut config = protocol_reproduction_config(0.0);
+        config.reproduction_energy_threshold = 10.0;
+        let mut world = WorldState::new(config).expect("failing evaluator world");
+        let key = world
+            .register_brain_family(
+                "live-evaluation-failure",
+                Box::new(FixtureBrainFamily::failing("live-evaluation-failure")),
+            )
+            .expect("register failing protocol fixture");
+        let agent = protocol_fixture_parent(&mut world, key, 41);
+        world
+            .agent_runtime_mut(agent)
+            .expect("failing runtime")
+            .outputs = [0.75; OUTPUT_SIZE];
+        let state_before = world
+            .agent_brain_evaluator_state(agent)
+            .expect("pre-failure checkpoint")
+            .expect("protocol state");
+
+        let completion = world
+            .step_outcome()
+            .expect("an evaluator fault must still return its completed containment boundary");
+        assert_eq!(completion.outcome.events.tick, Tick(1));
+        assert!(completion.outcome.births.is_empty());
+        let fault = completion
+            .fault
+            .expect("protocol evaluation failure must produce a completed fault");
+        assert!(matches!(&fault, CompletedStepFault::BrainSpawn(_)));
+        let CompletedStepFault::BrainSpawn(fault) = fault else {
+            return;
+        };
+        assert_eq!(fault.kind(), "live-evaluation-failure");
+        assert!(
+            fault
+                .to_string()
+                .contains("fixture requested an atomic evaluation failure")
+        );
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(
+            world
+                .agent_runtime(agent)
+                .expect("contained runtime")
+                .outputs,
+            [0.0; OUTPUT_SIZE],
+            "a rejected evaluator must not use unbound sensor-copy outputs or stale actions"
+        );
+        assert_eq!(
+            world
+                .agent_brain_evaluator_state(agent)
+                .expect("post-failure checkpoint")
+                .expect("protocol state"),
+            state_before,
+            "the family evaluate error must be atomic over future-affecting state"
+        );
+
+        let repeated = world
+            .step_outcome()
+            .expect_err("the completed evaluator fault must latch before a second transition");
+        assert!(matches!(&repeated, WorldStepError::BrainSpawn(_)));
+        let WorldStepError::BrainSpawn(repeated) = repeated else {
+            return;
+        };
+        assert_eq!(repeated.kind(), "live-evaluation-failure");
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(
+            world
+                .agent_brain_evaluator_state(agent)
+                .expect("latched checkpoint")
+                .expect("protocol state"),
+            state_before
+        );
+    }
+
+    #[test]
+    fn live_reproduction_enforces_reset_and_inherit_state_policies() {
+        for (id, policy, inherits) in [
+            ("live-reset", OffspringStatePolicy::Reset, false),
+            (
+                "live-inherit",
+                OffspringStatePolicy::Inherit { parent_index: 0 },
+                true,
+            ),
+        ] {
+            let offspring_parent_counts = Arc::new(Mutex::new(Vec::new()));
+            let mut world =
+                WorldState::new(protocol_reproduction_config(0.0)).expect("protocol policy world");
+            let key = world
+                .register_brain_family(
+                    id.to_owned(),
+                    Box::new(FixtureBrainFamily::with_policy_probe(
+                        id,
+                        policy,
+                        Arc::clone(&offspring_parent_counts),
+                    )),
+                )
+                .expect("register protocol policy fixture");
+            let parent = protocol_fixture_parent(&mut world, key, 5);
+            {
+                let runtime = world
+                    .agent_runtime_mut(parent)
+                    .expect("warm parent runtime");
+                runtime.energy = 0.0;
+                runtime.reproduction_counter = 0.0;
+            }
+            let warmup = world.step_outcome().expect("warm protocol evaluator");
+            assert!(warmup.fault.is_none());
+            assert!(
+                warmup.outcome.births.is_empty(),
+                "policy fixture reproduced during its state warmup"
+            );
+
+            let (child, _) = reproduce_protocol_child(
+                &mut world,
+                parent,
+                MutationRates {
+                    primary: 0.0,
+                    secondary: 0.0,
+                },
+                1,
+            );
+            let family = FixtureBrainFamily::with_policy(id, policy);
+            let parent_state = world
+                .agent_brain_evaluator_state(parent)
+                .expect("parent checkpoint")
+                .expect("parent protocol state");
+            let child_state = world
+                .agent_brain_evaluator_state(child)
+                .expect("child checkpoint")
+                .expect("child protocol state");
+            let parent_accumulator = family.decode_state(&parent_state).expect("parent state");
+            let child_accumulator = family.decode_state(&child_state).expect("child state");
+            let child_genome = world
+                .agent_brain_genome(child)
+                .expect("policy child genome");
+            let fresh_accumulator = i16::from(child_genome.payload()[1] as i8);
+            assert_ne!(
+                parent_accumulator, fresh_accumulator,
+                "the warmed parent must differ from fresh state or the policy proof is vacuous"
+            );
+            if inherits {
+                assert_eq!(child_accumulator, parent_accumulator);
+                assert_ne!(child_accumulator, fresh_accumulator);
+            } else {
+                assert_eq!(child_accumulator, fresh_accumulator);
+                assert_ne!(child_accumulator, parent_accumulator);
+            }
+            assert_eq!(
+                *offspring_parent_counts
+                    .lock()
+                    .expect("fixture offspring probe mutex"),
+                vec![if inherits { 1 } else { 0 }],
+                "the core must invoke the family offspring hook exactly once and expose parent \
+                 state only for a declared inheritance policy"
+            );
+        }
+    }
+
+    #[test]
+    fn live_protocol_genomes_evolve_through_five_non_vacuous_generations() {
+        let (mut world, key) =
+            protocol_fixture_world("live-five-generation", OffspringStatePolicy::Reset, 0.0);
+        let founder = protocol_fixture_parent(&mut world, key, 6);
+        let founder_uid = world.agent_uid(founder).expect("founder uid");
+        let founder_hash = world
+            .agent_brain_genome(founder)
+            .expect("founder genome")
+            .material_hash();
+        let founder_record = world
+            .pending_birth_records
+            .iter()
+            .find(|record| record.agent_uid == founder_uid)
+            .cloned()
+            .expect("founder must emit an ancestry root before reproduction");
+        let mut ancestry = ancestry::AncestryGraph::new();
+        ancestry
+            .apply_birth(&founder_record)
+            .expect("founder ancestry root");
+        let mut seen = BTreeSet::from([founder_hash]);
+        let mut lineage = vec![founder_uid];
+        let mut parent = founder;
+        let mut parent_uid = founder_uid;
+        let mut parent_hash = founder_hash;
+
+        for generation in 1..=5 {
+            let (child, record) = reproduce_protocol_child(
+                &mut world,
+                parent,
+                MutationRates {
+                    primary: 1.0,
+                    secondary: 0.0,
+                },
+                generation,
+            );
+            let child_genome = world
+                .agent_brain_genome(child)
+                .expect("generation child genome");
+            assert_eq!(record.parent_a, Some(parent_uid));
+            assert_eq!(record.parent_b, None);
+            assert_eq!(record.tick, Tick(u64::from(generation)));
+            assert_eq!(child_genome.provenance().parents, [Some(parent_uid), None]);
+            assert_eq!(
+                child_genome.provenance().created_at,
+                Tick(u64::from(generation))
+            );
+            assert_eq!(
+                child_genome.provenance().parent_genome_hashes,
+                [Some(parent_hash), None]
+            );
+            assert_eq!(
+                child_genome.provenance().derivation,
+                BrainGenomeDerivation::MutationOnly
+            );
+            assert_ne!(child_genome.material_hash(), parent_hash);
+            assert!(
+                seen.insert(child_genome.material_hash()),
+                "generation {generation} revisited an earlier genome hash; the fixture may have \
+                 converged on a placeholder instead of continuing to evolve"
+            );
+            ancestry
+                .apply_birth(&record)
+                .expect("each live reproduction must extend the append-only ancestry graph");
+            lineage.push(record.agent_uid);
+            parent = child;
+            parent_uid = record.agent_uid;
+            parent_hash = child_genome.material_hash();
+        }
+
+        assert_eq!(seen.len(), 6);
+        assert_eq!(ancestry.len(), 6);
+        assert_eq!(ancestry.roots(), vec![founder_uid]);
+        let expected_path = lineage.iter().rev().copied().collect::<Vec<_>>();
+        assert_eq!(
+            ancestry.lineage_path(parent_uid, 7),
+            expected_path,
+            "the fifth-generation ancestry path must reach every preceding genome parent in order"
+        );
+        assert_ne!(parent_hash, founder_hash);
+        assert_eq!(
+            world
+                .agents()
+                .snapshot(parent)
+                .expect("fifth-generation child")
+                .generation,
+            Generation(5)
+        );
     }
 
     #[test]
