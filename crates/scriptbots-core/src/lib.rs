@@ -981,6 +981,7 @@ fn angle_to(dx: f32, dy: f32) -> f32 {
     libm::atan2f(dy, dx)
 }
 
+#[cfg(test)]
 fn angle_difference(a: f32, b: f32) -> f32 {
     let diff = wrap_signed_angle(a - b);
     diff.abs()
@@ -1014,6 +1015,18 @@ struct SenseObserverGeometry {
     radius: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SenseNeighborInputs {
+    dx: f32,
+    dy: f32,
+    distance: f32,
+    distance_factor: f32,
+    color: [f32; 3],
+    speed_normalized: f32,
+    sound_emitter: f32,
+    target_health: f32,
+}
+
 #[inline]
 fn sense_distance_terms(
     distance_squared: f32,
@@ -1030,24 +1043,17 @@ fn sense_distance_terms(
 
 fn fixed_sense_contribution(
     observer: &SenseObserverGeometry,
-    dx: f32,
-    dy: f32,
-    distance: f32,
-    distance_factor: f32,
-    color: [f32; 3],
-    speed_normalized: f32,
-    sound_emitter: f32,
-    target_health: f32,
+    neighbor: SenseNeighborInputs,
 ) -> sense_fixed::NeighborContribution {
     // Keep the operation sequence identical to the planned WGSL lane. A
     // reciprocal followed by multiplication can round differently from the
     // shader's explicit division and would defeat an otherwise exact contract.
-    let neighbor_x = dx / distance;
-    let neighbor_y = dy / distance;
+    let neighbor_x = neighbor.dx / neighbor.distance;
+    let neighbor_y = neighbor.dy / neighbor.distance;
     let mut contribution = sense_fixed::NeighborContribution {
-        smell: distance_factor,
-        sound: distance_factor * speed_normalized,
-        hearing: distance_factor * sound_emitter,
+        smell: neighbor.distance_factor,
+        sound: neighbor.distance_factor * neighbor.speed_normalized,
+        hearing: neighbor.distance_factor * neighbor.sound_emitter,
         ..sense_fixed::NeighborContribution::default()
     };
 
@@ -1060,18 +1066,18 @@ fn fixed_sense_contribution(
             continue;
         }
         let fov_factor = ((fov - difference) / fov).max(0.0);
-        let intensity = observer.eye_sensitivity * fov_factor * distance_factor;
-        contribution.density[eye] = intensity * (distance / observer.radius);
-        contribution.red[eye] = intensity * color[0];
-        contribution.green[eye] = intensity * color[1];
-        contribution.blue[eye] = intensity * color[2];
+        let intensity = observer.eye_sensitivity * fov_factor * neighbor.distance_factor;
+        contribution.density[eye] = intensity * (neighbor.distance / observer.radius);
+        contribution.red[eye] = intensity * neighbor.color[0];
+        contribution.green[eye] = intensity * neighbor.color[1];
+        contribution.blue[eye] = intensity * neighbor.color[2];
     }
 
     let forward_dot = observer.heading_unit[0] * neighbor_x + observer.heading_unit[1] * neighbor_y;
     contribution.blood = blood_sensor_contribution(
         sense_fixed::poly_acos(forward_dot.clamp(-1.0, 1.0)),
-        distance_factor,
-        target_health,
+        neighbor.distance_factor,
+        neighbor.target_health,
     );
     contribution
 }
@@ -13192,14 +13198,16 @@ impl WorldState {
                         };
                         accumulator.contribute(&fixed_sense_contribution(
                             &observer,
-                            dx,
-                            dy,
-                            distance,
-                            distance_factor,
-                            colors[other_idx],
-                            self.work_speed_norm[other_idx],
-                            sound_emitters[other_idx],
-                            healths[other_idx],
+                            SenseNeighborInputs {
+                                dx,
+                                dy,
+                                distance,
+                                distance_factor,
+                                color: colors[other_idx],
+                                speed_normalized: self.work_speed_norm[other_idx],
+                                sound_emitter: sound_emitters[other_idx],
+                                target_health: healths[other_idx],
+                            },
                         ));
                     }
                 });
@@ -13348,14 +13356,16 @@ impl WorldState {
                 .map_or(0.0, |rt| rt.sound_multiplier);
             let fixed = fixed_sense_contribution(
                 &geometry,
-                dx,
-                dy,
-                dist,
-                dist_factor,
-                color,
-                speed_norm,
-                emitter,
-                healths[other_idx],
+                SenseNeighborInputs {
+                    dx,
+                    dy,
+                    distance: dist,
+                    distance_factor: dist_factor,
+                    color,
+                    speed_normalized: speed_norm,
+                    sound_emitter: emitter,
+                    target_health: healths[other_idx],
+                },
             );
             accumulator.contribute(&fixed);
             let quantized = sense_fixed::quantize_contribution_term;
@@ -24088,14 +24098,16 @@ mod tests {
         };
         let contribution = fixed_sense_contribution(
             &geometry,
-            50.0,
-            0.0,
-            50.0,
-            0.5,
-            [0.25, 0.5, 0.75],
-            0.25,
-            0.5,
-            0.0,
+            SenseNeighborInputs {
+                dx: 50.0,
+                dy: 0.0,
+                distance: 50.0,
+                distance_factor: 0.5,
+                color: [0.25, 0.5, 0.75],
+                speed_normalized: 0.25,
+                sound_emitter: 0.5,
+                target_health: 0.0,
+            },
         );
         let mut accumulator = sense_fixed::SenseAccum::default();
         accumulator.contribute(&contribution);
@@ -24209,14 +24221,16 @@ mod tests {
                 .expect("fixture distance is inside the sense radius");
             fixed_sense_contribution(
                 &geometry,
-                distance,
-                0.0,
-                distance,
-                distance_factor,
-                [0.0; 3],
-                speed_normalized,
-                0.0,
-                2.0,
+                SenseNeighborInputs {
+                    dx: distance,
+                    dy: 0.0,
+                    distance,
+                    distance_factor,
+                    color: [0.0; 3],
+                    speed_normalized,
+                    sound_emitter: 0.0,
+                    target_health: 2.0,
+                },
             )
         };
         let contributions = [
