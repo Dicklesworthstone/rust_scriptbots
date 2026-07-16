@@ -42,6 +42,9 @@ use crate::NUM_EYES;
 /// Fractional bits in the fixed-point accumulator.
 pub const SENSE_FRAC_BITS: u32 = 20;
 
+/// Geometry contract named in lifecycle diagnostics and run evidence.
+pub const SENSE_GEOMETRY: &str = "poly_acos";
+
 /// One unit in the accumulator's last place.
 const ONE: i64 = 1 << SENSE_FRAC_BITS;
 
@@ -78,6 +81,13 @@ pub const MAX_NEIGHBORS_ASSUMED: i64 = 4_096;
 /// produce a NEGATIVE sensor value — a silently insane input to a brain, which
 /// is the worst failure available here.
 pub const ACCUM_CEILING: i64 = MAX_NEIGHBORS_ASSUMED * (MAX_TERM as i64) * ONE;
+
+/// Whole binary orders of headroom between [`ACCUM_CEILING`] and `i64::MAX`.
+///
+/// This is emitted in the lifecycle numeric-contract line. Its test derives the
+/// value from the ceiling so the diagnostic cannot silently outlive the range
+/// analysis it claims to summarize.
+pub const SENSE_HEADROOM_BITS: u32 = 29;
 
 /// Convert to fixed point: round-to-nearest-even, saturating.
 ///
@@ -390,6 +400,13 @@ mod tests {
         assert_eq!(to_fixed(1e30), ACCUM_CEILING);
         assert_eq!(to_fixed(-1e30), -ACCUM_CEILING);
         assert!(to_fixed(1e30) > 0, "saturation must not wrap negative");
+    }
+
+    #[test]
+    fn advertised_headroom_matches_the_accumulator_range_derivation() {
+        let derived = (i64::MAX as u64 / ACCUM_CEILING as u64).ilog2();
+        assert_eq!(SENSE_HEADROOM_BITS, derived);
+        assert_eq!(SENSE_GEOMETRY, "poly_acos");
     }
 
     #[test]
