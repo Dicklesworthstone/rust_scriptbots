@@ -685,7 +685,7 @@ impl WorldCheckpointV1 {
         }
         state
             .agent_substream_protocol
-            .validate(state.random_streams.root_seed())?;
+            .validate(state.random_streams.root_seed)?;
         ensure_count_bound("agents", state.agents.len(), MAX_CHECKPOINT_AGENTS)?;
         ensure_count_bound(
             "registry.entries",
@@ -3223,7 +3223,7 @@ mod tests {
         let mut wrong_protocol_root = checkpoint.clone();
         wrong_protocol_root.state.agent_substream_protocol =
             AgentSubstreamProtocolV1::from_root_seed(
-                wrong_protocol_root.state.random_streams.root_seed() ^ 1,
+                wrong_protocol_root.state.random_streams.root_seed ^ 1,
             );
         assert!(matches!(
             wrong_protocol_root.encode(),
@@ -3540,7 +3540,7 @@ mod tests {
 
         let mut wrong_root = checkpoint.clone();
         wrong_root.state.agent_substream_protocol = AgentSubstreamProtocolV1::from_root_seed(
-            wrong_root.state.random_streams.root_seed() ^ 1,
+            wrong_root.state.random_streams.root_seed ^ 1,
         );
         assert!(matches!(
             WorldState::restore_checkpoint_v1(&wrong_root, prepared_registry()),
