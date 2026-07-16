@@ -1458,9 +1458,11 @@ mod tests {
 
     #[test]
     fn single_island_archipelago_is_bit_identical_to_a_plain_world() {
-        let mut archipelago =
-            populated_archipelago(archipelago_config(vec![spec(0, populated_config(None))], 10))
-                .expect("single-island archipelago");
+        let mut archipelago = populated_archipelago(archipelago_config(
+            vec![spec(0, populated_config(None))],
+            10,
+        ))
+        .expect("single-island archipelago");
         for _ in 0..3 {
             archipelago.step_to_barrier().expect("barrier");
         }
