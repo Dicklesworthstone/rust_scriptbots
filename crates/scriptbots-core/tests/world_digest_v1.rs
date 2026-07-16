@@ -10,7 +10,6 @@
 
 use std::collections::BTreeSet;
 
-use rand::RngCore;
 use scriptbots_brain::mlp::MlpBrain;
 use scriptbots_core::{
     AgentData, Intervention, Region, ScriptBotsConfig, SmallRngStream, WorldDigestV1,

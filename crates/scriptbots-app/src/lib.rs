@@ -1815,33 +1815,37 @@ mod characterization_tests {
 
         // These post-tick digests freeze the explicit energy-only ground-food
         // policy: eating changes energy and reproduction progress, not health.
+        let observed_sequences: [[String; 5]; 2] = [
+            sequence(&trace_a)
+                .try_into()
+                .expect("seed A trace has exactly five boundaries"),
+            sequence(&trace_c)
+                .try_into()
+                .expect("seed C trace has exactly five boundaries"),
+        ];
         assert_eq!(
-            sequence(&trace_a),
+            observed_sequences,
             [
-                // Re-pinned when the characterization digest was extended to
-                // cover ACTIVE INTERVENTIONS (bd-16g.10.1). A digest that ignored
-                // a drought in force would certify two runs as identical while
-                // one of them was in the middle of a famine, and every replay
-                // proof built on it would be hollow. The trajectory itself is
-                // unchanged: no intervention is active in this trace.
-                "12ffd8903f2588f4",
-                "57dadbd0dc0ef3bb",
-                "093aada106046e77",
-                "ccc3dc999e2dbd45",
-                "77bf36ffad164f62",
-            ]
-        );
-        assert_eq!(
-            sequence(&trace_c),
-            [
+                // Re-pinned when the characterization digest was extended to cover active
+                // interventions. The trajectory itself was unchanged: no intervention is active.
+                [
+                    "12ffd8903f2588f4",
+                    "57dadbd0dc0ef3bb",
+                    "093aada106046e77",
+                    "ccc3dc999e2dbd45",
+                    "77bf36ffad164f62",
+                ]
+                .map(str::to_owned),
                 // Re-pinned after sensory bearings moved from the host C math library to
-                // deterministic pure-Rust `libm::atan2f`. The trajectory is now bit-identical
-                // across the glibc versions used by supported Ubuntu runners.
-                "1daf2c9601805056",
-                "34862afcc3524912",
-                "20a40eb07ba95835",
-                "43e8f2f64a481ff5",
-                "360f4818949324a7",
+                // deterministic pure-Rust `libm::atan2f`.
+                [
+                    "1daf2c9601805056",
+                    "34862afcc3524912",
+                    "20a40eb07ba95835",
+                    "43e8f2f64a481ff5",
+                    "360f4818949324a7",
+                ]
+                .map(str::to_owned),
             ]
         );
 
