@@ -173,14 +173,16 @@ fn the_digest_is_deterministic() {
 }
 
 #[test]
-fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
+fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
     #[derive(Serialize)]
-    struct LegacyWorldDigestV1 {
+    struct LegacyWorldDigestV1_1 {
         schema: String,
+        codec_version: u16,
         algorithm: String,
         tick: scriptbots_core::Tick,
         overall: String,
         agents: String,
+        execution_order: String,
         brains: String,
         food: String,
         terrain: String,
@@ -188,24 +190,30 @@ fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
         rng: String,
         counters: String,
         brain_registry: String,
+        config: String,
+        effects: String,
+        derived_transition: String,
+        origins: String,
         evaluator_state_covered: bool,
         uncovered_families: Vec<String>,
+        factory_state_covered: bool,
+        uncovered_factory_families: Vec<String>,
         agent_identity: String,
     }
 
     let digest = world_with_brain_seed(17, 2)
         .world_digest_v1()
-        .expect("V1.1 wire fixture");
-    let json = serde_json::to_value(&digest).expect("encode V1.1 JSON");
+        .expect("V1.2 wire fixture");
+    let json = serde_json::to_value(&digest).expect("encode V1.2 JSON");
     let json_round_trip: WorldDigestV1 =
-        serde_json::from_value(json.clone()).expect("decode V1.1 JSON");
+        serde_json::from_value(json.clone()).expect("decode V1.2 JSON");
     assert_eq!(json_round_trip, digest);
     json_round_trip
         .validate_contract()
         .expect("JSON round trip must retain a valid V1");
     let keys: BTreeSet<String> = json
         .as_object()
-        .expect("V1.1 JSON object")
+        .expect("V1.2 JSON object")
         .keys()
         .cloned()
         .collect();
@@ -216,7 +224,6 @@ fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
         "tick",
         "overall",
         "agents",
-        "execution_order",
         "brains",
         "food",
         "terrain",
@@ -251,7 +258,7 @@ fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
         let mut missing = json.clone();
         missing
             .as_object_mut()
-            .expect("mutable V1.1 JSON")
+            .expect("mutable V1.2 JSON")
             .remove(required);
         assert!(
             serde_json::from_value::<WorldDigestV1>(missing).is_err(),
@@ -261,7 +268,7 @@ fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
     let mut unknown = json;
     unknown
         .as_object_mut()
-        .expect("mutable V1.1 JSON")
+        .expect("mutable V1.2 JSON")
         .insert("unknown".to_owned(), serde_json::Value::Bool(true));
     assert!(serde_json::from_value::<WorldDigestV1>(unknown).is_err());
 
@@ -310,12 +317,14 @@ fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
         })
     ));
 
-    let legacy = LegacyWorldDigestV1 {
-        schema: "scriptbots.world-digest.v1".to_owned(),
+    let legacy = LegacyWorldDigestV1_1 {
+        schema: "scriptbots.world-digest.v1.1".to_owned(),
+        codec_version: 1,
         algorithm: digest.algorithm.clone(),
         tick: digest.tick,
         overall: digest.overall.clone(),
         agents: digest.agents.clone(),
+        execution_order: digest.agents.clone(),
         brains: digest.brains.clone(),
         food: digest.food.clone(),
         terrain: digest.terrain.clone(),
@@ -323,15 +332,28 @@ fn v1_1_wire_is_exact_and_rejects_the_legacy_shape() {
         rng: digest.rng.clone(),
         counters: digest.counters.clone(),
         brain_registry: digest.brain_registry.clone(),
+        config: digest.config.clone(),
+        effects: digest.effects.clone(),
+        derived_transition: digest.derived_transition.clone(),
+        origins: digest.origins.clone(),
         evaluator_state_covered: digest.evaluator_state_covered,
         uncovered_families: digest.uncovered_families.clone(),
+        factory_state_covered: digest.factory_state_covered,
+        uncovered_factory_families: digest.uncovered_factory_families.clone(),
         agent_identity: digest.agent_identity.clone(),
     };
-    let legacy = postcard::to_allocvec(&legacy).expect("encode legacy V1 fixture");
+    let legacy_json = serde_json::to_value(&legacy).expect("encode legacy V1.1 JSON fixture");
     assert!(
-        postcard::from_bytes::<WorldDigestV1>(&legacy).is_err(),
-        "legacy positional V1 payload decoded as V1.1"
+        serde_json::from_value::<WorldDigestV1>(legacy_json).is_err(),
+        "allocation-sensitive JSON V1.1 payload decoded as V1.2"
     );
+    let legacy = postcard::to_allocvec(&legacy).expect("encode legacy V1.1 fixture");
+    if let Ok(decoded) = postcard::from_bytes::<WorldDigestV1>(&legacy) {
+        assert!(
+            decoded.validate_contract().is_err(),
+            "allocation-sensitive positional V1.1 payload satisfied the V1.2 contract"
+        );
+    }
 }
 
 #[test]

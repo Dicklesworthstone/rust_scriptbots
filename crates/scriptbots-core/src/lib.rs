@@ -1932,7 +1932,7 @@ impl BrainRegistry {
     ///
     /// The supplied digest must change whenever captured seeds, model bytes, architecture
     /// settings, or other closure state capable of changing a newly spawned brain changes.
-    /// Factories registered through [`Self::register`] remain valid, but V1.1 reports their
+    /// Factories registered through [`Self::register`] remain valid, but V1.2 reports their
     /// closure state as explicitly uncovered.
     pub fn register_with_state_digest<F>(
         &mut self,
@@ -2633,16 +2633,15 @@ pub struct CharacterizationDigestV0 {
 }
 
 /// Schema tag for [`WorldDigestV1`].
-/// Values carrying the original unqualified V1 tag were noncanonical: their overall lane omitted
-/// configuration, active effects, derived transition caches, algorithm metadata, and identity
-/// metadata. The repaired schema uses an explicit minor version so incompatible values cannot be
-/// mistaken for current evidence.
-pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.1";
-/// Wire revision for the first complete V1.1 payload.
-pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 1;
-/// Stable hash algorithm identifier carried by and hashed into V1.1.
+/// V1.2 retires V1.1's temporary dense-execution-order lane after making every transition
+/// canonical by stable logical identity. The minor schema and codec revision prevent an older
+/// allocation-layout-sensitive payload from being mistaken for current evidence.
+pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.2";
+/// Wire revision for the canonical V1.2 payload.
+pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 2;
+/// Stable hash algorithm identifier carried by and hashed into V1.2.
 pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
-/// Stable logical identity used by the V1.1 agent lane.
+/// Stable logical identity used by the V1.2 agent lane and transition order.
 pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
 
 /// The world's science-state oracle, version one — see [`WorldState::world_digest_v1`].
@@ -2665,9 +2664,6 @@ pub struct WorldDigestV1 {
     pub overall: String,
     /// Agent bodies, ordered by stable `AgentUid`.
     pub agents: String,
-    /// Dense execution order expressed as stable UIDs. Until every stage is UID-canonical, this
-    /// order can affect floating-point reductions, parent selection, and RNG assignment.
-    pub execution_order: String,
     /// Agent BRAINS — genome and evaluator state — kept in their own lane so that "the brains
     /// changed" is distinguishable from "the bodies changed".
     pub brains: String,
@@ -2703,7 +2699,7 @@ pub struct WorldDigestV1 {
     pub agent_identity: String,
 }
 
-/// A decoded V1.1 boundary digest violated its pinned semantic contract.
+/// A decoded V1.2 boundary digest violated its pinned semantic contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldDigestV1ContractError {
     #[error("world-digest schema `{found}` does not match `{expected}`")]
@@ -2743,7 +2739,6 @@ impl WorldDigestV1 {
         overall.string(&self.agent_identity);
         overall.u64(self.tick.0);
         overall.string(&self.agents);
-        overall.string(&self.execution_order);
         overall.string(&self.brains);
         overall.string(&self.food);
         overall.string(&self.terrain);
@@ -2811,7 +2806,6 @@ impl WorldDigestV1 {
         let required_digests = [
             ("overall", self.overall.as_str()),
             ("agents", self.agents.as_str()),
-            ("execution_order", self.execution_order.as_str()),
             ("brains", self.brains.as_str()),
             ("food", self.food.as_str()),
             ("terrain", self.terrain.as_str()),
@@ -3615,7 +3609,7 @@ struct DeathResourceActivity {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct SpawnOrder {
-    parent_index: usize,
+    parent_uid: AgentUid,
     parent_id: AgentId,
     partner_id: Option<AgentId>,
     parent_energy_before_debit: f32,
@@ -3968,12 +3962,12 @@ pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 pub const WORLD_STEP_OUTCOME_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v3";
 
 /// Schema identifier for opt-in per-stage scientific-state digests.
-pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.1";
-/// Wire revision for the first fully pinned six-point trace payload.
-pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 1;
+pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.2";
+/// Wire revision for the canonical-UID six-point trace payload.
+pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 2;
 /// Schema identifier for a non-boundary world digest captured during one transition.
 pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
-    "scriptbots.world-step-stage-world-digest.v1";
+    "scriptbots.world-step-stage-world-digest.v2";
 
 /// Stable stage identifiers emitted by [`WorldStepProfile`].
 ///
@@ -4295,7 +4289,6 @@ pub struct WorldStepStageWorldDigest {
     pub transition_tick: Tick,
     pub overall: String,
     pub agents: String,
-    pub execution_order: String,
     pub brains: String,
     pub food: String,
     pub terrain: String,
@@ -4324,7 +4317,6 @@ impl WorldStepStageWorldDigest {
             transition_tick,
             overall: String::new(),
             agents: digest.agents,
-            execution_order: digest.execution_order,
             brains: digest.brains,
             food: digest.food,
             terrain: digest.terrain,
@@ -4357,7 +4349,6 @@ impl WorldStepStageWorldDigest {
         overall.u64(self.transition_tick.0);
         overall.string(&self.agent_identity);
         overall.string(&self.agents);
-        overall.string(&self.execution_order);
         overall.string(&self.brains);
         overall.string(&self.food);
         overall.string(&self.terrain);
@@ -4876,7 +4867,6 @@ impl WorldStepTrace {
         let required_digests = [
             ("world.overall", world.overall.as_str()),
             ("world.agents", world.agents.as_str()),
-            ("world.execution_order", world.execution_order.as_str()),
             ("world.brains", world.brains.as_str()),
             ("world.food", world.food.as_str()),
             ("world.terrain", world.terrain.as_str()),
@@ -7539,18 +7529,55 @@ impl AgentArena {
         debug_assert_eq!(self.slots.len(), len);
     }
 
-    /// Remove `id` returning its scalar data if it was present.
+    /// Rebuild the dense rows in the exact handle order supplied by the world owner.
+    ///
+    /// Agent handles remain stable; only their dense SoA locations change. The normal simulation
+    /// path is already append-ordered, so this allocation is paid only when a restored or
+    /// deliberately perturbed world arrives with a noncanonical dense layout.
+    fn reorder(&mut self, ordered_handles: &[AgentId]) {
+        debug_assert_eq!(ordered_handles.len(), self.len());
+        if self.handles.as_slice() == ordered_handles {
+            return;
+        }
+
+        let mut ordered_columns = AgentColumns::with_capacity(self.len());
+        for id in ordered_handles {
+            let index = self
+                .index_of(*id)
+                .expect("canonical agent order must contain every live handle");
+            ordered_columns.push_trusted(self.columns.snapshot(index));
+        }
+
+        self.handles.clear();
+        self.handles.extend_from_slice(ordered_handles);
+        self.columns = ordered_columns;
+        for (index, id) in self.handles.iter().copied().enumerate() {
+            *self
+                .slots
+                .get_mut(id)
+                .expect("canonical agent order must contain only live handles") = index;
+        }
+        self.columns.debug_assert_coherent();
+        debug_assert_eq!(self.handles.len(), self.slots.len());
+    }
+
+    /// Remove `id` returning its scalar data if it was present, preserving dense iteration order.
     pub fn remove(&mut self, id: AgentId) -> Option<AgentData> {
         let index = self.slots.remove(id)?;
-        let removed = self.columns.swap_remove(index);
-        let removed_handle = self.handles.swap_remove(index);
-        debug_assert_eq!(removed_handle, id);
-        if index < self.handles.len() {
-            let moved = self.handles[index];
-            if let Some(slot) = self.slots.get_mut(moved) {
-                *slot = index;
-            }
+        let removed = self.columns.snapshot(index);
+        debug_assert_eq!(self.handles[index], id);
+        for read in (index + 1)..self.handles.len() {
+            let moved = self.handles[read];
+            self.handles[read - 1] = moved;
+            self.columns.move_row(read, read - 1);
+            *self
+                .slots
+                .get_mut(moved)
+                .expect("shifted dense handle must remain live") = read - 1;
         }
+        let new_len = self.handles.len() - 1;
+        self.handles.truncate(new_len);
+        self.columns.truncate(new_len);
         Some(removed)
     }
 
@@ -11725,6 +11752,7 @@ pub struct WorldState {
     epoch: u64,
     rng: SmallRngStream,
     agents: AgentArena,
+    agent_execution_order_canonical: bool,
     identities: AgentMap<AgentIdentity>,
     next_agent_uid: u64,
     next_spawn_ordinal: u64,
@@ -11873,6 +11901,7 @@ impl WorldState {
             epoch: 0,
             rng,
             agents: AgentArena::new(),
+            agent_execution_order_canonical: true,
             identities: AgentMap::new(),
             next_agent_uid: 1,
             next_spawn_ordinal: 0,
@@ -11965,8 +11994,13 @@ impl WorldState {
                 .map(|value| f64::from(*value))
                 .sum(),
             energy: self
-                .runtime
-                .values()
+                .agents
+                .iter_handles()
+                .map(|id| {
+                    self.runtime
+                        .get(id)
+                        .expect("every live agent must have runtime state")
+                })
                 .map(|runtime| f64::from(runtime.energy))
                 .sum(),
             health: self
@@ -11977,6 +12011,30 @@ impl WorldState {
                 .map(|value| f64::from(*value))
                 .sum(),
         }
+    }
+
+    /// Make the dense SoA layout match stable logical identity before any tick work begins.
+    ///
+    /// Normal monotonic insertion and stable removal keep this invariant, so the hot path pays
+    /// only one branch. A checkpoint restore or test that materializes the same scientific world
+    /// in a different slot/dense layout marks the representation dirty; that physical accident
+    /// must not choose RNG recipients, reduction order, neighbor priority, or offspring identity.
+    fn canonicalize_agent_execution_order(&mut self) {
+        if self.agent_execution_order_canonical {
+            return;
+        }
+
+        self.work_handles.clear();
+        self.work_handles.extend(self.agents.iter_handles());
+        let identities = &self.identities;
+        self.work_handles.sort_unstable_by_key(|id| {
+            identities
+                .get(*id)
+                .expect("every live agent must have a stable identity")
+                .uid
+        });
+        self.agents.reorder(&self.work_handles);
+        self.agent_execution_order_canonical = true;
     }
 
     fn capture_resource_amounts(&self) -> Option<ResourceAmounts> {
@@ -13925,7 +13983,16 @@ impl WorldState {
 
     fn stage_record_history(&mut self, next_tick: Tick) -> TickSummary {
         let agent_count = self.agents.len();
-        let total_energy: f32 = self.runtime.values().map(|runtime| runtime.energy).sum();
+        let total_energy: f32 = self
+            .agents
+            .iter_handles()
+            .map(|id| {
+                self.runtime
+                    .get(id)
+                    .expect("every live agent must have runtime state")
+            })
+            .map(|runtime| runtime.energy)
+            .sum();
         let total_health: f32 = self.agents.columns().health().iter().copied().sum();
         let max_age = self
             .agents
@@ -14570,8 +14637,11 @@ impl WorldState {
             let Some(index) = self.agents.index_of(*id) else {
                 return Ok(None);
             };
+            let uid = self
+                .agent_uid(*id)
+                .expect("live crossover candidate must have a stable identity");
             self.agents.columns().generations()[index]
-                .next_at(format!("agents[{}].generation", id.data().as_ffi()))?;
+                .next_at(format!("agents[uid={}].generation", uid.get()))?;
         }
 
         let eligible_ages = {
@@ -15567,6 +15637,13 @@ impl WorldState {
             return DeathResourceActivity::default();
         }
 
+        dead.sort_unstable_by_key(|(_, id)| {
+            self.identities
+                .get(*id)
+                .expect("live dying agent must have a stable identity")
+                .uid
+        });
+
         let death_records: Vec<DeathRecord> = {
             let columns = self.agents.columns();
             dead.iter()
@@ -15619,17 +15696,16 @@ impl WorldState {
             self.pending_death_records.extend(death_records);
         }
 
-        dead.sort_by_key(|(idx, _)| *idx);
         let before_carcass = self.capture_resource_amounts();
         let rejected = self.distribute_carcass_rewards(&dead);
         let after_carcass = before_carcass.map(|_| self.resource_amounts());
         let before_removal = after_carcass;
-        let mut removed = 0usize;
-        for (_, agent_id) in dead.into_iter().rev() {
-            if self.remove_agent(agent_id).is_some() {
-                removed += 1;
-            }
+        let dead_ids: HashSet<AgentId> = dead.iter().map(|(_, id)| *id).collect();
+        for id in &dead_ids {
+            self.runtime.remove(*id);
+            self.identities.remove(*id);
         }
+        let removed = self.agents.remove_many(&dead_ids);
         self.last_deaths = removed;
         let after_removal = before_removal.map(|_| self.resource_amounts());
         DeathResourceActivity {
@@ -15645,15 +15721,16 @@ impl WorldState {
         }
     }
     fn validate_live_generation_headroom(&self) -> Result<(), ScientificStateError> {
-        for (index, generation) in self
-            .agents
-            .columns()
-            .generations()
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            generation.next_at(format!("agents[{index}].generation"))?;
+        for id in self.agents.iter_handles() {
+            let index = self
+                .agents
+                .index_of(id)
+                .expect("live agent must have a dense row");
+            let uid = self
+                .agent_uid(id)
+                .expect("live agent must have a stable identity");
+            self.agents.columns().generations()[index]
+                .next_at(format!("agents[uid={}].generation", uid.get()))?;
         }
         Ok(())
     }
@@ -15792,7 +15869,7 @@ impl WorldState {
                 partner_uid,
             );
             self.pending_spawns.push(SpawnOrder {
-                parent_index: idx,
+                parent_uid,
                 parent_id: *agent_id,
                 partner_id,
                 parent_energy_before_debit,
@@ -15836,6 +15913,7 @@ impl WorldState {
 
     fn refund_spawn_orders(&mut self, orders: &[SpawnOrder]) {
         for order in orders {
+            debug_assert_eq!(self.agent_uid(order.parent_id), Some(order.parent_uid));
             debug_assert!(
                 self.runtime.contains_key(order.parent_id),
                 "queued birth parent disappeared before refund"
@@ -15858,7 +15936,7 @@ impl WorldState {
             return Ok(());
         }
         let mut orders = std::mem::take(&mut self.pending_spawns);
-        orders.sort_by_key(|order| order.parent_index);
+        orders.sort_unstable_by_key(|order| order.parent_uid);
 
         // Construct every offspring brain before inserting any child. This keeps a fallible
         // registry factory from leaving a partially committed birth set. The discarded runtime
@@ -15867,6 +15945,7 @@ impl WorldState {
         let rng_before = self.rng.clone();
         let preparation = (|| -> Result<(), BrainSpawnError> {
             for order in &mut orders {
+                debug_assert_eq!(self.agent_uid(order.parent_id), Some(order.parent_uid));
                 let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
                 let inherited_key = order.runtime.brain.registry_key();
                 let child_rates = order.runtime.mutation_rates;
@@ -15950,7 +16029,7 @@ impl WorldState {
         self.last_births = orders.len();
         for order in orders {
             let SpawnOrder {
-                parent_index: _,
+                parent_uid: _,
                 parent_id: _,
                 partner_id: _,
                 parent_energy_before_debit: _,
@@ -17078,6 +17157,7 @@ impl WorldState {
             .into());
         }
 
+        self.canonicalize_agent_execution_order();
         let next_tick = self.tick.next();
         self.validate_step_generation_headroom(next_tick)?;
         let step_started_at = observer.begin_step(next_tick);
@@ -17677,13 +17757,6 @@ impl WorldState {
                 Ok((uid, id))
             })
             .collect::<Result<_, CharacterizationError>>()?;
-        let mut execution_order_encoder =
-            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "execution-order");
-        execution_order_encoder.usize(ordered.len());
-        for (uid, _) in &ordered {
-            execution_order_encoder.u64(uid.get());
-        }
-        let execution_order = execution_order_encoder.finish();
         ordered.sort_unstable_by_key(|(uid, _)| uid.0);
 
         let mut agents_encoder = CharacterizationEncoderV0::new("agents-v1");
@@ -17856,7 +17929,6 @@ impl WorldState {
             tick: self.tick,
             overall: String::new(),
             agents,
-            execution_order,
             brains,
             food: v0.food,
             terrain: v0.terrain,
@@ -17934,15 +18006,23 @@ impl WorldState {
     ) -> Result<String, CharacterizationError> {
         let mut encoder = Self::world_step_trace_encoder(trace_tick, point, "transition");
 
-        encoder.usize(self.pending_deaths.len());
-        for id in &self.pending_deaths {
-            encoder.u64(self.required_agent_uid_for_trace(*id)?.get());
+        let mut pending_death_uids = self
+            .pending_deaths
+            .iter()
+            .map(|id| self.required_agent_uid_for_trace(*id))
+            .collect::<Result<Vec<_>, _>>()?;
+        pending_death_uids.sort_unstable();
+        encoder.usize(pending_death_uids.len());
+        for uid in pending_death_uids {
+            encoder.u64(uid.get());
         }
 
-        encoder.usize(self.pending_spawns.len());
-        for spawn in &self.pending_spawns {
-            encoder.usize(spawn.parent_index);
-            encoder.u64(self.required_agent_uid_for_trace(spawn.parent_id)?.get());
+        let mut pending_spawns: Vec<_> = self.pending_spawns.iter().collect();
+        pending_spawns.sort_unstable_by_key(|spawn| spawn.parent_uid);
+        encoder.usize(pending_spawns.len());
+        for spawn in pending_spawns {
+            debug_assert_eq!(self.agent_uid(spawn.parent_id), Some(spawn.parent_uid));
+            encoder.u64(spawn.parent_uid.get());
             encoder.bool(spawn.partner_id.is_some());
             if let Some(partner_id) = spawn.partner_id {
                 encoder.u64(self.required_agent_uid_for_trace(partner_id)?.get());
@@ -20234,6 +20314,7 @@ mod tests {
         let parent = world
             .try_spawn_agent(exhausted_parent)
             .expect("max-generation parent");
+        let parent_uid = world.agent_uid(parent).expect("max-generation parent uid");
         world
             .try_update_agent_runtime(parent, |runtime| {
                 runtime.energy = 2.0;
@@ -20261,7 +20342,7 @@ mod tests {
         assert_eq!(
             error,
             ScientificStateError::GenerationOverflow {
-                path: "agents[0].generation".to_owned(),
+                path: format!("agents[uid={}].generation", parent_uid.get()),
                 generation: u32::MAX,
             }
         );
@@ -20300,6 +20381,9 @@ mod tests {
         let parent_a = world
             .try_spawn_agent(exhausted_parent)
             .expect("max-generation parent");
+        let parent_a_uid = world
+            .agent_uid(parent_a)
+            .expect("max-generation parent uid");
         let parent_b = world
             .try_spawn_agent(sample_agent(5))
             .expect("second parent");
@@ -20334,7 +20418,7 @@ mod tests {
         assert_eq!(
             error,
             ScientificStateError::GenerationOverflow {
-                path: "agents[0].generation".to_owned(),
+                path: format!("agents[uid={}].generation", parent_a_uid.get()),
                 generation: u32::MAX,
             }
         );
@@ -24589,6 +24673,67 @@ mod tests {
             .iter_handles()
             .find(|id| world.agent_uid(*id) == Some(uid))
             .expect("a just-recorded birth UID must resolve to one live agent")
+    }
+
+    /// Remap complete scientific agent associations onto different raw handles while leaving the
+    /// arena's dense handle order untouched. This creates a world with the same UID-keyed bodies,
+    /// runtimes, brains, and identities but a genuinely different slot and dense UID layout.
+    fn permute_agent_associations(
+        world: &mut WorldState,
+        handles: &[AgentId],
+        source_for_destination: &[usize],
+    ) {
+        assert!(world.pending_deaths.is_empty());
+        assert!(world.pending_spawns.is_empty());
+        assert!(world.pending_persistence_runtime_tail.is_empty());
+        assert_eq!(handles.len(), source_for_destination.len());
+        let mut seen = vec![false; handles.len()];
+        for source in source_for_destination {
+            assert!(*source < handles.len());
+            assert!(!std::mem::replace(&mut seen[*source], true));
+        }
+
+        let data: Vec<_> = handles
+            .iter()
+            .map(|id| world.agents.snapshot(*id).expect("permuted body"))
+            .collect();
+        let identities: Vec<_> = handles
+            .iter()
+            .map(|id| world.identities.remove(*id).expect("permuted identity"))
+            .collect();
+        let mut runtimes: Vec<_> = handles
+            .iter()
+            .map(|id| Some(world.runtime.remove(*id).expect("permuted runtime")))
+            .collect();
+
+        for (destination, source) in source_for_destination.iter().copied().enumerate() {
+            let destination_id = handles[destination];
+            assert!(world
+                .agents
+                .replace_trusted(destination_id, data[source]));
+            assert!(world
+                .identities
+                .insert(destination_id, identities[source])
+                .is_none());
+            assert!(world
+                .runtime
+                .insert(
+                    destination_id,
+                    runtimes[source].take().expect("runtime permutation is bijective"),
+                )
+                .is_none());
+        }
+        world.agent_execution_order_canonical = false;
+    }
+
+    fn uid_slot_signature(world: &WorldState) -> Vec<(AgentUid, u64)> {
+        let mut signature: Vec<_> = world
+            .agents
+            .iter_handles()
+            .map(|id| (world.agent_uid(id).expect("signature uid"), id.raw()))
+            .collect();
+        signature.sort_unstable_by_key(|(uid, _)| *uid);
+        signature
     }
 
     fn reproduce_protocol_child(
@@ -29827,7 +29972,7 @@ mod tests {
     }
 
     #[test]
-    fn food_sharing_sorts_wrapped_bucket_candidates_by_dense_index() {
+    fn food_sharing_prioritizes_lower_uid_after_dense_layout_normalization() {
         let config = ScriptBotsConfig {
             world_width: 100,
             world_height: 100,
@@ -29843,18 +29988,16 @@ mod tests {
 
         let mut world = WorldState::new(config).expect("world");
         let giver = world.spawn_agent(sample_agent(0));
-        let lower_index_recipient = world.spawn_agent(sample_agent(1));
-        let higher_index_recipient = world.spawn_agent(sample_agent(2));
+        let lower_uid_recipient = world.spawn_agent(sample_agent(1));
+        let higher_uid_recipient = world.spawn_agent(sample_agent(2));
+        let lower_uid = world.agent_uid(lower_uid_recipient).expect("lower uid");
+        let higher_uid = world.agent_uid(higher_uid_recipient).expect("higher uid");
 
         {
             let arena = world.agents_mut();
             let giver_idx = arena.index_of(giver).unwrap();
-            let lower_idx = arena.index_of(lower_index_recipient).unwrap();
-            let higher_idx = arena.index_of(higher_index_recipient).unwrap();
-            assert!(
-                lower_idx < higher_idx,
-                "fixture must encode dense-index order"
-            );
+            let lower_idx = arena.index_of(lower_uid_recipient).unwrap();
+            let higher_idx = arena.index_of(higher_uid_recipient).unwrap();
             let positions = arena.columns_mut().positions_mut();
             positions[giver_idx] = Position::new(1.0, 50.0);
             positions[lower_idx] = Position::new(2.0, 50.0);
@@ -29868,23 +30011,34 @@ mod tests {
             runtime.give_intent = 1.0;
         }
         world
-            .agent_runtime_mut(lower_index_recipient)
+            .agent_runtime_mut(lower_uid_recipient)
             .unwrap()
             .energy = 0.0;
         world
-            .agent_runtime_mut(higher_index_recipient)
+            .agent_runtime_mut(higher_uid_recipient)
             .unwrap()
             .energy = 0.0;
+
+        let handles: Vec<_> = world.agents.iter_handles().collect();
+        permute_agent_associations(&mut world, &handles, &[0, 2, 1]);
+        let lower_uid_recipient = agent_id_for_uid(&world, lower_uid);
+        let higher_uid_recipient = agent_id_for_uid(&world, higher_uid);
+        assert!(
+            world.agents.index_of(lower_uid_recipient)
+                > world.agents.index_of(higher_uid_recipient),
+            "fixture must oppose stable UID order and physical dense order"
+        );
+        world.canonicalize_agent_execution_order();
 
         world.stage_food();
 
         assert!(
-            (world.agent_runtime(lower_index_recipient).unwrap().energy - 0.01).abs() < 1e-6,
-            "lower dense index should receive the first full transfer"
+            (world.agent_runtime(lower_uid_recipient).unwrap().energy - 0.01).abs() < 1e-6,
+            "lower AgentUid should receive the first full transfer"
         );
         assert!(
-            (world.agent_runtime(higher_index_recipient).unwrap().energy - 0.005).abs() < 1e-6,
-            "higher dense index should deterministically receive the remainder"
+            (world.agent_runtime(higher_uid_recipient).unwrap().energy - 0.005).abs() < 1e-6,
+            "higher AgentUid should deterministically receive the remainder"
         );
     }
 
@@ -31355,8 +31509,19 @@ mod tests {
         let stage_world = stage_world_json
             .as_object()
             .expect("stage-world JSON object");
+        assert_eq!(
+            stage_world.get("schema"),
+            Some(&serde_json::Value::String(
+                WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA.to_owned()
+            ))
+        );
+        assert_eq!(
+            stage_world.get("codec_version"),
+            Some(&serde_json::json!(WORLD_DIGEST_V1_CODEC_VERSION))
+        );
         assert!(stage_world.contains_key("completed_tick"));
         assert!(stage_world.contains_key("transition_tick"));
+        assert!(!stage_world.contains_key("execution_order"));
         assert!(!stage_world.contains_key("tick"));
 
         let mut missing_overall = trace_json.clone();
@@ -31481,7 +31646,7 @@ mod tests {
             Err(WorldStepTraceContractError::Schema { .. })
         ));
         let mut wrong_codec = trace.clone();
-        wrong_codec.codec_version = 2;
+        wrong_codec.codec_version = WORLD_STEP_TRACE_CODEC_VERSION + 1;
         assert!(matches!(
             wrong_codec.validate_contract(),
             Err(WorldStepTraceContractError::CodecVersion { .. })
@@ -31627,7 +31792,7 @@ mod tests {
             assert_eq!(observed, EXPECTED);
             assert_eq!(trace.overall, "6e3bcdad6c3719e4");
             println!(
-                "scriptbots.world-digest-golden.v1: six checkpoints and trace overall {} verified",
+                "scriptbots.world-digest-golden.v1.2: six checkpoints and trace overall {} verified",
                 trace.overall
             );
         } else {
@@ -31673,13 +31838,15 @@ mod tests {
         world.pending_deaths.push(first);
         let duplicate_death = capture(&world);
         assert_ne!(first_death.transition, duplicate_death.transition);
+        world.pending_deaths = vec![first, second];
+        let ordered_deaths = capture(&world);
         world.pending_deaths = vec![second, first];
         let reordered_deaths = capture(&world);
-        assert_ne!(duplicate_death.transition, reordered_deaths.transition);
+        assert_eq!(ordered_deaths.transition, reordered_deaths.transition);
 
         world.pending_deaths.clear();
         world.pending_spawns.push(SpawnOrder {
-            parent_index: world.agents.index_of(first).expect("parent index"),
+            parent_uid: world.agent_uid(first).expect("parent uid"),
             parent_id: first,
             partner_id: Some(second),
             parent_energy_before_debit: 0.75,
@@ -31964,36 +32131,442 @@ mod tests {
     }
 
     #[test]
-    fn world_digest_v1_names_dense_execution_order_until_stages_are_uid_canonical() {
-        fn two_identical_agents() -> WorldState {
-            let mut world =
-                WorldState::new(quiet_trace_config(2_823, 0)).expect("execution-order world");
-            world.spawn_agent(sample_agent(0));
-            world.spawn_agent(sample_agent(0));
+    fn uid_canonical_tick_matches_across_slot_and_dense_layouts() {
+        fn layout_world() -> WorldState {
+            let config = ScriptBotsConfig {
+                spike_radius: 20.0,
+                spike_damage: 0.5,
+                spike_energy_cost: 0.02,
+                spike_min_length: 0.1,
+                spike_alignment_cosine: 0.1,
+                spike_speed_damage_bonus: 0.0,
+                spike_length_damage_bonus: 0.0,
+                carcass_distribution_radius: 30.0,
+                carcass_health_reward: 0.4,
+                carcass_reproduction_reward: 0.2,
+                carcass_neighbor_exponent: 1.0,
+                carcass_maturity_age: 1,
+                carcass_energy_share_rate: 0.5,
+                ..quiet_trace_config(2_823, 0)
+            };
+            let mut world = WorldState::new(config).expect("UID-canonical layout world");
+            let attacker = world.spawn_agent(sample_agent(0));
+            let first_victim = world.spawn_agent(sample_agent(1));
+            let second_victim = world.spawn_agent(sample_agent(2));
+            let survivor = world.spawn_agent(sample_agent(3));
+            let attacker_brain = world
+                .brain_registry_mut()
+                .expect("layout aggressor registry")
+                .register_with_state_digest(
+                    "test.uid-layout-aggressor",
+                    0x5549_444c_4159_4f41,
+                    |_rng| Ok(Box::new(LedgerAggressorBrain)),
+                );
+            let idle_brain = world
+                .brain_registry_mut()
+                .expect("layout idle registry")
+                .register_with_state_digest(
+                    "test.uid-layout-idle",
+                    0x5549_444c_4159_4f49,
+                    |_rng| Ok(Box::new(LedgerIdleBrain)),
+                );
+            assert!(world.bind_agent_brain(attacker, attacker_brain).unwrap());
+            assert!(world.bind_agent_brain(first_victim, idle_brain).unwrap());
+            assert!(world.bind_agent_brain(second_victim, idle_brain).unwrap());
+
+            let attacker_idx = world.agents.index_of(attacker).unwrap();
+            let first_victim_idx = world.agents.index_of(first_victim).unwrap();
+            let second_victim_idx = world.agents.index_of(second_victim).unwrap();
+            let survivor_idx = world.agents.index_of(survivor).unwrap();
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[attacker_idx] = Position::new(10.0, 10.0);
+            columns.positions_mut()[first_victim_idx] = Position::new(15.0, 10.0);
+            columns.positions_mut()[second_victim_idx] = Position::new(16.0, 10.0);
+            columns.positions_mut()[survivor_idx] = Position::new(18.0, 10.0);
+            columns.headings_mut()[attacker_idx] = 0.0;
+            columns.headings_mut()[first_victim_idx] = 0.0;
+            columns.headings_mut()[second_victim_idx] = 0.0;
+            columns.headings_mut()[survivor_idx] = 0.0;
+            columns.health_mut()[attacker_idx] = 1.0;
+            columns.health_mut()[first_victim_idx] = 0.08;
+            columns.health_mut()[second_victim_idx] = 0.08;
+            columns.health_mut()[survivor_idx] = 1.0;
+            columns.ages_mut()[attacker_idx] = 5;
+            columns.ages_mut()[first_victim_idx] = 5;
+            columns.ages_mut()[second_victim_idx] = 5;
+            columns.ages_mut()[survivor_idx] = 5;
+            columns.spike_lengths_mut()[attacker_idx] = 1.0;
+
+            let attacker_runtime = world.agent_runtime_mut(attacker).unwrap();
+            attacker_runtime.energy = 1.0;
+            attacker_runtime.herbivore_tendency = 0.0;
+            let first_victim_runtime = world.agent_runtime_mut(first_victim).unwrap();
+            first_victim_runtime.energy = 0.2;
+            first_victim_runtime.herbivore_tendency = 1.0;
+            let second_victim_runtime = world.agent_runtime_mut(second_victim).unwrap();
+            second_victim_runtime.energy = 0.3;
+            second_victim_runtime.herbivore_tendency = 1.0;
+            let survivor_runtime = world.agent_runtime_mut(survivor).unwrap();
+            survivor_runtime.energy = 0.5;
+            survivor_runtime.herbivore_tendency = 0.0;
+            world.set_resource_ledger_enabled(true);
             world
         }
 
-        let left = two_identical_agents();
-        let mut right = two_identical_agents();
-        let first = right.agents.handles[0];
-        let second = right.agents.handles[1];
-        right.agents.handles.swap(0, 1);
-        *right.agents.slots.get_mut(first).expect("first dense slot") = 1;
-        *right
-            .agents
-            .slots
-            .get_mut(second)
-            .expect("second dense slot") = 0;
+        let mut left = layout_world();
+        let mut right = layout_world();
+        let handles: Vec<_> = right.agents.iter_handles().collect();
+        permute_agent_associations(&mut right, &handles, &[2, 0, 3, 1]);
 
-        let left = left.world_digest_v1().expect("left execution order");
-        let right = right.world_digest_v1().expect("right execution order");
-        assert_eq!(left.agents, right.agents);
-        assert_eq!(left.brains, right.brains);
-        assert_eq!(left.rng, right.rng);
-        assert_eq!(left.counters, right.counters);
-        assert_eq!(left.origins, right.origins);
-        assert_ne!(left.execution_order, right.execution_order);
-        assert_ne!(left.overall, right.overall);
+        assert_ne!(uid_slot_signature(&left), uid_slot_signature(&right));
+        assert_ne!(
+            left.agents
+                .iter_handles()
+                .map(|id| left.agent_uid(id).unwrap())
+                .collect::<Vec<_>>(),
+            right
+                .agents
+                .iter_handles()
+                .map(|id| right.agent_uid(id).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            left.characterization_digest_v0().expect("left legacy layout digest"),
+            right
+                .characterization_digest_v0()
+                .expect("right legacy layout digest"),
+            "legacy raw-slot characterization must prove the fixture layouts really differ"
+        );
+        assert_eq!(
+            left.world_digest_v1().expect("left pre-step V1.2"),
+            right.world_digest_v1().expect("right pre-step V1.2")
+        );
+
+        let mut left_tracer = WorldStepTracer::default();
+        let mut right_tracer = WorldStepTracer::default();
+        let left_completion = left
+            .step_traced_outcome(&mut left_tracer)
+            .expect("left canonical transition");
+        let right_completion = right
+            .step_traced_outcome(&mut right_tracer)
+            .expect("right canonical transition");
+        assert!(left_completion.fault.is_none());
+        assert!(right_completion.fault.is_none());
+        assert_eq!(left_completion.outcome.events, right_completion.outcome.events);
+        assert_eq!(left_completion.outcome.summary, right_completion.outcome.summary);
+        assert_eq!(left_completion.outcome.births, right_completion.outcome.births);
+        assert_eq!(left_completion.outcome.deaths, right_completion.outcome.deaths);
+        assert_eq!(left_completion.outcome.combat, right_completion.outcome.combat);
+        assert_eq!(
+            left_completion.outcome.resource_tick,
+            right_completion.outcome.resource_tick
+        );
+        assert_eq!(
+            left_completion.outcome.persistence.status(),
+            right_completion.outcome.persistence.status()
+        );
+        assert!(left_completion.outcome.combat.spike_hits > 0);
+        assert!(left_completion.outcome.deaths.len() >= 2);
+        assert!(
+            left_completion
+                .outcome
+                .deaths
+                .windows(2)
+                .all(|pair| pair[0].agent_uid < pair[1].agent_uid),
+            "death records must commit in stable UID order"
+        );
+        assert!(left_completion.outcome.resource_tick.is_some());
+        let left_trace = left_tracer.latest().expect("left canonical trace");
+        let right_trace = right_tracer.latest().expect("right canonical trace");
+        assert!(left_tracer.death_cleanup_input_pending_deaths.unwrap_or(0) > 0);
+        assert_eq!(
+            left_tracer.death_cleanup_input_pending_deaths,
+            right_tracer.death_cleanup_input_pending_deaths
+        );
+        assert!(left_trace.stages.iter().all(|stage| stage.capture.is_ok()));
+        left_trace.validate_contract().expect("left canonical trace contract");
+        right_trace
+            .validate_contract()
+            .expect("right canonical trace contract");
+        assert_eq!(left_trace, right_trace);
+        assert_eq!(left_trace.first_divergence(right_trace).unwrap(), None);
+        assert_eq!(left.resource_ledger(), right.resource_ledger());
+        assert_eq!(left.history, right.history);
+        assert_eq!(
+            left.world_digest_v1().expect("left final V1.2"),
+            right.world_digest_v1().expect("right final V1.2")
+        );
+    }
+
+    #[test]
+    fn uid_canonical_reproduction_assigns_identical_child_genomes_and_uids() {
+        fn reproduction_world() -> WorldState {
+            let (mut world, key) = protocol_fixture_world(
+                "test.uid-layout-protocol",
+                OffspringStatePolicy::Reset,
+                1.0,
+            );
+            let parents = [
+                protocol_fixture_parent(&mut world, key, 11),
+                protocol_fixture_parent(&mut world, key, 22),
+                protocol_fixture_parent(&mut world, key, 33),
+            ];
+            for (index, parent) in parents.into_iter().enumerate() {
+                replace_fixture_material(
+                    &mut world,
+                    key,
+                    parent,
+                    "test.uid-layout-protocol",
+                    index as i8 + 1,
+                    -(index as i8),
+                );
+                let dense = world.agents.index_of(parent).unwrap();
+                world.agents.columns_mut().ages_mut()[dense] = 5;
+                let runtime = world.agent_runtime_mut(parent).unwrap();
+                runtime.energy = if index == 1 { 0.0 } else { 5.0 };
+                runtime.reproduction_counter = if index == 1 { 0.0 } else { f32::MAX };
+                runtime.mutation_rates = MutationRates {
+                    primary: 1.0,
+                    secondary: 1.0,
+                };
+            }
+            world.set_resource_ledger_enabled(true);
+            world
+        }
+
+        let mut left = reproduction_world();
+        let mut right = reproduction_world();
+        let handles: Vec<_> = right.agents.iter_handles().collect();
+        permute_agent_associations(&mut right, &handles, &[2, 0, 1]);
+        assert_ne!(uid_slot_signature(&left), uid_slot_signature(&right));
+        assert_eq!(
+            left.world_digest_v1().expect("left reproduction input"),
+            right.world_digest_v1().expect("right reproduction input")
+        );
+
+        let mut left_tracer = WorldStepTracer::default();
+        let mut right_tracer = WorldStepTracer::default();
+        let left_completion = left
+            .step_traced_outcome(&mut left_tracer)
+            .expect("left protocol reproduction");
+        let right_completion = right
+            .step_traced_outcome(&mut right_tracer)
+            .expect("right protocol reproduction");
+        assert!(left_completion.fault.is_none());
+        assert!(right_completion.fault.is_none());
+        assert_eq!(left_completion.outcome.events, right_completion.outcome.events);
+        assert_eq!(left_completion.outcome.summary, right_completion.outcome.summary);
+        assert_eq!(left_completion.outcome.births, right_completion.outcome.births);
+        assert_eq!(left_completion.outcome.deaths, right_completion.outcome.deaths);
+        assert_eq!(left_completion.outcome.combat, right_completion.outcome.combat);
+        assert_eq!(
+            left_completion.outcome.resource_tick,
+            right_completion.outcome.resource_tick
+        );
+        assert_eq!(left_completion.outcome.births.len(), 2);
+        assert_eq!(
+            left_completion
+                .outcome
+                .births
+                .iter()
+                .map(|record| record.parent_a)
+                .collect::<Vec<_>>(),
+            vec![Some(AgentUid(1)), Some(AgentUid(3))]
+        );
+        assert!(left_tracer.population_input_pending_spawns.unwrap_or(0) > 0);
+        assert_eq!(
+            left_tracer.population_input_pending_spawns,
+            right_tracer.population_input_pending_spawns
+        );
+        let left_trace = left_tracer.latest().expect("left reproduction trace");
+        let right_trace = right_tracer.latest().expect("right reproduction trace");
+        assert!(left_trace.stages.iter().all(|stage| stage.capture.is_ok()));
+        left_trace
+            .validate_contract()
+            .expect("left reproduction trace contract");
+        right_trace
+            .validate_contract()
+            .expect("right reproduction trace contract");
+        assert_eq!(left_trace, right_trace);
+        assert_eq!(left_trace.first_divergence(right_trace).unwrap(), None);
+        assert_eq!(left.resource_ledger(), right.resource_ledger());
+
+        for birth in &left_completion.outcome.births {
+            let left_child = agent_id_for_uid(&left, birth.agent_uid);
+            let right_child = agent_id_for_uid(&right, birth.agent_uid);
+            assert_eq!(
+                left.agent_runtime(left_child).unwrap().lineage,
+                [birth.parent_a, birth.parent_b]
+            );
+            assert_eq!(
+                right.agent_runtime(right_child).unwrap().lineage,
+                [birth.parent_a, birth.parent_b]
+            );
+            assert_eq!(
+                left.agent_brain_genome(left_child),
+                right.agent_brain_genome(right_child)
+            );
+            let genome = left
+                .agent_brain_genome(left_child)
+                .expect("reproduction child genome");
+            assert_eq!(genome.provenance().parents, [birth.parent_a, birth.parent_b]);
+            assert!(matches!(
+                genome.provenance().derivation,
+                BrainGenomeDerivation::Crossover | BrainGenomeDerivation::CrossoverThenMutation
+            ));
+            let expected_hashes = [birth.parent_a, birth.parent_b].map(|uid| {
+                uid.map(|uid| {
+                    let parent = agent_id_for_uid(&left, uid);
+                    left.agent_brain_genome(parent)
+                        .expect("reproduction parent genome")
+                        .material_hash()
+                })
+            });
+            assert_eq!(genome.provenance().parent_genome_hashes, expected_hashes);
+            assert_eq!(
+                left.agent_brain_evaluator_state(left_child).unwrap(),
+                right.agent_brain_evaluator_state(right_child).unwrap()
+            );
+        }
+        let left_final = left.world_digest_v1().expect("left reproduction V1.2");
+        let right_final = right.world_digest_v1().expect("right reproduction V1.2");
+        assert_eq!(left_final.rng, right_final.rng);
+        assert_eq!(left_final.counters, right_final.counters);
+        assert_eq!(left_final, right_final);
+    }
+
+    #[test]
+    fn uid_canonical_population_crossover_preserves_directional_protocol_parents() {
+        fn crossover_world() -> WorldState {
+            let mut config = protocol_reproduction_config(0.0);
+            config.closed = false;
+            config.population_spawn_interval = 1;
+            config.population_spawn_count = 1;
+            config.population_crossover_chance = 1.0;
+            config.reproduction_energy_threshold = 0.0;
+            config.reproduction_attempt_chance = 0.0;
+            let mut world = WorldState::new(config).expect("scheduled crossover world");
+            let family_id = "test.uid-layout-scheduled-protocol";
+            let key = world
+                .register_brain_family(
+                    family_id,
+                    Box::new(FixtureBrainFamily::with_policy(
+                        family_id,
+                        OffspringStatePolicy::Reset,
+                    )),
+                )
+                .expect("register scheduled protocol family");
+            let parents = [
+                protocol_fixture_parent(&mut world, key, 44),
+                protocol_fixture_parent(&mut world, key, 55),
+                protocol_fixture_parent(&mut world, key, 66),
+            ];
+            for (index, parent) in parents.into_iter().enumerate() {
+                replace_fixture_material(
+                    &mut world,
+                    key,
+                    parent,
+                    family_id,
+                    index as i8 + 4,
+                    index as i8 - 1,
+                );
+                let dense = world.agents.index_of(parent).unwrap();
+                world.agents.columns_mut().ages_mut()[dense] = (index as u32 + 1) * 3;
+                world.agent_runtime_mut(parent).unwrap().mutation_rates = MutationRates {
+                    primary: 1.0,
+                    secondary: 1.0,
+                };
+            }
+            world.set_resource_ledger_enabled(true);
+            world
+        }
+
+        let mut left = crossover_world();
+        let mut right = crossover_world();
+        let handles: Vec<_> = right.agents.iter_handles().collect();
+        permute_agent_associations(&mut right, &handles, &[2, 0, 1]);
+        assert_ne!(uid_slot_signature(&left), uid_slot_signature(&right));
+        assert_eq!(
+            left.world_digest_v1().expect("left crossover input"),
+            right.world_digest_v1().expect("right crossover input")
+        );
+
+        let mut left_tracer = WorldStepTracer::default();
+        let mut right_tracer = WorldStepTracer::default();
+        let left_completion = left
+            .step_traced_outcome(&mut left_tracer)
+            .expect("left scheduled crossover");
+        let right_completion = right
+            .step_traced_outcome(&mut right_tracer)
+            .expect("right scheduled crossover");
+        assert!(left_completion.fault.is_none());
+        assert!(right_completion.fault.is_none());
+        assert_eq!(left_completion.outcome.events, right_completion.outcome.events);
+        assert_eq!(left_completion.outcome.summary, right_completion.outcome.summary);
+        assert_eq!(left_completion.outcome.births, right_completion.outcome.births);
+        assert_eq!(left_completion.outcome.resource_tick, right_completion.outcome.resource_tick);
+        assert_eq!(left_completion.outcome.births.len(), 1);
+        let birth = &left_completion.outcome.births[0];
+        assert_eq!(birth.origin, BirthOrigin::Injected);
+        assert!(birth.parent_a.is_some());
+        assert!(birth.parent_b.is_some());
+        assert_ne!(birth.parent_a, birth.parent_b);
+
+        let left_child = agent_id_for_uid(&left, birth.agent_uid);
+        let right_child = agent_id_for_uid(&right, birth.agent_uid);
+        let left_genome = left
+            .agent_brain_genome(left_child)
+            .expect("left scheduled child genome");
+        let right_genome = right
+            .agent_brain_genome(right_child)
+            .expect("right scheduled child genome");
+        assert_eq!(
+            left.agent_runtime(left_child).unwrap().lineage,
+            [birth.parent_a, birth.parent_b]
+        );
+        assert_eq!(
+            right.agent_runtime(right_child).unwrap().lineage,
+            [birth.parent_a, birth.parent_b]
+        );
+        assert_eq!(left_genome, right_genome);
+        assert_eq!(
+            left_genome.provenance().parents,
+            [birth.parent_a, birth.parent_b]
+        );
+        assert!(matches!(
+            left_genome.provenance().derivation,
+            BrainGenomeDerivation::Crossover | BrainGenomeDerivation::CrossoverThenMutation
+        ));
+        let expected_hashes = [birth.parent_a, birth.parent_b].map(|uid| {
+            uid.map(|uid| {
+                let parent = agent_id_for_uid(&left, uid);
+                left.agent_brain_genome(parent)
+                    .expect("scheduled parent genome")
+                    .material_hash()
+            })
+        });
+        assert_eq!(left_genome.provenance().parent_genome_hashes, expected_hashes);
+        assert_eq!(
+            left.agent_brain_evaluator_state(left_child).unwrap(),
+            right.agent_brain_evaluator_state(right_child).unwrap()
+        );
+
+        let left_trace = left_tracer.latest().expect("left scheduled trace");
+        let right_trace = right_tracer.latest().expect("right scheduled trace");
+        assert!(left_trace.stages.iter().all(|stage| stage.capture.is_ok()));
+        left_trace
+            .validate_contract()
+            .expect("left scheduled trace contract");
+        right_trace
+            .validate_contract()
+            .expect("right scheduled trace contract");
+        assert_eq!(left_trace.first_divergence(right_trace).unwrap(), None);
+        assert_eq!(left.resource_ledger(), right.resource_ledger());
+        let left_final = left.world_digest_v1().expect("left crossover V1.2");
+        let right_final = right.world_digest_v1().expect("right crossover V1.2");
+        assert_eq!(left_final.rng, right_final.rng);
+        assert_eq!(left_final.counters, right_final.counters);
+        assert_eq!(left_final, right_final);
     }
 
     #[test]
