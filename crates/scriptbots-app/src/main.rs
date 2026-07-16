@@ -347,13 +347,15 @@ fn main() -> Result<()> {
     }
     let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
         config,
-        cli.brain,
-        cli.storage,
-        thresholds,
-        cli.bootstrap_ticks,
-        policy,
-        launch_scenario,
-        config_overrides,
+        BootstrapRequest {
+            brain_preset: cli.brain,
+            storage_mode: cli.storage,
+            thresholds,
+            bootstrap_ticks: cli.bootstrap_ticks,
+            thread_policy: policy,
+            scenario: launch_scenario,
+            config_overrides,
+        },
     )?;
     let simulation_step = persistence_step_driver(&world, &persistence);
 
@@ -1185,21 +1187,34 @@ fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, co
     }
 }
 
-fn bootstrap_world(
-    mut config: ScriptBotsConfig,
+struct BootstrapRequest {
     brain_preset: BrainPreset,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
     bootstrap_ticks: u64,
     thread_policy: ThreadPolicy,
-    mut scenario: ScenarioIdentityV0,
+    scenario: ScenarioIdentityV0,
     config_overrides: Vec<ConfigFieldOverride>,
+}
+
+fn bootstrap_world(
+    mut config: ScriptBotsConfig,
+    request: BootstrapRequest,
 ) -> Result<(
     SharedWorld,
     SharedPersistenceAdmission,
     SharedAnalytics,
     StoragePipeline,
 )> {
+    let BootstrapRequest {
+        brain_preset,
+        storage_mode,
+        thresholds,
+        bootstrap_ticks,
+        thread_policy,
+        mut scenario,
+        config_overrides,
+    } = request;
     // This function owns bootstrap execution, so it also owns the authoritative requested count.
     // Never trust a caller-populated scenario field that could disagree with the work done here.
     scenario.bootstrap_ticks = bootstrap_ticks;
@@ -5342,13 +5357,15 @@ activation = "Sigmoid"
             config.neuroflow.hidden_layers = vec![4, 0, 2];
             let error = bootstrap_world(
                 config,
-                BrainPreset::Mixed,
-                StorageMode::File,
-                ThresholdsOverride::default(),
-                DEFAULT_BOOTSTRAP_TICKS,
-                resolve_thread_policy(None, None, None, false),
-                ScenarioIdentityV0::caller_seeded("invalid-neuroflow-test"),
-                Vec::new(),
+                BootstrapRequest {
+                    brain_preset: BrainPreset::Mixed,
+                    storage_mode: StorageMode::File,
+                    thresholds: ThresholdsOverride::default(),
+                    bootstrap_ticks: DEFAULT_BOOTSTRAP_TICKS,
+                    thread_policy: resolve_thread_policy(None, None, None, false),
+                    scenario: ScenarioIdentityV0::caller_seeded("invalid-neuroflow-test"),
+                    config_overrides: Vec::new(),
+                },
             )
             .err()
             .expect("adapter validation must fail before storage setup");
