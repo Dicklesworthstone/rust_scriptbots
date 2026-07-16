@@ -1360,15 +1360,15 @@ fn validate_environment_checkpoint(
             "terrain must exactly match the config-derived food grid and cell size",
         );
     }
-    if let Some(metadata) = &state.map_metadata {
-        if metadata.tileset_id.len() > MAX_CHECKPOINT_TILESET_ID_BYTES {
-            return contract_error(
-                "map_metadata.tileset_id",
-                format!(
-                    "tileset ID must contain at most {MAX_CHECKPOINT_TILESET_ID_BYTES} UTF-8 bytes"
-                ),
-            );
-        }
+    if let Some(metadata) = &state.map_metadata
+        && metadata.tileset_id.len() > MAX_CHECKPOINT_TILESET_ID_BYTES
+    {
+        return contract_error(
+            "map_metadata.tileset_id",
+            format!(
+                "tileset ID must contain at most {MAX_CHECKPOINT_TILESET_ID_BYTES} UTF-8 bytes"
+            ),
+        );
     }
     if let Some(hydrology) = &state.hydrology {
         for (path, count) in [
