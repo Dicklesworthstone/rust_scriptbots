@@ -579,12 +579,7 @@ fn characterization_records_the_same_config_layer_provenance_in_its_bound_manife
     let displaced: Vec<(&str, &str)> = overrides
         .iter()
         .filter(|entry| entry.path == "world_width")
-        .map(|entry| {
-            (
-                entry.losing_kind.wire_tag(),
-                entry.winning_kind.wire_tag(),
-            )
-        })
+        .map(|entry| (entry.losing_kind.wire_tag(), entry.winning_kind.wire_tag()))
         .collect();
     assert_eq!(
         displaced,
