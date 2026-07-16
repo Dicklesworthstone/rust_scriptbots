@@ -2727,6 +2727,16 @@ mod tests {
         let mut restored = WorldState::restore_checkpoint_v1(&decoded, prepared_mlp_registry())
             .expect("restore evolved checkpoint");
         assert_ne!(
+            original.config().history_capacity,
+            ScriptBotsConfig::default().history_capacity,
+            "the fixture must exercise a digest-neutralized nondefault config field"
+        );
+        assert_eq!(
+            restored.config(),
+            original.config(),
+            "the complete config must round-trip, including fields neutralized by WorldDigestV1"
+        );
+        assert_ne!(
             uid_handle_signature(&restored),
             source_signature,
             "restore must allocate fresh physical AgentIds"

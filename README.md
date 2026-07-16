@@ -881,7 +881,8 @@ MCP quickstart:
   - ✅ Type-safe encoding for replay artifacts shared by storage and analytics crates.
   - ✅ Storage plumbing to persist replay batches alongside standard metrics.
   - ✅ Headless runner and CLI comparison scaffold that refuses vacuous nonzero runs.
-  - ✅ Persistence-disabled core science checkpoint with strict restore and next-transition proof; application discovery and resume remain planned.
+- **In verification**
+  - ⏳ Persistence-disabled core science checkpoint with strict restore and next-transition proof; final DSR proof is pending, and application discovery/resume remain planned.
 - **Planned**
   - ❌ Production instrumentation for nonempty RNG/brain/action event streams.
   - ❌ Branch/diff workflows comparing Rust vs. Rust PR builds vs. the legacy C++ baseline.
