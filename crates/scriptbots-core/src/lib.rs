@@ -2052,7 +2052,9 @@ impl BrainRegistry {
     /// Stable family-owned semantic identity captured when the protocol adapter was admitted.
     #[must_use]
     pub fn adapter_identity(&self, key: u64) -> Option<BrainAdapterIdentityV1> {
-        self.entries.get(&key).and_then(|entry| entry.adapter_identity)
+        self.entries
+            .get(&key)
+            .and_then(|entry| entry.adapter_identity)
     }
 
     /// Whether `key` selects a versioned protocol family rather than a legacy runner factory.
@@ -25750,7 +25752,9 @@ mod tests {
         );
         assert_eq!(
             registry.adapter_identity(protocol),
-            registry.family(protocol).map(|adapter| adapter.adapter_identity()),
+            registry
+                .family(protocol)
+                .map(|adapter| adapter.adapter_identity()),
             "registration must capture the exact family-authored semantic identity"
         );
 
@@ -25821,7 +25825,10 @@ mod tests {
         assert_eq!(left_digest.counters, right_digest.counters);
         assert_eq!(left_digest.config, right_digest.config);
         assert_eq!(left_digest.effects, right_digest.effects);
-        assert_eq!(left_digest.derived_transition, right_digest.derived_transition);
+        assert_eq!(
+            left_digest.derived_transition,
+            right_digest.derived_transition
+        );
         assert_eq!(left_digest.origins, right_digest.origins);
     }
 

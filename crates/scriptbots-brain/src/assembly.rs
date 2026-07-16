@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "DSR_REBLESS_ASSEMBLY_ADAPTER_IDENTITY_V1",
+            "f0f345102059ff017681acdc92998a4de7817a8ee1afe579bae300b6ccfe92b7",
             "update only after reviewing an intentional Assembly executable-semantics change"
         );
     }

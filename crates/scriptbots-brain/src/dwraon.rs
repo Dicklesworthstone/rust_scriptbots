@@ -23,8 +23,7 @@ const BRAIN_SIZE: usize = 200;
 const CONNECTIONS: usize = 4;
 const DWRAON_FAMILY_NAME: &str = "dwraon-baseline";
 const ADAPTER_SEMANTIC_VERSION: u32 = 1;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] =
-    b"scriptbots.dwraon-baseline.adapter-semantics.v1";
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.adapter-semantics.v1";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -966,7 +965,7 @@ mod tests {
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "DSR_REBLESS_DWRAON_ADAPTER_IDENTITY_V1",
+            "ef624108890dc72279e271f38bb7b068b2e2e8735b7bb88a09c93066bc4c7e55",
             "update only after reviewing an intentional DWRAON executable-semantics change"
         );
     }

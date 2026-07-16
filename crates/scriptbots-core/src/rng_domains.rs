@@ -274,12 +274,12 @@ impl OffspringRngOperationV1 {
     pub const fn domain(self) -> RngDomain {
         match self {
             Self::BodyPopulation | Self::BrainInitialization => RngDomain::Population,
-            Self::RuntimeCrossover
-            | Self::BrainCrossover
-            | Self::BrainEvaluatorStateCrossover => RngDomain::Crossover,
-            Self::RuntimeMutation
-            | Self::BrainMutation
-            | Self::BrainEvaluatorStateMutation => RngDomain::Mutation,
+            Self::RuntimeCrossover | Self::BrainCrossover | Self::BrainEvaluatorStateCrossover => {
+                RngDomain::Crossover
+            }
+            Self::RuntimeMutation | Self::BrainMutation | Self::BrainEvaluatorStateMutation => {
+                RngDomain::Mutation
+            }
         }
     }
 }
@@ -1163,9 +1163,7 @@ mod tests {
         }
 
         let mut after_unrelated_work = agent_substream(root_seed, target_uid, operation, ordinal);
-        let actual: Vec<u64> = (0..16)
-            .map(|_| after_unrelated_work.next_u64())
-            .collect();
+        let actual: Vec<u64> = (0..16).map(|_| after_unrelated_work.next_u64()).collect();
         assert_eq!(
             actual, expected,
             "drawing from a distant agent changed an existing agent's local continuation"
@@ -1203,8 +1201,7 @@ mod tests {
     #[test]
     fn offspring_identity_is_lineage_order_and_parent_local_birth() {
         let root_seed = 616;
-        let baseline_identity =
-            OffspringRngIdentityV1::new(AgentUid(11), Some(AgentUid(29)), 6);
+        let baseline_identity = OffspringRngIdentityV1::new(AgentUid(11), Some(AgentUid(29)), 6);
         let baseline = derive_offspring_substream_seed(
             root_seed,
             baseline_identity,

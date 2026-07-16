@@ -23,8 +23,7 @@ const BRAIN_SIZE_WIRE: u16 = 200;
 const CONNECTIONS_WIRE: u8 = 4;
 const MLP_FAMILY_ID: &str = "mlp-baseline";
 const ADAPTER_SEMANTIC_VERSION: u32 = 1;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] =
-    b"scriptbots.mlp-baseline.adapter-semantics.v1";
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v1";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -1102,7 +1101,7 @@ mod tests {
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "DSR_REBLESS_MLP_ADAPTER_IDENTITY_V1",
+            "85bac0571c8e9981b5bc3ffe599a5ada3dfed14b5150e419776d18d5b3882ee2",
             "update only after reviewing an intentional MLP executable-semantics change"
         );
     }
