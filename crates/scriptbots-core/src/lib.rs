@@ -15483,7 +15483,13 @@ impl WorldState {
         if let Some(binding) = binding {
             runtime.brain = binding;
         }
-        let id = self.insert_reserved_agent(data, runtime, record_tick, BirthOrigin::Injected, reservation);
+        let id = self.insert_reserved_agent(
+            data,
+            runtime,
+            record_tick,
+            BirthOrigin::Injected,
+            reservation,
+        );
         Ok(id)
     }
 
