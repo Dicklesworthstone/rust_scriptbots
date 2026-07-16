@@ -635,7 +635,7 @@ fn dense_bench_config() -> ScriptBotsConfig {
         world_height: 1_000,
         food_cell_size: 20,
         initial_food: 0.0,
-        rng_seed: Some(0x25_16_09_ba_7c_2026),
+        rng_seed: Some(0x0025_1609_ba7c_2026),
         chart_flush_interval: 0,
         food_respawn_interval: 0,
         food_respawn_amount: 0.0,

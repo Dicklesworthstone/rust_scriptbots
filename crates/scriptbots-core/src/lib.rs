@@ -27976,9 +27976,13 @@ mod tests {
     #[cfg(feature = "batch-brains")]
     #[test]
     fn stage_batch_and_scalar_paths_are_bit_identical() {
-        fn build_world(
-            batch_enabled: bool,
-        ) -> (WorldState, [AgentId; 4], Arc<Mutex<Vec<Vec<i8>>>>) {
+        struct MatchedBatchWorld {
+            world: WorldState,
+            agents: [AgentId; 4],
+            probe: Arc<Mutex<Vec<Vec<i8>>>>,
+        }
+
+        fn build_world(batch_enabled: bool) -> MatchedBatchWorld {
             let mut world = WorldState::new(ScriptBotsConfig {
                 population_minimum: 0,
                 rng_seed: Some(0xB17B_17B1),
@@ -28001,11 +28005,23 @@ mod tests {
                 fixture_protocol_lane(4, 2, 0, -1, 5.0),
             ]
             .map(|lane| spawn_fixture_protocol_agent(&mut world, key, "batch-scalar-match", lane));
-            (world, agents, probe)
+            MatchedBatchWorld {
+                world,
+                agents,
+                probe,
+            }
         }
 
-        let (mut scalar, scalar_agents, scalar_probe) = build_world(false);
-        let (mut batch, batch_agents, batch_probe) = build_world(true);
+        let MatchedBatchWorld {
+            world: mut scalar,
+            agents: scalar_agents,
+            probe: scalar_probe,
+        } = build_world(false);
+        let MatchedBatchWorld {
+            world: mut batch,
+            agents: batch_agents,
+            probe: batch_probe,
+        } = build_world(true);
         scalar.stage_brains().expect("matched scalar stage");
         batch.stage_brains().expect("matched batch stage");
         assert!(
