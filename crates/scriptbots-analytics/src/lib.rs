@@ -61,6 +61,14 @@ pub mod compare;
 /// via [`certify`]. Pure; the certification that consumes it is where the resampling lives.
 pub mod changepoint;
 
+/// Native distribution characterization (bd-2z0.11.6 item 2).
+///
+/// Moment-based shape summary — skewness, kurtosis, and the Jarque-Bera normality test with an
+/// exact chi-square(2) p-value — so "is this metric normal, and how is it shaped?" is answered
+/// natively, with no `erf` and no `fsci` dependency. Full distribution fitting (lognormal/gamma +
+/// KS) is left for the adapter decision (bd-2z0.11.3). Pure functions over a slice.
+pub mod distribution;
+
 /// Schema version stamped into every machine-readable report payload.
 ///
 /// Bump ONLY with a migration note in the owning Bead/release evidence. Full
