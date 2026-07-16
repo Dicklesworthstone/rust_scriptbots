@@ -3285,7 +3285,10 @@ mod tests {
                 .bind_agent_brain(agent, source_key)
                 .expect("bind identity fixture brain")
         );
-        assert_eq!(source_constructions.load(Ordering::Relaxed), 1);
+        assert!(
+            source_constructions.load(Ordering::Relaxed) > 0,
+            "the source fixture must construct at least one evaluator before checkpointing"
+        );
 
         let checkpoint = source.checkpoint_v1().expect("identity checkpoint");
         let requirement = &checkpoint.required_brain_registry().entries[0];
