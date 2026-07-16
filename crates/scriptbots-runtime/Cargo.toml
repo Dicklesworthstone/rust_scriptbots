@@ -17,10 +17,9 @@ arc-swap = { workspace = true }
 asupersync = { workspace = true, optional = true }
 scriptbots-core = { path = "../scriptbots-core", default-features = false }
 serde = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

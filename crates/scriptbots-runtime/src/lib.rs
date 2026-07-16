@@ -72,12 +72,17 @@ mod serde_optional_arc {
     }
 }
 
+mod archipelago;
 mod host_core;
 mod native;
 
 const MAX_EVENT_PAGE_SIZE: usize = 4_096;
 const DEFAULT_PROJECTION_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+pub use archipelago::{
+    Archipelago, ArchipelagoConfig, ArchipelagoError, BarrierReport, IslandBarrierReport, IslandId,
+    IslandMeta, IslandSpec, MAX_ISLANDS, StepTopology, Topology,
+};
 pub use host_core::{
     HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, VolatileJournal,
 };
