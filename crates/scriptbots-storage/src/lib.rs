@@ -4938,6 +4938,15 @@ impl ExistingStorageLease {
     }
 }
 
+fn filesystem_identity_probe_prefix(database_path: &Path) -> String {
+    // This is an ephemeral ownership tag, not canonical filesystem identity or authentication.
+    // It lets diagnostics distinguish simultaneous probes for different database paths.
+    format!(
+        ".scriptbots-identity-probe-{}-",
+        blake3::hash(database_path.as_os_str().as_encoded_bytes()).to_hex()
+    )
+}
+
 /// Does this filesystem give a file a STABLE identity across truncate-and-regrow?
 ///
 /// Behavioural probe, not a filesystem-name lookup. We ask the filesystem to demonstrate the
@@ -4956,8 +4965,9 @@ fn filesystem_has_stable_file_identity(database_path: &Path) -> bool {
     let Some(dir) = database_path.parent() else {
         return true;
     };
+    let probe_prefix = filesystem_identity_probe_prefix(database_path);
     let probe_path = dir.join(format!(
-        ".scriptbots-identity-probe-{}-{}",
+        "{probe_prefix}{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -11026,6 +11036,7 @@ mod tests {
         // trusted.
         let path = temp_db_path("storage-identity-probe");
         std::fs::write(&path, b"probe").expect("write probe database");
+        let probe_prefix = filesystem_identity_probe_prefix(&path);
 
         let first = filesystem_has_stable_file_identity(&path);
         let second = filesystem_has_stable_file_identity(&path);
@@ -11036,7 +11047,9 @@ mod tests {
              or off depending on the run — and neither state could be trusted."
         );
 
-        // And it must not leave litter behind in the user's database directory.
+        // And it must not leave its own litter behind in the user's database directory. The
+        // database-path tag deliberately excludes another concurrently tested database's live
+        // probe from this assertion.
         let dir = path.parent().expect("temp dir");
         let leftovers = std::fs::read_dir(dir)
             .expect("read temp dir")
@@ -11045,7 +11058,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(".scriptbots-identity-probe-")
+                    .starts_with(probe_prefix.as_str())
             })
             .count();
         assert_eq!(
@@ -13761,15 +13774,17 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-admission-timeout-retry");
         let path_string = path.to_string_lossy().to_string();
-        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds_and_deadlines(
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
             &path_string,
             64,
             4096,
             1024,
             1024,
-            short_deadlines(),
         )?;
-        let sink = pipeline.sink();
+        let mut timeout_sink = pipeline.sink();
+        // Only the negative call owns the short deadline. The exact retry, flush, and shutdown
+        // prove the positive contract under the normal bounded production deadlines.
+        timeout_sink.deadlines.admission_ack = Duration::from_millis(250);
         let (entered_tx, entered_rx) = xchan::bounded(1);
         let (release_tx, release_rx) = xchan::bounded(1);
         pipeline
@@ -13781,7 +13796,7 @@ mod tests {
             })?;
         entered_rx.recv_timeout(Duration::from_secs(2))?;
 
-        let error = sink
+        let error = timeout_sink
             .submit_with_receipt(&sample_batch(84, 8.4))
             .expect_err("paused worker must miss the admission acknowledgement deadline");
         assert!(matches!(
@@ -13796,7 +13811,7 @@ mod tests {
         assert!(!pipeline.analytics_provider().snapshot().stopped);
         release_tx.send(())?;
 
-        let retry = sink.submit_with_receipt(&sample_batch(84, 8.4))?;
+        let retry = pipeline.submit_with_receipt(&sample_batch(84, 8.4))?;
         let flush = pipeline.flush_and_wait()?;
         assert_eq!(flush.watermarks.durable, Some(retry.batch_id));
         pipeline.shutdown()?;
