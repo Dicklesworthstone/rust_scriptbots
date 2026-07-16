@@ -15230,8 +15230,7 @@ impl WorldState {
             &parent_runtime,
             partner_runtime.as_ref(),
             self.config.reproduction_gene_log_capacity,
-            parent_uid,
-            Some(partner_uid),
+            offspring_rng_identity,
             &mut crossover_rng,
             &mut mutation_rng,
         );
@@ -16489,8 +16488,7 @@ impl WorldState {
                     &parent_runtime_snapshot,
                     partner_runtime.as_ref(),
                     gene_log_capacity,
-                    parent_uid,
-                    partner_uid,
+                    offspring_rng_identity,
                     &mut crossover_rng,
                     &mut mutation_rng,
                 );
@@ -16790,8 +16788,7 @@ impl WorldState {
         parent: &AgentRuntime,
         partner: Option<&AgentRuntime>,
         gene_log_capacity: usize,
-        parent_uid: AgentUid,
-        partner_uid: Option<AgentUid>,
+        offspring_rng_identity: OffspringRngIdentityV1,
         crossover_rng: &mut dyn RandomStream,
         mutation_rng: &mut dyn RandomStream,
     ) -> AgentRuntime {
@@ -16814,7 +16811,10 @@ impl WorldState {
         if runtime.brain.registry_key().is_none() {
             runtime.brain = BrainBinding::default();
         }
-        runtime.lineage = [Some(parent_uid), partner_uid];
+        runtime.lineage = [
+            Some(offspring_rng_identity.primary_parent()),
+            offspring_rng_identity.secondary_parent(),
+        ];
 
         if let Some(partner_runtime) = partner {
             runtime.hybrid = true;
