@@ -3539,9 +3539,8 @@ mod tests {
         };
 
         let mut wrong_root = checkpoint.clone();
-        wrong_root.state.agent_substream_protocol = AgentSubstreamProtocolV1::from_root_seed(
-            wrong_root.state.random_streams.root_seed ^ 1,
-        );
+        wrong_root.state.agent_substream_protocol =
+            AgentSubstreamProtocolV1::from_root_seed(wrong_root.state.random_streams.root_seed ^ 1);
         assert!(matches!(
             WorldState::restore_checkpoint_v1(&wrong_root, prepared_registry()),
             Err(WorldCheckpointError::AgentSubstreamProtocol(
