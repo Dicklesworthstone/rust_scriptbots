@@ -2546,9 +2546,11 @@ mod tests {
                 cells[41] = 0.125;
             })
             .expect("representative food field");
-        let mut data = AgentData::default();
-        data.position = Position::new(37.5, 82.25);
-        data.health = 1.75;
+        let data = AgentData {
+            position: Position::new(37.5, 82.25),
+            health: 1.75,
+            ..AgentData::default()
+        };
         let agent = world
             .try_inject_agent(data)
             .expect("representative checkpoint agent");
@@ -2604,8 +2606,10 @@ mod tests {
             })
             .expect("nontrivial food field");
 
-        let mut founder_data = AgentData::default();
-        founder_data.position = Position::new(80.0, 90.0);
+        let founder_data = AgentData {
+            position: Position::new(80.0, 90.0),
+            ..AgentData::default()
+        };
         let founder = original
             .try_spawn_agent(founder_data)
             .expect("protocol founder");
@@ -2633,9 +2637,11 @@ mod tests {
             .agent_brain_evaluator_state(founder)
             .expect("initial founder evaluator checkpoint");
 
-        let mut victim_data = AgentData::default();
-        victim_data.position = Position::new(120.0, 90.0);
-        victim_data.health = 0.0;
+        let victim_data = AgentData {
+            position: Position::new(120.0, 90.0),
+            health: 0.0,
+            ..AgentData::default()
+        };
         let victim = original
             .try_spawn_agent(victim_data)
             .expect("sacrificial agent");
@@ -2701,8 +2707,10 @@ mod tests {
             "the fixture must exercise a non-default evaluator state"
         );
 
-        let mut injected_data = AgentData::default();
-        injected_data.position = Position::new(15.0, 25.0);
+        let injected_data = AgentData {
+            position: Position::new(15.0, 25.0),
+            ..AgentData::default()
+        };
         let injected = original
             .try_inject_agent(injected_data)
             .expect("same-boundary injected arrival");
