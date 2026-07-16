@@ -337,18 +337,13 @@ impl BrainRegistryCheckpointV1 {
     fn digest_v1(&self) -> String {
         brain_registry_digest_v1(
             self.next_key,
-            self.entries
-                .iter()
-                .map(|entry| BrainRegistryDigestEntryV1 {
-                    key: entry.key,
-                    kind: &entry.kind,
-                    factory_state_digest: entry.factory_state_digest,
-                    protocol_family: entry
-                        .protocol_family
-                        .as_ref()
-                        .map(BrainFamilyId::as_str),
-                    adapter_identity: entry.adapter_identity,
-                }),
+            self.entries.iter().map(|entry| BrainRegistryDigestEntryV1 {
+                key: entry.key,
+                kind: &entry.kind,
+                factory_state_digest: entry.factory_state_digest,
+                protocol_family: entry.protocol_family.as_ref().map(BrainFamilyId::as_str),
+                adapter_identity: entry.adapter_identity,
+            }),
         )
     }
 }
@@ -3350,8 +3345,7 @@ mod tests {
             .adapter_identity(changed_key)
             .expect("prepared adapter identity");
         assert_ne!(
-            changed_identity,
-            saved_identity,
+            changed_identity, saved_identity,
             "the fixture's changed evaluator behavior must move its semantic identity"
         );
 

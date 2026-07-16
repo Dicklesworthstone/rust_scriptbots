@@ -2677,9 +2677,9 @@ struct BrainRegistryDigestEntryV1<'a> {
     adapter_identity: Option<BrainAdapterIdentityV1>,
 }
 
-fn brain_registry_digest_v1(
+fn brain_registry_digest_v1<'a>(
     next_key: u64,
-    entries: impl IntoIterator<Item = BrainRegistryDigestEntryV1<'_>>,
+    entries: impl IntoIterator<Item = BrainRegistryDigestEntryV1<'a>>,
 ) -> String {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|entry| entry.key);

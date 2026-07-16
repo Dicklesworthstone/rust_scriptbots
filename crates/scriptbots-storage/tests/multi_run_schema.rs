@@ -4,8 +4,7 @@ use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     Generation, MetricSample, PersistenceBatch, Position, ScriptBotsConfig, Tick, TickSummary,
-    WorldState,
-    rng_domains::DomainStreams,
+    WorldState, rng_domains::DomainStreams,
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
@@ -183,6 +182,23 @@ fn mutate_manifest(record: &mut RunManifestRecord, mutate: impl FnOnce(&mut serd
         serde_json::from_str(&record.manifest_json).expect("fixture manifest is valid JSON");
     mutate(&mut value);
     record.manifest_json = serde_json::to_string(&value).expect("mutated manifest is valid JSON");
+}
+
+fn attach_zero_tick_v32_evidence(
+    record: &mut RunManifestRecord,
+    digest: serde_json::Value,
+) {
+    record.brain_roster_json = "[]".to_owned();
+    mutate_manifest(record, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
+        value["brain_roster"] = serde_json::json!([]);
+        value["bootstrap_evidence"] = serde_json::json!({
+            "requested": 0,
+            "completed": 0,
+            "start": digest.clone(),
+            "end": digest,
+        });
+    });
 }
 
 fn manifest_validation_error(record: RunManifestRecord) -> String {
@@ -834,15 +850,7 @@ fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
 
     let digest = world_digest_fixture(u64::MAX);
     let mut valid = manifest(run_id, "v32-valid-evidence", 1_700_000_000_024);
-    mutate_manifest(&mut valid, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
-        value["bootstrap_evidence"] = serde_json::json!({
-            "requested": 0,
-            "completed": 0,
-            "start": digest.clone(),
-            "end": digest,
-        });
-    });
+    attach_zero_tick_v32_evidence(&mut valid, digest);
     let mut accepted = StoragePipeline::memory_for_run(valid)
         .expect("storage accepts complete adapter-attested V3.2 bootstrap evidence");
     accepted
@@ -855,14 +863,8 @@ fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
         1_700_000_000_025,
     );
     let digest = world_digest_fixture(u64::MAX);
+    attach_zero_tick_v32_evidence(&mut foreign_digest_schema, digest);
     mutate_manifest(&mut foreign_digest_schema, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
-        value["bootstrap_evidence"] = serde_json::json!({
-            "requested": 0,
-            "completed": 0,
-            "start": digest.clone(),
-            "end": digest,
-        });
         value["bootstrap_evidence"]["start"]["schema"] =
             serde_json::json!("scriptbots.world-digest.v1.3");
     });
@@ -873,24 +875,22 @@ fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
         "unexpected error: {error}"
     );
 
-    let mut invalid_digest_overall = manifest(
+    let mut invalid_registry_lane = manifest(
         RunId::from_namespace_sequence(0xc011_1de0, 7),
-        "v32-invalid-digest-overall",
+        "v32-invalid-registry-lane",
         1_700_000_000_026,
     );
     let digest = world_digest_fixture(u64::MAX);
-    mutate_manifest(&mut invalid_digest_overall, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
-        value["bootstrap_evidence"] = serde_json::json!({
-            "requested": 0,
-            "completed": 0,
-            "start": digest.clone(),
-            "end": digest,
-        });
-        value["bootstrap_evidence"]["start"]["overall"] =
+    attach_zero_tick_v32_evidence(&mut invalid_registry_lane, digest);
+    mutate_manifest(&mut invalid_registry_lane, |value| {
+        let registry_lane = value["bootstrap_evidence"]["start"]["brain_registry"]
+            .as_str()
+            .expect("fixture registry lane");
+        assert_ne!(registry_lane, "0000000000000000");
+        value["bootstrap_evidence"]["start"]["brain_registry"] =
             serde_json::json!("0000000000000000");
     });
-    let error = manifest_validation_error(invalid_digest_overall);
+    let error = manifest_validation_error(invalid_registry_lane);
     assert!(
         error.contains("/bootstrap_evidence/start violates the WorldDigestV1 contract")
             && error.contains("world-digest overall"),
