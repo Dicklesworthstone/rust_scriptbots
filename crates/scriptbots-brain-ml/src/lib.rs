@@ -1,4 +1,10 @@
-//! Optional modern ML brain backends (Candle, tract-onnx, tch).
+//! Optional modern ML brain backends (Candle, tract-onnx, tch, Frankentorch).
+
+#[cfg(feature = "brain-ft")]
+mod ft;
+
+#[cfg(feature = "brain-ft")]
+pub use ft::{FT_BRAIN_KIND, FtBrainConfig, FtBrainFamily};
 
 use scriptbots_brain::{Brain, BrainKind, into_runner};
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE, RandomStream};

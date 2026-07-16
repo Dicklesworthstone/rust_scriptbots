@@ -19,6 +19,8 @@ use scriptbots_brain::{
     AssemblyBrain, DwraonBrain, MlpBrain, assembly::AssemblyFamilyAdapter,
     dwraon::DwraonFamilyAdapter, mlp::MlpBrainFamily,
 };
+#[cfg(feature = "brain-ft")]
+use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
     AgentData, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
     PersistenceSessionError, RenderTonemapMode, ReplayEventKind, ScriptBotsConfig, TickSummary,
@@ -151,7 +153,7 @@ fn main() -> Result<()> {
         let ticks_env = env::var("SCRIPTBOTS_DET_TICKS").ok();
         let tick_limit = ticks_env.and_then(|s| s.parse::<u64>().ok()).unwrap_or(500);
         let config = compose_config(&cli)?;
-        run_det_child(&config, tick_limit)?;
+        run_det_child(&config, tick_limit, cli.brain)?;
         return Ok(());
     }
     let (config, launch_scenario, config_overrides) = compose_config_with_scenario(&cli)?;
@@ -213,12 +215,13 @@ fn main() -> Result<()> {
             }
         }
         if let Some(ticks) = cli.profile_steps {
-            profile_world_steps(&config, ticks)?;
+            profile_world_steps(&config, ticks, cli.brain)?;
         }
         if let Some(ticks) = cli.profile_storage_steps {
             profile_world_steps_with_storage(
                 &config,
                 ticks,
+                cli.brain,
                 cli.storage,
                 thresholds,
                 profile_thread_policy,
@@ -243,8 +246,14 @@ fn main() -> Result<()> {
     let mut thresholds = thresholds;
     let mut auto_tune_threads: Option<usize> = None;
     if let Some(ticks) = cli.auto_tune
-        && let Some(best) =
-            pick_best_for_storage(&config, ticks, cli.storage, cli.threads, cli.low_power)?
+        && let Some(best) = pick_best_for_storage(
+            &config,
+            ticks,
+            cli.brain,
+            cli.storage,
+            cli.threads,
+            cli.low_power,
+        )?
     {
         // The probe RECOMMENDS; it does not decide. Whether the recommendation is
         // taken is settled by resolve_thread_policy below, which is what keeps a
@@ -338,6 +347,7 @@ fn main() -> Result<()> {
     }
     let (world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
         config,
+        cli.brain,
         cli.storage,
         thresholds,
         cli.bootstrap_ticks,
@@ -713,7 +723,7 @@ fn run_characterization_v0(
     }
     let (mut world, mut persistence) =
         WorldState::with_persistence(config, Box::new(NullPersistence))?;
-    let brain_keys = install_brains(&mut world)?.population;
+    let brain_keys = install_brains(&mut world, cli.brain)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
     scenario.bootstrap_ticks = 0;
@@ -763,8 +773,12 @@ fn run_characterization_v0(
     Ok(())
 }
 
-fn run_det_child(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
-    let run = run_headless_simulation(config, tick_limit)?;
+fn run_det_child(
+    config: &ScriptBotsConfig,
+    tick_limit: u64,
+    brain_preset: BrainPreset,
+) -> Result<()> {
+    let run = run_headless_simulation(config, tick_limit, brain_preset)?;
     #[derive(serde::Serialize)]
     struct DetOut {
         events: usize,
@@ -826,6 +840,8 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         child.arg("--config-only"); // avoid launching UI
         child.arg("--config");
         child.arg(&layer_path);
+        child.arg("--brain");
+        child.arg(cli.brain.as_str());
         child.env("SCRIPTBOTS_DET_RUN", "1");
         child.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
         child.env("SCRIPTBOTS_RNG_SEED", seed.to_string());
@@ -1161,6 +1177,7 @@ fn emit_run_manifest(world: &WorldState, pending: Option<PendingRunManifest>, co
 
 fn bootstrap_world(
     mut config: ScriptBotsConfig,
+    brain_preset: BrainPreset,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
     bootstrap_ticks: u64,
@@ -1190,14 +1207,16 @@ fn bootstrap_world(
     }
 
     #[cfg(feature = "neuro")]
-    let _ = validated_neuroflow_config(&config)?;
+    if brain_preset == BrainPreset::Mixed {
+        let _ = validated_neuroflow_config(&config)?;
+    }
 
     // Establish the complete scientific launch state before opening a database. This keeps
     // invalid brain/seed configuration from reserving a run path and lets the manifest describe
     // the actual initial roster rather than a planned approximation.
     let mut world =
         WorldState::new(config).context("failed to construct world before tick zero")?;
-    let brain_keys = install_brains(&mut world)?.population;
+    let brain_keys = install_brains(&mut world, brain_preset)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
     let started_at_unix_ms = run_started_at_unix_ms()?;
@@ -1360,7 +1379,10 @@ fn compose_config_with_scenario(
         "scriptbots-app-layered-v1"
     };
     let mut scenario = ScenarioIdentityV0::caller_seeded(scenario_id);
-    scenario.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
+    scenario.population_recipe = format!(
+        "fixed-4x4-registered-brain-grid-v1;brain={}",
+        cli.brain.as_str()
+    );
 
     let defaults_value =
         serde_json::to_value(&defaults).context("failed to serialize base config")?;
@@ -1808,6 +1830,14 @@ struct AppCli {
         default_value_t = RendererMode::Auto
     )]
     mode: RendererMode,
+    /// Brain-family preset used for registration, founders, and later population injection.
+    #[arg(
+        long,
+        value_enum,
+        env = "SCRIPTBOTS_BRAIN",
+        default_value_t = BrainPreset::Mixed
+    )]
+    brain: BrainPreset,
     /// Layered configuration files (TOML or RON) applied in order.
     #[arg(
         long = "config",
@@ -1931,6 +1961,27 @@ struct AppCli {
     /// Auto-tune: quick sweep to pick threads/thresholds for current storage, then continue.
     #[arg(long = "auto-tune", value_name = "TICKS")]
     auto_tune: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum BrainPreset {
+    Mixed,
+    Mlp,
+    Dwraon,
+    Assembly,
+    Ft,
+}
+
+impl BrainPreset {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::Mlp => "mlp",
+            Self::Dwraon => "dwraon",
+            Self::Assembly => "assembly",
+            Self::Ft => "ft",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -2503,7 +2554,7 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
         );
     }
 
-    let replay_run = run_headless_simulation(config, tick_limit)?;
+    let replay_run = run_headless_simulation(config, tick_limit, cli.brain)?;
     let simulated_tick_count = replay_run.simulated_ticks;
     debug!(
         simulated_ticks = simulated_tick_count,
@@ -2673,11 +2724,15 @@ struct ReplayRun {
     simulated_ticks: u64,
 }
 
-fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result<ReplayRun> {
+fn run_headless_simulation(
+    config: &ScriptBotsConfig,
+    tick_limit: u64,
+    brain_preset: BrainPreset,
+) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let (mut world, mut persistence) =
         WorldState::with_persistence(config.clone(), Box::new(collector))?;
-    let brain_keys = install_brains(&mut world)?.population;
+    let brain_keys = install_brains(&mut world, brain_preset)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
     emit_sense_startup_contract();
@@ -2721,11 +2776,15 @@ fn run_headless_simulation(config: &ScriptBotsConfig, tick_limit: u64) -> Result
     })
 }
 
-fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()> {
+fn profile_world_steps(
+    config: &ScriptBotsConfig,
+    tick_limit: u64,
+    brain_preset: BrainPreset,
+) -> Result<()> {
     let (collector, _handle) = ReplayCollector::new();
     let (mut world, mut persistence) =
         WorldState::with_persistence(config.clone(), Box::new(collector))?;
-    let brain_keys = install_brains(&mut world)?.population;
+    let brain_keys = install_brains(&mut world, brain_preset)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
     emit_sense_startup_contract();
@@ -2755,6 +2814,7 @@ fn profile_world_steps(config: &ScriptBotsConfig, tick_limit: u64) -> Result<()>
 fn profile_world_steps_with_storage(
     config: &ScriptBotsConfig,
     tick_limit: u64,
+    brain_preset: BrainPreset,
     storage_mode: StorageMode,
     thresholds: ThresholdsOverride,
     thread_policy: ThreadPolicy,
@@ -2773,14 +2833,16 @@ fn profile_world_steps_with_storage(
     }
 
     #[cfg(feature = "neuro")]
-    let _ = validated_neuroflow_config(&run_config)?;
+    if brain_preset == BrainPreset::Mixed {
+        let _ = validated_neuroflow_config(&run_config)?;
+    }
 
     // Materialize the complete launch state before opening storage. The database registration
     // below therefore describes the exact seeded roster that will produce tick one, and a
     // configuration/brain error cannot leave a reserved run file behind.
     let mut world = WorldState::new(run_config)
         .context("failed to construct storage profile before tick zero")?;
-    let brain_keys = install_brains(&mut world)?.population;
+    let brain_keys = install_brains(&mut world, brain_preset)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
     let started_at_unix_ms = run_started_at_unix_ms()?;
@@ -2953,6 +3015,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
                 cmd.env("RUST_LOG", "error");
                 configure_profile_child_storage(&mut cmd, storage);
                 cmd.arg("--profile-storage-steps").arg(ticks.to_string());
+                cmd.arg("--brain").arg(cli.brain.as_str());
                 cmd.arg("--storage").arg(storage_label);
                 cmd.arg("--storage-thresholds").arg(thresholds);
                 cmd.arg("--threads").arg(threads.to_string());
@@ -3040,6 +3103,7 @@ struct BestPick {
 fn pick_best_for_storage(
     _config: &ScriptBotsConfig,
     ticks: u64,
+    brain_preset: BrainPreset,
     storage: StorageMode,
     pinned_threads: Option<usize>,
     low_power: bool,
@@ -3065,6 +3129,7 @@ fn pick_best_for_storage(
             cmd.env("RUST_LOG", "error");
             configure_profile_child_storage(&mut cmd, storage);
             cmd.arg("--profile-storage-steps").arg(ticks.to_string());
+            cmd.arg("--brain").arg(brain_preset.as_str());
             cmd.arg("--storage").arg(match storage {
                 StorageMode::File => "file",
                 StorageMode::Memory => "memory",
@@ -3341,33 +3406,71 @@ struct InstalledBrains {
     withheld: Vec<(String, u64)>,
 }
 
-fn install_brains(world: &mut WorldState) -> Result<InstalledBrains> {
+fn install_brains(world: &mut WorldState, preset: BrainPreset) -> Result<InstalledBrains> {
     #[cfg(feature = "neuro")]
-    let neuro_config = validated_neuroflow_config(world.config())?;
+    let neuro_config = if preset == BrainPreset::Mixed {
+        validated_neuroflow_config(world.config())?
+    } else {
+        None
+    };
 
     let mut withheld = Vec::new();
+    let mut population = Vec::new();
 
     // Founding-population admission is structural: every eligible entry must own a versioned
     // genome codec, evaluator-state codec, offspring-state policy, and evaluator constructor.
     // There is no legacy runner beside these entries that could become a second hereditary truth.
-    let mlp_key = world
-        .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
-        .context("failed to register the versioned MLP brain family")?;
-    let dwraon_key = world
-        .register_brain_family(
-            DwraonBrain::KIND.as_str(),
-            Box::new(DwraonFamilyAdapter::default()),
-        )
-        .context("failed to register the versioned DWRAON brain family")?;
-    let assembly = AssemblyFamilyAdapter::new()
-        .context("failed to construct the versioned Assembly brain family")?;
-    let assembly_key = world
-        .register_brain_family(AssemblyBrain::KIND.as_str(), Box::new(assembly))
-        .context("failed to register the versioned Assembly brain family")?;
-    let population = vec![mlp_key, dwraon_key, assembly_key];
+    let register_mlp = |world: &mut WorldState| {
+        world
+            .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+            .context("failed to register the versioned MLP brain family")
+    };
+    let register_dwraon = |world: &mut WorldState| {
+        world
+            .register_brain_family(
+                DwraonBrain::KIND.as_str(),
+                Box::new(DwraonFamilyAdapter::default()),
+            )
+            .context("failed to register the versioned DWRAON brain family")
+    };
+    let register_assembly = |world: &mut WorldState| {
+        let assembly = AssemblyFamilyAdapter::new()
+            .context("failed to construct the versioned Assembly brain family")?;
+        world
+            .register_brain_family(AssemblyBrain::KIND.as_str(), Box::new(assembly))
+            .context("failed to register the versioned Assembly brain family")
+    };
+    #[cfg(feature = "brain-ft")]
+    let register_ft = |world: &mut WorldState| {
+        world
+            .register_brain_family(FT_BRAIN_KIND, Box::new(FtBrainFamily::default()))
+            .context("failed to register the versioned Frankentorch brain family")
+    };
+
+    match preset {
+        BrainPreset::Mixed => {
+            population.push(register_mlp(world)?);
+            population.push(register_dwraon(world)?);
+            population.push(register_assembly(world)?);
+            #[cfg(feature = "brain-ft")]
+            population.push(register_ft(world)?);
+        }
+        BrainPreset::Mlp => population.push(register_mlp(world)?),
+        BrainPreset::Dwraon => population.push(register_dwraon(world)?),
+        BrainPreset::Assembly => population.push(register_assembly(world)?),
+        BrainPreset::Ft => {
+            #[cfg(feature = "brain-ft")]
+            population.push(register_ft(world)?);
+            #[cfg(not(feature = "brain-ft"))]
+            bail!(
+                "brain preset `ft` requires a scriptbots-app build with the non-default \
+                 `brain-ft` feature"
+            );
+        }
+    }
 
     #[cfg(feature = "neuro")]
-    {
+    if preset == BrainPreset::Mixed {
         use scriptbots_brain_neuro::NeuroflowBrain;
         if let Some(config) = neuro_config {
             let key = NeuroflowBrain::register(world, config)
@@ -3527,7 +3630,7 @@ mod tests {
         })
         .expect("world");
 
-        let installed = install_brains(&mut world).expect("brains install");
+        let installed = install_brains(&mut world, BrainPreset::Mixed).expect("brains install");
 
         let expected = [
             (MlpBrain::KIND.as_str(), "mlp-baseline"),
@@ -3536,8 +3639,8 @@ mod tests {
         ];
         assert_eq!(
             installed.population.len(),
-            expected.len(),
-            "startup must admit exactly the three implemented protocol families"
+            expected.len() + usize::from(cfg!(feature = "brain-ft")),
+            "mixed startup must admit every compiled, implemented protocol family"
         );
 
         let registry = world.brain_registry();
@@ -3552,6 +3655,13 @@ mod tests {
                 .family(*key)
                 .expect("a protocol registry key must expose its family adapter");
             assert_eq!(family.family_id().as_str(), expected_family_id);
+        }
+        #[cfg(feature = "brain-ft")]
+        {
+            let ft_key = installed.population[expected.len()];
+            assert_eq!(registry.kind(ft_key), Some(FT_BRAIN_KIND));
+            assert!(registry.is_protocol_family(ft_key));
+            assert!(registry.family(ft_key).is_some());
         }
 
         for (label, key) in &installed.withheld {
@@ -3569,6 +3679,77 @@ mod tests {
                 .all(|(_, kind)| !kind.contains("placeholder")),
             "`ml.placeholder` has no protocol codec and must not be registered at startup"
         );
+    }
+
+    #[test]
+    fn single_family_presets_register_only_the_requested_protocol_family() {
+        for (preset, expected_kind, expected_family_id) in [
+            (BrainPreset::Mlp, MlpBrain::KIND.as_str(), "mlp-baseline"),
+            (
+                BrainPreset::Dwraon,
+                DwraonBrain::KIND.as_str(),
+                "dwraon-baseline",
+            ),
+            (
+                BrainPreset::Assembly,
+                AssemblyBrain::KIND.as_str(),
+                "assembly",
+            ),
+        ] {
+            let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+            let installed =
+                install_brains(&mut world, preset).expect("single-family brain install");
+
+            assert_eq!(installed.registered(), 1);
+            assert_eq!(installed.population.len(), 1);
+            assert!(installed.withheld.is_empty());
+            let key = installed.population[0];
+            assert_eq!(
+                world.brain_registry().descriptors(),
+                vec![(key, expected_kind.to_owned())]
+            );
+            assert_eq!(
+                world
+                    .brain_registry()
+                    .family(key)
+                    .expect("single-family preset must register a protocol adapter")
+                    .family_id()
+                    .as_str(),
+                expected_family_id
+            );
+        }
+    }
+
+    #[cfg(feature = "brain-ft")]
+    #[test]
+    fn ft_preset_registers_only_frankentorch() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let installed =
+            install_brains(&mut world, BrainPreset::Ft).expect("Frankentorch brain install");
+
+        assert_eq!(installed.registered(), 1);
+        assert_eq!(installed.population.len(), 1);
+        assert!(installed.withheld.is_empty());
+        let key = installed.population[0];
+        assert_eq!(
+            world.brain_registry().descriptors(),
+            vec![(key, FT_BRAIN_KIND.to_owned())]
+        );
+        assert!(world.brain_registry().is_protocol_family(key));
+    }
+
+    #[cfg(not(feature = "brain-ft"))]
+    #[test]
+    fn ft_preset_without_feature_fails_before_registering_any_family() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let error = install_brains(&mut world, BrainPreset::Ft)
+            .expect_err("uncompiled Frankentorch preset must fail");
+
+        assert!(
+            error.to_string().contains("requires") && error.to_string().contains("brain-ft"),
+            "feature refusal must name the required app feature: {error:#}"
+        );
+        assert!(world.brain_registry().descriptors().is_empty());
     }
 
     #[test]
@@ -3605,7 +3786,8 @@ mod tests {
             }),
         )
         .expect("world");
-        let installed = install_brains(&mut world).expect("install seed brains");
+        let installed =
+            install_brains(&mut world, BrainPreset::Mixed).expect("install seed brains");
         seed_agents(&mut world, &installed.population).expect("seed founding population");
 
         persistence
@@ -3630,6 +3812,22 @@ mod tests {
 
     fn default_cli() -> AppCli {
         AppCli::parse_from(["scriptbots-app"])
+    }
+
+    #[test]
+    #[serial]
+    fn brain_preset_cli_defaults_to_mixed_and_parses_ft() {
+        with_clean_config_env(|| {
+            assert_eq!(default_cli().brain, BrainPreset::Mixed);
+            let cli = AppCli::parse_from(["scriptbots-app", "--brain", "ft"]);
+            assert_eq!(cli.brain, BrainPreset::Ft);
+            let (_, scenario, _) =
+                compose_config_with_scenario(&cli).expect("compose FT scenario provenance");
+            assert_eq!(
+                scenario.population_recipe,
+                "fixed-4x4-registered-brain-grid-v1;brain=ft"
+            );
+        });
     }
 
     #[test]
@@ -4480,7 +4678,8 @@ activation = "Sigmoid"
                 compose_config_with_scenario(&cli).expect("compose scenario provenance");
 
             let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v1");
-            expected.population_recipe = "fixed-4x4-registered-brain-grid-v1".to_owned();
+            expected.population_recipe =
+                "fixed-4x4-registered-brain-grid-v1;brain=mixed".to_owned();
             let defaults_value = serde_json::to_value(ScriptBotsConfig {
                 persistence_interval: 60,
                 history_capacity: 600,
@@ -4562,7 +4761,8 @@ activation = "Sigmoid"
             let (mut world, mut persistence) =
                 WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))
                     .expect("world");
-            let keys = install_brains(&mut world).expect("install replay-fixture brains");
+            let keys = install_brains(&mut world, BrainPreset::Mixed)
+                .expect("install replay-fixture brains");
             seed_agents(&mut world, &keys.population).expect("seed replay-fixture brains");
             for _ in 0..16 {
                 persistence
@@ -4580,7 +4780,8 @@ activation = "Sigmoid"
         storage.close().expect("close storage reader");
         assert_eq!(max_tick, 16, "fixture must persist its partial final tail");
 
-        let replay = run_headless_simulation(&config, max_tick).expect("replay run");
+        let replay =
+            run_headless_simulation(&config, max_tick, BrainPreset::Mixed).expect("replay run");
         assert_eq!(replay.simulated_ticks, max_tick);
         assert_eq!(
             replay
@@ -4850,11 +5051,12 @@ activation = "Sigmoid"
         }
     }
 
-    /// Every environment variable the configuration gatherers read. Tests that need a
-    /// deterministic composition clear all of them, because the environment is now a
-    /// digest-recorded LAYER: an ambient variable would add a statement and change the
-    /// scenario provenance under the test.
-    const CONFIG_ENV_VARS: [&str; 13] = [
+    /// Every environment variable the CLI/configuration gatherers read while composing a
+    /// scenario. Tests that need deterministic provenance clear all of them: an ambient brain
+    /// preset changes the population recipe, while an ambient configuration value adds a
+    /// digest-recorded layer statement.
+    const CONFIG_ENV_VARS: [&str; 14] = [
+        "SCRIPTBOTS_BRAIN",
         "SCRIPTBOTS_CONFIG_OVERRIDES",
         "SCRIPTBOTS_NEUROFLOW_ENABLED",
         "SCRIPTBOTS_NEUROFLOW_HIDDEN",
@@ -5053,7 +5255,7 @@ activation = "Sigmoid"
         let mut world = WorldState::new(config).expect("world accepts adapter-owned settings");
         let before = world.brain_registry().descriptors();
 
-        let error = install_brains(&mut world)
+        let error = install_brains(&mut world, BrainPreset::Mixed)
             .expect_err("invalid NeuroFlow dimensions must fail scenario registration");
         let source = error
             .downcast_ref::<scriptbots_brain_neuro::NeuroflowBrainError>()
@@ -5061,6 +5263,24 @@ activation = "Sigmoid"
         assert_eq!(source.field(), Some("hidden_layers[1]"));
         assert!(format!("{error:#}").contains("failed to validate configured"));
         assert_eq!(world.brain_registry().descriptors(), before);
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn single_family_preset_does_not_register_or_validate_neuroflow() {
+        let mut config = ScriptBotsConfig::default();
+        config.neuroflow.enabled = true;
+        config.neuroflow.hidden_layers = vec![4, 0, 2];
+        let mut world = WorldState::new(config).expect("world accepts adapter-owned settings");
+
+        let installed = install_brains(&mut world, BrainPreset::Mlp)
+            .expect("an explicit MLP-only scenario must not activate NeuroFlow");
+        assert_eq!(installed.registered(), 1);
+        assert!(installed.withheld.is_empty());
+        assert_eq!(
+            world.brain_registry().descriptors(),
+            vec![(installed.population[0], MlpBrain::KIND.as_str().to_owned())]
+        );
     }
 
     #[cfg(feature = "neuro")]
@@ -5080,6 +5300,7 @@ activation = "Sigmoid"
             config.neuroflow.hidden_layers = vec![4, 0, 2];
             let error = bootstrap_world(
                 config,
+                BrainPreset::Mixed,
                 StorageMode::File,
                 ThresholdsOverride::default(),
                 DEFAULT_BOOTSTRAP_TICKS,
@@ -5123,6 +5344,7 @@ activation = "Sigmoid"
             let error = profile_world_steps_with_storage(
                 &config,
                 1,
+                BrainPreset::Mixed,
                 StorageMode::File,
                 ThresholdsOverride::default(),
                 resolve_thread_policy(None, None, None, false),
@@ -5149,11 +5371,11 @@ activation = "Sigmoid"
     #[cfg(feature = "neuro")]
     #[test]
     fn neuroflow_installation_respects_toggle() {
-        let expected_protocol_families = 3;
+        let expected_protocol_families = 3 + usize::from(cfg!(feature = "brain-ft"));
         let mut config = ScriptBotsConfig::default();
         config.neuroflow.enabled = false;
         let mut world = WorldState::new(config).expect("world");
-        let keys = install_brains(&mut world).expect("install baseline brains");
+        let keys = install_brains(&mut world, BrainPreset::Mixed).expect("install baseline brains");
         assert_eq!(
             keys.registered(),
             expected_protocol_families,
@@ -5172,12 +5394,12 @@ activation = "Sigmoid"
         config_enabled.neuroflow.activation = NeuroflowActivationKind::Sigmoid;
         config_enabled.rng_seed = Some(99);
         let mut world_enabled = WorldState::new(config_enabled.clone()).expect("world");
-        let keys_enabled =
-            install_brains(&mut world_enabled).expect("install enabled NeuroFlow brain");
+        let keys_enabled = install_brains(&mut world_enabled, BrainPreset::Mixed)
+            .expect("install enabled NeuroFlow brain");
         assert_eq!(
             keys_enabled.registered(),
             expected_protocol_families + 1,
-            "expected three protocol families plus explicitly selectable NeuroFlow"
+            "expected every compiled protocol family plus explicitly selectable NeuroFlow"
         );
         assert_eq!(
             keys_enabled.population.len(),
@@ -5215,8 +5437,8 @@ activation = "Sigmoid"
         let outputs_one = world_enabled.agent_runtime(agent_id).unwrap().outputs;
 
         let mut world_repeat = WorldState::new(config_enabled).expect("world");
-        let keys_repeat =
-            install_brains(&mut world_repeat).expect("install repeat NeuroFlow brain");
+        let keys_repeat = install_brains(&mut world_repeat, BrainPreset::Mixed)
+            .expect("install repeat NeuroFlow brain");
         assert_eq!(keys_repeat.registered(), expected_protocol_families + 1);
         assert_eq!(keys_repeat.population.len(), expected_protocol_families);
         let neuro_repeat = keys_repeat

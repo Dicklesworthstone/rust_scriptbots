@@ -1,6 +1,6 @@
 # Franken Ecosystem Integration — Program Guide (bd-2js6)
 
-Last reconciled: **2026-07-15** (update this line whenever a program bead
+Last reconciled: **2026-07-16** (update this line whenever a program bead
 closes — that is part of each bead's close checklist by convention). This
 document is what a new contributor reads INSTEAD of re-running the six-repo
 survey that produced the program. Style: terse, factual. Authority order when
@@ -13,7 +13,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `1eec0d2669d0a7938e155b62ce8ebcd72e5bed78` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; clean V6 multi-run/provenance schema |
 | `asupersync` 0.3.6 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.6` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
 | `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
-| `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | dependency admitted; FtBrain implementation remains bd-2z0.3.12.3 |
+| `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` (`ft-api`, `ft-core`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`) | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | code-first FtBrain implemented; bd-2z0.3.12.3 compile/determinism/benchmark proof pending |
 | everything else (ftui, fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
 
 ## 2. Verdicts (with the one-paragraph why)
@@ -46,9 +46,12 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
   interaction persistence feeding graph analytics (bd-2z0.5.9).
 - **frankentorch** — the FtBrain family (bd-2z0.3.12 epic): batched cohort
   inference via the library-agnostic BatchBrain substrate, flat-genome weights
-  via `parameters_to_vector`, optional hybrid lifetime gradient learning
-  (Baldwin/Lamarck toggle). Retires NeuroflowBrain's f64 + serde_json
-  round-trip anti-pattern (comparison memo feeds bd-2z0.8.10's disposition).
+  validated via `parameters_to_vector`, and optional hybrid lifetime gradient
+  learning (Baldwin/Lamarck toggle). The pinned `vector_to_parameters`
+  implementation is not F32-safe, so the code-first path materializes canonical
+  F32 layer slices directly pending an upstream fix and reviewed repin. This
+  avoids NeuroflowBrain's f64 + serde_json round-trip anti-pattern (comparison
+  memo feeds bd-2z0.8.10's disposition).
 
 **Principled skips (do not re-propose without new evidence):**
 - **frankenjax** — self-described reference implementation; ~2.3–3.2 µs
@@ -134,6 +137,7 @@ and review log). Status at last reconcile:
   reconciliation → `ci/check_fsqlite_pin.sh`), bd-2z0.8.16 (wasm graph
   denylist + golden), bd-2z0.11.5 (analytics scaffold), bd-2z0.13.6 (rider
   release packaging), bd-2z0.3.12.1 (frankentorch dependency admission),
+  bd-2z0.3.12.2 (BatchBrain substrate),
   bd-2z0.8.18 (performance gates; DSR-only acceptance), bd-2z0.4.12
   (legacy app Crossfire removed; bounded Asupersync command bus DSR-verified),
   bd-2z0.5.1 (V6 multi-run schema, pre-tick-zero canonical provenance,
@@ -141,16 +145,19 @@ and review log). Status at last reconcile:
   `8861e55f`), bd-2z0.8.9.4.4 (all supported writes use the durable outbox;
   exact typed terminal causes survive receipt plus shutdown/join; DSR
   workspace-verified at `60e06b3`).
-- **OPEN, ready**: bd-2z0.3.12.2 (BatchBrain — sequenced after the
-  bd-16g.15.x sense-lane digest move), bd-2z0.8.9.12 (fsqlite async-api),
-  bd-2z0.4.14 (`Cx::scoped_cpu` spike), and bd-2z0.12.4 (BrowserRuntime
-  evaluation).
+- **OPEN, currently in progress**: bd-2z0.3.12.3 **[Currently In Progress]**
+  (real code-first FtBrain source exists; pinned DSR compile, determinism, and
+  benchmark proof plus the F32 `vector_to_parameters` disposition remain
+  pending).
+- **OPEN, ready**: bd-2z0.8.9.12 (fsqlite async-api), bd-2z0.4.14
+  (`Cx::scoped_cpu` spike), and bd-2z0.12.4 (BrowserRuntime evaluation).
 - **OPEN, gated**: bd-16g.2.6/.7 (FTS5, needs bd-16g.2.2), bd-2z0.8.9.13
   (MVCC decision), bd-2z0.4.13 + bd-2z0.8.9.15 (structured-shutdown chain),
-  bd-2z0.11.6/.7/.8/.9 (analytics implementations), bd-2z0.3.12.3–.6
+  bd-2z0.11.6/.7/.8/.9 (analytics implementations), bd-2z0.3.12.4–.6
   (FtBrain chain), bd-2z0.5.9 (interaction persistence, rides bd-2z0.5.2).
 
-The pinned local DSR verification profile is the only acceptance lane. It runs
+The pinned local DSR verification profile is the only acceptance lane. GitHub
+Actions and direct Cargo invocations are not accepted as verification. DSR runs
 `check_franken_licenses.sh`, `check_asupersync_universe.sh`,
 `check_fsqlite_pin.sh`, and `check_wasm_graph.sh` together with their relevant
 build/test surfaces. Each standalone guard has a `--self-test` mode; hosted

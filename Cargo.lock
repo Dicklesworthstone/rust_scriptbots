@@ -10137,6 +10137,8 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "ft-api",
+ "ft-core",
+ "ft-kernel-cpu",
  "ft-nn",
  "ft-optim",
  "scriptbots-brain",
