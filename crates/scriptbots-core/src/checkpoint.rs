@@ -143,7 +143,9 @@ pub enum WorldCheckpointError {
     )]
     PersistenceEnabled { persistence_interval: u32 },
     /// Capture was attempted outside an open completed persistence boundary.
-    #[error("checkpoint capture requires an open persistence boundary at tick {tick}; found {found:?}")]
+    #[error(
+        "checkpoint capture requires an open persistence boundary at tick {tick}; found {found:?}"
+    )]
     PersistenceBoundary {
         tick: u64,
         found: PersistenceBoundaryStatus,
@@ -460,12 +462,11 @@ impl WorldCheckpointV1 {
     /// Serialize this checkpoint into its strict, integrity-bound V1 envelope.
     pub fn encode(&self) -> Result<Vec<u8>, WorldCheckpointError> {
         self.validate_contract()?;
-        let payload = postcard::to_allocvec(&self.state).map_err(|error| {
-            WorldCheckpointError::Codec {
+        let payload =
+            postcard::to_allocvec(&self.state).map_err(|error| WorldCheckpointError::Codec {
                 operation: "payload encoding",
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         if payload.len() > MAX_WORLD_CHECKPOINT_PAYLOAD_BYTES {
             return Err(WorldCheckpointError::WireTooLarge {
                 found: payload.len(),
@@ -479,12 +480,11 @@ impl WorldCheckpointV1 {
             payload_blake3: *blake3::hash(&payload).as_bytes(),
             payload,
         };
-        let encoded = postcard::to_allocvec(&wire).map_err(|error| {
-            WorldCheckpointError::Codec {
+        let encoded =
+            postcard::to_allocvec(&wire).map_err(|error| WorldCheckpointError::Codec {
                 operation: "envelope encoding",
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         if encoded.len() > MAX_WORLD_CHECKPOINT_BYTES {
             return Err(WorldCheckpointError::WireTooLarge {
                 found: encoded.len(),
@@ -536,12 +536,11 @@ impl WorldCheckpointV1 {
         if *blake3::hash(&wire.payload).as_bytes() != wire.payload_blake3 {
             return Err(WorldCheckpointError::PayloadHashMismatch);
         }
-        let canonical_wire = postcard::to_allocvec(&wire).map_err(|error| {
-            WorldCheckpointError::Codec {
+        let canonical_wire =
+            postcard::to_allocvec(&wire).map_err(|error| WorldCheckpointError::Codec {
                 operation: "envelope canonicalization",
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         if canonical_wire != encoded {
             return Err(WorldCheckpointError::NonCanonical { layer: "envelope" });
         }
@@ -559,12 +558,11 @@ impl WorldCheckpointV1 {
                 count: trailing.len(),
             });
         }
-        let canonical_payload = postcard::to_allocvec(&state).map_err(|error| {
-            WorldCheckpointError::Codec {
+        let canonical_payload =
+            postcard::to_allocvec(&state).map_err(|error| WorldCheckpointError::Codec {
                 operation: "payload canonicalization",
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         if canonical_payload != wire.payload {
             return Err(WorldCheckpointError::NonCanonical { layer: "payload" });
         }
@@ -666,8 +664,7 @@ impl WorldCheckpointV1 {
             .any(|entry| entry.protocol_family.is_some());
         if has_legacy_registry_entry
             && !has_protocol_registry_entry
-            && (state.config.population_minimum != 0
-                || state.config.population_spawn_interval != 0)
+            && (state.config.population_minimum != 0 || state.config.population_spawn_interval != 0)
         {
             return contract_error(
                 "registry.entries",
@@ -678,12 +675,13 @@ impl WorldCheckpointV1 {
         validate_agent_checkpoint(state)?;
         validate_origin_checkpoint(state)?;
         for (index, effect) in state.active_effects.iter().enumerate() {
-            effect.region.validate().map_err(|error| {
-                WorldCheckpointError::Contract {
+            effect
+                .region
+                .validate()
+                .map_err(|error| WorldCheckpointError::Contract {
                     path: format!("active_effects[{index}].region"),
                     detail: error.to_string(),
-                }
-            })?;
+                })?;
             if effect.ticks_remaining == 0 {
                 return contract_error(
                     format!("active_effects[{index}].ticks_remaining"),
@@ -760,10 +758,7 @@ impl WorldState {
                 .map_metadata
                 .as_ref()
                 .map(MapMetadataCheckpointV1::capture),
-            hydrology: self
-                .hydrology
-                .as_ref()
-                .map(HydrologyCheckpointV1::capture),
+            hydrology: self.hydrology.as_ref().map(HydrologyCheckpointV1::capture),
             active_effects: self.active_effects.clone(),
             pending_birth_records: self
                 .pending_birth_records
@@ -920,7 +915,10 @@ impl WorldState {
         let blockers = [
             ("pending_deaths", !self.pending_deaths.is_empty()),
             ("pending_spawns", !self.pending_spawns.is_empty()),
-            ("pending_death_records", !self.pending_death_records.is_empty()),
+            (
+                "pending_death_records",
+                !self.pending_death_records.is_empty(),
+            ),
             (
                 "pending_lifecycle_birth_metrics",
                 !self.pending_lifecycle_birth_metrics.is_empty(),
@@ -934,14 +932,20 @@ impl WorldState {
                 "pending_persistence_runtime_tail",
                 !self.pending_persistence_runtime_tail.is_empty(),
             ),
-            ("pending_interventions", !self.pending_interventions.is_empty()),
+            (
+                "pending_interventions",
+                !self.pending_interventions.is_empty(),
+            ),
             ("pending_birth_events", self.pending_birth_events != 0),
             ("pending_death_events", self.pending_death_events != 0),
             (
                 "pending_spike_attempt_events",
                 self.pending_spike_attempt_events != 0,
             ),
-            ("pending_spike_hit_events", self.pending_spike_hit_events != 0),
+            (
+                "pending_spike_hit_events",
+                self.pending_spike_hit_events != 0,
+            ),
         ];
         if let Some((field, _)) = blockers.into_iter().find(|(_, blocked)| *blocked) {
             return Err(WorldCheckpointError::DeferredHostOutput { field });
@@ -954,24 +958,28 @@ impl WorldState {
         uid: AgentUid,
         id: AgentId,
     ) -> Result<AgentCheckpointV1, WorldCheckpointError> {
-        let identity = self.identities.get(id).copied().ok_or_else(|| {
-            WorldCheckpointError::Contract {
-                path: format!("agents[uid={}].identity", uid.0),
-                detail: "missing stable identity".to_owned(),
-            }
-        })?;
-        let data = self.agents.snapshot(id).ok_or_else(|| {
-            WorldCheckpointError::Contract {
+        let identity =
+            self.identities
+                .get(id)
+                .copied()
+                .ok_or_else(|| WorldCheckpointError::Contract {
+                    path: format!("agents[uid={}].identity", uid.0),
+                    detail: "missing stable identity".to_owned(),
+                })?;
+        let data = self
+            .agents
+            .snapshot(id)
+            .ok_or_else(|| WorldCheckpointError::Contract {
                 path: format!("agents[uid={}].data", uid.0),
                 detail: "missing dense scalar state".to_owned(),
-            }
-        })?;
-        let runtime = self.runtime.get(id).ok_or_else(|| {
-            WorldCheckpointError::Contract {
+            })?;
+        let runtime = self
+            .runtime
+            .get(id)
+            .ok_or_else(|| WorldCheckpointError::Contract {
                 path: format!("agents[uid={}].runtime", uid.0),
                 detail: "missing runtime state".to_owned(),
-            }
-        })?;
+            })?;
         let brain = match &runtime.brain {
             BrainBinding::Unbound => AgentBrainCheckpointV1::Unbound,
             BrainBinding::Legacy {
@@ -1269,9 +1277,7 @@ fn validate_registry_checkpoint(
         if entry.kind.is_empty() || entry.kind.len() > MAX_CHECKPOINT_KIND_BYTES {
             return contract_error(
                 format!("registry.entries[{index}].kind"),
-                format!(
-                    "kind must contain 1..={MAX_CHECKPOINT_KIND_BYTES} UTF-8 bytes"
-                ),
+                format!("kind must contain 1..={MAX_CHECKPOINT_KIND_BYTES} UTF-8 bytes"),
             );
         }
         if previous.is_some_and(|key| key >= entry.key) {
@@ -1373,15 +1379,9 @@ fn validate_environment_checkpoint(
     if let Some(hydrology) = &state.hydrology {
         for (path, count) in [
             ("hydrology.tiles", hydrology.tiles.len()),
-            (
-                "hydrology.flow_directions",
-                hydrology.flow_directions.len(),
-            ),
+            ("hydrology.flow_directions", hydrology.flow_directions.len()),
             ("hydrology.accumulation", hydrology.accumulation.len()),
-            (
-                "hydrology.spill_elevation",
-                hydrology.spill_elevation.len(),
-            ),
+            ("hydrology.spill_elevation", hydrology.spill_elevation.len()),
             ("hydrology.basin_ids", hydrology.basin_ids.len()),
             (
                 "hydrology.initial_water_depth",
@@ -1399,15 +1399,9 @@ fn validate_environment_checkpoint(
         }
         for (path, count) in [
             ("hydrology.tiles", hydrology.tiles.len()),
-            (
-                "hydrology.flow_directions",
-                hydrology.flow_directions.len(),
-            ),
+            ("hydrology.flow_directions", hydrology.flow_directions.len()),
             ("hydrology.accumulation", hydrology.accumulation.len()),
-            (
-                "hydrology.spill_elevation",
-                hydrology.spill_elevation.len(),
-            ),
+            ("hydrology.spill_elevation", hydrology.spill_elevation.len()),
             ("hydrology.basin_ids", hydrology.basin_ids.len()),
             (
                 "hydrology.initial_water_depth",
@@ -1427,9 +1421,7 @@ fn validate_environment_checkpoint(
     Ok(())
 }
 
-fn validate_agent_checkpoint(
-    state: &WorldCheckpointStateV1,
-) -> Result<(), WorldCheckpointError> {
+fn validate_agent_checkpoint(state: &WorldCheckpointStateV1) -> Result<(), WorldCheckpointError> {
     let expected_epoch = state.tick.0 / 10_000;
     if state.epoch != expected_epoch {
         return contract_error(
@@ -1657,9 +1649,7 @@ fn validate_lineage(
     Ok(())
 }
 
-fn validate_origin_checkpoint(
-    state: &WorldCheckpointStateV1,
-) -> Result<(), WorldCheckpointError> {
+fn validate_origin_checkpoint(state: &WorldCheckpointStateV1) -> Result<(), WorldCheckpointError> {
     let agents = state
         .agents
         .iter()
@@ -1750,7 +1740,10 @@ fn validate_origin_checkpoint(
                 "hybrid origin must carry exactly two parents",
             );
         }
-        validate_finite(&format!("{path}.herbivore_tendency"), origin.herbivore_tendency)?;
+        validate_finite(
+            &format!("{path}.herbivore_tendency"),
+            origin.herbivore_tendency,
+        )?;
         validate_finite(&format!("{path}.position.x"), origin.position.x)?;
         validate_finite(&format!("{path}.position.y"), origin.position.y)?;
     }
@@ -1798,7 +1791,11 @@ fn digest_mismatch(expected: &WorldDigestV1, actual: &WorldDigestV1) -> WorldChe
         ("agents", expected.agents.as_str(), actual.agents.as_str()),
         ("brains", expected.brains.as_str(), actual.brains.as_str()),
         ("food", expected.food.as_str(), actual.food.as_str()),
-        ("terrain", expected.terrain.as_str(), actual.terrain.as_str()),
+        (
+            "terrain",
+            expected.terrain.as_str(),
+            actual.terrain.as_str(),
+        ),
         (
             "rng",
             expected.rng.overall.as_str(),
@@ -1815,7 +1812,11 @@ fn digest_mismatch(expected: &WorldDigestV1, actual: &WorldDigestV1) -> WorldChe
             actual.brain_registry.as_str(),
         ),
         ("config", expected.config.as_str(), actual.config.as_str()),
-        ("effects", expected.effects.as_str(), actual.effects.as_str()),
+        (
+            "effects",
+            expected.effects.as_str(),
+            actual.effects.as_str(),
+        ),
         (
             "derived_transition",
             expected.derived_transition.as_str(),
@@ -1852,7 +1853,10 @@ fn digest_mismatch(expected: &WorldDigestV1, actual: &WorldDigestV1) -> WorldChe
         expected.tick,
         expected.codec_version,
         expected.hydrology,
-        (expected.evaluator_state_covered, &expected.uncovered_families),
+        (
+            expected.evaluator_state_covered,
+            &expected.uncovered_families
+        ),
         (
             expected.factory_state_covered,
             &expected.uncovered_factory_families
@@ -1963,9 +1967,7 @@ where
     )
 }
 
-fn deserialize_checkpoint_world_digest<'de, D>(
-    deserializer: D,
-) -> Result<WorldDigestV1, D::Error>
+fn deserialize_checkpoint_world_digest<'de, D>(deserializer: D) -> Result<WorldDigestV1, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -2186,9 +2188,7 @@ where
     deserialize_bounded_string::<D, MAX_CHECKPOINT_KIND_BYTES>(deserializer, "brain kind")
 }
 
-fn deserialize_optional_checkpoint_kind<'de, D>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error>
+fn deserialize_optional_checkpoint_kind<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -2385,12 +2385,7 @@ mod tests {
         let mut signature = world
             .agents()
             .iter_handles()
-            .map(|id| {
-                (
-                    world.agent_uid(id).expect("live handle identity"),
-                    id.raw(),
-                )
-            })
+            .map(|id| (world.agent_uid(id).expect("live handle identity"), id.raw()))
             .collect::<Vec<_>>();
         signature.sort_unstable_by_key(|(uid, _)| *uid);
         signature
@@ -2671,9 +2666,7 @@ mod tests {
         );
         let child_runtime = original.agent_runtime(child_id).expect("child runtime");
         assert_eq!(child_runtime.lineage, [Some(founder_uid), None]);
-        let child_genome = original
-            .agent_brain_genome(child_id)
-            .expect("child genome");
+        let child_genome = original.agent_brain_genome(child_id).expect("child genome");
         assert_ne!(
             child_genome.material_hash(),
             founder_genome.material_hash(),
@@ -2778,13 +2771,12 @@ mod tests {
                     .expect("force continuation reproduction");
             }
         }
-        let source_completion = original
-            .step_outcome()
-            .expect("source continuation step");
-        let restored_completion = restored
-            .step_outcome()
-            .expect("restored continuation step");
-        assert!(source_completion.fault.is_none(), "source continuation fault");
+        let source_completion = original.step_outcome().expect("source continuation step");
+        let restored_completion = restored.step_outcome().expect("restored continuation step");
+        assert!(
+            source_completion.fault.is_none(),
+            "source continuation fault"
+        );
         assert!(
             restored_completion.fault.is_none(),
             "restored continuation fault"
@@ -2804,10 +2796,7 @@ mod tests {
             restored_outcome.persistence.status(),
             source_outcome.persistence.status()
         );
-        assert_eq!(
-            restored_outcome.resource_tick,
-            source_outcome.resource_tick
-        );
+        assert_eq!(restored_outcome.resource_tick, source_outcome.resource_tick);
         assert_protocol_state_equal(&original, &restored);
         assert_digest_lanes_equal(
             &original
@@ -2846,16 +2835,14 @@ mod tests {
 
         let mut declared_oversize_payload = Vec::new();
         declared_oversize_payload.extend(
-            postcard::to_allocvec(&WORLD_CHECKPOINT_V1_SCHEMA.to_owned())
-                .expect("schema prefix"),
+            postcard::to_allocvec(&WORLD_CHECKPOINT_V1_SCHEMA.to_owned()).expect("schema prefix"),
         );
         declared_oversize_payload.extend(
             postcard::to_allocvec(&WORLD_CHECKPOINT_V1_CODEC_VERSION)
                 .expect("codec-version prefix"),
         );
         declared_oversize_payload.extend(
-            postcard::to_allocvec(&WORLD_CHECKPOINT_V1_CODEC.to_owned())
-                .expect("codec prefix"),
+            postcard::to_allocvec(&WORLD_CHECKPOINT_V1_CODEC.to_owned()).expect("codec prefix"),
         );
         declared_oversize_payload.extend(
             postcard::to_allocvec(&(MAX_WORLD_CHECKPOINT_PAYLOAD_BYTES + 1))
@@ -3074,17 +3061,15 @@ mod tests {
         let source_registry = retired_source
             .brain_registry_mut()
             .expect("mutable retired-key source registry");
-        let leading_retired_key = source_registry.register(
-            "retired-checkpoint-brain",
-            |_rng| Ok(Box::new(LegacyCheckpointBrain)),
-        );
+        let leading_retired_key = source_registry.register("retired-checkpoint-brain", |_rng| {
+            Ok(Box::new(LegacyCheckpointBrain))
+        });
         assert_eq!(leading_retired_key, 0);
         assert!(source_registry.unregister(leading_retired_key));
         assert_eq!(register_mlp(source_registry), 1);
-        let trailing_retired_key = source_registry.register(
-            "retired-checkpoint-brain",
-            |_rng| Ok(Box::new(LegacyCheckpointBrain)),
-        );
+        let trailing_retired_key = source_registry.register("retired-checkpoint-brain", |_rng| {
+            Ok(Box::new(LegacyCheckpointBrain))
+        });
         assert_eq!(trailing_retired_key, 2);
         assert!(source_registry.unregister(trailing_retired_key));
         let retired_checkpoint = retired_source
@@ -3105,10 +3090,9 @@ mod tests {
         );
 
         let mut cursor_too_low = BrainRegistry::new();
-        let retired_key = cursor_too_low.register(
-            "retired-checkpoint-brain",
-            |_rng| Ok(Box::new(LegacyCheckpointBrain)),
-        );
+        let retired_key = cursor_too_low.register("retired-checkpoint-brain", |_rng| {
+            Ok(Box::new(LegacyCheckpointBrain))
+        });
         assert!(cursor_too_low.unregister(retired_key));
         assert_eq!(register_mlp(&mut cursor_too_low), 1);
         assert!(matches!(
@@ -3117,17 +3101,15 @@ mod tests {
         ));
 
         let mut retired_prepared = BrainRegistry::new();
-        let prepared_leading_key = retired_prepared.register(
-            "retired-checkpoint-brain",
-            |_rng| Ok(Box::new(LegacyCheckpointBrain)),
-        );
+        let prepared_leading_key = retired_prepared.register("retired-checkpoint-brain", |_rng| {
+            Ok(Box::new(LegacyCheckpointBrain))
+        });
         assert_eq!(prepared_leading_key, leading_retired_key);
         assert!(retired_prepared.unregister(prepared_leading_key));
         assert_eq!(register_mlp(&mut retired_prepared), 1);
-        let prepared_trailing_key = retired_prepared.register(
-            "retired-checkpoint-brain",
-            |_rng| Ok(Box::new(LegacyCheckpointBrain)),
-        );
+        let prepared_trailing_key = retired_prepared.register("retired-checkpoint-brain", |_rng| {
+            Ok(Box::new(LegacyCheckpointBrain))
+        });
         assert_eq!(prepared_trailing_key, trailing_retired_key);
         assert!(retired_prepared.unregister(prepared_trailing_key));
         WorldState::restore_checkpoint_v1(&retired_checkpoint, retired_prepared)

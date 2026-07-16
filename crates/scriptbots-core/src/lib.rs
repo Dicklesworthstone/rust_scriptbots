@@ -8282,9 +8282,7 @@ impl Default for NeuroflowSettings {
     }
 }
 
-fn deserialize_neuroflow_hidden_layers<'de, D>(
-    deserializer: D,
-) -> Result<Vec<usize>, D::Error>
+fn deserialize_neuroflow_hidden_layers<'de, D>(deserializer: D) -> Result<Vec<usize>, D::Error>
 where
     D: Deserializer<'de>,
 {
