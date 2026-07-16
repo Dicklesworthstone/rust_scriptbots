@@ -24150,6 +24150,108 @@ mod tests {
     }
 
     #[test]
+    fn production_fixed_sense_preserves_near_zero_and_radius_exclusions() {
+        let sensed_smell = |neighbour_x: f32, radius: f32| {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                sense_radius: radius,
+                rng_seed: Some(0x3002),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("fixed sense boundary world");
+            let observer = world.spawn_agent(AgentData {
+                position: Position::new(0.0, 0.0),
+                ..AgentData::default()
+            });
+            world.spawn_agent(AgentData {
+                position: Position::new(neighbour_x, 0.0),
+                ..AgentData::default()
+            });
+            world.stage_sense();
+            world
+                .agent_runtime(observer)
+                .expect("observer runtime")
+                .sensors[10]
+        };
+
+        let root = f32::EPSILON.sqrt();
+        let mut below_dx = root;
+        while below_dx * below_dx > f32::EPSILON {
+            below_dx = f32::from_bits(below_dx.to_bits() - 1);
+        }
+        let mut above_dx = root;
+        while above_dx * above_dx <= f32::EPSILON {
+            above_dx = f32::from_bits(above_dx.to_bits() + 1);
+        }
+        assert!(below_dx * below_dx <= f32::EPSILON);
+        assert!(above_dx * above_dx > f32::EPSILON);
+        assert_eq!(sensed_smell(below_dx, 1.0).to_bits(), 0.0_f32.to_bits());
+        assert!(sensed_smell(above_dx, 1.0) > 0.0);
+        assert_eq!(sensed_smell(1.0, 1.0).to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn production_contribution_fixture_proves_the_f32_fault_alarm() {
+        let geometry = SenseObserverGeometry {
+            eye_units: [[1.0, 0.0]; NUM_EYES],
+            eye_fov: [1.0; NUM_EYES],
+            heading_unit: [1.0, 0.0],
+            eye_sensitivity: 0.0,
+            radius: 2.0,
+        };
+        let near_radius = f32::from_bits(2.0_f32.to_bits() - 1);
+        let contribution_at = |distance: f32, speed_normalized: f32| {
+            let (distance, distance_factor) = sense_distance_terms(distance * distance, 2.0, 4.0)
+                .expect("fixture distance is inside the sense radius");
+            fixed_sense_contribution(
+                &geometry,
+                distance,
+                0.0,
+                distance,
+                distance_factor,
+                [0.0; 3],
+                speed_normalized,
+                0.0,
+                2.0,
+            )
+        };
+        let contributions = [
+            contribution_at(1.0, 1.0),
+            contribution_at(near_radius, 0.5),
+            contribution_at(near_radius, 0.5),
+        ];
+        assert_eq!(contributions[0].sound.to_bits(), 0.5_f32.to_bits());
+        assert_eq!(
+            contributions[1].sound.to_bits(),
+            (2.0_f32.powi(-25)).to_bits()
+        );
+
+        let fixed_reduce = |order: [usize; 3]| {
+            let mut accumulator = sense_fixed::SenseAccum::default();
+            for index in order {
+                accumulator.contribute(&contributions[index]);
+            }
+            accumulator
+        };
+        assert_eq!(fixed_reduce([0, 1, 2]), fixed_reduce([1, 2, 0]));
+
+        let faulty_f32_reduce = |order: [usize; 3]| {
+            order
+                .into_iter()
+                .fold(0.0_f32, |sum, index| sum + contributions[index].sound)
+        };
+        assert_ne!(
+            faulty_f32_reduce([0, 1, 2]).to_bits(),
+            faulty_f32_reduce([1, 2, 0]).to_bits(),
+            "the production fixture must reject an order-dependent f32 reducer"
+        );
+    }
+
+    #[test]
     fn production_fixed_sense_is_bit_exact_across_order_and_toroidal_wrap() {
         let run_order_fixture = |reverse: bool| {
             let mut world = WorldState::new(ScriptBotsConfig {
