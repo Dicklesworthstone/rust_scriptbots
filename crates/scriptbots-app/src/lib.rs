@@ -244,7 +244,7 @@ impl ScenarioIdentityV0 {
 /// Human-readable registered brain family recorded in stable key order.
 ///
 /// This roster is a query/provenance projection, not an executable-semantics attestation. Current
-/// V3.2 bootstrap evidence carries the authoritative adapter-attested registry fingerprint in each
+/// V3.4 bootstrap evidence carries the authoritative adapter-attested registry fingerprint in each
 /// [`WorldDigestV1::brain_registry`] lane; key and kind alone cannot recompute that fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainRosterEntryV0 {
@@ -527,6 +527,18 @@ pub enum RunManifestError {
         recorded: bool,
         /// Validated build-provenance result.
         derived: bool,
+    },
+    /// Run manifests attest the complete tick-zero launch continuation set, not an evolved world.
+    #[error(
+        "run manifest capture requires the tick-zero launch boundary with every allocated UID still live; found tick {tick}, live agents {live_agents}, allocated UIDs {allocated_agents}"
+    )]
+    LaunchBoundary {
+        /// Scientific tick observed during capture.
+        tick: u64,
+        /// Number of agents still live in the world.
+        live_agents: u64,
+        /// Number of stable UIDs allocated since launch.
+        allocated_agents: u64,
     },
     #[error("run manifest V3 requires an explicit rng_seed")]
     MissingExplicitSeed,
@@ -1006,7 +1018,10 @@ impl RunManifestV3 {
         Ok(self)
     }
 
-    /// Capture a run manifest using provenance embedded in the current build.
+    /// Capture a tick-zero launch manifest using provenance embedded in the current build.
+    ///
+    /// Every allocated stable UID must still be live because V3.3 records the complete launch
+    /// continuation set. Use a characterization digest or trace for evolved-world boundaries.
     pub fn from_world(
         identity: RunIdentityV1,
         scenario_id: impl Into<String>,
@@ -1020,10 +1035,11 @@ impl RunManifestV3 {
         )
     }
 
-    /// Capture a run manifest using explicitly supplied build provenance.
+    /// Capture a tick-zero launch manifest using explicitly supplied build provenance.
     ///
     /// This constructor supports release tooling and tests that obtain source revision and tree
-    /// cleanliness through a trusted path outside the library.
+    /// cleanliness through a trusted path outside the library. It rejects evolved worlds because
+    /// their live continuation rows cannot represent the complete launch allocation history.
     pub fn from_world_with_provenance(
         identity: RunIdentityV1,
         mut scenario: ScenarioIdentityV0,
@@ -1034,6 +1050,18 @@ impl RunManifestV3 {
         validate_scenario_identity(&scenario.id)?;
         scenario.id = scenario.id.trim().to_owned();
         let reproducible = validate_build_provenance_claim(&build)?;
+        let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) =
+            world.identity_sequence_state();
+        let allocated_agents = next_agent_uid.saturating_sub(1);
+        let live_agents = u64::try_from(world.agent_count()).unwrap_or(u64::MAX);
+        let tick = world.tick().0;
+        if tick != 0 || live_agents != allocated_agents {
+            return Err(RunManifestError::LaunchBoundary {
+                tick,
+                live_agents,
+                allocated_agents,
+            });
+        }
 
         let normalized_config = normalized_config(world.config())?;
         let config_digest_bytes = canonical_json_bytes(&normalized_config)
@@ -1064,8 +1092,6 @@ impl RunManifestV3 {
         let agent_rng_counters = world
             .ordered_agent_rng_counters_v1()
             .map_err(|source| RunManifestError::AgentRngCountersCapture { source })?;
-        let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) =
-            world.identity_sequence_state();
 
         let manifest = Self {
             schema: RUN_MANIFEST_V3_SCHEMA.to_owned(),
@@ -2031,9 +2057,8 @@ mod characterization_tests {
     }
 
     #[test]
-    fn manifest_and_audit_observe_closed_world_boundary_transitions() {
+    fn launch_manifest_and_audit_observe_closed_world_transition() {
         let mut world = test_world(Some(34));
-        world.step().expect("tick before policy transition");
         let build = complete_test_build();
         let scenario = ScenarioIdentityV0::caller_seeded("closed-policy-test");
         let identity = test_run_identity(34);
@@ -2058,10 +2083,33 @@ mod characterization_tests {
         assert_eq!(
             world.config_audit(),
             [scriptbots_core::ConfigAuditEntry {
-                tick: 1,
+                tick: 0,
                 patch: serde_json::json!({ "closed": true }),
             }]
         );
+    }
+
+    #[test]
+    fn manifest_capture_rejects_evolved_worlds_at_the_launch_boundary() {
+        let mut world = test_world(Some(0x1A0C_B0A0));
+        world.step().expect("advance beyond launch");
+
+        let error = RunManifestV3::from_world_with_provenance(
+            test_run_identity(0x1A0C_B0A0),
+            ScenarioIdentityV0::caller_seeded("evolved-world"),
+            &world,
+            complete_test_build(),
+        )
+        .expect_err("an evolved world cannot be serialized as launch provenance");
+
+        assert!(matches!(
+            error,
+            RunManifestError::LaunchBoundary {
+                tick: 1,
+                live_agents: 2,
+                allocated_agents: 2,
+            }
+        ));
     }
 
     #[test]
