@@ -9,7 +9,7 @@ use scriptbots_analytics::{ReaderCtx, Registry, ReportParams};
 use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
 use scriptbots_storage::Storage;
 
-fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
+const fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
     PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),
@@ -40,7 +40,10 @@ fn fixture(dir: &tempfile::TempDir) -> String {
     let mut storage = Storage::create_unattributed_file(&path).expect("create fixture run db");
     // A tiny deterministic wobble so the segments are not perfectly constant (a real permutation
     // test needs some within-segment variation; a constant series is a degenerate edge case).
-    let wobble = |tick: u64| -> f64 { ((tick % 5) as f64 - 2.0) * 0.3 };
+    let wobble = |tick: u64| -> f64 {
+        let phase = u32::try_from(tick % 5).expect("tick modulo five always fits in u32");
+        (f64::from(phase) - 2.0) * 0.3
+    };
     for tick in 1..=200u64 {
         let base = if tick < 100 { 10.0 } else { 40.0 };
         let metrics = vec![
