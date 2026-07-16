@@ -2031,7 +2031,7 @@ claim that world integration early.
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
-#### 1.8 canonical digest and checkpoint skeleton [Completed — digest oracle and RNG-aware manifest: `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; core checkpoint: `bd-3n7p`, implementation series `b544705` through `a977cdf`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`, TopazCastle, 2026-07-16]
+#### 1.8 canonical digest and checkpoint skeleton [Core checkpoint completed — digest oracle and RNG-aware manifest: `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; core checkpoint: `bd-3n7p`, implementation series `b544705` through `a977cdf`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`; executable adapter attestation currently in progress — `bd-h547`, TopazCastle, 2026-07-16]
 
 - [Completed — `bd-2z0.3.13`] Canonical `scriptbots.world-digest.v1.1`: stable-UID
   science lanes, explicit current dense execution-order lane, evaluator/factory coverage,
@@ -2067,6 +2067,10 @@ claim that world integration early.
   product run bundle. Application checkpoint discovery/resume remains Phase 4.1, so the legacy
   `CharacterizationLimitationsV0::checkpoint_replay_guarantee` remains `false`; flipping that V0
   manifest claim here would overstate product replay support;
+- [Currently In Progress — `bd-h547`] Require every product-admitted protocol family to expose a
+  stable, versioned, family-owned semantic adapter identity; bind it into the registry digest and
+  checkpoint requirements, and reject a differently identified prepared adapter before restoring
+  any agent. This is a trusted semantic attestation, not a compiler artifact or executable hash;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical V3/V3.1 with the fixed
   six-domain continuation object.
 
