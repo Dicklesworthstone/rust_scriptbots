@@ -34509,6 +34509,9 @@ mod tests {
             food_transfer_rate: 0.04,
             food_sharing_distance: 20.0,
             bot_speed: 0.5,
+            // This ledger fixture pins its authored one-tick combat geometry;
+            // locomotion behavior is covered by dedicated legacy-model tests.
+            locomotion_model: LocomotionModel::Differential,
             movement_drain: 0.01,
             metabolism_drain: 0.01,
             metabolism_ramp_floor: 0.2,
