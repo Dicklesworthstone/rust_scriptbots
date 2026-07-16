@@ -24514,7 +24514,7 @@ mod tests {
             reproduction_meta_mutation_scale: 0.0,
             persistence_interval: 0,
             chart_flush_interval: 0,
-            rng_seed: Some(0xB2C_A_2026),
+            rng_seed: Some(0xB2CA_2026),
             ..ScriptBotsConfig::default()
         }
     }
