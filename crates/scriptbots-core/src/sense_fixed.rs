@@ -302,10 +302,12 @@ fn add_saturating(
 
 fn bounded_contribution_term(term: f32) -> (f32, bool) {
     let out_of_range = !term.is_finite() || !(0.0..=MAX_TERM).contains(&term);
-    let bounded = if term.is_finite() {
-        term.clamp(0.0, MAX_TERM)
-    } else {
+    let bounded = if term.is_nan() || term.is_sign_negative() {
         0.0
+    } else if term > MAX_TERM {
+        MAX_TERM
+    } else {
+        term
     };
     (bounded, out_of_range)
 }
@@ -474,17 +476,19 @@ mod tests {
     fn invalid_terms_are_bounded_and_counted_once_per_channel() {
         let mut accum = SenseAccum::default();
         accum.contribute(&NeighborContribution {
+            red: [f32::INFINITY, 0.0, 0.0, 0.0],
             smell: 1e30,
             sound: -1.0,
             hearing: f32::NAN,
             ..NeighborContribution::default()
         });
 
+        assert_eq!(accum.red[0], (MAX_TERM as i64) * ONE);
         assert_eq!(accum.smell, (MAX_TERM as i64) * ONE);
         assert_eq!(accum.sound, 0);
         assert_eq!(accum.hearing, 0);
         assert_eq!(
-            accum.saturations, 3,
+            accum.saturations, 4,
             "each invalid channel must make the run suspect exactly once"
         );
 
@@ -492,7 +496,7 @@ mod tests {
             smell: 1e30,
             ..NeighborContribution::default()
         });
-        assert_eq!(accum.saturations, 3, "the channel diagnostic is sticky");
+        assert_eq!(accum.saturations, 4, "the channel diagnostic is sticky");
     }
 
     #[test]
