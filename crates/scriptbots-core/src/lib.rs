@@ -25667,10 +25667,7 @@ mod tests {
             family
         }
 
-        fn truncating_batch_checkpoint(
-            id: &str,
-            batch_probe: Arc<Mutex<Vec<Vec<i8>>>>,
-        ) -> Self {
+        fn truncating_batch_checkpoint(id: &str, batch_probe: Arc<Mutex<Vec<Vec<i8>>>>) -> Self {
             let mut family = Self::with_batch_probe(id, batch_probe);
             family.batch_truncates_checkpoint = true;
             family
@@ -26257,8 +26254,7 @@ mod tests {
         let runtime = world
             .agent_runtime_mut(agent)
             .expect("fixture protocol runtime");
-        runtime.brain =
-            BrainBinding::protocol(key, family_id.to_owned(), genome, evaluator);
+        runtime.brain = BrainBinding::protocol(key, family_id.to_owned(), genome, evaluator);
         runtime.sensors[0] = lane.sensor_zero;
         agent
     }
@@ -27677,7 +27673,11 @@ mod tests {
             "family grouping must not coalesce or reorder another registry family"
         );
         assert_eq!(
-            world.agent_runtime(unbound).expect("unbound result").outputs[0].to_bits(),
+            world
+                .agent_runtime(unbound)
+                .expect("unbound result")
+                .outputs[0]
+                .to_bits(),
             0.25_f32.to_bits()
         );
         assert_eq!(
@@ -27794,7 +27794,11 @@ mod tests {
             "executor-free protocol and legacy bindings must never enter a cohort"
         );
         assert_eq!(
-            world.agent_runtime(first).expect("first live result").outputs[0].to_bits(),
+            world
+                .agent_runtime(first)
+                .expect("first live result")
+                .outputs[0]
+                .to_bits(),
             12.0_f32.to_bits()
         );
         assert_eq!(
@@ -27850,14 +27854,7 @@ mod tests {
                 fixture_protocol_lane(5, 4, -3, 7, -0.5),
                 fixture_protocol_lane(6, -2, 6, 2, 1.25),
             ]
-            .map(|lane| {
-                spawn_fixture_protocol_agent(
-                    &mut world,
-                    key,
-                    "batch-thread-count",
-                    lane,
-                )
-            });
+            .map(|lane| spawn_fixture_protocol_agent(&mut world, key, "batch-thread-count", lane));
             let unbound = world.spawn_agent(sample_agent(7));
             world
                 .agent_runtime_mut(unbound)
@@ -27970,11 +27967,7 @@ mod tests {
         );
         for (agent, expected) in agents.into_iter().zip([12.0_f32, 5.0, 4.0, 9.0]) {
             assert_eq!(
-                world
-                    .agent_runtime(agent)
-                    .expect("fallback result")
-                    .outputs[0]
-                    .to_bits(),
+                world.agent_runtime(agent).expect("fallback result").outputs[0].to_bits(),
                 expected.to_bits()
             );
         }
@@ -28007,14 +28000,7 @@ mod tests {
                 fixture_protocol_lane(3, -1, 2, 5, 3.0),
                 fixture_protocol_lane(4, 2, 0, -1, 5.0),
             ]
-            .map(|lane| {
-                spawn_fixture_protocol_agent(
-                    &mut world,
-                    key,
-                    "batch-scalar-match",
-                    lane,
-                )
-            });
+            .map(|lane| spawn_fixture_protocol_agent(&mut world, key, "batch-scalar-match", lane));
             (world, agents, probe)
         }
 
@@ -28022,7 +28008,12 @@ mod tests {
         let (mut batch, batch_agents, batch_probe) = build_world(true);
         scalar.stage_brains().expect("matched scalar stage");
         batch.stage_brains().expect("matched batch stage");
-        assert!(scalar_probe.lock().expect("matched scalar probe").is_empty());
+        assert!(
+            scalar_probe
+                .lock()
+                .expect("matched scalar probe")
+                .is_empty()
+        );
         assert_eq!(
             *batch_probe.lock().expect("matched batch probe"),
             vec![vec![2, 3, -1, 2]]
@@ -28105,11 +28096,7 @@ mod tests {
             .stage_brains()
             .expect_err("partial batch mutation must fail the whole cohort");
         assert_eq!(error.kind(), "batch-rollback");
-        assert!(
-            error
-                .to_string()
-                .contains("fixture batch failed at lane 1")
-        );
+        assert!(error.to_string().contains("fixture batch failed at lane 1"));
         assert_eq!(*probe.lock().expect("rollback probe"), vec![vec![2, 3]]);
         for (lane, agent) in [first, second].into_iter().enumerate() {
             let runtime = world.agent_runtime(agent).expect("rolled-back runtime");
