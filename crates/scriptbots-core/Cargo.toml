@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["parallel", "simd_wide"]
+default = ["batch-brains", "parallel", "simd_wide"]
+batch-brains = []
 parallel = ["dep:rayon"]
 simd_wide = ["dep:wide"]
 
