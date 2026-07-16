@@ -10,6 +10,7 @@ pub use channels::{
     BOOST_THRESHOLD, OutputChannel, OutputsExt, SENSOR_LAYOUT, SensorChannel, SensorKind,
     SensorsExt,
 };
+use rng_domains::{DomainStreams, DomainStreamsCheckpoint, RngDomain};
 
 use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 #[cfg(feature = "parallel")]
@@ -234,9 +235,8 @@ pub enum RandomStreamRestoreError {
 
 /// Object-safe random-stream protocol consumed by core and brain families.
 ///
-/// The current world owns a [`SmallRngStream`], while consumers depend only on this checkpointable
-/// interface. Named domains and scheduler-independent child streams are deliberately not part of
-/// this first protocol.
+/// Each world random domain owns a [`SmallRngStream`], while consumers depend only on this
+/// checkpointable interface. Domain selection lives one layer above this generator protocol.
 pub trait RandomStream: RngCore {
     /// Stable identity of the concrete algorithm/state encoding.
     fn algorithm_id(&self) -> &'static str;
@@ -247,9 +247,8 @@ pub trait RandomStream: RngCore {
 
 /// Restorable adapter around the world's existing [`SmallRng`] algorithm.
 ///
-/// The adapter implements [`RngCore`], so existing core and brain-family consumers retain the
-/// exact sampling calls they make today. It is one global stream for now; named domains and
-/// scheduler-independent substreams remain a later protocol decision.
+/// The adapter implements [`RngCore`], so core and brain-family consumers retain the exact
+/// sampling operations they need after selecting an explicit world domain.
 #[derive(Clone, Debug)]
 pub struct SmallRngStream {
     seed: u64,
@@ -283,6 +282,12 @@ impl SmallRngStream {
     #[must_use]
     pub const fn algorithm() -> &'static str {
         RANDOM_STREAM_ALGORITHM
+    }
+
+    /// Return the construction seed embedded in this stream's continuation state.
+    #[must_use]
+    pub const fn seed(&self) -> u64 {
+        self.seed
     }
 
     /// Capture a serializable continuation state.
@@ -1780,7 +1785,7 @@ pub trait BrainRunner: Send + Sync {
     /// SAME v0 digest, as long as the families and bindings match. The oracle that decides whether
     /// two runs are the same run is blind to the only thing that is actually evolving.
     ///
-    /// That limitation is declared rather than hidden (`RunManifestV2`'s
+    /// That limitation is declared rather than hidden (`RunManifestV3`'s
     /// `CharacterizationLimitationsV0::evaluator_state_covered = false`, `superseded_by:
     /// WorldDigestV1`), and this method is how `WorldDigestV1` closes it.
     ///
@@ -1932,7 +1937,7 @@ impl BrainRegistry {
     ///
     /// The supplied digest must change whenever captured seeds, model bytes, architecture
     /// settings, or other closure state capable of changing a newly spawned brain changes.
-    /// Factories registered through [`Self::register`] remain valid, but V1.2 reports their
+    /// Factories registered through [`Self::register`] remain valid, but V1.3 reports their
     /// closure state as explicitly uncovered.
     pub fn register_with_state_digest<F>(
         &mut self,
@@ -2633,16 +2638,43 @@ pub struct CharacterizationDigestV0 {
 }
 
 /// Schema tag for [`WorldDigestV1`].
-/// V1.2 retires V1.1's temporary dense-execution-order lane after making every transition
-/// canonical by stable logical identity. The minor schema and codec revision prevent an older
-/// allocation-layout-sensitive payload from being mistaken for current evidence.
-pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.2";
-/// Wire revision for the canonical V1.2 payload.
-pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 2;
-/// Stable hash algorithm identifier carried by and hashed into V1.2.
+/// V1.3 replaces the single global RNG checkpoint with six domain-separated checkpoints. The
+/// minor schema and codec revision prevent a pre-domain payload from being mistaken for current
+/// continuation evidence.
+pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.3";
+/// Wire revision for the canonical V1.3 payload.
+pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 3;
+/// Stable hash algorithm identifier carried by and hashed into V1.3.
 pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
-/// Stable logical identity used by the V1.2 agent lane and transition order.
+/// Stable logical identity used by the V1.3 agent lane and transition order.
 pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
+
+/// Diagnostic hash of every restorable random-domain checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RngDomainDigestV1 {
+    /// Hash over the exact ordered set of domain hashes below.
+    pub overall: String,
+    /// Per-domain hashes keyed by the stable [`RngDomain::tag`] values.
+    pub domains: BTreeMap<String, String>,
+}
+
+impl RngDomainDigestV1 {
+    fn recomputed_overall(&self) -> String {
+        let mut encoder =
+            CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "rng-domains");
+        encoder.usize(RngDomain::ALL.len());
+        for domain in RngDomain::ALL {
+            encoder.string(domain.tag());
+            encoder.string(
+                self.domains
+                    .get(domain.tag())
+                    .map_or("<missing>", String::as_str),
+            );
+        }
+        encoder.finish()
+    }
+}
 
 /// The world's science-state oracle, version one — see [`WorldState::world_digest_v1`].
 ///
@@ -2670,8 +2702,8 @@ pub struct WorldDigestV1 {
     pub food: String,
     pub terrain: String,
     pub hydrology: Option<String>,
-    /// The RNG's restorable checkpoint, algorithm identity included.
-    pub rng: String,
+    /// All six RNG-domain checkpoints, with per-domain diagnostics and one aggregate.
+    pub rng: RngDomainDigestV1,
     /// Future-affecting allocation counters.
     pub counters: String,
     pub brain_registry: String,
@@ -2699,7 +2731,7 @@ pub struct WorldDigestV1 {
     pub agent_identity: String,
 }
 
-/// A decoded V1.2 boundary digest violated its pinned semantic contract.
+/// A decoded V1.3 boundary digest violated its pinned semantic contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldDigestV1ContractError {
     #[error("world-digest schema `{found}` does not match `{expected}`")]
@@ -2725,6 +2757,12 @@ pub enum WorldDigestV1ContractError {
     CoverageOrder { coverage: &'static str },
     #[error("world-digest field `{field}` is not a lowercase 16-digit digest")]
     DigestFormat { field: &'static str },
+    #[error("world-digest RNG domains are not the exact supported six-domain set")]
+    RngDomainSet,
+    #[error("world-digest RNG domain `{domain}` is not a lowercase 16-digit digest")]
+    RngDomainDigestFormat { domain: String },
+    #[error("world-digest RNG aggregate does not match its ordered domain hashes")]
+    RngOverall,
     #[error("world-digest overall does not match its metadata, tick, lanes, and coverage")]
     Overall,
 }
@@ -2743,7 +2781,7 @@ impl WorldDigestV1 {
         overall.string(&self.food);
         overall.string(&self.terrain);
         overall.option_string(self.hydrology.as_deref());
-        overall.string(&self.rng);
+        overall.string(&self.rng.overall);
         overall.string(&self.counters);
         overall.string(&self.brain_registry);
         overall.string(&self.config);
@@ -2809,7 +2847,6 @@ impl WorldDigestV1 {
             ("brains", self.brains.as_str()),
             ("food", self.food.as_str()),
             ("terrain", self.terrain.as_str()),
-            ("rng", self.rng.as_str()),
             ("counters", self.counters.as_str()),
             ("brain_registry", self.brain_registry.as_str()),
             ("config", self.config.as_str()),
@@ -2821,6 +2858,25 @@ impl WorldDigestV1 {
             if !is_characterization_digest(digest) {
                 return Err(WorldDigestV1ContractError::DigestFormat { field });
             }
+        }
+        if self.rng.domains.len() != RngDomain::ALL.len()
+            || RngDomain::ALL
+                .into_iter()
+                .any(|domain| !self.rng.domains.contains_key(domain.tag()))
+        {
+            return Err(WorldDigestV1ContractError::RngDomainSet);
+        }
+        for (domain, digest) in &self.rng.domains {
+            if !is_characterization_digest(digest) {
+                return Err(WorldDigestV1ContractError::RngDomainDigestFormat {
+                    domain: domain.clone(),
+                });
+            }
+        }
+        if !is_characterization_digest(&self.rng.overall)
+            || self.rng.overall != self.rng.recomputed_overall()
+        {
+            return Err(WorldDigestV1ContractError::RngOverall);
         }
         if self
             .hydrology
@@ -3622,7 +3678,7 @@ struct PopulationSpawnReceipt {
     inserted: Vec<AgentId>,
     arena_checkpoint: (SlotMap<AgentId, usize>, usize),
     pending_birth_records_before: usize,
-    rng_before: SmallRngStream,
+    rng_before: DomainStreams,
     next_agent_uid_before: u64,
     next_spawn_ordinal_before: u64,
     next_birth_ordinal_before: u64,
@@ -3962,12 +4018,12 @@ pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 pub const WORLD_STEP_OUTCOME_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v3";
 
 /// Schema identifier for opt-in per-stage scientific-state digests.
-pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.2";
+pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.3";
 /// Wire revision for the canonical-UID six-point trace payload.
-pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 2;
+pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 3;
 /// Schema identifier for a non-boundary world digest captured during one transition.
 pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
-    "scriptbots.world-step-stage-world-digest.v2";
+    "scriptbots.world-step-stage-world-digest.v3";
 
 /// Stable stage identifiers emitted by [`WorldStepProfile`].
 ///
@@ -4293,7 +4349,7 @@ pub struct WorldStepStageWorldDigest {
     pub food: String,
     pub terrain: String,
     pub hydrology: Option<String>,
-    pub rng: String,
+    pub rng: RngDomainDigestV1,
     pub counters: String,
     pub brain_registry: String,
     pub config: String,
@@ -4353,7 +4409,7 @@ impl WorldStepStageWorldDigest {
         overall.string(&self.food);
         overall.string(&self.terrain);
         overall.option_string(self.hydrology.as_deref());
-        overall.string(&self.rng);
+        overall.string(&self.rng.overall);
         overall.string(&self.counters);
         overall.string(&self.brain_registry);
         overall.string(&self.config);
@@ -4870,7 +4926,6 @@ impl WorldStepTrace {
             ("world.brains", world.brains.as_str()),
             ("world.food", world.food.as_str()),
             ("world.terrain", world.terrain.as_str()),
-            ("world.rng", world.rng.as_str()),
             ("world.counters", world.counters.as_str()),
             ("world.brain_registry", world.brain_registry.as_str()),
             ("world.config", world.config.as_str()),
@@ -4889,6 +4944,23 @@ impl WorldStepTrace {
             if !is_characterization_digest(digest) {
                 return Err(WorldStepTraceContractError::DigestFormat { point, field });
             }
+        }
+        if world.rng.domains.len() != RngDomain::ALL.len()
+            || RngDomain::ALL
+                .into_iter()
+                .any(|domain| !world.rng.domains.contains_key(domain.tag()))
+            || world
+                .rng
+                .domains
+                .values()
+                .any(|digest| !is_characterization_digest(digest))
+            || !is_characterization_digest(&world.rng.overall)
+            || world.rng.overall != world.rng.recomputed_overall()
+        {
+            return Err(WorldStepTraceContractError::DigestFormat {
+                point,
+                field: "world.rng",
+            });
         }
         if world
             .hydrology
@@ -8763,9 +8835,9 @@ impl ScriptBotsConfig {
         ))
     }
 
-    /// Returns the configured RNG seed, generating one from entropy if absent.
-    fn seeded_rng(&self) -> SmallRngStream {
-        SmallRngStream::seed_from_u64(self.rng_seed.unwrap_or_else(rand::random))
+    /// Returns the configured root seed, generating one from entropy if absent.
+    fn resolved_rng_seed(&self) -> u64 {
+        self.rng_seed.unwrap_or_else(rand::random)
     }
 }
 
@@ -11750,7 +11822,7 @@ pub struct WorldState {
     config: ScriptBotsConfig,
     tick: Tick,
     epoch: u64,
-    rng: SmallRngStream,
+    rng: DomainStreams,
     agents: AgentArena,
     agent_execution_order_canonical: bool,
     identities: AgentMap<AgentIdentity>,
@@ -11876,10 +11948,9 @@ impl WorldState {
     fn build(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
         configure_parallelism();
         let (food_w, food_h) = config.food_dimensions()?;
-        let mut rng = config.seeded_rng();
-        // Decorrelate terrain noise from the world RNG stream: a plain clone
-        // replays identical draws for terrain and the first agent spawns.
-        let mut terrain_rng = SmallRng::seed_from_u64(rng.next_u64());
+        let mut rng = DomainStreams::from_root_seed(config.resolved_rng_seed());
+        let mut terrain_rng =
+            SmallRng::seed_from_u64(rng.stream(RngDomain::Environment).next_u64());
         let terrain =
             TerrainLayer::generate(food_w, food_h, config.food_cell_size, &mut terrain_rng)?;
         let food = FoodGrid::new(food_w, food_h, config.initial_food)?;
@@ -12131,8 +12202,9 @@ impl WorldState {
         if width == 0 || height == 0 {
             return None;
         }
-        let x = self.rng.random_range(0..width);
-        let y = self.rng.random_range(0..height);
+        let rng = self.rng.stream(RngDomain::Food);
+        let x = rng.random_range(0..width);
+        let y = rng.random_range(0..height);
         let idx = (y as usize) * (width as usize) + x as usize;
         let capacity = self
             .food_profiles
@@ -14387,7 +14459,10 @@ impl WorldState {
         let Some(kind) = self.brain_registry.kind(key).map(str::to_owned) else {
             return Ok(None);
         };
-        let (registry, rng) = (&self.brain_registry, &mut self.rng);
+        let (registry, rng) = (
+            &self.brain_registry,
+            self.rng.stream(RngDomain::Population),
+        );
         let Some(adapter) = registry.family(key) else {
             return BrainBinding::from_registry(registry, rng, key);
         };
@@ -14532,15 +14607,13 @@ impl WorldState {
             derivation,
         };
 
-        let rng = &mut self.rng;
-
         let child_genome = if let Some((partner_genome, _, _)) = &partner {
             let crossed = adapter
                 .crossover_genomes(
                     &parent_genome,
                     partner_genome,
                     provenance(BrainGenomeDerivation::Crossover),
-                    rng,
+                    self.rng.stream(RngDomain::Crossover),
                 )
                 .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
             let mutated = adapter
@@ -14548,7 +14621,7 @@ impl WorldState {
                     &crossed,
                     rates,
                     provenance(BrainGenomeDerivation::CrossoverThenMutation),
-                    rng,
+                    self.rng.stream(RngDomain::Mutation),
                 )
                 .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
             if mutated.material_hash() == crossed.material_hash() {
@@ -14564,7 +14637,7 @@ impl WorldState {
                     &parent_genome,
                     rates,
                     provenance(BrainGenomeDerivation::MutationOnly),
-                    rng,
+                    self.rng.stream(RngDomain::Mutation),
                 )
                 .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
             if mutated.material_hash() == parent_genome.material_hash() {
@@ -14612,8 +14685,13 @@ impl WorldState {
                 parent_states.as_slice()
             }
         };
+        let state_domain = if state_policy == OffspringStatePolicy::Blend {
+            RngDomain::Crossover
+        } else {
+            RngDomain::Mutation
+        };
         let child_state = adapter
-            .offspring_state(&child_genome, state_parents, rng)
+            .offspring_state(&child_genome, state_parents, self.rng.stream(state_domain))
             .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
         Self::instantiate_protocol_binding(adapter, key, kind, child_genome, child_state).map(Some)
     }
@@ -14657,24 +14735,25 @@ impl WorldState {
             eligible_ages
         };
         let (idx1, idx2) = {
-            let mut first = self.rng.random_range(0..count);
+            let rng = self.rng.stream(RngDomain::Lineage);
+            let mut first = rng.random_range(0..count);
             let mut second = if count > 1 {
-                self.rng.random_range(0..count)
+                rng.random_range(0..count)
             } else {
                 first
             };
             if count > 1 {
                 while second == first {
-                    second = self.rng.random_range(0..count);
+                    second = rng.random_range(0..count);
                 }
             }
             for (idx, &age) in eligible_ages.iter().enumerate() {
-                if age > eligible_ages[first] && self.rng.random_range(0.0..1.0) < 0.1 {
+                if age > eligible_ages[first] && rng.random_range(0.0..1.0) < 0.1 {
                     first = idx;
                 }
                 if idx != first
                     && age > eligible_ages[second]
-                    && self.rng.random_range(0.0..1.0) < 0.1
+                    && rng.random_range(0.0..1.0) < 0.1
                 {
                     second = idx;
                 }
@@ -14753,7 +14832,8 @@ impl WorldState {
         // Preserve the historical RNG position of `spawn_agent`, whose random runtime was
         // immediately replaced below, while constructing any fallible fallback brain before
         // insertion so a factory error cannot leave a partially inserted child.
-        let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
+        let _discarded_runtime =
+            AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
 
         let child_rates = child_runtime.mutation_rates;
         let inherited_key = parent_runtime.brain.registry_key();
@@ -14793,7 +14873,9 @@ impl WorldState {
                 .and_then(|rt| rt.brain.runner());
             match (parent_runner, partner_runner) {
                 (Some(parent), Some(partner)) => {
-                    if let Some(runner) = parent.crossover(partner, &mut self.rng) {
+                    if let Some(runner) =
+                        parent.crossover(partner, self.rng.stream(RngDomain::Crossover))
+                    {
                         Some(runner)
                     } else {
                         parent.clone_runner()?
@@ -14804,11 +14886,18 @@ impl WorldState {
             }
         };
         if let Some(mut runner) = inherited_runner {
-            runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary)?;
+            runner.mutate(
+                self.rng.stream(RngDomain::Mutation),
+                child_rates.primary,
+                child_rates.secondary,
+            )?;
             child_runtime.brain = BrainBinding::inherited(runner, inherited_key);
         } else if let Some(key) = inherited_key {
-            let Some(binding) =
-                BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+            let Some(binding) = BrainBinding::from_registry(
+                &self.brain_registry,
+                self.rng.stream(RngDomain::Population),
+                key,
+            )?
             else {
                 return Err(
                     BrainSpawnError::new(parent_kind.clone(), MissingBrainFactory { key }).into(),
@@ -14886,7 +14975,11 @@ impl WorldState {
                 for _ in 0..spawn_count {
                     let use_crossover = crossover_eligible.len() >= 2
                         && crossover_chance > 0.0
-                        && self.rng.random_range(0.0..1.0) < crossover_chance;
+                        && self
+                            .rng
+                            .stream(RngDomain::Crossover)
+                            .random_range(0.0..1.0)
+                            < crossover_chance;
                     let spawned = if use_crossover {
                         self.spawn_crossover_agent(next_tick, &crossover_eligible)?
                     } else {
@@ -14913,18 +15006,18 @@ impl WorldState {
     fn spawn_random_agent(&mut self, record_tick: Tick) -> Result<AgentId, BrainSpawnError> {
         let width = self.config.world_width as f32;
         let height = self.config.world_height as f32;
-        let position = Position::new(
-            self.rng.random_range(0.0..width),
-            self.rng.random_range(0.0..height),
-        );
-        let heading = self
-            .rng
-            .random_range(-std::f32::consts::PI..std::f32::consts::PI);
-        let color = [
-            self.rng.random_range(0.0..1.0),
-            self.rng.random_range(0.0..1.0),
-            self.rng.random_range(0.0..1.0),
-        ];
+        let (position, heading, color) = {
+            let rng = self.rng.stream(RngDomain::Population);
+            (
+                Position::new(rng.random_range(0.0..width), rng.random_range(0.0..height)),
+                rng.random_range(-std::f32::consts::PI..std::f32::consts::PI),
+                [
+                    rng.random_range(0.0..1.0),
+                    rng.random_range(0.0..1.0),
+                    rng.random_range(0.0..1.0),
+                ],
+            )
+        };
         let data = AgentData::new(
             position,
             Velocity::default(),
@@ -14939,8 +15032,11 @@ impl WorldState {
         // `spawn_agent` historically initialized runtime traits before choosing a registry key.
         // Build the same runtime first so fallible brain construction preserves seeded behavior
         // without leaving a partially inserted agent on error.
-        let mut runtime = AgentRuntime::new_random(&mut self.rng);
-        let binding = if let Some(key) = self.brain_registry.random_key(&mut self.rng) {
+        let mut runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
+        let binding = if let Some(key) = self
+            .brain_registry
+            .random_key(self.rng.stream(RngDomain::Population))
+        {
             self.prepare_registered_brain(key, record_tick)?
         } else {
             None
@@ -15813,7 +15909,13 @@ impl WorldState {
             if reproduction_chance <= 0.0 {
                 continue;
             }
-            if reproduction_chance < 1.0 && self.rng.random_range(0.0..1.0) >= reproduction_chance {
+            if reproduction_chance < 1.0
+                && self
+                    .rng
+                    .stream(RngDomain::Lineage)
+                    .random_range(0.0..1.0)
+                    >= reproduction_chance
+            {
                 continue;
             }
 
@@ -15891,7 +15993,12 @@ impl WorldState {
         if population < 2 || partner_chance <= 0.0 {
             return None;
         }
-        if self.rng.random_range(0.0..1.0) >= partner_chance {
+        if self
+            .rng
+            .stream(RngDomain::Lineage)
+            .random_range(0.0..1.0)
+            >= partner_chance
+        {
             return None;
         }
         let mut best: Option<(usize, u32)> = None;
@@ -15946,7 +16053,8 @@ impl WorldState {
         let preparation = (|| -> Result<(), BrainSpawnError> {
             for order in &mut orders {
                 debug_assert_eq!(self.agent_uid(order.parent_id), Some(order.parent_uid));
-                let _discarded_runtime = AgentRuntime::new_random(&mut self.rng);
+                let _discarded_runtime =
+                    AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
                 let inherited_key = order.runtime.brain.registry_key();
                 let child_rates = order.runtime.mutation_rates;
                 let parent_uses_protocol = self
@@ -15992,7 +16100,10 @@ impl WorldState {
                             .and_then(|runtime| runtime.brain.runner())
                             .filter(|partner| partner.kind() == parent_runner.kind());
                         if let Some(runner) = partner_runner
-                            .and_then(|partner| parent_runner.crossover(partner, &mut self.rng))
+                            .and_then(|partner| {
+                                parent_runner
+                                    .crossover(partner, self.rng.stream(RngDomain::Crossover))
+                            })
                         {
                             Some(runner)
                         } else {
@@ -16003,12 +16114,19 @@ impl WorldState {
                     }
                 };
                 if let Some(mut runner) = inherited_runner {
-                    runner.mutate(&mut self.rng, child_rates.primary, child_rates.secondary)?;
+                    runner.mutate(
+                        self.rng.stream(RngDomain::Mutation),
+                        child_rates.primary,
+                        child_rates.secondary,
+                    )?;
                     order.runtime.brain = BrainBinding::inherited(runner, inherited_key);
                 } else if let Some(key) = inherited_key {
                     let kind = order.runtime.brain.kind().unwrap_or("unknown").to_owned();
-                    let Some(binding) =
-                        BrainBinding::from_registry(&self.brain_registry, &mut self.rng, key)?
+                    let Some(binding) = BrainBinding::from_registry(
+                        &self.brain_registry,
+                        self.rng.stream(RngDomain::Population),
+                        key,
+                    )?
                     else {
                         return Err(BrainSpawnError::new(kind, MissingBrainFactory { key }));
                     };
@@ -16065,19 +16183,29 @@ impl WorldState {
         let base_dx = -heading.cos() * back_offset;
         let base_dy = -heading.sin() * back_offset;
         let jitter_dx = if jitter > 0.0 {
-            self.rng.random_range(-jitter..jitter)
+            self.rng
+                .stream(RngDomain::Population)
+                .random_range(-jitter..jitter)
         } else {
             0.0
         };
         let jitter_dy = if jitter > 0.0 {
-            self.rng.random_range(-jitter..jitter)
+            self.rng
+                .stream(RngDomain::Population)
+                .random_range(-jitter..jitter)
         } else {
             0.0
         };
         child.position.x = Self::wrap_position(parent.position.x + base_dx + jitter_dx, width);
         child.position.y = Self::wrap_position(parent.position.y + base_dy + jitter_dy, height);
         child.velocity = Velocity::default();
-        child.heading = wrap_signed_angle(parent.heading + self.rng.random_range(-0.2..0.2));
+        child.heading = wrap_signed_angle(
+            parent.heading
+                + self
+                    .rng
+                    .stream(RngDomain::Mutation)
+                    .random_range(-0.2..0.2),
+        );
         child.health = 1.0;
         child.boost = false;
         child.age = 0;
@@ -16093,7 +16221,12 @@ impl WorldState {
         if color_jitter > 0.0 {
             for channel in &mut child.color {
                 *channel =
-                    (*channel + self.rng.random_range(-color_jitter..color_jitter)).clamp(0.0, 1.0);
+                    (*channel
+                        + self
+                            .rng
+                            .stream(RngDomain::Mutation)
+                            .random_range(-color_jitter..color_jitter))
+                    .clamp(0.0, 1.0);
             }
         }
         Ok(child)
@@ -16138,7 +16271,10 @@ impl WorldState {
 
         if let Some(partner_runtime) = partner {
             runtime.hybrid = true;
-            let blend = self.rng.random_range(0.35..0.65);
+            let blend = self
+                .rng
+                .stream(RngDomain::Crossover)
+                .random_range(0.35..0.65);
             let mix = |a: f32, b: f32| lerp(a, b, blend);
 
             let before = runtime.herbivore_tendency;
@@ -16240,12 +16376,22 @@ impl WorldState {
                 runtime.mutation_rates.secondary,
             );
 
-            runtime.clocks[0] = if self.rng.random_range(0.0..1.0) < 0.5 {
+            runtime.clocks[0] = if self
+                .rng
+                .stream(RngDomain::Crossover)
+                .random_range(0.0..1.0)
+                < 0.5
+            {
                 parent.clocks[0]
             } else {
                 partner_runtime.clocks[0]
             };
-            runtime.clocks[1] = if self.rng.random_range(0.0..1.0) < 0.5 {
+            runtime.clocks[1] = if self
+                .rng
+                .stream(RngDomain::Crossover)
+                .random_range(0.0..1.0)
+                < 0.5
+            {
                 parent.clocks[1]
             } else {
                 partner_runtime.clocks[1]
@@ -16275,8 +16421,18 @@ impl WorldState {
 
         let meta_chance = self.config.reproduction_meta_mutation_chance;
         let meta_scale = self.config.reproduction_meta_mutation_scale;
-        if meta_chance > 0.0 && meta_scale > 0.0 && self.rng.random_range(0.0..1.0) < meta_chance {
-            let delta_primary = self.rng.random_range(-meta_scale..meta_scale);
+        if meta_chance > 0.0
+            && meta_scale > 0.0
+            && self
+                .rng
+                .stream(RngDomain::Mutation)
+                .random_range(0.0..1.0)
+                < meta_chance
+        {
+            let delta_primary = self
+                .rng
+                .stream(RngDomain::Mutation)
+                .random_range(-meta_scale..meta_scale);
             let before = runtime.mutation_rates.primary;
             runtime.mutation_rates.primary =
                 (runtime.mutation_rates.primary + delta_primary).max(0.0001);
@@ -16287,7 +16443,10 @@ impl WorldState {
                 runtime.mutation_rates.primary,
             );
 
-            let delta_secondary = self.rng.random_range(-meta_scale..meta_scale);
+            let delta_secondary = self
+                .rng
+                .stream(RngDomain::Mutation)
+                .random_range(-meta_scale..meta_scale);
             let before = runtime.mutation_rates.secondary;
             runtime.mutation_rates.secondary =
                 (runtime.mutation_rates.secondary + delta_secondary).max(0.001);
@@ -16405,13 +16564,21 @@ impl WorldState {
             }
             for i in 0..runtime.eye_direction.len() {
                 let before = runtime.eye_direction[i];
-                let after =
-                    if primary_rate > 0.0 && self.rng.random_range(0.0..1.0) < primary_rate * 5.0 {
-                        let delta = self.rng.random_range(-mutation_scale..mutation_scale);
-                        wrap_unsigned_angle(runtime.eye_direction[i] + delta)
-                    } else {
-                        wrap_unsigned_angle(runtime.eye_direction[i])
-                    };
+                let after = if primary_rate > 0.0
+                    && self
+                        .rng
+                        .stream(RngDomain::Mutation)
+                        .random_range(0.0..1.0)
+                        < primary_rate * 5.0
+                {
+                    let delta = self
+                        .rng
+                        .stream(RngDomain::Mutation)
+                        .random_range(-mutation_scale..mutation_scale);
+                    wrap_unsigned_angle(runtime.eye_direction[i] + delta)
+                } else {
+                    wrap_unsigned_angle(runtime.eye_direction[i])
+                };
                 runtime.eye_direction[i] = after;
                 if (after - before).abs() > 1e-4 {
                     runtime.push_gene_log(
@@ -16429,7 +16596,10 @@ impl WorldState {
         if scale <= 0.0 {
             return value.clamp(min, max);
         }
-        let delta = self.rng.random_range(-scale..scale);
+        let delta = self
+            .rng
+            .stream(RngDomain::Mutation)
+            .random_range(-scale..scale);
         (value + delta).clamp(min, max)
     }
 
@@ -16444,7 +16614,12 @@ impl WorldState {
         if scale <= 0.0 || rate <= 0.0 {
             return value.clamp(min, max);
         }
-        if self.rng.random_range(0.0..1.0) < rate * 5.0 {
+        if self
+            .rng
+            .stream(RngDomain::Mutation)
+            .random_range(0.0..1.0)
+            < rate * 5.0
+        {
             self.mutate_value(value, scale, min, max)
         } else {
             value.clamp(min, max)
@@ -17614,9 +17789,18 @@ impl WorldState {
         });
 
         let mut rng = self.rng.clone();
+        let checkpoint = rng.checkpoint();
         let mut rng_encoder = CharacterizationEncoderV0::new("rng-probe");
-        for _ in 0..4 {
-            rng_encoder.u64(rng.next_u64());
+        rng_encoder.string(&checkpoint.algorithm);
+        rng_encoder.u16(checkpoint.version);
+        rng_encoder.u16(checkpoint.codec_version);
+        rng_encoder.u64(checkpoint.root_seed);
+        rng_encoder.usize(RngDomain::ALL.len());
+        for domain in RngDomain::ALL {
+            rng_encoder.string(domain.tag());
+            for _ in 0..4 {
+                rng_encoder.u64(rng.stream(domain).next_u64());
+            }
         }
         let rng_probe = rng_encoder.finish();
 
@@ -17685,7 +17869,7 @@ impl WorldState {
     /// The world's science-state oracle, version one.
     ///
     /// `CharacterizationDigestV0` has three limitations, and it DECLARES all three rather than
-    /// hiding them (`RunManifestV2` carries them in `CharacterizationLimitationsV0`, whose
+    /// hiding them (`RunManifestV3` carries them in `CharacterizationLimitationsV0`, whose
     /// `superseded_by` field names this very method). V1 closes them:
     ///
     /// 1. **v0 is blind to the brains.** It encodes a brain's registry key, family name and
@@ -17816,18 +18000,38 @@ impl WorldState {
         let agents = agents_encoder.finish();
         let brains = brains_encoder.finish();
 
-        // RNG: the RESTORABLE state, not a probe. The algorithm id rides along, so a digest can
-        // never silently compare a run against one produced by a different generator.
+        // RNG: every domain's RESTORABLE state, not a probe. Both the domain derivation and each
+        // stream's algorithm identity ride along, so no generator or domain-remapping change can
+        // silently compare as the same continuation.
         let checkpoint = self.rng.checkpoint();
-        let mut rng_encoder = CharacterizationEncoderV0::new("rng-v1");
-        rng_encoder.string(&checkpoint.algorithm);
-        rng_encoder.u16(checkpoint.version);
-        rng_encoder.u16(checkpoint.codec_version);
-        rng_encoder.usize(checkpoint.state.len());
-        for byte in &checkpoint.state {
-            rng_encoder.u8(*byte);
+        let mut rng_domains = BTreeMap::new();
+        for domain in RngDomain::ALL {
+            let state = checkpoint
+                .stream(domain)
+                .expect("live DomainStreams checkpoints contain every domain");
+            let mut encoder = CharacterizationEncoderV0::new_with_schema(
+                WORLD_DIGEST_V1_SCHEMA,
+                "rng-domain",
+            );
+            encoder.string(&checkpoint.algorithm);
+            encoder.u16(checkpoint.version);
+            encoder.u16(checkpoint.codec_version);
+            encoder.u64(checkpoint.root_seed);
+            encoder.string(domain.tag());
+            encoder.string(&state.algorithm);
+            encoder.u16(state.version);
+            encoder.u16(state.codec_version);
+            encoder.usize(state.state.len());
+            for byte in &state.state {
+                encoder.u8(*byte);
+            }
+            rng_domains.insert(domain.tag().to_owned(), encoder.finish());
         }
-        let rng = rng_encoder.finish();
+        let mut rng = RngDomainDigestV1 {
+            overall: String::new(),
+            domains: rng_domains,
+        };
+        rng.overall = rng.recomputed_overall();
 
         // FUTURE-AFFECTING COUNTERS. Two worlds that look identical but are poised to hand
         // different UIDs to their next offspring will diverge from that tick onward.
@@ -18611,10 +18815,13 @@ impl WorldState {
         Ok(())
     }
 
-    /// Borrow the world RNG mutably for deterministic sampling.
-    pub fn rng(&mut self) -> Result<&mut dyn RandomStream, ScientificStateError> {
-        self.ensure_scientific_mutation_allowed("world.rng")?;
-        Ok(&mut self.rng)
+    /// Borrow one explicitly named world RNG domain for deterministic sampling.
+    pub fn rng(
+        &mut self,
+        domain: RngDomain,
+    ) -> Result<&mut dyn RandomStream, ScientificStateError> {
+        self.ensure_scientific_mutation_allowed(&format!("world.rng.{}", domain.tag()))?;
+        Ok(self.rng.stream(domain))
     }
 
     /// Read-only access to the agent arena.
@@ -18648,9 +18855,9 @@ impl WorldState {
         self.agent_identity(id).map(|identity| identity.uid)
     }
 
-    /// Capture the restorable state of the current, single world random stream.
+    /// Capture the exact restorable state of every random domain.
     #[must_use]
-    pub fn random_stream_state(&self) -> RandomStreamState {
+    pub fn random_streams_checkpoint(&self) -> DomainStreamsCheckpoint {
         self.rng.checkpoint()
     }
 
@@ -18756,7 +18963,7 @@ impl WorldState {
             Some(parent_b_state.identity.uid),
         ];
         let rng_before = self.rng.clone();
-        let mut runtime = AgentRuntime::new_random(&mut self.rng);
+        let mut runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
         update(&mut agent, &mut runtime);
         agent.generation = generation;
         runtime.lineage = lineage;
@@ -18836,7 +19043,7 @@ impl WorldState {
         }
         agent.validate()?;
         let rng_before = self.rng.clone();
-        let mut runtime = AgentRuntime::new_random(&mut self.rng);
+        let mut runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
         update_runtime(&mut runtime);
         if runtime.lineage != [None, None] {
             self.rng = rng_before;
@@ -18856,7 +19063,7 @@ impl WorldState {
     #[cfg(test)]
     fn spawn_agent(&mut self, agent: AgentData) -> AgentId {
         debug_assert!(agent.validate().is_ok());
-        let runtime = AgentRuntime::new_random(&mut self.rng);
+        let runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
         debug_assert!(runtime.validate().is_ok());
         self.insert_agent(agent, runtime, self.tick, BirthOrigin::Seeded)
     }
@@ -20089,7 +20296,7 @@ mod tests {
         world.step().expect("advance beyond bootstrap");
 
         let callback_calls = Cell::new(0usize);
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
         let identity_before = world.identity_sequence_state();
         let records_before = world.pending_birth_records.clone();
         let digest_before = world
@@ -20109,7 +20316,7 @@ mod tests {
         );
         assert_eq!(callback_calls.get(), 0);
         assert_eq!(world.agent_count(), 0);
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(world.pending_birth_records, records_before);
         assert_eq!(
@@ -20195,7 +20402,7 @@ mod tests {
         assert_eq!(world.identity_sequence_state(), (4, 3, 0));
 
         let state_before_rewrites = world.snapshot_agent(child_id).expect("crossover child");
-        let rng_before_rewrites = world.random_stream_state();
+        let rng_before_rewrites = world.random_streams_checkpoint();
         let digest_before_rewrites = world
             .characterization_digest_v0()
             .expect("pre-rewrite digest");
@@ -20233,7 +20440,7 @@ mod tests {
                 < f32::EPSILON
         );
         assert_eq!(world.pending_birth_records.last(), Some(&record));
-        assert_eq!(world.random_stream_state(), rng_before_rewrites);
+        assert_eq!(world.random_streams_checkpoint(), rng_before_rewrites);
         assert_eq!(
             world
                 .characterization_digest_v0()
@@ -20262,7 +20469,7 @@ mod tests {
             .expect("second parent");
         world.advance_tick();
 
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
         let identity_before = world.identity_sequence_state();
         let records_before = world.pending_birth_records.clone();
         let digest_before = world
@@ -20284,7 +20491,7 @@ mod tests {
         );
         assert_eq!(callback_calls.get(), 0);
         assert_eq!(world.agent_count(), 2);
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(world.pending_birth_records, records_before);
         assert_eq!(
@@ -20324,7 +20531,7 @@ mod tests {
             .expect("make parent reproduction-eligible");
 
         let tick_before = world.tick();
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
         let identity_before = world.identity_sequence_state();
         let records_before = world.pending_birth_records.clone();
         let digest_before = world
@@ -20349,7 +20556,7 @@ mod tests {
         );
         assert_eq!(world.tick(), tick_before);
         assert_eq!(world.agent_count(), 1);
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(world.pending_birth_records, records_before);
         assert_eq!(
@@ -20400,7 +20607,7 @@ mod tests {
         );
 
         let tick_before = world.tick();
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
         let identity_before = world.identity_sequence_state();
         let records_before = world.pending_birth_records.clone();
         let digest_before = world
@@ -20425,7 +20632,7 @@ mod tests {
         );
         assert_eq!(world.tick(), tick_before);
         assert_eq!(world.agent_count(), 2);
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(world.pending_birth_records, records_before);
         assert_eq!(
@@ -20449,7 +20656,7 @@ mod tests {
         let missing = world.spawn_agent(sample_agent(5));
         let callback_calls = Cell::new(0usize);
 
-        let same_tick_rng = world.random_stream_state();
+        let same_tick_rng = world.random_streams_checkpoint();
         let same_tick_identity = world.identity_sequence_state();
         let same_tick_records = world.pending_birth_records.clone();
         let same_tick = world
@@ -20459,13 +20666,13 @@ mod tests {
             .expect("same-boundary parent rejection is typed");
         assert_eq!(same_tick, None);
         assert_eq!(callback_calls.get(), 0);
-        assert_eq!(world.random_stream_state(), same_tick_rng);
+        assert_eq!(world.random_streams_checkpoint(), same_tick_rng);
         assert_eq!(world.identity_sequence_state(), same_tick_identity);
         assert_eq!(world.pending_birth_records, same_tick_records);
 
         world.remove_agent(missing).expect("remove second parent");
 
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
         let identity_before = world.identity_sequence_state();
         let records_before = world.pending_birth_records.clone();
         let agent_count_before = world.agent_count();
@@ -20484,7 +20691,7 @@ mod tests {
         assert_eq!(same, None);
         assert_eq!(stale, None);
         assert_eq!(callback_calls.get(), 0);
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(world.pending_birth_records, records_before);
         assert_eq!(world.agent_count(), agent_count_before);
@@ -20502,7 +20709,7 @@ mod tests {
         };
         let mut rejected = WorldState::new(config.clone()).expect("rejected world");
         let mut reference = WorldState::new(config).expect("reference world");
-        let before_rng = rejected.random_stream_state();
+        let before_rng = rejected.random_streams_checkpoint();
         let before_identity = rejected.identity_sequence_state();
         let before_digest = rejected
             .characterization_digest_v0()
@@ -20526,7 +20733,7 @@ mod tests {
             );
             assert_eq!(rejected.agent_count(), 0);
             assert!(rejected.pending_birth_records.is_empty());
-            assert_eq!(rejected.random_stream_state(), before_rng);
+            assert_eq!(rejected.random_streams_checkpoint(), before_rng);
             assert_eq!(rejected.identity_sequence_state(), before_identity);
             assert_eq!(
                 rejected
@@ -20544,8 +20751,8 @@ mod tests {
             .expect("reference injection");
         assert_eq!(actual, expected);
         assert_eq!(
-            rejected.random_stream_state(),
-            reference.random_stream_state()
+            rejected.random_streams_checkpoint(),
+            reference.random_streams_checkpoint()
         );
         assert_eq!(
             rejected.identity_sequence_state(),
@@ -23997,21 +24204,24 @@ mod tests {
 
         let width = reference_world.config.world_width as f32;
         let height = reference_world.config.world_height as f32;
+        let (position, heading, color) = {
+            let rng = reference_world.rng.stream(RngDomain::Population);
+            (
+                Position::new(rng.random_range(0.0..width), rng.random_range(0.0..height)),
+                rng.random_range(-std::f32::consts::PI..std::f32::consts::PI),
+                [
+                    rng.random_range(0.0..1.0),
+                    rng.random_range(0.0..1.0),
+                    rng.random_range(0.0..1.0),
+                ],
+            )
+        };
         let data = AgentData::new(
-            Position::new(
-                reference_world.rng.random_range(0.0..width),
-                reference_world.rng.random_range(0.0..height),
-            ),
+            position,
             Velocity::default(),
-            reference_world
-                .rng
-                .random_range(-std::f32::consts::PI..std::f32::consts::PI),
+            heading,
             1.0,
-            [
-                reference_world.rng.random_range(0.0..1.0),
-                reference_world.rng.random_range(0.0..1.0),
-                reference_world.rng.random_range(0.0..1.0),
-            ],
+            color,
             0.0,
             false,
             0,
@@ -24020,7 +24230,7 @@ mod tests {
         let id = reference_world.spawn_agent(data);
         if let Some(key) = reference_world
             .brain_registry
-            .random_key(&mut reference_world.rng)
+            .random_key(reference_world.rng.stream(RngDomain::Population))
         {
             assert!(
                 reference_world
@@ -24657,7 +24867,7 @@ mod tests {
             },
         );
         let state = family
-            .initial_state(&genome, &mut world.rng)
+            .initial_state(&genome, world.rng.stream(RngDomain::Mutation))
             .expect("fixture initial state");
         let evaluator = family
             .evaluator(&genome, &state)
@@ -26547,7 +26757,7 @@ mod tests {
             world.validate_external_arrival_boundary(),
             Err(expected.clone())
         );
-        let before_rng = world.random_stream_state();
+        let before_rng = world.random_streams_checkpoint();
         let before_identity = world.identity_sequence_state();
         let before_agent_count = world.agent_count();
         let before_births = world.pending_birth_records.clone();
@@ -26582,7 +26792,7 @@ mod tests {
         );
 
         assert_eq!(callback_calls.get(), 0);
-        assert_eq!(world.random_stream_state(), before_rng);
+        assert_eq!(world.random_streams_checkpoint(), before_rng);
         assert_eq!(world.identity_sequence_state(), before_identity);
         assert_eq!(world.agent_count(), before_agent_count);
         assert_eq!(world.pending_birth_records, before_births);
@@ -26614,7 +26824,7 @@ mod tests {
             world.validate_external_arrival_boundary(),
             Err(expected.clone())
         );
-        let reenabled_rng = world.random_stream_state();
+        let reenabled_rng = world.random_streams_checkpoint();
         let reenabled_identity = world.identity_sequence_state();
         assert_eq!(
             world.try_inject_agent_with(sample_agent(4), |_| {
@@ -26623,7 +26833,7 @@ mod tests {
             Err(expected)
         );
         assert_eq!(callback_calls.get(), 0);
-        assert_eq!(world.random_stream_state(), reenabled_rng);
+        assert_eq!(world.random_streams_checkpoint(), reenabled_rng);
         assert_eq!(world.identity_sequence_state(), reenabled_identity);
         assert_eq!(logs.lock().unwrap().len(), 1);
     }
@@ -26655,7 +26865,7 @@ mod tests {
             world.validate_external_arrival_boundary(),
             Err(expected.clone())
         );
-        let before_rng = world.random_stream_state();
+        let before_rng = world.random_streams_checkpoint();
         let before_identity = world.identity_sequence_state();
         let before_history = world.history().cloned().collect::<Vec<_>>();
         let before_digest = world
@@ -26671,7 +26881,7 @@ mod tests {
         );
 
         assert_eq!(callback_calls.get(), 0);
-        assert_eq!(world.random_stream_state(), before_rng);
+        assert_eq!(world.random_streams_checkpoint(), before_rng);
         assert_eq!(world.identity_sequence_state(), before_identity);
         assert_eq!(world.agent_count(), 0);
         assert!(world.pending_birth_records.is_empty());
@@ -26715,7 +26925,7 @@ mod tests {
         let revision_before = world.config_revision();
         let audit_before = world.config_audit().to_vec();
         let food_before = world.food().cells().to_vec();
-        let rng_before_bundled_update = world.random_stream_state();
+        let rng_before_bundled_update = world.random_streams_checkpoint();
         let digest_before_bundled_update = world
             .characterization_digest_v0()
             .expect("pre-config-rejection digest");
@@ -26746,7 +26956,7 @@ mod tests {
         assert_eq!(world.config_revision(), revision_before);
         assert_eq!(world.config_audit(), audit_before.as_slice());
         assert_eq!(world.food().cells(), food_before.as_slice());
-        assert_eq!(world.random_stream_state(), rng_before_bundled_update);
+        assert_eq!(world.random_streams_checkpoint(), rng_before_bundled_update);
         assert_eq!(
             world
                 .characterization_digest_v0()
@@ -26779,7 +26989,7 @@ mod tests {
             world.validate_external_arrival_boundary(),
             Err(expected.clone())
         );
-        let before_rng = world.random_stream_state();
+        let before_rng = world.random_streams_checkpoint();
         let before_identity = world.identity_sequence_state();
         let before_digest = world
             .characterization_digest_v0()
@@ -26795,7 +27005,7 @@ mod tests {
         );
 
         assert_eq!(callback_calls.get(), 0);
-        assert_eq!(world.random_stream_state(), before_rng);
+        assert_eq!(world.random_streams_checkpoint(), before_rng);
         assert_eq!(world.identity_sequence_state(), before_identity);
         assert_eq!(world.agent_count(), 0);
         assert!(world.pending_birth_records.is_empty());
@@ -26904,7 +27114,7 @@ mod tests {
         let food_before = world.food().cells().to_vec();
         let agent_before = world.snapshot_agent(agent_id).expect("guarded agent").data;
         let registry_before = world.brain_registry().descriptors();
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
         let identity_before = world.identity_sequence_state();
         let interventions_before = world.pending_interventions.clone();
         let digest_before = world
@@ -26979,7 +27189,7 @@ mod tests {
             return;
         };
         assert_eq!(intervention_error, unresolved("interventions".to_owned()));
-        let rng_result = world.rng();
+        let rng_result = world.rng(RngDomain::Food);
         assert!(
             rng_result.is_err(),
             "unresolved boundary exposed the mutable RNG"
@@ -26987,7 +27197,7 @@ mod tests {
         let Err(rng_error) = rng_result else {
             return;
         };
-        assert_eq!(rng_error, unresolved("world.rng".to_owned()));
+        assert_eq!(rng_error, unresolved("world.rng.food".to_owned()));
         let registry_result = world.brain_registry_mut();
         assert!(
             registry_result.is_err(),
@@ -27017,7 +27227,7 @@ mod tests {
             agent_before
         );
         assert_eq!(world.brain_registry().descriptors(), registry_before);
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(world.pending_interventions, interventions_before);
         assert_eq!(
@@ -27431,7 +27641,7 @@ mod tests {
             .expect("ordinary post-admission update");
 
         let stable = world.snapshot_agent(agent).expect("updated live agent");
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
         let identity_before = world.identity_sequence_state();
         let digest_before = world
             .characterization_digest_v0()
@@ -27471,7 +27681,7 @@ mod tests {
             (live.runtime.herbivore_tendency - stable.runtime.herbivore_tendency).abs()
                 < f32::EPSILON
         );
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(
             world
@@ -30341,7 +30551,7 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("world");
-        let rng_before = world.random_stream_state();
+        let rng_before = world.random_streams_checkpoint();
 
         let receipt = world
             .stage_population(Tick(7))
@@ -30370,7 +30580,7 @@ mod tests {
         assert_eq!(world.agent_count(), 0);
         assert!(world.pending_birth_records.is_empty());
         assert_eq!(world.identity_sequence_state(), (1, 0, 0));
-        assert_eq!(world.random_stream_state(), rng_before);
+        assert_eq!(world.random_streams_checkpoint(), rng_before);
     }
 
     #[test]
@@ -30654,8 +30864,14 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first, peer);
         assert_eq!(
-            world_a.rng().expect("first RNG access").next_u64(),
-            world_b.rng().expect("second RNG access").next_u64()
+            world_a
+                .rng(RngDomain::Population)
+                .expect("first RNG access")
+                .next_u64(),
+            world_b
+                .rng(RngDomain::Population)
+                .expect("second RNG access")
+                .next_u64()
         );
     }
 
@@ -30719,7 +30935,10 @@ mod tests {
         assert_ne!(baseline.overall, changed.overall);
 
         let (mut rng_world, _) = characterization_world(42);
-        rng_world.rng().expect("digest RNG access").next_u64();
+        rng_world
+            .rng(RngDomain::Food)
+            .expect("digest RNG access")
+            .next_u64();
         let changed = rng_world.characterization_digest_v0().expect("rng digest");
         assert_ne!(baseline.rng_probe, changed.rng_probe);
         assert_ne!(baseline.overall, changed.overall);
@@ -31794,7 +32013,7 @@ mod tests {
             assert_eq!(observed, EXPECTED);
             assert_eq!(trace.overall, "4d72af5390c11b38");
             println!(
-                "scriptbots.world-digest-golden.v1.2: six checkpoints and trace overall {} verified",
+                "scriptbots.world-digest-golden.v1.3: six checkpoints and trace overall {} verified",
                 trace.overall
             );
         } else {
@@ -32241,8 +32460,8 @@ mod tests {
             "legacy raw-slot characterization must prove the fixture layouts really differ"
         );
         assert_eq!(
-            left.world_digest_v1().expect("left pre-step V1.2"),
-            right.world_digest_v1().expect("right pre-step V1.2")
+            left.world_digest_v1().expect("left pre-step V1.3"),
+            right.world_digest_v1().expect("right pre-step V1.3")
         );
 
         let mut left_tracer = WorldStepTracer::default();
@@ -32313,8 +32532,8 @@ mod tests {
         assert_eq!(left.resource_ledger(), right.resource_ledger());
         assert_eq!(left.history, right.history);
         assert_eq!(
-            left.world_digest_v1().expect("left final V1.2"),
-            right.world_digest_v1().expect("right final V1.2")
+            left.world_digest_v1().expect("left final V1.3"),
+            right.world_digest_v1().expect("right final V1.3")
         );
     }
 
@@ -32466,8 +32685,8 @@ mod tests {
                 right.agent_brain_evaluator_state(right_child).unwrap()
             );
         }
-        let left_final = left.world_digest_v1().expect("left reproduction V1.2");
-        let right_final = right.world_digest_v1().expect("right reproduction V1.2");
+        let left_final = left.world_digest_v1().expect("left reproduction V1.3");
+        let right_final = right.world_digest_v1().expect("right reproduction V1.3");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);
@@ -32615,8 +32834,8 @@ mod tests {
             .expect("right scheduled trace contract");
         assert_eq!(left_trace.first_divergence(right_trace).unwrap(), None);
         assert_eq!(left.resource_ledger(), right.resource_ledger());
-        let left_final = left.world_digest_v1().expect("left crossover V1.2");
-        let right_final = right.world_digest_v1().expect("right crossover V1.2");
+        let left_final = left.world_digest_v1().expect("left crossover V1.3");
+        let right_final = right.world_digest_v1().expect("right crossover V1.3");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);

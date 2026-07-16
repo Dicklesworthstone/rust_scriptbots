@@ -9,6 +9,7 @@ use postcard::{from_bytes, to_allocvec};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use scriptbots_brain::{MlpBrain, mlp::MlpBrainFamily};
+use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
     Generation, INPUT_SIZE, NullPersistence, OUTPUT_SIZE, PersistenceAdmissionSession, Position,
@@ -185,7 +186,7 @@ impl Simulation {
         let handles: Vec<_> = self.world.agents().iter_handles().collect();
         for id in handles {
             let seed = {
-                let rng = self.world.rng()?;
+                let rng = self.world.rng(RngDomain::Population)?;
                 rng.random::<u64>()
             };
             bind_wander_brain(&mut self.world, id, seed)?;
@@ -351,7 +352,7 @@ fn seed_agents(
 
     for _ in 0..count {
         let (agent, wander_seed) = {
-            let rng = world.rng()?;
+            let rng = world.rng(RngDomain::Population)?;
             let x = rng.random_range(0.0..world_width);
             let y = rng.random_range(0.0..world_height);
             let heading = rng.random_range(-std::f32::consts::PI..std::f32::consts::PI);
@@ -663,7 +664,7 @@ mod tests {
                     "mlp-baseline"
                 );
             }
-            let random_stream = world.random_stream_state();
+            let random_streams = world.random_streams_checkpoint();
             persistence
                 .step(&mut world)
                 .expect("persist seeded lifecycle records");
@@ -674,7 +675,7 @@ mod tests {
                 .expect("first persistence cadence batch")
                 .births
                 .clone();
-            (births, mlp_key, random_stream)
+            (births, mlp_key, random_streams)
         };
 
         let (mlp_births, mlp_key, _) = capture(SeedStrategy::None, Some(BrainPreset::Mlp));
@@ -686,7 +687,8 @@ mod tests {
             assert_eq!(birth.brain_key, Some(mlp_key));
         }
 
-        let (wander_births, wander_key, wander_random_stream) = capture(SeedStrategy::Wander, None);
+        let (wander_births, wander_key, wander_random_streams) =
+            capture(SeedStrategy::Wander, None);
         assert!(wander_key.is_none());
         assert_eq!(wander_births.len(), 3);
         for birth in wander_births {
@@ -695,11 +697,11 @@ mod tests {
             assert_eq!(birth.brain_key, None);
         }
 
-        let (_, unbound_key, unbound_random_stream) = capture(SeedStrategy::None, None);
+        let (_, unbound_key, unbound_random_streams) = capture(SeedStrategy::None, None);
         assert!(unbound_key.is_none());
         assert_eq!(
-            wander_random_stream, unbound_random_stream,
-            "installing per-agent wander runners and refreshing their seeded origin records must not consume the world RNG"
+            wander_random_streams, unbound_random_streams,
+            "installing per-agent wander runners and refreshing their seeded origin records must not consume any world RNG domain"
         );
     }
 

@@ -636,9 +636,9 @@ pub struct RunManifestRecord {
     pub config_digest: String,
     /// Root seed, preserved losslessly as an unsigned value and stored as fixed-width hex.
     pub root_seed: u64,
-    /// Random-stream implementation identifier.
+    /// Random-domain checkpoint derivation identifier.
     pub rng_algorithm: String,
-    /// Random-stream state protocol version.
+    /// Random-domain checkpoint protocol version.
     pub rng_version: u16,
     /// Canonical JSON describing the initial brain-family roster and versions.
     pub brain_roster_json: String,
@@ -847,7 +847,7 @@ impl RunManifestRecord {
         }
         match self.manifest_schema_version {
             0 => {}
-            2 => validate_v2_manifest_projection(&self, &manifest, &config, &roster)?,
+            3 => validate_v3_manifest_projection(&self, &manifest, &config, &roster)?,
             version => {
                 return Err(StorageError::InvalidData {
                     context: "runs.manifest_schema_version",
@@ -894,7 +894,7 @@ impl RunManifestRecord {
     }
 }
 
-fn validate_v2_manifest_projection(
+fn validate_v3_manifest_projection(
     record: &RunManifestRecord,
     manifest: &Value,
     normalized_config: &Value,
@@ -903,10 +903,10 @@ fn validate_v2_manifest_projection(
     let schema = manifest_required_bounded_string(manifest, "/schema", MAX_RUN_LABEL_BYTES)?;
     if !matches!(
         schema,
-        "scriptbots.run-manifest.v2" | "scriptbots.run-manifest.v2.1"
+        "scriptbots.run-manifest.v3" | "scriptbots.run-manifest.v3.1"
     ) {
         return Err(manifest_projection_error(format!(
-            "/schema is {schema:?}, expected a supported V2 manifest"
+            "/schema is {schema:?}, expected a supported V3 manifest"
         )));
     }
 
@@ -918,11 +918,11 @@ fn validate_v2_manifest_projection(
     manifest_required_u16(manifest, "/schema_version")?;
     let purpose = manifest_required_bounded_string(manifest, "/purpose", MAX_RUN_LABEL_BYTES)?;
 
-    validate_v2_identity(record, manifest)?;
-    validate_v2_thread_policy(manifest)?;
+    validate_v3_identity(record, manifest)?;
+    validate_v3_thread_policy(manifest)?;
     require_manifest_projection(manifest, "/root_seed", &json!(record.root_seed))?;
     manifest_required_u64(manifest, "/root_seed")?;
-    validate_v2_random_stream(record, manifest)?;
+    validate_v3_random_streams(record, manifest)?;
     for pointer in [
         "/next_agent_uid",
         "/next_spawn_ordinal",
@@ -930,7 +930,7 @@ fn validate_v2_manifest_projection(
     ] {
         manifest_required_u64(manifest, pointer)?;
     }
-    let bootstrap_ticks = validate_v2_scenario(record, manifest)?;
+    let bootstrap_ticks = validate_v3_scenario(record, manifest)?;
 
     require_manifest_projection(manifest, "/normalized_config", normalized_config)?;
     manifest_required_object(manifest, "/normalized_config")?;
@@ -941,9 +941,9 @@ fn validate_v2_manifest_projection(
             record.root_seed
         )));
     }
-    validate_v2_config_digest(record, manifest, normalized_config)?;
-    validate_v2_build(record, manifest)?;
-    validate_v2_brain_roster(manifest, brain_roster)?;
+    validate_v3_config_digest(record, manifest, normalized_config)?;
+    validate_v3_build(record, manifest)?;
+    validate_v3_brain_roster(manifest, brain_roster)?;
     require_manifest_projection(manifest, "/reproducible", &json!(record.reproducible))?;
     manifest_required_bool(manifest, "/reproducible")?;
 
@@ -964,13 +964,13 @@ fn validate_v2_manifest_projection(
             "/warnings must exactly match /build/warnings",
         ));
     }
-    validate_v2_limitations(manifest, purpose)?;
-    validate_v2_bootstrap(manifest, schema, bootstrap_ticks)?;
+    validate_v3_limitations(manifest, purpose)?;
+    validate_v3_bootstrap(manifest, schema, bootstrap_ticks)?;
 
     Ok(())
 }
 
-fn validate_v2_identity(record: &RunManifestRecord, manifest: &Value) -> Result<(), StorageError> {
+fn validate_v3_identity(record: &RunManifestRecord, manifest: &Value) -> Result<(), StorageError> {
     manifest_required_object(manifest, "/identity")?;
     require_manifest_projection(manifest, "/identity/run_id", &json!(record.run_id))?;
     require_omittable_manifest_projection(
@@ -1013,7 +1013,7 @@ fn validate_v2_identity(record: &RunManifestRecord, manifest: &Value) -> Result<
     Ok(())
 }
 
-fn validate_v2_thread_policy(manifest: &Value) -> Result<(), StorageError> {
+fn validate_v3_thread_policy(manifest: &Value) -> Result<(), StorageError> {
     manifest_required_object(manifest, "/thread_policy")?;
     if let Some(threads) = manifest_required_nullable_u64(manifest, "/thread_policy/threads")?
         && (threads == 0 || usize::try_from(threads).is_err())
@@ -1032,47 +1032,105 @@ fn validate_v2_thread_policy(manifest: &Value) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn validate_v2_random_stream(
+const RUN_MANIFEST_V3_RANDOM_DOMAINS: [&str; 6] = [
+    "environment",
+    "food",
+    "population",
+    "lineage",
+    "mutation",
+    "crossover",
+];
+
+fn validate_v3_random_streams(
     record: &RunManifestRecord,
     manifest: &Value,
 ) -> Result<(), StorageError> {
-    manifest_required_object(manifest, "/random_stream")?;
+    manifest_require_exact_object_fields(
+        manifest,
+        "/random_streams",
+        &["version", "algorithm", "codec_version", "root_seed", "streams"],
+    )?;
     require_manifest_projection(
         manifest,
-        "/random_stream/algorithm",
+        "/random_streams/algorithm",
         &json!(record.rng_algorithm),
     )?;
     require_manifest_projection(
         manifest,
-        "/random_stream/version",
+        "/random_streams/version",
         &json!(record.rng_version),
     )?;
-    manifest_required_bounded_string(manifest, "/random_stream/algorithm", MAX_RUN_LABEL_BYTES)?;
-    let version = manifest_required_u16(manifest, "/random_stream/version")?;
-    let codec_version = manifest_required_u16(manifest, "/random_stream/codec_version")?;
+    require_manifest_projection(
+        manifest,
+        "/random_streams/root_seed",
+        &json!(record.root_seed),
+    )?;
+    manifest_required_bounded_string(
+        manifest,
+        "/random_streams/algorithm",
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    let version = manifest_required_u16(manifest, "/random_streams/version")?;
+    let codec_version = manifest_required_u16(manifest, "/random_streams/codec_version")?;
+    manifest_required_u64(manifest, "/random_streams/root_seed")?;
     if version == 0 || codec_version == 0 {
         return Err(manifest_projection_error(
-            "/random_stream version and codec_version must be greater than zero",
+            "/random_streams version and codec_version must be greater than zero",
         ));
     }
-    let state = manifest_required_array(manifest, "/random_stream/state")?;
+
+    manifest_require_exact_object_fields(
+        manifest,
+        "/random_streams/streams",
+        &RUN_MANIFEST_V3_RANDOM_DOMAINS,
+    )?;
+    for domain in RUN_MANIFEST_V3_RANDOM_DOMAINS {
+        validate_v3_random_stream_state(manifest, domain)?;
+    }
+    Ok(())
+}
+
+fn validate_v3_random_stream_state(
+    manifest: &Value,
+    domain: &str,
+) -> Result<(), StorageError> {
+    let pointer = format!("/random_streams/streams/{domain}");
+    manifest_require_exact_object_fields(
+        manifest,
+        &pointer,
+        &["algorithm", "version", "codec_version", "state"],
+    )?;
+    manifest_required_bounded_string(
+        manifest,
+        &format!("{pointer}/algorithm"),
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    let version = manifest_required_u16(manifest, &format!("{pointer}/version"))?;
+    let codec_version = manifest_required_u16(manifest, &format!("{pointer}/codec_version"))?;
+    if version == 0 || codec_version == 0 {
+        return Err(manifest_projection_error(format!(
+            "{pointer} version and codec_version must be greater than zero"
+        )));
+    }
+    let state_pointer = format!("{pointer}/state");
+    let state = manifest_required_array(manifest, &state_pointer)?;
     if state.is_empty() || state.len() > scriptbots_core::MAX_RANDOM_STREAM_STATE_BYTES {
         return Err(manifest_projection_error(format!(
-            "/random_stream/state must contain 1..={} bytes",
+            "{state_pointer} must contain 1..={} bytes",
             scriptbots_core::MAX_RANDOM_STREAM_STATE_BYTES
         )));
     }
     for (index, value) in state.iter().enumerate() {
         if value.as_u64().is_none_or(|byte| byte > u64::from(u8::MAX)) {
             return Err(manifest_projection_error(format!(
-                "/random_stream/state/{index} must be an integer byte"
+                "{state_pointer}/{index} must be an integer byte"
             )));
         }
     }
     Ok(())
 }
 
-fn validate_v2_scenario(record: &RunManifestRecord, manifest: &Value) -> Result<u64, StorageError> {
+fn validate_v3_scenario(record: &RunManifestRecord, manifest: &Value) -> Result<u64, StorageError> {
     manifest_required_object(manifest, "/scenario")?;
     require_manifest_projection(manifest, "/scenario/id", &json!(record.scenario_id))?;
     require_manifest_projection(
@@ -1092,7 +1150,7 @@ fn validate_v2_scenario(record: &RunManifestRecord, manifest: &Value) -> Result<
     manifest_required_u64(manifest, "/scenario/bootstrap_ticks")
 }
 
-fn validate_v2_config_digest(
+fn validate_v3_config_digest(
     record: &RunManifestRecord,
     manifest: &Value,
     normalized_config: &Value,
@@ -1123,7 +1181,7 @@ fn validate_v2_config_digest(
     Ok(())
 }
 
-fn validate_v2_build(record: &RunManifestRecord, manifest: &Value) -> Result<(), StorageError> {
+fn validate_v3_build(record: &RunManifestRecord, manifest: &Value) -> Result<(), StorageError> {
     manifest_required_object(manifest, "/build")?;
     for pointer in ["/build/package_name", "/build/package_version"] {
         manifest_required_bounded_string(manifest, pointer, MAX_RUN_LABEL_BYTES)?;
@@ -1232,7 +1290,7 @@ fn validate_v2_build(record: &RunManifestRecord, manifest: &Value) -> Result<(),
         )));
     }
 
-    validate_v2_core_build(manifest)?;
+    validate_v3_core_build(manifest)?;
     for pointer in [
         "/build/rustflags",
         "/build/rayon_num_threads",
@@ -1279,7 +1337,7 @@ fn validate_v2_build(record: &RunManifestRecord, manifest: &Value) -> Result<(),
     Ok(())
 }
 
-fn validate_v2_core_build(manifest: &Value) -> Result<(), StorageError> {
+fn validate_v3_core_build(manifest: &Value) -> Result<(), StorageError> {
     manifest_required_object(manifest, "/build/core")?;
     manifest_required_bool(manifest, "/build/core/parallel")?;
     manifest_required_bool(manifest, "/build/core/simd_wide")?;
@@ -1306,7 +1364,7 @@ fn validate_v2_core_build(manifest: &Value) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn validate_v2_brain_roster(manifest: &Value, brain_roster: &Value) -> Result<(), StorageError> {
+fn validate_v3_brain_roster(manifest: &Value, brain_roster: &Value) -> Result<(), StorageError> {
     require_manifest_projection(manifest, "/brain_roster", brain_roster)?;
     let entries = manifest_required_array(manifest, "/brain_roster")?;
     if entries.len() > MAX_RUN_FEATURES {
@@ -1339,7 +1397,7 @@ fn validate_v2_brain_roster(manifest: &Value, brain_roster: &Value) -> Result<()
     Ok(())
 }
 
-fn validate_v2_limitations(manifest: &Value, purpose: &str) -> Result<(), StorageError> {
+fn validate_v3_limitations(manifest: &Value, purpose: &str) -> Result<(), StorageError> {
     manifest_required_object(manifest, "/limitations")?;
     let limitations_purpose = manifest_required_bounded_string(
         manifest,
@@ -1369,15 +1427,15 @@ fn validate_v2_limitations(manifest: &Value, purpose: &str) -> Result<(), Storag
     Ok(())
 }
 
-fn validate_v2_bootstrap(
+fn validate_v3_bootstrap(
     manifest: &Value,
     schema: &str,
     scenario_bootstrap_ticks: u64,
 ) -> Result<(), StorageError> {
-    if schema == "scriptbots.run-manifest.v2" {
+    if schema == "scriptbots.run-manifest.v3" {
         if manifest.pointer("/bootstrap_evidence").is_some() {
             return Err(manifest_projection_error(
-                "/bootstrap_evidence is forbidden by scriptbots.run-manifest.v2",
+                "/bootstrap_evidence is forbidden by scriptbots.run-manifest.v3",
             ));
         }
         return Ok(());
@@ -1396,8 +1454,8 @@ fn validate_v2_bootstrap(
             "/bootstrap_evidence/completed is {completed}, expected requested {requested}"
         )));
     }
-    let start = validate_v2_world_digest(manifest, "/bootstrap_evidence/start")?;
-    let end = validate_v2_world_digest(manifest, "/bootstrap_evidence/end")?;
+    let start = validate_v3_world_digest(manifest, "/bootstrap_evidence/start")?;
+    let end = validate_v3_world_digest(manifest, "/bootstrap_evidence/end")?;
     if start.tick.0 != 0 {
         return Err(manifest_projection_error(format!(
             "/bootstrap_evidence/start/tick is {}, expected 0",
@@ -1421,7 +1479,7 @@ fn validate_v2_bootstrap(
     Ok(())
 }
 
-fn validate_v2_world_digest(
+fn validate_v3_world_digest(
     manifest: &Value,
     pointer: &str,
 ) -> Result<scriptbots_core::WorldDigestV1, StorageError> {
@@ -1490,6 +1548,25 @@ fn manifest_required_object<'a>(
         )));
     }
     Ok(value)
+}
+
+fn manifest_require_exact_object_fields(
+    manifest: &Value,
+    pointer: &str,
+    expected_fields: &[&str],
+) -> Result<(), StorageError> {
+    let value = manifest_required_object(manifest, pointer)?;
+    let object = value
+        .as_object()
+        .expect("manifest_required_object guarantees an object");
+    let actual: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = expected_fields.iter().copied().collect();
+    if actual != expected {
+        return Err(manifest_projection_error(format!(
+            "{pointer} fields are {actual:?}, expected exactly {expected:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn manifest_required_array<'a>(

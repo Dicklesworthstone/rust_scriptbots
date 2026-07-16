@@ -6,7 +6,7 @@
 //! completely different brains produce the SAME v0 digest, provided their families and bindings
 //! match. The oracle is blind to the only thing in the simulation that is actually evolving.
 //!
-//! That limitation is DECLARED rather than hidden — `RunManifestV2` carries
+//! That limitation is DECLARED rather than hidden — `RunManifestV3` carries
 //! `CharacterizationLimitationsV0 { evaluator_state_covered: false, superseded_by: "WorldDigestV1" }`
 //! — and `BrainRunner::state_digest` is the hook that closes it (bd-2z0.3.9).
 //!

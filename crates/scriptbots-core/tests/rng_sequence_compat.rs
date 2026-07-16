@@ -1,9 +1,10 @@
 //! A `rand` upgrade must not be able to silently move the science.
 //!
 //! Every stochastic decision in this simulator — mutation, spawn placement, food
-//! scatter, reproduction rolls — is drawn from one `RandomStream`. The world's
-//! characterization digest samples that stream, so if `rand` ever changed the
-//! algorithm behind `SmallRng`, the digest of every run in the project would move.
+//! scatter, reproduction rolls — is drawn from one of six domain-separated
+//! `RandomStream`s. Every domain currently uses `SmallRngStream`, and the canonical
+//! world digest plus `RunManifestV3` cover their versioned checkpoint, so if `rand`
+//! ever changed the algorithm behind `SmallRng`, every run's identity would move.
 //!
 //! It would move *quietly*. The symptom would be "the digest changed", which is
 //! indistinguishable from "someone changed the physics" — the single most expensive
@@ -83,8 +84,8 @@ fn the_random_stream_produces_its_pinned_sequence() {
 
 #[test]
 fn the_algorithm_identity_is_stable() {
-    // The manifest records this string (`RunManifestV2::random_stream.algorithm`) and the
-    // restore path REFUSES a state whose algorithm id does not match. If the id drifted
+    // RunManifestV3 records this string for every entry in `random_streams.streams`, and
+    // the restore path REFUSES a state whose algorithm id does not match. If the id drifted
     // silently, an old checkpoint would either be rejected for the wrong reason or — far
     // worse — be accepted by a generator that no longer produces the same numbers.
     let stream = SmallRngStream::seed_from_u64(PINNED_SEED);

@@ -487,7 +487,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - This is lifecycle hardening plus interim double-drive containment: the HUD is the only current GPUI simulation driver and the world window is read-only. It is not the final ownership fix—the renderer still owns scientific time and GPUI command draining remains incorrect. The `HostCore` migration owns both remaining defects and the permanent exactly-one-driver proof.
 
 ## Simulation overview
-Deterministic, staged tick pipeline (seeded RNG; explicit staged ordering):
+Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; explicit staged ordering):
 1. Aging and scheduled tasks
 2. Food respawn/diffusion
 3. Sense (spatial index snapshot)
@@ -502,13 +502,13 @@ Deterministic, staged tick pipeline (seeded RNG; explicit staged ordering):
 ### Design principles & determinism
 - **No undefined behavior**: workspace lints flag `unsafe`; the remaining platform/environment boundary blocks are explicit and reviewable.
 - **Explicit order of effects**: floating-point reductions and removals are staged. Before each successful tick, the dense SoA is normalized to ascending stable `AgentUid`; stable compaction and monotonic insertion preserve that order through death and spawn commits. Physical slot allocation therefore cannot choose reduction, neighbor, parent, or child priority.
-- **Restorable RNG state**: the world owns a versioned, restorable random stream whose exact state enters V1. Draw assignment follows the canonical UID stage order; independent domain-separated agent streams remain roadmap work rather than a claimed property.
+- **Restorable domain RNG state**: the world owns six independently derived, versioned streams—Environment, Food, Population, Lineage, Mutation, and Crossover. Their exact root seed, derivation identity, and per-domain continuation states enter V1, so a draw added to one domain cannot silently shift another. Draw assignment within each domain follows canonical UID stage order.
 - **Feature-gated parallelism**: `scriptbots-core` defaults to `parallel` (Rayon), while web builds disable it for single-thread determinism.
 - **Completed-boundary outcome and admission seam**: `WorldState` owns deterministic accumulators plus a payload-free `Open`/`Pending`/`Sealed` boundary marker; it no longer owns a sink, retry payload, acknowledgement error, or admission watermark. A one-lifetime `PersistenceAdmissionSession` owns those external concerns. Its step APIs stage the exact immutable `Arc<PersistenceBatch>` before returning, retain that same allocation across definite and indeterminate failures, and seal the world only after acknowledgement. Direct `WorldState` stepping is intentionally limited to persistence-disabled worlds. Application-owned drivers route TUI, GPUI, Bevy, headless, profiling, and WASM ticks through the matching session without exposing session state to renderers. Completed population faults still travel beside the full `StepOutcome`; the clock-free traced outcome keeps the same boundary, and profiled session stepping retains the reviewed v2 timing contract. The hidden playback transport queue is also retired: application drains return one ordered `Vec<ControlCommand>`, while core returns normalized playback as an explicit driver-owned disposition.
 
 #### Canonical digest and first-divergence trace
 
-- `WorldState::world_digest_v1()` emits the exact `scriptbots.world-digest.v1.2` science-state wire. Every agent transition is canonicalized by stable `AgentUid`, so physical slot/dense allocation is no longer science state and the temporary V1.1 execution-order lane is retired. The aggregate covers stable-UID agent bodies, brain genomes/evaluator coverage, food, terrain/hydrology, restorable RNG state, identity counters, registered-factory coverage, a scientific configuration projection, active effects, derived transition caches, and open ancestry origins. Operational rendering, analytics, persistence-admission policy, host receipts, and backend error prose do not enter the science digest.
+- `WorldState::world_digest_v1()` emits the exact `scriptbots.world-digest.v1.3` science-state wire. Every agent transition is canonicalized by stable `AgentUid`, so physical slot/dense allocation is no longer science state and the temporary V1.1 execution-order lane is retired. The aggregate covers stable-UID agent bodies, brain genomes/evaluator coverage, food, terrain/hydrology, all six restorable RNG-domain checkpoints with per-domain diagnostics, identity counters, registered-factory coverage, a scientific configuration projection, active effects, derived transition caches, and open ancestry origins. Operational rendering, analytics, persistence-admission policy, host receipts, and backend error prose do not enter the science digest.
 - `WorldState::step_traced()` is an opt-in, clock-free diagnostic API. It records exactly six semantic checkpoints—Sense, Brains, Actuation, Food, DeathCleanup, and Population—with separate world, ordered deferred-work, pending output-tail, and resource-ledger hashes. The trace has its own aggregate hash, typed capture failures, and `validate_contract()` enforcement for schema, cardinality, order, ticks, coverage, digest shape, and nested aggregate hashes.
 - Both V1 and trace validation prove protocol self-consistency, not artifact authenticity. Their FNV-1a64 hashes are diagnostic first-divergence aids, not signatures or collision-resistant attestations; a durable run bundle will require separate provenance/authentication.
 - DeathCleanup and Population retain the ordered queue state immediately before consumption, while the final completed-boundary V1 and resource report prove traced/untraced parity after finalization. The literal six-point golden is enabled only by the `SCRIPTBOTS_WORLD_DIGEST_GOLDEN=1` environment guard in its pinned DSR test lane, so ordinary `--all-features` tests remain portable; there is no product CLI or replay-file claim yet.
@@ -518,6 +518,7 @@ Deterministic, staged tick pipeline (seeded RNG; explicit staged ordering):
   ```json
   { "rng_seed": 42 }
   ```
+- The root seed deterministically derives all six domain streams. `RunManifestV3` records that root plus the exact versioned `random_streams` checkpoint; it never collapses the domains back into one ambiguous global stream.
 - For CPU thread control during profiling, prefer the standard `RAYON_NUM_THREADS` env var.
 
 ### Data model & spatial indexing

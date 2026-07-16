@@ -12,6 +12,7 @@ use gpui::{
 use gpui_platform::application;
 use rand::Rng;
 use scriptbots_core::PresetKind;
+use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     ActivationEdge, ActivationLayer, AgentColumns, AgentData, AgentId, AgentRuntime, AgentUid,
     BrainActivations, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
@@ -4410,7 +4411,7 @@ impl SimulationView {
         }
 
         let (pos_x, pos_y, color) = {
-            let rng = match world.rng() {
+            let rng = match world.rng(RngDomain::Population) {
                 Ok(rng) => rng,
                 Err(error) => {
                     warn!(error = %error, "Agent injection rejected before RNG sampling");
@@ -13696,7 +13697,7 @@ mod command_characterization_tests {
             let world = world.lock().expect("world lock");
             (
                 world.agent_count(),
-                world.random_stream_state(),
+                world.random_streams_checkpoint(),
                 world.identity_sequence_state(),
             )
         };
@@ -13712,9 +13713,9 @@ mod command_characterization_tests {
         );
         let world = world.lock().expect("world lock");
         assert_eq!(
-            world.random_stream_state(),
+            world.random_streams_checkpoint(),
             rng_before,
-            "sealed GUI ingress must be rejected before position/color RNG sampling"
+            "sealed GUI ingress must be rejected before Population-domain position/color sampling"
         );
         assert_eq!(world.identity_sequence_state(), identity_before);
     }

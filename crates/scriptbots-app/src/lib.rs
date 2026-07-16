@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use scriptbots_core::{
     CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
-    PersistenceAdmissionSession, RandomStreamState, ScriptBotsConfig, TickEvents, WorldDigestV1,
+    PersistenceAdmissionSession, ScriptBotsConfig, TickEvents, WorldDigestV1,
     WorldDigestV1ContractError, WorldState,
+    rng_domains::DomainStreamsCheckpoint,
 };
 use scriptbots_runtime::RunId;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
@@ -16,10 +17,10 @@ use thiserror::Error;
 pub type SharedWorld = Arc<Mutex<WorldState>>;
 pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
-/// Schema identifier for the run-scoped stable-identity/random-stream manifest.
-pub const RUN_MANIFEST_V2_SCHEMA: &str = "scriptbots.run-manifest.v2";
-/// Compatible V2 minor schema used when a manifest carries bootstrap execution evidence.
-pub const RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v2.1";
+/// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
+pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3";
+/// Compatible V3 minor schema used when a manifest carries bootstrap execution evidence.
+pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.1";
 /// Schema identifier for a sequence of V1 world characterization points.
 pub const CHARACTERIZATION_TRACE_V1_SCHEMA: &str = "scriptbots.characterization-trace.v1";
 /// Safety bound for the temporary characterization runner.
@@ -34,7 +35,7 @@ const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 const RUST_TOOLCHAIN_BYTES: &[u8] = include_bytes!("../../../rust-toolchain.toml");
 const RUST_TOOLCHAIN_TEXT: &str = include_str!("../../../rust-toolchain.toml");
 
-/// Build identity V0 embedded in the V2 run manifest and characterization trace.
+/// Build identity V0 embedded in the V3 run manifest and characterization trace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildProvenanceV0 {
     pub package_name: String,
@@ -217,7 +218,7 @@ impl Default for CharacterizationLimitationsV0 {
     fn default() -> Self {
         Self {
             purpose: "characterization_only".to_owned(),
-            agent_identity: "AgentState snapshots and persistence use stable AgentUid; RunManifestV2 records run identity and allocation counters; legacy CharacterizationDigestV0 still orders agents by transient AgentId and excludes AgentUid".to_owned(),
+            agent_identity: "AgentState snapshots and persistence use stable AgentUid; RunManifestV3 records run identity and allocation counters; legacy CharacterizationDigestV0 still orders agents by transient AgentId and excludes AgentUid".to_owned(),
             source_identity:
                 "commit plus status/tracked-diff digests; untracked file contents are not hashed"
                     .to_owned(),
@@ -277,7 +278,7 @@ pub struct BootstrapEvidenceV0 {
     pub end: WorldDigestV1,
 }
 
-/// Run-scoped identity and launch intent embedded in [`RunManifestV2`].
+/// Run-scoped identity and launch intent embedded in [`RunManifestV3`].
 ///
 /// `started_at_unix_ms` is the launch boundary measured in milliseconds since the Unix epoch. It
 /// is metadata, not a deterministic simulation input. Exactly one execution boundary must be
@@ -354,14 +355,14 @@ impl RunIdentityV1 {
     }
 }
 
-/// Version-two record tying run identity, scenario construction, stable identity allocation,
-/// random-stream continuation, and normalized configuration to a build.
+/// Version-three record tying run identity, scenario construction, stable identity allocation,
+/// domain-separated random-stream continuation, and normalized configuration to a build.
 ///
 /// `reproducible` means the manifest has an explicit seed and complete clean-source provenance. It
 /// does not override the characterization digest's exclusions or claim that replay can reconstruct
 /// the world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RunManifestV2 {
+pub struct RunManifestV3 {
     pub schema: String,
     pub schema_version: u16,
     pub purpose: String,
@@ -377,10 +378,10 @@ pub struct RunManifestV2 {
     /// Explicit proof of the requested startup warmup, attached only after it completes.
     ///
     /// Attaching it through [`Self::with_bootstrap_evidence`] validates the two digests and
-    /// upgrades the schema tag to [`RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA`].
+    /// upgrades the schema tag to [`RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_evidence: Option<BootstrapEvidenceV0>,
-    pub random_stream: RandomStreamState,
+    pub random_streams: DomainStreamsCheckpoint,
     pub next_agent_uid: u64,
     pub next_spawn_ordinal: u64,
     pub next_birth_ordinal: u64,
@@ -395,7 +396,7 @@ pub struct RunManifestV2 {
     pub limitations: CharacterizationLimitationsV0,
 }
 
-/// Errors returned while constructing a version-two run manifest.
+/// Errors returned while constructing a version-three run manifest.
 #[derive(Debug, Error)]
 pub enum RunManifestError {
     #[error("scenario identity must not be empty")]
@@ -460,8 +461,18 @@ pub enum RunManifestError {
         /// Validated build-provenance result.
         derived: bool,
     },
-    #[error("run manifest V2 requires an explicit rng_seed")]
+    #[error("run manifest V3 requires an explicit rng_seed")]
     MissingExplicitSeed,
+    /// The manifest root seed and the domain-stream checkpoint disagree.
+    #[error(
+        "run manifest root seed {manifest} does not match random-stream checkpoint root seed {checkpoint}"
+    )]
+    RandomStreamRootSeedMismatch {
+        /// Root seed recorded by the manifest.
+        manifest: u64,
+        /// Root seed carried by the domain-stream checkpoint.
+        checkpoint: u64,
+    },
     #[error("failed to normalize ScriptBots configuration: {0}")]
     ConfigSerialization(#[source] serde_json::Error),
     #[error("failed to encode normalized ScriptBots configuration for its BLAKE3 digest: {0}")]
@@ -532,7 +543,7 @@ pub enum RunManifestError {
     },
 }
 
-impl RunManifestV2 {
+impl RunManifestV3 {
     /// Project the complete manifest into the storage-owned queryable provenance contract.
     ///
     /// The full canonical manifest remains embedded, while frequently filtered provenance fields
@@ -541,6 +552,12 @@ impl RunManifestV2 {
     pub fn to_storage_record(&self) -> Result<RunManifestRecord, RunManifestError> {
         self.identity.validate()?;
         validate_scenario_identity(&self.scenario.id)?;
+        if self.random_streams.root_seed != self.root_seed {
+            return Err(RunManifestError::RandomStreamRootSeedMismatch {
+                manifest: self.root_seed,
+                checkpoint: self.random_streams.root_seed,
+            });
+        }
         let derived_provenance = validate_build_provenance_claim(&self.build)?;
         if self.reproducible != derived_provenance {
             return Err(RunManifestError::InconsistentReproducibilityClaim {
@@ -593,8 +610,8 @@ impl RunManifestV2 {
             normalized_config_json,
             config_digest: self.config_digest.clone(),
             root_seed: self.root_seed,
-            rng_algorithm: self.random_stream.algorithm.clone(),
-            rng_version: self.random_stream.version,
+            rng_algorithm: self.random_streams.algorithm.clone(),
+            rng_version: self.random_streams.version,
             brain_roster_json,
             source_revision: self.build.source_revision.clone(),
             source_tree_digest: self
@@ -697,7 +714,7 @@ impl RunManifestV2 {
                 source,
             })?;
 
-        self.schema = RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA.to_owned();
+        self.schema = RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA.to_owned();
         self.bootstrap_evidence = Some(evidence);
         Ok(self)
     }
@@ -746,13 +763,19 @@ impl RunManifestV2 {
             .map(|(registry_key, kind)| BrainRosterEntryV0 { registry_key, kind })
             .collect();
         let warnings = build.warnings.clone();
-        let random_stream = world.random_stream_state();
+        let random_streams = world.random_streams_checkpoint();
+        if random_streams.root_seed != root_seed {
+            return Err(RunManifestError::RandomStreamRootSeedMismatch {
+                manifest: root_seed,
+                checkpoint: random_streams.root_seed,
+            });
+        }
         let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) =
             world.identity_sequence_state();
 
         Ok(Self {
-            schema: RUN_MANIFEST_V2_SCHEMA.to_owned(),
-            schema_version: 2,
+            schema: RUN_MANIFEST_V3_SCHEMA.to_owned(),
+            schema_version: 3,
             purpose: "characterization_only".to_owned(),
             identity,
             root_seed,
@@ -762,7 +785,7 @@ impl RunManifestV2 {
             // outside a real run — which is a true statement, not a missing field.
             thread_policy: None,
             bootstrap_evidence: None,
-            random_stream,
+            random_streams,
             next_agent_uid,
             next_spawn_ordinal,
             next_birth_ordinal,
@@ -804,7 +827,7 @@ pub struct CharacterizationTraceV1 {
     pub schema: String,
     pub schema_version: u16,
     pub digest_algorithm: String,
-    pub manifest: RunManifestV2,
+    pub manifest: RunManifestV3,
     pub manifest_digest: String,
     pub points: Vec<TracePointV0>,
 }
@@ -883,14 +906,14 @@ impl CharacterizationTraceV1 {
             });
         }
 
-        let manifest = RunManifestV2::from_world_with_provenance(
+        let manifest = RunManifestV3::from_world_with_provenance(
             identity,
             scenario,
             world,
             BuildProvenanceV0::current(),
         )?;
         let manifest_bytes = manifest.canonical_json_bytes()?;
-        let manifest_digest = manifest_digest("run-manifest-v2", &manifest_bytes);
+        let manifest_digest = manifest_digest("run-manifest-v3", &manifest_bytes);
         let mut points = Vec::with_capacity(usize::try_from(ticks).unwrap_or(0) + 1);
         let initial = world.characterization_digest_v0()?;
         points.push(TracePointV0 {
@@ -1214,7 +1237,7 @@ mod characterization_tests {
         let mut identity = test_run_identity(0x17);
         identity.experiment_id = Some("canonical-experiment".to_owned());
         identity.variant_id = Some("variant-a".to_owned());
-        let manifest = RunManifestV2::from_world_with_provenance(
+        let manifest = RunManifestV3::from_world_with_provenance(
             identity,
             ScenarioIdentityV0::caller_seeded("canonical-test"),
             &world,
@@ -1228,8 +1251,11 @@ mod characterization_tests {
             format!("blake3:{}", blake3::hash(&normalized_config_bytes).to_hex())
         );
         assert_eq!(manifest.config_digest_encoding, "blake3-canonical-json-v1");
+        assert_eq!(manifest.random_streams.root_seed, manifest.root_seed);
         let encoded = manifest.canonical_json_bytes().expect("manifest JSON");
         let storage_record = manifest.to_storage_record().expect("storage projection");
+        assert_eq!(storage_record.rng_algorithm, manifest.random_streams.algorithm);
+        assert_eq!(storage_record.rng_version, manifest.random_streams.version);
         assert_eq!(
             storage_record.manifest_json,
             manifest.canonical_json().expect("canonical manifest text")
@@ -1242,7 +1268,7 @@ mod characterization_tests {
             storage_record.brain_roster_json,
             canonical_json_text(&manifest.brain_roster).expect("canonical roster text")
         );
-        let decoded: RunManifestV2 = serde_json::from_slice(&encoded).expect("round trip");
+        let decoded: RunManifestV3 = serde_json::from_slice(&encoded).expect("round trip");
         assert_eq!(manifest, decoded);
         assert_eq!(
             decoded.canonical_json_bytes().expect("re-encoded manifest"),
@@ -1269,7 +1295,7 @@ mod characterization_tests {
                 "next_spawn_ordinal",
                 "normalized_config",
                 "purpose",
-                "random_stream",
+                "random_streams",
                 "reproducible",
                 "root_seed",
                 "scenario",
@@ -1278,8 +1304,8 @@ mod characterization_tests {
                 "warnings",
             ]
         );
-        assert_eq!(encoded_value["schema"], RUN_MANIFEST_V2_SCHEMA);
-        assert_eq!(encoded_value["schema_version"], 2);
+        assert_eq!(encoded_value["schema"], RUN_MANIFEST_V3_SCHEMA);
+        assert_eq!(encoded_value["schema_version"], 3);
         assert_eq!(
             encoded_value["identity"]["experiment_id"],
             "canonical-experiment"
@@ -1298,7 +1324,7 @@ mod characterization_tests {
             RunIdentityV1::new(RunId::new(u128::MAX), u64::MAX, Some(u64::MAX), None);
         identity.experiment_id = Some("experiment-max".to_owned());
         identity.variant_id = Some("variant-max".to_owned());
-        let manifest = RunManifestV2::from_world_with_provenance(
+        let manifest = RunManifestV3::from_world_with_provenance(
             identity,
             ScenarioIdentityV0::caller_seeded("identity-max"),
             &world,
@@ -1328,7 +1354,7 @@ mod characterization_tests {
             None,
             Some("operator-controlled-until-stop-v1".to_owned()),
         );
-        let manifest = RunManifestV2::from_world_with_provenance(
+        let manifest = RunManifestV3::from_world_with_provenance(
             identity,
             ScenarioIdentityV0::caller_seeded("live-identity"),
             &world,
@@ -1347,7 +1373,7 @@ mod characterization_tests {
     fn run_identity_rejects_blank_or_oversized_text_fields() {
         let world = test_world(Some(19));
         let manifest_error = |identity| {
-            RunManifestV2::from_world_with_provenance(
+            RunManifestV3::from_world_with_provenance(
                 identity,
                 ScenarioIdentityV0::caller_seeded("invalid-identity"),
                 &world,
@@ -1426,7 +1452,7 @@ mod characterization_tests {
         ));
 
         let scenario_error = |id: String| {
-            RunManifestV2::from_world_with_provenance(
+            RunManifestV3::from_world_with_provenance(
                 test_run_identity(0x1907),
                 ScenarioIdentityV0::caller_seeded(id),
                 &world,
@@ -1451,14 +1477,14 @@ mod characterization_tests {
     fn bootstrap_evidence_is_explicit_validated_and_schema_tagged() {
         let world = test_world(Some(0xB007_57A4));
         let start = world.world_digest_v1().expect("tick-zero start digest");
-        let base = RunManifestV2::from_world_with_provenance(
+        let base = RunManifestV3::from_world_with_provenance(
             test_run_identity(0xB007_57A4),
             ScenarioIdentityV0::caller_seeded("zero-bootstrap"),
             &world,
             complete_test_build(),
         )
         .expect("base manifest");
-        assert_eq!(base.schema, RUN_MANIFEST_V2_SCHEMA);
+        assert_eq!(base.schema, RUN_MANIFEST_V3_SCHEMA);
         assert!(base.bootstrap_evidence.is_none());
 
         let manifest = base
@@ -1470,7 +1496,7 @@ mod characterization_tests {
                 end: start.clone(),
             })
             .expect("zero bootstrap evidence");
-        assert_eq!(manifest.schema, RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA);
+        assert_eq!(manifest.schema, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA);
         let evidence = manifest
             .bootstrap_evidence
             .as_ref()
@@ -1480,10 +1506,10 @@ mod characterization_tests {
         assert_eq!(evidence.start, evidence.end);
 
         let encoded = manifest.canonical_json_bytes().expect("evidence JSON");
-        let decoded: RunManifestV2 = serde_json::from_slice(&encoded).expect("evidence round trip");
+        let decoded: RunManifestV3 = serde_json::from_slice(&encoded).expect("evidence round trip");
         assert_eq!(decoded, manifest);
         let value: serde_json::Value = serde_json::from_slice(&encoded).expect("evidence wire");
-        assert_eq!(value["schema"], RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA);
+        assert_eq!(value["schema"], RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA);
         assert_eq!(
             value["bootstrap_evidence"]
                 .as_object()
@@ -1554,7 +1580,7 @@ mod characterization_tests {
         let end = world.world_digest_v1().expect("end digest");
         let mut scenario = ScenarioIdentityV0::caller_seeded("one-bootstrap");
         scenario.bootstrap_ticks = 1;
-        let manifest = RunManifestV2::from_world_with_provenance(
+        let manifest = RunManifestV3::from_world_with_provenance(
             test_run_identity(0xB007_57A6),
             scenario,
             &test_world(Some(0xB007_57A6)),
@@ -1584,7 +1610,7 @@ mod characterization_tests {
         let world_b = test_world(Some(33));
         let scenario = ScenarioIdentityV0::caller_seeded("stable-test");
         let identity = test_run_identity(33);
-        let manifest_a = RunManifestV2::from_world_with_provenance(
+        let manifest_a = RunManifestV3::from_world_with_provenance(
             identity.clone(),
             scenario.clone(),
             &world_a,
@@ -1592,7 +1618,7 @@ mod characterization_tests {
         )
         .expect("manifest A");
         let manifest_b =
-            RunManifestV2::from_world_with_provenance(identity, scenario, &world_b, build)
+            RunManifestV3::from_world_with_provenance(identity, scenario, &world_b, build)
                 .expect("manifest B");
         assert_eq!(
             manifest_a.canonical_json_bytes().expect("manifest A JSON"),
@@ -1620,7 +1646,7 @@ mod characterization_tests {
         let build = complete_test_build();
         let scenario = ScenarioIdentityV0::caller_seeded("closed-policy-test");
         let identity = test_run_identity(34);
-        let open_manifest = RunManifestV2::from_world_with_provenance(
+        let open_manifest = RunManifestV3::from_world_with_provenance(
             identity.clone(),
             scenario.clone(),
             &world,
@@ -1631,7 +1657,7 @@ mod characterization_tests {
 
         world.set_closed(true).expect("close manifest world");
         let closed_manifest =
-            RunManifestV2::from_world_with_provenance(identity, scenario, &world, build)
+            RunManifestV3::from_world_with_provenance(identity, scenario, &world, build)
                 .expect("closed manifest");
 
         assert!(world.is_closed());
@@ -1651,7 +1677,7 @@ mod characterization_tests {
     fn manifest_rejects_entropy_seed_and_marks_provenance_gaps() {
         let entropy_world = test_world(None);
         assert!(matches!(
-            RunManifestV2::from_world_with_provenance(
+            RunManifestV3::from_world_with_provenance(
                 test_run_identity(1),
                 ScenarioIdentityV0::caller_seeded("entropy"),
                 &entropy_world,
@@ -1669,7 +1695,7 @@ mod characterization_tests {
         incomplete.provenance_complete = false;
         incomplete.warnings = vec!["provenance deliberately incomplete".to_owned()];
         let world = test_world(Some(5));
-        let manifest = RunManifestV2::from_world_with_provenance(
+        let manifest = RunManifestV3::from_world_with_provenance(
             test_run_identity(5),
             ScenarioIdentityV0::caller_seeded("incomplete"),
             &world,
@@ -1688,7 +1714,7 @@ mod characterization_tests {
         assert!(!inconsistent_build.derived_provenance_complete());
         assert!(inconsistent_build.provenance_complete);
 
-        let error = RunManifestV2::from_world_with_provenance(
+        let error = RunManifestV3::from_world_with_provenance(
             test_run_identity(0xC1A1_0001),
             ScenarioIdentityV0::caller_seeded("inconsistent-build"),
             &world,
@@ -1703,13 +1729,26 @@ mod characterization_tests {
             }
         ));
 
-        let mut manifest = RunManifestV2::from_world_with_provenance(
+        let mut manifest = RunManifestV3::from_world_with_provenance(
             test_run_identity(0xC1A1_0002),
             ScenarioIdentityV0::caller_seeded("mutated-claim"),
             &world,
             complete_test_build(),
         )
         .expect("consistent manifest");
+        let mut mismatched_streams = manifest.clone();
+        mismatched_streams.random_streams.root_seed ^= 1;
+        let error = mismatched_streams
+            .to_storage_record()
+            .expect_err("storage projection must reject a mismatched stream root seed");
+        assert!(matches!(
+            error,
+            RunManifestError::RandomStreamRootSeedMismatch {
+                manifest: 0xC1A1_0001,
+                checkpoint,
+            } if checkpoint == (0xC1A1_0001 ^ 1)
+        ));
+
         manifest.reproducible = false;
         let error = manifest
             .to_storage_record()

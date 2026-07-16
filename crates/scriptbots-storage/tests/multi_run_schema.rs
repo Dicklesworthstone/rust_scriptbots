@@ -29,6 +29,32 @@ fn temp_db_path(label: &str) -> String {
         .to_owned()
 }
 
+fn random_stream_state_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "algorithm": "test-small-rng",
+        "version": 1,
+        "codec_version": 1,
+        "state": [1, 2, 3, 4]
+    })
+}
+
+fn random_streams_checkpoint_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "algorithm": "scriptbots.rng-domains.v1",
+        "codec_version": 1,
+        "root_seed": u64::MAX,
+        "streams": {
+            "environment": random_stream_state_fixture(),
+            "food": random_stream_state_fixture(),
+            "population": random_stream_state_fixture(),
+            "lineage": random_stream_state_fixture(),
+            "mutation": random_stream_state_fixture(),
+            "crossover": random_stream_state_fixture()
+        }
+    })
+}
+
 fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunManifestRecord {
     let normalized_config = serde_json::json!({
         "agent_count": 1,
@@ -45,8 +71,8 @@ fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunMani
     let brain_roster_json =
         serde_json::to_string(&brain_roster).expect("fixture brain roster is serializable");
     let manifest_json = serde_json::json!({
-        "schema": "scriptbots.run-manifest.v2",
-        "schema_version": 2,
+        "schema": "scriptbots.run-manifest.v3",
+        "schema_version": 3,
         "purpose": "characterization_only",
         "identity": {
             "run_id": run_id,
@@ -62,12 +88,7 @@ fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunMani
             "source": "test-fixture",
             "overridden": null
         },
-        "random_stream": {
-            "algorithm": "test-small-rng",
-            "version": 1,
-            "codec_version": 1,
-            "state": [1, 2, 3, 4]
-        },
+        "random_streams": random_streams_checkpoint_fixture(),
         "next_agent_uid": 2,
         "next_spawn_ordinal": 1,
         "next_birth_ordinal": 0,
@@ -128,7 +149,7 @@ fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunMani
     .to_string();
     RunManifestRecord {
         run_id,
-        manifest_schema_version: 2,
+        manifest_schema_version: 3,
         experiment_id: Some("overlapping-identities".to_owned()),
         variant_id: Some(variant_id.to_owned()),
         scenario_id: "multi-run-schema-proof".to_owned(),
@@ -136,7 +157,7 @@ fn manifest(run_id: RunId, variant_id: &str, started_at_unix_ms: u64) -> RunMani
         normalized_config_json,
         config_digest,
         root_seed: u64::MAX,
-        rng_algorithm: "test-small-rng".to_owned(),
+        rng_algorithm: "scriptbots.rng-domains.v1".to_owned(),
         rng_version: 1,
         brain_roster_json,
         source_revision: Some("0123456789abcdef".to_owned()),
@@ -173,7 +194,7 @@ fn manifest_validation_error(record: RunManifestRecord) -> String {
                 .shutdown()
                 .expect("unexpected accepted fixture still shuts down");
         })
-        .expect_err("storage unexpectedly accepted an invalid V2 manifest")
+        .expect_err("storage unexpectedly accepted an invalid V3 manifest")
         .to_string()
 }
 
@@ -508,7 +529,7 @@ fn registration_and_recovery_reject_unverifiable_manifest_provenance()
 }
 
 #[test]
-fn v2_manifest_validation_rejects_missing_and_wrongly_typed_structure() {
+fn v3_manifest_validation_rejects_missing_and_wrongly_typed_structure() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 2);
 
     let mut missing_purpose = manifest(run_id, "missing-purpose", 1_700_000_000_012);
@@ -526,14 +547,14 @@ fn v2_manifest_validation_rejects_missing_and_wrongly_typed_structure() {
 
     let mut missing_codec = manifest(run_id, "missing-codec", 1_700_000_000_013);
     mutate_manifest(&mut missing_codec, |value| {
-        value["random_stream"]
+        value["random_streams"]
             .as_object_mut()
-            .expect("random stream object")
+            .expect("domain-stream checkpoint object")
             .remove("codec_version");
     });
     let error = manifest_validation_error(missing_codec);
     assert!(
-        error.contains("/random_stream/codec_version is required"),
+        error.contains("/random_streams") && error.contains("codec_version"),
         "unexpected error: {error}"
     );
 
@@ -562,7 +583,7 @@ fn v2_manifest_validation_rejects_missing_and_wrongly_typed_structure() {
 }
 
 #[test]
-fn v2_manifest_validation_recomputes_config_digest_and_binds_root_seed() {
+fn v3_manifest_validation_recomputes_config_digest_and_binds_root_seed() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 3);
 
     let mut unknown_encoding = manifest(run_id, "unknown-encoding", 1_700_000_000_016);
@@ -612,16 +633,17 @@ fn v2_manifest_validation_recomputes_config_digest_and_binds_root_seed() {
 }
 
 #[test]
-fn v2_manifest_validation_rejects_incomplete_rng_and_provenance() {
+fn v3_manifest_validation_rejects_incomplete_rng_and_provenance() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 4);
 
     let mut invalid_state = manifest(run_id, "invalid-rng-state", 1_700_000_000_019);
     mutate_manifest(&mut invalid_state, |value| {
-        value["random_stream"]["state"] = serde_json::json!([256]);
+        value["random_streams"]["streams"]["mutation"]["state"] =
+            serde_json::json!([256]);
     });
     let error = manifest_validation_error(invalid_state);
     assert!(
-        error.contains("/random_stream/state/0 must be an integer byte"),
+        error.contains("/random_streams/streams/mutation/state/0 must be an integer byte"),
         "unexpected error: {error}"
     );
 
@@ -657,11 +679,110 @@ fn v2_manifest_validation_rejects_incomplete_rng_and_provenance() {
 }
 
 #[test]
-fn v21_manifest_requires_explicit_bootstrap_evidence() {
+fn v3_manifest_requires_exactly_six_strict_random_domain_states() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 5);
-    let mut missing_evidence = manifest(run_id, "v21-missing-evidence", 1_700_000_000_023);
+
+    let mut missing_domain = manifest(run_id, "missing-domain", 1_700_000_000_023);
+    mutate_manifest(&mut missing_domain, |value| {
+        value["random_streams"]["streams"]
+            .as_object_mut()
+            .expect("domain stream map")
+            .remove("mutation");
+    });
+    let error = manifest_validation_error(missing_domain);
+    assert!(
+        error.contains("/random_streams/streams")
+            && error.contains("expected exactly")
+            && error.contains("mutation"),
+        "unexpected error: {error}"
+    );
+
+    let mut extra_domain = manifest(run_id, "extra-domain", 1_700_000_000_024);
+    mutate_manifest(&mut extra_domain, |value| {
+        value["random_streams"]["streams"]
+            .as_object_mut()
+            .expect("domain stream map")
+            .insert("analytics".to_owned(), random_stream_state_fixture());
+    });
+    let error = manifest_validation_error(extra_domain);
+    assert!(
+        error.contains("/random_streams/streams")
+            && error.contains("expected exactly")
+            && error.contains("analytics"),
+        "unexpected error: {error}"
+    );
+
+    let mut extra_state_field = manifest(run_id, "extra-state-field", 1_700_000_000_025);
+    mutate_manifest(&mut extra_state_field, |value| {
+        value["random_streams"]["streams"]["lineage"]
+            .as_object_mut()
+            .expect("lineage random-stream state")
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+    });
+    let error = manifest_validation_error(extra_state_field);
+    assert!(
+        error.contains("/random_streams/streams/lineage")
+            && error.contains("expected exactly")
+            && error.contains("unknown"),
+        "unexpected error: {error}"
+    );
+
+    let mut invalid_one_of_six = manifest(run_id, "invalid-one-of-six", 1_700_000_000_026);
+    mutate_manifest(&mut invalid_one_of_six, |value| {
+        value["random_streams"]["streams"]["crossover"]["algorithm"] =
+            serde_json::json!("");
+    });
+    let error = manifest_validation_error(invalid_one_of_six);
+    assert!(
+        error.contains("/random_streams/streams/crossover/algorithm")
+            && error.contains("must be nonblank"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn v3_manifest_binds_domain_checkpoint_metadata_and_rejects_v2() {
+    let run_id = RunId::from_namespace_sequence(0xc011_1de0, 6);
+
+    let mut mismatched_root = manifest(run_id, "rng-root-mismatch", 1_700_000_000_027);
+    mutate_manifest(&mut mismatched_root, |value| {
+        value["random_streams"]["root_seed"] = serde_json::json!(7);
+    });
+    let error = manifest_validation_error(mismatched_root);
+    assert!(
+        error.contains("/random_streams/root_seed") && error.contains("expected"),
+        "unexpected error: {error}"
+    );
+
+    let mut mismatched_algorithm = manifest(run_id, "rng-algorithm-mismatch", 1_700_000_000_028);
+    mutate_manifest(&mut mismatched_algorithm, |value| {
+        value["random_streams"]["algorithm"] = serde_json::json!("other-derivation");
+    });
+    let error = manifest_validation_error(mismatched_algorithm);
+    assert!(
+        error.contains("/random_streams/algorithm") && error.contains("expected"),
+        "unexpected error: {error}"
+    );
+
+    let mut legacy = manifest(run_id, "unsupported-v2", 1_700_000_000_029);
+    legacy.manifest_schema_version = 2;
+    mutate_manifest(&mut legacy, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v2");
+        value["schema_version"] = serde_json::json!(2);
+    });
+    let error = manifest_validation_error(legacy);
+    assert!(
+        error.contains("unsupported run manifest schema version 2"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn v31_manifest_requires_explicit_bootstrap_evidence() {
+    let run_id = RunId::from_namespace_sequence(0xc011_1de0, 5);
+    let mut missing_evidence = manifest(run_id, "v31-missing-evidence", 1_700_000_000_023);
     mutate_manifest(&mut missing_evidence, |value| {
-        value["schema"] = serde_json::json!("scriptbots.run-manifest.v2.1");
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.1");
     });
     let error = manifest_validation_error(missing_evidence);
     assert!(

@@ -5,8 +5,8 @@
 //! runs was therefore true of the library and false of the product: a user could
 //! not tell which build, which seed, or which config produced a run directory.
 //!
-//! The current contract is stronger: a base `RunManifestV2` is registered in the
-//! run database before tick zero, and the adjacent V2.1 sidecar supplements that
+//! The current contract is stronger: a base `RunManifestV3` is registered in the
+//! run database before tick zero, and the adjacent V3.1 sidecar supplements that
 //! durable record with post-bootstrap evidence. These tests drive the real binary
 //! and inspect both records on disk.
 
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use scriptbots_app::{RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA, RUN_MANIFEST_V2_SCHEMA, RunManifestV2};
+use scriptbots_app::{RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA, RUN_MANIFEST_V3_SCHEMA, RunManifestV3};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::StorageReader;
 
@@ -215,10 +215,11 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         "the manifest records a different seed than the run actually used"
     );
     assert_eq!(
-        manifest["schema"], RUN_MANIFEST_V2_BOOTSTRAP_SCHEMA,
-        "bootstrap evidence must move the V2 manifest onto its compatible V2.1 schema"
+        manifest["schema"], RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
+        "bootstrap evidence must move the V3 manifest onto its compatible V3.1 schema"
     );
-    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["schema_version"], 3);
+    assert_eq!(manifest["random_streams"]["root_seed"], 4242);
     let bootstrap = &manifest["bootstrap_evidence"];
     assert_eq!(bootstrap["requested"], 2);
     assert_eq!(bootstrap["completed"], 2);
@@ -243,8 +244,8 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         );
     }
 
-    let sidecar: RunManifestV2 = serde_json::from_value(manifest.clone())
-        .expect("the supplemental sidecar must satisfy the typed V2 manifest contract");
+    let sidecar: RunManifestV3 = serde_json::from_value(manifest.clone())
+        .expect("the supplemental sidecar must satisfy the typed V3 manifest contract");
     let run_id_text = manifest["identity"]["run_id"]
         .as_str()
         .expect("the run identity must encode its durable RunId as text");
@@ -334,7 +335,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     );
 
     // The sidecar is supplemental. The authoritative run row must already contain the same
-    // identity and launch provenance, but remain at base V2 because it was registered before any
+    // identity and launch provenance, but remain at base V3 because it was registered before any
     // bootstrap transition executed.
     let database_path = dir.join("run.sqlite");
     let database_path = database_path
@@ -347,8 +348,10 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         .run_manifest()
         .expect("the run database must contain its validated durable manifest");
     assert_eq!(durable.run_id, parsed_run_id);
-    assert_eq!(durable.manifest_schema_version, 2);
+    assert_eq!(durable.manifest_schema_version, 3);
     assert_eq!(durable.root_seed, sidecar.root_seed);
+    assert_eq!(durable.rng_algorithm, sidecar.random_streams.algorithm);
+    assert_eq!(durable.rng_version, sidecar.random_streams.version);
     assert_eq!(durable.config_digest, sidecar.config_digest);
     assert_eq!(
         durable.requested_tick_budget,
@@ -370,12 +373,13 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     );
     assert_eq!(durable.cargo_lock_digest, sidecar.build.lockfile_digest);
 
-    let pre_tick: RunManifestV2 = serde_json::from_str(&durable.manifest_json)
-        .expect("the durable launch manifest must retain its typed V2 representation");
-    assert_eq!(pre_tick.schema, RUN_MANIFEST_V2_SCHEMA);
-    assert_eq!(pre_tick.schema_version, 2);
+    let pre_tick: RunManifestV3 = serde_json::from_str(&durable.manifest_json)
+        .expect("the durable launch manifest must retain its typed V3 representation");
+    assert_eq!(pre_tick.schema, RUN_MANIFEST_V3_SCHEMA);
+    assert_eq!(pre_tick.schema_version, 3);
     assert_eq!(pre_tick.identity, sidecar.identity);
     assert_eq!(pre_tick.root_seed, sidecar.root_seed);
+    assert_eq!(pre_tick.random_streams, sidecar.random_streams);
     assert_eq!(pre_tick.normalized_config, sidecar.normalized_config);
     assert_eq!(pre_tick.build, sidecar.build);
     assert!(

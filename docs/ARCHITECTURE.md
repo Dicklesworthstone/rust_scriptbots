@@ -156,22 +156,25 @@ families).
 
 ## 5. RNG and determinism
 
-Every stochastic decision is drawn from a `RandomStream`. The concrete generator is `SmallRngStream`
-(xoshiro256++ on 64-bit, xoshiro128++ on 32-bit — so a `wasm32` run legitimately draws a *different*
-sequence from the same seed, and its manifest records the different algorithm id so the two can
-never be confused).
+Every stochastic decision is drawn from one of six domain-specific `RandomStream`s owned by
+`DomainStreams`. The concrete generator for each domain is `SmallRngStream` (xoshiro256++ on
+64-bit, xoshiro128++ on 32-bit — so a `wasm32` run legitimately draws a *different* sequence from
+the same derived seed). `RunManifestV3` records the domain-derivation identity and every concrete
+stream's algorithm id, so native and browser continuations cannot be confused.
 
-- **Algorithm identity is versioned and self-describing.** `RandomStreamState` carries an algorithm
-  id (embedding the `rand` version) and a codec version; `from_state` **refuses** a checkpoint whose
-  algorithm id does not match. A `rand` upgrade that changes the generator is therefore a loud,
-  announced act — `crates/scriptbots-core/tests/rng_sequence_compat.rs` pins the sequence so the
-  bump fails in a test whose subject *is* the dependency, rather than silently moving every digest.
+- **Both protocol layers are versioned and self-describing.** `DomainStreamsCheckpoint` carries the
+  root seed, domain-derivation algorithm, mapping codec, and exact named-domain set. Each embedded
+  `RandomStreamState` separately carries its concrete generator id (including the `rand` version)
+  and codec; restore **refuses** either a domain-protocol mismatch or an incompatible stream state.
+  A `rand` upgrade that changes the generator is therefore a loud, announced act —
+  `crates/scriptbots-core/tests/rng_sequence_compat.rs` pins the sequence so the bump fails in a
+  test whose subject *is* the dependency, rather than silently moving every digest.
 - **Domain separation.** `rng_domains` derives an independent stream per `RngDomain`
   (Environment, Food, Population, Lineage, Mutation, Crossover) from the root seed, via a versioned
   FNV-1a over a *stable string tag* (never the enum discriminant — inserting a variant must not
   re-seed the others). Independent streams mean adding a draw in one domain cannot perturb another,
-  and "same food, different mutation seed" becomes an askable experiment. *(Substrate landed; the
-  migration of core's call sites onto it is tracked separately and moves the digest.)*
+  and "same food, different mutation seed" becomes an askable experiment. Core and frontend callers
+  must name the domain at every stochastic boundary; there is no fallback global stream.
 
 **The hashing rule, learned the hard way.** Anything persisted or compared across runs uses a
 **specified** hash (`characterization_fnv1a64` / a pinned FNV-1a), **never** `std::hash::DefaultHasher`
@@ -179,7 +182,8 @@ never be confused).
 the science. This bug was found feeding the characterization digest; do not reintroduce it.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`RandomStream`, `SmallRngStream`,
-`RandomStreamState`); `crates/scriptbots-core/src/rng_domains.rs`.
+`RandomStreamState`, `WorldState::rng`); `crates/scriptbots-core/src/rng_domains.rs`
+(`RngDomain`, `DomainStreams`, `DomainStreamsCheckpoint`).
 
 ---
 
@@ -187,16 +191,16 @@ Source of truth: `crates/scriptbots-core/src/lib.rs` (`RandomStream`, `SmallRngS
 
 Two digests decide whether two runs are *the same run*.
 
-- `CharacterizationDigestV0` — the original oracle. It is deliberately kept intact and
-  **un-re-baselined**, and it *declares* its own limitations (in `CharacterizationLimitationsV0`,
-  whose `superseded_by` field names `WorldDigestV1`): it is blind to brain weights, it keys agents
-  by the *recycled* slotmap id, and it samples the RNG with a four-draw probe.
+- `CharacterizationDigestV0` — the original, explicitly legacy oracle. It *declares* its own
+  limitations (in `CharacterizationLimitationsV0`, whose `superseded_by` field names
+  `WorldDigestV1`): it is blind to brain weights, keys agents by the *recycled* slotmap id, and its
+  RNG evidence is only a forward probe rather than a restorable continuation checkpoint.
 - `WorldDigestV1` — supersedes v0 with per-lane hashes: agents ordered by the **stable `AgentUid`**
   (not the reused slot key), brains (genome + evaluator state via `state_digest`), food, terrain,
-  hydrology, the **restorable** RNG checkpoint, and the future-affecting counters. Coverage is part
-  of the output: if a bound brain cannot expose its state, `evaluator_state_covered` is false and
-  the family is *named*, so a digest computed while blind can never collide with one computed while
-  seeing.
+  hydrology, the **restorable six-domain** RNG checkpoint, and the future-affecting counters.
+  Coverage is part of the output: if a bound brain cannot expose its state,
+  `evaluator_state_covered` is false and the family is *named*, so a digest computed while blind can
+  never collide with one computed while seeing.
 
 **Rules.**
 
@@ -213,7 +217,7 @@ Two digests decide whether two runs are *the same run*.
   one that says it cannot see it.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`characterization_digest_v0`,
-`WorldState::world_digest_v1`, `WorldDigestV1`); the run manifest in `scriptbots-app`.
+`WorldState::world_digest_v1`, `WorldDigestV1`); `RunManifestV3` in `scriptbots-app`.
 
 ---
 

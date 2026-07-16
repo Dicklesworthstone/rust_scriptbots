@@ -1,6 +1,6 @@
 //! `WorldDigestV1` must see what `CharacterizationDigestV0` could not.
 //!
-//! v0's limitations were DECLARED rather than hidden — `RunManifestV2` carries
+//! v0's limitations were DECLARED rather than hidden — `RunManifestV3` carries
 //! `CharacterizationLimitationsV0 { evaluator_state_covered: false, ..., superseded_by:
 //! "WorldDigestV1" }`. This file is where that promise is kept.
 //!
@@ -10,10 +10,11 @@
 
 use std::collections::BTreeSet;
 
+use rand::RngCore;
 use scriptbots_brain::mlp::MlpBrain;
 use scriptbots_core::{
     AgentData, Intervention, Region, ScriptBotsConfig, SmallRngStream, WorldDigestV1,
-    WorldDigestV1ContractError, WorldState,
+    WorldDigestV1ContractError, WorldState, rng_domains::RngDomain,
 };
 use serde::Serialize;
 
@@ -22,7 +23,7 @@ use serde::Serialize;
 /// The registered factory deliberately IGNORES the world's RNG and seeds from a fixed value, so
 /// that two worlds built with different `brain_seed`s differ in their brain GENOMES and in
 /// nothing else whatsoever: same config, same world seed, same bodies, same registry key, same
-/// family label, and — because the factory never draws from it — the same random-stream state.
+/// family label, and — because the factory never draws from them — the same domain-stream states.
 ///
 /// That isolation is the whole experiment. Any digest difference between two such worlds is
 /// attributable to the brains and to nothing else.
@@ -173,16 +174,115 @@ fn the_digest_is_deterministic() {
 }
 
 #[test]
-fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
+fn a_food_draw_moves_only_the_food_rng_domain() {
+    let config = ScriptBotsConfig {
+        rng_seed: Some(0xD04A_1A5E),
+        ..ScriptBotsConfig::default()
+    };
+    let control = WorldState::new(config.clone()).expect("control world");
+    let mut food_advanced = WorldState::new(config).expect("food-advanced world");
+
+    let before = control.world_digest_v1().expect("control V1.3 digest");
+    let _ = food_advanced
+        .rng(RngDomain::Food)
+        .expect("Food-domain RNG access")
+        .next_u64();
+    let after = food_advanced
+        .world_digest_v1()
+        .expect("food-advanced V1.3 digest");
+
+    assert_ne!(
+        before
+            .rng
+            .domains
+            .get(RngDomain::Food.tag())
+            .expect("Food digest before draw"),
+        after
+            .rng
+            .domains
+            .get(RngDomain::Food.tag())
+            .expect("Food digest after draw"),
+        "advancing the Food stream did not move its domain digest"
+    );
+    assert_eq!(
+        before
+            .rng
+            .domains
+            .get(RngDomain::Mutation.tag())
+            .expect("Mutation digest before Food draw"),
+        after
+            .rng
+            .domains
+            .get(RngDomain::Mutation.tag())
+            .expect("Mutation digest after Food draw"),
+        "a Food draw perturbed the Mutation-domain continuation"
+    );
+    for domain in RngDomain::ALL {
+        if domain == RngDomain::Food {
+            continue;
+        }
+        assert_eq!(
+            before
+                .rng
+                .domains
+                .get(domain.tag())
+                .expect("control digest contains every RNG domain"),
+            after
+                .rng
+                .domains
+                .get(domain.tag())
+                .expect("food-advanced digest contains every RNG domain"),
+            "a Food draw perturbed the {} RNG domain",
+            domain.tag()
+        );
+    }
+    assert_ne!(
+        before.rng.overall, after.rng.overall,
+        "the RNG aggregate ignored the changed Food checkpoint"
+    );
+    assert_ne!(
+        before.overall, after.overall,
+        "the world aggregate ignored the changed RNG aggregate"
+    );
+
+    assert_eq!(before.schema, after.schema);
+    assert_eq!(before.codec_version, after.codec_version);
+    assert_eq!(before.algorithm, after.algorithm);
+    assert_eq!(before.tick, after.tick);
+    assert_eq!(before.agents, after.agents);
+    assert_eq!(before.brains, after.brains);
+    assert_eq!(before.food, after.food);
+    assert_eq!(before.terrain, after.terrain);
+    assert_eq!(before.hydrology, after.hydrology);
+    assert_eq!(before.counters, after.counters);
+    assert_eq!(before.brain_registry, after.brain_registry);
+    assert_eq!(before.config, after.config);
+    assert_eq!(before.effects, after.effects);
+    assert_eq!(before.derived_transition, after.derived_transition);
+    assert_eq!(before.origins, after.origins);
+    assert_eq!(
+        before.evaluator_state_covered,
+        after.evaluator_state_covered
+    );
+    assert_eq!(before.uncovered_families, after.uncovered_families);
+    assert_eq!(before.factory_state_covered, after.factory_state_covered);
+    assert_eq!(
+        before.uncovered_factory_families,
+        after.uncovered_factory_families
+    );
+    assert_eq!(before.agent_identity, after.agent_identity);
+}
+
+#[test]
+fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
     #[derive(Serialize)]
-    struct LegacyWorldDigestV1_1 {
+    struct LegacyWorldDigestV1_2 {
         schema: String,
         codec_version: u16,
         algorithm: String,
         tick: scriptbots_core::Tick,
         overall: String,
         agents: String,
-        execution_order: String,
         brains: String,
         food: String,
         terrain: String,
@@ -203,17 +303,17 @@ fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
 
     let digest = world_with_brain_seed(17, 2)
         .world_digest_v1()
-        .expect("V1.2 wire fixture");
-    let json = serde_json::to_value(&digest).expect("encode V1.2 JSON");
+        .expect("V1.3 wire fixture");
+    let json = serde_json::to_value(&digest).expect("encode V1.3 JSON");
     let json_round_trip: WorldDigestV1 =
-        serde_json::from_value(json.clone()).expect("decode V1.2 JSON");
+        serde_json::from_value(json.clone()).expect("decode V1.3 JSON");
     assert_eq!(json_round_trip, digest);
     json_round_trip
         .validate_contract()
         .expect("JSON round trip must retain a valid V1");
     let keys: BTreeSet<String> = json
         .as_object()
-        .expect("V1.2 JSON object")
+        .expect("V1.3 JSON object")
         .keys()
         .cloned()
         .collect();
@@ -245,6 +345,29 @@ fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
     .map(str::to_owned)
     .collect();
     assert_eq!(keys, expected);
+    let rng = json["rng"].as_object().expect("V1.3 RNG digest object");
+    let rng_keys: BTreeSet<String> = rng.keys().cloned().collect();
+    let expected_rng_keys: BTreeSet<String> = ["overall", "domains"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        rng_keys,
+        expected_rng_keys,
+        "V1.3 RNG diagnostics must carry exactly one aggregate and one domain map"
+    );
+    let domain_keys: BTreeSet<String> = rng
+        .get("domains")
+        .and_then(serde_json::Value::as_object)
+        .expect("V1.3 RNG domain map")
+        .keys()
+        .cloned()
+        .collect();
+    let expected_domain_keys: BTreeSet<String> = RngDomain::ALL
+        .into_iter()
+        .map(|domain| domain.tag().to_owned())
+        .collect();
+    assert_eq!(domain_keys, expected_domain_keys);
 
     for required in [
         "codec_version",
@@ -258,7 +381,7 @@ fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
         let mut missing = json.clone();
         missing
             .as_object_mut()
-            .expect("mutable V1.2 JSON")
+            .expect("mutable V1.3 JSON")
             .remove(required);
         assert!(
             serde_json::from_value::<WorldDigestV1>(missing).is_err(),
@@ -268,7 +391,7 @@ fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
     let mut unknown = json;
     unknown
         .as_object_mut()
-        .expect("mutable V1.2 JSON")
+        .expect("mutable V1.3 JSON")
         .insert("unknown".to_owned(), serde_json::Value::Bool(true));
     assert!(serde_json::from_value::<WorldDigestV1>(unknown).is_err());
 
@@ -317,19 +440,18 @@ fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
         })
     ));
 
-    let legacy = LegacyWorldDigestV1_1 {
-        schema: "scriptbots.world-digest.v1.1".to_owned(),
-        codec_version: 1,
+    let legacy = LegacyWorldDigestV1_2 {
+        schema: "scriptbots.world-digest.v1.2".to_owned(),
+        codec_version: 2,
         algorithm: digest.algorithm.clone(),
         tick: digest.tick,
         overall: digest.overall.clone(),
         agents: digest.agents.clone(),
-        execution_order: digest.agents.clone(),
         brains: digest.brains.clone(),
         food: digest.food.clone(),
         terrain: digest.terrain.clone(),
         hydrology: digest.hydrology.clone(),
-        rng: digest.rng.clone(),
+        rng: digest.rng.overall.clone(),
         counters: digest.counters.clone(),
         brain_registry: digest.brain_registry.clone(),
         config: digest.config.clone(),
@@ -342,16 +464,16 @@ fn v1_2_wire_is_exact_and_rejects_the_allocation_sensitive_v1_1_shape() {
         uncovered_factory_families: digest.uncovered_factory_families.clone(),
         agent_identity: digest.agent_identity.clone(),
     };
-    let legacy_json = serde_json::to_value(&legacy).expect("encode legacy V1.1 JSON fixture");
+    let legacy_json = serde_json::to_value(&legacy).expect("encode legacy V1.2 JSON fixture");
     assert!(
         serde_json::from_value::<WorldDigestV1>(legacy_json).is_err(),
-        "allocation-sensitive JSON V1.1 payload decoded as V1.2"
+        "single-stream JSON V1.2 payload decoded as V1.3"
     );
-    let legacy = postcard::to_allocvec(&legacy).expect("encode legacy V1.1 fixture");
+    let legacy = postcard::to_allocvec(&legacy).expect("encode legacy V1.2 fixture");
     if let Ok(decoded) = postcard::from_bytes::<WorldDigestV1>(&legacy) {
         assert!(
             decoded.validate_contract().is_err(),
-            "allocation-sensitive positional V1.1 payload satisfied the V1.2 contract"
+            "single-stream positional V1.2 payload satisfied the V1.3 contract"
         );
     }
 }
@@ -431,10 +553,10 @@ fn a_live_world_moves_and_the_lanes_say_where() {
          observing the simulation at all"
     );
 
-    // The RNG lane must move: a stepped world has drawn from its stream, and two worlds whose
-    // streams stand at different points have different futures from the very next stochastic
-    // decision onward. v1 encodes the RESTORABLE checkpoint (algorithm identity included), not
-    // v0's four-draw probe.
+    // The RNG lane must move: a stepped world has drawn from its domain streams, and two worlds
+    // whose domain checkpoints stand at different points have different futures from the very
+    // next stochastic decision onward. v1 encodes every RESTORABLE checkpoint (domain derivation
+    // and generator identities included), not v0's four-draw probe.
     assert_ne!(
         before.rng, after.rng,
         "the RNG lane did not move across 25 ticks, so the digest cannot tell apart two worlds \

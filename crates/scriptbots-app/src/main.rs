@@ -4,7 +4,7 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::{
     BootstrapEvidenceV0, CharacterizationTraceV1, ControlServerConfig, ControlServerReservation,
-    RunIdentityV1, RunManifestV2, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
+    RunIdentityV1, RunManifestV3, ScenarioIdentityV0, SharedAnalytics, SharedWorld, ThreadPolicyV0,
     WorldStepDriver,
     precedence::{ThreadPolicy, ThreadSource, resolve_thread_policy},
     renderer::{Renderer, RendererContext},
@@ -931,8 +931,8 @@ fn build_run_manifest(
     identity: RunIdentityV1,
     scenario: ScenarioIdentityV0,
     thread_policy: ThreadPolicy,
-) -> std::result::Result<RunManifestV2, scriptbots_app::RunManifestError> {
-    RunManifestV2::from_world_with_provenance(
+) -> std::result::Result<RunManifestV3, scriptbots_app::RunManifestError> {
+    RunManifestV3::from_world_with_provenance(
         identity,
         scenario,
         world,
@@ -953,7 +953,7 @@ fn build_run_manifest(
 
 struct PendingRunManifest {
     path: PathBuf,
-    manifest: RunManifestV2,
+    manifest: RunManifestV3,
     start: WorldDigestV1,
     requested: u64,
     thread_policy: ThreadPolicy,
@@ -962,7 +962,7 @@ struct PendingRunManifest {
 fn prepare_run_manifest(
     world: &WorldState,
     storage_path: Option<&str>,
-    manifest: RunManifestV2,
+    manifest: RunManifestV3,
     thread_policy: ThreadPolicy,
     bootstrap_ticks: u64,
 ) -> Option<PendingRunManifest> {
@@ -3392,7 +3392,7 @@ mod tests {
         );
         assert_eq!(manifest.scenario.bootstrap_ticks, 37);
         assert!(manifest.bootstrap_evidence.is_none());
-        assert_eq!(manifest.schema, scriptbots_app::RUN_MANIFEST_V2_SCHEMA);
+        assert_eq!(manifest.schema, scriptbots_app::RUN_MANIFEST_V3_SCHEMA);
         assert_eq!(
             manifest
                 .thread_policy
