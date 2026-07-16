@@ -2036,7 +2036,7 @@ claim that world integration early.
 - [Completed — `bd-2z0.3.13`] Canonical `scriptbots.world-digest.v1.1`: stable-UID
   science lanes, explicit current dense execution-order lane, evaluator/factory coverage,
   scientific config/effects/derived/origin state, and aggregate metadata binding;
-- [Currently In Progress — `bd-2z0.3.14`, TopazCastle, 2026-07-15] Make every dense agent
+- [Completed — `bd-2z0.3.14`, `1387939`, DSR `bd-2z0-3-14-verify-7`] Make every dense agent
   execution and spawn stage canonical by `AgentUid`, then advance the digest schema before
   retiring the explicit execution-order lane;
 - include genome, evaluator state, RNG state, config, terrain/food, spawn ordinals, and all future-affecting counters;
