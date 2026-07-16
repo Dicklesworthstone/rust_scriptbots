@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use scriptbots_app::{RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA, RUN_MANIFEST_V3_SCHEMA, RunManifestV3};
+use scriptbots_app::{
+    CHARACTERIZATION_TRACE_V2_SCHEMA, CharacterizationTraceV2, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
+    RUN_MANIFEST_V3_SCHEMA, RunManifestV3,
+};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::StorageReader;
 
@@ -84,6 +87,40 @@ fn manifest_of(output: &std::process::Output, dir: &Path) -> serde_json::Value {
     );
     let bytes = std::fs::read(dir.join("run.manifest.json")).expect("manifest exists");
     serde_json::from_slice(&bytes).expect("valid JSON")
+}
+
+fn characterization_trace_of(
+    output: &std::process::Output,
+    path: &Path,
+) -> CharacterizationTraceV2 {
+    assert!(
+        output.status.success(),
+        "the characterization run did not complete, so this test proves nothing.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(path).expect("characterization trace exists");
+    serde_json::from_slice(&bytes).expect("valid characterization trace JSON")
+}
+
+fn manifest_digest_for_test(manifest: &RunManifestV3) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let bytes = manifest
+        .canonical_json_bytes()
+        .expect("manifest has canonical JSON");
+    let mut hash = OFFSET_BASIS;
+    for byte in b"run-manifest-v3"
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(bytes.iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 #[test]
@@ -498,6 +535,88 @@ fn the_manifest_records_which_config_layers_built_the_run_and_who_displaced_whom
         "the durable manifest and the sidecar must agree on the ordered layer digests"
     );
     drop(reader);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn characterization_records_the_same_config_layer_provenance_in_its_bound_manifest() {
+    let dir = run_dir("characterization_config_layer_provenance");
+    let scenario_path = dir.join("scenario.toml");
+    let trace_path = dir.join("characterization.json");
+    std::fs::write(&scenario_path, b"world_width = 2000\n").expect("write scenario layer");
+    let scenario_arg = scenario_path
+        .to_str()
+        .expect("temp path is valid Unicode")
+        .to_owned();
+    let trace_arg = trace_path
+        .to_str()
+        .expect("trace path is valid Unicode")
+        .to_owned();
+
+    let output = launch_with(
+        &dir,
+        &[("SCRIPTBOTS_CONFIG_OVERRIDES", "world_width = 1000")],
+        &[
+            "--config",
+            &scenario_arg,
+            "--set",
+            "world_width=500",
+            "--characterize-v0",
+            "0",
+            "--characterization-out",
+            &trace_arg,
+        ],
+    );
+    let trace = characterization_trace_of(&output, &trace_path);
+
+    assert_eq!(trace.schema, CHARACTERIZATION_TRACE_V2_SCHEMA);
+    assert_eq!(
+        trace.manifest.normalized_config["world_width"], 500,
+        "the characterization world must use the CLI layer's winning value"
+    );
+    let overrides = &trace.manifest.config_overrides;
+    let displaced: Vec<(&str, &str)> = overrides
+        .iter()
+        .filter(|entry| entry.path == "world_width")
+        .map(|entry| {
+            (
+                entry.losing_kind.wire_tag(),
+                entry.winning_kind.wire_tag(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        displaced,
+        vec![("file", "environment"), ("environment", "cli")],
+        "the characterization manifest must preserve both displacements: {overrides:?}"
+    );
+
+    let digest_kinds: Vec<&str> = trace
+        .manifest
+        .scenario
+        .ordered_config_layer_digests
+        .iter()
+        .map(|entry| entry.split(':').next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        digest_kinds,
+        vec!["defaults", "file", "environment", "environment", "cli"],
+        "the characterization manifest must retain every ordered config layer"
+    );
+
+    assert_eq!(
+        trace.manifest_digest,
+        manifest_digest_for_test(&trace.manifest),
+        "the trace digest must bind the manifest after override provenance is attached"
+    );
+    let mut without_overrides = trace.manifest.clone();
+    without_overrides.config_overrides.clear();
+    assert_ne!(
+        trace.manifest_digest,
+        manifest_digest_for_test(&without_overrides),
+        "removing override provenance must change the bound manifest digest"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

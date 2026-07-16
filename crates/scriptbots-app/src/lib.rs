@@ -946,25 +946,39 @@ impl CharacterizationTraceV2 {
         world: &mut WorldState,
         ticks: u64,
     ) -> Result<Self, CharacterizationTraceErrorV2> {
-        Self::capture_with_scenario_and_step(identity, scenario, world, ticks, |world| world.step())
+        Self::capture_with_scenario_and_step(
+            identity,
+            scenario,
+            Vec::new(),
+            world,
+            ticks,
+            |world| world.step(),
+        )
     }
 
-    /// Capture through the world's external persistence session without changing its config.
+    /// Capture through the world's external persistence session with launch provenance.
     pub fn capture_with_scenario_and_session(
         identity: RunIdentityV1,
         scenario: ScenarioIdentityV0,
+        config_overrides: Vec<precedence::ConfigFieldOverride>,
         world: &mut WorldState,
         persistence: &mut PersistenceAdmissionSession,
         ticks: u64,
     ) -> Result<Self, CharacterizationTraceErrorV2> {
-        Self::capture_with_scenario_and_step(identity, scenario, world, ticks, |world| {
-            persistence.step(world)
-        })
+        Self::capture_with_scenario_and_step(
+            identity,
+            scenario,
+            config_overrides,
+            world,
+            ticks,
+            |world| persistence.step(world),
+        )
     }
 
     fn capture_with_scenario_and_step(
         identity: RunIdentityV1,
         scenario: ScenarioIdentityV0,
+        config_overrides: Vec<precedence::ConfigFieldOverride>,
         world: &mut WorldState,
         ticks: u64,
         mut step: impl FnMut(&mut WorldState) -> Result<TickEvents, scriptbots_core::WorldStepError>,
@@ -981,7 +995,8 @@ impl CharacterizationTraceV2 {
             scenario,
             world,
             BuildProvenanceV0::current(),
-        )?;
+        )?
+        .with_config_overrides(config_overrides);
         let manifest_bytes = manifest.canonical_json_bytes()?;
         let manifest_digest = manifest_digest("run-manifest-v3", &manifest_bytes);
         let mut points = Vec::with_capacity(usize::try_from(ticks).unwrap_or(0) + 1);
@@ -1978,6 +1993,7 @@ mod characterization_tests {
         let trace = CharacterizationTraceV2::capture_with_scenario_and_session(
             identity,
             ScenarioIdentityV0::caller_seeded("session-enabled-trace"),
+            Vec::new(),
             &mut world,
             &mut persistence,
             2,

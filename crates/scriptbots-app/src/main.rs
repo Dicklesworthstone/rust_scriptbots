@@ -98,7 +98,7 @@ fn main() -> Result<()> {
     let (config, launch_scenario, config_overrides) = compose_config_with_scenario(&cli)?;
 
     if let Some(ticks) = cli.characterize_v0 {
-        run_characterization_v0(&cli, config, launch_scenario, ticks)?;
+        run_characterization_v0(&cli, config, launch_scenario, config_overrides, ticks)?;
         return Ok(());
     }
 
@@ -640,6 +640,7 @@ fn run_characterization_v0(
     cli: &AppCli,
     mut config: ScriptBotsConfig,
     mut scenario: ScenarioIdentityV0,
+    config_overrides: Vec<ConfigFieldOverride>,
     ticks: u64,
 ) -> Result<()> {
     let (root_seed, generated_seed) = materialize_run_seed(&mut config);
@@ -664,6 +665,7 @@ fn run_characterization_v0(
     let trace = CharacterizationTraceV2::capture_with_scenario_and_session(
         identity,
         scenario,
+        config_overrides,
         &mut world,
         &mut persistence,
         ticks,
@@ -4299,7 +4301,7 @@ mod tests {
         };
         let scenario = ScenarioIdentityV0::caller_seeded("characterization-seed-test");
 
-        run_characterization_v0(&cli, config, scenario, 0)
+        run_characterization_v0(&cli, config, scenario, Vec::new(), 0)
             .expect("capture zero-tick characterization");
         let trace: CharacterizationTraceV2 =
             serde_json::from_slice(&fs::read(output).expect("read characterization artifact"))
