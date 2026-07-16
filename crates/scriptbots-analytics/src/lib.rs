@@ -234,6 +234,7 @@ impl Registry {
                 Box::new(NarrativeTimeline),
                 Box::new(MetricSummary),
                 Box::new(MetricChangepoints),
+                Box::new(RunComparison),
             ],
         }
     }
@@ -650,6 +651,223 @@ impl Report for MetricChangepoints {
             self.name(),
             cx,
             machine.changepoints.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
+    }
+}
+
+/// `compare-runs`: paired treatment-effect comparison of two run databases (serves bd-16g.1.4).
+///
+/// Given a control run (the database this report runs against) and a `treatment_db=<path>`, it
+/// measures whether the treatment shifted each metric the two runs share. The runs are assumed to
+/// share seeds, so each metric is compared TICK-ALIGNED — the control and treatment values at the
+/// same tick form a matched pair — and the pairing is fed to [`compare`], which applies a
+/// sign-flip permutation test, a paired-bootstrap CI, Cohen's `d_z`, and Benjamini-Hochberg across
+/// the metrics. It is the DB-facing glue for the matched-seed statistics; the pure analysis was
+/// proven in isolation, this wires it to two real databases.
+struct RunComparison;
+
+#[derive(Debug, Serialize)]
+struct RunComparisonMachine {
+    /// The treatment database this control run was compared against (provenance).
+    treatment_db: String,
+    /// Target false-discovery rate for the across-metrics correction.
+    fdr: f64,
+    /// Metrics present in BOTH runs with enough tick-aligned pairs to compare.
+    metrics_compared: usize,
+    /// How many hold up under FDR control — the honest count of real treatment effects.
+    significant: usize,
+    /// True when either bounded metric read hit its cap, so the comparison is over recent history
+    /// rather than the whole run.
+    truncated: bool,
+    metrics: Vec<RunComparisonRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunComparisonRow {
+    metric: String,
+    /// Number of tick-aligned matched pairs.
+    n_pairs: usize,
+    /// Mean of `treatment - control` over the matched pairs. The treatment-effect estimate.
+    mean_difference: f64,
+    ci_lower: f64,
+    ci_upper: f64,
+    p_value: f64,
+    /// Paired standardized effect size (`d_z`).
+    cohens_dz: f64,
+    /// Fraction of pairs where treatment exceeded control.
+    fraction_positive: f64,
+    /// Survives Benjamini-Hochberg across the run's shared metrics. The field to act on.
+    significant_fdr: bool,
+}
+
+impl Report for RunComparison {
+    fn name(&self) -> &'static str {
+        "compare-runs"
+    }
+
+    fn description(&self) -> &'static str {
+        "Paired treatment-effect comparison of two run databases (tick-aligned, FDR-controlled)"
+    }
+
+    fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let treatment_path = params.get("treatment_db").ok_or_else(|| AnalyticsError::BadParam {
+            name: "treatment_db".to_owned(),
+            reason: "compare-runs requires treatment_db=<path> (the treatment run database)"
+                .to_owned(),
+        })?;
+        let fdr = params
+            .get("fdr")
+            .map(str::parse::<f64>)
+            .transpose()
+            .map_err(|e| AnalyticsError::BadParam {
+                name: "fdr".to_owned(),
+                reason: e.to_string(),
+            })?
+            .unwrap_or(0.05);
+
+        let read_started = Instant::now();
+        let control_readings = cx.reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
+        let treatment_reader = StorageReader::open_finished(treatment_path)?;
+        let treatment_readings = treatment_reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
+        let truncated = control_readings.len() >= METRIC_SUMMARY_ROW_LIMIT
+            || treatment_readings.len() >= METRIC_SUMMARY_ROW_LIMIT;
+        log_report_stage(
+            "read",
+            &read_started,
+            control_readings.len() + treatment_readings.len(),
+        );
+
+        let render_started = Instant::now();
+        // metric -> (tick -> value), for each run. BTreeMap so tick order and metric order are
+        // stable and the tick intersection below is straightforward.
+        let mut control: BTreeMap<String, BTreeMap<u64, f64>> = BTreeMap::new();
+        for PersistedMetric { tick, name, value } in control_readings {
+            control.entry(name).or_default().insert(tick, value);
+        }
+        let mut treatment: BTreeMap<String, BTreeMap<u64, f64>> = BTreeMap::new();
+        for PersistedMetric { tick, name, value } in treatment_readings {
+            treatment.entry(name).or_default().insert(tick, value);
+        }
+
+        // For every metric present in BOTH runs, pair the values at ticks the two runs share. At
+        // least three pairs are required — a paired test on one or two points is noise.
+        struct Paired {
+            name: String,
+            control: Vec<f64>,
+            treatment: Vec<f64>,
+        }
+        let mut paired: Vec<Paired> = Vec::new();
+        for (name, control_ticks) in &control {
+            let Some(treatment_ticks) = treatment.get(name) else {
+                continue; // metric only present in one run — nothing to compare
+            };
+            let mut control_values = Vec::new();
+            let mut treatment_values = Vec::new();
+            for (tick, control_value) in control_ticks {
+                if let Some(treatment_value) = treatment_ticks.get(tick) {
+                    control_values.push(*control_value);
+                    treatment_values.push(*treatment_value);
+                }
+            }
+            if control_values.len() >= 3 {
+                paired.push(Paired {
+                    name: name.clone(),
+                    control: control_values,
+                    treatment: treatment_values,
+                });
+            }
+        }
+
+        let compare_params = compare::CompareParams {
+            fdr,
+            ..compare::CompareParams::default()
+        };
+        // `series` borrows `paired`, which outlives it and the compare_metrics call below.
+        // `as_str`/`as_slice` are explicit rather than relying on `&String`/`&Vec` coercion at the
+        // struct-field site.
+        let series: Vec<compare::MetricSeries<'_>> = paired
+            .iter()
+            .map(|p| compare::MetricSeries {
+                name: p.name.as_str(),
+                control: p.control.as_slice(),
+                treatment: p.treatment.as_slice(),
+            })
+            .collect();
+        let study = compare::compare_metrics(&series, &compare_params).map_err(|e| metric_stats_error(&e))?;
+
+        let mut rows = Vec::with_capacity(study.metrics.len());
+        let mut significant = 0usize;
+        for named in &study.metrics {
+            let c = &named.comparison;
+            if c.significant_fdr {
+                significant += 1;
+            }
+            rows.push(RunComparisonRow {
+                metric: named.metric.clone(),
+                n_pairs: c.n_pairs,
+                mean_difference: c.mean_difference,
+                ci_lower: c.difference_ci.lower,
+                ci_upper: c.difference_ci.upper,
+                p_value: c.p_value,
+                cohens_dz: c.cohens_dz,
+                fraction_positive: c.fraction_positive,
+                significant_fdr: c.significant_fdr,
+            });
+        }
+
+        let machine = RunComparisonMachine {
+            treatment_db: treatment_path.to_owned(),
+            fdr,
+            metrics_compared: rows.len(),
+            significant,
+            truncated,
+            metrics: rows,
+        };
+
+        let mut md = String::new();
+        let _ = writeln!(md, "# Run comparison\n");
+        let _ = writeln!(
+            md,
+            "_treatment=`{}`, FDR={}, {} of {} shared metrics show a certified treatment effect._\n",
+            machine.treatment_db, machine.fdr, machine.significant, machine.metrics_compared
+        );
+        if machine.truncated {
+            let _ = writeln!(
+                md,
+                "> **Note:** a metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; the \
+                 comparison is over recent history, not the whole run.\n"
+            );
+        }
+        if machine.metrics.is_empty() {
+            let _ = writeln!(md, "_No metric was present in both runs with enough matched ticks._");
+        } else {
+            let _ = writeln!(md, "| metric | pairs | Δ (treat−ctrl) | 95% CI | p | d_z | +frac | real? |");
+            let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
+            for row in &machine.metrics {
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {:+.4} | [{:.3}, {:.3}] | {:.4} | {:.3} | {:.2} | {} |",
+                    row.metric,
+                    row.n_pairs,
+                    row.mean_difference,
+                    row.ci_lower,
+                    row.ci_upper,
+                    row.p_value,
+                    row.cohens_dz,
+                    row.fraction_positive,
+                    if row.significant_fdr { "yes" } else { "no" },
+                );
+            }
+        }
+
+        let output = base_output(
+            self.name(),
+            cx,
+            machine.metrics.len(),
             serde_json::to_value(&machine)?,
             md,
         )?;

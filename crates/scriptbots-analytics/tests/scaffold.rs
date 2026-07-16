@@ -329,6 +329,7 @@ fn registry_lists_builtin_reports_with_descriptions() {
             "narrative-timeline",
             "metric-summary",
             "metric-changepoints",
+            "compare-runs",
         ]
     );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));
