@@ -785,6 +785,7 @@ fn run_det_child(
         ticks: u64,
         last_tick: u64,
         summaries: Vec<TickSummary>,
+        world_digest: WorldDigestV1,
     }
     let last_tick = run.summaries.last().map(|s| s.tick.0).unwrap_or(0);
     let out = DetOut {
@@ -792,6 +793,7 @@ fn run_det_child(
         ticks: run.simulated_ticks,
         last_tick,
         summaries: run.summaries,
+        world_digest: run.final_digest,
     };
     let json = serde_json::to_string(&out)?;
     println!("{}", json);
@@ -878,6 +880,7 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         ticks: u64,
         last_tick: u64,
         summaries: Vec<TickSummary>,
+        world_digest: WorldDigestV1,
     }
     let left: DetOutIn =
         serde_json::from_slice(&out1.stdout).context("failed to parse child 1 JSON output")?;
@@ -920,6 +923,13 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
             "event count mismatch: 1t={} vs Nt={}",
             left.events,
             right.events
+        );
+    }
+    if left.world_digest != right.world_digest {
+        bail!(
+            "WorldDigestV1 mismatch: 1t={} vs Nt={}",
+            left.world_digest.overall,
+            right.world_digest.overall
         );
     }
     let _ = fs::remove_file(&layer_path);
@@ -2722,6 +2732,7 @@ struct ReplayRun {
     events: Vec<PersistedReplayEvent>,
     summaries: Vec<TickSummary>,
     simulated_ticks: u64,
+    final_digest: WorldDigestV1,
 }
 
 fn run_headless_simulation(
@@ -2748,6 +2759,9 @@ fn run_headless_simulation(
     let sense_summary = SenseRunSummary::capture(&world);
     emit_sense_run_end(sense_summary, simulation_result.is_ok());
     simulation_result?;
+    let final_digest = world
+        .world_digest_v1()
+        .context("failed to capture the final headless WorldDigestV1")?;
     drop(world);
     drop(persistence);
 
@@ -2773,6 +2787,7 @@ fn run_headless_simulation(
         events,
         summaries,
         simulated_ticks: tick_limit,
+        final_digest,
     })
 }
 
@@ -3414,7 +3429,10 @@ fn install_brains(world: &mut WorldState, preset: BrainPreset) -> Result<Install
         None
     };
 
+    #[cfg(feature = "neuro")]
     let mut withheld = Vec::new();
+    #[cfg(not(feature = "neuro"))]
+    let withheld = Vec::new();
     let mut population = Vec::new();
 
     // Founding-population admission is structural: every eligible entry must own a versioned
@@ -3736,6 +3754,30 @@ mod tests {
             vec![(key, FT_BRAIN_KIND.to_owned())]
         );
         assert!(world.brain_registry().is_protocol_family(key));
+    }
+
+    #[cfg(feature = "brain-ft")]
+    #[test]
+    fn ft_headless_run_exposes_a_complete_world_digest() {
+        let run = run_headless_simulation(
+            &ScriptBotsConfig {
+                rng_seed: Some(424_242),
+                persistence_interval: 1,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                reproduction_attempt_chance: 0.0,
+                ..ScriptBotsConfig::default()
+            },
+            2,
+            BrainPreset::Ft,
+        )
+        .expect("headless Ft run");
+
+        run.final_digest
+            .validate_contract()
+            .expect("complete Ft world digest contract");
+        assert!(run.final_digest.evaluator_state_covered);
+        assert!(run.final_digest.uncovered_families.is_empty());
     }
 
     #[cfg(not(feature = "brain-ft"))]
