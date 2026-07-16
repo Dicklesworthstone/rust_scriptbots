@@ -6190,6 +6190,8 @@ pub const MAX_BRAIN_FAMILY_ID_BYTES: usize = 64;
 pub const MAX_BRAIN_GENOME_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Maximum opaque payload accepted for a live evaluator checkpoint.
 pub const MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES: usize = 256 * 1024;
+/// Maximum family-owned execution-layout key used to form one batch cohort.
+pub const MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES: usize = 256;
 
 /// Validated, stable identifier for a brain-family protocol.
 ///
@@ -6246,6 +6248,33 @@ impl BrainFamilyId {
     /// Borrow the validated wire identifier.
     #[must_use]
     pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Bounded family-owned execution-layout identity for protocol batching.
+///
+/// Equal keys promise only that the family can evaluate the corresponding lanes through one
+/// batch kernel. Every lane still carries its own genome and evaluator state; the key is transient
+/// execution metadata and is deliberately absent from checkpoints and scientific digests.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BrainBatchArchitectureKey(Vec<u8>);
+
+impl BrainBatchArchitectureKey {
+    /// Validate and construct one family-owned architecture key.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, BrainProtocolError> {
+        if bytes.len() > MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES {
+            return Err(BrainProtocolError::BatchArchitectureKeyTooLarge {
+                found: bytes.len(),
+                maximum: MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Borrow the exact family-owned key bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -6883,6 +6912,8 @@ pub enum BrainProtocolError {
         inputs: usize,
         outputs: usize,
     },
+    #[error("brain batch architecture key is {found} bytes; maximum is {maximum}")]
+    BatchArchitectureKeyTooLarge { found: usize, maximum: usize },
 }
 
 fn ensure_payload_bound(
@@ -7009,6 +7040,11 @@ pub trait BrainEvaluator: Send + Sync {
 ///
 /// This is deliberately separate from the scalar evaluator so families can keep structure-of-
 /// arrays or device-native state instead of allocating one `Box<dyn BrainEvaluator>` per agent.
+/// Lane order is caller order. A successful call must be bit-identical to scalar evaluation with
+/// the same per-lane reduction order and independent of cohort partitioning or thread count. Core
+/// evaluates through a disposable batch object and commits outputs/state only after every lane
+/// checkpoints and reconstructs successfully, so a rejected or partially mutated batch is never
+/// allowed to replace the parked scalar preimages.
 pub trait BrainBatchEvaluator: Send {
     /// Owning protocol family.
     fn family_id(&self) -> &BrainFamilyId;
@@ -7097,11 +7133,23 @@ pub trait BrainFamilyCodec: Send + Sync {
         state: &BrainEvaluatorStateEnvelope,
     ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError>;
 
+    /// Return the bounded execution-layout key for one batch-capable genome.
+    ///
+    /// `None` preserves the exact scalar path. Equal keys mean only that the family can process
+    /// those ordered lanes together; weights and dynamic state remain distinct per lane. An
+    /// implementation opting in must validate the supplied genome before returning a key.
+    fn batch_architecture_key(
+        &self,
+        _genome: &BrainGenomeEnvelope,
+    ) -> Result<Option<BrainBatchArchitectureKey>, BrainProtocolError> {
+        Ok(None)
+    }
+
     /// Optionally reconstruct a family-owned batch/arena evaluator.
     fn batch_evaluator(
         &self,
-        _genomes: &[BrainGenomeEnvelope],
-        _states: &[BrainEvaluatorStateEnvelope],
+        _genomes: &[&BrainGenomeEnvelope],
+        _states: &[&BrainEvaluatorStateEnvelope],
     ) -> Result<Option<Box<dyn BrainBatchEvaluator>>, BrainProtocolError> {
         Ok(None)
     }
@@ -13608,6 +13656,14 @@ impl WorldState {
     }
 
     fn stage_brains(&mut self) -> Result<(), BrainSpawnError> {
+        #[cfg(feature = "batch-brains")]
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+        struct BrainCohortKey {
+            registry_key: u64,
+            family_id: BrainFamilyId,
+            architecture: BrainBatchArchitectureKey,
+        }
+
         struct BrainJob {
             agent_id: AgentId,
             kind: String,
@@ -13615,6 +13671,10 @@ impl WorldState {
             sensors: [f32; INPUT_SIZE],
             outputs: [f32; OUTPUT_SIZE],
             error: Option<BrainSpawnError>,
+            #[cfg(feature = "batch-brains")]
+            protocol_registry_key: Option<u64>,
+            #[cfg(feature = "batch-brains")]
+            batch_handled: bool,
         }
 
         // Pull each live execution object out of its exclusive binding so evaluation can run
@@ -13623,6 +13683,11 @@ impl WorldState {
         let mut jobs: Vec<BrainJob> = Vec::with_capacity(self.agents.len());
         for agent_id in self.agents.iter_handles() {
             if let Some(runtime) = self.runtime.get_mut(agent_id) {
+                #[cfg(feature = "batch-brains")]
+                let protocol_registry_key = match &runtime.brain {
+                    BrainBinding::Protocol { registry_key, .. } => Some(*registry_key),
+                    BrainBinding::Unbound | BrainBinding::Legacy { .. } => None,
+                };
                 jobs.push(BrainJob {
                     agent_id,
                     kind: runtime.brain.kind().unwrap_or("unbound").to_owned(),
@@ -13630,11 +13695,227 @@ impl WorldState {
                     sensors: runtime.sensors,
                     outputs: [0.0; OUTPUT_SIZE],
                     error: None,
+                    #[cfg(feature = "batch-brains")]
+                    protocol_registry_key,
+                    #[cfg(feature = "batch-brains")]
+                    batch_handled: false,
                 });
             }
         }
 
+        #[cfg(feature = "batch-brains")]
+        {
+            let mut candidates = Vec::<(BrainCohortKey, usize)>::new();
+            let mut opted_in_families = BTreeSet::new();
+            let mut rejected_cohorts = 0_usize;
+
+            // Classification is canonical and fail-closed. Missing execution variants never
+            // reach this loop because only a parked live protocol evaluator can become a batch
+            // candidate. A family declining the architecture hook preserves the scalar path.
+            for (job_index, job) in jobs.iter_mut().enumerate() {
+                if !matches!(job.execution, BrainExecution::Protocol(_)) {
+                    continue;
+                }
+                let Some(registry_key) = job.protocol_registry_key else {
+                    continue;
+                };
+                let Some(adapter) = self.brain_registry.family(registry_key) else {
+                    continue;
+                };
+                let Some(genome) = self
+                    .runtime
+                    .get(job.agent_id)
+                    .and_then(|runtime| runtime.brain.genome())
+                else {
+                    continue;
+                };
+                match adapter.batch_architecture_key(genome) {
+                    Ok(Some(architecture)) => {
+                        opted_in_families.insert(registry_key);
+                        candidates.push((
+                            BrainCohortKey {
+                                registry_key,
+                                family_id: genome.family_id().clone(),
+                                architecture,
+                            },
+                            job_index,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        job.batch_handled = true;
+                        job.error = Some(BrainSpawnError::new(job.kind.clone(), error));
+                    }
+                }
+            }
+
+            // Sorting a single flat index list avoids per-family map/vector churn while retaining
+            // canonical handle order inside every equal-key cohort.
+            candidates.sort_unstable_by(|(left_key, left_index), (right_key, right_index)| {
+                left_key
+                    .cmp(right_key)
+                    .then_with(|| left_index.cmp(right_index))
+            });
+
+            let reject_cohort = |jobs: &mut [BrainJob],
+                                 cohort: &[(BrainCohortKey, usize)],
+                                 error: BrainProtocolError| {
+                for (lane, (_, job_index)) in cohort.iter().enumerate() {
+                    let job = &mut jobs[*job_index];
+                    job.batch_handled = true;
+                    if lane == 0 {
+                        job.error = Some(BrainSpawnError::new(job.kind.clone(), error.clone()));
+                    }
+                }
+            };
+
+            let mut eligible_sizes = Vec::new();
+            let mut batch_sizes = Vec::new();
+            let mut cursor = 0_usize;
+            while cursor < candidates.len() {
+                let cohort_key = &candidates[cursor].0;
+                let cohort_len = candidates[cursor..]
+                    .iter()
+                    .take_while(|(key, _)| key == cohort_key)
+                    .count();
+                let end = cursor + cohort_len;
+                let cohort = &candidates[cursor..end];
+
+                // A single lane gains nothing from transient cohort construction and retains the
+                // exact scalar steady-state path.
+                if cohort.len() < 2 {
+                    cursor = end;
+                    continue;
+                }
+                eligible_sizes.push(cohort.len());
+
+                let Some(adapter) = self.brain_registry.family(cohort_key.registry_key) else {
+                    cursor = end;
+                    continue;
+                };
+                let genomes = cohort
+                    .iter()
+                    .map(|(_, job_index)| {
+                        self.runtime
+                            .get(jobs[*job_index].agent_id)
+                            .and_then(|runtime| runtime.brain.genome())
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let Some(genomes) = genomes else {
+                    cursor = end;
+                    continue;
+                };
+
+                let mut states = Vec::with_capacity(cohort.len());
+                let mut checkpoint_error = None;
+                for ((_, job_index), genome) in cohort.iter().zip(&genomes) {
+                    let BrainExecution::Protocol(evaluator) = &jobs[*job_index].execution else {
+                        unreachable!("only live protocol evaluators enter batch cohorts");
+                    };
+                    match adapter.checkpoint_evaluator_for_genome(genome, evaluator.as_ref()) {
+                        Ok(state) => states.push(state),
+                        Err(error) => {
+                            checkpoint_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if let Some(error) = checkpoint_error {
+                    rejected_cohorts += 1;
+                    reject_cohort(&mut jobs, cohort, error);
+                    cursor = end;
+                    continue;
+                }
+
+                let state_refs = states.iter().collect::<Vec<_>>();
+                let mut batch = match adapter.batch_evaluator(&genomes, &state_refs) {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => {
+                        cursor = end;
+                        continue;
+                    }
+                    Err(error) => {
+                        rejected_cohorts += 1;
+                        reject_cohort(&mut jobs, cohort, error);
+                        cursor = end;
+                        continue;
+                    }
+                };
+
+                let sensors = cohort
+                    .iter()
+                    .map(|(_, job_index)| jobs[*job_index].sensors)
+                    .collect::<Vec<_>>();
+                let mut outputs = vec![[0.0; OUTPUT_SIZE]; cohort.len()];
+                let replacements = (|| {
+                    require_family(batch.family_id(), adapter.family_id())?;
+                    batch.evaluate_batch(&sensors, &mut outputs)?;
+                    let next_states = batch.checkpoint_states()?;
+                    if next_states.len() != cohort.len() {
+                        return Err(BrainProtocolError::BatchCardinalityMismatch {
+                            evaluators: next_states.len(),
+                            inputs: cohort.len(),
+                            outputs: outputs.len(),
+                        });
+                    }
+                    genomes
+                        .iter()
+                        .zip(&next_states)
+                        .map(|(genome, state)| {
+                            Self::reconstruct_protocol_evaluator(adapter, genome, state)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })();
+
+                match replacements {
+                    Ok(replacements) => {
+                        for (((_, job_index), output), evaluator) in cohort
+                            .iter()
+                            .zip(outputs.into_iter())
+                            .zip(replacements.into_iter())
+                        {
+                            let job = &mut jobs[*job_index];
+                            job.execution = BrainExecution::Protocol(evaluator);
+                            job.outputs = output;
+                            job.batch_handled = true;
+                        }
+                        batch_sizes.push(cohort.len());
+                    }
+                    Err(error) => {
+                        rejected_cohorts += 1;
+                        reject_cohort(&mut jobs, cohort, error);
+                    }
+                }
+                cursor = end;
+            }
+
+            let scalar_protocol_agents = jobs
+                .iter()
+                .filter(|job| {
+                    !job.batch_handled && matches!(job.execution, BrainExecution::Protocol(_))
+                })
+                .count();
+            tracing::debug!(
+                target: "scriptbots::brain_batch",
+                tick = self.tick.0,
+                opted_in_families = opted_in_families.len(),
+                eligible_cohorts = eligible_sizes.len(),
+                eligible_agents = eligible_sizes.iter().sum::<usize>(),
+                batch_cohorts = batch_sizes.len(),
+                batch_agents = batch_sizes.iter().sum::<usize>(),
+                scalar_protocol_agents,
+                rejected_cohorts,
+                eligible_sizes = ?eligible_sizes,
+                batch_sizes = ?batch_sizes,
+                "classified and evaluated protocol brain cohorts"
+            );
+        }
+
         let evaluate = |job: &mut BrainJob| {
+            #[cfg(feature = "batch-brains")]
+            if job.batch_handled {
+                return;
+            }
             match &mut job.execution {
                 BrainExecution::None => {
                     job.outputs = Self::default_outputs(&job.sensors);
@@ -14862,27 +15143,26 @@ impl WorldState {
         genome: BrainGenomeEnvelope,
         state: BrainEvaluatorStateEnvelope,
     ) -> Result<BrainBinding, BrainSpawnError> {
-        adapter
-            .validate_genome(&genome)
+        let evaluator = Self::reconstruct_protocol_evaluator(adapter, &genome, &state)
             .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
-        adapter
-            .validate_evaluator_state(&state)
-            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
-        let evaluator = adapter
-            .evaluator(&genome, &state)
-            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
-        let reconstructed = adapter
-            .checkpoint_evaluator_for_genome(&genome, evaluator.as_ref())
-            .map_err(|error| BrainSpawnError::new(kind.clone(), error))?;
-        if reconstructed != state {
-            return Err(BrainSpawnError::new(
-                kind,
-                BrainProtocolError::EvaluatorStateRoundTripMismatch {
-                    family_id: adapter.family_id().clone(),
-                },
-            ));
-        }
         Ok(BrainBinding::protocol(key, kind, genome, evaluator))
+    }
+
+    fn reconstruct_protocol_evaluator(
+        adapter: &dyn BrainFamilyAdapter,
+        genome: &BrainGenomeEnvelope,
+        state: &BrainEvaluatorStateEnvelope,
+    ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+        adapter.validate_genome(genome)?;
+        adapter.validate_evaluator_state(state)?;
+        let evaluator = adapter.evaluator(genome, state)?;
+        let reconstructed = adapter.checkpoint_evaluator_for_genome(genome, evaluator.as_ref())?;
+        if reconstructed != *state {
+            return Err(BrainProtocolError::EvaluatorStateRoundTripMismatch {
+                family_id: adapter.family_id().clone(),
+            });
+        }
+        Ok(evaluator)
     }
 
     fn prepare_protocol_offspring_brain(
@@ -25291,6 +25571,11 @@ mod tests {
         evaluation_fails: bool,
         evaluation_offset: i16,
         evaluator_constructions: Option<Arc<AtomicUsize>>,
+        batch_opt_in: bool,
+        batch_returns_none: bool,
+        batch_fail_at_lane: Option<usize>,
+        batch_truncates_checkpoint: bool,
+        batch_probe: Option<Arc<Mutex<Vec<Vec<i8>>>>>,
     }
 
     impl FixtureBrainFamily {
@@ -25302,18 +25587,18 @@ mod tests {
                 evaluation_fails: false,
                 evaluation_offset: 0,
                 evaluator_constructions: None,
+                batch_opt_in: true,
+                batch_returns_none: false,
+                batch_fail_at_lane: None,
+                batch_truncates_checkpoint: false,
+                batch_probe: None,
             }
         }
 
         fn with_policy(id: &str, offspring_policy: OffspringStatePolicy) -> Self {
-            Self {
-                id: BrainFamilyId::new(id).expect("valid fixture family id"),
-                offspring_policy,
-                offspring_parent_counts: None,
-                evaluation_fails: false,
-                evaluation_offset: 0,
-                evaluator_constructions: None,
-            }
+            let mut family = Self::new(id);
+            family.offspring_policy = offspring_policy;
+            family
         }
 
         fn with_policy_probe(
@@ -25321,25 +25606,15 @@ mod tests {
             offspring_policy: OffspringStatePolicy,
             offspring_parent_counts: Arc<Mutex<Vec<usize>>>,
         ) -> Self {
-            Self {
-                id: BrainFamilyId::new(id).expect("valid fixture family id"),
-                offspring_policy,
-                offspring_parent_counts: Some(offspring_parent_counts),
-                evaluation_fails: false,
-                evaluation_offset: 0,
-                evaluator_constructions: None,
-            }
+            let mut family = Self::with_policy(id, offspring_policy);
+            family.offspring_parent_counts = Some(offspring_parent_counts);
+            family
         }
 
         fn failing(id: &str) -> Self {
-            Self {
-                id: BrainFamilyId::new(id).expect("valid fixture family id"),
-                offspring_policy: OffspringStatePolicy::Reset,
-                offspring_parent_counts: None,
-                evaluation_fails: true,
-                evaluation_offset: 0,
-                evaluator_constructions: None,
-            }
+            let mut family = Self::new(id);
+            family.evaluation_fails = true;
+            family
         }
 
         fn with_behavior_probe(
@@ -25347,14 +25622,47 @@ mod tests {
             evaluation_offset: i16,
             evaluator_constructions: Arc<AtomicUsize>,
         ) -> Self {
-            Self {
-                id: BrainFamilyId::new(id).expect("valid fixture family id"),
-                offspring_policy: OffspringStatePolicy::Reset,
-                offspring_parent_counts: None,
-                evaluation_fails: false,
-                evaluation_offset,
-                evaluator_constructions: Some(evaluator_constructions),
-            }
+            let mut family = Self::new(id);
+            family.evaluation_offset = evaluation_offset;
+            family.evaluator_constructions = Some(evaluator_constructions);
+            family
+        }
+
+        fn with_batch_probe(id: &str, batch_probe: Arc<Mutex<Vec<Vec<i8>>>>) -> Self {
+            let mut family = Self::new(id);
+            family.batch_probe = Some(batch_probe);
+            family
+        }
+
+        fn scalar_only(id: &str, batch_probe: Arc<Mutex<Vec<Vec<i8>>>>) -> Self {
+            let mut family = Self::with_batch_probe(id, batch_probe);
+            family.batch_opt_in = false;
+            family
+        }
+
+        fn declining_batch(id: &str, batch_probe: Arc<Mutex<Vec<Vec<i8>>>>) -> Self {
+            let mut family = Self::with_batch_probe(id, batch_probe);
+            family.batch_returns_none = true;
+            family
+        }
+
+        fn failing_batch_after(
+            id: &str,
+            lane: usize,
+            batch_probe: Arc<Mutex<Vec<Vec<i8>>>>,
+        ) -> Self {
+            let mut family = Self::with_batch_probe(id, batch_probe);
+            family.batch_fail_at_lane = Some(lane);
+            family
+        }
+
+        fn truncating_batch_checkpoint(
+            id: &str,
+            batch_probe: Arc<Mutex<Vec<Vec<i8>>>>,
+        ) -> Self {
+            let mut family = Self::with_batch_probe(id, batch_probe);
+            family.batch_truncates_checkpoint = true;
+            family
         }
 
         fn genome(&self, gain: i8, bias: i8, provenance: BrainProvenance) -> BrainGenomeEnvelope {
@@ -25480,6 +25788,8 @@ mod tests {
     struct FixtureBrainBatchEvaluator {
         id: BrainFamilyId,
         evaluators: Vec<FixtureBrainEvaluator>,
+        fail_at_lane: Option<usize>,
+        truncates_checkpoint: bool,
     }
 
     impl BrainBatchEvaluator for FixtureBrainBatchEvaluator {
@@ -25499,12 +25809,20 @@ mod tests {
                     outputs: outputs.len(),
                 });
             }
-            for ((evaluator, inputs), output) in self
+            for (lane, ((evaluator, inputs), output)) in self
                 .evaluators
                 .iter_mut()
                 .zip(sensors)
                 .zip(outputs.iter_mut())
+                .enumerate()
             {
+                if self.fail_at_lane == Some(lane) {
+                    return Err(BrainProtocolError::InvalidPayload {
+                        kind: BrainEnvelopeKind::EvaluatorState,
+                        family_id: self.id.clone(),
+                        detail: format!("fixture batch failed at lane {lane}"),
+                    });
+                }
                 *output = evaluator.evaluate(inputs)?;
             }
             Ok(())
@@ -25513,10 +25831,15 @@ mod tests {
         fn checkpoint_states(
             &self,
         ) -> Result<Vec<BrainEvaluatorStateEnvelope>, BrainProtocolError> {
-            self.evaluators
+            let mut states = self
+                .evaluators
                 .iter()
                 .map(BrainEvaluator::checkpoint_state)
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            if self.truncates_checkpoint {
+                states.pop();
+            }
+            Ok(states)
         }
     }
 
@@ -25666,10 +25989,21 @@ mod tests {
             }))
         }
 
+        fn batch_architecture_key(
+            &self,
+            genome: &BrainGenomeEnvelope,
+        ) -> Result<Option<BrainBatchArchitectureKey>, BrainProtocolError> {
+            self.validate_genome(genome)?;
+            if !self.batch_opt_in {
+                return Ok(None);
+            }
+            BrainBatchArchitectureKey::new(b"fixture-dense-scalar-v1".to_vec()).map(Some)
+        }
+
         fn batch_evaluator(
             &self,
-            genomes: &[BrainGenomeEnvelope],
-            states: &[BrainEvaluatorStateEnvelope],
+            genomes: &[&BrainGenomeEnvelope],
+            states: &[&BrainEvaluatorStateEnvelope],
         ) -> Result<Option<Box<dyn BrainBatchEvaluator>>, BrainProtocolError> {
             if genomes.len() != states.len() {
                 return Err(BrainProtocolError::BatchCardinalityMismatch {
@@ -25679,8 +26013,10 @@ mod tests {
                 });
             }
             let mut evaluators = Vec::with_capacity(genomes.len());
+            let mut lane_gains = Vec::with_capacity(genomes.len());
             for (genome, state) in genomes.iter().zip(states) {
                 let (gain, bias) = self.decode_genome(genome)?;
+                lane_gains.push(gain);
                 evaluators.push(FixtureBrainEvaluator {
                     id: self.id.clone(),
                     gain,
@@ -25690,9 +26026,20 @@ mod tests {
                     evaluation_offset: self.evaluation_offset,
                 });
             }
+            if let Some(probe) = &self.batch_probe {
+                probe
+                    .lock()
+                    .expect("fixture batch probe mutex")
+                    .push(lane_gains);
+            }
+            if self.batch_returns_none {
+                return Ok(None);
+            }
             Ok(Some(Box::new(FixtureBrainBatchEvaluator {
                 id: self.id.clone(),
                 evaluators,
+                fail_at_lane: self.batch_fail_at_lane,
+                truncates_checkpoint: self.batch_truncates_checkpoint,
             })))
         }
     }
@@ -25817,6 +26164,43 @@ mod tests {
             .agent_runtime_mut(agent)
             .expect("fixture runtime")
             .brain = BrainBinding::protocol(key, id.to_owned(), genome, evaluator);
+    }
+
+    fn spawn_fixture_protocol_agent(
+        world: &mut WorldState,
+        key: u64,
+        family_id: &str,
+        seed: u32,
+        gain: i8,
+        bias: i8,
+        accumulator: i16,
+        sensor_zero: f32,
+    ) -> AgentId {
+        let agent = world.spawn_agent(sample_agent(seed));
+        let family = FixtureBrainFamily::new(family_id);
+        let genome = family.genome(
+            gain,
+            bias,
+            BrainProvenance {
+                created_at: world.tick(),
+                ..BrainProvenance::default()
+            },
+        );
+        let state = family.state(accumulator);
+        let evaluator = family
+            .evaluator(&genome, &state)
+            .expect("fixture protocol evaluator");
+        let runtime = world
+            .agent_runtime_mut(agent)
+            .expect("fixture protocol runtime");
+        runtime.brain =
+            BrainBinding::protocol(key, family_id.to_owned(), genome, evaluator);
+        runtime.sensors[0] = sensor_zero;
+        agent
+    }
+
+    fn output_bits(output: [f32; OUTPUT_SIZE]) -> [u32; OUTPUT_SIZE] {
+        output.map(f32::to_bits)
     }
 
     fn agent_id_for_uid(world: &WorldState, uid: AgentUid) -> AgentId {
@@ -26977,12 +27361,15 @@ mod tests {
         let first_state = FixtureBrainFamily::new("fixture-alpha").state(4);
         let second_state = FixtureBrainFamily::new("fixture-alpha").state(5);
         let mut batch = alpha
-            .batch_evaluator(&[first_genome, second_genome], &[first_state, second_state])
+            .batch_evaluator(
+                &[&first_genome, &second_genome],
+                &[&first_state, &second_state],
+            )
             .expect("batch construction")
             .expect("fixture batch extension");
         assert!(matches!(
             alpha.batch_evaluator(
-                &[FixtureBrainFamily::new("fixture-alpha").genome(
+                &[&FixtureBrainFamily::new("fixture-alpha").genome(
                     1,
                     0,
                     BrainProvenance::default(),
@@ -27017,6 +27404,545 @@ mod tests {
         assert_eq!(states.len(), 2);
         assert_eq!(states[0].payload(), &5_i16.to_le_bytes());
         assert_eq!(states[1].payload(), &6_i16.to_le_bytes());
+    }
+
+    #[test]
+    fn brain_batch_architecture_keys_are_bounded_exactly() {
+        let maximum = vec![0x5a; MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES];
+        let key = BrainBatchArchitectureKey::new(maximum.clone()).expect("maximum key");
+        assert_eq!(key.as_bytes(), maximum);
+        assert_eq!(
+            BrainBatchArchitectureKey::new(Vec::new())
+                .expect("empty family-owned key")
+                .as_bytes(),
+            &[]
+        );
+        assert!(matches!(
+            BrainBatchArchitectureKey::new(vec![
+                0;
+                MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES + 1
+            ]),
+            Err(BrainProtocolError::BatchArchitectureKeyTooLarge {
+                found,
+                maximum: MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES,
+            }) if found == MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn fixture_batch_is_bit_identical_to_scalar_and_partition_independent() {
+        let family = FixtureBrainFamily::new("fixture-batch-identity");
+        let genomes = [
+            family.genome(2, 1, BrainProvenance::default()),
+            family.genome(-3, 4, BrainProvenance::default()),
+            family.genome(5, -2, BrainProvenance::default()),
+            family.genome(1, 7, BrainProvenance::default()),
+        ];
+        assert_eq!(
+            genomes
+                .iter()
+                .map(BrainGenomeEnvelope::material_hash)
+                .collect::<HashSet<_>>()
+                .len(),
+            genomes.len(),
+            "one architecture cohort must retain distinct per-lane weights"
+        );
+        let initial_states = [
+            family.state(3),
+            family.state(-1),
+            family.state(8),
+            family.state(0),
+        ];
+        let mut sensors = [[0.0; INPUT_SIZE]; 4];
+        for (lane, input) in sensors.iter_mut().enumerate() {
+            input[0] = lane as f32 * 1.25 - 0.5;
+            input[7] = lane as f32 + 0.25;
+        }
+
+        let mut scalar_outputs = Vec::new();
+        let mut scalar_states = Vec::new();
+        for ((genome, state), input) in genomes.iter().zip(&initial_states).zip(&sensors) {
+            let mut evaluator = family.evaluator(genome, state).expect("scalar evaluator");
+            scalar_outputs.push(evaluator.evaluate(input).expect("scalar evaluation"));
+            scalar_states.push(evaluator.checkpoint_state().expect("scalar checkpoint"));
+        }
+
+        let genome_refs = genomes.iter().collect::<Vec<_>>();
+        let state_refs = initial_states.iter().collect::<Vec<_>>();
+        let mut full_batch = family
+            .batch_evaluator(&genome_refs, &state_refs)
+            .expect("full batch construction")
+            .expect("fixture batch opt-in");
+        let mut full_outputs = vec![[0.0; OUTPUT_SIZE]; genomes.len()];
+        full_batch
+            .evaluate_batch(&sensors, &mut full_outputs)
+            .expect("full batch evaluation");
+        let full_states = full_batch
+            .checkpoint_states()
+            .expect("full batch checkpoint");
+        assert_eq!(
+            full_outputs
+                .iter()
+                .copied()
+                .map(output_bits)
+                .collect::<Vec<_>>(),
+            scalar_outputs
+                .iter()
+                .copied()
+                .map(output_bits)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(full_states, scalar_states);
+
+        for split in 0..=genomes.len() {
+            let mut partitioned_outputs = Vec::new();
+            let mut partitioned_states = Vec::new();
+            for range in [0..split, split..genomes.len()] {
+                if range.is_empty() {
+                    continue;
+                }
+                let mut batch = family
+                    .batch_evaluator(&genome_refs[range.clone()], &state_refs[range.clone()])
+                    .expect("partition batch construction")
+                    .expect("fixture partition batch opt-in");
+                let mut outputs = vec![[0.0; OUTPUT_SIZE]; range.len()];
+                batch
+                    .evaluate_batch(&sensors[range.clone()], &mut outputs)
+                    .expect("partition batch evaluation");
+                partitioned_outputs.extend(outputs);
+                partitioned_states.extend(
+                    batch
+                        .checkpoint_states()
+                        .expect("partition batch checkpoints"),
+                );
+            }
+            assert_eq!(
+                partitioned_outputs
+                    .into_iter()
+                    .map(output_bits)
+                    .collect::<Vec<_>>(),
+                full_outputs
+                    .iter()
+                    .copied()
+                    .map(output_bits)
+                    .collect::<Vec<_>>(),
+                "output bits changed at cohort split {split}"
+            );
+            assert_eq!(
+                partitioned_states, full_states,
+                "evaluator state changed at cohort split {split}"
+            );
+        }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_batches_mixed_families_in_canonical_lane_order() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("mixed batch world");
+        let alpha_probe = Arc::new(Mutex::new(Vec::new()));
+        let beta_probe = Arc::new(Mutex::new(Vec::new()));
+        let alpha_key = world
+            .register_brain_family(
+                "batch-alpha",
+                Box::new(FixtureBrainFamily::with_batch_probe(
+                    "batch-alpha",
+                    Arc::clone(&alpha_probe),
+                )),
+            )
+            .expect("alpha family");
+        let beta_key = world
+            .register_brain_family(
+                "batch-beta",
+                Box::new(FixtureBrainFamily::with_batch_probe(
+                    "batch-beta",
+                    Arc::clone(&beta_probe),
+                )),
+            )
+            .expect("beta family");
+
+        let unbound = world.spawn_agent(sample_agent(0));
+        world
+            .agent_runtime_mut(unbound)
+            .expect("unbound runtime")
+            .sensors[0] = 0.25;
+        let alpha_first =
+            spawn_fixture_protocol_agent(&mut world, alpha_key, "batch-alpha", 1, 2, 1, 3, 4.0);
+        let legacy = world.spawn_agent(sample_agent(2));
+        {
+            let runtime = world.agent_runtime_mut(legacy).expect("legacy runtime");
+            runtime.brain = BrainBinding::with_runner(Box::new(StubBrain));
+            runtime.sensors[0] = 0.75;
+        }
+        let beta_first =
+            spawn_fixture_protocol_agent(&mut world, beta_key, "batch-beta", 3, -1, 2, 5, 3.0);
+        let alpha_second =
+            spawn_fixture_protocol_agent(&mut world, alpha_key, "batch-alpha", 4, 3, -2, 1, 2.0);
+        let beta_second =
+            spawn_fixture_protocol_agent(&mut world, beta_key, "batch-beta", 5, 2, 0, -1, 5.0);
+
+        world.stage_brains().expect("mixed batch stage");
+
+        assert_eq!(
+            *alpha_probe.lock().expect("alpha probe"),
+            vec![vec![2, 3]],
+            "same-family lanes must retain canonical handle order"
+        );
+        assert_eq!(
+            *beta_probe.lock().expect("beta probe"),
+            vec![vec![-1, 2]],
+            "family grouping must not coalesce or reorder another registry family"
+        );
+        assert_eq!(
+            world.agent_runtime(unbound).expect("unbound result").outputs[0].to_bits(),
+            0.25_f32.to_bits()
+        );
+        assert_eq!(
+            world
+                .agent_runtime(alpha_first)
+                .expect("first alpha result")
+                .outputs[0]
+                .to_bits(),
+            12.0_f32.to_bits()
+        );
+        assert_eq!(
+            world.agent_runtime(legacy).expect("legacy result").outputs[0].to_bits(),
+            1.0_f32.to_bits()
+        );
+        assert_eq!(
+            world
+                .agent_runtime(beta_first)
+                .expect("first beta result")
+                .outputs[0]
+                .to_bits(),
+            4.0_f32.to_bits()
+        );
+        assert_eq!(
+            world
+                .agent_runtime(alpha_second)
+                .expect("second alpha result")
+                .outputs[0]
+                .to_bits(),
+            5.0_f32.to_bits()
+        );
+        assert_eq!(
+            world
+                .agent_runtime(beta_second)
+                .expect("second beta result")
+                .outputs[0]
+                .to_bits(),
+            9.0_f32.to_bits()
+        );
+        for (agent, expected_accumulator) in [
+            (alpha_first, 4_i16),
+            (beta_first, 6),
+            (alpha_second, 2),
+            (beta_second, 0),
+        ] {
+            assert_eq!(
+                world
+                    .agent_brain_evaluator_state(agent)
+                    .expect("mixed state checkpoint")
+                    .expect("mixed protocol state")
+                    .payload(),
+                &expected_accumulator.to_le_bytes()
+            );
+        }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_preserves_scalar_fallback_when_family_declines_batch() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("batch fallback world");
+        let scalar_probe = Arc::new(Mutex::new(Vec::new()));
+        let declining_probe = Arc::new(Mutex::new(Vec::new()));
+        let scalar_key = world
+            .register_brain_family(
+                "scalar-only",
+                Box::new(FixtureBrainFamily::scalar_only(
+                    "scalar-only",
+                    Arc::clone(&scalar_probe),
+                )),
+            )
+            .expect("scalar-only family");
+        let declining_key = world
+            .register_brain_family(
+                "declining-batch",
+                Box::new(FixtureBrainFamily::declining_batch(
+                    "declining-batch",
+                    Arc::clone(&declining_probe),
+                )),
+            )
+            .expect("declining family");
+
+        let agents = [
+            spawn_fixture_protocol_agent(
+                &mut world,
+                scalar_key,
+                "scalar-only",
+                1,
+                2,
+                1,
+                3,
+                4.0,
+            ),
+            spawn_fixture_protocol_agent(
+                &mut world,
+                scalar_key,
+                "scalar-only",
+                2,
+                3,
+                -2,
+                1,
+                2.0,
+            ),
+            spawn_fixture_protocol_agent(
+                &mut world,
+                declining_key,
+                "declining-batch",
+                3,
+                -1,
+                2,
+                5,
+                3.0,
+            ),
+            spawn_fixture_protocol_agent(
+                &mut world,
+                declining_key,
+                "declining-batch",
+                4,
+                2,
+                0,
+                -1,
+                5.0,
+            ),
+        ];
+
+        world.stage_brains().expect("scalar fallback stage");
+        assert!(scalar_probe.lock().expect("scalar probe").is_empty());
+        assert_eq!(
+            *declining_probe.lock().expect("declining probe"),
+            vec![vec![-1, 2]],
+            "Ok(None) must be observed before exact scalar fallback"
+        );
+        for (agent, expected) in agents.into_iter().zip([12.0_f32, 5.0, 4.0, 9.0]) {
+            assert_eq!(
+                world
+                    .agent_runtime(agent)
+                    .expect("fallback result")
+                    .outputs[0]
+                    .to_bits(),
+                expected.to_bits()
+            );
+        }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_rolls_back_partial_batch_failure_atomically() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("batch rollback world");
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let key = world
+            .register_brain_family(
+                "batch-rollback",
+                Box::new(FixtureBrainFamily::failing_batch_after(
+                    "batch-rollback",
+                    1,
+                    Arc::clone(&probe),
+                )),
+            )
+            .expect("rollback family");
+        let first = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "batch-rollback",
+            1,
+            2,
+            1,
+            3,
+            4.0,
+        );
+        let second = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "batch-rollback",
+            2,
+            3,
+            -2,
+            1,
+            2.0,
+        );
+        let before = [first, second].map(|agent| {
+            world
+                .agent_brain_evaluator_state(agent)
+                .expect("pre-failure checkpoint")
+                .expect("pre-failure protocol state")
+        });
+        for agent in [first, second] {
+            world
+                .agent_runtime_mut(agent)
+                .expect("pre-failure runtime")
+                .outputs = [9.0; OUTPUT_SIZE];
+        }
+
+        let error = world
+            .stage_brains()
+            .expect_err("partial batch mutation must fail the whole cohort");
+        assert_eq!(error.kind(), "batch-rollback");
+        assert!(
+            error
+                .to_string()
+                .contains("fixture batch failed at lane 1")
+        );
+        assert_eq!(*probe.lock().expect("rollback probe"), vec![vec![2, 3]]);
+        for (lane, agent) in [first, second].into_iter().enumerate() {
+            let runtime = world.agent_runtime(agent).expect("rolled-back runtime");
+            assert_eq!(runtime.outputs, [0.0; OUTPUT_SIZE]);
+            assert!(runtime.brain.is_bound());
+            assert_eq!(
+                world
+                    .agent_brain_evaluator_state(agent)
+                    .expect("post-failure checkpoint")
+                    .expect("post-failure protocol state"),
+                before[lane]
+            );
+        }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_rejects_batch_checkpoint_cardinality_without_committing() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("batch cardinality world");
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let key = world
+            .register_brain_family(
+                "batch-cardinality",
+                Box::new(FixtureBrainFamily::truncating_batch_checkpoint(
+                    "batch-cardinality",
+                    Arc::clone(&probe),
+                )),
+            )
+            .expect("cardinality family");
+        let agents = [
+            spawn_fixture_protocol_agent(
+                &mut world,
+                key,
+                "batch-cardinality",
+                1,
+                2,
+                1,
+                3,
+                4.0,
+            ),
+            spawn_fixture_protocol_agent(
+                &mut world,
+                key,
+                "batch-cardinality",
+                2,
+                3,
+                -2,
+                1,
+                2.0,
+            ),
+        ];
+        let before = agents.map(|agent| {
+            world
+                .agent_brain_evaluator_state(agent)
+                .expect("pre-cardinality checkpoint")
+                .expect("pre-cardinality protocol state")
+        });
+
+        let error = world
+            .stage_brains()
+            .expect_err("wrong batch checkpoint count must fail closed");
+        assert!(error.to_string().contains("batch cardinality mismatch"));
+        assert_eq!(*probe.lock().expect("cardinality probe"), vec![vec![2, 3]]);
+        for (lane, agent) in agents.into_iter().enumerate() {
+            assert_eq!(
+                world
+                    .agent_runtime(agent)
+                    .expect("cardinality runtime")
+                    .outputs,
+                [0.0; OUTPUT_SIZE]
+            );
+            assert_eq!(
+                world
+                    .agent_brain_evaluator_state(agent)
+                    .expect("post-cardinality checkpoint")
+                    .expect("post-cardinality protocol state"),
+                before[lane]
+            );
+        }
+    }
+
+    #[cfg(not(feature = "batch-brains"))]
+    #[test]
+    fn stage_brains_without_batch_feature_uses_scalar_protocol_path() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("feature-disabled world");
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let key = world
+            .register_brain_family(
+                "disabled-batch",
+                Box::new(FixtureBrainFamily::with_batch_probe(
+                    "disabled-batch",
+                    Arc::clone(&probe),
+                )),
+            )
+            .expect("disabled family");
+        let agents = [
+            spawn_fixture_protocol_agent(
+                &mut world,
+                key,
+                "disabled-batch",
+                1,
+                2,
+                1,
+                3,
+                4.0,
+            ),
+            spawn_fixture_protocol_agent(
+                &mut world,
+                key,
+                "disabled-batch",
+                2,
+                3,
+                -2,
+                1,
+                2.0,
+            ),
+        ];
+
+        world.stage_brains().expect("feature-disabled scalar stage");
+        assert!(probe.lock().expect("disabled probe").is_empty());
+        for (agent, expected) in agents.into_iter().zip([12.0_f32, 5.0]) {
+            assert_eq!(
+                world
+                    .agent_runtime(agent)
+                    .expect("disabled scalar result")
+                    .outputs[0]
+                    .to_bits(),
+                expected.to_bits()
+            );
+        }
     }
 
     #[derive(Clone, Default)]
