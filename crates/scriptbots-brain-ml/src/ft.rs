@@ -1132,9 +1132,8 @@ mod tests {
 
         let mut oracle_rng = SmallRngStream::seed_from_u64(102);
         for _ in 0..parameter_count {
-            let _probability = oracle_rng.next_u32();
-            let _gaussian_u1 = oracle_rng.next_u32();
-            let _gaussian_u2 = oracle_rng.next_u32();
+            let _probability = unit_f32(&mut oracle_rng);
+            let _gaussian = gaussian_f32(&mut oracle_rng);
         }
         assert_eq!(actual_rng.checkpoint(), oracle_rng.checkpoint());
     }
