@@ -2,7 +2,7 @@
 
 use rand::Rng;
 use scriptbots_core::{
-    ActivationLayer, BrainActivations, BrainEnvelopeKind, BrainEvaluator,
+    ActivationLayer, BrainActivations, BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator,
     BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope,
     BrainGenomeMaterial, BrainInspection, BrainInspectionError, BrainInspectionLimits,
     BrainInspectionSnapshot, BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream,
@@ -22,6 +22,9 @@ use crate::{Brain, BrainKind, into_runner};
 const BRAIN_SIZE: usize = 200;
 const CONNECTIONS: usize = 4;
 const DWRAON_FAMILY_NAME: &str = "dwraon-baseline";
+const ADAPTER_SEMANTIC_VERSION: u32 = 1;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] =
+    b"scriptbots.dwraon-baseline.adapter-semantics.v1";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const GENOME_CODEC_VERSION: u16 = 1;
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -727,6 +730,14 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
         &self.family_id
     }
 
+    fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
+        BrainAdapterIdentityV1::from_semantic_descriptor(
+            self.family_id(),
+            ADAPTER_SEMANTIC_VERSION,
+            ADAPTER_SEMANTIC_DESCRIPTOR,
+        )
+    }
+
     fn random_genome_material(
         &self,
         rng: &mut dyn RandomStream,
@@ -948,6 +959,17 @@ mod tests {
     use scriptbots_core::{
         AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, SmallRngStream, Tick,
     };
+
+    #[test]
+    fn adapter_semantic_identity_v1_is_pinned() {
+        let identity = DwraonFamilyAdapter::default().adapter_identity();
+        assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
+        assert_eq!(
+            identity.to_string(),
+            "DSR_REBLESS_DWRAON_ADAPTER_IDENTITY_V1",
+            "update only after reviewing an intentional DWRAON executable-semantics change"
+        );
+    }
 
     fn protocol_genome(nodes: &[NodeParams], provenance: BrainProvenance) -> BrainGenomeEnvelope {
         genome_envelope(nodes, provenance).expect("valid test genome")

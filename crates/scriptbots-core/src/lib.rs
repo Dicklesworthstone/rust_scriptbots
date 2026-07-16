@@ -1903,6 +1903,7 @@ type BrainSpawner = Box<
 struct BrainEntry {
     kind: Cow<'static, str>,
     factory_state_digest: Option<u64>,
+    adapter_identity: Option<BrainAdapterIdentityV1>,
     spawner: Option<BrainSpawner>,
     protocol_adapter: Option<Box<dyn BrainFamilyAdapter>>,
 }
@@ -1944,7 +1945,7 @@ impl BrainRegistry {
     ///
     /// The supplied digest must change whenever captured seeds, model bytes, architecture
     /// settings, or other closure state capable of changing a newly spawned brain changes.
-    /// Factories registered through [`Self::register`] remain valid, but V1.3 reports their
+    /// Factories registered through [`Self::register`] remain valid, but V1.4 reports their
     /// closure state as explicitly uncovered.
     pub fn register_with_state_digest<F>(
         &mut self,
@@ -1980,6 +1981,7 @@ impl BrainRegistry {
             BrainEntry {
                 kind: kind.into(),
                 factory_state_digest,
+                adapter_identity: None,
                 spawner: Some(Box::new(factory)),
                 protocol_adapter: None,
             },
@@ -1997,6 +1999,7 @@ impl BrainRegistry {
         adapter: Box<dyn BrainFamilyAdapter>,
     ) -> Result<u64, BrainProtocolError> {
         let family_id = adapter.family_id().clone();
+        let adapter_identity = adapter.adapter_identity();
         if self.entries.values().any(|entry| {
             entry
                 .protocol_adapter
@@ -2012,11 +2015,8 @@ impl BrainRegistry {
             key,
             BrainEntry {
                 kind: kind.into(),
-                // A family ID identifies the wire protocol, not every future-affecting adapter
-                // setting or model byte. Until an adapter supplies an explicit construction-state
-                // digest, WorldDigestV1 must name this as uncovered instead of certifying a false
-                // equality between differently configured adapters.
                 factory_state_digest: None,
+                adapter_identity: Some(adapter_identity),
                 spawner: None,
                 protocol_adapter: Some(adapter),
             },
@@ -2047,6 +2047,12 @@ impl BrainRegistry {
         self.entries
             .get(&key)
             .and_then(|entry| entry.protocol_adapter.as_deref())
+    }
+
+    /// Stable family-owned semantic identity captured when the protocol adapter was admitted.
+    #[must_use]
+    pub fn adapter_identity(&self, key: u64) -> Option<BrainAdapterIdentityV1> {
+        self.entries.get(&key).and_then(|entry| entry.adapter_identity)
     }
 
     /// Whether `key` selects a versioned protocol family rather than a legacy runner factory.
@@ -2649,15 +2655,15 @@ pub struct CharacterizationDigestV0 {
 }
 
 /// Schema tag for [`WorldDigestV1`].
-/// V1.3 replaces the single global RNG checkpoint with six domain-separated checkpoints. The
-/// minor schema and codec revision prevent a pre-domain payload from being mistaken for current
-/// continuation evidence.
-pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.3";
-/// Wire revision for the canonical V1.3 payload.
-pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 3;
-/// Stable hash algorithm identifier carried by and hashed into V1.3.
+/// V1.4 binds every admitted protocol family's semantic adapter identity into the registry lane.
+/// The minor schema and codec revision prevent an adapter-blind payload from being mistaken for
+/// current continuation evidence.
+pub const WORLD_DIGEST_V1_SCHEMA: &str = "scriptbots.world-digest.v1.4";
+/// Wire revision for the canonical V1.4 payload.
+pub const WORLD_DIGEST_V1_CODEC_VERSION: u16 = 4;
+/// Stable hash algorithm identifier carried by and hashed into V1.4.
 pub const WORLD_DIGEST_V1_ALGORITHM: &str = "fnv1a64-v0";
-/// Stable logical identity used by the V1.3 agent lane and transition order.
+/// Stable logical identity used by the V1.4 agent lane and transition order.
 pub const WORLD_DIGEST_V1_AGENT_IDENTITY: &str = "AgentUid";
 
 /// The exact six per-domain hashes carried by [`RngDomainDigestV1`].
@@ -2788,7 +2794,7 @@ pub struct WorldDigestV1 {
     pub agent_identity: String,
 }
 
-/// A decoded V1.3 boundary digest violated its pinned semantic contract.
+/// A decoded V1.4 boundary digest violated its pinned semantic contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorldDigestV1ContractError {
     #[error("world-digest schema `{found}` does not match `{expected}`")]
@@ -4066,12 +4072,12 @@ pub const WORLD_STEP_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v2";
 pub const WORLD_STEP_OUTCOME_PROFILE_SCHEMA: &str = "scriptbots.world-step-profile.v3";
 
 /// Schema identifier for opt-in per-stage scientific-state digests.
-pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.3";
-/// Wire revision for the canonical-UID six-point trace payload.
-pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 3;
+pub const WORLD_STEP_TRACE_SCHEMA: &str = "scriptbots.world-step-trace.v1.4";
+/// Wire revision for the adapter-attested canonical-UID six-point trace payload.
+pub const WORLD_STEP_TRACE_CODEC_VERSION: u16 = 4;
 /// Schema identifier for a non-boundary world digest captured during one transition.
 pub const WORLD_STEP_STAGE_WORLD_DIGEST_SCHEMA: &str =
-    "scriptbots.world-step-stage-world-digest.v3";
+    "scriptbots.world-step-stage-world-digest.v4";
 
 /// Stable stage identifiers emitted by [`WorldStepProfile`].
 ///
@@ -6125,6 +6131,77 @@ impl<'de> Deserialize<'de> for BrainFamilyId {
     }
 }
 
+/// Domain used by the family-owned executable-adapter semantic identity.
+const BRAIN_ADAPTER_IDENTITY_V1_CONTEXT: &str =
+    "rust-scriptbots.brain-adapter-semantic-identity.v1";
+
+/// Stable family-authored identity for executable construction and evaluation semantics.
+///
+/// This is a semantic attestation, not a hash of executable bytes. A family must bump
+/// `semantic_version` or change `semantic_material` whenever adapter behavior capable of changing
+/// a future transition changes. Serialized payload interpretation changes additionally require
+/// the existing family schema/codec bumps. Compiler output, trait-object addresses, type names,
+/// closure layouts, and other ambient process details must never be used as semantic material.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct BrainAdapterIdentityV1 {
+    semantic_version: u32,
+    digest: [u8; 32],
+}
+
+impl BrainAdapterIdentityV1 {
+    /// Derive an identity from a family ID, semantic revision, and stable family-owned material.
+    #[must_use]
+    pub fn from_semantic_descriptor(
+        family_id: &BrainFamilyId,
+        semantic_version: u32,
+        semantic_material: &[u8],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key(BRAIN_ADAPTER_IDENTITY_V1_CONTEXT);
+        let family = family_id.as_str().as_bytes();
+        hasher.update(&(family.len() as u64).to_le_bytes());
+        hasher.update(family);
+        hasher.update(&semantic_version.to_le_bytes());
+        hasher.update(&(semantic_material.len() as u64).to_le_bytes());
+        hasher.update(semantic_material);
+        Self {
+            semantic_version,
+            digest: *hasher.finalize().as_bytes(),
+        }
+    }
+
+    /// Family-owned semantic revision included in the digest input.
+    #[must_use]
+    pub const fn semantic_version(self) -> u32 {
+        self.semantic_version
+    }
+
+    /// Borrow the exact 32-byte BLAKE3 attestation digest.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+impl fmt::Debug for BrainAdapterIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrainAdapterIdentityV1")
+            .field("semantic_version", &self.semantic_version)
+            .field("digest", &self.to_string())
+            .finish()
+    }
+}
+
+impl fmt::Display for BrainAdapterIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.digest {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Domain used by the one core-owned brain-genome material hash.
 const BRAIN_GENOME_HASH_CONTEXT: &str = "rust-scriptbots.brain-genome-material.v1";
 
@@ -6811,6 +6888,14 @@ pub trait BrainBatchEvaluator: Send {
 pub trait BrainFamilyCodec: Send + Sync {
     /// Stable family identity used by every envelope and registry lookup.
     fn family_id(&self) -> &BrainFamilyId;
+
+    /// Stable family-owned identity of executable construction and evaluation semantics.
+    ///
+    /// This attestation must change whenever the admitted adapter could produce a different next
+    /// transition from identical genome, evaluator-state, sensor, and RNG inputs. It must be
+    /// independent of compiler output, memory addresses, concrete Rust type names, and ambient
+    /// process state.
+    fn adapter_identity(&self) -> BrainAdapterIdentityV1;
 
     /// Generate provenance-free heritable material from the supplied deterministic stream.
     fn random_genome_material(
@@ -18169,9 +18254,9 @@ impl WorldState {
         origins_encoder.postcard("pending birth records", &self.pending_birth_records)?;
         let origins = origins_encoder.finish();
 
-        // Registry closure state is separate from bound evaluator state. A factory can capture a
-        // seed or model while keeping the same key and family label, so each registration must
-        // either declare that state digest or be named as an explicit coverage gap.
+        // Registry construction semantics are separate from bound evaluator state. Legacy
+        // factories attest captured closure state, while protocol families attest stable adapter
+        // behavior. A registration that supplies neither is named as an explicit coverage gap.
         let mut registrations: Vec<_> = self.brain_registry.entries.iter().collect();
         registrations.sort_unstable_by_key(|(key, _)| **key);
         let mut uncovered_factories: BTreeSet<String> = BTreeSet::new();
@@ -18183,10 +18268,23 @@ impl WorldState {
             registry_encoder.u64(*key);
             registry_encoder.string(entry.kind.as_ref());
             registry_encoder.option_u64(entry.factory_state_digest);
-            if let Some(adapter) = &entry.protocol_adapter {
-                registry_encoder.string(adapter.family_id().as_str());
+            registry_encoder.option_string(
+                entry
+                    .protocol_adapter
+                    .as_ref()
+                    .map(|adapter| adapter.family_id().as_str()),
+            );
+            registry_encoder.bool(entry.adapter_identity.is_some());
+            if let Some(identity) = entry.adapter_identity {
+                registry_encoder.u32(identity.semantic_version());
+                registry_encoder.bytes(identity.digest());
             }
-            if entry.factory_state_digest.is_none() {
+            let construction_semantics_covered = if entry.protocol_adapter.is_some() {
+                entry.adapter_identity.is_some()
+            } else {
+                entry.factory_state_digest.is_some()
+            };
+            if !construction_semantics_covered {
                 uncovered_factories.insert(entry.kind.to_string());
             }
         }
@@ -24535,6 +24633,8 @@ mod tests {
         offspring_policy: OffspringStatePolicy,
         offspring_parent_counts: Option<Arc<Mutex<Vec<usize>>>>,
         evaluation_fails: bool,
+        evaluation_offset: i16,
+        evaluator_constructions: Option<Arc<AtomicUsize>>,
     }
 
     impl FixtureBrainFamily {
@@ -24544,6 +24644,8 @@ mod tests {
                 offspring_policy: OffspringStatePolicy::Reset,
                 offspring_parent_counts: None,
                 evaluation_fails: false,
+                evaluation_offset: 0,
+                evaluator_constructions: None,
             }
         }
 
@@ -24553,6 +24655,8 @@ mod tests {
                 offspring_policy,
                 offspring_parent_counts: None,
                 evaluation_fails: false,
+                evaluation_offset: 0,
+                evaluator_constructions: None,
             }
         }
 
@@ -24566,6 +24670,8 @@ mod tests {
                 offspring_policy,
                 offspring_parent_counts: Some(offspring_parent_counts),
                 evaluation_fails: false,
+                evaluation_offset: 0,
+                evaluator_constructions: None,
             }
         }
 
@@ -24575,6 +24681,23 @@ mod tests {
                 offspring_policy: OffspringStatePolicy::Reset,
                 offspring_parent_counts: None,
                 evaluation_fails: true,
+                evaluation_offset: 0,
+                evaluator_constructions: None,
+            }
+        }
+
+        fn with_behavior_probe(
+            id: &str,
+            evaluation_offset: i16,
+            evaluator_constructions: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                id: BrainFamilyId::new(id).expect("valid fixture family id"),
+                offspring_policy: OffspringStatePolicy::Reset,
+                offspring_parent_counts: None,
+                evaluation_fails: false,
+                evaluation_offset,
+                evaluator_constructions: Some(evaluator_constructions),
             }
         }
 
@@ -24653,6 +24776,7 @@ mod tests {
         bias: i8,
         accumulator: i16,
         evaluation_fails: bool,
+        evaluation_offset: i16,
     }
 
     impl BrainEvaluator for FixtureBrainEvaluator {
@@ -24674,7 +24798,8 @@ mod tests {
             let mut outputs = [0.0; OUTPUT_SIZE];
             outputs[0] = sensors[0] * f32::from(self.gain)
                 + f32::from(self.bias)
-                + f32::from(self.accumulator);
+                + f32::from(self.accumulator)
+                + f32::from(self.evaluation_offset);
             self.accumulator = self.accumulator.saturating_add(1);
             Ok(outputs)
         }
@@ -24742,6 +24867,21 @@ mod tests {
     impl BrainFamilyCodec for FixtureBrainFamily {
         fn family_id(&self) -> &BrainFamilyId {
             &self.id
+        }
+
+        fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
+            let mut semantic_material =
+                b"scriptbots.fixture-brain-family.adapter-semantics.v1".to_vec();
+            match self.offspring_policy {
+                OffspringStatePolicy::Reset => semantic_material.push(0),
+                OffspringStatePolicy::Inherit { parent_index } => {
+                    semantic_material.extend_from_slice(&[1, parent_index]);
+                }
+                OffspringStatePolicy::Blend => semantic_material.push(2),
+            }
+            semantic_material.push(u8::from(self.evaluation_fails));
+            semantic_material.extend_from_slice(&self.evaluation_offset.to_le_bytes());
+            BrainAdapterIdentityV1::from_semantic_descriptor(&self.id, 1, &semantic_material)
         }
 
         fn random_genome_material(
@@ -24855,6 +24995,9 @@ mod tests {
             genome: &BrainGenomeEnvelope,
             state: &BrainEvaluatorStateEnvelope,
         ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+            if let Some(constructions) = &self.evaluator_constructions {
+                constructions.fetch_add(1, AtomicUsizeOrdering::Relaxed);
+            }
             let (gain, bias) = self.decode_genome(genome)?;
             let accumulator = self.decode_state(state)?;
             Ok(Box::new(FixtureBrainEvaluator {
@@ -24863,6 +25006,7 @@ mod tests {
                 bias,
                 accumulator,
                 evaluation_fails: self.evaluation_fails,
+                evaluation_offset: self.evaluation_offset,
             }))
         }
 
@@ -24887,6 +25031,7 @@ mod tests {
                     bias,
                     accumulator: self.decode_state(state)?,
                     evaluation_fails: self.evaluation_fails,
+                    evaluation_offset: self.evaluation_offset,
                 });
             }
             Ok(Some(Box::new(FixtureBrainBatchEvaluator {
@@ -24898,6 +25043,18 @@ mod tests {
 
     pub(crate) fn boxed_fixture_brain_family(id: &str) -> Box<dyn BrainFamilyAdapter> {
         Box::new(FixtureBrainFamily::new(id))
+    }
+
+    pub(crate) fn boxed_fixture_brain_family_with_behavior_probe(
+        id: &str,
+        evaluation_offset: i16,
+        evaluator_constructions: Arc<AtomicUsize>,
+    ) -> Box<dyn BrainFamilyAdapter> {
+        Box::new(FixtureBrainFamily::with_behavior_probe(
+            id,
+            evaluation_offset,
+            evaluator_constructions,
+        ))
     }
 
     fn fixture_provenance() -> BrainProvenance {
@@ -25589,7 +25746,12 @@ mod tests {
                 .expect("protocol entry")
                 .factory_state_digest
                 .is_none(),
-            "a family ID alone must not falsely certify opaque adapter construction state"
+            "protocol adapters must not masquerade as legacy closure-state digests"
+        );
+        assert_eq!(
+            registry.adapter_identity(protocol),
+            registry.family(protocol).map(|adapter| adapter.adapter_identity()),
+            "registration must capture the exact family-authored semantic identity"
         );
 
         let mut rng = SmallRngStream::seed_from_u64(0xA11D_17ED);
@@ -25601,6 +25763,66 @@ mod tests {
                  an explicitly selectable legacy runner"
             );
         }
+    }
+
+    #[test]
+    fn protocol_adapter_identity_moves_only_the_registry_lane_and_is_fully_covered() {
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xADA9_7E57),
+            ..ScriptBotsConfig::default()
+        };
+        let mut left = WorldState::new(config.clone()).expect("left identity world");
+        let mut right = WorldState::new(config).expect("right identity world");
+        let left_constructions = Arc::new(AtomicUsize::new(0));
+        let right_constructions = Arc::new(AtomicUsize::new(0));
+        let left_key = left
+            .register_brain_family(
+                "identity-fixture",
+                Box::new(FixtureBrainFamily::with_behavior_probe(
+                    "identity-fixture",
+                    0,
+                    left_constructions,
+                )),
+            )
+            .expect("left identity adapter");
+        let right_key = right
+            .register_brain_family(
+                "identity-fixture",
+                Box::new(FixtureBrainFamily::with_behavior_probe(
+                    "identity-fixture",
+                    1,
+                    right_constructions,
+                )),
+            )
+            .expect("right identity adapter");
+        assert_eq!(left_key, right_key);
+        assert_ne!(
+            left.brain_registry.adapter_identity(left_key),
+            right.brain_registry.adapter_identity(right_key),
+            "the fixture's changed executable behavior must change its attestation"
+        );
+
+        let left_digest = left.world_digest_v1().expect("left identity digest");
+        let right_digest = right.world_digest_v1().expect("right identity digest");
+        assert!(left_digest.factory_state_covered);
+        assert!(right_digest.factory_state_covered);
+        assert!(left_digest.uncovered_factory_families.is_empty());
+        assert!(right_digest.uncovered_factory_families.is_empty());
+        assert_ne!(left_digest.brain_registry, right_digest.brain_registry);
+        assert_ne!(left_digest.overall, right_digest.overall);
+        assert_eq!(left_digest.agents, right_digest.agents);
+        assert_eq!(left_digest.brains, right_digest.brains);
+        assert_eq!(left_digest.food, right_digest.food);
+        assert_eq!(left_digest.terrain, right_digest.terrain);
+        assert_eq!(left_digest.hydrology, right_digest.hydrology);
+        assert_eq!(left_digest.rng, right_digest.rng);
+        assert_eq!(left_digest.counters, right_digest.counters);
+        assert_eq!(left_digest.config, right_digest.config);
+        assert_eq!(left_digest.effects, right_digest.effects);
+        assert_eq!(left_digest.derived_transition, right_digest.derived_transition);
+        assert_eq!(left_digest.origins, right_digest.origins);
     }
 
     #[test]
@@ -32143,7 +32365,7 @@ mod tests {
                 (&EXPECTED[..], "6686160962c35715")
             );
             println!(
-                "scriptbots.world-digest-golden.v1.3: six checkpoints and trace overall {} verified",
+                "scriptbots.world-digest-golden.v1.4: six checkpoints and trace overall {} verified",
                 trace.overall
             );
         } else {
@@ -32590,8 +32812,8 @@ mod tests {
             "legacy raw-slot characterization must prove the fixture layouts really differ"
         );
         assert_eq!(
-            left.world_digest_v1().expect("left pre-step V1.3"),
-            right.world_digest_v1().expect("right pre-step V1.3")
+            left.world_digest_v1().expect("left pre-step V1.4"),
+            right.world_digest_v1().expect("right pre-step V1.4")
         );
 
         let mut left_tracer = WorldStepTracer::default();
@@ -32662,8 +32884,8 @@ mod tests {
         assert_eq!(left.resource_ledger(), right.resource_ledger());
         assert_eq!(left.history, right.history);
         assert_eq!(
-            left.world_digest_v1().expect("left final V1.3"),
-            right.world_digest_v1().expect("right final V1.3")
+            left.world_digest_v1().expect("left final V1.4"),
+            right.world_digest_v1().expect("right final V1.4")
         );
     }
 
@@ -32815,8 +33037,8 @@ mod tests {
                 right.agent_brain_evaluator_state(right_child).unwrap()
             );
         }
-        let left_final = left.world_digest_v1().expect("left reproduction V1.3");
-        let right_final = right.world_digest_v1().expect("right reproduction V1.3");
+        let left_final = left.world_digest_v1().expect("left reproduction V1.4");
+        let right_final = right.world_digest_v1().expect("right reproduction V1.4");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);
@@ -32964,8 +33186,8 @@ mod tests {
             .expect("right scheduled trace contract");
         assert_eq!(left_trace.first_divergence(right_trace).unwrap(), None);
         assert_eq!(left.resource_ledger(), right.resource_ledger());
-        let left_final = left.world_digest_v1().expect("left crossover V1.3");
-        let right_final = right.world_digest_v1().expect("right crossover V1.3");
+        let left_final = left.world_digest_v1().expect("left crossover V1.4");
+        let right_final = right.world_digest_v1().expect("right crossover V1.4");
         assert_eq!(left_final.rng, right_final.rng);
         assert_eq!(left_final.counters, right_final.counters);
         assert_eq!(left_final, right_final);

@@ -2,8 +2,9 @@
 //!
 //! A checkpoint is deliberately narrower than a product "resume run" artifact. It restores every
 //! checkpoint-owned value that can change the next core simulation transition, assuming
-//! caller-supplied executable brain adapters implement the recorded family/schema/codec
-//! contracts. It does not claim to restore a persistence session, retained analytics output,
+//! caller-supplied executable brain adapters implement the recorded family/schema/codec and
+//! family-authored semantic-identity contracts. It does not claim to restore a persistence
+//! session, retained analytics output,
 //! configuration-audit revision, UI selection, mutation-log prose, chart history, narrative
 //! history, or renderer state. Those host-owned surfaces belong to the later replay/runtime work.
 //! Keeping that boundary explicit prevents a core round trip from being advertised as a storage
@@ -17,15 +18,15 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 /// Strict schema carried by the first world checkpoint envelope.
-pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1";
+pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.1";
 /// Codec revision for [`WorldCheckpointV1`].
 ///
 /// Any serialized field or variant layout, nested live DTO layout, or canonicalization change
 /// requires a codec bump. A change to future-state coverage or field meaning requires a new
 /// checkpoint schema. Never rebless the representative V1 wire golden without reviewing both
 /// version identities.
-pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 1;
-const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v1";
+pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 2;
+const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v2";
 
 /// Maximum complete checkpoint wire accepted by the decoder.
 ///
@@ -58,9 +59,9 @@ pub struct WorldCheckpointV1 {
 
 /// Data-only registry roster a host must recreate before restoring a checkpoint.
 ///
-/// This is an inspection aid, not executable code and not an implementation attestation. The host
-/// still owns adapter construction and the protocol-version discipline described by
-/// [`WorldState::restore_checkpoint_v1`].
+/// This is an inspection aid, not executable code. The semantic identity is a family-authored
+/// attestation rather than executable-byte authentication; the host still owns adapter
+/// construction and the version discipline described by [`WorldState::restore_checkpoint_v1`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointBrainRegistryRequirementV1 {
     /// Stable registry key that must be recreated.
@@ -69,6 +70,8 @@ pub struct CheckpointBrainRegistryRequirementV1 {
     pub kind: String,
     /// Declared legacy construction-state digest, when the source supplied one.
     pub factory_state_digest: Option<u64>,
+    /// Family-authored executable semantic identity, when a protocol adapter is admitted.
+    pub adapter_identity: Option<BrainAdapterIdentityV1>,
     /// Versioned protocol family attached at this key, when admitted.
     pub protocol_family: Option<BrainFamilyId>,
 }
@@ -196,7 +199,7 @@ pub enum WorldCheckpointError {
     /// The six-domain random-stream checkpoint could not be restored.
     #[error(transparent)]
     RandomStreams(#[from] DomainStreamRestoreError),
-    /// The embedded V1.3 source digest violated its own contract.
+    /// The embedded V1.4 source digest violated its own contract.
     #[error(transparent)]
     DigestContract(#[from] WorldDigestV1ContractError),
 }
@@ -326,6 +329,7 @@ struct BrainRegistryEntryCheckpointV1 {
     #[serde(deserialize_with = "deserialize_checkpoint_kind")]
     kind: String,
     factory_state_digest: Option<u64>,
+    adapter_identity: Option<BrainAdapterIdentityV1>,
     protocol_family: Option<BrainFamilyId>,
 }
 
@@ -631,6 +635,7 @@ impl WorldCheckpointV1 {
                     key: entry.key,
                     kind: entry.kind.clone(),
                     factory_state_digest: entry.factory_state_digest,
+                    adapter_identity: entry.adapter_identity,
                     protocol_family: entry.protocol_family.clone(),
                 })
                 .collect(),
@@ -801,11 +806,12 @@ impl WorldState {
     ///
     /// `brain_registry` must reproduce the complete recipe returned by
     /// [`WorldCheckpointV1::required_brain_registry`]: exact allocation cursor, retired-key gaps,
-    /// surviving key order, kinds, protocol families, legacy/protocol classification, and factory
-    /// state declarations. The registry itself is trusted host code and is never accepted from
-    /// checkpoint bytes. Declarative equality cannot attest executable code identity: adapter
-    /// authors must bump their family schema/codec whenever evaluation or construction semantics
-    /// change, and the source digest retains its explicit incomplete-factory-coverage declaration.
+    /// surviving key order, kinds, protocol families, legacy/protocol classification, legacy
+    /// factory state declarations, and protocol adapter semantic identities. The registry itself
+    /// is trusted host code and is never accepted from checkpoint bytes. Adapter identity is a
+    /// family-authored semantic attestation rather than executable-byte authentication: authors
+    /// must change it whenever construction or evaluation behavior changes, and must additionally
+    /// bump their family schema/codec whenever serialized payload interpretation changes.
     pub fn restore_checkpoint_v1(
         checkpoint: &WorldCheckpointV1,
         brain_registry: BrainRegistry,
@@ -1077,6 +1083,7 @@ impl BrainRegistry {
                 key: *key,
                 kind: entry.kind.to_string(),
                 factory_state_digest: entry.factory_state_digest,
+                adapter_identity: entry.adapter_identity,
                 protocol_family: entry
                     .protocol_adapter
                     .as_ref()
@@ -1359,6 +1366,31 @@ fn validate_registry_checkpoint(
                     entry.key, registry.next_key
                 ),
             );
+        }
+        match (
+            entry.protocol_family.is_some(),
+            entry.factory_state_digest.is_some(),
+            entry.adapter_identity.is_some(),
+        ) {
+            (true, false, true) | (false, _, false) => {}
+            (true, true, _) => {
+                return contract_error(
+                    format!("registry.entries[{index}].factory_state_digest"),
+                    "protocol families must use adapter identity rather than a legacy factory-state digest",
+                );
+            }
+            (true, false, false) => {
+                return contract_error(
+                    format!("registry.entries[{index}].adapter_identity"),
+                    "protocol families must carry a family-authored adapter identity",
+                );
+            }
+            (false, _, true) => {
+                return contract_error(
+                    format!("registry.entries[{index}].adapter_identity"),
+                    "legacy factories cannot claim a protocol adapter identity",
+                );
+            }
         }
         previous = Some(entry.key);
     }
@@ -2359,7 +2391,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::boxed_fixture_brain_family;
+    use crate::tests::{
+        boxed_fixture_brain_family, boxed_fixture_brain_family_with_behavior_probe,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     const CHECKPOINT_KIND: &str = "checkpoint-test-protocol";
     const CHECKPOINT_FAMILY_ID: &str = "checkpoint-test-protocol-family";
@@ -3169,6 +3207,12 @@ mod tests {
         assert_eq!(requirements.entries[0].kind, CHECKPOINT_KIND);
         assert_eq!(requirements.entries[0].factory_state_digest, None);
         assert_eq!(
+            requirements.entries[0].adapter_identity,
+            retired_source
+                .brain_registry
+                .adapter_identity(requirements.entries[0].key)
+        );
+        assert_eq!(
             requirements.entries[0]
                 .protocol_family
                 .as_ref()
@@ -3217,6 +3261,75 @@ mod tests {
             Err(WorldCheckpointError::Contract { ref path, .. })
                 if path == "registry.entries"
         ));
+    }
+
+    #[test]
+    fn changed_adapter_identity_is_rejected_before_evaluator_reconstruction() {
+        let source_constructions = Arc::new(AtomicUsize::new(0));
+        let mut source = WorldState::new(checkpoint_config()).expect("identity source world");
+        let source_key = source
+            .register_brain_family(
+                CHECKPOINT_KIND,
+                boxed_fixture_brain_family_with_behavior_probe(
+                    CHECKPOINT_FAMILY_ID,
+                    0,
+                    Arc::clone(&source_constructions),
+                ),
+            )
+            .expect("register source identity fixture");
+        let agent = source
+            .try_spawn_agent(AgentData::default())
+            .expect("identity fixture agent");
+        assert!(
+            source
+                .bind_agent_brain(agent, source_key)
+                .expect("bind identity fixture brain")
+        );
+        assert_eq!(source_constructions.load(Ordering::Relaxed), 1);
+
+        let checkpoint = source.checkpoint_v1().expect("identity checkpoint");
+        let requirement = &checkpoint.required_brain_registry().entries[0];
+        let saved_identity = requirement
+            .adapter_identity
+            .expect("protocol checkpoint carries adapter identity");
+        let mut missing_identity = checkpoint.clone();
+        missing_identity.state.registry.entries[0].adapter_identity = None;
+        assert!(matches!(
+            missing_identity.encode(),
+            Err(WorldCheckpointError::Contract { ref path, .. })
+                if path == "registry.entries[0].adapter_identity"
+        ));
+
+        let prepared_constructions = Arc::new(AtomicUsize::new(0));
+        let mut changed_registry = BrainRegistry::new();
+        let changed_key = changed_registry
+            .register_family(
+                CHECKPOINT_KIND,
+                boxed_fixture_brain_family_with_behavior_probe(
+                    CHECKPOINT_FAMILY_ID,
+                    1,
+                    Arc::clone(&prepared_constructions),
+                ),
+            )
+            .expect("register changed-behavior identity fixture");
+        assert_eq!(changed_key, source_key);
+        assert_ne!(
+            changed_registry
+                .adapter_identity(changed_key)
+                .expect("prepared adapter identity"),
+            saved_identity,
+            "the fixture's changed evaluator behavior must move its semantic identity"
+        );
+
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&checkpoint, changed_registry),
+            Err(WorldCheckpointError::RegistryMismatch { .. })
+        ));
+        assert_eq!(
+            prepared_constructions.load(Ordering::Relaxed),
+            0,
+            "registry identity mismatch must reject before reconstructing any evaluator or agent"
+        );
     }
 
     #[test]

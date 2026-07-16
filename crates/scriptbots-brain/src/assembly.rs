@@ -2,9 +2,10 @@
 
 use rand::Rng;
 use scriptbots_core::{
-    BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec,
-    BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection, BrainInspectionError,
-    BrainInspectionSnapshot, BrainProtocolError, MutationRates, OffspringStatePolicy, RandomStream,
+    BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
+    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial, BrainInspection,
+    BrainInspectionError, BrainInspectionSnapshot, BrainProtocolError, MutationRates,
+    OffspringStatePolicy, RandomStream,
 };
 use std::any::Any;
 
@@ -17,6 +18,8 @@ use crate::{Brain, BrainKind, into_runner};
 
 const BRAIN_SIZE: usize = 200;
 const ASSEMBLY_FAMILY_ID: &str = "assembly";
+const ADAPTER_SEMANTIC_VERSION: u32 = 1;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v1";
 const ASSEMBLY_GENOME_SCHEMA_VERSION: u32 = 1;
 const ASSEMBLY_GENOME_CODEC_VERSION: u16 = 1;
 const ASSEMBLY_STATE_SCHEMA_VERSION: u32 = 1;
@@ -337,6 +340,14 @@ impl BrainEvaluator for AssemblyProtocolEvaluator {
 impl BrainFamilyCodec for AssemblyFamilyAdapter {
     fn family_id(&self) -> &BrainFamilyId {
         &self.family_id
+    }
+
+    fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
+        BrainAdapterIdentityV1::from_semantic_descriptor(
+            self.family_id(),
+            ADAPTER_SEMANTIC_VERSION,
+            ADAPTER_SEMANTIC_DESCRIPTOR,
+        )
     }
 
     fn random_genome_material(
@@ -683,6 +694,19 @@ mod tests {
         AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, BrainInspectionLimits, SmallRngStream,
         Tick,
     };
+
+    #[test]
+    fn adapter_semantic_identity_v1_is_pinned() {
+        let identity = AssemblyFamilyAdapter::new()
+            .expect("canonical Assembly adapter")
+            .adapter_identity();
+        assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
+        assert_eq!(
+            identity.to_string(),
+            "DSR_REBLESS_ASSEMBLY_ADAPTER_IDENTITY_V1",
+            "update only after reviewing an intentional Assembly executable-semantics change"
+        );
+    }
 
     #[derive(Clone, Debug, Default)]
     struct AlternatingThresholdStream {

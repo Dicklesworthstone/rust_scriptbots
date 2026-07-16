@@ -181,14 +181,14 @@ fn a_food_draw_moves_only_the_food_rng_domain() {
     let control = WorldState::new(config.clone()).expect("control world");
     let mut food_advanced = WorldState::new(config).expect("food-advanced world");
 
-    let before = control.world_digest_v1().expect("control V1.3 digest");
+    let before = control.world_digest_v1().expect("control V1.4 digest");
     let _ = food_advanced
         .rng(RngDomain::Food)
         .expect("Food-domain RNG access")
         .next_u64();
     let after = food_advanced
         .world_digest_v1()
-        .expect("food-advanced V1.3 digest");
+        .expect("food-advanced V1.4 digest");
 
     assert_ne!(
         before.rng.domains.get(RngDomain::Food),
@@ -249,7 +249,7 @@ fn a_food_draw_moves_only_the_food_rng_domain() {
 }
 
 #[test]
-fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
+fn v1_4_wire_is_exact_and_rejects_older_contracts() {
     #[derive(Serialize)]
     struct LegacyWorldDigestV1_2 {
         schema: String,
@@ -278,17 +278,17 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
 
     let digest = world_with_brain_seed(17, 2)
         .world_digest_v1()
-        .expect("V1.3 wire fixture");
-    let json = serde_json::to_value(&digest).expect("encode V1.3 JSON");
+        .expect("V1.4 wire fixture");
+    let json = serde_json::to_value(&digest).expect("encode V1.4 JSON");
     let json_round_trip: WorldDigestV1 =
-        serde_json::from_value(json.clone()).expect("decode V1.3 JSON");
+        serde_json::from_value(json.clone()).expect("decode V1.4 JSON");
     assert_eq!(json_round_trip, digest);
     json_round_trip
         .validate_contract()
         .expect("JSON round trip must retain a valid V1");
     let keys: BTreeSet<String> = json
         .as_object()
-        .expect("V1.3 JSON object")
+        .expect("V1.4 JSON object")
         .keys()
         .cloned()
         .collect();
@@ -320,7 +320,7 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
     .map(str::to_owned)
     .collect();
     assert_eq!(keys, expected);
-    let rng = json["rng"].as_object().expect("V1.3 RNG digest object");
+    let rng = json["rng"].as_object().expect("V1.4 RNG digest object");
     let rng_keys: BTreeSet<String> = rng.keys().cloned().collect();
     let expected_rng_keys: BTreeSet<String> = ["overall", "domains"]
         .into_iter()
@@ -328,12 +328,12 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
         .collect();
     assert_eq!(
         rng_keys, expected_rng_keys,
-        "V1.3 RNG diagnostics must carry exactly one aggregate and one domain map"
+        "V1.4 RNG diagnostics must carry exactly one aggregate and one domain map"
     );
     let domain_keys: BTreeSet<String> = rng
         .get("domains")
         .and_then(serde_json::Value::as_object)
-        .expect("V1.3 RNG domain map")
+        .expect("V1.4 RNG domain map")
         .keys()
         .cloned()
         .collect();
@@ -346,7 +346,7 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
     let mut missing_domain = json.clone();
     missing_domain["rng"]["domains"]
         .as_object_mut()
-        .expect("mutable V1.3 RNG domains")
+        .expect("mutable V1.4 RNG domains")
         .remove(RngDomain::Food.tag());
     assert!(
         serde_json::from_value::<WorldDigestV1>(missing_domain).is_err(),
@@ -355,7 +355,7 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
     let mut unknown_domain = json.clone();
     unknown_domain["rng"]["domains"]
         .as_object_mut()
-        .expect("mutable V1.3 RNG domains")
+        .expect("mutable V1.4 RNG domains")
         .insert(
             "future-domain".to_owned(),
             serde_json::Value::String("0000000000000000".to_owned()),
@@ -377,7 +377,7 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
         let mut missing = json.clone();
         missing
             .as_object_mut()
-            .expect("mutable V1.3 JSON")
+            .expect("mutable V1.4 JSON")
             .remove(required);
         assert!(
             serde_json::from_value::<WorldDigestV1>(missing).is_err(),
@@ -387,7 +387,7 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
     let mut unknown = json;
     unknown
         .as_object_mut()
-        .expect("mutable V1.3 JSON")
+        .expect("mutable V1.4 JSON")
         .insert("unknown".to_owned(), serde_json::Value::Bool(true));
     assert!(serde_json::from_value::<WorldDigestV1>(unknown).is_err());
 
@@ -397,6 +397,13 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
         wrong_schema.validate_contract(),
         Err(WorldDigestV1ContractError::Schema { .. })
     ));
+    let mut adapter_blind_v1_3 = digest.clone();
+    adapter_blind_v1_3.schema = "scriptbots.world-digest.v1.3".to_owned();
+    adapter_blind_v1_3.codec_version = 3;
+    assert!(
+        adapter_blind_v1_3.validate_contract().is_err(),
+        "an adapter-blind V1.3 contract satisfied the V1.4 identity boundary"
+    );
     let mut wrong_codec = digest.clone();
     wrong_codec.codec_version += 1;
     assert!(matches!(
@@ -463,13 +470,13 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
     let legacy_json = serde_json::to_value(&legacy).expect("encode legacy V1.2 JSON fixture");
     assert!(
         serde_json::from_value::<WorldDigestV1>(legacy_json).is_err(),
-        "single-stream JSON V1.2 payload decoded as V1.3"
+        "single-stream JSON V1.2 payload decoded as V1.4"
     );
     let legacy = postcard::to_allocvec(&legacy).expect("encode legacy V1.2 fixture");
     if let Ok(decoded) = postcard::from_bytes::<WorldDigestV1>(&legacy) {
         assert!(
             decoded.validate_contract().is_err(),
-            "single-stream positional V1.2 payload satisfied the V1.3 contract"
+            "single-stream positional V1.2 payload satisfied the V1.4 contract"
         );
     }
 }
