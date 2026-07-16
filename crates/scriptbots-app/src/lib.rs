@@ -5,10 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use scriptbots_core::{
     AgentRngCounterStateV1, CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
     PersistenceAdmissionSession, ScriptBotsConfig, TickEvents, WorldDigestV1,
-    WorldDigestV1ContractError, WorldState, world_counters_digest_v1,
-    rng_domains::{
-        AgentSubstreamProtocolError, AgentSubstreamProtocolV1, DomainStreamsCheckpoint,
-    },
+    WorldDigestV1ContractError, WorldState,
+    rng_domains::{AgentSubstreamProtocolError, AgentSubstreamProtocolV1, DomainStreamsCheckpoint},
+    world_counters_digest_v1,
 };
 use scriptbots_runtime::RunId;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;

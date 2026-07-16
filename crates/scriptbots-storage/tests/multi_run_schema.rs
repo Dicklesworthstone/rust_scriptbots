@@ -70,8 +70,7 @@ fn launch_continuation_fixture(root_seed: u64) -> LaunchContinuationFixture {
             .expect("fixture agent counters are complete"),
     )
     .expect("fixture agent counters are serializable");
-    let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) =
-        world.identity_sequence_state();
+    let (next_agent_uid, next_spawn_ordinal, next_birth_ordinal) = world.identity_sequence_state();
     let world_digest = serde_json::to_value(
         world
             .world_digest_v1()

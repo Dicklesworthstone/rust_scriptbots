@@ -2791,10 +2791,7 @@ mod tests {
         let actual = blake3::hash(&wire).to_hex().to_string();
         assert_eq!(
             (wire.len(), actual.as_str()),
-            (
-                0,
-                "DSR_REBLESS_WORLD_CHECKPOINT_V1_2_CODEC3",
-            ),
+            (0, "DSR_REBLESS_WORLD_CHECKPOINT_V1_2_CODEC3",),
             "the first DSR batch-verification pass must report and then rebless the reviewed V1.2/codec-3 wire"
         );
     }
@@ -3265,9 +3262,8 @@ mod tests {
         let counter_checkpoint = counter_world
             .checkpoint_v1()
             .expect("checkpoint with agent counters");
-        let mut missing_counters =
-            serde_json::to_value(&counter_checkpoint.state.agents[0])
-                .expect("agent checkpoint JSON fixture");
+        let mut missing_counters = serde_json::to_value(&counter_checkpoint.state.agents[0])
+            .expect("agent checkpoint JSON fixture");
         missing_counters
             .as_object_mut()
             .expect("agent checkpoint is an object")
@@ -3276,9 +3272,8 @@ mod tests {
             serde_json::from_value::<AgentCheckpointV1>(missing_counters).is_err(),
             "agent checkpoint missing its random continuation counters decoded"
         );
-        let mut unknown_counter_peer =
-            serde_json::to_value(&counter_checkpoint.state.agents[0])
-                .expect("agent checkpoint JSON fixture");
+        let mut unknown_counter_peer = serde_json::to_value(&counter_checkpoint.state.agents[0])
+            .expect("agent checkpoint JSON fixture");
         unknown_counter_peer
             .as_object_mut()
             .expect("agent checkpoint is an object")
@@ -3544,10 +3539,9 @@ mod tests {
         };
 
         let mut wrong_root = checkpoint.clone();
-        wrong_root.state.agent_substream_protocol =
-            AgentSubstreamProtocolV1::from_root_seed(
-                wrong_root.state.random_streams.root_seed() ^ 1,
-            );
+        wrong_root.state.agent_substream_protocol = AgentSubstreamProtocolV1::from_root_seed(
+            wrong_root.state.random_streams.root_seed() ^ 1,
+        );
         assert!(matches!(
             WorldState::restore_checkpoint_v1(&wrong_root, prepared_registry()),
             Err(WorldCheckpointError::AgentSubstreamProtocol(

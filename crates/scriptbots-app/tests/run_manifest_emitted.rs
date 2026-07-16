@@ -18,9 +18,7 @@ use scriptbots_app::{
     CHARACTERIZATION_TRACE_V2_SCHEMA, CharacterizationTraceV2, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
     RUN_MANIFEST_V3_SCHEMA, RunManifestV3,
 };
-use scriptbots_core::{
-    Tick, rng_domains::AgentSubstreamProtocolV1, world_counters_digest_v1,
-};
+use scriptbots_core::{Tick, rng_domains::AgentSubstreamProtocolV1, world_counters_digest_v1};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::StorageReader;
 
@@ -289,8 +287,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         .expect("the supplemental sidecar must satisfy the typed V3 manifest contract");
     let expected_agent_substream_protocol = AgentSubstreamProtocolV1::from_root_seed(4242);
     assert_eq!(
-        sidecar.agent_substream_protocol,
-        expected_agent_substream_protocol,
+        sidecar.agent_substream_protocol, expected_agent_substream_protocol,
         "the sidecar must bind the exact target-specific agent-keyed RNG protocol for this seed"
     );
     assert_eq!(sidecar.agent_substream_protocol.root_seed(), 4242);

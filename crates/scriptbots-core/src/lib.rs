@@ -7994,10 +7994,7 @@ pub enum ScientificStateError {
     GenerationOverflow { path: String, generation: u32 },
     /// An agent-keyed random continuation could not advance without reusing an earlier ordinal.
     #[error("agent-keyed random continuation `{counter}` is exhausted at `{path}`")]
-    AgentRngCounterExhausted {
-        path: String,
-        counter: &'static str,
-    },
+    AgentRngCounterExhausted { path: String, counter: &'static str },
     /// A live agent did not have the keyed-RNG continuation required by the protocol.
     #[error("agent-keyed random continuation is missing at `{path}`")]
     MissingAgentRngCounters { path: String },
@@ -16425,13 +16422,8 @@ impl WorldState {
                 AgentRngOperationV1::ReproductionPartner,
                 attempt_ordinal,
             );
-            let partner_index = self.select_partner_index(
-                idx,
-                &handles,
-                &ages,
-                partner_chance,
-                &mut partner_rng,
-            );
+            let partner_index =
+                self.select_partner_index(idx, &handles, &ages, partner_chance, &mut partner_rng);
             let partner_data = partner_index.map(|j| parent_snapshots[j]);
             // Cloning an AgentRuntime is deep (logs, sensor arrays); do it only
             // for the one partner of an actual birth, not the whole population.
@@ -16763,8 +16755,7 @@ impl WorldState {
         child.position.x = Self::wrap_position(parent.position.x + base_dx + jitter_dx, width);
         child.position.y = Self::wrap_position(parent.position.y + base_dy + jitter_dy, height);
         child.velocity = Velocity::default();
-        child.heading =
-            wrap_signed_angle(parent.heading + population_rng.random_range(-0.2..0.2));
+        child.heading = wrap_signed_angle(parent.heading + population_rng.random_range(-0.2..0.2));
         child.health = 1.0;
         child.boost = false;
         child.age = 0;
@@ -16779,9 +16770,8 @@ impl WorldState {
 
         if color_jitter > 0.0 {
             for channel in &mut child.color {
-                *channel = (*channel
-                    + population_rng.random_range(-color_jitter..color_jitter))
-                .clamp(0.0, 1.0);
+                *channel = (*channel + population_rng.random_range(-color_jitter..color_jitter))
+                    .clamp(0.0, 1.0);
             }
         }
         Ok(child)
@@ -17013,8 +17003,7 @@ impl WorldState {
 
             let (before_smell, after_smell) = {
                 let before = runtime.trait_modifiers.smell;
-                let after =
-                    Self::mutate_value(mutation_rng, before, mutation_scale, 0.05, 3.0);
+                let after = Self::mutate_value(mutation_rng, before, mutation_scale, 0.05, 3.0);
                 runtime.trait_modifiers.smell = after;
                 (before, after)
             };
@@ -17022,8 +17011,7 @@ impl WorldState {
 
             let (before_sound, after_sound) = {
                 let before = runtime.trait_modifiers.sound;
-                let after =
-                    Self::mutate_value(mutation_rng, before, mutation_scale, 0.05, 3.0);
+                let after = Self::mutate_value(mutation_rng, before, mutation_scale, 0.05, 3.0);
                 runtime.trait_modifiers.sound = after;
                 (before, after)
             };
@@ -17129,13 +17117,7 @@ impl WorldState {
         runtime
     }
 
-    fn mutate_value(
-        rng: &mut dyn RandomStream,
-        value: f32,
-        scale: f32,
-        min: f32,
-        max: f32,
-    ) -> f32 {
+    fn mutate_value(rng: &mut dyn RandomStream, value: f32, scale: f32, min: f32, max: f32) -> f32 {
         if scale <= 0.0 {
             return value.clamp(min, max);
         }
@@ -18799,11 +18781,7 @@ impl WorldState {
                     .parent_rng_counters_before_attempt
                     .reproduction_attempt_ordinal(),
             );
-            encoder.u64(
-                spawn
-                    .parent_rng_counters_before_attempt
-                    .birth_ordinal(),
-            );
+            encoder.u64(spawn.parent_rng_counters_before_attempt.birth_ordinal());
             encoder.u64(
                 spawn
                     .parent_rng_counters_before_attempt
@@ -19447,21 +19425,21 @@ impl WorldState {
     pub fn ordered_agent_rng_counters_v1(
         &self,
     ) -> Result<Vec<AgentRngCounterStateV1>, CharacterizationError> {
-        let mut states = self
-            .agents
-            .iter_handles()
-            .map(|id| {
-                let raw_id = id.data().as_ffi();
-                let identity = self
-                    .identities
-                    .get(id)
-                    .ok_or(CharacterizationError::MissingAgentData { agent_id: raw_id })?;
-                let counters = self.agent_rng_counters.get(id).copied().ok_or(
-                    CharacterizationError::MissingAgentRngCounters { agent_id: raw_id },
-                )?;
-                Ok(AgentRngCounterStateV1::new(identity.uid, counters))
-            })
-            .collect::<Result<Vec<_>, CharacterizationError>>()?;
+        let mut states =
+            self.agents
+                .iter_handles()
+                .map(|id| {
+                    let raw_id = id.data().as_ffi();
+                    let identity = self
+                        .identities
+                        .get(id)
+                        .ok_or(CharacterizationError::MissingAgentData { agent_id: raw_id })?;
+                    let counters = self.agent_rng_counters.get(id).copied().ok_or(
+                        CharacterizationError::MissingAgentRngCounters { agent_id: raw_id },
+                    )?;
+                    Ok(AgentRngCounterStateV1::new(identity.uid, counters))
+                })
+                .collect::<Result<Vec<_>, CharacterizationError>>()?;
         states.sort_unstable_by_key(|state| state.agent_uid());
         Ok(states)
     }
@@ -19816,13 +19794,11 @@ impl WorldState {
         let uid = self
             .agent_uid(id)
             .expect("live agent must have a stable identity before brain binding");
-        let counters_before = self
-            .agent_rng_counters
-            .get(id)
-            .copied()
-            .ok_or_else(|| ScientificStateError::MissingAgentRngCounters {
+        let counters_before = self.agent_rng_counters.get(id).copied().ok_or_else(|| {
+            ScientificStateError::MissingAgentRngCounters {
                 path: format!("agents[uid={}].rng_counters", uid.get()),
-            })?;
+            }
+        })?;
         let ordinal = self
             .agent_rng_counters
             .get_mut(id)
@@ -24950,10 +24926,7 @@ mod tests {
             AgentRngOperationV1::BrainInitialization,
             ordinal,
         );
-        if let Some(key) = reference_world
-            .brain_registry
-            .random_key(&mut key_rng)
-        {
+        if let Some(key) = reference_world.brain_registry.random_key(&mut key_rng) {
             assert!(
                 reference_world
                     .bind_agent_brain(id, key)
@@ -29888,9 +29861,7 @@ mod tests {
             runtime.reproduction_counter = 1.0;
         }
 
-        admitted
-            .stage_reproduction()
-            .expect("admitted keyed birth");
+        admitted.stage_reproduction().expect("admitted keyed birth");
         assert_eq!(admitted.pending_spawns.len(), 1);
         let order = &admitted.pending_spawns[0];
         assert_eq!(
@@ -29905,8 +29876,7 @@ mod tests {
             AgentRngCountersV1::from_ordinals(1, 1, 0)
         );
         let energy_before_debit = order.parent_energy_before_debit;
-        let reproduction_counter_before_reset =
-            order.parent_reproduction_counter_before_reset;
+        let reproduction_counter_before_reset = order.parent_reproduction_counter_before_reset;
 
         admitted.abort_pending_spawns();
         assert!(admitted.pending_spawns.is_empty());
@@ -30046,9 +30016,7 @@ mod tests {
                 distant_data.velocity = Velocity::default();
                 distant_data.heading = 0.0;
                 let distant = world.spawn_agent(distant_data);
-                let runtime = world
-                    .agent_runtime_mut(distant)
-                    .expect("distant runtime");
+                let runtime = world.agent_runtime_mut(distant).expect("distant runtime");
                 runtime.energy = 0.0;
                 runtime.reproduction_counter = 0.0;
                 runtime.outputs = [0.0; OUTPUT_SIZE];
@@ -33236,11 +33204,7 @@ mod tests {
             partner_id: Some(second),
             parent_energy_before_debit: 0.75,
             parent_reproduction_counter_before_reset: 2.0,
-            offspring_rng_identity: OffspringRngIdentityV1::new(
-                first_uid,
-                Some(second_uid),
-                0,
-            ),
+            offspring_rng_identity: OffspringRngIdentityV1::new(first_uid, Some(second_uid), 0),
             parent_rng_counters_before_attempt: world
                 .agent_rng_counters(first)
                 .expect("parent RNG counters"),

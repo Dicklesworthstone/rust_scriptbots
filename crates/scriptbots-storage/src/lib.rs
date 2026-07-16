@@ -10,14 +10,13 @@ use fsqlite::{
     migrate::MigrationRunner,
 };
 use scriptbots_core::{
-    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding, DeathCause,
-    DeathRecord, Generation, PersistenceAdmissionError, PersistenceAdmissionState,
+    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainBinding,
+    DeathCause, DeathRecord, Generation, PersistenceAdmissionError, PersistenceAdmissionState,
     PersistenceBatch, PersistenceEventKind, ReplayAgentPhase, ReplayEvent, ReplayEventKind,
-    ReplayRngScope, Tick, WorldPersistence, world_counters_digest_v1,
+    ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
-    rng_domains::{
-        AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain,
-    },
+    rng_domains::{AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, RngDomain},
+    world_counters_digest_v1,
 };
 use scriptbots_runtime::RunId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -979,12 +978,7 @@ fn validate_v3_manifest_projection(
         ));
     }
     validate_v3_limitations(manifest, purpose)?;
-    validate_v3_bootstrap(
-        manifest,
-        schema,
-        bootstrap_ticks,
-        &launch_counters_digest,
-    )?;
+    validate_v3_bootstrap(manifest, schema, bootstrap_ticks, &launch_counters_digest)?;
 
     Ok(())
 }
@@ -1201,7 +1195,9 @@ fn validate_v3_agent_rng_continuations(
         ))
     })?;
     protocol.validate(record.root_seed).map_err(|error| {
-        manifest_projection_error(format!("/agent_substream_protocol is incompatible: {error}"))
+        manifest_projection_error(format!(
+            "/agent_substream_protocol is incompatible: {error}"
+        ))
     })?;
 
     let expected_next_agent_uid = next_spawn_ordinal.checked_add(1).ok_or_else(|| {
@@ -1240,11 +1236,7 @@ fn validate_v3_agent_rng_continuations(
     let mut previous_uid = None;
     for (index, value) in values.iter().enumerate() {
         let pointer = format!("/agent_rng_counters/{index}");
-        manifest_require_exact_object_fields(
-            manifest,
-            &pointer,
-            &["agent_uid", "counters"],
-        )?;
+        manifest_require_exact_object_fields(manifest, &pointer, &["agent_uid", "counters"])?;
         manifest_required_u64(manifest, &format!("{pointer}/agent_uid"))?;
         manifest_require_exact_object_fields(
             manifest,
@@ -9704,8 +9696,7 @@ mod tests {
     use super::*;
     use scriptbots_core::{
         AgentData, AgentRuntime, AgentState, MetricSample, PersistenceBatch, PersistenceEvent,
-        PersistenceEventKind, Position, Tick, TickSummary,
-        rng_domains::AgentRngCountersV1,
+        PersistenceEventKind, Position, Tick, TickSummary, rng_domains::AgentRngCountersV1,
     };
     use std::{
         fs,
@@ -9744,14 +9735,8 @@ mod tests {
         record.root_seed = root_seed;
         let protocol = AgentSubstreamProtocolV1::from_root_seed(root_seed);
         let counters = vec![
-            AgentRngCounterStateV1::new(
-                AgentUid(1),
-                AgentRngCountersV1::from_ordinals(2, 3, 4),
-            ),
-            AgentRngCounterStateV1::new(
-                AgentUid(2),
-                AgentRngCountersV1::from_ordinals(5, 6, 7),
-            ),
+            AgentRngCounterStateV1::new(AgentUid(1), AgentRngCountersV1::from_ordinals(2, 3, 4)),
+            AgentRngCounterStateV1::new(AgentUid(2), AgentRngCountersV1::from_ordinals(5, 6, 7)),
         ];
         let manifest = json!({
             "agent_substream_protocol": protocol,
@@ -9761,15 +9746,7 @@ mod tests {
             .expect("strict continuation projection");
         assert_eq!(
             digest,
-            world_counters_digest_v1(
-                &protocol,
-                Tick::zero(),
-                0,
-                3,
-                2,
-                1,
-                &counters,
-            )
+            world_counters_digest_v1(&protocol, Tick::zero(), 0, 3, 2, 1, &counters,)
         );
 
         let mut reordered = manifest.clone();
@@ -9792,7 +9769,11 @@ mod tests {
             .pop();
         let error = validate_v3_agent_rng_continuations(&record, &missing, 3, 2, 1)
             .expect_err("missing launch continuation must fail");
-        assert!(error.to_string().contains("expected one launch continuation"));
+        assert!(
+            error
+                .to_string()
+                .contains("expected one launch continuation")
+        );
 
         let mut unknown = manifest.clone();
         unknown["agent_rng_counters"][0]["counters"]["future_counter"] = json!(0);
