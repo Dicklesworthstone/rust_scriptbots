@@ -1956,7 +1956,7 @@ Writer errors, queue bounds, flush, and cancellation belong to the runtime/stora
 
 #### 1.4 scenario/startup construction
 
-- minimal scenario schema on `RunManifestV2`;
+- minimal scenario schema on `RunManifestV3`;
 - full-world seeding;
 - remove hidden 120 ticks;
 - preserve current ecology parameters until honest brains/RNG/digests exist;
@@ -2051,7 +2051,7 @@ claim that world integration early.
 
 **Exit:** fixed runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.
 
-#### 1.9 domain-separated RNG and `fnp-random` decision
+#### 1.9 domain-separated RNG and `fnp-random` decision [Currently In Progress — `bd-2cd1`, TopazCastle, 2026-07-15]
 
 - benchmark/integrate or reject pinned `fnp-random` adapter;
 - domain-separated streams;
