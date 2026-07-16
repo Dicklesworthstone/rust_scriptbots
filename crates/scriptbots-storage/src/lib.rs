@@ -1091,14 +1091,13 @@ fn validate_v3_random_streams(
         validate_v3_random_stream_state(manifest, domain)?;
     }
 
-    let checkpoint: DomainStreamsCheckpoint = serde_json::from_value(
-        manifest_required_value(manifest, "/random_streams")?.clone(),
-    )
-    .map_err(|error| {
-        manifest_projection_error(format!(
-            "/random_streams cannot be decoded as a domain-stream checkpoint: {error}"
-        ))
-    })?;
+    let checkpoint: DomainStreamsCheckpoint =
+        serde_json::from_value(manifest_required_value(manifest, "/random_streams")?.clone())
+            .map_err(|error| {
+                manifest_projection_error(format!(
+                    "/random_streams cannot be decoded as a domain-stream checkpoint: {error}"
+                ))
+            })?;
     DomainStreams::restore(&checkpoint).map_err(|error| {
         manifest_projection_error(format!(
             "/random_streams is not a restorable domain-stream checkpoint: {error}"

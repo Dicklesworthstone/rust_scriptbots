@@ -774,8 +774,7 @@ fn v3_manifest_requires_every_random_domain_checkpoint_to_restore() {
         "unexpected error: {error}"
     );
 
-    let mut invalid_continuation =
-        manifest(run_id, "invalid-continuation", 1_700_000_000_031);
+    let mut invalid_continuation = manifest(run_id, "invalid-continuation", 1_700_000_000_031);
     mutate_manifest(&mut invalid_continuation, |value| {
         value["random_streams"]["streams"]["crossover"]["state"]
             .as_array_mut()

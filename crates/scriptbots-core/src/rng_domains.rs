@@ -500,11 +500,8 @@ mod tests {
         }
 
         let checkpoint = original.checkpoint();
-        let expected: [Vec<u64>; RngDomain::ALL.len()] = RngDomain::ALL.map(|domain| {
-            (0..8)
-                .map(|_| original.stream(domain).next_u64())
-                .collect()
-        });
+        let expected: [Vec<u64>; RngDomain::ALL.len()] = RngDomain::ALL
+            .map(|domain| (0..8).map(|_| original.stream(domain).next_u64()).collect());
 
         let mut restored =
             DomainStreams::restore(&checkpoint).expect("a checkpoint we just took must restore");
