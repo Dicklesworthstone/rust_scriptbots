@@ -27475,11 +27475,11 @@ mod tests {
         let maximum = vec![0x5a; MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES];
         let key = BrainBatchArchitectureKey::new(maximum.clone()).expect("maximum key");
         assert_eq!(key.as_bytes(), maximum);
-        assert_eq!(
+        assert!(
             BrainBatchArchitectureKey::new(Vec::new())
                 .expect("empty family-owned key")
-                .as_bytes(),
-            &[]
+                .as_bytes()
+                .is_empty()
         );
         assert!(matches!(
             BrainBatchArchitectureKey::new(vec![
