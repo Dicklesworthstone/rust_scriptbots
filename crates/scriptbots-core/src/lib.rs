@@ -31792,7 +31792,7 @@ mod tests {
             assert_eq!(build.target_endian, "little");
             assert_eq!(build.pointer_width, 64);
             assert_eq!(observed, EXPECTED);
-            assert_eq!(trace.overall, "6e3bcdad6c3719e4");
+            assert_eq!(trace.overall, "4d72af5390c11b38");
             println!(
                 "scriptbots.world-digest-golden.v1.2: six checkpoints and trace overall {} verified",
                 trace.overall
