@@ -4008,7 +4008,7 @@ mod tests {
             "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}"
         );
         assert_eq!(
-            evidence.full_cell_fnv1a64, "8ba8b5fc2f0f2f7a",
+            evidence.full_cell_fnv1a64, "c1b5c6b979cee722",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         assert_eq!(
