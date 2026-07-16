@@ -2031,7 +2031,7 @@ claim that world integration early.
 
 **Exit:** a multi-generation fixture proves real brain genomes evolve and every child is bound.
 
-#### 1.8 canonical digest and checkpoint skeleton [Core checkpoint completed — digest oracle and RNG-aware manifest: `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; core checkpoint: `bd-3n7p`, implementation series `b544705` through `a977cdf`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`; executable adapter attestation currently in progress — `bd-h547`, TopazCastle, 2026-07-16]
+#### 1.8 canonical digest and checkpoint skeleton [Core checkpoint completed — digest oracle and RNG-aware manifest: `bd-2z0.3.13`, `bd-2z0.3.14`, `bd-2cd1`; core checkpoint: `bd-3n7p`, implementation series `b544705` through `a977cdf`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`; executable adapter attestation code-first implementation committed at `1107282`, centralized DSR pending — `bd-h547`, TopazCastle, 2026-07-16]
 
 - [Completed — `bd-2z0.3.13`] Canonical `scriptbots.world-digest.v1.1`: stable-UID
   science lanes, explicit current dense execution-order lane, evaluator/factory coverage,
@@ -2041,8 +2041,9 @@ claim that world integration early.
   retiring the explicit execution-order lane;
 - [Completed — `bd-2cd1`, `a547201`, DSR `bd-2cd1-verify-5` and `bd-2cd1-perf-compare-1`]
   Advanced the digest and six-point trace to V1.3 with a strict fixed-object hash for all six
-  restorable random-domain checkpoints; advanced the run manifest to V3/V3.1 so root seed and
-  continuation state cannot be collapsed back into one stream;
+  restorable random-domain checkpoints; advanced the base/bootstrap run manifest to V3/V3.1 so
+  root seed and continuation state could not be collapsed back into one stream (the adapter
+  attestation change above advances the bootstrap minor to V3.2);
 - [Completed — `bd-2z0.3.13`, `bd-2cd1`] Bind the canonical digest to genome, evaluator state,
   all six RNG states, config, terrain/food, spawn ordinals, and all future-affecting counters;
 - [Completed — `bd-2z0.3.13`] Opt-in clock-free trace with exactly six semantic checkpoints,
@@ -2067,12 +2068,19 @@ claim that world integration early.
   product run bundle. Application checkpoint discovery/resume remains Phase 4.1, so the legacy
   `CharacterizationLimitationsV0::checkpoint_replay_guarantee` remains `false`; flipping that V0
   manifest claim here would overstate product replay support;
-- [Currently In Progress — `bd-h547`] Require every product-admitted protocol family to expose a
-  stable, versioned, family-owned semantic adapter identity; bind it into the registry digest and
-  checkpoint requirements, and reject a differently identified prepared adapter before restoring
-  any agent. This is a trusted semantic attestation, not a compiler artifact or executable hash;
-- [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical V3/V3.1 with the fixed
-  six-domain continuation object.
+- [Implementation committed, centralized DSR pending — `bd-h547`, `1107282`] MLP, DWRAON, and
+  Assembly expose a stable versioned family-owned `BrainAdapterIdentityV1`; the V1.4 digest and
+  six-point trace bind its full 256-bit value and report protocol construction semantics covered;
+  the `scriptbots.world-checkpoint.v1.1`/codec-2 registry recipe carries the identity and rejects a
+  same-family changed-behavior adapter before constructing any evaluator or agent. The compatible
+  bootstrap manifest advances to V3.2. This is a trusted semantic attestation, not a compiler
+  artifact, Rust type identity, closure-layout hash, or executable-byte authentication. Behavior
+  changes must change the identity; payload interpretation changes must additionally bump the
+  family schema/codec. Identity/digest/trace/checkpoint goldens remain deliberately pending the
+  centralized DSR batch;
+- [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical base V3 plus the then-current
+  V3.1 bootstrap minor with the fixed six-domain continuation object; `bd-h547` advances that
+  bootstrap minor to V3.2 when it embeds adapter-attested V1.4 digests.
 
 **Exit (completed — `bd-3n7p`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`):** fixed
 runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.
@@ -2547,7 +2555,7 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 - persist the already-defined canonical manifest/digest schemas;
 - sequenced commands and status transitions;
 - nonempty domain events;
-- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1` science envelope, then
+- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.1` science envelope, then
   reconstruct host-owned persistence/session state around the restored core world;
 - checkpoint resume and first-divergence verification.
 

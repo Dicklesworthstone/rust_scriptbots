@@ -792,11 +792,21 @@ fn v3_manifest_requires_every_random_domain_checkpoint_to_restore() {
 }
 
 #[test]
-fn v31_manifest_requires_explicit_bootstrap_evidence() {
+fn v32_manifest_requires_explicit_adapter_attested_bootstrap_evidence() {
     let run_id = RunId::from_namespace_sequence(0xc011_1de0, 5);
-    let mut missing_evidence = manifest(run_id, "v31-missing-evidence", 1_700_000_000_023);
-    mutate_manifest(&mut missing_evidence, |value| {
+    let mut adapter_blind = manifest(run_id, "v31-adapter-blind", 1_700_000_000_022);
+    mutate_manifest(&mut adapter_blind, |value| {
         value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.1");
+    });
+    let error = manifest_validation_error(adapter_blind);
+    assert!(
+        error.contains("expected a supported V3 manifest"),
+        "unexpected error: {error}"
+    );
+
+    let mut missing_evidence = manifest(run_id, "v32-missing-evidence", 1_700_000_000_023);
+    mutate_manifest(&mut missing_evidence, |value| {
+        value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");
     });
     let error = manifest_validation_error(missing_evidence);
     assert!(

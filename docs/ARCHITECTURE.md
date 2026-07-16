@@ -134,6 +134,10 @@ Families implement the `BrainRunner` trait (`scriptbots-core`), adapted from the
 - `mutate` — perturb in place. The default does nothing and returns `Ok(())`.
 - `state_digest` — a stable hash of genome **and** evaluator state, the hook `WorldDigestV1` uses to
   see inside a brain (§6). One-way: it can prove a restored brain identical but cannot rebuild one.
+- `BrainFamilyCodec::adapter_identity` — a stable versioned BLAKE3 semantic attestation owned by
+  each protocol family. It identifies construction and evaluation behavior independently from the
+  family/schema/codec tuple; it is not derived from addresses, Rust type names, compiler output,
+  closures, or executable bytes.
 
 **Rules.**
 
@@ -199,17 +203,21 @@ reconstruction envelope for the core science state whose equality those digests 
   RNG evidence is only a forward probe rather than a restorable continuation checkpoint.
 - `WorldDigestV1` — supersedes v0 with per-lane hashes: agents ordered by the **stable `AgentUid`**
   (not the reused slot key), brains (genome + evaluator state via `state_digest`), food, terrain,
-  hydrology, the **restorable six-domain** RNG checkpoint, and the future-affecting counters.
+  hydrology, the **restorable six-domain** RNG checkpoint, future-affecting counters, and the exact
+  semantic identity captured for every admitted protocol adapter.
   Coverage is part of the output: if a bound brain cannot expose its state,
   `evaluator_state_covered` is false and the family is *named*, so a digest computed while blind can
-  never collide with one computed while seeing.
-- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1` Postcard
+  never collide with one computed while seeing. V1.4 considers protocol construction semantics
+  covered only when the family identity is present; legacy factories still use their explicit
+  captured-state digest.
+- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1.1` Postcard
   envelope with an unkeyed BLAKE3 corruption checksum, only at an open, persistence-disabled
   completed boundary with no deferred host output. It carries the complete configuration,
   stable-UID agents, genome/evaluator state, exact declarative registry roster and allocation
-  cursor, environment/effects/origins, future-affecting counters, and all six RNG continuations.
-  Restore allocates fresh physical `AgentId` values through a caller-prepared exact
-  `BrainRegistry` and rechecks the saved `WorldDigestV1`.
+  cursor, protocol adapter identities, environment/effects/origins, future-affecting counters, and
+  all six RNG continuations. Restore compares that registry recipe before constructing any
+  evaluator, allocates fresh physical `AgentId` values through the exact caller-prepared
+  `BrainRegistry`, and rechecks the saved `WorldDigestV1`.
 
 **Rules.**
 
@@ -225,8 +233,9 @@ reconstruction envelope for the core science state whose equality those digests 
   it does not cover — is the standard. A digest that quietly skips part of the world is worse than
   one that says it cannot see it.
 - **Checkpoint bytes are data, never executable code, and a core checkpoint is not product
-  resume.** Declarative registry equality does not attest adapter implementation identity, so
-  semantic changes currently rely on honest family schema/codec bumps. The envelope excludes
+  resume.** `BrainAdapterIdentityV1` is a family-authored semantic attestation, not executable-byte
+  authentication. A behavior change must change that identity; a serialized genome/evaluator
+  interpretation change must additionally bump the family schema/codec. The envelope excludes
   storage/session ownership, retained analytics/history, configuration-audit provenance,
   UI/render state, and run-bundle discovery; application resume remains Phase 4.1.
 

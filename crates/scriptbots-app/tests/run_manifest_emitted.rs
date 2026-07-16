@@ -6,7 +6,7 @@
 //! not tell which build, which seed, or which config produced a run directory.
 //!
 //! The current contract is stronger: a base `RunManifestV3` is registered in the
-//! run database before tick zero, and the adjacent V3.1 sidecar supplements that
+//! run database before tick zero, and the adjacent V3.2 sidecar supplements that
 //! durable record with post-bootstrap evidence. These tests drive the real binary
 //! and inspect both records on disk.
 
@@ -254,7 +254,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
     );
     assert_eq!(
         manifest["schema"], RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA,
-        "bootstrap evidence must move the V3 manifest onto its compatible V3.1 schema"
+        "bootstrap evidence must move the V3 manifest onto its adapter-attested V3.2 schema"
     );
     assert_eq!(manifest["schema_version"], 3);
     assert_eq!(manifest["random_streams"]["root_seed"], 4242);

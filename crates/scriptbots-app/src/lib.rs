@@ -18,8 +18,8 @@ pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
 /// Schema identifier for the run-scoped stable-identity/domain-stream manifest.
 pub const RUN_MANIFEST_V3_SCHEMA: &str = "scriptbots.run-manifest.v3";
-/// Compatible V3 minor schema used when a manifest carries bootstrap execution evidence.
-pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.1";
+/// Compatible V3 minor schema used when a manifest carries adapter-attested bootstrap evidence.
+pub const RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA: &str = "scriptbots.run-manifest.v3.2";
 /// Schema identifier for a sequence of V2 world characterization points.
 pub const CHARACTERIZATION_TRACE_V2_SCHEMA: &str = "scriptbots.characterization-trace.v2";
 /// Safety bound for the temporary characterization runner.

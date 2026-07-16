@@ -904,7 +904,7 @@ fn validate_v3_manifest_projection(
     let schema = manifest_required_bounded_string(manifest, "/schema", MAX_RUN_LABEL_BYTES)?;
     if !matches!(
         schema,
-        "scriptbots.run-manifest.v3" | "scriptbots.run-manifest.v3.1"
+        "scriptbots.run-manifest.v3" | "scriptbots.run-manifest.v3.2"
     ) {
         return Err(manifest_projection_error(format!(
             "/schema is {schema:?}, expected a supported V3 manifest"
