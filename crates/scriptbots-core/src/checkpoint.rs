@@ -778,12 +778,13 @@ impl WorldState {
 
     /// Reconstruct a live world from a V1 checkpoint and a freshly prepared exact registry.
     ///
-    /// `brain_registry` must be registered in the same key order and contain the same kind,
-    /// protocol-family, legacy/protocol classification, and factory-state declaration as the
-    /// source. The registry itself is trusted host code and is never accepted from checkpoint
-    /// bytes. Declarative equality cannot attest executable code identity: adapter authors must
-    /// bump their family schema/codec whenever evaluation or construction semantics change, and
-    /// the source digest retains its explicit incomplete-factory-coverage declaration.
+    /// `brain_registry` must reproduce the complete recipe returned by
+    /// [`WorldCheckpointV1::required_brain_registry`]: exact allocation cursor, retired-key gaps,
+    /// surviving key order, kinds, protocol families, legacy/protocol classification, and factory
+    /// state declarations. The registry itself is trusted host code and is never accepted from
+    /// checkpoint bytes. Declarative equality cannot attest executable code identity: adapter
+    /// authors must bump their family schema/codec whenever evaluation or construction semantics
+    /// change, and the source digest retains its explicit incomplete-factory-coverage declaration.
     pub fn restore_checkpoint_v1(
         checkpoint: &WorldCheckpointV1,
         brain_registry: BrainRegistry,
@@ -910,14 +911,19 @@ impl WorldState {
     }
 
     fn ensure_checkpoint_has_no_deferred_host_output(&self) -> Result<(), WorldCheckpointError> {
-        // `last_*`, combat totals, and carcass totals describe the completed tick whose owned
-        // outcome has already been returned. They are reset before the next transition and are
-        // neither checkpoint science state nor deferred work. Only still-undelivered queues and
-        // persistence accumulators block capture here.
+        // `last_*` and combat totals describe the completed tick whose owned outcome has already
+        // been returned and are reset before the next transition. Carcass totals are
+        // persistence-only analytics accumulators; disabled persistence cannot later be spliced
+        // back in after its discard marker. None of these fields is checkpoint science state or
+        // deferred work. Only still-undelivered queues and persistence accumulators block capture.
         let blockers = [
             ("pending_deaths", !self.pending_deaths.is_empty()),
             ("pending_spawns", !self.pending_spawns.is_empty()),
             ("pending_death_records", !self.pending_death_records.is_empty()),
+            (
+                "pending_lifecycle_birth_metrics",
+                !self.pending_lifecycle_birth_metrics.is_empty(),
+            ),
             (
                 "pending_lifecycle_death_metrics",
                 !self.pending_lifecycle_death_metrics.is_empty(),
@@ -2514,6 +2520,10 @@ mod tests {
         world.hydrology = Some(hydrology);
     }
 
+    // The nested RNG algorithm identity deliberately names its pointer-width lane. Keep this
+    // literal golden on the pinned 64-bit verification target; semantic round-trip tests remain
+    // portable across the other supported lanes.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn checkpoint_v1_representative_wire_golden() {
         let (mut world, brain_key) = world_with_mlp();
@@ -2557,9 +2567,16 @@ mod tests {
             .expect("representative checkpoint")
             .encode()
             .expect("representative checkpoint wire");
+        let decoded = WorldCheckpointV1::decode(&wire).expect("decode representative wire");
+        assert_eq!(
+            decoded.encode().expect("re-encode representative wire"),
+            wire,
+            "the representative wire must remain canonical and idempotent"
+        );
         let actual = blake3::hash(&wire).to_hex().to_string();
         assert_eq!(
-            actual, "PENDING_DSR_REPRESENTATIVE_V1_WIRE_HASH",
+            (wire.len(), actual.as_str()),
+            (0, "PENDING_DSR_REPRESENTATIVE_V1_WIRE_HASH"),
             "a V1 wire change requires explicit schema/codec review before reblessing"
         );
     }
@@ -2915,8 +2932,8 @@ mod tests {
 
         for hidden_layers in [
             vec![4, 0, 2],
-            vec![1; 65],
-            vec![65_537],
+            vec![1; MAX_NEUROFLOW_HIDDEN_LAYERS + 1],
+            vec![MAX_NEUROFLOW_LAYER_NEURONS + 1],
             vec![1_024, 1_024],
         ] {
             let mut oversized_config = checkpoint.clone();
@@ -3066,6 +3083,15 @@ mod tests {
         assert_eq!(requirements.next_key, 3);
         assert_eq!(requirements.entries.len(), 1);
         assert_eq!(requirements.entries[0].key, 1);
+        assert_eq!(requirements.entries[0].kind, MLP_KIND);
+        assert_eq!(requirements.entries[0].factory_state_digest, None);
+        assert_eq!(
+            requirements.entries[0]
+                .protocol_family
+                .as_ref()
+                .map(BrainFamilyId::as_str),
+            Some("mlp-baseline")
+        );
 
         let mut cursor_too_low = BrainRegistry::new();
         let retired_key = cursor_too_low.register(
