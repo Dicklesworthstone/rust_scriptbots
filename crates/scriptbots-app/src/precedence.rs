@@ -750,7 +750,7 @@ mod config_layering_tests {
         let pointer = format!("/{}", dotted.replace('.', "/"));
         merged
             .pointer(&pointer)
-            .unwrap_or_else(|| panic!("path `{dotted}` missing from merged config"))
+            .expect("the requested test path must exist in the merged config")
     }
 
     /// The layering matrix, in full — the config analogue of the thread matrix
