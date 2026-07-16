@@ -12697,7 +12697,9 @@ mod tests {
             storage
                 .persist(&sample_batch(8, 0.8))
                 .expect("buffer a second batch");
-            panic!("simulated worker panic while storage holds a buffered batch");
+            std::panic::panic_any(
+                "simulated worker panic while storage holds a buffered batch",
+            );
         }));
         assert!(unwound.is_err(), "the simulated panic must actually unwind");
     }
@@ -12717,7 +12719,7 @@ mod tests {
             storage
                 .persist(&sample_batch(8, 0.8))
                 .expect("admit the second batch without applying it");
-            panic!("simulated worker panic between admission and application");
+            std::panic::panic_any("simulated worker panic between admission and application");
         }));
         assert!(unwound.is_err(), "the simulated panic must actually unwind");
 
