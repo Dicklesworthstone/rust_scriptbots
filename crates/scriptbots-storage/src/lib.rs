@@ -1052,8 +1052,7 @@ fn validate_v3_thread_policy(manifest: &Value) -> Result<(), StorageError> {
     Ok(())
 }
 
-const RUN_MANIFEST_V3_CONFIG_OVERRIDE_KINDS: [&str; 4] =
-    ["defaults", "file", "environment", "cli"];
+const RUN_MANIFEST_V3_CONFIG_OVERRIDE_KINDS: [&str; 4] = ["defaults", "file", "environment", "cli"];
 
 fn validate_v3_config_overrides(manifest: &Value) -> Result<(), StorageError> {
     let Some(value) = manifest.pointer("/config_overrides") else {
@@ -1087,10 +1086,7 @@ fn validate_v3_config_overrides(manifest: &Value) -> Result<(), StorageError> {
             ],
         )?;
         for field in ["path", "losing_layer", "winning_layer"] {
-            manifest_required_config_override_label(
-                manifest,
-                &format!("{pointer}/{field}"),
-            )?;
+            manifest_required_config_override_label(manifest, &format!("{pointer}/{field}"))?;
         }
         for field in ["losing_kind", "winning_kind"] {
             let kind_pointer = format!("{pointer}/{field}");

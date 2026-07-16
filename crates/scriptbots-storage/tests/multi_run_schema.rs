@@ -833,12 +833,7 @@ fn v3_config_overrides_require_an_array_and_exact_record_shape() {
 
 #[test]
 fn v3_config_overrides_enforce_count_label_and_kind_bounds() {
-    let entry = config_override(
-        "file",
-        "cli",
-        serde_json::json!(1),
-        serde_json::json!(2),
-    );
+    let entry = config_override("file", "cli", serde_json::json!(1), serde_json::json!(2));
     let mut at_cap = manifest(
         RunId::from_namespace_sequence(0xc011_1de0, 107),
         "override-count-cap",
@@ -931,10 +926,7 @@ fn v3_config_overrides_enforce_count_label_and_kind_bounds() {
 fn v3_config_override_values_are_bounded_by_compact_json_bytes() {
     const VALUE_LIMIT: usize = 64 * 1024;
     let boundary = serde_json::Value::String("\n".repeat((VALUE_LIMIT - 2) / 2));
-    let one_over = serde_json::Value::String(format!(
-        "{}x",
-        "\n".repeat((VALUE_LIMIT - 2) / 2)
-    ));
+    let one_over = serde_json::Value::String(format!("{}x", "\n".repeat((VALUE_LIMIT - 2) / 2)));
     assert_eq!(
         serde_json::to_vec(&boundary)
             .expect("boundary JSON value serializes")
@@ -954,12 +946,8 @@ fn v3_config_override_values_are_bounded_by_compact_json_bytes() {
         1_700_000_000_116,
     );
     mutate_manifest(&mut accepted, |value| {
-        value["config_overrides"] = serde_json::json!([config_override(
-            "file",
-            "cli",
-            boundary.clone(),
-            boundary,
-        )]);
+        value["config_overrides"] =
+            serde_json::json!([config_override("file", "cli", boundary.clone(), boundary,)]);
     });
     accept_manifest(accepted);
 
@@ -970,12 +958,8 @@ fn v3_config_override_values_are_bounded_by_compact_json_bytes() {
             1_700_000_000_000 + sequence,
         );
         mutate_manifest(&mut rejected, |value| {
-            let mut invalid_entry = config_override(
-                "file",
-                "cli",
-                serde_json::json!(1),
-                serde_json::json!(2),
-            );
+            let mut invalid_entry =
+                config_override("file", "cli", serde_json::json!(1), serde_json::json!(2));
             invalid_entry[field] = one_over.clone();
             value["config_overrides"] = serde_json::json!([invalid_entry]);
         });
@@ -1040,7 +1024,9 @@ fn config_overrides_are_bound_by_manifest_digest() -> Result<(), Box<dyn std::er
         Err(error) => error,
         Ok(mut unexpected) => {
             unexpected.shutdown()?;
-            return Err("recovery accepted override provenance with a stale manifest digest".into());
+            return Err(
+                "recovery accepted override provenance with a stale manifest digest".into(),
+            );
         }
     };
     assert!(
