@@ -1005,6 +1005,77 @@ fn blood_sensor_contribution(
     angular_factor * distance_factor * wound_factor
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SenseObserverGeometry {
+    eye_units: [[f32; 2]; NUM_EYES],
+    eye_fov: [f32; NUM_EYES],
+    heading_unit: [f32; 2],
+    eye_sensitivity: f32,
+    radius: f32,
+}
+
+#[inline]
+fn sense_distance_terms(
+    distance_squared: f32,
+    radius: f32,
+    radius_squared: f32,
+) -> Option<(f32, f32)> {
+    if distance_squared <= f32::EPSILON || distance_squared > radius_squared {
+        return None;
+    }
+    let distance = distance_squared.sqrt();
+    let distance_factor = (radius - distance) / radius;
+    (distance_factor > 0.0).then_some((distance, distance_factor))
+}
+
+fn fixed_sense_contribution(
+    observer: &SenseObserverGeometry,
+    dx: f32,
+    dy: f32,
+    distance: f32,
+    distance_factor: f32,
+    color: [f32; 3],
+    speed_normalized: f32,
+    sound_emitter: f32,
+    target_health: f32,
+) -> sense_fixed::NeighborContribution {
+    // Keep the operation sequence identical to the planned WGSL lane. A
+    // reciprocal followed by multiplication can round differently from the
+    // shader's explicit division and would defeat an otherwise exact contract.
+    let neighbor_x = dx / distance;
+    let neighbor_y = dy / distance;
+    let mut contribution = sense_fixed::NeighborContribution {
+        smell: distance_factor,
+        sound: distance_factor * speed_normalized,
+        hearing: distance_factor * sound_emitter,
+        ..sense_fixed::NeighborContribution::default()
+    };
+
+    for eye in 0..NUM_EYES {
+        let eye_unit = observer.eye_units[eye];
+        let dot = eye_unit[0] * neighbor_x + eye_unit[1] * neighbor_y;
+        let difference = sense_fixed::poly_acos(dot.clamp(-1.0, 1.0));
+        let fov = observer.eye_fov[eye];
+        if difference >= fov {
+            continue;
+        }
+        let fov_factor = ((fov - difference) / fov).max(0.0);
+        let intensity = observer.eye_sensitivity * fov_factor * distance_factor;
+        contribution.density[eye] = intensity * (distance / observer.radius);
+        contribution.red[eye] = intensity * color[0];
+        contribution.green[eye] = intensity * color[1];
+        contribution.blue[eye] = intensity * color[2];
+    }
+
+    let forward_dot = observer.heading_unit[0] * neighbor_x + observer.heading_unit[1] * neighbor_y;
+    contribution.blood = blood_sensor_contribution(
+        sense_fixed::poly_acos(forward_dot.clamp(-1.0, 1.0)),
+        distance_factor,
+        target_health,
+    );
+    contribution
+}
+
 #[inline]
 fn dot2(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     ax.mul_add(bx, ay * by)
@@ -3386,8 +3457,10 @@ struct ActuationDelta {
 
 /// One neighbour's share of what an agent currently perceives.
 ///
-/// Every field is the *delta this neighbour added*, in the same units the
-/// sensor vector uses before clamping.
+/// Every sensory field is the fixed-point-quantized delta this neighbour added,
+/// in the same units the sensor vector uses before clamping. In a suspect run
+/// whose accumulator hit its ceiling, the individual shares can sum above the
+/// capped aggregate; the lifecycle saturation diagnostic makes that explicit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorContribution {
     /// Transient live handle for the neighbour responsible.
@@ -3436,7 +3509,11 @@ pub struct SensorAttribution {
     pub agent: AgentId,
     /// Tick the attribution was taken at.
     pub tick: Tick,
-    /// Sensor values *before* clamping. Contributions sum to these.
+    /// Sensor values *before* the brain-facing `[0, 1]` clamp.
+    ///
+    /// Neighbour shares are reported before the non-eye trait multipliers. They
+    /// reconcile with these totals after those documented multipliers, except in
+    /// a suspect run whose fixed accumulator reached its declared ceiling.
     pub raw: [f32; INPUT_SIZE],
     /// Sensor values after clamping — what a brain actually receives.
     pub clamped: [f32; INPUT_SIZE],
@@ -12255,9 +12332,7 @@ pub struct WorldState {
     work_handles: Vec<AgentId>,
     work_position_pairs: Vec<(f32, f32)>,
     work_trait_modifiers: Vec<TraitModifiers>,
-    work_eye_directions: Vec<[f32; NUM_EYES]>,
-    work_eye_fov: Vec<[f32; NUM_EYES]>,
-    work_eye_view_dirs: Vec<[f32; NUM_EYES]>,
+    work_eye_units: Vec<[[f32; 2]; NUM_EYES]>,
     work_eye_fov_clamped: Vec<[f32; NUM_EYES]>,
     work_clocks: Vec<[f32; 2]>,
     work_temperature_preferences: Vec<f32>,
@@ -12304,6 +12379,7 @@ pub struct WorldState {
     carcass_reproduction_bonus: f32,
     combat_spike_attempts: u32,
     combat_spike_hits: u32,
+    sense_saturations_total: u64,
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
@@ -12399,9 +12475,7 @@ impl WorldState {
             work_handles: Vec::new(),
             work_position_pairs: Vec::new(),
             work_trait_modifiers: Vec::new(),
-            work_eye_directions: Vec::new(),
-            work_eye_fov: Vec::new(),
-            work_eye_view_dirs: Vec::new(),
+            work_eye_units: Vec::new(),
             work_eye_fov_clamped: Vec::new(),
             work_clocks: Vec::new(),
             work_temperature_preferences: Vec::new(),
@@ -12444,6 +12518,7 @@ impl WorldState {
             carcass_reproduction_bonus: 0.0,
             combat_spike_attempts: 0,
             combat_spike_hits: 0,
+            sense_saturations_total: 0,
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
@@ -13000,10 +13075,8 @@ impl WorldState {
         // Populate reusable runtime-derived SoA buffers
         self.work_trait_modifiers
             .resize(agent_count, TraitModifiers::default());
-        self.work_eye_directions
-            .resize(agent_count, [0.0; NUM_EYES]);
-        self.work_eye_fov.resize(agent_count, [1.0; NUM_EYES]);
-        self.work_eye_view_dirs.resize(agent_count, [0.0; NUM_EYES]);
+        self.work_eye_units
+            .resize(agent_count, [[0.0; 2]; NUM_EYES]);
         self.work_eye_fov_clamped
             .resize(agent_count, [1.0; NUM_EYES]);
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
@@ -13013,17 +13086,17 @@ impl WorldState {
         for (idx, id) in handles.iter().enumerate() {
             if let Some(rt) = runtime.get(*id) {
                 self.work_trait_modifiers[idx] = rt.trait_modifiers;
-                self.work_eye_directions[idx] = rt.eye_direction;
-                self.work_eye_fov[idx] = rt.eye_fov;
-                // Precompute per-eye view directions and clamped FOV once per agent
-                let mut views = [0.0; NUM_EYES];
+                // Precompute per-eye unit vectors and clamped FOV once per agent. The
+                // neighbour loop then uses only dot products and the shared polynomial acos.
+                let mut units = [[0.0; 2]; NUM_EYES];
                 let mut fovc = [1.0; NUM_EYES];
                 let base_heading = headings[idx];
                 for e in 0..NUM_EYES {
-                    views[e] = wrap_signed_angle(base_heading + rt.eye_direction[e]);
+                    let direction = wrap_signed_angle(base_heading + rt.eye_direction[e]);
+                    units[e] = [libm::cosf(direction), libm::sinf(direction)];
                     fovc[e] = rt.eye_fov[e].max(0.01);
                 }
-                self.work_eye_view_dirs[idx] = views;
+                self.work_eye_units[idx] = units;
                 self.work_eye_fov_clamped[idx] = fovc;
                 self.work_clocks[idx] = rt.clocks;
                 self.work_temperature_preferences[idx] = rt.temperature_preference;
@@ -13031,24 +13104,24 @@ impl WorldState {
             }
         }
         let trait_modifiers = &self.work_trait_modifiers;
-        let eye_directions = &self.work_eye_directions;
-        let eye_fov = &self.work_eye_fov;
+        let eye_units = &self.work_eye_units;
+        let eye_fov = &self.work_eye_fov_clamped;
         let clocks = &self.work_clocks;
         let temperature_preferences = &self.work_temperature_preferences;
         let sound_emitters = &self.work_sound_emitters;
 
         // Sanity checks (debug-only) to validate buffers are well-formed
-        debug_assert!(eye_directions.len() == handles.len());
+        debug_assert!(eye_units.len() == handles.len());
         debug_assert!(eye_fov.len() == handles.len());
         debug_assert!(clocks.len() == handles.len());
         debug_assert!(temperature_preferences.len() == handles.len());
         debug_assert!(sound_emitters.len() == handles.len());
         debug_assert!({
-            // Ensure FOV and directions contain finite values
+            // Ensure FOVs and unit vectors contain finite values.
             let mut ok = true;
-            for dir in eye_directions.iter() {
-                for &d in dir.iter() {
-                    if !d.is_finite() {
+            for units in eye_units {
+                for unit in units {
+                    if !unit[0].is_finite() || !unit[1].is_finite() {
                         ok = false;
                         break;
                     }
@@ -13089,333 +13162,108 @@ impl WorldState {
         let tick_value = self.tick.0 as f32;
         let index = &self.index;
 
-        let sensor_results: Vec<[f32; INPUT_SIZE]> = collect_handles!(handles, |idx, _handle| {
-            let mut sensors = [0.0f32; INPUT_SIZE];
-            let mut density = [0.0f32; NUM_EYES];
-            let mut eye_r = [0.0f32; NUM_EYES];
-            let mut eye_g = [0.0f32; NUM_EYES];
-            let mut eye_b = [0.0f32; NUM_EYES];
-            let mut smell = 0.0f32;
-            let mut sound = 0.0f32;
-            let mut hearing = 0.0f32;
-            let mut blood = 0.0f32;
+        let sensor_results: Vec<([f32; INPUT_SIZE], u32)> =
+            collect_handles!(handles, |idx, _handle| {
+                let mut sensors = [0.0f32; INPUT_SIZE];
+                let position = positions[idx];
+                let heading = headings[idx];
+                let traits = trait_modifiers[idx];
+                let observer = SenseObserverGeometry {
+                    eye_units: self.work_eye_units[idx],
+                    eye_fov: self.work_eye_fov_clamped[idx],
+                    heading_unit: [libm::cosf(heading), libm::sinf(heading)],
+                    eye_sensitivity: traits.eye,
+                    radius,
+                };
+                let mut accumulator = sense_fixed::SenseAccum::default();
 
-            let position = positions[idx];
-            let heading = headings[idx];
-            let hx = heading.cos();
-            let hy = heading.sin();
-            let cos_bhf = (BLOOD_HALF_FOV).cos();
-            let traits = trait_modifiers[idx];
-            let eyes_dir = &self.work_eye_view_dirs[idx];
-            let eyes_fov = &self.work_eye_fov_clamped[idx];
-
-            index.visit_neighbor_buckets(idx, radius, &mut |indices| {
-                #[cfg(feature = "simd_wide")]
-                {
-                    // SIMD-batch smell/sound/hearing; eyes/blood remain per-lane for correctness
-                    let (chunks, remainder) = indices.as_chunks::<4>();
-                    for chunk in chunks {
-                        let ids = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                        let dx_arr = [
-                            toroidal_delta(positions[ids[0]].x, position.x, world_width),
-                            toroidal_delta(positions[ids[1]].x, position.x, world_width),
-                            toroidal_delta(positions[ids[2]].x, position.x, world_width),
-                            toroidal_delta(positions[ids[3]].x, position.x, world_width),
-                        ];
-                        let dy_arr = [
-                            toroidal_delta(positions[ids[0]].y, position.y, world_height),
-                            toroidal_delta(positions[ids[1]].y, position.y, world_height),
-                            toroidal_delta(positions[ids[2]].y, position.y, world_height),
-                            toroidal_delta(positions[ids[3]].y, position.y, world_height),
-                        ];
-                        let dx_v = f32x4::new(dx_arr);
-                        let dy_v = f32x4::new(dy_arr);
-                        let dist_sq_v = dx_v * dx_v + dy_v * dy_v;
-                        let dist_v = dist_sq_v.sqrt();
-                        let mut df_v = (f32x4::splat(radius) - dist_v) / f32x4::splat(radius);
-                        df_v = df_v.max(f32x4::splat(0.0));
-                        // Zero out invalid lanes (self, <= eps, > radius^2)
-                        let dsq = dist_sq_v.to_array();
-                        let mut df = df_v.to_array();
-                        for (lane, &oid) in ids.iter().enumerate() {
-                            if oid == idx || dsq[lane] <= f32::EPSILON || dsq[lane] > radius_sq {
-                                df[lane] = 0.0;
-                            }
-                        }
-                        let df_v = f32x4::new(df);
-                        // Smell accumulation
-                        smell += df.iter().copied().sum::<f32>();
-                        // Sound accumulation
-                        let sp = f32x4::new([
-                            self.work_speed_norm[ids[0]],
-                            self.work_speed_norm[ids[1]],
-                            self.work_speed_norm[ids[2]],
-                            self.work_speed_norm[ids[3]],
-                        ]);
-                        sound += (df_v * sp).to_array().iter().copied().sum::<f32>();
-                        // Hearing accumulation
-                        let em = f32x4::new([
-                            sound_emitters[ids[0]],
-                            sound_emitters[ids[1]],
-                            sound_emitters[ids[2]],
-                            sound_emitters[ids[3]],
-                        ]);
-                        hearing += (df_v * em).to_array().iter().copied().sum::<f32>();
-
-                        // Eyes and blood per-lane for these four
-                        let dist_arr = dist_v.to_array();
-                        for (lane, &other_idx) in ids.iter().enumerate() {
-                            if df[lane] <= 0.0 {
-                                continue;
-                            }
-                            let dx = dx_arr[lane];
-                            let dy = dy_arr[lane];
-                            let dist = dist_arr[lane];
-                            let dist_factor = (radius - dist) / radius;
-                            // Neighbor unit dir
-                            let nx = dx / dist;
-                            let ny = dy / dist;
-                            {
-                                // Same falloff as the scalar path and legacy C++:
-                                // (fov - diff)/fov * (radius - dist)/radius.
-                                let ang = angle_to(dx, dy);
-                                let diff_v = f32x4::new([
-                                    angle_difference(eyes_dir[0], ang),
-                                    angle_difference(eyes_dir[1], ang),
-                                    angle_difference(eyes_dir[2], ang),
-                                    angle_difference(eyes_dir[3], ang),
-                                ]);
-                                let fov_v = f32x4::new([
-                                    eyes_fov[0],
-                                    eyes_fov[1],
-                                    eyes_fov[2],
-                                    eyes_fov[3],
-                                ]);
-                                let fov_factor = ((fov_v - diff_v) / fov_v).max(f32x4::splat(0.0));
-                                let intensity_v =
-                                    fov_factor * f32x4::splat(traits.eye * dist_factor);
-                                let color = colors[other_idx];
-                                let mut dens =
-                                    f32x4::new([density[0], density[1], density[2], density[3]]);
-                                let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
-                                let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
-                                let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                                // legacy C++: proximity channel carries an extra d/DIST
-                                dens += intensity_v * f32x4::splat(dist / radius);
-                                r += intensity_v * f32x4::splat(color[0]);
-                                g += intensity_v * f32x4::splat(color[1]);
-                                b += intensity_v * f32x4::splat(color[2]);
-                                let out_d = dens.to_array();
-                                let out_r = r.to_array();
-                                let out_g = g.to_array();
-                                let out_b = b.to_array();
-                                density[0] = out_d[0];
-                                density[1] = out_d[1];
-                                density[2] = out_d[2];
-                                density[3] = out_d[3];
-                                eye_r[0] = out_r[0];
-                                eye_r[1] = out_r[1];
-                                eye_r[2] = out_r[2];
-                                eye_r[3] = out_r[3];
-                                eye_g[0] = out_g[0];
-                                eye_g[1] = out_g[1];
-                                eye_g[2] = out_g[2];
-                                eye_g[3] = out_g[3];
-                                eye_b[0] = out_b[0];
-                                eye_b[1] = out_b[1];
-                                eye_b[2] = out_b[2];
-                                eye_b[3] = out_b[3];
-                            }
-                            // Blood via dot threshold to prune; magnitude via angle diff
-                            let align = hx * nx + hy * ny;
-                            if align >= cos_bhf {
-                                let ang = angle_to(dx, dy);
-                                let forward_diff = angle_difference(heading, ang);
-                                blood += blood_sensor_contribution(
-                                    forward_diff,
-                                    dist_factor,
-                                    healths[other_idx],
-                                );
-                            }
-                        }
-                    }
-                    // Remainder (less than 4)
-                    for &other_idx in remainder {
+                index.visit_neighbor_buckets(idx, radius, &mut |indices| {
+                    for &other_idx in indices {
                         if other_idx == idx {
                             continue;
                         }
                         let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
                         let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
-                        let dist_sq_val = dx.mul_add(dx, dy * dy);
-                        if dist_sq_val <= f32::EPSILON || dist_sq_val > radius_sq {
+                        let distance_squared = dx * dx + dy * dy;
+                        let Some((distance, distance_factor)) =
+                            sense_distance_terms(distance_squared, radius, radius_sq)
+                        else {
                             continue;
-                        }
-                        let dist = dist_sq_val.sqrt();
-                        let ang = angle_to(dx, dy);
-                        let dist_factor = (radius - dist) / radius;
-                        if dist_factor <= 0.0 {
-                            continue;
-                        }
-                        smell += dist_factor;
-                        sound += dist_factor * self.work_speed_norm[other_idx];
-                        hearing += dist_factor * sound_emitters[other_idx];
-                        #[cfg(feature = "simd_wide")]
-                        {
-                            let base = [eyes_dir[0], eyes_dir[1], eyes_dir[2], eyes_dir[3]];
-                            let fov = [eyes_fov[0], eyes_fov[1], eyes_fov[2], eyes_fov[3]];
-                            let diff = [
-                                angle_difference(base[0], ang),
-                                angle_difference(base[1], ang),
-                                angle_difference(base[2], ang),
-                                angle_difference(base[3], ang),
-                            ];
-                            let diff_v = f32x4::new(diff);
-                            let fov_v = f32x4::new(fov);
-                            let mut fov_factor = (fov_v - diff_v) / fov_v;
-                            fov_factor = fov_factor.max(f32x4::splat(0.0));
-                            let scalar = traits.eye * dist_factor;
-                            let intensity_v = fov_factor * f32x4::splat(scalar);
-                            let color = colors[other_idx];
-                            let mut dens =
-                                f32x4::new([density[0], density[1], density[2], density[3]]);
-                            let mut r = f32x4::new([eye_r[0], eye_r[1], eye_r[2], eye_r[3]]);
-                            let mut g = f32x4::new([eye_g[0], eye_g[1], eye_g[2], eye_g[3]]);
-                            let mut b = f32x4::new([eye_b[0], eye_b[1], eye_b[2], eye_b[3]]);
-                            // legacy C++: proximity channel carries an extra d/DIST
-                            dens += intensity_v * f32x4::splat(dist / radius);
-                            r += intensity_v * f32x4::splat(color[0]);
-                            g += intensity_v * f32x4::splat(color[1]);
-                            b += intensity_v * f32x4::splat(color[2]);
-                            let out_d = dens.to_array();
-                            let out_r = r.to_array();
-                            let out_g = g.to_array();
-                            let out_b = b.to_array();
-                            density[0] = out_d[0];
-                            density[1] = out_d[1];
-                            density[2] = out_d[2];
-                            density[3] = out_d[3];
-                            eye_r[0] = out_r[0];
-                            eye_r[1] = out_r[1];
-                            eye_r[2] = out_r[2];
-                            eye_r[3] = out_r[3];
-                            eye_g[0] = out_g[0];
-                            eye_g[1] = out_g[1];
-                            eye_g[2] = out_g[2];
-                            eye_g[3] = out_g[3];
-                            eye_b[0] = out_b[0];
-                            eye_b[1] = out_b[1];
-                            eye_b[2] = out_b[2];
-                            eye_b[3] = out_b[3];
-                        }
-                        let forward_diff = angle_difference(heading, ang);
-                        blood += blood_sensor_contribution(
-                            forward_diff,
-                            dist_factor,
+                        };
+                        accumulator.contribute(&fixed_sense_contribution(
+                            &observer,
+                            dx,
+                            dy,
+                            distance,
+                            distance_factor,
+                            colors[other_idx],
+                            self.work_speed_norm[other_idx],
+                            sound_emitters[other_idx],
                             healths[other_idx],
-                        );
+                        ));
                     }
-                }
-                #[cfg(not(feature = "simd_wide"))]
-                for &other_idx in indices {
-                    if other_idx == idx {
-                        continue;
-                    }
-                    let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
-                    let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
-                    let dist_sq_val = dx.mul_add(dx, dy * dy);
-                    if dist_sq_val <= f32::EPSILON {
-                        continue;
-                    }
-                    if dist_sq_val > radius_sq {
-                        continue;
-                    }
-                    let dist = dist_sq_val.sqrt();
-                    let ang = angle_to(dx, dy);
-                    let dist_factor = (radius - dist) / radius;
-                    if dist_factor <= 0.0 {
-                        continue;
-                    }
+                });
 
-                    for eye in 0..NUM_EYES {
-                        // eyes_dir already includes the agent heading (see work_eye_view_dirs)
-                        let diff = angle_difference(eyes_dir[eye], ang);
-                        let fov = eyes_fov[eye];
-                        if diff < fov {
-                            let fov_factor = ((fov - diff) / fov).max(0.0);
-                            let intensity = traits.eye * fov_factor * dist_factor;
-                            // legacy C++: proximity channel carries an extra d/DIST
-                            density[eye] += intensity * (dist / radius);
-                            let color = colors[other_idx];
-                            eye_r[eye] += intensity * color[0];
-                            eye_g[eye] += intensity * color[1];
-                            eye_b[eye] += intensity * color[2];
-                        }
-                    }
+                let channels = accumulator.finalize_with_multipliers(
+                    traits.smell,
+                    traits.sound,
+                    traits.hearing,
+                    traits.blood,
+                );
+                let density = channels.density;
+                let eye_r = channels.red;
+                let eye_g = channels.green;
+                let eye_b = channels.blue;
+                let smell = channels.smell;
+                let sound = channels.sound;
+                let hearing = channels.hearing;
+                let blood = channels.blood;
 
-                    smell += dist_factor;
+                let cell_x =
+                    ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
+                let cell_y =
+                    ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
+                let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
+                let food_value = food_cells.get(food_idx).copied().unwrap_or(0.0) / food_max;
 
-                    sound += dist_factor * self.work_speed_norm[other_idx];
-                    hearing += dist_factor * sound_emitters[other_idx];
-
-                    // Blood via dot(heading_dir, n) >= cos(BLOOD_HALF_FOV)
-                    let align = hx * (dx / dist) + hy * (dy / dist);
-                    if align >= cos_bhf {
-                        let forward_diff = angle_difference(heading, ang);
-                        blood += blood_sensor_contribution(
-                            forward_diff,
-                            dist_factor,
-                            healths[other_idx],
-                        );
-                    }
-                }
+                sensors[0] = clamp01(density[0]);
+                sensors[1] = clamp01(eye_r[0]);
+                sensors[2] = clamp01(eye_g[0]);
+                sensors[3] = clamp01(eye_b[0]);
+                sensors[4] = clamp01(food_value);
+                sensors[5] = clamp01(density[1]);
+                sensors[6] = clamp01(eye_r[1]);
+                sensors[7] = clamp01(eye_g[1]);
+                sensors[8] = clamp01(eye_b[1]);
+                sensors[9] = clamp01(sound);
+                sensors[10] = clamp01(smell);
+                sensors[11] = clamp01(healths[idx] * 0.5);
+                sensors[12] = clamp01(density[2]);
+                sensors[13] = clamp01(eye_r[2]);
+                sensors[14] = clamp01(eye_g[2]);
+                sensors[15] = clamp01(eye_b[2]);
+                sensors[16] = (tick_value / clocks[idx][0].max(1.0)).sin().abs();
+                sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
+                sensors[18] = clamp01(hearing);
+                sensors[19] = clamp01(blood);
+                let env_temperature = sample_temperature(&self.config, position.x);
+                let discomfort =
+                    temperature_discomfort(env_temperature, temperature_preferences[idx]);
+                sensors[20] = clamp01(discomfort);
+                sensors[21] = clamp01(density[3]);
+                sensors[22] = clamp01(eye_r[3]);
+                sensors[23] = clamp01(eye_g[3]);
+                sensors[24] = clamp01(eye_b[3]);
+                (sensors, accumulator.saturations)
             });
-
-            smell *= traits.smell;
-            sound *= traits.sound;
-            hearing *= traits.hearing;
-            blood *= traits.blood;
-
-            let cell_x =
-                ((position.x / cell_size).floor() as i32).rem_euclid(food_width as i32) as u32;
-            let cell_y =
-                ((position.y / cell_size).floor() as i32).rem_euclid(food_height as i32) as u32;
-            let food_idx = (cell_y as usize) * (food_width as usize) + cell_x as usize;
-            let food_value = food_cells.get(food_idx).copied().unwrap_or(0.0) / food_max;
-
-            sensors[0] = clamp01(density[0]);
-            sensors[1] = clamp01(eye_r[0]);
-            sensors[2] = clamp01(eye_g[0]);
-            sensors[3] = clamp01(eye_b[0]);
-            sensors[4] = clamp01(food_value);
-            sensors[5] = clamp01(density[1]);
-            sensors[6] = clamp01(eye_r[1]);
-            sensors[7] = clamp01(eye_g[1]);
-            sensors[8] = clamp01(eye_b[1]);
-            sensors[9] = clamp01(sound);
-            sensors[10] = clamp01(smell);
-            sensors[11] = clamp01(healths[idx] * 0.5);
-            sensors[12] = clamp01(density[2]);
-            sensors[13] = clamp01(eye_r[2]);
-            sensors[14] = clamp01(eye_g[2]);
-            sensors[15] = clamp01(eye_b[2]);
-            sensors[16] = (tick_value / clocks[idx][0].max(1.0)).sin().abs();
-            sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
-            sensors[18] = clamp01(hearing);
-            sensors[19] = clamp01(blood);
-            let env_temperature = sample_temperature(&self.config, position.x);
-            let discomfort = temperature_discomfort(env_temperature, temperature_preferences[idx]);
-            sensors[20] = clamp01(discomfort);
-            sensors[21] = clamp01(density[3]);
-            sensors[22] = clamp01(eye_r[3]);
-            sensors[23] = clamp01(eye_g[3]);
-            sensors[24] = clamp01(eye_b[3]);
-            sensors
-        });
 
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                runtime.sensors.copy_from_slice(&sensor_results[idx]);
+                runtime.sensors.copy_from_slice(&sensor_results[idx].0);
             }
+            self.sense_saturations_total = self
+                .sense_saturations_total
+                .saturating_add(u64::from(sensor_results[idx].1));
         }
     }
 
@@ -13456,21 +13304,21 @@ impl WorldState {
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
         let max_speed = (self.config.bot_speed * self.config.boost_multiplier).max(1e-3);
-        let (hx, hy) = (heading.cos(), heading.sin());
-        let cos_bhf = BLOOD_HALF_FOV.cos();
-
-        let mut eye_dirs = [0.0f32; NUM_EYES];
+        let mut eye_units = [[0.0; 2]; NUM_EYES];
         let mut eye_fovs = [1.0f32; NUM_EYES];
         for eye in 0..NUM_EYES {
-            eye_dirs[eye] = wrap_signed_angle(heading + observer.eye_direction[eye]);
+            let direction = wrap_signed_angle(heading + observer.eye_direction[eye]);
+            eye_units[eye] = [libm::cosf(direction), libm::sinf(direction)];
             eye_fovs[eye] = observer.eye_fov[eye].max(0.01);
         }
-
-        let mut density = [0.0f32; NUM_EYES];
-        let mut eye_r = [0.0f32; NUM_EYES];
-        let mut eye_g = [0.0f32; NUM_EYES];
-        let mut eye_b = [0.0f32; NUM_EYES];
-        let (mut smell, mut sound, mut hearing, mut blood) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let geometry = SenseObserverGeometry {
+            eye_units,
+            eye_fov: eye_fovs,
+            heading_unit: [libm::cosf(heading), libm::sinf(heading)],
+            eye_sensitivity: traits.eye,
+            radius,
+        };
+        let mut accumulator = sense_fixed::SenseAccum::default();
         let mut contributions: Vec<SensorContribution> = Vec::new();
 
         // A full scan rather than a spatial-index query: the index holds the
@@ -13483,55 +13331,12 @@ impl WorldState {
             }
             let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
             let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
-            let dist_sq = dx.mul_add(dx, dy * dy);
-            if dist_sq <= f32::EPSILON || dist_sq > radius_sq {
+            let dist_sq = dx * dx + dy * dy;
+            let Some((dist, dist_factor)) = sense_distance_terms(dist_sq, radius, radius_sq) else {
                 continue;
-            }
-            let dist = dist_sq.sqrt();
-            let dist_factor = (radius - dist) / radius;
-            if dist_factor <= 0.0 {
-                continue;
-            }
-            let ang = angle_to(dx, dy);
+            };
             let color = colors[other_idx];
             let source_uid = self.agent_uid(other_id)?;
-
-            let mut share = SensorContribution {
-                source: other_id,
-                source_uid,
-                bearing: wrap_signed_angle(ang - heading),
-                distance: dist,
-                color,
-                eye_density: [0.0; NUM_EYES],
-                eye_rgb: [[0.0; 3]; NUM_EYES],
-                smell: 0.0,
-                sound: 0.0,
-                hearing: 0.0,
-                blood: 0.0,
-                total: 0.0,
-            };
-
-            for eye in 0..NUM_EYES {
-                let diff = angle_difference(eye_dirs[eye], ang);
-                let fov = eye_fovs[eye];
-                if diff >= fov {
-                    continue;
-                }
-                let fov_factor = ((fov - diff) / fov).max(0.0);
-                let intensity = traits.eye * fov_factor * dist_factor;
-                // The density channel alone carries the legacy proximity factor.
-                let density_delta = intensity * (dist / radius);
-                share.eye_density[eye] = density_delta;
-                share.eye_rgb[eye] = [
-                    intensity * color[0],
-                    intensity * color[1],
-                    intensity * color[2],
-                ];
-                density[eye] += density_delta;
-                eye_r[eye] += intensity * color[0];
-                eye_g[eye] += intensity * color[1];
-                eye_b[eye] += intensity * color[2];
-            }
 
             let velocity = velocities[other_idx];
             let speed_norm = ((velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt()
@@ -13541,21 +13346,40 @@ impl WorldState {
                 .runtime
                 .get(other_id)
                 .map_or(0.0, |rt| rt.sound_multiplier);
+            let fixed = fixed_sense_contribution(
+                &geometry,
+                dx,
+                dy,
+                dist,
+                dist_factor,
+                color,
+                speed_norm,
+                emitter,
+                healths[other_idx],
+            );
+            accumulator.contribute(&fixed);
+            let quantized = sense_fixed::quantize_contribution_term;
 
-            share.smell = dist_factor;
-            share.sound = dist_factor * speed_norm;
-            share.hearing = dist_factor * emitter;
-            smell += share.smell;
-            sound += share.sound;
-            hearing += share.hearing;
-
-            let align = hx * (dx / dist) + hy * (dy / dist);
-            if align >= cos_bhf {
-                let forward_diff = angle_difference(heading, ang);
-                share.blood =
-                    blood_sensor_contribution(forward_diff, dist_factor, healths[other_idx]);
-                blood += share.blood;
-            }
+            let mut share = SensorContribution {
+                source: other_id,
+                source_uid,
+                bearing: wrap_signed_angle(angle_to(dx, dy) - heading),
+                distance: dist,
+                color,
+                eye_density: fixed.density.map(quantized),
+                eye_rgb: std::array::from_fn(|eye| {
+                    [
+                        quantized(fixed.red[eye]),
+                        quantized(fixed.green[eye]),
+                        quantized(fixed.blue[eye]),
+                    ]
+                }),
+                smell: quantized(fixed.smell),
+                sound: quantized(fixed.sound),
+                hearing: quantized(fixed.hearing),
+                blood: quantized(fixed.blood),
+                total: 0.0,
+            };
 
             share.total = share.eye_density.iter().sum::<f32>()
                 + share
@@ -13570,13 +13394,16 @@ impl WorldState {
             contributions.push(share);
         }
 
-        // Trait multipliers apply to the ACCUMULATED totals, after the neighbour
-        // loop — exactly as stage_sense does. Folding them in per-neighbour would
-        // be plausible-looking and wrong.
-        smell *= traits.smell;
-        sound *= traits.sound;
-        hearing *= traits.hearing;
-        blood *= traits.blood;
+        // Read the same fixed-point totals the production stage finalizes. Trait
+        // multipliers remain post-reduction, preserving the established contract.
+        let density = accumulator.density.map(sense_fixed::from_fixed);
+        let eye_r = accumulator.red.map(sense_fixed::from_fixed);
+        let eye_g = accumulator.green.map(sense_fixed::from_fixed);
+        let eye_b = accumulator.blue.map(sense_fixed::from_fixed);
+        let smell = sense_fixed::from_fixed(accumulator.smell) * traits.smell;
+        let sound = sense_fixed::from_fixed(accumulator.sound) * traits.sound;
+        let hearing = sense_fixed::from_fixed(accumulator.hearing) * traits.hearing;
+        let blood = sense_fixed::from_fixed(accumulator.blood) * traits.blood;
 
         let cell_size = self.config.food_cell_size as f32;
         let food_width = self.food.width();
@@ -19597,6 +19424,15 @@ impl WorldState {
         self.tick
     }
 
+    /// Total fixed-point sensing channel saturations observed over this world lifetime.
+    ///
+    /// Any non-zero value marks the run as scientifically suspect: at least one sensor
+    /// contribution or accumulated channel exceeded the kernel's declared numeric range.
+    #[must_use]
+    pub const fn sense_saturations_total(&self) -> u64 {
+        self.sense_saturations_total
+    }
+
     /// Current epoch counter.
     #[must_use]
     pub const fn epoch(&self) -> u64 {
@@ -24239,6 +24075,287 @@ mod tests {
 
         world.remove_agent(lone);
         assert!(world.explain_sensors(lone, 8).is_none());
+    }
+
+    #[test]
+    fn fixed_sense_contribution_matches_the_reviewed_integer_golden() {
+        let geometry = SenseObserverGeometry {
+            eye_units: [[1.0, 0.0]; NUM_EYES],
+            eye_fov: [1.0; NUM_EYES],
+            heading_unit: [1.0, 0.0],
+            eye_sensitivity: 1.0,
+            radius: 100.0,
+        };
+        let contribution = fixed_sense_contribution(
+            &geometry,
+            50.0,
+            0.0,
+            50.0,
+            0.5,
+            [0.25, 0.5, 0.75],
+            0.25,
+            0.5,
+            0.0,
+        );
+        let mut accumulator = sense_fixed::SenseAccum::default();
+        accumulator.contribute(&contribution);
+
+        assert_eq!(accumulator.density, [262_144; NUM_EYES]);
+        assert_eq!(accumulator.red, [131_072; NUM_EYES]);
+        assert_eq!(accumulator.green, [262_144; NUM_EYES]);
+        assert_eq!(accumulator.blue, [393_216; NUM_EYES]);
+        assert_eq!(accumulator.smell, 524_288);
+        assert_eq!(accumulator.sound, 131_072);
+        assert_eq!(accumulator.hearing, 262_144);
+        assert_eq!(accumulator.blood, 524_288);
+        assert_eq!(accumulator.saturations, 0);
+
+        let finalized = accumulator.finalize();
+        assert_eq!(
+            finalized.density.map(f32::to_bits),
+            [0.25_f32.to_bits(); NUM_EYES]
+        );
+        assert_eq!(
+            finalized.red.map(f32::to_bits),
+            [0.125_f32.to_bits(); NUM_EYES]
+        );
+        assert_eq!(
+            finalized.green.map(f32::to_bits),
+            [0.25_f32.to_bits(); NUM_EYES]
+        );
+        assert_eq!(
+            finalized.blue.map(f32::to_bits),
+            [0.375_f32.to_bits(); NUM_EYES]
+        );
+        assert_eq!(finalized.smell.to_bits(), 0.5_f32.to_bits());
+        assert_eq!(finalized.sound.to_bits(), 0.125_f32.to_bits());
+        assert_eq!(finalized.hearing.to_bits(), 0.25_f32.to_bits());
+        assert_eq!(finalized.blood.to_bits(), 0.5_f32.to_bits());
+    }
+
+    #[test]
+    fn fixed_sense_preserves_the_exact_distance_exclusion_boundaries() {
+        let epsilon_bits = f32::EPSILON.to_bits();
+        let below = f32::from_bits(epsilon_bits - 1);
+        let above = f32::from_bits(epsilon_bits + 1);
+
+        assert!(sense_distance_terms(below, 1.0, 1.0).is_none());
+        assert!(sense_distance_terms(f32::EPSILON, 1.0, 1.0).is_none());
+        assert!(sense_distance_terms(above, 1.0, 1.0).is_some());
+        assert!(
+            sense_distance_terms(1.0, 1.0, 1.0).is_none(),
+            "a neighbour exactly at the radius has zero falloff"
+        );
+        assert!(sense_distance_terms(f32::from_bits(1.0_f32.to_bits() + 1), 1.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn production_fixed_sense_is_bit_exact_across_order_and_toroidal_wrap() {
+        let run_order_fixture = |reverse: bool| {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                sense_radius: 30.0,
+                rng_seed: Some(0x3000),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("fixed sense world");
+            let observer = world.spawn_agent(AgentData {
+                position: Position::new(51.0, 51.0),
+                heading: 0.25,
+                health: 1.0,
+                ..AgentData::default()
+            });
+            // All neighbours occupy the same uniform-grid bucket. Reversing
+            // their insertion order therefore reverses the production visit
+            // order rather than merely changing SlotMap identities.
+            let mut neighbours = vec![
+                (
+                    1.0,
+                    1.0,
+                    [0.2, 0.7, 0.4],
+                    Velocity { vx: 0.1, vy: 0.2 },
+                    0.4,
+                ),
+                (
+                    2.0,
+                    2.0,
+                    [0.9, 0.1, 0.3],
+                    Velocity { vx: -0.2, vy: 0.1 },
+                    1.2,
+                ),
+                (
+                    3.0,
+                    3.0,
+                    [0.3, 0.4, 0.8],
+                    Velocity { vx: 0.0, vy: -0.3 },
+                    0.8,
+                ),
+            ];
+            if reverse {
+                neighbours.reverse();
+            }
+            for (dx, dy, color, velocity, health) in neighbours {
+                world.spawn_agent(AgentData {
+                    position: Position::new(51.0 + dx, 51.0 + dy),
+                    velocity,
+                    heading: -0.5,
+                    health,
+                    color,
+                    ..AgentData::default()
+                });
+            }
+            world.stage_sense();
+            world
+                .agent_runtime(observer)
+                .expect("observer runtime")
+                .sensors
+                .map(f32::to_bits)
+        };
+
+        assert_eq!(run_order_fixture(false), run_order_fixture(true));
+
+        let run_seam_fixture = |observer_x: f32| {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 10,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                sense_radius: 30.0,
+                rng_seed: Some(0x3000),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("fixed sense seam world");
+            let observer = world.spawn_agent(AgentData {
+                position: Position::new(observer_x, 50.0),
+                heading: 0.25,
+                health: 1.0,
+                ..AgentData::default()
+            });
+            world.spawn_agent(AgentData {
+                position: Position::new((observer_x - 4.0).rem_euclid(100.0), 47.0),
+                velocity: Velocity { vx: 0.1, vy: 0.2 },
+                heading: -0.5,
+                health: 0.4,
+                color: [0.2, 0.7, 0.4],
+                ..AgentData::default()
+            });
+            world.stage_sense();
+            world
+                .agent_runtime(observer)
+                .expect("observer runtime")
+                .sensors
+                .map(f32::to_bits)
+        };
+
+        let canonical = run_seam_fixture(50.0);
+        let wrapped = run_seam_fixture(2.0);
+        for index in [
+            0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 18, 19, 21, 22, 23, 24,
+        ] {
+            assert_eq!(
+                canonical[index], wrapped[index],
+                "neighbour-derived sensor {index} changed across the toroidal seam"
+            );
+        }
+    }
+
+    #[test]
+    fn production_fixed_sense_tracks_saturation_and_matches_legacy_single_neighbour() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            sense_radius: 50.0,
+            bot_speed: 1.0,
+            boost_multiplier: 1.0,
+            rng_seed: Some(0x3001),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("fixed sense world");
+        let observer = world.spawn_agent(AgentData {
+            position: Position::new(100.0, 100.0),
+            heading: 0.0,
+            health: 1.0,
+            ..AgentData::default()
+        });
+        let neighbour = world.spawn_agent(AgentData {
+            position: Position::new(130.0, 110.0),
+            velocity: Velocity { vx: 0.25, vy: 0.0 },
+            health: 0.4,
+            color: [0.8, 0.3, 0.6],
+            ..AgentData::default()
+        });
+        let eye_directions = [0.0, 0.5, -0.5, 1.0];
+        let eye_fov = [1.0, 0.8, 0.9, 0.7];
+        let traits = TraitModifiers {
+            smell: 0.7,
+            sound: 0.6,
+            hearing: 0.5,
+            eye: 0.8,
+            blood: 0.9,
+        };
+        {
+            let runtime = world.agent_runtime_mut(observer).expect("observer runtime");
+            runtime.eye_direction = eye_directions;
+            runtime.eye_fov = eye_fov;
+            runtime.trait_modifiers = traits;
+        }
+        world
+            .agent_runtime_mut(neighbour)
+            .expect("neighbour runtime")
+            .sound_multiplier = 0.4;
+
+        world.stage_sense();
+        let sensed = world
+            .agent_runtime(observer)
+            .expect("observer runtime")
+            .sensors;
+        let dx = 30.0_f32;
+        let dy = 10.0_f32;
+        let distance = (dx * dx + dy * dy).sqrt();
+        let distance_factor = (50.0 - distance) / 50.0;
+        let bearing = angle_to(dx, dy);
+        let tolerance = 2.0e-5_f32;
+        for eye in 0..NUM_EYES {
+            let difference = angle_difference(eye_directions[eye], bearing);
+            let fov_factor = ((eye_fov[eye] - difference) / eye_fov[eye]).max(0.0);
+            let intensity = traits.eye * fov_factor * distance_factor;
+            let base = [0, 5, 12, 21][eye];
+            for (offset, expected) in [
+                (0, intensity * (distance / 50.0)),
+                (1, intensity * 0.8),
+                (2, intensity * 0.3),
+                (3, intensity * 0.6),
+            ] {
+                assert!(
+                    (sensed[base + offset] - expected.clamp(0.0, 1.0)).abs() <= tolerance,
+                    "eye {eye} channel {offset}: fixed={} legacy={expected}",
+                    sensed[base + offset]
+                );
+            }
+        }
+        assert!((sensed[9] - distance_factor * 0.25 * traits.sound).abs() <= tolerance);
+        assert!((sensed[10] - distance_factor * traits.smell).abs() <= tolerance);
+        assert!((sensed[18] - distance_factor * 0.4 * traits.hearing).abs() <= tolerance);
+        let legacy_blood =
+            blood_sensor_contribution(bearing.abs(), distance_factor, 0.4) * traits.blood;
+        assert!((sensed[19] - legacy_blood).abs() <= tolerance);
+        assert_eq!(world.sense_saturations_total(), 0);
+
+        world
+            .agent_runtime_mut(observer)
+            .expect("observer runtime")
+            .trait_modifiers
+            .eye = 1.0e30;
+        world.stage_sense();
+        assert!(world.sense_saturations_total() > 0);
     }
 
     #[test]

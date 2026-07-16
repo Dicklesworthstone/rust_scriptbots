@@ -82,7 +82,7 @@ pub const MAX_NEIGHBORS_ASSUMED: i64 = 4_096;
 /// is the worst failure available here.
 pub const ACCUM_CEILING: i64 = MAX_NEIGHBORS_ASSUMED * (MAX_TERM as i64) * ONE;
 
-/// Whole binary orders of headroom between [`ACCUM_CEILING`] and `i64::MAX`.
+/// Unused positive-magnitude bit positions above [`ACCUM_CEILING`].
 ///
 /// This is emitted in the lifecycle numeric-contract line. Its test derives the
 /// value from the ceiling so the diagnostic cannot silently outlive the range
@@ -232,13 +232,16 @@ pub struct SenseAccum {
     pub hearing: i64,
     /// Blood.
     pub blood: i64,
-    /// How many times a channel hit [`ACCUM_CEILING`].
+    /// How many distinct channels observed an invalid term or hit [`ACCUM_CEILING`].
     ///
     /// A run with a non-zero count is SUSPECT and must say so: a sensor that hit
     /// the ceiling is a sensor that lied to a brain, and the run's conclusions
     /// inherit that. The struct carries the count so the caller can emit a
     /// complete log line without reaching back into the kernel.
     pub saturations: u32,
+    /// Sticky per-channel saturation state used to keep [`Self::saturations`]
+    /// independent of contribution order.
+    saturated_channels: u32,
 }
 
 /// The finalized, clamped channels — what a brain actually reads.
@@ -267,8 +270,18 @@ pub struct SenseChannels {
 }
 
 #[inline]
-fn add_saturating(slot: &mut i64, term: f32, saturations: &mut u32) {
-    let (fixed, conversion_saturated) = to_fixed_with_saturation(term);
+fn add_saturating(
+    slot: &mut i64,
+    term: f32,
+    channel_bit: u32,
+    saturated_channels: &mut u32,
+    saturations: &mut u32,
+) {
+    // Production sensor contributions are nonnegative and individually bounded
+    // by MAX_TERM. Enforce that contract here so invalid state cannot make the
+    // otherwise associative integer reduction order-dependent.
+    let (bounded, term_out_of_range) = bounded_contribution_term(term);
+    let (fixed, conversion_saturated) = to_fixed_with_saturation(bounded);
     let sum = slot.saturating_add(fixed);
     let accumulation_saturated = if sum > ACCUM_CEILING {
         *slot = ACCUM_CEILING;
@@ -280,9 +293,29 @@ fn add_saturating(slot: &mut i64, term: f32, saturations: &mut u32) {
         *slot = sum;
         false
     };
-    if conversion_saturated || accumulation_saturated {
+    let newly_saturated = term_out_of_range || conversion_saturated || accumulation_saturated;
+    if newly_saturated && (*saturated_channels & channel_bit) == 0 {
+        *saturated_channels |= channel_bit;
         *saturations = saturations.saturating_add(1);
     }
+}
+
+fn bounded_contribution_term(term: f32) -> (f32, bool) {
+    let out_of_range = !term.is_finite() || !(0.0..=MAX_TERM).contains(&term);
+    let bounded = if term.is_finite() {
+        term.clamp(0.0, MAX_TERM)
+    } else {
+        0.0
+    };
+    (bounded, out_of_range)
+}
+
+/// Apply the production per-neighbour bound and fixed-point rounding to one term.
+#[must_use]
+#[inline]
+pub(crate) fn quantize_contribution_term(term: f32) -> f32 {
+    let (bounded, _) = bounded_contribution_term(term);
+    from_fixed(to_fixed(bounded))
 }
 
 impl SenseAccum {
@@ -293,35 +326,64 @@ impl SenseAccum {
     /// BIT-IDENTICAL accumulator, which is the entire point of this module.
     pub fn contribute(&mut self, contribution: &NeighborContribution) {
         for eye in 0..NUM_EYES {
+            let base_bit = eye as u32 * 4;
             add_saturating(
                 &mut self.density[eye],
                 contribution.density[eye],
+                1 << base_bit,
+                &mut self.saturated_channels,
                 &mut self.saturations,
             );
             add_saturating(
                 &mut self.red[eye],
                 contribution.red[eye],
+                1 << (base_bit + 1),
+                &mut self.saturated_channels,
                 &mut self.saturations,
             );
             add_saturating(
                 &mut self.green[eye],
                 contribution.green[eye],
+                1 << (base_bit + 2),
+                &mut self.saturated_channels,
                 &mut self.saturations,
             );
             add_saturating(
                 &mut self.blue[eye],
                 contribution.blue[eye],
+                1 << (base_bit + 3),
+                &mut self.saturated_channels,
                 &mut self.saturations,
             );
         }
-        add_saturating(&mut self.smell, contribution.smell, &mut self.saturations);
-        add_saturating(&mut self.sound, contribution.sound, &mut self.saturations);
+        add_saturating(
+            &mut self.smell,
+            contribution.smell,
+            1 << 16,
+            &mut self.saturated_channels,
+            &mut self.saturations,
+        );
+        add_saturating(
+            &mut self.sound,
+            contribution.sound,
+            1 << 17,
+            &mut self.saturated_channels,
+            &mut self.saturations,
+        );
         add_saturating(
             &mut self.hearing,
             contribution.hearing,
+            1 << 18,
+            &mut self.saturated_channels,
             &mut self.saturations,
         );
-        add_saturating(&mut self.blood, contribution.blood, &mut self.saturations);
+        add_saturating(
+            &mut self.blood,
+            contribution.blood,
+            1 << 19,
+            &mut self.saturated_channels,
+            &mut self.saturations,
+        );
     }
 
     /// Convert to the clamped channels a brain reads.
@@ -348,9 +410,8 @@ impl SenseAccum {
         hearing: f32,
         blood: f32,
     ) -> SenseChannels {
-        let channel = |value: i64, multiplier: f32| {
-            (from_fixed(value) * multiplier).clamp(0.0, 1.0)
-        };
+        let channel =
+            |value: i64, multiplier: f32| (from_fixed(value) * multiplier).clamp(0.0, 1.0);
         let mut out = SenseChannels {
             smell: channel(self.smell, smell),
             sound: channel(self.sound, sound),
@@ -404,26 +465,34 @@ mod tests {
 
     #[test]
     fn advertised_headroom_matches_the_accumulator_range_derivation() {
-        let derived = (i64::MAX as u64 / ACCUM_CEILING as u64).ilog2();
+        let derived = (i64::BITS - 1) - (ACCUM_CEILING as u64).ilog2();
         assert_eq!(SENSE_HEADROOM_BITS, derived);
         assert_eq!(SENSE_GEOMETRY, "poly_acos");
     }
 
     #[test]
-    fn a_single_oversized_term_counts_its_conversion_saturation() {
+    fn invalid_terms_are_bounded_and_counted_once_per_channel() {
         let mut accum = SenseAccum::default();
         accum.contribute(&NeighborContribution {
             smell: 1e30,
-            sound: -1e30,
+            sound: -1.0,
+            hearing: f32::NAN,
             ..NeighborContribution::default()
         });
 
-        assert_eq!(accum.smell, ACCUM_CEILING);
-        assert_eq!(accum.sound, -ACCUM_CEILING);
+        assert_eq!(accum.smell, (MAX_TERM as i64) * ONE);
+        assert_eq!(accum.sound, 0);
+        assert_eq!(accum.hearing, 0);
         assert_eq!(
-            accum.saturations, 2,
-            "each term clamped during fixed-point conversion must make the run suspect"
+            accum.saturations, 3,
+            "each invalid channel must make the run suspect exactly once"
         );
+
+        accum.contribute(&NeighborContribution {
+            smell: 1e30,
+            ..NeighborContribution::default()
+        });
+        assert_eq!(accum.saturations, 3, "the channel diagnostic is sticky");
     }
 
     #[test]
@@ -491,6 +560,38 @@ mod tests {
     }
 
     #[test]
+    fn saturation_diagnostics_are_bit_identical_under_reordering() {
+        let neighbors: Vec<NeighborContribution> = (0..4_160)
+            .map(|index| NeighborContribution {
+                smell: if index % 8 == 0 { 3.75 } else { MAX_TERM },
+                ..NeighborContribution::default()
+            })
+            .collect();
+        let accumulate = |order: &[usize]| {
+            let mut accum = SenseAccum::default();
+            for &index in order {
+                accum.contribute(&neighbors[index]);
+            }
+            accum
+        };
+
+        let mut order: Vec<usize> = (0..neighbors.len()).collect();
+        let reference = accumulate(&order);
+        assert_eq!(reference.smell, ACCUM_CEILING);
+        assert_eq!(reference.saturations, 1);
+
+        let mut rng = SmallRng::seed_from_u64(0x5A7_0001);
+        for shuffle in 0..50 {
+            order.shuffle(&mut rng);
+            assert_eq!(
+                accumulate(&order),
+                reference,
+                "shuffle {shuffle} changed the saturation result or diagnostic"
+            );
+        }
+    }
+
+    #[test]
     fn the_legacy_f32_accumulation_really_does_diverge_under_reordering() {
         // Without this test, "fixed point for determinism" is a story we tell
         // ourselves. This is what proves the problem is real and the fix is
@@ -543,9 +644,9 @@ mod tests {
             accum.contribute(&huge);
         }
 
-        assert!(
-            accum.saturations > 0,
-            "a crowd past the assumed maximum must be reported, not swallowed"
+        assert_eq!(
+            accum.saturations, 20,
+            "every sensor channel must report the pile-up exactly once"
         );
         assert_eq!(accum.density[0], ACCUM_CEILING);
         assert!(
