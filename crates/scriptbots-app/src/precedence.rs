@@ -746,11 +746,9 @@ mod config_layering_tests {
         })
     }
 
-    fn at<'v>(merged: &'v JsonValue, dotted: &str) -> &'v JsonValue {
+    fn at<'v>(merged: &'v JsonValue, dotted: &str) -> Option<&'v JsonValue> {
         let pointer = format!("/{}", dotted.replace('.', "/"));
-        merged
-            .pointer(&pointer)
-            .expect("the requested test path must exist in the merged config")
+        merged.pointer(&pointer)
     }
 
     /// The layering matrix, in full — the config analogue of the thread matrix
@@ -990,7 +988,7 @@ mod config_layering_tests {
             for (path, want_value) in &case.want {
                 assert_eq!(
                     at(&resolved.merged, path),
-                    want_value,
+                    Some(want_value),
                     "`{}`: wrong merged value at `{path}`",
                     case.name
                 );
