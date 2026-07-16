@@ -59,11 +59,11 @@ Shortcut: `scripts/run_perf_benchmarks.sh --renderer bevy --scenario dense_agent
 ### 3.1 Initial Golden Comparison (GPU-less sanity check)
 
 Using the DSR-reviewed CPU-surrogate reference PNGs, with the Rust asset regenerated after the
-exact legacy-locomotion restoration (`rust_default.png` SHA-256 `d36e71cb…c09636a9` and
+wheel-output sensing and combat-speed correction (`rust_default.png` SHA-256 `bc50c960…3ea694a` and
 `bevy_default.png` SHA-256 `1f68f947…429aef`), the difference is:
 
 - Mean absolute error: **58.73**
-- RMSE: **72.66**
+- RMSE: **72.67**
 - Channel MAE (R,G,B): **54.79**, **52.50**, **68.89**
 
 These 8-bit-scale values come from ImageMagick 7 `compare` with alpha disabled
