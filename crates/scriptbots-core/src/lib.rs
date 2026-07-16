@@ -8311,7 +8311,7 @@ where
             let mut layers = Vec::with_capacity(hinted.min(MAX_NEUROFLOW_HIDDEN_LAYERS));
             let mut previous = INPUT_SIZE;
             let mut total_weights = 0usize;
-            while let Some(layer) = sequence.next_element()? {
+            while let Some(layer) = sequence.next_element::<usize>()? {
                 if layers.len() == MAX_NEUROFLOW_HIDDEN_LAYERS {
                     return Err(serde::de::Error::invalid_length(layers.len() + 1, &self));
                 }

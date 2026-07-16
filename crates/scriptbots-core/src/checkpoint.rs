@@ -912,10 +912,11 @@ impl WorldState {
 
     fn ensure_checkpoint_has_no_deferred_host_output(&self) -> Result<(), WorldCheckpointError> {
         // `last_*` and combat totals describe the completed tick whose owned outcome has already
-        // been returned and are reset before the next transition. Carcass totals are
-        // persistence-only analytics accumulators; disabled persistence cannot later be spliced
-        // back in after its discard marker. None of these fields is checkpoint science state or
-        // deferred work. Only still-undelivered queues and persistence accumulators block capture.
+        // been returned; they are reset or overwritten before they can influence science.
+        // Carcass totals are persistence-only analytics accumulators; disabled persistence cannot
+        // later be spliced back in after its discard marker. None of these fields is checkpoint
+        // science state or deferred work. Only still-undelivered queues and persistence
+        // accumulators block capture.
         let blockers = [
             ("pending_deaths", !self.pending_deaths.is_empty()),
             ("pending_spawns", !self.pending_spawns.is_empty()),
