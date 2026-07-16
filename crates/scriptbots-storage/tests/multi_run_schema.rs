@@ -184,10 +184,7 @@ fn mutate_manifest(record: &mut RunManifestRecord, mutate: impl FnOnce(&mut serd
     record.manifest_json = serde_json::to_string(&value).expect("mutated manifest is valid JSON");
 }
 
-fn attach_zero_tick_v32_evidence(
-    record: &mut RunManifestRecord,
-    digest: serde_json::Value,
-) {
+fn attach_zero_tick_v32_evidence(record: &mut RunManifestRecord, digest: serde_json::Value) {
     record.brain_roster_json = "[]".to_owned();
     mutate_manifest(record, |value| {
         value["schema"] = serde_json::json!("scriptbots.run-manifest.v3.2");

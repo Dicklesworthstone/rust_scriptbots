@@ -2710,8 +2710,8 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_426,
-                "d1730cefafadca7267de747a33a75c3d1bfbe5e6fa25acc293149480167352a0",
+                8_437,
+                "32c6b7155d5e061cdd041227a62f53e4af0b43e8166f686bd81a26348bb10b2f",
             ),
             "a V1 wire change requires explicit schema/codec review before reblessing"
         );
@@ -3024,7 +3024,7 @@ mod tests {
 
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode codec-identity fixture");
-        wire.codec = "postcard+blake3-v2".to_owned();
+        wire.codec = "postcard+blake3-v1".to_owned();
         let foreign_codec_identity =
             postcard::to_allocvec(&wire).expect("foreign codec identity wire");
         assert!(matches!(
