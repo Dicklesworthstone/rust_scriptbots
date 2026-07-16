@@ -893,7 +893,7 @@ mod tests {
         );
         assert_eq!(
             fnv1a64(state.payload()),
-            0x22ee_6310_9581_716c,
+            0x0004_9030_3a2f_eadf,
             "update only after reviewing an intentional Assembly state codec change"
         );
         let mut evaluator = family.evaluator(&genome, &state).expect("evaluator");

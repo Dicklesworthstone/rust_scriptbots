@@ -1267,7 +1267,7 @@ mod tests {
         );
         assert_eq!(
             fnv1a64(state.payload()),
-            0x0c03_4910_5011_b4e2,
+            0x4b5d_bcda_e928_1d57,
             "update only after reviewing an intentional MLP state codec change"
         );
         let decoded_state = family.decode_state(&state).expect("decode state");

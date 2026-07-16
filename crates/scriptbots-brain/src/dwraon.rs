@@ -1134,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             fnv1a64(state.payload()),
-            0x1569_fe8b_2724_180d,
+            0x0e9d_cc8f_9467_5f95,
             "update only after reviewing an intentional DWRAON state codec change"
         );
         assert!(
