@@ -1497,6 +1497,7 @@ pub enum BrainBinding {
 
 enum BrainExecution {
     None,
+    MissingLegacy(Option<u64>),
     MissingProtocol(BrainFamilyId),
     Protocol(Box<dyn BrainEvaluator>),
     Legacy(Box<dyn BrainRunner>),
@@ -1643,7 +1644,7 @@ impl BrainBinding {
         }
     }
 
-    /// Return the registry key, if any, associated with this binding.
+    /// Return the semantic registry identity, even when no live executor is attached.
     #[must_use]
     pub fn registry_key(&self) -> Option<u64> {
         match self {
@@ -1653,7 +1654,7 @@ impl BrainBinding {
         }
     }
 
-    /// Return the brain identifier when available.
+    /// Return the semantic brain-family identity, even when no live executor is attached.
     #[must_use]
     pub fn kind(&self) -> Option<&str> {
         match self {
@@ -1712,7 +1713,10 @@ impl BrainBinding {
         }
     }
 
-    /// Produce a short descriptor suitable for persistence logs.
+    /// Produce a short semantic identity descriptor suitable for persistence logs.
+    ///
+    /// This deliberately does not claim executable liveness: executor-free clones are normal
+    /// read-model snapshots. Call [`Self::is_bound`] when the live execution attachment matters.
     #[must_use]
     pub fn describe(&self) -> Cow<'_, str> {
         if let Some(key) = self.registry_key() {
@@ -1749,17 +1753,21 @@ impl BrainBinding {
                 || BrainExecution::MissingProtocol(genome.family_id().clone()),
                 BrainExecution::Protocol,
             ),
-            Self::Legacy { runner, .. } => runner
-                .take()
-                .map_or(BrainExecution::None, BrainExecution::Legacy),
+            Self::Legacy {
+                runner,
+                registry_key,
+                ..
+            } => runner.take().map_or(
+                BrainExecution::MissingLegacy(*registry_key),
+                BrainExecution::Legacy,
+            ),
         }
     }
 
     fn restore_execution(&mut self, execution: BrainExecution) {
         match (self, execution) {
             (Self::Unbound, BrainExecution::None)
-            | (Self::Protocol { .. }, BrainExecution::None)
-            | (Self::Legacy { .. }, BrainExecution::None)
+            | (Self::Legacy { .. }, BrainExecution::MissingLegacy(_))
             | (Self::Protocol { .. }, BrainExecution::MissingProtocol(_)) => {}
             (Self::Protocol { evaluator, .. }, BrainExecution::Protocol(restored)) => {
                 debug_assert!(evaluator.is_none());
@@ -1921,6 +1929,12 @@ struct MissingBrainFactory {
 #[derive(Debug, Error)]
 #[error("bound parent has no exact heritable snapshot and no registry fallback")]
 struct MissingHeritableBrain;
+
+#[derive(Debug, Error)]
+#[error("legacy brain binding has no live runner (registry_key={registry_key:?})")]
+struct MissingLegacyRunner {
+    registry_key: Option<u64>,
+}
 
 #[derive(Debug, Error)]
 #[error("protocol brain `{family_id}` has no live evaluator at offspring preparation")]
@@ -13625,6 +13639,17 @@ impl WorldState {
                 BrainExecution::None => {
                     job.outputs = Self::default_outputs(&job.sensors);
                 }
+                BrainExecution::MissingLegacy(registry_key) => {
+                    // A runner lost by cloning or deserialization is not an intentionally unbound
+                    // brain. Keep the preinitialized zero output, complete this containment tick,
+                    // and latch a typed terminal fault instead of silently sensor-copying.
+                    job.error = Some(BrainSpawnError::new(
+                        job.kind.clone(),
+                        MissingLegacyRunner {
+                            registry_key: *registry_key,
+                        },
+                    ));
+                }
                 BrainExecution::MissingProtocol(family_id) => {
                     // Keep the preinitialized all-zero fail-closed output. The transition is
                     // still finalized and returned with a typed terminal fault; this is never
@@ -19252,7 +19277,7 @@ impl WorldState {
         self.persistence_boundary
     }
 
-    /// Latched brain-construction error that prevents any later science tick from starting.
+    /// Latched brain construction or execution error that prevents later science ticks.
     #[must_use]
     pub const fn brain_fault(&self) -> Option<&BrainSpawnError> {
         self.brain_fault.as_ref()
@@ -22998,6 +23023,165 @@ mod tests {
         let position = world.agents().columns().positions()[0];
         assert!(position.x != 0.0 || position.y != 0.0);
         assert!(runtime.energy < 1.0);
+    }
+
+    #[test]
+    fn missing_legacy_runners_fail_closed_while_literal_unbound_sensor_copies() {
+        let live_binding = BrainBinding::Legacy {
+            runner: Some(Box::new(StubBrain)),
+            registry_key: Some(7),
+            kind: "stub".to_owned(),
+        };
+        assert!(live_binding.is_bound());
+        let cloned_binding = live_binding.clone();
+        let serialized = serde_json::to_string(&live_binding).expect("serialize legacy binding");
+        let deserialized_binding: BrainBinding =
+            serde_json::from_str(&serialized).expect("deserialize legacy binding");
+        let sensor_copy = [0.11, 0.22, 0.33, 0.44, 0.55, 0.66, 0.77, 0.88, 0.99];
+
+        for (origin, binding) in [
+            ("clone", cloned_binding),
+            ("serde round-trip", deserialized_binding),
+        ] {
+            assert!(!binding.is_bound(), "{origin} must strip the live runner");
+            assert_eq!(binding.kind(), Some("stub"));
+            assert_eq!(binding.registry_key(), Some(7));
+            assert_eq!(binding.describe(), "registry:7");
+
+            let mut world = WorldState::new(ScriptBotsConfig {
+                population_minimum: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("missing-runner world");
+            let agent = world.spawn_agent(sample_agent(0));
+            {
+                let runtime = world.agent_runtime_mut(agent).expect("missing runtime");
+                runtime.brain = binding;
+                runtime.sensors[..OUTPUT_SIZE].copy_from_slice(&sensor_copy);
+                runtime.outputs = [1.0; OUTPUT_SIZE];
+            }
+
+            let error = world
+                .stage_brains()
+                .expect_err("a missing legacy runner must fail closed");
+            assert_eq!(error.kind(), "stub");
+            let source = std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<MissingLegacyRunner>())
+                .expect("typed missing-legacy source");
+            assert_eq!(source.registry_key, Some(7));
+            let runtime = world.agent_runtime(agent).expect("contained runtime");
+            assert_eq!(runtime.outputs, [0.0; OUTPUT_SIZE]);
+            assert_eq!(runtime.brain.kind(), Some("stub"));
+            assert_eq!(runtime.brain.registry_key(), Some(7));
+            assert_eq!(runtime.brain.describe(), "registry:7");
+            assert!(!runtime.brain.is_bound());
+        }
+
+        let mut unbound_world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("unbound world");
+        let unbound_agent = unbound_world.spawn_agent(sample_agent(1));
+        {
+            let runtime = unbound_world
+                .agent_runtime_mut(unbound_agent)
+                .expect("unbound runtime");
+            runtime.brain = BrainBinding::Unbound;
+            runtime.sensors[..OUTPUT_SIZE].copy_from_slice(&sensor_copy);
+        }
+        unbound_world
+            .stage_brains()
+            .expect("literal unbound brain uses intentional sensor-copy behavior");
+        assert_eq!(
+            unbound_world
+                .agent_runtime(unbound_agent)
+                .expect("evaluated unbound runtime")
+                .outputs,
+            sensor_copy
+        );
+    }
+
+    #[test]
+    fn missing_legacy_runner_completes_one_zero_output_tick_then_latches() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            temperature_discomfort_rate: 0.0,
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.25,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 0,
+            reproduction_attempt_chance: 1.0,
+            reproduction_rate_herbivore: f32::MIN_POSITIVE,
+            reproduction_rate_carnivore: f32::MIN_POSITIVE,
+            reproduction_partner_chance: 0.0,
+            persistence_interval: 0,
+            rng_seed: Some(0x1e6a_c700),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("missing-runner containment world");
+        let agent = world.spawn_agent(sample_agent(0));
+        {
+            let runtime = world.agent_runtime_mut(agent).expect("legacy runtime");
+            runtime.brain = BrainBinding::Legacy {
+                runner: Some(Box::new(StubBrain)),
+                registry_key: Some(41),
+                kind: "stub".to_owned(),
+            }
+            .clone();
+            runtime.energy = 1.0;
+            runtime.reproduction_counter = 1.0;
+            runtime.outputs = [0.75; OUTPUT_SIZE];
+        }
+
+        let completion = world
+            .step_outcome()
+            .expect("missing legacy execution still completes its containment boundary");
+        assert_eq!(completion.outcome.events.tick, Tick(1));
+        assert!(
+            completion.outcome.births.is_empty(),
+            "the otherwise reproduction-eligible parent must not birth from a containment tick"
+        );
+        let CompletedStepFault::BrainSpawn(fault) = completion
+            .fault
+            .expect("missing legacy execution must produce a completed fault")
+        else {
+            panic!("missing legacy execution produced a non-brain fault");
+        };
+        assert_eq!(fault.kind(), "stub");
+        assert!(
+            std::error::Error::source(&fault)
+                .and_then(|source| source.downcast_ref::<MissingLegacyRunner>())
+                .is_some()
+        );
+        let runtime = world.agent_runtime(agent).expect("contained runtime");
+        assert_eq!(runtime.outputs, [0.0; OUTPUT_SIZE]);
+        assert_eq!(runtime.brain.kind(), Some("stub"));
+        assert_eq!(runtime.brain.registry_key(), Some(41));
+        assert!(!runtime.brain.is_bound());
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(world.brain_fault().map(BrainSpawnError::kind), Some("stub"));
+
+        let repeated = world
+            .step_outcome()
+            .expect_err("latched missing-runner fault must reject a second transition");
+        let WorldStepError::BrainSpawn(repeated) = repeated else {
+            panic!("latched missing-runner fault changed error type");
+        };
+        assert_eq!(repeated.kind(), "stub");
+        assert_eq!(world.tick(), Tick(1));
+        assert_eq!(
+            world
+                .agent_runtime(agent)
+                .expect("latched runtime")
+                .outputs,
+            [0.0; OUTPUT_SIZE]
+        );
     }
 
     /// Build a synthetic history so the narrative layer can be exercised
