@@ -24536,7 +24536,9 @@ mod tests {
     }
 
     fn protocol_fixture_parent(world: &mut WorldState, key: u64, seed: u32) -> AgentId {
-        let parent = world.spawn_agent(sample_agent(seed));
+        let mut founder = sample_agent(seed);
+        founder.generation = Generation::default();
+        let parent = world.spawn_agent(founder);
         assert!(
             world
                 .bind_agent_brain(parent, key)
@@ -24652,8 +24654,10 @@ mod tests {
         assert_eq!(
             genome_wire,
             [
-                1, 15, b'f', b'i', b'x', b't', b'u', b'r', b'e', b'-', b'c', b'o', b'u', b'n',
-                b't', b'e', b'r', 7, 3, 2, 2, 253, 1, 41, 1, 99, 12,
+                2, 15, b'f', b'i', b'x', b't', b'u', b'r', b'e', b'-', b'c', b'o', b'u', b'n',
+                b't', b'e', b'r', 7, 3, 2, 2, 253, 212, 167, 222, 238, 182, 5, 185, 222, 75, 227,
+                1, 7, 148, 33, 59, 118, 245, 167, 30, 228, 207, 140, 173, 21, 101, 147, 158, 179,
+                76, 167, 0, 45, 0, 0, 0, 0, 12, 0,
             ]
         );
         let state_wire = postcard::to_allocvec(&state).expect("encode fixture state");
