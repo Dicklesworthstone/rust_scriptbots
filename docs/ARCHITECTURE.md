@@ -160,11 +160,13 @@ families).
 
 ## 5. RNG and determinism
 
-Every stochastic decision is drawn from one of six domain-specific `RandomStream`s owned by
-`DomainStreams`. The concrete generator for each domain is `SmallRngStream` (xoshiro256++ on
-64-bit, xoshiro128++ on 32-bit — so a `wasm32` run legitimately draws a *different* sequence from
-the same derived seed). `RunManifestV3` records the domain-derivation identity and every concrete
-stream's algorithm id, so native and browser continuations cannot be confused.
+Environmental and run-global stochastic decisions are drawn from one of six domain-specific
+`RandomStream`s owned by `DomainStreams`. Agent-affecting decisions do not consume one shared
+domain continuation: `AgentSubstreamProtocolV1` derives a fresh operation-local `SmallRngStream`
+from the root seed, stable subject identity, fixed domain/operation tag, and a persisted local
+ordinal. The concrete generator is xoshiro256++ on 64-bit and xoshiro128++ on 32-bit, so a `wasm32`
+run legitimately draws a *different* sequence from the same derived seed. The protocol records
+that exact generator identity; native and browser continuations therefore cannot be confused.
 
 - **Both protocol layers are versioned and self-describing.** `DomainStreamsCheckpoint` carries the
   root seed, domain-derivation algorithm, fixed-object codec, and exactly six named domain fields.
@@ -180,6 +182,31 @@ stream's algorithm id, so native and browser continuations cannot be confused.
   re-seed the others). Independent streams mean adding a draw in one domain cannot perturb another,
   so changing one domain's draw schedule leaves every other continuation fixed. Core and frontend
   callers must name the domain at every stochastic boundary; there is no fallback global stream.
+- **Stable agent operations.** Existing-agent streams derive from
+  `(root seed, AgentUid, AgentRngOperationV1, agent-local ordinal)`. The persisted
+  `AgentRngCountersV1` owns independent next-unused ordinals for reproduction attempts, successful
+  births, and brain initialization. Dense index, recycled `AgentId`, loop position, thread order,
+  and wall-clock state never enter the identity.
+- **Directional offspring operations.** `OffspringRngIdentityV1` is
+  `(primary parent UID, optional secondary parent UID, primary-parent-local birth ordinal)`.
+  Parent order is meaningful: the primary supplies base runtime/genome material and owns the
+  counter, while the secondary contributes crossover material. This local birth ordinal is not the
+  run-wide demographic `AgentIdentity::birth_ordinal`; the latter remains an ancestry/reporting
+  sequence assigned at successful insertion.
+- **One stream per operation, created once.** Body population, runtime crossover, runtime mutation,
+  brain crossover, brain mutation, fallback initialization, evaluator-state crossover, and
+  evaluator-state mutation have distinct stable tags. A caller constructs each required stream
+  once and threads it through the complete operation instead of repeatedly deriving it or falling
+  back to a shared domain stream.
+- **Transactional counter ownership.** An attempted reproduction claims its local attempt ordinal;
+  only an admitted offspring claims the primary parent's local birth ordinal. Failure rolls back
+  the exact counter preimage together with parent energy/progress and staged population state.
+  Population rollback happens before queued natural-birth refunds, preserving reverse chronological
+  order when both paths touched the same parent.
+- **Manifest launch binding.** `scriptbots.run-manifest.v3.3` records the root, exact six-domain
+  checkpoint, `AgentSubstreamProtocolV1`, and UID-ordered `AgentRngCounterStateV1` launch rows. The
+  `scriptbots.run-manifest.v3.4` bootstrap form additionally binds the tick-zero start
+  `WorldDigestV1`; the protocol/counters in that digest and manifest must describe the same launch.
 
 **The hashing rule, learned the hard way.** Anything persisted or compared across runs uses a
 **specified** hash (`characterization_fnv1a64` / a pinned FNV-1a), **never** `std::hash::DefaultHasher`
@@ -188,7 +215,8 @@ the science. This bug was found feeding the characterization digest; do not rein
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`RandomStream`, `SmallRngStream`,
 `RandomStreamState`, `WorldState::rng`); `crates/scriptbots-core/src/rng_domains.rs`
-(`RngDomain`, `DomainStreams`, `DomainStreamsCheckpoint`).
+(`RngDomain`, `DomainStreams`, `DomainStreamsCheckpoint`, `AgentSubstreamProtocolV1`,
+`AgentRngCountersV1`, `OffspringRngIdentityV1`).
 
 ---
 
@@ -201,23 +229,32 @@ reconstruction envelope for the core science state whose equality those digests 
   limitations (in `CharacterizationLimitationsV0`, whose `superseded_by` field names
   `WorldDigestV1`): it is blind to brain weights, keys agents by the *recycled* slotmap id, and its
   RNG evidence is only a forward probe rather than a restorable continuation checkpoint.
-- `WorldDigestV1` — supersedes v0 with per-lane hashes: agents ordered by the **stable `AgentUid`**
+- `WorldDigestV1` — `scriptbots.world-digest.v1.5`/codec-5 supersedes v0 with per-lane hashes:
+  agents ordered by the **stable `AgentUid`**
   (not the reused slot key), brains (genome + evaluator state via `state_digest`), food, terrain,
-  hydrology, the **restorable six-domain** RNG checkpoint, future-affecting counters, and the exact
-  semantic identity captured for every admitted protocol adapter.
+  hydrology, the **restorable six-domain** RNG checkpoint, exact `AgentSubstreamProtocolV1`,
+  UID-ordered `AgentRngCounterStateV1` rows carrying per-agent continuation counters, global
+  future-affecting counters, and the exact semantic identity captured for every admitted protocol
+  adapter.
   Coverage is part of the output: if a bound brain cannot expose its state,
   `evaluator_state_covered` is false and the family is *named*, so a digest computed while blind can
-  never collide with one computed while seeing. V1.4 considers protocol construction semantics
+  never collide with one computed while seeing. V1.5 considers protocol construction semantics
   covered only when the family identity is present; legacy factories still use their explicit
   captured-state digest.
-- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1.1` Postcard
-  envelope with an unkeyed BLAKE3 corruption checksum, only at an open, persistence-disabled
-  completed boundary with no deferred host output. It carries the complete configuration,
-  stable-UID agents, genome/evaluator state, exact declarative registry roster and allocation
-  cursor, protocol adapter identities, environment/effects/origins, future-affecting counters, and
-  all six RNG continuations. Restore compares that registry recipe before constructing any
-  evaluator, allocates fresh physical `AgentId` values through the exact caller-prepared
-  `BrainRegistry`, and rechecks the saved `WorldDigestV1`.
+- `WorldCheckpointV1` — captures a bounded canonical `scriptbots.world-checkpoint.v1.2`/codec-3
+  `postcard+blake3-v3` envelope with an unkeyed BLAKE3 corruption checksum, only at an open,
+  persistence-disabled completed boundary with no deferred host output. It carries the complete
+  configuration, stable-UID agents, genome/evaluator state, exact declarative registry roster and
+  allocation cursor, protocol adapter identities, environment/effects/origins, exact
+  agent-substream metadata, UID-ordered per-agent counters, global future-affecting counters, and all
+  six RNG continuations.
+  Restore validates the protocol, counter cardinality/order/UID correspondence, and registry recipe
+  before constructing any evaluator or agent, allocates fresh physical `AgentId` values through the
+  exact caller-prepared `BrainRegistry`, and rechecks the saved `WorldDigestV1`.
+- `WorldStepTrace` — `scriptbots.world-step-trace.v1.5`/codec-5 carries the same embedded V1.5
+  world contract at each of its six semantic capture points. Its deferred-work lane includes queued
+  offspring identities/counter-relevant state, so first-divergence evidence cannot omit a claim that
+  will affect the Population stage.
 
 **Rules.**
 
@@ -238,6 +275,9 @@ reconstruction envelope for the core science state whose equality those digests 
   interpretation change must additionally bump the family schema/codec. The envelope excludes
   storage/session ownership, retained analytics/history, configuration-audit provenance,
   UI/render state, and run-bundle discovery; application resume remains Phase 4.1.
+- **The keyed-substream move is still under proof.** bd-1kxd is in its code-first/batch-verify
+  phase. The schema and rollback contract above require pinned DSR-only native and WASM evidence
+  before the bead can close; hosted workflow results are not accepted.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`characterization_digest_v0`,
 `WorldState::world_digest_v1`, `WorldDigestV1`);

@@ -816,7 +816,12 @@ A single world RNG makes unrelated code changes perturb all future outcomes. Int
 - brain crossover;
 - optional presentation-only effects, which must never consume scientific streams.
 
-Dynamic agent streams derive from `(run seed, domain tag, stable lineage or agent UID, birth ordinal)`. The state required for checkpoints is explicit.
+Dynamic existing-agent streams derive from `(run seed, stable AgentUid, fixed domain/operation tag,
+agent-local operation ordinal)`. Offspring streams derive from ordered parent UIDs plus the primary
+parent's local successful-birth ordinal. That ordinal is distinct from the global demographic birth
+ordinal assigned when a `born` lifecycle record is inserted. Every next-unused agent counter and the
+exact native/WASM generator lane are explicit checkpoint state; a failed reproduction restores the
+counter preimage together with the rest of the staged transaction.
 
 The leading reuse candidate is `franken_numpy`’s `fnp-random`, which provides `SeedSequence`, hierarchical child streams, PCG64DXSM state restoration, and jump-ahead. Adoption is gated by a small adapter/toolchain/build-size spike because the current crate is pre-0.2, pulls ndarray and Rayon, and does not implement `rand::RngCore`. Pin an exact commit; never use a mutable sibling path in released builds.
 
@@ -2044,8 +2049,10 @@ claim that world integration early.
   restorable random-domain checkpoints; advanced the base/bootstrap run manifest to V3/V3.1 so
   root seed and continuation state could not be collapsed back into one stream (the adapter
   attestation change above advances the bootstrap minor to V3.2);
-- [Completed — `bd-2z0.3.13`, `bd-2cd1`] Bind the canonical digest to genome, evaluator state,
-  all six RNG states, config, terrain/food, spawn ordinals, and all future-affecting counters;
+- [Completed through V1.4 — `bd-2z0.3.13`, `bd-2cd1`, `bd-h547`; V1.5 code-first integration
+  currently in progress — `bd-1kxd`] Bind the canonical digest to genome, evaluator state, all six
+  RNG states, config, terrain/food, spawn ordinals, adapter identities, the exact agent-substream
+  protocol, and UID-ordered per-agent continuation counters;
 - [Completed — `bd-2z0.3.13`] Opt-in clock-free trace with exactly six semantic checkpoints,
   separate world/deferred-work/output/resource lanes, pre-consumption death/spawn queues,
   typed capture errors, first-divergence lookup, an aggregate trace hash, and strict decoded-wire
@@ -2078,24 +2085,47 @@ claim that world integration early.
   changes must change the identity; payload interpretation changes must additionally bump the
   family schema/codec. Identity/digest/trace/checkpoint goldens remain deliberately pending the
   centralized DSR batch;
+- [Currently In Progress — `bd-1kxd`, code-first/batch-verify] Advance the canonical science
+  surfaces to `scriptbots.world-digest.v1.5`/codec-5,
+  `scriptbots.world-step-trace.v1.5`/codec-5, and
+  `scriptbots.world-checkpoint.v1.2`/codec-3 with `postcard+blake3-v3`. The digest and trace bind
+  `AgentSubstreamProtocolV1` plus counters ordered by stable UID. The checkpoint validates the exact
+  protocol and one counter object per saved UID before any evaluator or agent reconstruction;
 - [Completed — `bd-2cd1`] Upgrade `RunManifestV0` to strict canonical base V3 plus the then-current
-  V3.1 bootstrap minor with the fixed six-domain continuation object; `bd-h547` advances that
-  bootstrap minor to V3.2 when it embeds adapter-attested V1.4 digests.
+  V3.1 bootstrap minor with the fixed six-domain continuation object; `bd-h547` advanced that
+  bootstrap minor to V3.2 for adapter-attested V1.4 evidence. `bd-1kxd` now advances the canonical
+  base to `scriptbots.run-manifest.v3.3` with launch protocol/counters and the bootstrap form to
+  `scriptbots.run-manifest.v3.4`, which binds those exact launch values to the tick-zero V1.5
+  digest. This schema movement remains code-first and DSR-pending.
 
 **Exit (completed — `bd-3n7p`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`):** fixed
 runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.
 
-#### 1.9 domain-separated RNG and `fnp-random` decision [Global six-domain cutover completed — `bd-2cd1`, TopazCastle, 2026-07-16; per-agent noninteraction remains — `bd-1kxd`]
+#### 1.9 domain-separated RNG and `fnp-random` decision [Currently In Progress — global six-domain cutover completed in `bd-2cd1`; agent-keyed noninteraction implementation and DSR proof pending in `bd-1kxd`]
 
 - [Completed — `bd-2z0.3.10`] Reject pinned `fnp-random`: its nightly-only, non-WASM contract
   does not serve this project's C++ parity oracle; retain the pinned `SmallRngStream` protocol;
 - [Completed — `bd-2cd1`, `a547201`, DSR `bd-2cd1-verify-5` and `bd-2cd1-perf-compare-1`]
   Routed every world stochastic boundary through one of six explicit global domains, persisted a
   strict fixed six-field checkpoint, and exposed every domain independently in the canonical digest;
-- [Tracked — `bd-1kxd`, depends on `bd-3n7p` after `bd-2cd1`] Replace shared agent-affecting
-  domain consumption with stable agent-keyed/counter substreams and prove dense-permutation and
-  distant-agent noninteraction. Six global domains solve cross-domain draw coupling, not per-agent
-  coupling.
+- [Currently In Progress — `bd-1kxd`] Replace shared agent-affecting domain consumption with
+  stable substreams derived from root seed, `AgentUid`, fixed operation/domain tag, and a persisted
+  agent-local ordinal. Reproduction admission and partner choice use separate keyed streams from one
+  attempt ordinal. Successful offspring use directional `OffspringRngIdentityV1` with the primary
+  parent's local birth ordinal; body, runtime, brain-genome, initialization, and evaluator-state
+  operations each own a distinct stream that is constructed once and threaded through the complete
+  operation.
+- [Currently In Progress — `bd-1kxd`] Store exact `AgentRngCountersV1` values with each stable
+  agent. Counter claims are transactional: failure restores the full preimage together with parent
+  energy/progress, staged offspring, population insertions, and any later claims in reverse order.
+  The parent-local RNG birth ordinal does not replace or alias the run-wide demographic
+  `AgentIdentity::birth_ordinal`.
+- [Currently In Progress — `bd-1kxd`] Advance digest/trace/checkpoint and manifest contracts as
+  recorded in Phase 1.8, then prove multi-tick distant-agent noninteraction, dense-association
+  permutation invariance, deterministic lineage-derived offspring, strict counter
+  encode/decode/digest divergence, and checkpoint continuation.
+- [Proof pending — `bd-1kxd`] Run the pinned DSR native and WASM lanes over the integrated source.
+  GitHub Actions and direct Cargo/RCH evidence are not accepted for this exit.
 
 **Exit (pending `bd-1kxd`):** unrelated agent insertion or analytics cadence does not perturb
 existing agent streams.
@@ -2555,7 +2585,8 @@ These become separate implementation beads for terrain, camera/input, HUD, and c
 - persist the already-defined canonical manifest/digest schemas;
 - sequenced commands and status transitions;
 - nonempty domain events;
-- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.1` science envelope, then
+- persist and discover the Phase 1 `scriptbots.world-checkpoint.v1.2`/codec-3
+  `postcard+blake3-v3` science envelope, then
   reconstruct host-owned persistence/session state around the restored core world;
 - checkpoint resume and first-divergence verification.
 
