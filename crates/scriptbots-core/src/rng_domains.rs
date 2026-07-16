@@ -222,9 +222,7 @@ impl DomainStreams {
     /// domain's stream to tick zero — the resumed run would diverge from the one it claims to
     /// continue, and the digest would not necessarily catch it because the *other* domains would
     /// match perfectly.
-    pub fn restore(
-        checkpoint: &DomainStreamsCheckpoint,
-    ) -> Result<Self, DomainStreamRestoreError> {
+    pub fn restore(checkpoint: &DomainStreamsCheckpoint) -> Result<Self, DomainStreamRestoreError> {
         if checkpoint.version != DOMAIN_STREAMS_CHECKPOINT_VERSION {
             return Err(DomainStreamRestoreError::Version {
                 found: checkpoint.version,
@@ -243,11 +241,11 @@ impl DomainStreams {
                 expected: DOMAIN_STREAMS_CHECKPOINT_CODEC_VERSION,
             });
         }
-        if let Some(domain) = checkpoint
-            .streams
-            .keys()
-            .find(|tag| !RngDomain::ALL.into_iter().any(|domain| domain.tag() == tag.as_str()))
-        {
+        if let Some(domain) = checkpoint.streams.keys().find(|tag| {
+            !RngDomain::ALL
+                .into_iter()
+                .any(|domain| domain.tag() == tag.as_str())
+        }) {
             return Err(DomainStreamRestoreError::UnexpectedDomain {
                 domain: domain.clone(),
             });
@@ -255,27 +253,27 @@ impl DomainStreams {
 
         let restore_domain =
             |domain: RngDomain| -> Result<SmallRngStream, DomainStreamRestoreError> {
-            let state = checkpoint.stream(domain).ok_or_else(|| {
-                DomainStreamRestoreError::MissingDomain {
-                    domain: domain.tag(),
+                let state = checkpoint.stream(domain).ok_or_else(|| {
+                    DomainStreamRestoreError::MissingDomain {
+                        domain: domain.tag(),
+                    }
+                })?;
+                let stream = SmallRngStream::from_state(state).map_err(|source| {
+                    DomainStreamRestoreError::Stream {
+                        domain: domain.tag(),
+                        source,
+                    }
+                })?;
+                let expected_seed = derive_domain_seed(checkpoint.root_seed, domain);
+                if stream.seed() != expected_seed {
+                    return Err(DomainStreamRestoreError::DerivedSeedMismatch {
+                        domain: domain.tag(),
+                        found: stream.seed(),
+                        expected: expected_seed,
+                    });
                 }
-            })?;
-            let stream = SmallRngStream::from_state(state).map_err(|source| {
-                DomainStreamRestoreError::Stream {
-                    domain: domain.tag(),
-                    source,
-                }
-            })?;
-            let expected_seed = derive_domain_seed(checkpoint.root_seed, domain);
-            if stream.seed() != expected_seed {
-                return Err(DomainStreamRestoreError::DerivedSeedMismatch {
-                    domain: domain.tag(),
-                    found: stream.seed(),
-                    expected: expected_seed,
-                });
-            }
-            Ok(stream)
-        };
+                Ok(stream)
+            };
         let streams = [
             restore_domain(RngDomain::Environment)?,
             restore_domain(RngDomain::Food)?,
@@ -320,9 +318,7 @@ pub enum DomainStreamRestoreError {
     UnexpectedDomain { domain: String },
 
     /// A stream state claims it belongs to a different root/domain derivation.
-    #[error(
-        "the `{domain}` domain's embedded seed {found} does not match derived seed {expected}"
-    )]
+    #[error("the `{domain}` domain's embedded seed {found} does not match derived seed {expected}")]
     DerivedSeedMismatch {
         domain: &'static str,
         found: u64,
@@ -510,8 +506,8 @@ mod tests {
             })
             .collect();
 
-        let mut restored = DomainStreams::restore(&checkpoint)
-            .expect("a checkpoint we just took must restore");
+        let mut restored =
+            DomainStreams::restore(&checkpoint).expect("a checkpoint we just took must restore");
         for domain in RngDomain::ALL {
             let draws: Vec<u64> = (0..8).map(|_| restored.stream(domain).next_u64()).collect();
             assert_eq!(
@@ -591,10 +587,7 @@ mod tests {
 
         assert!(matches!(
             DomainStreams::restore(&checkpoint),
-            Err(DomainStreamRestoreError::DerivedSeedMismatch {
-                domain: "food",
-                ..
-            })
+            Err(DomainStreamRestoreError::DerivedSeedMismatch { domain: "food", .. })
         ));
     }
 }

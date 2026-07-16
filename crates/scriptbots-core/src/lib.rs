@@ -14459,10 +14459,7 @@ impl WorldState {
         let Some(kind) = self.brain_registry.kind(key).map(str::to_owned) else {
             return Ok(None);
         };
-        let (registry, rng) = (
-            &self.brain_registry,
-            self.rng.stream(RngDomain::Population),
-        );
+        let (registry, rng) = (&self.brain_registry, self.rng.stream(RngDomain::Population));
         let Some(adapter) = registry.family(key) else {
             return BrainBinding::from_registry(registry, rng, key);
         };
@@ -14751,10 +14748,7 @@ impl WorldState {
                 if age > eligible_ages[first] && rng.random_range(0.0..1.0) < 0.1 {
                     first = idx;
                 }
-                if idx != first
-                    && age > eligible_ages[second]
-                    && rng.random_range(0.0..1.0) < 0.1
-                {
+                if idx != first && age > eligible_ages[second] && rng.random_range(0.0..1.0) < 0.1 {
                     second = idx;
                 }
             }
@@ -14832,8 +14826,7 @@ impl WorldState {
         // Preserve the historical RNG position of `spawn_agent`, whose random runtime was
         // immediately replaced below, while constructing any fallible fallback brain before
         // insertion so a factory error cannot leave a partially inserted child.
-        let _discarded_runtime =
-            AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
+        let _discarded_runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
 
         let child_rates = child_runtime.mutation_rates;
         let inherited_key = parent_runtime.brain.registry_key();
@@ -14975,10 +14968,7 @@ impl WorldState {
                 for _ in 0..spawn_count {
                     let use_crossover = crossover_eligible.len() >= 2
                         && crossover_chance > 0.0
-                        && self
-                            .rng
-                            .stream(RngDomain::Crossover)
-                            .random_range(0.0..1.0)
+                        && self.rng.stream(RngDomain::Crossover).random_range(0.0..1.0)
                             < crossover_chance;
                     let spawned = if use_crossover {
                         self.spawn_crossover_agent(next_tick, &crossover_eligible)?
@@ -15910,11 +15900,7 @@ impl WorldState {
                 continue;
             }
             if reproduction_chance < 1.0
-                && self
-                    .rng
-                    .stream(RngDomain::Lineage)
-                    .random_range(0.0..1.0)
-                    >= reproduction_chance
+                && self.rng.stream(RngDomain::Lineage).random_range(0.0..1.0) >= reproduction_chance
             {
                 continue;
             }
@@ -15993,12 +15979,7 @@ impl WorldState {
         if population < 2 || partner_chance <= 0.0 {
             return None;
         }
-        if self
-            .rng
-            .stream(RngDomain::Lineage)
-            .random_range(0.0..1.0)
-            >= partner_chance
-        {
+        if self.rng.stream(RngDomain::Lineage).random_range(0.0..1.0) >= partner_chance {
             return None;
         }
         let mut best: Option<(usize, u32)> = None;
@@ -16099,12 +16080,9 @@ impl WorldState {
                             .and_then(|partner_id| self.runtime.get(partner_id))
                             .and_then(|runtime| runtime.brain.runner())
                             .filter(|partner| partner.kind() == parent_runner.kind());
-                        if let Some(runner) = partner_runner
-                            .and_then(|partner| {
-                                parent_runner
-                                    .crossover(partner, self.rng.stream(RngDomain::Crossover))
-                            })
-                        {
+                        if let Some(runner) = partner_runner.and_then(|partner| {
+                            parent_runner.crossover(partner, self.rng.stream(RngDomain::Crossover))
+                        }) {
                             Some(runner)
                         } else {
                             parent_runner.clone_runner()?
@@ -16200,11 +16178,7 @@ impl WorldState {
         child.position.y = Self::wrap_position(parent.position.y + base_dy + jitter_dy, height);
         child.velocity = Velocity::default();
         child.heading = wrap_signed_angle(
-            parent.heading
-                + self
-                    .rng
-                    .stream(RngDomain::Mutation)
-                    .random_range(-0.2..0.2),
+            parent.heading + self.rng.stream(RngDomain::Mutation).random_range(-0.2..0.2),
         );
         child.health = 1.0;
         child.boost = false;
@@ -16220,13 +16194,12 @@ impl WorldState {
 
         if color_jitter > 0.0 {
             for channel in &mut child.color {
-                *channel =
-                    (*channel
-                        + self
-                            .rng
-                            .stream(RngDomain::Mutation)
-                            .random_range(-color_jitter..color_jitter))
-                    .clamp(0.0, 1.0);
+                *channel = (*channel
+                    + self
+                        .rng
+                        .stream(RngDomain::Mutation)
+                        .random_range(-color_jitter..color_jitter))
+                .clamp(0.0, 1.0);
             }
         }
         Ok(child)
@@ -16376,26 +16349,18 @@ impl WorldState {
                 runtime.mutation_rates.secondary,
             );
 
-            runtime.clocks[0] = if self
-                .rng
-                .stream(RngDomain::Crossover)
-                .random_range(0.0..1.0)
-                < 0.5
-            {
-                parent.clocks[0]
-            } else {
-                partner_runtime.clocks[0]
-            };
-            runtime.clocks[1] = if self
-                .rng
-                .stream(RngDomain::Crossover)
-                .random_range(0.0..1.0)
-                < 0.5
-            {
-                parent.clocks[1]
-            } else {
-                partner_runtime.clocks[1]
-            };
+            runtime.clocks[0] =
+                if self.rng.stream(RngDomain::Crossover).random_range(0.0..1.0) < 0.5 {
+                    parent.clocks[0]
+                } else {
+                    partner_runtime.clocks[0]
+                };
+            runtime.clocks[1] =
+                if self.rng.stream(RngDomain::Crossover).random_range(0.0..1.0) < 0.5 {
+                    parent.clocks[1]
+                } else {
+                    partner_runtime.clocks[1]
+                };
 
             let before_temp = runtime.temperature_preference;
             runtime.temperature_preference = mix(
@@ -16423,11 +16388,7 @@ impl WorldState {
         let meta_scale = self.config.reproduction_meta_mutation_scale;
         if meta_chance > 0.0
             && meta_scale > 0.0
-            && self
-                .rng
-                .stream(RngDomain::Mutation)
-                .random_range(0.0..1.0)
-                < meta_chance
+            && self.rng.stream(RngDomain::Mutation).random_range(0.0..1.0) < meta_chance
         {
             let delta_primary = self
                 .rng
@@ -16565,10 +16526,7 @@ impl WorldState {
             for i in 0..runtime.eye_direction.len() {
                 let before = runtime.eye_direction[i];
                 let after = if primary_rate > 0.0
-                    && self
-                        .rng
-                        .stream(RngDomain::Mutation)
-                        .random_range(0.0..1.0)
+                    && self.rng.stream(RngDomain::Mutation).random_range(0.0..1.0)
                         < primary_rate * 5.0
                 {
                     let delta = self
@@ -16614,12 +16572,7 @@ impl WorldState {
         if scale <= 0.0 || rate <= 0.0 {
             return value.clamp(min, max);
         }
-        if self
-            .rng
-            .stream(RngDomain::Mutation)
-            .random_range(0.0..1.0)
-            < rate * 5.0
-        {
+        if self.rng.stream(RngDomain::Mutation).random_range(0.0..1.0) < rate * 5.0 {
             self.mutate_value(value, scale, min, max)
         } else {
             value.clamp(min, max)
@@ -18009,10 +17962,8 @@ impl WorldState {
             let state = checkpoint
                 .stream(domain)
                 .expect("live DomainStreams checkpoints contain every domain");
-            let mut encoder = CharacterizationEncoderV0::new_with_schema(
-                WORLD_DIGEST_V1_SCHEMA,
-                "rng-domain",
-            );
+            let mut encoder =
+                CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "rng-domain");
             encoder.string(&checkpoint.algorithm);
             encoder.u16(checkpoint.version);
             encoder.u16(checkpoint.codec_version);

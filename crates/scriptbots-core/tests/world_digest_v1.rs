@@ -352,8 +352,7 @@ fn v1_3_wire_is_exact_and_rejects_the_single_stream_v1_2_shape() {
         .map(str::to_owned)
         .collect();
     assert_eq!(
-        rng_keys,
-        expected_rng_keys,
+        rng_keys, expected_rng_keys,
         "V1.3 RNG diagnostics must carry exactly one aggregate and one domain map"
     );
     let domain_keys: BTreeSet<String> = rng

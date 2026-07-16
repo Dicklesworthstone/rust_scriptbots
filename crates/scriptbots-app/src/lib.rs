@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 use scriptbots_core::{
     CharacterizationDigestV0, CharacterizationError, CoreBuildIdentityV0,
     PersistenceAdmissionSession, ScriptBotsConfig, TickEvents, WorldDigestV1,
-    WorldDigestV1ContractError, WorldState,
-    rng_domains::DomainStreamsCheckpoint,
+    WorldDigestV1ContractError, WorldState, rng_domains::DomainStreamsCheckpoint,
 };
 use scriptbots_runtime::RunId;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
@@ -1254,7 +1253,10 @@ mod characterization_tests {
         assert_eq!(manifest.random_streams.root_seed, manifest.root_seed);
         let encoded = manifest.canonical_json_bytes().expect("manifest JSON");
         let storage_record = manifest.to_storage_record().expect("storage projection");
-        assert_eq!(storage_record.rng_algorithm, manifest.random_streams.algorithm);
+        assert_eq!(
+            storage_record.rng_algorithm,
+            manifest.random_streams.algorithm
+        );
         assert_eq!(storage_record.rng_version, manifest.random_streams.version);
         assert_eq!(
             storage_record.manifest_json,

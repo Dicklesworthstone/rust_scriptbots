@@ -1048,7 +1048,13 @@ fn validate_v3_random_streams(
     manifest_require_exact_object_fields(
         manifest,
         "/random_streams",
-        &["version", "algorithm", "codec_version", "root_seed", "streams"],
+        &[
+            "version",
+            "algorithm",
+            "codec_version",
+            "root_seed",
+            "streams",
+        ],
     )?;
     require_manifest_projection(
         manifest,
@@ -1065,11 +1071,7 @@ fn validate_v3_random_streams(
         "/random_streams/root_seed",
         &json!(record.root_seed),
     )?;
-    manifest_required_bounded_string(
-        manifest,
-        "/random_streams/algorithm",
-        MAX_RUN_LABEL_BYTES,
-    )?;
+    manifest_required_bounded_string(manifest, "/random_streams/algorithm", MAX_RUN_LABEL_BYTES)?;
     let version = manifest_required_u16(manifest, "/random_streams/version")?;
     let codec_version = manifest_required_u16(manifest, "/random_streams/codec_version")?;
     manifest_required_u64(manifest, "/random_streams/root_seed")?;
@@ -1090,10 +1092,7 @@ fn validate_v3_random_streams(
     Ok(())
 }
 
-fn validate_v3_random_stream_state(
-    manifest: &Value,
-    domain: &str,
-) -> Result<(), StorageError> {
+fn validate_v3_random_stream_state(manifest: &Value, domain: &str) -> Result<(), StorageError> {
     let pointer = format!("/random_streams/streams/{domain}");
     manifest_require_exact_object_fields(
         manifest,

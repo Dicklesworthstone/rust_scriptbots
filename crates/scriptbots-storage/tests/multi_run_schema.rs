@@ -638,8 +638,7 @@ fn v3_manifest_validation_rejects_incomplete_rng_and_provenance() {
 
     let mut invalid_state = manifest(run_id, "invalid-rng-state", 1_700_000_000_019);
     mutate_manifest(&mut invalid_state, |value| {
-        value["random_streams"]["streams"]["mutation"]["state"] =
-            serde_json::json!([256]);
+        value["random_streams"]["streams"]["mutation"]["state"] = serde_json::json!([256]);
     });
     let error = manifest_validation_error(invalid_state);
     assert!(
@@ -729,8 +728,7 @@ fn v3_manifest_requires_exactly_six_strict_random_domain_states() {
 
     let mut invalid_one_of_six = manifest(run_id, "invalid-one-of-six", 1_700_000_000_026);
     mutate_manifest(&mut invalid_one_of_six, |value| {
-        value["random_streams"]["streams"]["crossover"]["algorithm"] =
-            serde_json::json!("");
+        value["random_streams"]["streams"]["crossover"]["algorithm"] = serde_json::json!("");
     });
     let error = manifest_validation_error(invalid_one_of_six);
     assert!(
