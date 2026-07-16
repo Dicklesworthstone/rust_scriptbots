@@ -32322,7 +32322,7 @@ mod tests {
     fn uid_canonical_reproduction_assigns_identical_child_genomes_and_uids() {
         fn reproduction_world() -> WorldState {
             let (mut world, key) = protocol_fixture_world(
-                "test.uid-layout-protocol",
+                "test-uid-layout-protocol",
                 OffspringStatePolicy::Reset,
                 1.0,
             );
@@ -32336,7 +32336,7 @@ mod tests {
                     &mut world,
                     key,
                     parent,
-                    "test.uid-layout-protocol",
+                    "test-uid-layout-protocol",
                     index as i8 + 1,
                     -(index as i8),
                 );
@@ -32484,7 +32484,7 @@ mod tests {
             config.reproduction_energy_threshold = 0.0;
             config.reproduction_attempt_chance = 0.0;
             let mut world = WorldState::new(config).expect("scheduled crossover world");
-            let family_id = "test.uid-layout-scheduled-protocol";
+            let family_id = "test-uid-layout-scheduled-protocol";
             let key = world
                 .register_brain_family(
                     family_id,
