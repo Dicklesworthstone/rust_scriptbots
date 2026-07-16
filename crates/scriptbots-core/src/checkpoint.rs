@@ -232,7 +232,7 @@ struct WorldCheckpointStateV1 {
     map_metadata: Option<MapMetadataCheckpointV1>,
     hydrology: Option<HydrologyCheckpointV1>,
     #[serde(deserialize_with = "deserialize_checkpoint_active_effects")]
-    active_effects: Vec<ActiveEffect>,
+    active_effects: Vec<ActiveEffectCheckpointV1>,
     #[serde(deserialize_with = "deserialize_checkpoint_origins")]
     pending_birth_records: Vec<BirthRecordCheckpointV1>,
 }
@@ -437,6 +437,26 @@ struct HydrologyCheckpointV1 {
     initial_water_depth: Vec<f32>,
     #[serde(deserialize_with = "deserialize_checkpoint_f32_cells")]
     water_depth: Vec<f32>,
+}
+
+/// Checkpoint-local region wire.
+///
+/// The public [`Region`] representation is internally tagged for the JSON control API. Postcard
+/// deliberately cannot deserialize internally tagged enums because they require
+/// `deserialize_any`, so the checkpoint owns an externally tagged wire instead of leaking that
+/// host-facing representation into the binary science contract.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum RegionCheckpointV1 {
+    All,
+    Disc { x: f32, y: f32, radius: f32 },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveEffectCheckpointV1 {
+    region: RegionCheckpointV1,
+    ticks_remaining: u32,
+    growth_scale: f32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -677,6 +697,7 @@ impl WorldCheckpointV1 {
         for (index, effect) in state.active_effects.iter().enumerate() {
             effect
                 .region
+                .restore()
                 .validate()
                 .map_err(|error| WorldCheckpointError::Contract {
                     path: format!("active_effects[{index}].region"),
@@ -759,7 +780,12 @@ impl WorldState {
                 .as_ref()
                 .map(MapMetadataCheckpointV1::capture),
             hydrology: self.hydrology.as_ref().map(HydrologyCheckpointV1::capture),
-            active_effects: self.active_effects.clone(),
+            active_effects: self
+                .active_effects
+                .iter()
+                .copied()
+                .map(ActiveEffectCheckpointV1::capture)
+                .collect(),
             pending_birth_records: self
                 .pending_birth_records
                 .iter()
@@ -881,7 +907,12 @@ impl WorldState {
             restored.runtime.insert(id, runtime);
         }
         restored.agent_execution_order_canonical = true;
-        restored.active_effects.clone_from(&state.active_effects);
+        restored.active_effects = state
+            .active_effects
+            .iter()
+            .copied()
+            .map(ActiveEffectCheckpointV1::restore)
+            .collect();
         restored.pending_birth_records = state
             .pending_birth_records
             .iter()
@@ -1222,6 +1253,40 @@ impl HydrologyCheckpointV1 {
         }
         hydrology.try_update_water_depth(|depth| depth.copy_from_slice(&self.water_depth))?;
         Ok(hydrology)
+    }
+}
+
+impl RegionCheckpointV1 {
+    const fn capture(region: Region) -> Self {
+        match region {
+            Region::All => Self::All,
+            Region::Disc { x, y, radius } => Self::Disc { x, y, radius },
+        }
+    }
+
+    const fn restore(self) -> Region {
+        match self {
+            Self::All => Region::All,
+            Self::Disc { x, y, radius } => Region::Disc { x, y, radius },
+        }
+    }
+}
+
+impl ActiveEffectCheckpointV1 {
+    const fn capture(effect: ActiveEffect) -> Self {
+        Self {
+            region: RegionCheckpointV1::capture(effect.region),
+            ticks_remaining: effect.ticks_remaining,
+            growth_scale: effect.growth_scale,
+        }
+    }
+
+    const fn restore(self) -> ActiveEffect {
+        ActiveEffect {
+            region: self.region.restore(),
+            ticks_remaining: self.ticks_remaining,
+            growth_scale: self.growth_scale,
+        }
     }
 }
 
@@ -2099,11 +2164,11 @@ where
 
 fn deserialize_checkpoint_active_effects<'de, D>(
     deserializer: D,
-) -> Result<Vec<ActiveEffect>, D::Error>
+) -> Result<Vec<ActiveEffectCheckpointV1>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec::<D, ActiveEffect, MAX_CHECKPOINT_ACTIVE_EFFECTS>(
+    deserialize_bounded_vec::<D, ActiveEffectCheckpointV1, MAX_CHECKPOINT_ACTIVE_EFFECTS>(
         deserializer,
         "checkpoint active effects",
     )
@@ -2977,7 +3042,7 @@ mod tests {
             AgentCheckpointV1 {
                 identity: AgentIdentity {
                     uid: AgentUid(1),
-                    spawn_ordinal: 1,
+                    spawn_ordinal: 0,
                     birth_ordinal: None,
                 },
                 data: AgentData::default(),
