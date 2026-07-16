@@ -2105,9 +2105,9 @@ claim that world integration early.
   `scriptbots.run-manifest.v3.4`, which binds those exact launch values to the tick-zero V1.5
   digest. `bd-2i1` advances only the bootstrap form to `scriptbots.run-manifest.v3.5` so the
   selected locomotion model is bound through the tick-zero V1.6 digest. The V3.5 schema movement
-  is complete under the same pinned DSR evidence. `bd-hiv1` remains open for the separate
-  movement-noise and spike-speed consumers that must use legacy wheel effort rather than physical
-  displacement.
+  is complete under the same pinned DSR evidence. [Currently In Progress — `bd-hiv1`] Correct the
+  separate movement-noise and spike-speed consumers to use named legacy wheel effort rather than
+  physical displacement.
 
 **Exit (completed — `bd-3n7p`, DSR `bd-3n7p-checkpoint-v1-20260716-13` at `7866550`):** fixed
 runs have a canonical first-divergence oracle and checkpoint schema before runtime/replay work.

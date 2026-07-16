@@ -249,6 +249,14 @@ pub trait OutputsExt {
         self.channel(channel).clamp(0.0, 1.0)
     }
 
+    /// Peak commanded wheel effort in normalized actuator space.
+    ///
+    /// This deliberately excludes physical displacement and boost-scaled wheel speed.
+    fn peak_wheel_output(&self) -> f32 {
+        self.channel_clamped(OutputChannel::WheelLeft)
+            .max(self.channel_clamped(OutputChannel::WheelRight))
+    }
+
     /// Whether the brain is requesting boost.
     fn boost_engaged(&self) -> bool {
         self.channel(OutputChannel::Boost) > BOOST_THRESHOLD
@@ -421,5 +429,32 @@ mod tests {
         outputs[OutputChannel::WheelRight.index()] = 1e9;
         assert!((outputs.channel_clamped(OutputChannel::WheelLeft) - 0.0).abs() < f32::EPSILON);
         assert!((outputs.channel_clamped(OutputChannel::WheelRight) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn peak_wheel_output_uses_the_stronger_named_wheel_only() {
+        let mut outputs = [0.0f32; OUTPUT_SIZE];
+        assert!(outputs.peak_wheel_output().abs() < f32::EPSILON);
+
+        outputs[OutputChannel::WheelLeft.index()] = 0.25;
+        outputs[OutputChannel::WheelRight.index()] = 0.75;
+        outputs[OutputChannel::ColorGreen.index()] = 1.0;
+        outputs[OutputChannel::Boost.index()] = 1.0;
+        assert!((outputs.peak_wheel_output() - 0.75).abs() < f32::EPSILON);
+
+        outputs[OutputChannel::WheelLeft.index()] = 0.9;
+        outputs[OutputChannel::WheelRight.index()] = 0.1;
+        assert!((outputs.peak_wheel_output() - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn peak_wheel_output_clamps_each_wheel_before_reduction() {
+        let mut outputs = [0.0f32; OUTPUT_SIZE];
+        outputs[OutputChannel::WheelLeft.index()] = -3.0;
+        outputs[OutputChannel::WheelRight.index()] = 0.4;
+        assert!((outputs.peak_wheel_output() - 0.4).abs() < f32::EPSILON);
+
+        outputs[OutputChannel::WheelRight.index()] = 1e9;
+        assert!((outputs.peak_wheel_output() - 1.0).abs() < f32::EPSILON);
     }
 }

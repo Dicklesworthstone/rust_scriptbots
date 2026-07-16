@@ -1022,7 +1022,7 @@ struct SenseNeighborInputs {
     distance: f32,
     distance_factor: f32,
     color: [f32; 3],
-    speed_normalized: f32,
+    wheel_effort: f32,
     sound_emitter: f32,
     target_health: f32,
 }
@@ -1052,7 +1052,7 @@ fn fixed_sense_contribution(
     let neighbor_y = neighbor.dy / neighbor.distance;
     let mut contribution = sense_fixed::NeighborContribution {
         smell: neighbor.distance_factor,
-        sound: neighbor.distance_factor * neighbor.speed_normalized,
+        sound: neighbor.distance_factor * neighbor.wheel_effort,
         hearing: neighbor.distance_factor * neighbor.sound_emitter,
         ..sense_fixed::NeighborContribution::default()
     };
@@ -8520,7 +8520,7 @@ pub struct ScriptBotsConfig {
     pub spike_min_length: f32,
     /// Cosine threshold for considering a spike aligned with its target.
     pub spike_alignment_cosine: f32,
-    /// Scalar applied to velocity when scaling spike damage.
+    /// Scalar applied to peak normalized wheel output when scaling spike damage.
     pub spike_speed_damage_bonus: f32,
     /// Scalar applied to spike length when scaling damage.
     pub spike_length_damage_bonus: f32,
@@ -12382,8 +12382,7 @@ pub struct WorldState {
     work_heading_dir_x: Vec<f32>,
     work_heading_dir_y: Vec<f32>,
     work_spike_lengths: Vec<f32>,
-    work_velocities: Vec<Velocity>,
-    work_speed_norm: Vec<f32>,
+    work_peak_wheel_outputs: Vec<f32>,
     work_combat_views: Vec<CombatAgentView>,
     work_penalties: Vec<f32>,
     pending_deaths: Vec<AgentId>,
@@ -12525,8 +12524,7 @@ impl WorldState {
             work_heading_dir_x: Vec::new(),
             work_heading_dir_y: Vec::new(),
             work_spike_lengths: Vec::new(),
-            work_velocities: Vec::new(),
-            work_speed_norm: Vec::new(),
+            work_peak_wheel_outputs: Vec::new(),
             work_combat_views: Vec::new(),
             work_penalties: Vec::new(),
             pending_deaths: Vec::new(),
@@ -13091,7 +13089,6 @@ impl WorldState {
         let columns = self.agents.columns();
         let positions = columns.positions();
         let headings = columns.headings();
-        let velocities = columns.velocities();
         let colors = columns.colors();
         let healths = columns.health();
 
@@ -13122,7 +13119,8 @@ impl WorldState {
         self.work_clocks.resize(agent_count, [50.0, 50.0]);
         self.work_temperature_preferences.resize(agent_count, 0.5);
         self.work_sound_emitters.resize(agent_count, 0.0);
-        self.work_speed_norm.resize(agent_count, 0.0);
+        self.work_peak_wheel_outputs.resize(agent_count, 0.0);
+        self.work_peak_wheel_outputs.fill(0.0);
         for (idx, id) in handles.iter().enumerate() {
             if let Some(rt) = runtime.get(*id) {
                 self.work_trait_modifiers[idx] = rt.trait_modifiers;
@@ -13141,6 +13139,7 @@ impl WorldState {
                 self.work_clocks[idx] = rt.clocks;
                 self.work_temperature_preferences[idx] = rt.temperature_preference;
                 self.work_sound_emitters[idx] = rt.sound_multiplier;
+                self.work_peak_wheel_outputs[idx] = rt.outputs.peak_wheel_output();
             }
         }
         let trait_modifiers = &self.work_trait_modifiers;
@@ -13149,6 +13148,7 @@ impl WorldState {
         let clocks = &self.work_clocks;
         let temperature_preferences = &self.work_temperature_preferences;
         let sound_emitters = &self.work_sound_emitters;
+        let peak_wheel_outputs = &self.work_peak_wheel_outputs;
 
         // Sanity checks (debug-only) to validate buffers are well-formed
         debug_assert!(eye_units.len() == handles.len());
@@ -13156,6 +13156,7 @@ impl WorldState {
         debug_assert!(clocks.len() == handles.len());
         debug_assert!(temperature_preferences.len() == handles.len());
         debug_assert!(sound_emitters.len() == handles.len());
+        debug_assert!(peak_wheel_outputs.len() == handles.len());
         debug_assert!({
             // Ensure FOVs and unit vectors contain finite values.
             let mut ok = true;
@@ -13193,12 +13194,6 @@ impl WorldState {
         let food_height = self.food.height();
         let food_cells = self.food.cells();
         let food_max = self.config.food_max;
-        let max_speed = (self.config.bot_speed * self.config.boost_multiplier).max(1e-3);
-        // Precompute normalized speed per agent for sound channel
-        for (idx, vel) in velocities.iter().enumerate() {
-            let sp = (vel.vx * vel.vx + vel.vy * vel.vy).sqrt();
-            self.work_speed_norm[idx] = (sp / max_speed).clamp(0.0, 1.0);
-        }
         let tick_value = self.tick.0 as f32;
         let index = &self.index;
 
@@ -13238,7 +13233,7 @@ impl WorldState {
                                 distance,
                                 distance_factor,
                                 color: colors[other_idx],
-                                speed_normalized: self.work_speed_norm[other_idx],
+                                wheel_effort: peak_wheel_outputs[other_idx],
                                 sound_emitter: sound_emitters[other_idx],
                                 target_health: healths[other_idx],
                             },
@@ -13335,7 +13330,6 @@ impl WorldState {
         let positions = columns.positions();
         let colors = columns.colors();
         let healths = columns.health();
-        let velocities = columns.velocities();
         let headings = columns.headings();
 
         let position = positions[idx];
@@ -13345,7 +13339,6 @@ impl WorldState {
         let radius_sq = radius * radius;
         let world_width = self.config.world_width as f32;
         let world_height = self.config.world_height as f32;
-        let max_speed = (self.config.bot_speed * self.config.boost_multiplier).max(1e-3);
         let mut eye_units = [[0.0; 2]; NUM_EYES];
         let mut eye_fovs = [1.0f32; NUM_EYES];
         for eye in 0..NUM_EYES {
@@ -13380,14 +13373,9 @@ impl WorldState {
             let color = colors[other_idx];
             let source_uid = self.agent_uid(other_id)?;
 
-            let velocity = velocities[other_idx];
-            let speed_norm = ((velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt()
-                / max_speed)
-                .clamp(0.0, 1.0);
-            let emitter = self
-                .runtime
-                .get(other_id)
-                .map_or(0.0, |rt| rt.sound_multiplier);
+            let (wheel_effort, emitter) = self.runtime.get(other_id).map_or((0.0, 0.0), |rt| {
+                (rt.outputs.peak_wheel_output(), rt.sound_multiplier)
+            });
             let fixed = fixed_sense_contribution(
                 &geometry,
                 SenseNeighborInputs {
@@ -13396,7 +13384,7 @@ impl WorldState {
                     distance: dist,
                     distance_factor: dist_factor,
                     color,
-                    speed_normalized: speed_norm,
+                    wheel_effort,
                     sound_emitter: emitter,
                     target_health: healths[other_idx],
                 },
@@ -15853,11 +15841,6 @@ impl WorldState {
 
         let positions = self.agents.columns().positions();
         let headings = self.agents.columns().headings();
-        // Reuse velocity buffer
-        self.work_velocities.clear();
-        self.work_velocities
-            .extend_from_slice(self.agents.columns().velocities());
-        let velocities = &self.work_velocities;
         let spike_lengths = self.agents.columns().spike_lengths();
         // Reuse position_pairs buffer for index rebuild
         self.work_position_pairs.clear();
@@ -15929,19 +15912,10 @@ impl WorldState {
             let reach_sq = reach * reach;
             let heading = headings[idx];
             let facing = (heading.cos(), heading.sin());
-            let wheel_left = attacker_runtime
-                .outputs
-                .channel(OutputChannel::WheelLeft)
-                .abs();
-            let wheel_right = attacker_runtime
-                .outputs
-                .channel(OutputChannel::WheelRight)
-                .abs();
-            let velocity = velocities[idx];
-            let speed_mag = (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt();
-            // Legacy C++ gates the damage bonus on boost. This line once read
-            // the green colour slot instead, rewarding carnivores for being
-            // green; the named channel is what makes that unrepresentable.
+            let wheel_effort = attacker_runtime.outputs.peak_wheel_output();
+            // Rust preserves its named binary boost-damage policy. The legacy
+            // C++ computes a boost multiplier here but accidentally never uses
+            // it; copying that dead-local bug would be a separate combat retune.
             let boost_bonus = if attacker_runtime.outputs.boost_engaged() {
                 1.0
             } else {
@@ -15950,8 +15924,7 @@ impl WorldState {
 
             let base_power = spike_damage * spike_power;
             let length_factor = 1.0 + spike_length * length_bonus;
-            let speed_factor =
-                1.0 + (wheel_left.max(wheel_right) + speed_mag) * speed_bonus + boost_bonus;
+            let speed_factor = 1.0 + wheel_effort * speed_bonus + boost_bonus;
             let base_damage = base_power * length_factor * speed_factor;
 
             let origin = positions[idx];
@@ -24600,7 +24573,7 @@ mod tests {
                 distance: 50.0,
                 distance_factor: 0.5,
                 color: [0.25, 0.5, 0.75],
-                speed_normalized: 0.25,
+                wheel_effort: 0.25,
                 sound_emitter: 0.5,
                 target_health: 0.0,
             },
@@ -24712,7 +24685,7 @@ mod tests {
             radius: 2.0,
         };
         let near_radius = f32::from_bits(2.0_f32.to_bits() - 1);
-        let contribution_at = |distance: f32, speed_normalized: f32| {
+        let contribution_at = |distance: f32, wheel_effort: f32| {
             let (distance, distance_factor) = sense_distance_terms(distance * distance, 2.0, 4.0)
                 .expect("fixture distance is inside the sense radius");
             fixed_sense_contribution(
@@ -24723,7 +24696,7 @@ mod tests {
                     distance,
                     distance_factor,
                     color: [0.0; 3],
-                    speed_normalized,
+                    wheel_effort,
                     sound_emitter: 0.0,
                     target_health: 2.0,
                 },
@@ -24899,7 +24872,9 @@ mod tests {
         });
         let neighbour = world.spawn_agent(AgentData {
             position: Position::new(130.0, 110.0),
-            velocity: Velocity { vx: 0.25, vy: 0.0 },
+            // Deliberately much larger than any configured movement speed: the
+            // legacy sound channel is wheel-command effort, not displacement.
+            velocity: Velocity { vx: 25.0, vy: 0.0 },
             health: 0.4,
             color: [0.8, 0.3, 0.6],
             ..AgentData::default()
@@ -24919,10 +24894,14 @@ mod tests {
             runtime.eye_fov = eye_fov;
             runtime.trait_modifiers = traits;
         }
-        world
-            .agent_runtime_mut(neighbour)
-            .expect("neighbour runtime")
-            .sound_multiplier = 0.4;
+        {
+            let runtime = world
+                .agent_runtime_mut(neighbour)
+                .expect("neighbour runtime");
+            runtime.sound_multiplier = 0.4;
+            runtime.outputs[OutputChannel::WheelLeft.index()] = 0.25;
+            runtime.outputs[OutputChannel::WheelRight.index()] = 0.1;
+        }
 
         world.stage_sense();
         let sensed = world
@@ -24968,6 +24947,87 @@ mod tests {
             .eye = 1.0e30;
         world.stage_sense();
         assert!(world.sense_saturations_total() > 0);
+    }
+
+    #[test]
+    fn production_sound_uses_peak_wheel_output_for_every_locomotion_model() {
+        let sound_index = SENSOR_LAYOUT
+            .iter()
+            .find(|channel| channel.kind == SensorKind::Sound)
+            .expect("canonical movement-noise sensor")
+            .index;
+        let sense =
+            |model: LocomotionModel, velocity: Velocity, left: f32, right: f32, boost: bool| {
+                let mut world = WorldState::new(ScriptBotsConfig {
+                    world_width: 500,
+                    world_height: 500,
+                    food_cell_size: 20,
+                    initial_food: 0.0,
+                    food_respawn_interval: 0,
+                    sense_radius: 100.0,
+                    locomotion_model: model,
+                    rng_seed: Some(0xB0_017),
+                    ..ScriptBotsConfig::default()
+                })
+                .expect("wheel-output sense world");
+                let observer = world.spawn_agent(AgentData {
+                    position: Position::new(100.0, 100.0),
+                    ..AgentData::default()
+                });
+                let neighbour = world.spawn_agent(AgentData {
+                    position: Position::new(150.0, 100.0),
+                    velocity,
+                    ..AgentData::default()
+                });
+                world
+                    .agent_runtime_mut(observer)
+                    .expect("observer runtime")
+                    .trait_modifiers
+                    .sound = 1.0;
+                {
+                    let runtime = world
+                        .agent_runtime_mut(neighbour)
+                        .expect("neighbour runtime");
+                    runtime.outputs[OutputChannel::WheelLeft.index()] = left;
+                    runtime.outputs[OutputChannel::WheelRight.index()] = right;
+                    runtime.outputs[OutputChannel::Boost.index()] = if boost { 1.0 } else { 0.0 };
+                }
+
+                let explained = world
+                    .explain_sensors(observer, 8)
+                    .expect("sound attribution");
+                world.stage_sense();
+                let sensed = world
+                    .agent_runtime(observer)
+                    .expect("observer runtime")
+                    .sensors[sound_index];
+                (sensed, explained.clamped[sound_index])
+            };
+
+        let tolerance = 2.0e-6_f32;
+        for model in [LocomotionModel::Legacy, LocomotionModel::Differential] {
+            let low = sense(model, Velocity::new(100.0, -100.0), 0.2, 0.1, false);
+            let high_same_displacement =
+                sense(model, Velocity::new(100.0, -100.0), 0.8, 0.1, false);
+            let high_zero_displacement = sense(model, Velocity::default(), 0.8, 0.1, false);
+            let high_boosted = sense(model, Velocity::default(), 0.8, 0.1, true);
+
+            for (actual, expected) in [
+                (low.0, 0.1),
+                (low.1, 0.1),
+                (high_same_displacement.0, 0.4),
+                (high_same_displacement.1, 0.4),
+                (high_zero_displacement.0, 0.4),
+                (high_zero_displacement.1, 0.4),
+                (high_boosted.0, 0.4),
+                (high_boosted.1, 0.4),
+            ] {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{model:?}: wheel-output sound {actual} != {expected}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -26292,6 +26352,89 @@ mod tests {
         assert!(attacker_runtime.combat.spike_attacker);
         assert!(attacker_runtime.combat.hit_carnivore);
         assert!(!attacker_runtime.combat.hit_herbivore);
+    }
+
+    #[test]
+    fn combat_speed_scaling_uses_wheel_output_not_physical_velocity() {
+        let damage = |model: LocomotionModel,
+                      velocity: Velocity,
+                      wheel_peak: f32,
+                      boost: bool,
+                      green: f32| {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 20,
+                initial_food: 0.0,
+                food_respawn_interval: 0,
+                locomotion_model: model,
+                spike_radius: 50.0,
+                spike_damage: 0.25,
+                spike_energy_cost: 0.0,
+                spike_min_length: 0.1,
+                spike_alignment_cosine: 0.1,
+                spike_speed_damage_bonus: 0.6,
+                spike_length_damage_bonus: 0.75,
+                rng_seed: Some(0xC0_BA7),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("wheel-output combat world");
+            let attacker = world.spawn_agent(sample_agent(0));
+            let victim = world.spawn_agent(sample_agent(1));
+            let attacker_idx = world.agents().index_of(attacker).expect("attacker index");
+            let victim_idx = world.agents().index_of(victim).expect("victim index");
+            {
+                let columns = world.agents_mut().columns_mut();
+                columns.positions_mut()[attacker_idx] = Position::new(10.0, 10.0);
+                columns.positions_mut()[victim_idx] = Position::new(12.0, 10.0);
+                columns.headings_mut()[attacker_idx] = 0.0;
+                columns.spike_lengths_mut()[attacker_idx] = 1.0;
+                columns.velocities_mut()[attacker_idx] = velocity;
+                columns.health_mut()[victim_idx] = 2.0;
+            }
+            {
+                let runtime = world.agent_runtime_mut(attacker).expect("attacker runtime");
+                runtime.herbivore_tendency = 0.1;
+                runtime.outputs[OutputChannel::WheelLeft.index()] = wheel_peak;
+                runtime.outputs[OutputChannel::WheelRight.index()] = wheel_peak * 0.5;
+                runtime.outputs[OutputChannel::ColorGreen.index()] = green;
+                runtime.outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+                runtime.outputs[OutputChannel::Boost.index()] = if boost { 1.0 } else { 0.0 };
+            }
+
+            world.stage_combat();
+            2.0 - world.agents().columns().health()[victim_idx]
+        };
+
+        let huge_velocity = Velocity::new(100.0, -100.0);
+        let legacy = damage(LocomotionModel::Legacy, huge_velocity, 0.8, false, 0.0);
+        let legacy_zero_velocity = damage(
+            LocomotionModel::Legacy,
+            Velocity::default(),
+            0.8,
+            false,
+            0.0,
+        );
+        let differential = damage(
+            LocomotionModel::Differential,
+            huge_velocity,
+            0.8,
+            false,
+            0.0,
+        );
+        let lower_wheel_same_velocity =
+            damage(LocomotionModel::Legacy, huge_velocity, 0.5, false, 0.0);
+        let green = damage(LocomotionModel::Legacy, huge_velocity, 0.8, false, 1.0);
+        let boosted = damage(LocomotionModel::Legacy, huge_velocity, 0.8, true, 0.0);
+
+        // Existing configurable damage shape, with the C++ dependency quantity:
+        // 0.25 * (1 + 1.0 * 0.75) * (1 + 0.8 * 0.6) = 0.6475.
+        assert!((legacy - 0.6475).abs() <= 1.0e-6);
+        assert_eq!(legacy.to_bits(), legacy_zero_velocity.to_bits());
+        assert_eq!(legacy.to_bits(), differential.to_bits());
+        assert_eq!(legacy.to_bits(), green.to_bits());
+        assert!((lower_wheel_same_velocity - 0.56875).abs() <= 1.0e-6);
+        assert!((boosted - 1.085).abs() <= 1.0e-6);
     }
 
     const FIXTURE_GENOME_SCHEMA: u32 = 7;

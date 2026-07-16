@@ -1,7 +1,7 @@
 use scriptbots_core::{
-    AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, NUM_EYES,
-    NullPersistence, OUTPUT_SIZE, Position, SENSOR_LAYOUT, ScriptBotsConfig, SensorKind, Tick,
-    TickSummary, TraitModifiers, WorldState,
+    AgentData, AgentId, BrainRunner, FoodCellProfileSnapshot, INPUT_SIZE, LocomotionModel,
+    NUM_EYES, NullPersistence, OUTPUT_SIZE, OutputChannel, Position, SENSOR_LAYOUT,
+    ScriptBotsConfig, SensorKind, Tick, TickSummary, TraitModifiers, WorldState,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +111,21 @@ impl BrainRunner for ZeroBrain {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FixedOutputsBrain {
+    outputs: [f32; OUTPUT_SIZE],
+}
+
+impl BrainRunner for FixedOutputsBrain {
+    fn kind(&self) -> &'static str {
+        "test.oracle.fixed-outputs"
+    }
+
+    fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        self.outputs
+    }
+}
+
 fn bind_zero_brain(world: &mut WorldState, agents: &[AgentId]) {
     let key = world
         .brain_registry_mut()
@@ -125,6 +140,91 @@ fn bind_zero_brain(world: &mut WorldState, agents: &[AgentId]) {
             "oracle agent should accept the deterministic zero brain"
         );
     }
+}
+
+fn bind_fixed_outputs_brain(
+    world: &mut WorldState,
+    agent: AgentId,
+    kind: &'static str,
+    outputs: [f32; OUTPUT_SIZE],
+) {
+    let key = world
+        .brain_registry_mut()
+        .expect("fixed-output registry mutation")
+        .register(kind, move |_rng| {
+            Ok(Box::new(FixedOutputsBrain { outputs }))
+        });
+    assert!(
+        world
+            .bind_agent_brain(agent, key)
+            .expect("fixed-output brain factory"),
+        "oracle agent should accept its deterministic fixed-output brain"
+    );
+}
+
+fn wheel_outputs(left: f32, right: f32) -> [f32; OUTPUT_SIZE] {
+    let mut outputs = [0.0; OUTPUT_SIZE];
+    outputs[OutputChannel::WheelLeft.index()] = left;
+    outputs[OutputChannel::WheelRight.index()] = right;
+    outputs
+}
+
+fn quiet_locomotion_config(model: LocomotionModel, seed: u64) -> ScriptBotsConfig {
+    ScriptBotsConfig {
+        world_width: 400,
+        world_height: 400,
+        food_cell_size: 20,
+        initial_food: 0.0,
+        food_respawn_interval: 0,
+        food_growth_rate: 0.0,
+        food_decay_rate: 0.0,
+        food_diffusion_rate: 0.0,
+        sense_radius: 100.0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        metabolism_ramp_rate: 0.0,
+        metabolism_boost_penalty: 0.0,
+        temperature_discomfort_rate: 0.0,
+        food_intake_rate: 0.0,
+        food_waste_rate: 0.0,
+        reproduction_energy_threshold: 10.0,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        persistence_interval: 0,
+        topography_enabled: false,
+        locomotion_model: model,
+        rng_seed: Some(seed),
+        ..ScriptBotsConfig::default()
+    }
+}
+
+fn sound_sensor_index() -> usize {
+    SENSOR_LAYOUT
+        .iter()
+        .find(|channel| channel.kind == SensorKind::Sound)
+        .expect("canonical movement-noise sensor")
+        .index
+}
+
+fn velocity_magnitude(world: &WorldState, agent: AgentId) -> f32 {
+    let velocity = world
+        .snapshot_agent(agent)
+        .expect("oracle agent should remain alive")
+        .data
+        .velocity;
+    (velocity.vx * velocity.vx + velocity.vy * velocity.vy).sqrt()
+}
+
+fn reposition_agent(world: &mut WorldState, agent: AgentId, position: Position) {
+    assert!(
+        world
+            .try_update_agent(agent, |data, _runtime| {
+                data.position = position;
+                data.heading = 0.0;
+            })
+            .expect("finite oracle position update"),
+        "oracle agent should still exist"
+    );
 }
 
 fn default_profile(config: &ScriptBotsConfig) -> FoodCellProfileSnapshot {
@@ -381,6 +481,320 @@ fn combat_records_carnivore_event_flags() {
         assert!(victim_runtime.combat.was_spiked_by_carnivore);
         assert!(!victim_runtime.combat.was_spiked_by_herbivore);
     }
+}
+
+#[test]
+fn movement_noise_distinguishes_wheel_effort_when_legacy_displacements_match() {
+    const SEED: u64 = 0x501D_EFF0;
+    const DISTANCE_FACTOR: f32 = 0.5;
+
+    let mut world = WorldState::new(quiet_locomotion_config(LocomotionModel::Legacy, SEED))
+        .expect("legacy wheel-effort world");
+    world.set_closed(true).expect("close wheel-effort world");
+
+    let observer = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(200.0, 200.0),
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("observer is finite");
+    let high_effort = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(80.0, 80.0),
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("high-effort emitter is finite");
+    let low_effort = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(320.0, 320.0),
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("low-effort emitter is finite");
+
+    bind_zero_brain(&mut world, &[observer]);
+    bind_fixed_outputs_brain(
+        &mut world,
+        high_effort,
+        "test.oracle.wheel-effort.high",
+        wheel_outputs(0.0, 0.6),
+    );
+    bind_fixed_outputs_brain(
+        &mut world,
+        low_effort,
+        "test.oracle.wheel-effort.low",
+        wheel_outputs(0.3, 0.3),
+    );
+    world
+        .try_update_agent_runtime(observer, |runtime| {
+            runtime.trait_modifiers = TraitModifiers {
+                smell: 0.0,
+                sound: 1.0,
+                hearing: 0.0,
+                eye: 0.0,
+                blood: 0.0,
+            };
+        })
+        .expect("finite observer runtime update");
+
+    world
+        .step()
+        .expect("wheel-effort world should produce one actuation");
+
+    let high_displacement = velocity_magnitude(&world, high_effort);
+    let low_displacement = velocity_magnitude(&world, low_effort);
+    let obsolete_velocity_normalizer = world.config().bot_speed * world.config().boost_multiplier;
+    assert!(
+        (high_displacement - low_displacement).abs() < 0.002,
+        "the fixture requires nearly equal physical displacement, got high={high_displacement}, low={low_displacement}"
+    );
+    assert!(
+        high_displacement > 0.8 && low_displacement > 0.8,
+        "the fixture must exercise substantial legacy displacement"
+    );
+    assert!(
+        low_displacement > obsolete_velocity_normalizer,
+        "the low-effort emitter must exceed the obsolete velocity normalization ceiling"
+    );
+
+    reposition_agent(&mut world, observer, Position::new(200.0, 200.0));
+    reposition_agent(&mut world, high_effort, Position::new(250.0, 200.0));
+    reposition_agent(&mut world, low_effort, Position::new(150.0, 200.0));
+
+    let attribution = world
+        .explain_sensors(observer, 8)
+        .expect("movement-noise attribution");
+    let high_contribution = attribution
+        .contributions
+        .iter()
+        .find(|contribution| contribution.source == high_effort)
+        .expect("high-effort contribution")
+        .sound;
+    let low_contribution = attribution
+        .contributions
+        .iter()
+        .find(|contribution| contribution.source == low_effort)
+        .expect("low-effort contribution")
+        .sound;
+    let expected_high = DISTANCE_FACTOR * 0.6;
+    let expected_low = DISTANCE_FACTOR * 0.3;
+    assert!(
+        (high_contribution - expected_high).abs() <= 2.0e-6,
+        "movement noise must follow peak wheel output, expected {expected_high}, got {high_contribution}"
+    );
+    assert!(
+        (low_contribution - expected_low).abs() <= 2.0e-6,
+        "movement noise must follow peak wheel output, expected {expected_low}, got {low_contribution}"
+    );
+    assert!(
+        (high_contribution - low_contribution * 2.0).abs() <= 3.0e-6,
+        "nearly equal displacement must not conflate 0.6 and 0.3 wheel effort"
+    );
+    assert!(
+        low_contribution < 0.3,
+        "large rotation-derived displacement must not saturate low wheel effort"
+    );
+
+    world
+        .step()
+        .expect("wheel-effort world should complete its sensing pass");
+    let actual_total = world
+        .agent_runtime(observer)
+        .expect("observer survives")
+        .sensors[sound_sensor_index()];
+    assert!(
+        (actual_total - (expected_high + expected_low)).abs() <= 3.0e-6,
+        "production sensing must match the attributed wheel-effort total"
+    );
+}
+
+fn movement_noise_for_model(model: LocomotionModel, seed: u64) -> (f32, f32) {
+    let mut world =
+        WorldState::new(quiet_locomotion_config(model, seed)).expect("model sound world");
+    world.set_closed(true).expect("close model sound world");
+
+    let observer = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(200.0, 200.0),
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("observer is finite");
+    let emitter = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(80.0, 80.0),
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("emitter is finite");
+    bind_zero_brain(&mut world, &[observer]);
+    let kind = match model {
+        LocomotionModel::Legacy => "test.oracle.model-sound.legacy",
+        LocomotionModel::Differential => "test.oracle.model-sound.differential",
+    };
+    bind_fixed_outputs_brain(&mut world, emitter, kind, wheel_outputs(0.4, 0.4));
+    world
+        .try_update_agent_runtime(observer, |runtime| {
+            runtime.trait_modifiers = TraitModifiers {
+                smell: 0.0,
+                sound: 1.0,
+                hearing: 0.0,
+                eye: 0.0,
+                blood: 0.0,
+            };
+        })
+        .expect("finite observer runtime update");
+
+    world
+        .step()
+        .expect("model sound world should produce one actuation");
+    let displacement = velocity_magnitude(&world, emitter);
+    reposition_agent(&mut world, observer, Position::new(200.0, 200.0));
+    reposition_agent(&mut world, emitter, Position::new(240.0, 200.0));
+    world
+        .step()
+        .expect("model sound world should complete its sensing pass");
+    let sound = world
+        .agent_runtime(observer)
+        .expect("observer survives")
+        .sensors[sound_sensor_index()];
+    (sound, displacement)
+}
+
+fn combat_damage_for_model(model: LocomotionModel, seed: u64) -> (f32, f32) {
+    let mut config = quiet_locomotion_config(model, seed);
+    config.spike_growth_rate = 0.0;
+    config.spike_radius = 20.0;
+    config.spike_damage = 0.25;
+    config.spike_energy_cost = 0.0;
+    config.spike_min_length = 0.1;
+    config.spike_alignment_cosine = 0.99;
+    config.spike_speed_damage_bonus = 0.6;
+    config.spike_length_damage_bonus = 0.75;
+
+    let mut world = WorldState::new(config).expect("model combat world");
+    world.set_closed(true).expect("close model combat world");
+    let attacker = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            heading: 0.0,
+            health: 2.0,
+            spike_length: 1.0,
+            ..AgentData::default()
+        })
+        .expect("attacker is finite");
+    let victim = world
+        .try_spawn_agent(AgentData {
+            position: Position::new(300.0, 300.0),
+            heading: 0.0,
+            health: 2.0,
+            ..AgentData::default()
+        })
+        .expect("victim is finite");
+
+    let mut attacker_outputs = wheel_outputs(0.4, 0.4);
+    attacker_outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+    attacker_outputs[OutputChannel::Boost.index()] = 1.0;
+    let kind = match model {
+        LocomotionModel::Legacy => "test.oracle.model-combat.legacy",
+        LocomotionModel::Differential => "test.oracle.model-combat.differential",
+    };
+    bind_fixed_outputs_brain(&mut world, attacker, kind, attacker_outputs);
+    bind_zero_brain(&mut world, &[victim]);
+    world
+        .try_update_agent_runtime(attacker, |runtime| {
+            runtime.herbivore_tendency = 0.0;
+        })
+        .expect("finite attacker runtime update");
+    world
+        .try_update_agent_runtime(victim, |runtime| {
+            runtime.herbivore_tendency = 1.0;
+        })
+        .expect("finite victim runtime update");
+
+    world
+        .step()
+        .expect("model combat world should produce one actuation");
+    let displacement = world
+        .snapshot_agent(attacker)
+        .expect("attacker survives warmup")
+        .data
+        .velocity;
+    let displacement_magnitude =
+        (displacement.vx * displacement.vx + displacement.vy * displacement.vy).sqrt();
+
+    let common_attacker_position = Position::new(200.0, 200.0);
+    reposition_agent(
+        &mut world,
+        attacker,
+        Position::new(
+            common_attacker_position.x - displacement.vx,
+            common_attacker_position.y - displacement.vy,
+        ),
+    );
+    assert!(
+        world
+            .try_update_agent(victim, |data, _runtime| {
+                data.position = Position::new(215.0, 200.0);
+                data.heading = 0.0;
+                data.health = 2.0;
+            })
+            .expect("finite victim reset"),
+        "victim should still exist before the combat oracle"
+    );
+
+    world
+        .step()
+        .expect("model combat world should resolve the aligned hit");
+    let victim_health = world
+        .snapshot_agent(victim)
+        .expect("the bounded oracle hit must not kill the victim")
+        .data
+        .health;
+    (2.0 - victim_health, displacement_magnitude)
+}
+
+#[test]
+fn identical_outputs_have_model_independent_sound_and_combat_scaling() {
+    let (legacy_sound, legacy_sound_displacement) =
+        movement_noise_for_model(LocomotionModel::Legacy, 0x501D_5A1E);
+    let (differential_sound, differential_sound_displacement) =
+        movement_noise_for_model(LocomotionModel::Differential, 0x501D_5A1E);
+    assert!(
+        legacy_sound_displacement > differential_sound_displacement * 5.0,
+        "the sound oracle must compare materially different physical displacement"
+    );
+    assert!(
+        (legacy_sound - differential_sound).abs() <= 2.0e-6,
+        "identical wheel outputs must produce identical movement noise across locomotion models: legacy={legacy_sound}, differential={differential_sound}"
+    );
+    assert!(
+        (legacy_sound - 0.24).abs() <= 2.0e-6,
+        "0.4 wheel effort at distance factor 0.6 should produce 0.24 movement noise"
+    );
+
+    let (legacy_damage, legacy_combat_displacement) =
+        combat_damage_for_model(LocomotionModel::Legacy, 0xC0AB_5A1E);
+    let (differential_damage, differential_combat_displacement) =
+        combat_damage_for_model(LocomotionModel::Differential, 0xC0AB_5A1E);
+    assert!(
+        legacy_combat_displacement > differential_combat_displacement * 5.0,
+        "the combat oracle must compare materially different physical displacement"
+    );
+    assert!(
+        legacy_damage > 0.0 && differential_damage > 0.0,
+        "both locomotion models must resolve the aligned spike hit"
+    );
+    assert!(
+        (legacy_damage - differential_damage).abs() <= 1.0e-4,
+        "identical named wheel/spike/boost outputs must produce identical combat scaling without a second velocity bonus: legacy={legacy_damage}, differential={differential_damage}"
+    );
+    assert!(
+        (legacy_damage - 0.98).abs() <= 1.0e-4,
+        "0.25 base * 1.75 length * 2.24 wheel/boost factor should deal 0.98 damage"
+    );
 }
 
 #[test]
