@@ -2646,7 +2646,10 @@ mod tests {
         let actual = blake3::hash(&wire).to_hex().to_string();
         assert_eq!(
             (wire.len(), actual.as_str()),
-            (0, "PENDING_DSR_REPRESENTATIVE_V1_WIRE_HASH"),
+            (
+                8_426,
+                "d1730cefafadca7267de747a33a75c3d1bfbe5e6fa25acc293149480167352a0",
+            ),
             "a V1 wire change requires explicit schema/codec review before reblessing"
         );
     }
