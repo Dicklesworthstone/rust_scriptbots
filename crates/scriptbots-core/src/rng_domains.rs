@@ -32,7 +32,7 @@
 //! the root seed and a schema tag, so the streams are separated by construction and the property
 //! is testable rather than hoped for.
 
-use crate::{RandomStream, RandomStreamRestoreError, RandomStreamState, SmallRngStream};
+use crate::{AgentUid, RandomStream, RandomStreamRestoreError, RandomStreamState, SmallRngStream};
 use serde::{Deserialize, Serialize};
 
 /// Identity of the derivation. Bump this ONLY when deliberately re-deriving every domain seed —
@@ -43,6 +43,16 @@ pub const RNG_DOMAIN_DERIVATION_V1: &str = "scriptbots.rng-domains.v1";
 pub const DOMAIN_STREAMS_CHECKPOINT_VERSION: u16 = 1;
 /// Codec version for the fixed domain-state wire object.
 pub const DOMAIN_STREAMS_CHECKPOINT_CODEC_VERSION: u16 = 1;
+/// Identity of the stable agent/offspring keyed-substream derivation.
+///
+/// Bump this only when deliberately changing a field, tag, byte order, or hash step in
+/// [`derive_agent_substream_seed`] or [`derive_offspring_substream_seed`]. Such a change moves
+/// agent-local stochastic decisions and therefore requires an announced science re-baseline.
+pub const AGENT_SUBSTREAM_DERIVATION_V1: &str = "scriptbots.agent-rng-substreams.v1";
+/// Version of the agent-keyed random-substream protocol envelope.
+pub const AGENT_SUBSTREAM_PROTOCOL_VERSION: u16 = 1;
+/// Codec version for agent-keyed random-substream counters and identities.
+pub const AGENT_SUBSTREAM_PROTOCOL_CODEC_VERSION: u16 = 1;
 
 /// The independent domains a stochastic decision can belong to.
 ///
@@ -133,6 +143,475 @@ pub fn derive_domain_seed(root_seed: u64, domain: RngDomain) -> u64 {
     absorb(&root_seed.to_le_bytes());
 
     hash
+}
+
+const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[derive(Debug, Clone, Copy)]
+struct StableSeedHash(u64);
+
+impl StableSeedHash {
+    const fn new() -> Self {
+        Self(FNV1A_64_OFFSET_BASIS)
+    }
+
+    fn absorb(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(FNV1A_64_PRIME);
+        }
+    }
+
+    fn absorb_field(&mut self, bytes: &[u8]) {
+        self.absorb(&(bytes.len() as u64).to_le_bytes());
+        self.absorb(bytes);
+    }
+
+    fn absorb_u64(&mut self, value: u64) {
+        self.absorb(&value.to_le_bytes());
+    }
+
+    const fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+fn begin_agent_substream_derivation(
+    root_seed: u64,
+    subject: &str,
+    domain: RngDomain,
+    operation: &str,
+) -> StableSeedHash {
+    let mut hash = StableSeedHash::new();
+    hash.absorb_field(AGENT_SUBSTREAM_DERIVATION_V1.as_bytes());
+    hash.absorb_field(subject.as_bytes());
+    hash.absorb_field(domain.tag().as_bytes());
+    hash.absorb_field(operation.as_bytes());
+    hash.absorb_u64(root_seed);
+    hash
+}
+
+/// A stochastic operation performed on behalf of one existing agent.
+///
+/// Each variant owns a stable tag and domain. Callers cannot accidentally derive the same
+/// operation under two domains, and adding a new variant does not renumber or re-seed an existing
+/// operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AgentRngOperationV1 {
+    /// Decide whether an otherwise eligible agent reproduces in this window.
+    ReproductionAdmission,
+    /// Decide whether an admitted parent uses an eligible partner.
+    ReproductionPartner,
+    /// Construct or reconstruct an agent-owned brain from a registered family.
+    BrainInitialization,
+}
+
+impl AgentRngOperationV1 {
+    /// Stable derivation tag for this operation.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::ReproductionAdmission => "reproduction-admission",
+            Self::ReproductionPartner => "reproduction-partner",
+            Self::BrainInitialization => "brain-initialization",
+        }
+    }
+
+    /// Random domain whose scientific meaning owns this operation.
+    #[must_use]
+    pub const fn domain(self) -> RngDomain {
+        match self {
+            Self::ReproductionAdmission | Self::ReproductionPartner => RngDomain::Lineage,
+            Self::BrainInitialization => RngDomain::Population,
+        }
+    }
+}
+
+/// A stochastic operation performed while constructing one offspring.
+///
+/// Offspring operations use [`OffspringRngIdentityV1`] instead of the child's eventual
+/// [`AgentUid`]. Construction therefore cannot depend on a global insertion schedule that may be
+/// shifted by an unrelated agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OffspringRngOperationV1 {
+    /// Derive spawn geometry and other population-owned body initialization.
+    BodyPopulation,
+    /// Cross scalar runtime traits inherited from two parents.
+    RuntimeCrossover,
+    /// Mutate scalar runtime traits inherited from the primary parent.
+    RuntimeMutation,
+    /// Cross compatible heritable brain genomes.
+    BrainCrossover,
+    /// Mutate a heritable brain genome.
+    BrainMutation,
+    /// Construct a fallback brain when no heritable evaluator can be reused.
+    BrainInitialization,
+    /// Construct evaluator state using a crossover/blend policy.
+    BrainEvaluatorStateCrossover,
+    /// Construct evaluator state using a reset/inherit/mutation policy.
+    BrainEvaluatorStateMutation,
+}
+
+impl OffspringRngOperationV1 {
+    /// Stable derivation tag for this operation.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::BodyPopulation => "body-population",
+            Self::RuntimeCrossover => "runtime-crossover",
+            Self::RuntimeMutation => "runtime-mutation",
+            Self::BrainCrossover => "brain-crossover",
+            Self::BrainMutation => "brain-mutation",
+            Self::BrainInitialization => "brain-initialization",
+            Self::BrainEvaluatorStateCrossover => "brain-evaluator-state-crossover",
+            Self::BrainEvaluatorStateMutation => "brain-evaluator-state-mutation",
+        }
+    }
+
+    /// Random domain whose scientific meaning owns this operation.
+    #[must_use]
+    pub const fn domain(self) -> RngDomain {
+        match self {
+            Self::BodyPopulation | Self::BrainInitialization => RngDomain::Population,
+            Self::RuntimeCrossover
+            | Self::BrainCrossover
+            | Self::BrainEvaluatorStateCrossover => RngDomain::Crossover,
+            Self::RuntimeMutation
+            | Self::BrainMutation
+            | Self::BrainEvaluatorStateMutation => RngDomain::Mutation,
+        }
+    }
+}
+
+/// Stable lineage identity used to derive every random stream for one offspring.
+///
+/// `birth_ordinal` is local to the primary parent. It must come from that parent's persisted
+/// [`AgentRngCountersV1`], not from the world's global insertion or birth sequence. Parent order
+/// is intentionally directional because the primary parent supplies the base runtime/genome while
+/// the optional secondary parent contributes crossover material.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct OffspringRngIdentityV1 {
+    primary_parent: AgentUid,
+    secondary_parent: Option<AgentUid>,
+    birth_ordinal: u64,
+}
+
+impl OffspringRngIdentityV1 {
+    /// Construct an offspring identity from stable lineage and a parent-local birth ordinal.
+    #[must_use]
+    pub const fn new(
+        primary_parent: AgentUid,
+        secondary_parent: Option<AgentUid>,
+        birth_ordinal: u64,
+    ) -> Self {
+        Self {
+            primary_parent,
+            secondary_parent,
+            birth_ordinal,
+        }
+    }
+
+    /// Primary parent whose persisted counter assigned this birth ordinal.
+    #[must_use]
+    pub const fn primary_parent(self) -> AgentUid {
+        self.primary_parent
+    }
+
+    /// Optional secondary parent contributing crossover material.
+    #[must_use]
+    pub const fn secondary_parent(self) -> Option<AgentUid> {
+        self.secondary_parent
+    }
+
+    /// Parent-local ordinal of this successful birth.
+    #[must_use]
+    pub const fn birth_ordinal(self) -> u64 {
+        self.birth_ordinal
+    }
+}
+
+/// Persisted agent-local continuation counters for keyed random substreams.
+///
+/// Each value is the next unused ordinal. A counter is advanced only through the checked `take_*`
+/// methods, which return the claimed ordinal and refuse to wrap. Transactional callers must
+/// restore the previous value when the scientific operation itself rolls back.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRngCountersV1 {
+    reproduction_attempt: u64,
+    birth: u64,
+    brain_initialization: u64,
+}
+
+impl AgentRngCountersV1 {
+    /// Reconstruct exact persisted continuation values.
+    #[must_use]
+    pub const fn from_ordinals(
+        reproduction_attempt: u64,
+        birth: u64,
+        brain_initialization: u64,
+    ) -> Self {
+        Self {
+            reproduction_attempt,
+            birth,
+            brain_initialization,
+        }
+    }
+
+    /// Next unused reproduction-attempt ordinal.
+    #[must_use]
+    pub const fn reproduction_attempt_ordinal(self) -> u64 {
+        self.reproduction_attempt
+    }
+
+    /// Next unused parent-local birth ordinal.
+    #[must_use]
+    pub const fn birth_ordinal(self) -> u64 {
+        self.birth
+    }
+
+    /// Next unused brain-initialization ordinal.
+    #[must_use]
+    pub const fn brain_initialization_ordinal(self) -> u64 {
+        self.brain_initialization
+    }
+
+    /// Claim the next reproduction-attempt ordinal.
+    pub fn take_reproduction_attempt(&mut self) -> Result<u64, AgentRngCounterError> {
+        Self::take_counter(&mut self.reproduction_attempt, "reproduction-attempt")
+    }
+
+    /// Claim the next successful-birth ordinal.
+    pub fn take_birth(&mut self) -> Result<u64, AgentRngCounterError> {
+        Self::take_counter(&mut self.birth, "birth")
+    }
+
+    /// Claim the next brain-initialization ordinal.
+    pub fn take_brain_initialization(&mut self) -> Result<u64, AgentRngCounterError> {
+        Self::take_counter(&mut self.brain_initialization, "brain-initialization")
+    }
+
+    fn take_counter(
+        counter: &mut u64,
+        counter_name: &'static str,
+    ) -> Result<u64, AgentRngCounterError> {
+        let claimed = *counter;
+        let Some(next) = claimed.checked_add(1) else {
+            return Err(AgentRngCounterError::Exhausted {
+                counter: counter_name,
+            });
+        };
+        *counter = next;
+        Ok(claimed)
+    }
+}
+
+/// Failure to advance a persisted agent-local random continuation.
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+pub enum AgentRngCounterError {
+    /// The next ordinal would wrap and reuse an earlier random identity.
+    #[error("agent random counter `{counter}` is exhausted")]
+    Exhausted { counter: &'static str },
+}
+
+/// Versioned metadata binding an agent-keyed protocol to its root and concrete RNG lane.
+///
+/// The derivation is cross-target stable, but [`SmallRngStream`] deliberately records the exact
+/// generator algorithm selected by the compilation target. Restore must validate this envelope
+/// before consuming persisted counters so a native continuation is never misrepresented as a
+/// compatible WASM continuation, or vice versa.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSubstreamProtocolV1 {
+    version: u16,
+    algorithm: String,
+    codec_version: u16,
+    stream_algorithm: String,
+    root_seed: u64,
+}
+
+impl AgentSubstreamProtocolV1 {
+    /// Construct the protocol metadata for one world root seed and compiled RNG lane.
+    #[must_use]
+    pub fn from_root_seed(root_seed: u64) -> Self {
+        Self {
+            version: AGENT_SUBSTREAM_PROTOCOL_VERSION,
+            algorithm: AGENT_SUBSTREAM_DERIVATION_V1.to_owned(),
+            codec_version: AGENT_SUBSTREAM_PROTOCOL_CODEC_VERSION,
+            stream_algorithm: SmallRngStream::algorithm().to_owned(),
+            root_seed,
+        }
+    }
+
+    /// Protocol envelope version.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Stable keyed-substream derivation identity.
+    #[must_use]
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    /// Counter/identity object codec version.
+    #[must_use]
+    pub const fn codec_version(&self) -> u16 {
+        self.codec_version
+    }
+
+    /// Exact concrete generator algorithm selected by this compilation target.
+    #[must_use]
+    pub fn stream_algorithm(&self) -> &str {
+        &self.stream_algorithm
+    }
+
+    /// Root seed from which all agent and offspring substreams are derived.
+    #[must_use]
+    pub const fn root_seed(&self) -> u64 {
+        self.root_seed
+    }
+
+    /// Validate a decoded protocol envelope against the expected world and compiled RNG lane.
+    pub fn validate(&self, expected_root_seed: u64) -> Result<(), AgentSubstreamProtocolError> {
+        if self.version != AGENT_SUBSTREAM_PROTOCOL_VERSION {
+            return Err(AgentSubstreamProtocolError::Version {
+                found: self.version,
+                expected: AGENT_SUBSTREAM_PROTOCOL_VERSION,
+            });
+        }
+        if self.algorithm != AGENT_SUBSTREAM_DERIVATION_V1 {
+            return Err(AgentSubstreamProtocolError::Algorithm {
+                found: self.algorithm.clone(),
+                expected: AGENT_SUBSTREAM_DERIVATION_V1,
+            });
+        }
+        if self.codec_version != AGENT_SUBSTREAM_PROTOCOL_CODEC_VERSION {
+            return Err(AgentSubstreamProtocolError::CodecVersion {
+                found: self.codec_version,
+                expected: AGENT_SUBSTREAM_PROTOCOL_CODEC_VERSION,
+            });
+        }
+        if self.stream_algorithm != SmallRngStream::algorithm() {
+            return Err(AgentSubstreamProtocolError::StreamAlgorithm {
+                found: self.stream_algorithm.clone(),
+                expected: SmallRngStream::algorithm(),
+            });
+        }
+        if self.root_seed != expected_root_seed {
+            return Err(AgentSubstreamProtocolError::RootSeed {
+                found: self.root_seed,
+                expected: expected_root_seed,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why decoded agent-keyed random-substream metadata is incompatible.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum AgentSubstreamProtocolError {
+    /// The protocol envelope version is unsupported.
+    #[error("agent random-substream protocol version {found} does not match {expected}")]
+    Version { found: u16, expected: u16 },
+
+    /// The persisted keyed derivation algorithm is unsupported.
+    #[error("agent random-substream algorithm `{found}` does not match `{expected}`")]
+    Algorithm {
+        found: String,
+        expected: &'static str,
+    },
+
+    /// The persisted counter/identity codec is unsupported.
+    #[error("agent random-substream codec version {found} does not match {expected}")]
+    CodecVersion { found: u16, expected: u16 },
+
+    /// The concrete generator lane does not match this compilation target.
+    #[error("agent random-substream generator `{found}` does not match `{expected}`")]
+    StreamAlgorithm {
+        found: String,
+        expected: &'static str,
+    },
+
+    /// The envelope belongs to a different world root seed.
+    #[error("agent random-substream root seed {found} does not match {expected}")]
+    RootSeed { found: u64, expected: u64 },
+}
+
+/// Derive one existing agent's operation-local stream seed.
+///
+/// The complete identity is the protocol tag, subject kind, fixed domain, stable operation tag,
+/// world root seed, stable [`AgentUid`], and agent-local operation ordinal. Dense storage position,
+/// [`crate::AgentId`], iteration order, and wall-clock state are absent by construction.
+#[must_use]
+pub fn derive_agent_substream_seed(
+    root_seed: u64,
+    agent_uid: AgentUid,
+    operation: AgentRngOperationV1,
+    ordinal: u64,
+) -> u64 {
+    let mut hash =
+        begin_agent_substream_derivation(root_seed, "agent", operation.domain(), operation.tag());
+    hash.absorb_u64(agent_uid.get());
+    hash.absorb_u64(ordinal);
+    hash.finish()
+}
+
+/// Construct one existing agent's isolated operation-local random stream.
+#[must_use]
+pub fn agent_substream(
+    root_seed: u64,
+    agent_uid: AgentUid,
+    operation: AgentRngOperationV1,
+    ordinal: u64,
+) -> SmallRngStream {
+    SmallRngStream::seed_from_u64(derive_agent_substream_seed(
+        root_seed, agent_uid, operation, ordinal,
+    ))
+}
+
+/// Derive one offspring construction operation's isolated stream seed.
+///
+/// The partner-presence byte makes `None` distinct from `Some(AgentUid(0))`. Ordered parent UIDs
+/// and the primary parent's local birth ordinal make the offspring identity independent of the
+/// child's future dense handle, global UID, or global insertion ordinal.
+#[must_use]
+pub fn derive_offspring_substream_seed(
+    root_seed: u64,
+    identity: OffspringRngIdentityV1,
+    operation: OffspringRngOperationV1,
+) -> u64 {
+    let mut hash = begin_agent_substream_derivation(
+        root_seed,
+        "offspring",
+        operation.domain(),
+        operation.tag(),
+    );
+    hash.absorb_u64(identity.primary_parent().get());
+    match identity.secondary_parent() {
+        Some(secondary_parent) => {
+            hash.absorb(&[1]);
+            hash.absorb_u64(secondary_parent.get());
+        }
+        None => hash.absorb(&[0]),
+    }
+    hash.absorb_u64(identity.birth_ordinal());
+    hash.finish()
+}
+
+/// Construct one offspring operation's isolated random stream.
+#[must_use]
+pub fn offspring_substream(
+    root_seed: u64,
+    identity: OffspringRngIdentityV1,
+    operation: OffspringRngOperationV1,
+) -> SmallRngStream {
+    SmallRngStream::seed_from_u64(derive_offspring_substream_seed(
+        root_seed, identity, operation,
+    ))
 }
 
 /// One independent [`SmallRngStream`] per [`RngDomain`].
@@ -486,6 +965,521 @@ mod tests {
             derive_domain_seed(0, RngDomain::Mutation),
             0xe734_d3a0_3c32_070a
         );
+    }
+
+    #[test]
+    fn keyed_substream_tags_domains_and_golden_seeds_are_stable() {
+        assert_eq!(
+            AGENT_SUBSTREAM_DERIVATION_V1,
+            "scriptbots.agent-rng-substreams.v1"
+        );
+        assert_eq!(AGENT_SUBSTREAM_PROTOCOL_VERSION, 1);
+        assert_eq!(AGENT_SUBSTREAM_PROTOCOL_CODEC_VERSION, 1);
+
+        assert_eq!(
+            AgentRngOperationV1::ReproductionAdmission.tag(),
+            "reproduction-admission"
+        );
+        assert_eq!(
+            AgentRngOperationV1::ReproductionAdmission.domain(),
+            RngDomain::Lineage
+        );
+        assert_eq!(
+            AgentRngOperationV1::ReproductionPartner.tag(),
+            "reproduction-partner"
+        );
+        assert_eq!(
+            AgentRngOperationV1::ReproductionPartner.domain(),
+            RngDomain::Lineage
+        );
+        assert_eq!(
+            AgentRngOperationV1::BrainInitialization.tag(),
+            "brain-initialization"
+        );
+        assert_eq!(
+            AgentRngOperationV1::BrainInitialization.domain(),
+            RngDomain::Population
+        );
+
+        let offspring_operations = [
+            (
+                OffspringRngOperationV1::BodyPopulation,
+                "body-population",
+                RngDomain::Population,
+            ),
+            (
+                OffspringRngOperationV1::RuntimeCrossover,
+                "runtime-crossover",
+                RngDomain::Crossover,
+            ),
+            (
+                OffspringRngOperationV1::RuntimeMutation,
+                "runtime-mutation",
+                RngDomain::Mutation,
+            ),
+            (
+                OffspringRngOperationV1::BrainCrossover,
+                "brain-crossover",
+                RngDomain::Crossover,
+            ),
+            (
+                OffspringRngOperationV1::BrainMutation,
+                "brain-mutation",
+                RngDomain::Mutation,
+            ),
+            (
+                OffspringRngOperationV1::BrainInitialization,
+                "brain-initialization",
+                RngDomain::Population,
+            ),
+            (
+                OffspringRngOperationV1::BrainEvaluatorStateCrossover,
+                "brain-evaluator-state-crossover",
+                RngDomain::Crossover,
+            ),
+            (
+                OffspringRngOperationV1::BrainEvaluatorStateMutation,
+                "brain-evaluator-state-mutation",
+                RngDomain::Mutation,
+            ),
+        ];
+        for (operation, tag, domain) in offspring_operations {
+            assert_eq!(operation.tag(), tag);
+            assert_eq!(operation.domain(), domain);
+        }
+
+        let root_seed = 0x0123_4567_89ab_cdef;
+        assert_eq!(
+            derive_agent_substream_seed(
+                root_seed,
+                AgentUid(42),
+                AgentRngOperationV1::ReproductionAdmission,
+                7,
+            ),
+            0x4a62_e9d3_894c_91c1
+        );
+        assert_eq!(
+            derive_agent_substream_seed(
+                root_seed,
+                AgentUid(42),
+                AgentRngOperationV1::ReproductionPartner,
+                7,
+            ),
+            0x6c02_cda0_3a2f_2928
+        );
+
+        let identity = OffspringRngIdentityV1::new(AgentUid(42), Some(AgentUid(99)), 3);
+        assert_eq!(
+            derive_offspring_substream_seed(
+                root_seed,
+                identity,
+                OffspringRngOperationV1::BrainMutation,
+            ),
+            0xd997_56b8_9852_5f01
+        );
+    }
+
+    #[test]
+    fn agent_substream_derivation_uses_uid_operation_and_local_ordinal() {
+        let root_seed = 8181;
+        let baseline = derive_agent_substream_seed(
+            root_seed,
+            AgentUid(12),
+            AgentRngOperationV1::ReproductionAdmission,
+            4,
+        );
+        assert_eq!(
+            baseline,
+            derive_agent_substream_seed(
+                root_seed,
+                AgentUid(12),
+                AgentRngOperationV1::ReproductionAdmission,
+                4,
+            ),
+            "the same stable identity did not reproduce the same local seed"
+        );
+        assert_ne!(
+            baseline,
+            derive_agent_substream_seed(
+                root_seed,
+                AgentUid(13),
+                AgentRngOperationV1::ReproductionAdmission,
+                4,
+            ),
+            "AgentUid is absent from the keyed derivation"
+        );
+        assert_ne!(
+            baseline,
+            derive_agent_substream_seed(
+                root_seed,
+                AgentUid(12),
+                AgentRngOperationV1::ReproductionAdmission,
+                5,
+            ),
+            "the persisted local ordinal is absent from the keyed derivation"
+        );
+        assert_ne!(
+            baseline,
+            derive_agent_substream_seed(
+                root_seed,
+                AgentUid(12),
+                AgentRngOperationV1::ReproductionPartner,
+                4,
+            ),
+            "two lineage operations share a seed despite their distinct stable tags"
+        );
+        assert_ne!(
+            baseline,
+            derive_agent_substream_seed(
+                root_seed,
+                AgentUid(12),
+                AgentRngOperationV1::BrainInitialization,
+                4,
+            ),
+            "the operation's fixed domain is absent from the keyed derivation"
+        );
+    }
+
+    #[test]
+    fn hammering_an_unrelated_agent_cannot_perturb_an_existing_agent_stream() {
+        let root_seed = 7331;
+        let target_uid = AgentUid(41);
+        let operation = AgentRngOperationV1::ReproductionAdmission;
+        let ordinal = 9;
+
+        let mut untouched = agent_substream(root_seed, target_uid, operation, ordinal);
+        let expected: Vec<u64> = (0..16).map(|_| untouched.next_u64()).collect();
+
+        for unrelated_ordinal in 0..1000 {
+            let mut unrelated = agent_substream(
+                root_seed,
+                AgentUid(9001),
+                AgentRngOperationV1::ReproductionAdmission,
+                unrelated_ordinal,
+            );
+            for _ in 0..8 {
+                let _ = unrelated.next_u64();
+            }
+        }
+
+        let mut after_unrelated_work = agent_substream(root_seed, target_uid, operation, ordinal);
+        let actual: Vec<u64> = (0..16)
+            .map(|_| after_unrelated_work.next_u64())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "drawing from a distant agent changed an existing agent's local continuation"
+        );
+    }
+
+    #[test]
+    fn dense_permutation_cannot_change_agent_keyed_seeds() {
+        let root_seed = 771;
+        let operation = AgentRngOperationV1::ReproductionPartner;
+        let canonical_order = [AgentUid(5), AgentUid(90), AgentUid(17), AgentUid(44)];
+        let permuted_order = [AgentUid(44), AgentUid(17), AgentUid(5), AgentUid(90)];
+
+        let derive_and_sort = |uids: &[AgentUid]| {
+            let mut keyed: Vec<(u64, u64)> = uids
+                .iter()
+                .map(|uid| {
+                    (
+                        uid.get(),
+                        derive_agent_substream_seed(root_seed, *uid, operation, 2),
+                    )
+                })
+                .collect();
+            keyed.sort_unstable_by_key(|(uid, _)| *uid);
+            keyed
+        };
+
+        assert_eq!(
+            derive_and_sort(&canonical_order),
+            derive_and_sort(&permuted_order),
+            "reordering dense storage changed seeds even though every stable AgentUid was unchanged"
+        );
+    }
+
+    #[test]
+    fn offspring_identity_is_lineage_order_and_parent_local_birth() {
+        let root_seed = 616;
+        let baseline_identity =
+            OffspringRngIdentityV1::new(AgentUid(11), Some(AgentUid(29)), 6);
+        let baseline = derive_offspring_substream_seed(
+            root_seed,
+            baseline_identity,
+            OffspringRngOperationV1::RuntimeMutation,
+        );
+
+        assert_ne!(
+            baseline,
+            derive_offspring_substream_seed(
+                root_seed,
+                OffspringRngIdentityV1::new(AgentUid(11), Some(AgentUid(29)), 7),
+                OffspringRngOperationV1::RuntimeMutation,
+            ),
+            "the primary parent's local birth ordinal is absent"
+        );
+        assert_ne!(
+            baseline,
+            derive_offspring_substream_seed(
+                root_seed,
+                OffspringRngIdentityV1::new(AgentUid(29), Some(AgentUid(11)), 6),
+                OffspringRngOperationV1::RuntimeMutation,
+            ),
+            "ordered lineage was collapsed into an unordered parent set"
+        );
+        assert_ne!(
+            baseline,
+            derive_offspring_substream_seed(
+                root_seed,
+                OffspringRngIdentityV1::new(AgentUid(11), None, 6),
+                OffspringRngOperationV1::RuntimeMutation,
+            ),
+            "the optional secondary parent is absent"
+        );
+        assert_ne!(
+            derive_offspring_substream_seed(
+                root_seed,
+                OffspringRngIdentityV1::new(AgentUid(11), None, 6),
+                OffspringRngOperationV1::RuntimeMutation,
+            ),
+            derive_offspring_substream_seed(
+                root_seed,
+                OffspringRngIdentityV1::new(AgentUid(11), Some(AgentUid(0)), 6),
+                OffspringRngOperationV1::RuntimeMutation,
+            ),
+            "partner absence collided with a present zero-valued AgentUid"
+        );
+        assert_ne!(
+            baseline,
+            derive_offspring_substream_seed(
+                root_seed,
+                baseline_identity,
+                OffspringRngOperationV1::BrainMutation,
+            ),
+            "distinct offspring operations share one seed"
+        );
+
+        let agent_brain_seed = derive_agent_substream_seed(
+            root_seed,
+            AgentUid(11),
+            AgentRngOperationV1::BrainInitialization,
+            6,
+        );
+        let offspring_brain_seed = derive_offspring_substream_seed(
+            root_seed,
+            OffspringRngIdentityV1::new(AgentUid(11), None, 6),
+            OffspringRngOperationV1::BrainInitialization,
+        );
+        assert_ne!(
+            agent_brain_seed, offspring_brain_seed,
+            "agent and offspring subjects collided despite separate subject tags"
+        );
+    }
+
+    #[test]
+    fn offspring_identity_wire_is_strict_and_idempotent() {
+        let identity = OffspringRngIdentityV1::new(AgentUid(8), Some(AgentUid(13)), 21);
+        let encoded = serde_json::to_string(&identity).expect("offspring identity encodes");
+        let decoded: OffspringRngIdentityV1 =
+            serde_json::from_str(&encoded).expect("offspring identity decodes");
+        assert_eq!(decoded, identity);
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("decoded identity re-encodes"),
+            encoded
+        );
+
+        let mut missing = serde_json::to_value(identity).expect("offspring identity encodes");
+        missing
+            .as_object_mut()
+            .expect("offspring identity is an object")
+            .remove("birth_ordinal");
+        assert!(
+            serde_json::from_value::<OffspringRngIdentityV1>(missing).is_err(),
+            "an offspring identity missing its parent-local ordinal decoded"
+        );
+
+        let mut unknown = serde_json::to_value(identity).expect("offspring identity encodes");
+        unknown
+            .as_object_mut()
+            .expect("offspring identity is an object")
+            .insert("child_uid".to_owned(), serde_json::json!(999));
+        assert!(
+            serde_json::from_value::<OffspringRngIdentityV1>(unknown).is_err(),
+            "a future child UID was accepted into the lineage-derived identity"
+        );
+    }
+
+    #[test]
+    fn agent_rng_counters_advance_independently_and_never_wrap() {
+        let mut counters = AgentRngCountersV1::default();
+        assert_eq!(counters.take_reproduction_attempt(), Ok(0));
+        assert_eq!(counters.take_reproduction_attempt(), Ok(1));
+        assert_eq!(counters.take_birth(), Ok(0));
+        assert_eq!(counters.take_brain_initialization(), Ok(0));
+        assert_eq!(counters.reproduction_attempt_ordinal(), 2);
+        assert_eq!(counters.birth_ordinal(), 1);
+        assert_eq!(counters.brain_initialization_ordinal(), 1);
+
+        let mut exhausted = AgentRngCountersV1::from_ordinals(u64::MAX, 4, 5);
+        let before = exhausted;
+        assert_eq!(
+            exhausted.take_reproduction_attempt(),
+            Err(AgentRngCounterError::Exhausted {
+                counter: "reproduction-attempt",
+            })
+        );
+        assert_eq!(
+            exhausted, before,
+            "counter exhaustion mutated another continuation or wrapped the exhausted one"
+        );
+    }
+
+    #[test]
+    fn agent_rng_counter_wire_rejects_missing_unknown_and_duplicate_fields() {
+        let counters = AgentRngCountersV1::from_ordinals(3, 4, 5);
+        let encoded = serde_json::to_string(&counters).expect("agent counters encode");
+        let decoded: AgentRngCountersV1 =
+            serde_json::from_str(&encoded).expect("agent counters decode");
+        assert_eq!(decoded, counters);
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("decoded counters re-encode"),
+            encoded
+        );
+
+        let mut missing = serde_json::to_value(counters).expect("agent counters encode");
+        missing
+            .as_object_mut()
+            .expect("agent counters are an object")
+            .remove("birth");
+        assert!(
+            serde_json::from_value::<AgentRngCountersV1>(missing).is_err(),
+            "agent counters missing the birth continuation decoded"
+        );
+
+        let mut unknown = serde_json::to_value(counters).expect("agent counters encode");
+        unknown
+            .as_object_mut()
+            .expect("agent counters are an object")
+            .insert("dense_index".to_owned(), serde_json::json!(7));
+        assert!(
+            serde_json::from_value::<AgentRngCountersV1>(unknown).is_err(),
+            "a dense-index continuation was accepted by the stable counter wire"
+        );
+
+        let birth_entry = "\"birth\":4";
+        let duplicate_birth = format!("{birth_entry},{birth_entry}");
+        let duplicated = encoded.replacen(birth_entry, &duplicate_birth, 1);
+        assert_ne!(
+            duplicated, encoded,
+            "duplicate-counter fixture did not locate the birth field"
+        );
+        let error = serde_json::from_str::<AgentRngCountersV1>(&duplicated)
+            .expect_err("duplicate birth counters must not decode");
+        assert!(
+            error.to_string().contains("duplicate field `birth`"),
+            "duplicate-counter error did not name the repeated continuation: {error}"
+        );
+    }
+
+    #[test]
+    fn agent_substream_protocol_metadata_is_strictly_versioned() {
+        let protocol = AgentSubstreamProtocolV1::from_root_seed(910);
+        assert_eq!(protocol.version(), AGENT_SUBSTREAM_PROTOCOL_VERSION);
+        assert_eq!(protocol.algorithm(), AGENT_SUBSTREAM_DERIVATION_V1);
+        assert_eq!(
+            protocol.codec_version(),
+            AGENT_SUBSTREAM_PROTOCOL_CODEC_VERSION
+        );
+        assert_eq!(protocol.stream_algorithm(), SmallRngStream::algorithm());
+        assert_eq!(protocol.root_seed(), 910);
+        assert_eq!(protocol.validate(910), Ok(()));
+
+        let encoded = serde_json::to_string(&protocol).expect("protocol metadata encodes");
+        let decoded: AgentSubstreamProtocolV1 =
+            serde_json::from_str(&encoded).expect("protocol metadata decodes");
+        assert_eq!(decoded, protocol);
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("protocol metadata re-encodes"),
+            encoded
+        );
+
+        let mut wrong_version = protocol.clone();
+        wrong_version.version += 1;
+        assert!(matches!(
+            wrong_version.validate(910),
+            Err(AgentSubstreamProtocolError::Version { .. })
+        ));
+
+        let mut wrong_algorithm = protocol.clone();
+        wrong_algorithm.algorithm = "other".to_owned();
+        assert!(matches!(
+            wrong_algorithm.validate(910),
+            Err(AgentSubstreamProtocolError::Algorithm { .. })
+        ));
+
+        let mut wrong_codec = protocol.clone();
+        wrong_codec.codec_version += 1;
+        assert!(matches!(
+            wrong_codec.validate(910),
+            Err(AgentSubstreamProtocolError::CodecVersion { .. })
+        ));
+
+        let mut wrong_stream = protocol.clone();
+        wrong_stream.stream_algorithm = "other".to_owned();
+        assert!(matches!(
+            wrong_stream.validate(910),
+            Err(AgentSubstreamProtocolError::StreamAlgorithm { .. })
+        ));
+
+        assert!(matches!(
+            protocol.validate(911),
+            Err(AgentSubstreamProtocolError::RootSeed { .. })
+        ));
+
+        let mut unknown = serde_json::to_value(protocol).expect("protocol metadata encodes");
+        unknown
+            .as_object_mut()
+            .expect("protocol metadata is an object")
+            .insert("target_pointer_width".to_owned(), serde_json::json!(64));
+        assert!(
+            serde_json::from_value::<AgentSubstreamProtocolV1>(unknown).is_err(),
+            "unknown target metadata was silently accepted by the frozen envelope"
+        );
+    }
+
+    #[test]
+    fn keyed_substreams_record_the_compiled_native_or_wasm_generator_lane() {
+        let root_seed = 2026;
+        let agent_seed = derive_agent_substream_seed(
+            root_seed,
+            AgentUid(55),
+            AgentRngOperationV1::BrainInitialization,
+            0,
+        );
+        let agent = agent_substream(
+            root_seed,
+            AgentUid(55),
+            AgentRngOperationV1::BrainInitialization,
+            0,
+        );
+        assert_eq!(agent.seed(), agent_seed);
+        assert_eq!(agent.algorithm_id(), SmallRngStream::algorithm());
+
+        let identity = OffspringRngIdentityV1::new(AgentUid(55), None, 0);
+        let offspring_seed = derive_offspring_substream_seed(
+            root_seed,
+            identity,
+            OffspringRngOperationV1::BrainEvaluatorStateMutation,
+        );
+        let offspring = offspring_substream(
+            root_seed,
+            identity,
+            OffspringRngOperationV1::BrainEvaluatorStateMutation,
+        );
+        assert_eq!(offspring.seed(), offspring_seed);
+        assert_eq!(offspring.algorithm_id(), SmallRngStream::algorithm());
     }
 
     #[test]
